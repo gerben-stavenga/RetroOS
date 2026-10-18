@@ -95,6 +95,10 @@ fn with<T>(f: impl FnOnce(&mut Network) -> Result<T, Error>) -> Result<T, Error>
 pub fn installed() -> bool {
     NETWORK.lock().is_some()
 }
+pub fn socket_kind(h: i32) -> Result<Kind, Error> {
+    with(|n| Ok(n.entries[n.index(h)?].kind))
+}
+
 pub fn nonblocking(h: i32) -> bool {
     with(|n| {
         n.entries

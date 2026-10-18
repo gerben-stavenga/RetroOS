@@ -62,6 +62,72 @@ the local clock; Windows system time and Unix file timestamps use UTC.
 The offset is fixed: update it yourself when daylight saving time changes.
 Settings take effect after reboot and do not alter the hardware clock.
 
+## QEMU with the live machine files
+
+Configure the local live-files profile once, as your normal user:
+
+```sh
+python3 tools/qemu_live.py setup --root / --c-root /home/retroos
+./run.sh qemu --kvm
+```
+
+With that profile present, QEMU KVM uses the host's live `/` read-only and
+`/home/retroos` as writable C:, through authenticated, signed SMB2 over VirtIO.
+It reads the same GNU programs, shared libraries, CA certificates and user
+`RETROOS/RETROOS.INI` as the metal installation. C: writes and user-settings
+edits are visible immediately on the host. Existing C: application symlinks
+retain access to their targets with your Unix user's permissions.
+
+The launcher starts a private Samba process on loopback, with a random port
+and fresh per-launch credentials. It reuses installed Samba tools or the
+existing user-local RetroOS Samba tools. On Debian/Ubuntu, setup can extract
+missing server utilities locally; their runtime libraries must be available.
+The writable SMB session uses a subdirectory view of the host namespace so
+normal server symlink handling can resolve C: links. The guest's `/` mount is
+read-only. This shares live files; storage access is SMB rather than the ext4
+backend used on metal, and QEMU still supplies virtual hardware.
+
+No mounted host block device is attached. The only VM disk is a disposable
+boot image containing the matched runtime and bootstrap INIs. It carries a
+private copy of user settings while mounting the network filesystems; the
+persistent user INI is exposed again once C: is mounted. The QEMU RTC base
+follows the selected user's clock setting. The server and bootstrap copy are
+removed when the VM exits; an unavailable root/C: share stops boot.
+
+`--live-root` explicitly selects this profile. To use a separate persistent
+disk instead, supply `--data-image build/data.bin`; this overrides the KVM
+live-files default. `RETROOS_QEMU_LIVE_PROFILE` selects another profile JSON
+with `root` and `c_root` directory paths. Run `python3 test/live_root.py` for
+GNU userspace from the live root, DOS/Linux C: writes, application symlinks,
+persistent settings, and rejection of writes through the root view.
+
+The installed native Linux Codex binary can be exercised in the same VM:
+
+```sh
+python3 test/linux_codex.py
+python3 test/linux_codex.py --request
+```
+
+The first command checks `--version` without a model request. The second
+copies saved CLI authentication into a private temporary C:, requests one
+short response without tool calls, and removes the copy on exit. Both use
+2 GiB guest RAM and the live host root; `--binary /absolute/path/to/codex`
+selects another native executable. Results are saved under `build/ci/codex-*`.
+This invokes the native executable directly; `/usr/local/bin/codex` may be
+a Node launcher. The request test does not validate interactive terminal
+operation or execution of model-generated tools.
+
+Codex CLI 0.163.0 has returned `Hello from Codex on RetroOS.` from a real
+model request and exited with code 0 in this configuration. Model-catalog
+refresh timeouts still appeared during that successful run.
+
+Linux socket `writev` and `recvmsg` use the common network stack. Run
+`python3 test/linux_message.py` to check both word sizes, UDP scatter/gather,
+peeking, truncation, executable-path reporting and filesystem initialization
+calls. BSD file locks belong to VFS open file descriptions and survive
+`dup`/`fork` until the last close. They coordinate RetroOS processes; they
+do not acquire locks in other SMB clients or host applications.
+
 ## QEMU networking
 
 The QEMU launchers enable **VirtIO user networking** by default. No TAP
@@ -116,6 +182,19 @@ Run `python3 test/virtio_net.py` to check BIOS/UEFI DHCP, TCP transfers, UDP,
 incoming connections, poll timeouts, descriptor sharing and a BusyBox HTTP
 download against local servers. Tests retain packet captures and boot logs
 in their printed temporary directory and do not depend on internet access.
+
+With GNU `wget` from a Linux root, HTTPS is handled by its userspace OpenSSL
+libraries. Keep the Linux root's CA certificates installed for verification:
+
+```sh
+wget -O /home/retroos/HTTPS.TXT https://example.com/
+```
+
+Native QEMU verifies an HTTPS download from `example.com`. Run
+`python3 test/linux_https.py` for local TLS 1.2/1.3 downloads and rejection of
+untrusted issuers and mismatched hostnames. That test uses host GNU `wget`
+and its libraries in an isolated ext4 image, generated test certificates,
+KVM and VirtIO; certificate verification stays enabled.
 
 ## DOS display scaling
 
@@ -649,7 +728,8 @@ encrypted link, and receives DHCP address `192.168.1.160/24` with DNS server
 adds UDP error-reporting registration, `sendmsg`/`sendmmsg` and `pselect6`, plus
 clock resolution and ABI-correct time structures. GNU wget now resolves
 `example.com` and downloads its HTTP page with exit code 0 in an isolated
-QEMU ext4 fixture; that application check still needs confirmation over Wi-Fi.
+QEMU ext4 fixture. KLOG0012 confirms DNS resolution, HTTP 200 and a 577-byte
+`example.com` download over native Wi-Fi.
 The stack currently registers UDP error-reporting interest without generating
 ICMP auxiliary error records. GNU wget's optional alarm timer and setting a
 remote file timestamp can still report unsupported calls; the tested HTTP
@@ -694,7 +774,9 @@ path=/home/retroos/NET
 ```
 
 `server` is an IPv4 address; `port` defaults to 445 and `domain` may be omitted.
-`path` must be an absolute non-root VFS path. With the normal C: mapping, this
+`path` must be an absolute VFS path. `/` is accepted only with `access=ro`.
+Other mounts default to `access=rw`; `subdir=/some/directory` selects a
+canonical subdirectory of the share instead of its root. With the normal C: mapping, this
 example appears as `C:\NET` to DOS/OS2/Windows and `/home/retroos/NET` to Linux.
 To give a share its own DOS/OS2/Windows drive, add `drive=H` and use
 `path=/host`; Linux then accesses the same share at `/host`. Explicit network
@@ -735,6 +817,16 @@ normally arrives after boot-time mounts are attempted. The default QEMU UEFI
 launcher uses `-cpu max`; for BIOS, pass `-- -cpu max` for immediate hardware
 seeding. An unseeded pool fails the mount rather than using the guest PRNG.
 There is no automatic retry of a failed boot-time SMB mount.
+
+Linux `getrandom` uses that same entropy service for both 32-bit and 64-bit
+applications, including userspace TLS libraries. Blocking requests wait for a
+seeded generator; `GRND_NONBLOCK` returns `EAGAIN` while entropy is unavailable.
+`GRND_RANDOM` also uses the shared generator. Unknown flags and the insecure
+fallback flag are rejected, and large requests return at most 64 KiB per call.
+No scheduler-PRNG fallback is exposed through this interface.
+`python3 test/random_interrupts.py` checks these semantics without RDRAND on
+486/PIT and UEFI/x86-64, including waking a blocked call after input seeding.
+Injected input validates the waiting/wakeup path, not entropy quality.
 
 This first implementation uses synchronous VFS operations and pumps the
 network while waiting, with a three-second request timeout. VFS operations

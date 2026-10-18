@@ -21,7 +21,7 @@ launch() {
     else
         args=(-m 128 -drive "file=$BOOT_IMAGE,format=raw")
     fi
-    if [ "$FREEDOS" = 0 ]; then
+    if [ "$FREEDOS" = 0 ] && [ -n "$DATA_IMAGE" ]; then
         args+=(-drive "file=$DATA_IMAGE,if=none,id=data,format=raw")
         case "$HD" in
             ata)
@@ -43,6 +43,7 @@ launch() {
     if [ "$NETWORK" = virtio ]; then
         args+=(-netdev user,id=net0 -device virtio-net-pci,netdev=net0)
     fi
+    [ "$LIVE" != 1 ] || cpu=(-cpu max)
     [ "$KVM" = 0 ] || cpu=(-accel kvm -cpu host)
     if [ "$FIRMWARE" = bios ]; then
         local rom="${VGABIOS_ROM:-$SCRIPT_DIR/third_party/vgabios/vgabios-stdvga.bin}"
@@ -80,6 +81,8 @@ launch() {
         args+=(-fw_cfg "name=opt/cwd,string=$cwd")
     fi
     [ -z "$SB_AUDIO" ] || args+=(-fw_cfg "name=opt/audio,string=$SB_AUDIO")
-    run_vm "$qemu" "${cpu[@]}" "${args[@]}" -rtc base=localtime \
+    local rtc=localtime
+    if [ "$LIVE" = 1 ] && [ -f "$WORK/rtc-base" ]; then read -r rtc < "$WORK/rtc-base" || true; fi
+    run_vm "$qemu" "${cpu[@]}" "${args[@]}" -rtc "base=$rtc" \
         -debugcon stdio -display "$display" -no-reboot "${PASS[@]}"
 }

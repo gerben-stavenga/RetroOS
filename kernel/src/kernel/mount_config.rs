@@ -48,6 +48,8 @@ pub struct SmbMount {
     pub username: String,
     pub password: String,
     pub domain: String,
+    pub access: Access,
+    pub subdir: String,
 }
 impl core::fmt::Debug for SmbMount {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -122,7 +124,7 @@ impl Config {
                 } else if section == "smb" {
                     if config.smb.len() >= 8 { return Err("too many SMB mounts"); }
                     config.smb.push(SmbMount { drive: None, server: [0;4], port: 445, share: String::new(), path: String::new(),
-                        username: String::new(), password: String::new(), domain: String::new() });
+                        username: String::new(), password: String::new(), domain: String::new(), access: Access::Rw, subdir: "/".into() });
                 } else if section == "bundle" {
                     if config.bundle.is_some() { return Err("duplicate bundle section"); }
                     config.bundle = Some(Bundle { source: String::new(), subdir: "/".into() });
@@ -185,6 +187,11 @@ impl Config {
                     "port" => mount.port = value.parse().map_err(|_|"invalid SMB port")?,
                     "share" => mount.share = value.into(), "path" => mount.path = value.into(),
                     "username" => mount.username = value.into(), "password" => mount.password = value.into(),
+                    "access" => mount.access = match value {
+                        "ro" => Access::Ro, "rw" => Access::Rw,
+                        _ => return Err("SMB access must be ro or rw"),
+                    },
+                    "subdir" => mount.subdir = value.into(),
                     "domain" => mount.domain = value.into(), _ => return Err("unknown SMB key"),
                 }
             } else if section == "bundle" {
@@ -270,7 +277,7 @@ impl Config {
             if mount.server == [0; 4] || mount.port == 0
                 || mount.username.is_empty() || mount.share.is_empty()
                 || mount.share.contains(['/', '\\', ':'])
-                || !canonical(&mount.path) || mount.path == "/"
+                || !canonical(&mount.path) || !canonical(&mount.subdir) || mount.path == "/" && mount.access != Access::Ro
                 || config.smb[..i].iter().any(|s| s.path == mount.path
                     || mount.drive.is_some() && s.drive == mount.drive)
             {
@@ -937,7 +944,7 @@ mod tests {
 
 #[cfg(test)]
 mod smb_config_tests {
-    use super::Config;
+    use super::{Config, Access};
     const MOUNT: &str = "[smb]\nserver=10.0.2.2\nshare=data\nusername=retroos\npassword=secret-test-value\npath=/SMB\n";
     #[test]
     fn smb_credentials_stay_out_of_guest_environment_and_debug_output() {
@@ -956,6 +963,21 @@ mod smb_config_tests {
         }
         let duplicate = [config.as_str(), &config.replace("path=/SMB", "path=/OTHER")].concat();
         assert!(Config::parse_user(duplicate.as_bytes()).is_err());
+    }
+    #[test]
+    fn smb_root_is_explicitly_readonly_and_data_keeps_its_access() {
+        let root = MOUNT.replace("path=/SMB", "path=/");
+        assert!(Config::parse_user(root.as_bytes()).is_err());
+        let root = [root.as_str(), "access=ro\n"].concat();
+        assert_eq!(Config::parse_user(root.as_bytes()).unwrap().smb[0].access, Access::Ro);
+        assert_eq!(Config::parse_user(MOUNT.as_bytes()).unwrap().smb[0].access, Access::Rw);
+        assert!(Config::parse_user([MOUNT, "access=ram\n"].concat().as_bytes()).is_err());
+    }
+    #[test]
+    fn smb_subdirectory_views_require_canonical_paths() {
+        let config = [MOUNT, "subdir=/home/retroos\n"].concat();
+        assert_eq!(Config::parse_user(config.as_bytes()).unwrap().smb[0].subdir, "/home/retroos");
+        assert!(Config::parse_user([MOUNT, "subdir=/home/../etc\n"].concat().as_bytes()).is_err());
     }
     #[test]
     fn smb_rejects_invalid_addresses_paths_and_duplicate_mounts() {

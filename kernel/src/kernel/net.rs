@@ -52,6 +52,7 @@ pub fn poll() {
 pub fn native_backend() -> bool {
     stack::installed()
 }
+pub fn socket_kind(h: i32) -> Result<SocketKind> { stack::socket_kind(h) }
 pub fn nonblocking(h: i32) -> bool {
     stack::nonblocking(h)
 }

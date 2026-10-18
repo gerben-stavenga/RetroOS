@@ -19,6 +19,8 @@ macro_rules! linux_trace {
 }
 
 mod async_io;
+mod entropy;
+mod file_mapping;
 mod tty;
 mod time;
 mod message;
@@ -100,6 +102,8 @@ pub struct LinuxState {
     pub pending_poll: Option<PendingPoll>,  // Blocked poll on a pollfd array
     pending_socket: Option<PendingSocket>,
     pending_select:Option<select::Request>,
+    pending_random: Option<entropy::Request>,
+    pending_flock: Option<(i32, u32)>,
     pub wait_status_ptr: usize,            // Deferred wait4 status write
     pub wait_exit_code: i32,
     /// VFS-form cwd (lowercase, forward-slash, no leading/trailing slash).
@@ -112,7 +116,7 @@ pub struct LinuxState {
     /// resolves to. Set on each successful exec; preserved across the
     /// in-place ELF execve. Lets self-re-exec'ing binaries (busybox standalone
     /// shell) find themselves without a real /proc or any hardcoded path.
-    pub exec_path: [u8; 128],
+    pub exec_path: [u8; vfs::PATH_KEY_MAX],
     pub exec_path_len: usize,
 }
 
@@ -139,11 +143,13 @@ impl LinuxState {
             pending_poll: None,
             pending_socket: None,
             pending_select:None,
+            pending_random: None,
+            pending_flock: None,
             wait_status_ptr: 0,
             wait_exit_code: 0,
             cwd: [0; 64],
             cwd_len: 0,
-            exec_path: [0; 128],
+            exec_path: [0; vfs::PATH_KEY_MAX],
             exec_path_len: 0,
         }
     }
@@ -250,15 +256,15 @@ fn blocking_socket_call<A: crate::Arch>(
             3 => (word(0) as usize, 0, true),
             5 | 18 => (word(0) as usize, 0, false),
             9..=12 | 20 => (word(0) as usize, word(3), false),
-            16 => (word(0) as usize,word(2),false),
+            16 | 17 => (word(0) as usize,word(2),false),
             _ => return None,
         }
     } else {
         match (mode64, nr) {
-            (false, 3 | 4) | (true, 0 | 1 | 43 | 288) => (args.a0 as usize, 0, false),
+            (false, 3 | 4 | 146) | (true, 0 | 1 | 20 | 43 | 288) => (args.a0 as usize, 0, false),
             (true, 42) => (args.a0 as usize, 0, true),
             (true, 44 | 45 | 307) | (false,345) => (args.a0 as usize, args.a3 as u32, false),
-            (true,46)=>(args.a0 as usize,args.a2 as u32,false),
+            (true,46 | 47) | (false, 370 | 372)=>(args.a0 as usize,args.a2 as u32,false),
             _ => return None,
         }
     };
@@ -336,6 +342,23 @@ pub fn complete_pending_io<A: crate::Arch>(machine: &mut A,
     linux: &mut LinuxState,
     regs: &mut Regs,
 ) {
+    if let Some((handle, operation)) = linux.pending_flock {
+        let result = vfs::flock(handle, operation);
+        if result != -11 {
+            regs.rax = result as i64 as u64;
+            linux.pending_flock = None;
+            kt.state = thread::ThreadState::Ready;
+        }
+        return;
+    }
+    if let Some(request) = linux.pending_random {
+        if let Some(result) = request.step(machine) {
+            regs.rax = result as i64 as u64;
+            linux.pending_random = None;
+            kt.state = thread::ThreadState::Ready;
+        }
+        return;
+    }
     if let Some(request)=linux.pending_select {
         if let Some(result)=request.step(machine,kt) {regs.rax=result as i64 as u64;linux.pending_select=None;kt.state=thread::ThreadState::Ready;}
         return;
@@ -464,6 +487,13 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         54  => sys_ioctl(machine, kt, linux, a),
         180 => sys_pread64(machine, kt, a),
         55  => sys_fcntl(kt, a),
+        143 => sys_flock(kt, linux, a),
+        118 | 148 => sys_fsync(kt, a),
+        370 => message::sendmsg(machine, kt, a, false),
+        372 => message::recvmsg(machine, kt, a, false),
+        15 => sys_chmod(machine, linux, a),
+        94 => sys_fchmod(kt, a),
+        301 => sys_unlinkat(machine, kt, linux, a),
         63  => sys_dup2(kt, a),
         85  => sys_readlink(machine, linux, a),
         // Old i386 struct stat — 64-byte layout. busybox/uclibc still uses
@@ -512,7 +542,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         308 => select::call(machine,kt,linux,a,regs,false),
         413 => select::call(machine,kt,linux,a,regs,true),
         345 => message::sendmmsg(machine,kt,a,false),
-        355 => sys_getrandom(machine, &mut kt.vcpu, a),
+        355 => sys_getrandom(machine, kt, linux, a),
         383 => sys_statx(machine, kt, linux, a),
         102 => sys_socketcall(machine, kt, a),
         _ => {
@@ -566,6 +596,11 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         61  => sys_wait4(machine, kt, a, regs),
         63  => sys_uname(machine, &mut kt.vcpu, a, true),
         72  => sys_fcntl(kt, a),
+        73 => sys_flock(kt, linux, a),
+        74 | 75 => sys_fsync(kt, a),
+        90 => sys_chmod(machine, linux, a),
+        91 => sys_fchmod(kt, a),
+        263 => sys_unlinkat(machine, kt, linux, a),
         79  => sys_getcwd(machine, &mut kt.vcpu, linux, a),
         80  => sys_chdir(machine, &mut kt.vcpu, linux, a),
         77 => sys_ftruncate(kt,a),
@@ -606,13 +641,14 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         334 => SyscallResult::val(-ENOSYS), // rseq — glibc falls back cleanly
         439 => sys_faccessat(machine, linux, a),
         302 => SyscallResult::val(0),
-        318 => sys_getrandom(machine, &mut kt.vcpu, a),
+        318 => sys_getrandom(machine, kt, linux, a),
         // Sockets (x86-64 direct numbering).
         41  => sys_socket(kt, a.a0, a.a1, a.a2),
         42  => sys_connect(machine, kt, a.a0, a.a1 as usize, a.a2 as usize),
         43  => sys_accept(machine, kt, a.a0, a.a1 as usize, a.a2 as usize),
         44  => sys_sendto(machine, kt, a.a0, a.a1 as usize, a.a2 as usize, a.a3, a.a4 as usize, a.a5 as usize),
         46 => message::sendmsg(machine,kt,a,true),
+        47 => message::recvmsg(machine,kt,a,true),
         270 => select::call(machine,kt,linux,a,regs,true),
         307 => message::sendmmsg(machine,kt,a,true),
         45  => sys_recvfrom(machine, kt, a.a0, a.a1 as usize, a.a2 as usize, a.a3, a.a4 as usize, a.a5 as usize),
@@ -1192,6 +1228,7 @@ fn sys_socketcall<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         13 => sys_shutdown(kt, g(0), g(1)),
         14 => sys_setsockopt(machine, kt, g(0), g(1), g(2), g(3) as usize, g(4) as usize),
         15 => sys_getsockopt(machine, kt, g(0), g(1), g(2), g(3) as usize, g(4) as usize),
+        17 => { let args = Args { a0:g(0), a1:g(1), a2:g(2), a3:0, a4:0, a5:0 }; message::recvmsg(machine,kt,&args,false) },
         16 | 20 => {let args=Args {a0:g(0),a1:g(1),a2:g(2),a3:g(3),a4:0,a5:0};
             if a.a0==16 {message::sendmsg(machine,kt,&args,false)}else{message::sendmmsg(machine,kt,&args,false)}
         },
@@ -1373,11 +1410,13 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     let cwd_snapshot: alloc::vec::Vec<u8> = linux.cwd_str().into();
 
     // Load file (resolves path against cwd)
-    let mut resolved = [0; 164];
+    let mut resolved = [0; vfs::PATH_KEY_MAX];
     let mut buffer = match exec::load_executable_resolved(exec::resolve_path(&path, &cwd_snapshot, &mut resolved)) {
         Ok(b) => b,
         Err(_) => return SyscallResult::val(-ENOENT),
     };
+
+    path = [b"/".as_slice(), exec::resolve_path(&path, &cwd_snapshot, &mut resolved)].concat();
 
     // A 64-bit ELF on a backend without 64-bit user execution must fail HERE,
     // before the point of no return, so the caller survives and can fall back
@@ -1393,7 +1432,7 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     let mut cmdtail = if matches!(format, exec::BinaryFormat::MzExe | exec::BinaryFormat::Com) {
         let tail = dos_command_tail(&args);
         if tail.len() > 126 { return SyscallResult::val(-7); } // E2BIG: PSP command tail capacity.
-        let mut resolved = [0; 164];
+        let mut resolved = [0; vfs::PATH_KEY_MAX];
         args[0] = exec::resolve_path(&path, &cwd_snapshot, &mut resolved).to_vec();
         tail
     } else { alloc::vec::Vec::new() };
@@ -1672,12 +1711,15 @@ fn readlink_at<A: crate::Arch>(
     base: &[u8],
     buf: usize,
     bufsz: usize,
+    executable: &[u8],
 ) -> SyscallResult {
     let mut self_exe_buf = [0u8; 256];
     let self_exe_len = machine.copy_cstr(path_ptr, &mut self_exe_buf);
     let is_self_exe = &self_exe_buf[..self_exe_len] == b"/proc/self/exe";
     if is_self_exe {
-        let target: &[u8] = b"/bin/busybox";
+        if executable.is_empty() { return SyscallResult::val(-ENOENT); }
+        let target = if executable.starts_with(b"/") { executable.to_vec() }
+            else { [b"/".as_slice(), executable].concat() };
         let n = target.len().min(bufsz);
         machine.copy_to(buf, &target[..n]);
         return SyscallResult::val(n as i32);
@@ -1707,6 +1749,7 @@ fn sys_readlink<A: crate::Arch>(
         linux.cwd_str(),
         a.a1 as usize,
         a.a2 as usize,
+        linux.exec_path_str(),
     )
 }
 
@@ -1725,6 +1768,7 @@ fn sys_readlinkat<A: crate::Arch>(
         base,
         a.a2 as usize,
         a.a3 as usize,
+        linux.exec_path_str(),
     )
 }
 
@@ -1771,6 +1815,63 @@ fn sys_brk(linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let new_end = addr.max(linux.heap_base).min(linux.mmap_cursor);
     linux.heap_end = new_end;
     SyscallResult::val64(linux.heap_end as i64)
+}
+
+fn flock_handle<A: crate::Arch>(kt: &thread::KernelThread<A>, args: &Args) -> Result<i32, i32> {
+    match kt.fds.get(args.a0 as usize) {
+        Some(thread::FdKind::Vfs(h)) => Ok(*h),
+        _ => Err(-EBADF),
+    }
+}
+fn sys_flock<A: crate::Arch>(kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, args: &Args) -> SyscallResult {
+    let h = match flock_handle(kt, args) { Ok(h) => h, Err(e) => return SyscallResult::val(e) };
+    if args.a1 > u32::MAX as u64 { return SyscallResult::val(-EINVAL); }
+    let operation = args.a1 as u32;
+    let result = vfs::flock(h, operation);
+    if result == -11 && operation & 4 == 0 {
+        linux.pending_flock = Some((h, operation));
+        kt.state = thread::ThreadState::Blocked;
+        SyscallResult::val(0)
+    } else { SyscallResult::val(result) }
+}
+fn sys_fsync<A: crate::Arch>(kt: &thread::KernelThread<A>, args: &Args) -> SyscallResult {
+    SyscallResult::val(match kt.fds.get(args.a0 as usize) {
+        Some(thread::FdKind::Vfs(h)) => vfs::sync_by_handle(*h),
+        Some(thread::FdKind::None) | None => -EBADF,
+        _ => -EINVAL,
+    })
+}
+fn sys_fchmod<A: crate::Arch>(kt: &thread::KernelThread<A>, args: &Args) -> SyscallResult {
+    let mode = args.a1 as u32 & 0o7777;
+    let result = match kt.fds.get(args.a0 as usize) {
+        Some(thread::FdKind::Vfs(h)) => vfs::set_handle_mode(*h, mode),
+        Some(thread::FdKind::Dir { handle, .. }) => {
+            let mut path = [0; vfs::DIR_PATH_MAX];
+            match vfs::dir_handle_path(*handle, &mut path) {
+                Some(n) => vfs::set_path_mode(&path[..n], mode), None => -EBADF,
+            }
+        }
+        _ => -EBADF,
+    };
+    SyscallResult::val(result)
+}
+fn sys_unlinkat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, linux: &LinuxState, args: &Args) -> SyscallResult {
+    if args.a2 & !0x200 != 0 { return SyscallResult::val(-EINVAL); }
+    let mut raw = [0; 256]; let n = machine.copy_cstr(args.a1 as usize, &mut raw);
+    let fd = args.a0 as i32;
+    if raw.first() != Some(&b'/') && fd != -100
+        && !matches!(kt.fds.get(fd as usize), Some(thread::FdKind::Dir { .. })) {
+        return SyscallResult::val(-EBADF);
+    }
+    let mut base = [0; vfs::DIR_PATH_MAX];
+    let mut path = [0; vfs::DIR_PATH_MAX];
+    let resolved = resolve_path(&raw[..n], at_base(kt, linux, fd, &mut base), &mut path);
+    SyscallResult::val(if args.a2 & 0x200 != 0 { vfs::rmdir(resolved) } else { vfs::delete(resolved) })
+}
+fn sys_chmod<A: crate::Arch>(machine: &mut A, linux: &LinuxState, args: &Args) -> SyscallResult {
+    let mut raw = [0; 256]; let n = machine.copy_cstr(args.a0 as usize, &mut raw);
+    let mut resolved = [0; 256];
+    SyscallResult::val(vfs::set_path_mode(resolve_path(&raw[..n], linux.cwd_str(), &mut resolved), args.a1 as u32 & 0o7777))
 }
 
 /// fcntl(55) / fcntl64(221)
@@ -1950,6 +2051,7 @@ fn sys_writev<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
     if iovcnt > 1024 { return SyscallResult::val(-EINVAL); }
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
     let fd_kind = kt.fds[fd];
+    if let thread::FdKind::Socket(h) = fd_kind { return message::writev(machine, h, a, want_64); }
 
     let mut total = 0i32;
 
@@ -2111,9 +2213,9 @@ fn sys_pread64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
     match kt.fds[fd] {
         thread::FdKind::Vfs(handle) => {
-            vfs::seek_by_handle(handle, offset as i32, 0 /*SEEK_SET*/);
+            if offset < 0 || offset > i64::from(u32::MAX) { return SyscallResult::val(-EINVAL); }
             let mut tmp = alloc::vec![0u8; len];
-            let n = vfs::read_by_handle(handle, &mut tmp);
+            let n = vfs::read_at_by_handle(handle, offset as u32, &mut tmp);
             if n > 0 { machine.copy_to(buf, &tmp[..n as usize]); }
             SyscallResult::val(n)
         }
@@ -2173,10 +2275,11 @@ fn sys_mmap2<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
         }
         match kt.fds[fd as usize] {
             thread::FdKind::Vfs(handle) => {
-                vfs::seek_by_handle(handle, offset_bytes as i32, 0 /*SEEK_SET*/);
-                let mut tmp = alloc::vec![0u8; length];
-                let n = vfs::read_by_handle(handle, &mut tmp);
-                if n > 0 { machine.copy_to(base, &tmp[..n as usize]); }
+                machine.zero(base, alloc_size);
+                if let Err(error) = file_mapping::copy_region(offset_bytes, length,
+                    |offset, bytes| vfs::read_at_by_handle(handle, offset, bytes),
+                    |offset, bytes| machine.copy_to(base + offset, bytes))
+                { return SyscallResult::val(error); }
             }
             _ => return SyscallResult::val64(-EBADF as i64),
         }
@@ -2606,16 +2709,19 @@ fn sys_openat<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
     sys_open(machine, kt, linux, &shifted)
 }
 
-/// getrandom(355) — stub: fill with PRNG output
-fn sys_getrandom<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> SyscallResult {
-    let buf = a.a0 as usize;
-    let buflen = a.a1 as usize;
-    let mut tmp = alloc::vec![0u8; buflen];
-    for b in tmp.iter_mut() {
-        *b = thread::prng() as u8;
+/// getrandom(355 i386 / 318 x86_64) — shared cryptographic entropy.
+fn sys_getrandom<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+    match entropy::Request::read(a) {
+        Err(error) => SyscallResult::val(error),
+        Ok(request) => match request.step(machine) {
+            Some(result) => SyscallResult::val(result),
+            None => {
+                linux.pending_random = Some(request);
+                kt.state = thread::ThreadState::Blocked;
+                SyscallResult::val(0)
+            }
+        },
     }
-    machine.copy_to(buf, &tmp);
-    SyscallResult::val(buflen as i32)
 }
 
 /// pipe(42) / pipe2(359)

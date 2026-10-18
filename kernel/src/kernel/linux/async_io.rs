@@ -19,6 +19,8 @@ enum Wait {
     Sleep(u64),
     Poll(usize, usize, u64),
     Select(super::select::Request),
+    Random(super::entropy::Request),
+    Flock(i32, u32),
     Read(u8, usize, usize),
     Socket(i32, usize, usize),
     Exited,
@@ -299,7 +301,7 @@ pub(super) fn call<A: crate::Arch>(
                 0
             }
         }
-        0 | 1 | 44 | 45 if matches!(descriptor(s, fd), Some(Descriptor::Socket(_))) => {
+        0 | 1 | 20 | 44 | 45 if matches!(descriptor(s, fd), Some(Descriptor::Socket(_))) => {
             if matches!(nr, 0 | 45) {
                 let end = match descriptor(s, fd).unwrap() {
                     Descriptor::Socket(end) => end.clone(),
@@ -320,12 +322,18 @@ pub(super) fn call<A: crate::Arch>(
                     _ => unreachable!(),
                 };
                 if let Some(peer) = peer {
-                    let mut data = alloc::vec![0; a.a2 as usize];
-                    machine.copy_from(a.a1 as usize, &mut data);
-                    if !data.is_empty() {
-                        peer.packets.borrow_mut().push_back(data);
-                    }
-                    a.a2 as i32
+                    let data = if nr == 20 {
+                        match super::message::gather(machine, a.a1 as usize, a.a2 as usize, true) {
+                            Ok(bytes) => bytes, Err(e) => return Some(SyscallResult::val(e)),
+                        }
+                    } else {
+                        let mut data = alloc::vec![0; a.a2 as usize];
+                        machine.copy_from(a.a1 as usize, &mut data);
+                        data
+                    };
+                    let n = data.len() as i32;
+                    if !data.is_empty() { peer.packets.borrow_mut().push_back(data); }
+                    n
                 } else {
                     -EPIPE
                 }
@@ -411,6 +419,17 @@ pub(super) fn call<A: crate::Arch>(
                 }
             }
         }
+        73 => {
+            let handle = match super::flock_handle(kt, a) { Ok(h) => h, Err(e) => return Some(SyscallResult::val(e)) };
+            if a.a1 > u32::MAX as u64 { return Some(SyscallResult::val(-EINVAL)); }
+            let operation = a.a1 as u32;
+            let n = vfs::flock(handle, operation);
+            if n == -11 && operation & 4 == 0 {
+                ensure(machine, kt, s, regs);
+                s.contexts[s.active].wait = Wait::Flock(handle, operation);
+                0
+            } else { n }
+        }
         7 => {
             if a.a1 > 4096 {
                 -EINVAL
@@ -424,6 +443,17 @@ pub(super) fn call<A: crate::Arch>(
                 n
             }
         }
+        318 => match super::entropy::Request::read(a) {
+            Err(error) => error,
+            Ok(request) => match request.step(machine) {
+                Some(result) => result,
+                None => {
+                    ensure(machine, kt, s, regs);
+                    s.contexts[s.active].wait = Wait::Random(request);
+                    0
+                }
+            },
+        },
         270 => match super::select::Request::read(machine, a, true) {
             Err(e) => e,
             Ok(request) => match request.step(machine, kt) {
@@ -777,6 +807,11 @@ pub(super) fn schedule<A: crate::Arch>(
                 if n != 0 || now >= end { Some(n) } else { None }
             }
             Wait::Select(request) => request.step(machine, kt),
+            Wait::Random(request) => request.step(machine),
+            Wait::Flock(handle, operation) => {
+                let n = vfs::flock(handle, operation);
+                if n == -11 { None } else { Some(n) }
+            }
             Wait::Socket(fd, out, count) => match descriptor(s, fd) {
                 Some(Descriptor::Socket(end)) => socket_read(machine, end, out, count),
                 _ => Some(-EBADF),

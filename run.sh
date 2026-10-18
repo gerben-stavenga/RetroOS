@@ -17,7 +17,8 @@ Usage: ./run.sh [qemu|bochs|86box|unipcemu|rust-dos|rust-dos-games|hosted] [opti
   --sb-audio native|mixed QEMU guest audio policy
   --cmd, -c, -r COMMAND   Run a startup command
   --headless, -T          No window (QEMU or hosted)
-  --kvm                  Use KVM (QEMU or hosted)
+  --kvm                  Use KVM (QEMU or hosted); use configured live SMB files in QEMU
+  --live-root            Use the live SMB profile explicitly (QEMU only)
   --wav, -w PATH          Hosted audio capture
   --screenshot, -s PATH   Hosted screenshot
   --trace, -t             Hosted instruction trace
@@ -30,12 +31,16 @@ RETROOS_DATA_IMAGE also selects the data path. VM_DIR selects the Bochs/86Box
 configuration directory. Old -i image modes and --gpt have been removed.
 Host-directory sharing uses [smb] mounts in RETROOS.INI (see BOOTING.md).
 The deprecated --host directory shortcut has been removed.
+After tools/qemu_live.py setup, qemu --kvm uses the live SMB profile.
+An explicit --data-image keeps the separate persistent-disk mode.
 HELP
 }
 fail() { echo "run.sh: $*" >&2; exit 1; }
 BACKEND=qemu FIRMWARE= SOUND= ARCH=386 ARCH_EXPLICIT=0 FREEDOS=0 HEADLESS=0 KVM=0
 COMMAND= WAV= SHOT= TRACE=0 SB_AUDIO= HD=
-NETWORK=
+NETWORK= LIVE=auto DATA_EXPLICIT=0
+LIVE_PROFILE="${RETROOS_QEMU_LIVE_PROFILE:-$SCRIPT_DIR/build/qemu-live.json}"
+[ -z "${RETROOS_DATA_IMAGE:-}" ] || DATA_EXPLICIT=1
 DATA_IMAGE="${RETROOS_DATA_IMAGE:-$SCRIPT_DIR/build/data.bin}"
 PASS=()
 case "${1:-}" in
@@ -48,7 +53,7 @@ while [ $# -gt 0 ]; do
         --backend|--data-image|--firmware|--arch|--hd|--sound|--net|--sb-audio|--cmd|-c|-r|--wav|-w|--screenshot|-s)
             [ $# -ge 2 ] || fail "$1 needs a value"
             case "$1" in
-                --backend) BACKEND="$2" ;; --data-image) DATA_IMAGE="$2" ;;
+                --backend) BACKEND="$2" ;; --data-image) DATA_IMAGE="$2"; DATA_EXPLICIT=1 ;;
                 --firmware) FIRMWARE="$2" ;;
                 --hd) HD="$2" ;;
                 --arch) ARCH="$2"; ARCH_EXPLICIT=1 ;;
@@ -62,6 +67,7 @@ while [ $# -gt 0 ]; do
         --freedos) FREEDOS=1; shift ;;
         --headless|-T) HEADLESS=1; shift ;;
         --kvm) KVM=1; shift ;;
+        --live-root) LIVE=1; shift ;;
         --trace|-t) TRACE=1; shift ;;
         -i|--image|--gpt) fail "$1 was removed; use --data-image PATH or --freedos" ;;
         --) shift; PASS=("$@"); break ;;
@@ -99,16 +105,31 @@ if [ "$BACKEND" = unipcemu ]; then
     [ "$HD" = ata ] || fail "UniPCemu requires ATA disks"
 fi
 
+if [ "$LIVE" = auto ]; then
+    LIVE=0
+    if [ "$BACKEND" = qemu ] && [ "$KVM" = 1 ] && [ "$FREEDOS" = 0 ] && [ "$DATA_EXPLICIT" = 0 ] && [ -f "$LIVE_PROFILE" ]; then LIVE=1; fi
+fi
+if [ "$LIVE" = 1 ]; then
+    [ "$BACKEND" = qemu ] && [ "$FREEDOS" = 0 ] || fail "--live-root requires QEMU booting RetroOS"
+    [ "$DATA_EXPLICIT" = 0 ] || fail "choose live files or --data-image, not both"
+    [ "$NETWORK" = virtio ] || fail "live SMB files require --net virtio"
+    [ -f "$LIVE_PROFILE" ] || fail "run python3 tools/qemu_live.py setup first"
+fi
+
 BAZEL="${BAZEL:-$(command -v bazelisk || command -v bazel || true)}"
 [ -n "$BAZEL" ] || BAZEL="$HOME/bin/bazelisk"
 BAZEL=$(command -v "$BAZEL" || true)
 [ -n "$BAZEL" ] || fail "install bazelisk or set BAZEL"
 WORK=$(mktemp -d -t retroos-run.XXXXXX)
-VM_PID= STAGED= RUST_DOS_IMAGE_LINK=
+VM_PID= SMB_PID= STAGED= RUST_DOS_IMAGE_LINK=
 cleanup() {
     if [ -n "$VM_PID" ]; then
         kill "$VM_PID" 2>/dev/null || true
         wait "$VM_PID" 2>/dev/null || true
+    fi
+    if [ -n "$SMB_PID" ]; then
+        kill "$SMB_PID" 2>/dev/null || true
+        wait "$SMB_PID" 2>/dev/null || true
     fi
     [ -z "$STAGED" ] || rm -f "$STAGED"
     [ -z "$RUST_DOS_IMAGE_LINK" ] || rm -f -- "$RUST_DOS_IMAGE_LINK"
@@ -127,6 +148,20 @@ if [ "$BACKEND" = rust-dos-games ]; then
     GAMES_IMAGE="$WORK/games.img"
     cp --reflink=auto "bazel-bin/$GAMES_TARGET.img" "$GAMES_IMAGE"
     chmod u+rw "$GAMES_IMAGE"
+elif [ "$LIVE" = 1 ]; then
+    "$BAZEL" build //:boot_disk
+    BOOT_IMAGE="$WORK/boot.img"
+    cp --reflink=auto bazel-bin/boot_disk.bin "$BOOT_IMAGE"
+    chmod 600 "$BOOT_IMAGE"
+    DATA_IMAGE=
+    python3 "$SCRIPT_DIR/tools/qemu_live.py" serve --work "$WORK" --boot-image "$BOOT_IMAGE" --command "$COMMAND" --profile "$LIVE_PROFILE" &
+    SMB_PID=$!
+    for ((attempt=0; attempt<200; attempt++)); do
+        [ ! -f "$WORK/smb-ready" ] || break
+        kill -0 "$SMB_PID" 2>/dev/null || { wait "$SMB_PID" || true; fail "live SMB setup failed"; }
+        sleep .1
+    done
+    [ -f "$WORK/smb-ready" ] || fail "live SMB setup timed out"
 else
     DATA_IMAGE=$(realpath -m "$DATA_IMAGE")
     mkdir -p "$(dirname "$DATA_IMAGE")"

@@ -310,6 +310,8 @@ pub struct FileEntry {
     pub mtime_dirty: bool,
     pub access: OpenAccess,
     pub share: SharePolicy,
+    /// BSD whole-file lock, owned by this open file description.
+    flock: u8,
     /// Resolved path retained for path-oriented metadata operations.
     pub path: Vec<u8>,
 }
@@ -725,6 +727,7 @@ impl Vfs {
             mtime_dirty: false,
             access: OpenAccess::Read,
             share: SharePolicy::DenyNone,
+            flock: 0,
             path: path.to_vec(),
         };
         if index == self.file_table.len() {
@@ -1381,6 +1384,11 @@ impl Vfs {
         n
     }
 
+    fn read_at_by_handle(&self, handle: i32, offset: u32, buf: &mut [u8]) -> i32 {
+        let Some(entry) = self.file_table.get(handle as usize).filter(|entry| entry.refcount != 0) else { return -9; };
+        self.mount_fs(entry.mount_idx).read(entry.vnode.handle, offset, buf, entry.vnode.size)
+    }
+
     fn write_by_handle(&mut self, handle: i32, data: &[u8]) -> i32 {
         if handle < 0 || (handle as usize) >= self.file_table.len() { return -9; }
         let h = handle as usize;
@@ -1474,6 +1482,22 @@ impl Vfs {
         }
         self.file_table[handle as usize].access = access;
         self.file_table[handle as usize].share = share;
+        0
+    }
+
+    fn flock(&mut self, handle: i32, operation: u32) -> i32 {
+        let Some(entry) = self.file_table.get(handle as usize).filter(|e| e.refcount != 0) else { return -9 };
+        let mode = (operation & !4) as u8;
+        if operation & !15 != 0 || !matches!(mode, 1 | 2 | 8) { return -22; }
+        let ino = entry.ino;
+        let mount = entry.mount_idx;
+        // Conversions release the old lock before competing for the new one.
+        self.file_table[handle as usize].flock = 0;
+        if mode == 8 { return 0; }
+        if self.file_table.iter().enumerate().any(|(i, e)| i != handle as usize
+            && e.refcount != 0 && e.ino == ino && e.mount_idx == mount
+            && e.flock != 0 && (mode == 2 || e.flock == 2)) { return -11; }
+        self.file_table[handle as usize].flock = mode;
         0
     }
 
@@ -1809,6 +1833,12 @@ pub fn path_exists(path: &[u8]) -> bool { VFS.lock().path_exists(path) }
 pub fn path_mode(path: &[u8]) -> Option<(u32, bool)> { VFS.lock().path_mode(path) }
 #[inline(never)]
 pub fn set_path_mode(path: &[u8], mode: u32) -> i32 { VFS.lock().set_path_mode(path, mode) }
+pub fn set_handle_mode(handle: i32, mode: u32) -> i32 {
+    let mut vfs = VFS.lock();
+    let Some(path) = vfs.handle_path(handle).map(|p| p.to_vec()) else { return -9 };
+    vfs.set_path_mode(&path, mode)
+}
+
 
 /// DOS attributes are session metadata until backends offer a setter. They
 /// never rewrite Unix owner/mode permissions (the independent write grant).
@@ -2069,6 +2099,11 @@ pub fn read_by_handle(handle: i32, buf: &mut [u8]) -> i32 {
     VFS.lock().read_by_handle(handle, buf)
 }
 
+/// Positioned read without changing the descriptor's shared file offset.
+pub fn read_at_by_handle(handle: i32, offset: u32, buf: &mut [u8]) -> i32 {
+    VFS.lock().read_at_by_handle(handle, offset, buf)
+}
+
 /// Write to a VFS file table entry by handle index.
 pub fn write_by_handle<A: crate::Arch>(machine: &mut A, handle: i32, data: &[u8]) -> i32 {
     let _ = machine;
@@ -2088,6 +2123,14 @@ pub fn try_flush_by_handle(handle: i32) -> Option<i32> {
 /// Persist data and metadata for a kernel-owned VFS handle.
 pub fn flush_by_handle(handle: i32) -> i32 {
     VFS.lock().flush_handle(handle)
+}
+
+/// Persist an open file and the backing filesystem's device/server barrier.
+pub fn sync_by_handle(handle: i32) -> i32 {
+    let mut vfs = VFS.lock();
+    let result = vfs.flush_handle(handle);
+    if result < 0 { return result; }
+    match vfs.handle_object(handle) { Some(object) => object.fs.sync(), None => -9 }
 }
 
 /// Seek on a VFS handle directly.
@@ -2298,6 +2341,57 @@ mod tests {
         assert_eq!(vfs.mount_prefix_by_handle(handle), Some(b"disk1/".as_slice()));
         vfs.close_handle(handle);
         assert_eq!(vfs.mount_prefix_by_handle(handle), None);
+    }
+
+    #[test]
+    fn whole_file_locks_share_dup_ownership_and_release_on_last_close() {
+        let fs = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
+        let node = fs.create(b"LOCK").unwrap();
+        fs.clunk(node.handle);
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", fs);
+        let a = vfs.install_handle(b"LOCK", 42, 0, fs.open(b"LOCK").unwrap(), true);
+        let b = vfs.install_handle(b"LOCK", 42, 0, fs.open(b"LOCK").unwrap(), true);
+        assert_eq!(vfs.flock(a, 1), 0);
+        assert_eq!(vfs.flock(b, 1), 0);
+        assert_eq!(vfs.flock(a, 2 | 4), -11); // Conversion releases a's shared lock.
+        assert_eq!(vfs.flock(b, 2), 0);
+        assert_eq!(vfs.flock(a, 1 | 4), -11);
+        vfs.add_ref(b);
+        assert_eq!(vfs.close_handle(b), 0);
+        assert_eq!(vfs.flock(a, 2 | 4), -11);
+        assert_eq!(vfs.close_handle(b), 0);
+        assert_eq!(vfs.flock(a, 2 | 4), 0);
+        assert_eq!(vfs.flock(a, 8), 0);
+        assert_eq!(vfs.flock(a, 3), -22);
+        assert_eq!(vfs.flock(a, 0x102), -22);
+        assert_eq!(vfs.flock(b, 2), -9);
+        vfs.close_handle(a);
+    }
+
+    #[test]
+    fn positioned_reads_preserve_the_shared_file_offset() {
+        struct Bytes;
+        impl Filesystem for Bytes {
+            fn open(&self, _: &[u8]) -> Option<Vnode> { Some(Vnode { handle: 1, size: 26, mode: 0o444 }) }
+            fn read(&self, _: u64, offset: u32, out: &mut [u8], _: u32) -> i32 {
+                let data = b"abcdefghijklmnopqrstuvwxyz";
+                let start = (offset as usize).min(data.len());
+                let n = out.len().min(data.len() - start);
+                out[..n].copy_from_slice(&data[start..start+n]); n as i32
+            }
+            fn readdir(&self, _: &[u8], _: u64, _: &mut Vec<DirEntry>, _: usize) -> Option<u64> { None }
+            fn dir_exists(&self, path: &[u8]) -> bool { path.is_empty() }
+        }
+        static BYTES: Bytes = Bytes;
+        let mut vfs = super::Vfs::new(); vfs.mount(b"", &BYTES);
+        let h = vfs.install_handle(b"file", 1, 0, BYTES.open(b"file").unwrap(), false); assert!(h >= 0);
+        let mut buf = [0; 3];
+        assert_eq!(vfs.read_by_handle(h, &mut buf), 3); assert_eq!(&buf, b"abc");
+        assert_eq!(vfs.read_at_by_handle(h, 20, &mut buf), 3); assert_eq!(&buf, b"uvw");
+        assert_eq!(vfs.read_by_handle(h, &mut buf), 3); assert_eq!(&buf, b"def");
+        assert_eq!(vfs.read_at_by_handle(-1, 0, &mut buf), -9);
+        vfs.close_handle(h);
     }
 
     struct OwnedFs {
@@ -2788,3 +2882,6 @@ mod tests {
         assert_eq!(PATH_OPEN_CALLS.load(Ordering::Relaxed), 0);
     }
 }
+
+/// Advisory BSD locks are local to RetroOS; dup/fork share their ownership.
+pub fn flock(handle: i32, operation: u32) -> i32 { VFS.lock().flock(handle, operation) }

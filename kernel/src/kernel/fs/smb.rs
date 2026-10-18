@@ -518,12 +518,12 @@ pub fn mount_configured() {
     let Ok(config) = crate::kernel::mount_config::Config::parse_user(&bytes) else {
         return;
     };
-    for mount in config.smb {
-        let prefix = Box::leak(
-            alloc::format!("{}/", mount.path.trim_matches('/'))
-                .into_bytes()
-                .into_boxed_slice(),
-        );
+    for (index, mount) in config.smb.into_iter().enumerate() {
+        let prefix: &'static [u8] = Box::leak(if mount.path == "/" {
+            Vec::new().into_boxed_slice()
+        } else {
+            alloc::format!("{}/", mount.path.trim_matches('/')).into_bytes().into_boxed_slice()
+        });
         if let Some(drive) = mount.drive {
             if crate::kernel::dos::extra_drive_prefix(drive).is_some()
                 || drive == b'H' && vfs::is_mounted(b"host/")
@@ -571,14 +571,42 @@ pub fn mount_configured() {
                     directories: BTreeMap::new(),
                     next: 1,
                 }))));
-                vfs::mount(prefix, fs);
+                let subdir = mount.subdir.trim_matches('/').as_bytes();
+                if !subdir.is_empty() && !fs.dir_exists(subdir) {
+                    lib::compact_panic!("SMB: configured subdirectory unavailable");
+                }
+                let private: &'static [u8] = Box::leak(alloc::format!("smbfs/{}/", index).into_bytes().into_boxed_slice());
+                if mount.access == crate::kernel::mount_config::Access::Ro {
+                    vfs::mount_readonly(private, fs);
+                } else { vfs::mount(private, fs); }
+                vfs::hide_mount(private);
+                let mut source = private.to_vec();
+                if !subdir.is_empty() { source.extend_from_slice(subdir); source.push(b'/'); }
+                if prefix.is_empty() {
+                    // The network root owns /bin, replacing the bootstrap
+                    // bundle's shell and command aliases.
+                    vfs::bind(b"bin/", Box::leak([source.as_slice(), b"bin/"].concat().into_boxed_slice()));
+                }
+                if prefix == root {
+                    // Mount credentials live only in the boot copy. Once C:
+                    // is online its normal user settings must stay persistent.
+                    let ini = [source.as_slice(), b"RETROOS/RETROOS.INI"].concat();
+                    vfs::bind(Box::leak([prefix, b"RETROOS/RETROOS.INI"].concat().into_boxed_slice()), Box::leak(ini.into_boxed_slice()));
+                    if fs.dir_exists(&[subdir, if subdir.is_empty() { b"RETROOS/FIRMWARE" } else { b"/RETROOS/FIRMWARE" }].concat()) {
+                        vfs::bind(Box::leak([prefix, b"RETROOS/FIRMWARE/"].concat().into_boxed_slice()), Box::leak([source.as_slice(), b"RETROOS/FIRMWARE/"].concat().into_boxed_slice()));
+                    }
+                }
+                vfs::bind(prefix, Box::leak(source.into_boxed_slice()));
                 crate::compact_println!(
                     "SMB: mounted {} (authenticated, signed SMB2)",
                     mount.path.as_str()
                 );
             }
             Err(e) => {
-                crate::compact_println!("SMB: mount {} failed ({})", mount.path.as_str(), errno(e))
+                crate::compact_println!("SMB: mount {} failed ({})", mount.path.as_str(), errno(e));
+                if prefix.is_empty() || prefix == root {
+                    lib::compact_panic!("SMB: required root or C: filesystem unavailable");
+                }
             }
         }
     }

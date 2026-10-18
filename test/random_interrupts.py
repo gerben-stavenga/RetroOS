@@ -27,12 +27,13 @@ def session(work, uefi=False):
     with data.open('wb') as stream:
         stream.truncate(32 * 1024 * 1024)
     run('mkfs.fat', '-F', '16', data)
-    # Keep the test task alive: TEST automatically powers off after exit.
-    source = work / 'rnd.c'
-    source.write_text('void _start(void) { for (;;) { unsigned nr = 158; '
-                      '__asm__ volatile("int $0x80" : "+a"(nr) : : "memory"); } }\n')
-    run('gcc', '-m32', '-nostdlib', '-static', '-no-pie', '-fno-pic',
-        '-fno-stack-protector', '-O2', '-e', '_start', source, '-o', work / 'RND.ELF')
+    # Exercise both Linux ABIs: unseeded NONBLOCK, a blocking request, then
+    # successful reads once input timing seeds the shared generator.
+    bits = '64' if uefi else '32'
+    run('gcc', '-m' + bits, '-nostdlib', '-static', '-no-pie', '-fno-pic',
+        '-fno-stack-protector', '-fno-builtin', '-O2', '-e', '_start',
+        *([] if uefi else ['-march=i486']),
+        ROOT / 'test/linux_getrandom_probe.c', '-o', work / 'RND.ELF')
     run('mcopy', '-i', data, work / 'RND.ELF', '::RND.ELF')
     boot = prepare_boot(work, data, '[environment]\nTEST=RND.ELF\n')
     log, monitor = work / 'klog', work / 'monitor'
@@ -56,7 +57,7 @@ def session(work, uefi=False):
                 text = log.read_text(errors='replace') if log.exists() else ''
                 assert process.poll() is None, text[-5000:]
                 assert 'PANIC' not in text and 'FATAL' not in text, text[-5000:]
-                if 'event_loop entered' in text:
+                if 'GETRANDOM WAITING' in text:
                     break
                 assert time.monotonic() < deadline, text[-5000:]
                 time.sleep(.1)
@@ -68,6 +69,7 @@ def session(work, uefi=False):
             # Timer traffic by itself must never seed the generator.
             time.sleep(.5)
             assert SEEDED not in log.read_text(errors='replace')
+            assert 'GETRANDOM PASS' not in log.read_text(errors='replace')
             with socket.socket(socket.AF_UNIX) as control:
                 control.connect(str(monitor))
                 control.settimeout(.001)
@@ -82,12 +84,21 @@ def session(work, uefi=False):
                         break
                 else:
                     raise AssertionError(log.read_text(errors='replace')[-5000:])
-            text = log.read_text(errors='replace')
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                text = log.read_text(errors='replace')
+                if 'GETRANDOM PASS' in text and '[mem] exit tid=1 code=0' in text:
+                    break
+                assert process.poll() is None, text[-5000:]
+                time.sleep(.1)
+            else:
+                raise AssertionError(text[-5000:])
             assert 'PANIC' not in text and 'FATAL' not in text, text[-5000:]
         finally:
-            process.terminate()
+            if process.poll() is None:
+                process.terminate()
             process.wait(timeout=5)
-    print(f'PASS: {work.name}: input interrupt timing seeded without RDRAND', flush=True)
+    print(f'PASS: {work.name}: Linux getrandom blocks until input timing seeds, then succeeds without RDRAND', flush=True)
 
 
 def main():

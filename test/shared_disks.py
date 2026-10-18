@@ -104,8 +104,29 @@ if os.environ.get("HOLD_VM"):
                 assert config["Hard disks"]["hdd_01_parameters"] == "63, 16, 1, 0, ide"
                 assert "hdd_02_fn" not in config["Hard disks"]
         assert run(command + ["-i", "image"]).returncode != 0
+        # A configured KVM live view uses only the disposable boot disk;
+        # explicit --data-image still selects the old persistent-disk path.
+        (root / "build/qemu-live.json").write_text('{}')
+        (root / "tools/qemu_live.py").write_text("""import argparse, pathlib, time
+p=argparse.ArgumentParser(); p.add_argument('action'); p.add_argument('--work'); p.add_argument('--boot-image'); p.add_argument('--command'); p.add_argument('--profile'); a=p.parse_args()
+pathlib.Path(a.work, 'smb-ready').write_text('ready')
+pathlib.Path(__file__).resolve().parents[1].joinpath('live-work').write_text(a.work)
+while True: time.sleep(1)
+""")
+        good(run(command + ['--kvm']))
+        args = json.loads((root / 'arguments').read_text())
+        assert args[args.index('-accel') + 1] == 'kvm'
+        assert not any('id=data' in arg or 'drive=data' in arg for arg in args)
+        assert not Path((root / 'live-work').read_text()).exists(), 'live share state was not cleaned up'
+        good(run(command + ['--kvm', '--data-image', str(data)]))
+        args = json.loads((root / 'arguments').read_text())
+        assert f'file={data},if=none,id=data,format=raw' in args
+        good(run(command))
+        assert 'id=data' in ' '.join(json.loads((root / 'arguments').read_text()))
+        rejected = run(command + ['--kvm', '--net', 'none'])
+        assert rejected.returncode != 0 and 'live SMB files require' in rejected.stderr
         assert data.read_bytes().startswith(b"guest changes")
-    print("PASS: seed once, rebuild boot, preserve writes, lock, failed seed, backend attachments")
+    print("PASS: seed once, rebuild boot, preserve writes, lock, failed seed, backend attachments, KVM live files and explicit disk override")
 
 
 if __name__ == "__main__":
