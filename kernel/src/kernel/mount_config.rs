@@ -715,6 +715,15 @@ pub fn apply(
         }
     }
     if let Some(source) = settings_source {
+        // Device firmware belongs to persistent C:, independently of the
+        // matched runtime directory supplied by the boot bundle above.
+        let firmware = [source.as_slice(), b"FIRMWARE/"].concat();
+        if vfs::dir_exists(&firmware) {
+            vfs::bind(
+                Box::leak([c, b"RETROOS/FIRMWARE/"].concat().into_boxed_slice()),
+                Box::leak(firmware.into_boxed_slice()),
+            );
+        }
         for name in [b"RETROOS.INI".as_slice(), b"BOOT.INI".as_slice()] {
             let target = [b"RETROOS/".as_slice(), name].concat();
             let backing = Box::leak([source.as_slice(), name].concat().into_boxed_slice());

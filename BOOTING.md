@@ -708,3 +708,551 @@ the custom network instead of the default one:
 The share must allow the configured authenticated account; RetroOS does not
 accept a guest-only export. An explicitly configured Samba share on the host
 at `10.0.2.2` is suitable for normal authenticated mounts.
+
+## Native Qualcomm Wi-Fi bring-up
+
+The initial native driver targets WCN7850 hw2.0, PCI `17cb:1107` (including
+the Foxconn `105b:e109` subsystem). It detects the controller, recovers its
+PCIe/MHI state, transfers the signed AMSS firmware through BHI/BHIE, starts
+MHI IPCR channels, and discovers the WLANFW control service through QRTR.
+Progress and failures are logged with a `WiFi:` prefix; `/proc/wifi` exposes
+the current status. Device timeouts and malformed DMA completions stop the
+transport and disable bus mastering; DMA allocations remain reserved until
+reboot. The initial path uses one shared MSI vector and polls control rings;
+runtime power saving is disabled. Context arrays and each DMA ring occupy
+separate pages, matching x86 Linux coherent allocation placement even when a
+ring is smaller than a page. The WCN7850 profile adds a 1 ms firmware settling
+delay before START, following the
+[OpenBSD qwx startup workaround](https://github.com/openbsd/src/blob/master/sys/dev/pci/if_qwx_pci.c).
+Physical laptop log `KLOG0025.TXT` confirms AMSS/M0, successful IPCR channel
+startup, and WLANFW service discovery at QRTR node 7, port 1. The preceding
+build without the settling delay timed out starting channel 20.
+
+The Wi-Fi service uses a shared radio interface. MHI boot, DMA staging, and
+packet channels live in `kernel/src/kernel/drivers/mhi`; QRTR framing and service
+discovery live in `kernel/src/kernel/qrtr.rs`; reusable QMI framing and bounded
+transactions live in `kernel/src/kernel/qmi.rs`. Channels and service identities
+are supplied by drivers. The WCN785x hardware profile owns its PCI ID, firmware
+path, DMA limit, and chip-specific reset register; only WCN7850 hw2.0 is enabled.
+
+After service discovery, the driver runs WLANFW QMI initialization: indication
+registration, host capabilities, requested host memory (up to 48 MiB total),
+firmware-memory-ready, target capabilities, board/regulatory data download, M3
+DMA staging, and firmware-init-ready. Startup RPCs use a local QRTR port and
+accept replies only from the discovered endpoint with the matching transaction
+and message ID. Each wait has a 10-second deadline and a spin budget; failures
+report the stage and QMI result/error in the saved kernel log. Unsupported
+firmware memory types receive a null address, following ath12k. Allocated DMA
+remains reserved until reboot, including on failure.
+
+Board data is selected from `board-2.bin` using the exact PCI/subsystem IDs and
+firmware chip/board IDs. Regulatory data uses the matching entry or the
+bundle's `bus=pci` entry, with an external `regdb.bin` fallback if installed.
+No other board's calibration data is substituted. SMBIOS board variants are not yet
+parsed. The existing firmware installation already supplies `board-2.bin` and
+`m3.bin`; no firmware reinstall is needed for the local WCN7850 bundle.
+Physical logs `KLOG0027.TXT` and `KLOG0028.TXT` confirm the complete QMI startup:
+notification registration, host capabilities, memory response/memory-ready,
+target capabilities, regulatory and exact board data downloads, M3 information,
+and firmware-init-ready (indication `0x0038`). Firmware reports chip 2, family 4,
+board 255, SoC `0x40170200`, and version `0x1108811c`.
+`KLOG0026.TXT` confirms successful indication registration and host capability
+RPCs, followed by requests for 7,012,352 bytes of host DDR and 8,454,144 bytes
+of calibration memory. Firmware entered SYS_ERR/RDDM after the memory response.
+The current build physically aligns these buffers (and M3) to the smallest
+power-of-two page order large enough for each buffer, preserving the device
+address alignment guaranteed by Linux coherent DMA allocation. Their addresses
+are logged before sending the memory response. Both successful physical boots
+used host DDR at `0x05800000` and calibration memory at `0x06000000`, respecting
+8 MiB and 16 MiB alignment respectively. The earlier page-separated MHI layout
+is retained.
+
+**This is firmware/control bring-up, not a working wireless connection.**
+Radio configuration, channel/regulatory setup, scanning, association,
+WPA authentication, and Ethernet data delivery are not yet implemented.
+Firmware boot, QRTR discovery, and QMI firmware initialization have been
+confirmed on the physical laptop. The next build adds polled CE rings, WLANFW
+pipe configuration and mission mode, HTC ready/service negotiation, and WMI
+service/resource initialization through unified-ready. CE, HTC, and WMI use
+shared modules; WCN7850 pipe mappings and resource settings live in its hardware
+profile. This stage still needs physical validation. The success marker is
+`WiFi: WMI ready MAC=...`; failures log the startup stage and CE ring pointers.
+`KLOG0029.TXT` confirms WLANFW pipe configuration/mission mode, CE transport,
+HTC target-ready (credit size 2176), and HTT/WMI endpoint connections (1/2).
+It stops on WMI service-ready parsing after service-available. The follow-up
+parser accepts repeated array type tags, using the first UINT32 array as the
+service bitmap, and logs startup TLV tags/lengths and RF chain count. Fixed
+event fields still reject duplicates; WMI unified-ready remains unverified.
+`KLOG0030.TXT` verifies that correction: service-ready reports two RF chains,
+followed by extended-ready and extended-ready-2. After WMI INIT is consumed,
+firmware sends memory-dump notification `0x016005` and enters RDDM (EE 3).
+The next diagnostic build arms shared MHI BHIE receive vectors before HTC
+startup, with the WCN7850 profile's 0x780000-byte dump capacity. On an
+initialization crash, it waits for completed DMA and saves the raw bytes to
+the first unused `C:\WIFI0001.DMP`, `C:\WIFI0002.DMP`, etc., flushing the file
+before continuing boot. It logs capture/write failures and never treats an
+incomplete transfer as a valid dump. This capture path needs physical validation;
+the underlying firmware crash is still unresolved.
+`KLOG0031.TXT` and `WIFI0001.DMP` confirm successful crash DMA and persistent
+dump saving. The Q6-SFR section reports
+`cmnos_thread_patch.c:1174:0x8Asserted in:0x1f26a9c:0x1f269ac, line#386`.
+The referenced text is absent from the captured SRAM sections; its location
+has not yet been resolved. Follow-up captures append QMI type-1 host DDR
+(firmware paging memory), preserving the raw RDDM bytes and their offsets.
+A versioned `RTWFPAGE` descriptor table and `RTWFEND1` footer record each
+region's type, requested size, and physical address. Calibration buffers and
+allocation padding are excluded. Inspect either dump version with
+`python3 tools/inspect_wifi_dump.py /home/retroos/WIFI0001.DMP`; use
+`--find TEXT` to search printable strings in each section. The firmware crash
+is still unresolved; these additional bytes need another physical capture.
+`KLOG0032.TXT` and `WIFI0002.DMP` verify the host DDR extension (7,012,352
+bytes at physical `0x05800000`). The same line-386 assertion recurs; its
+referenced text is still unresolved. Firmware's copy of the WMI INIT/resource
+TLVs is present and agrees with the transmitted message.
+The follow-up build adds missing packet-engine bootstrap storage: a contiguous
+bank of 32,768 aligned 128-byte link descriptors with 32,767 supplied to the
+WBM idle ring before HTC startup, and eight empty 2,048-entry REO destinations
+after WMI service-ready and before INIT. CE and these rings now share SRNG
+register setup. Hardware addresses/counts live in the WCN7850 profile. This is
+partial packet-engine infrastructure; common TX/release rings, cookie
+conversion, HTT ring configuration, and Ethernet delivery remain unimplemented.
+Whether this bootstrap changes the firmware assertion needs a physical boot.
+`KLOG0033.TXT` and `WIFI0003.DMP` show both bootstrap stages completed, with
+the same firmware assertion afterward. Descriptor-pool setup did not resolve it.
+The captured service-available bitmap advertises service 281 (extended
+regulatory events), while our INIT host-service flag was zero. The follow-up
+build implements receiving and retaining these reports, including rule groups,
+DFS/bandwidth metadata, restriction flags and PSD values, and acknowledges
+support with host-service bit 4 when firmware advertises service 281. It logs
+the negotiated flag and country/PHY/rule count. This matches ath12k's capability
+negotiation; whether it changes this crash is still unverified. Scanning and
+transmission remain unimplemented; retaining regulatory data does not enable
+the radio or implement channel selection policy.
+`KLOG0034.TXT` and `WIFI0004.DMP` show the same line-386 assertion with
+extended regulatory support negotiated. That change did not resolve the crash.
+The next diagnostic build arms crash capture before a read-only WLANFW
+ATHDIAG request (`0x0030`). Only firmware `0x1108811c` receives the temporary
+profile read: 512 bytes at `0x01f26900`, memory type 0, covering the two reported
+assertion pointers. Success logs raw words and printable strings; rejection or
+a one-second timeout logs an unavailable diagnostic and continues startup.
+This does not change INIT settings. Support for the request and interpretation
+of that device memory address still need physical validation.
+`KLOG0035.TXT` records an immediate QMI rejection (result 1, error 48),
+and `WIFI0005.DMP` contains the same assertion. The temporary profile read
+is now disabled; it did not reveal the assertion source.
+The next build adds the common rings missing from the Linux startup sequence:
+three TCL transmit queues and their WBM completions (0/2/4), software release,
+RX release/error, REO exception/reinjection, and REO command/status rings.
+All queues start empty; REO command slots receive sequence numbers without
+publishing commands. Hardware-profile ring maps use the shared SRNG engine,
+with separate DMA descriptor spans and pointer writebacks. REO aging,
+fragment/BAR exception routing, and hash routing to SW1..SW4 are configured.
+Ring register state is logged before INIT while the hardware is available.
+This closes a startup gap, but has not been validated on the physical card
+and is not an identified fix for the assertion. Cookie conversion, HTT ring
+configuration, scanning, association and packet processing remain outstanding.
+`KLOG0036.TXT` verifies the 12 common rings and eight REO destinations before
+INIT: base addresses and sizes read back correctly, and all common queues
+remain empty. `WIFI0006.DMP` still reports the same line-386 assertion, so
+adding the common rings did not resolve it. Firmware and board-bundle files
+installed on C: were compared byte for byte with the decompressed Linux
+firmware files and match. The Linux host currently uses kernel
+`7.0.0-38-generic` with `ath12k_wifi7_pci`. The saved Linux kernel journal
+confirms the same chip, board and firmware version (`0x1108811c`) boot there;
+it does not contain INIT packet bytes.
+Offline inspection of the SRAM copy of INIT finds tags `74:28, 75:288, 0:0`
+inside the HTC payload, whereas the host builder produces
+`74:28, 75:288, 18:0`. An empty-array tag is present 44 bytes later in SRAM.
+Firmware may have translated or consumed this copy, so this is not evidence
+that the transmitted packet was malformed. The next diagnostic build appends
+a snapshot of the host CE DMA allocation after RDDM completes, using private
+trailer kind `0x100`. This preserves source buffers and descriptors for
+comparison with the firmware-side copy without changing the startup commands.
+`python3 tools/inspect_wifi_dump.py WIFIxxxx.DMP --wmi-init` locates bounded
+INIT candidates in both regions and reports their TLV sequences. CE snapshots
+are labeled `CE-DMA`; firmware SRAM candidates must not be treated as pristine
+wire captures. This remains diagnostic, not a confirmed assertion fix.
+`WIFI0007.DMP` and `WIFI0008.DMP` contain the expected complete INIT sequence
+in the host CE source buffer. The differing firmware-side copy does not
+establish a host serialization error. The same assertion remains.
+The next implementation adds the remaining pre-INIT cookie-conversion stage:
+QMI capability TLV `0x1c` supplies four fixed address/size pairs, with CMEM at
+index zero. The driver validates the region before any CMEM access, allocates
+256 TX and 24 RX secondary pages and driver-owned descriptor slots, and
+populates and verifies the primary table while conversion is disabled.
+Unused primary entries are zero. Conversion is enabled after service-ready,
+before REO destinations and INIT, using WCN7850's WBM ring mask (0/2/3/4).
+CMEM MMIO uses the 25-bit PCI window alias while the hardware conversion
+registers retain the complete base address, including its target-bus prefix.
+Converted values are bounded physical slot tokens, not unchecked CPU pointers;
+future packet handling must validate both cookie and token before slot access.
+Table initialization failure prevents enable and follows the existing crash
+capture path. CMEM address, table verification and enable are logged.
+This is required packet-engine infrastructure but has not been validated on
+the laptop or established as the cause of the assertion. HTT configuration,
+scanning, association and packet processing remain outstanding.
+`KLOG0039.TXT` reports CMEM at `0x00113000` (20,480 bytes), verifies all
+primary table entries and enables cookie conversion. `WIFI0009.DMP` still
+contains the same line-386 assertion and a valid host INIT packet, so this
+addition did not resolve the crash.
+The installed board bundle contains two different calibration entries for
+subsystem `105b:e109`: the default (88,872 bytes) and `variant=QC_5mm`
+(88,824 bytes). Linux checks SMBIOS type `0xf8`, formatted length 9, for an
+enabled `BDF_` variant before board lookup; RetroOS currently uses the default.
+The read-only Linux helper `tools/inspect_wifi_platform.py` prints only this
+Wi-Fi metadata, skipping unrelated SMBIOS records. Its result is needed to
+establish whether this laptop selects a variant; neither profile is substituted
+based on subsystem ID alone. The table is root-readable on Linux:
+
+```sh
+sudo python3 tools/inspect_wifi_platform.py > build/linux-wifi-platform.txt
+```
+
+The saved platform report contains one type-248 record with formatted length
+17. Linux v7.0's ath12k parser requires exactly 9 and ignores that record, as
+does the helper. Its result is no selected variant, so the documented Linux
+selection path and RetroOS both use the default entry. There is no evidence
+for switching to `QC_5mm` on this laptop.
+Offline analysis of `WIFI0009.DMP` finds assertion arguments near target
+address `0x0157edd8` and the original INIT size (`0x14c`) nearby. These are
+raw stack candidates, not an unwound call chain or an identified bad TLV.
+The assertion source pointers are not covered by the installed AMSS ELF's
+loadable virtual ranges. The ELF declares ARM despite containing Hexagon
+instructions; disassembly was attempted only on a temporary copy with the
+machine field set to Hexagon. Installed firmware was not changed. The BIOS
+check and this offline examination do not establish a fix, and no additional
+hardware test build has been prepared from them.
+
+To compare against successful Linux initialization, prepare a separate Linux
+initramfs with startup tracing (from the repository directory):
+
+```sh
+sudo python3 tools/record_linux_wifi.py prepare
+```
+
+This validates disabled kprobes, reads `sk_buff` offsets from the running
+kernel's BTF, and builds `/boot/initrd.img-<running-kernel>-retroos-wifi-v2`.
+It does not reload the current NIC or change GRUB defaults. It installs
+`/etc/grub.d/43_retroos_wifi_capture` and runs `update-grub`, adding
+**Linux Wi-Fi startup capture (<running-kernel>)**. Select that entry at
+the next boot. Its disk search, kernel options and any microcode initrd
+come from the existing normal Linux entry. If the diagnostic image was
+already prepared, rerunning `prepare` adds or refreshes just the GRUB entry.
+
+Tracing starts before initramfs udev, using deferred module kprobes in its
+own tracing instance. It records WMI command IDs and lengths, the 328-byte
+WMI INIT payload when its length matches, PCI writes, QMI message IDs and
+buffer capacities, and the firmware-ready wait result. QMI capacities are
+not encoded message lengths. Version 2 additionally records encoded WLANFW
+QMI startup requests (up to 1,024 bytes, excluding board-data downloads) at
+`kernel_sendmsg`, and HTC endpoint-zero negotiation in both directions (up
+to 64 bytes). Socket family and `kvec` offsets also come from kernel BTF;
+connected QRTR sockets have no `msg_name`, so filtering uses the socket's
+family rather than the destination argument. It stops on a successful firmware-ready wait;
+the ring buffer is bounded to 4 MiB per CPU if startup fails. After Linux
+starts, save the trace and kernel log:
+
+```sh
+sudo python3 tools/record_linux_wifi.py collect
+```
+
+Results go into the next unused `build/linux-wifi-trace/` or
+`build/linux-wifi-trace-N/`, preserving earlier captures. Fixed-fetch padding
+is discarded before writing `trace.txt`. The `packets/` subdirectory contains
+binary packets and `decoded.txt` with QMI TLVs, CE/service maps, HTC credits,
+connection flags and assigned endpoints. Incomplete packet sets or malformed
+lengths are reported explicitly. Verify that `trace.txt` contains
+`wmi_init` and a successful `ready` result, and inspect `buffer-stats.txt`
+for overruns before treating the trace as complete. The setup checks shell
+syntax and generated initramfs ordering; actual probe registration and a
+successful boot capture require the privileged commands above. A subsequent
+normal boot removes the probes. To remove the diagnostic boot option, delete
+`/etc/grub.d/43_retroos_wifi_capture` and run `sudo update-grub`; the separate
+diagnostic initramfs can then be deleted. The original Linux initramfs is
+retained throughout.
+
+Re-run `prepare` to install version 2 if the original diagnostic image was
+already installed, then boot the same capture entry and run `collect`.
+The original version-1 image and saved traces remain available. The decoder
+can also run without root on an already saved trace, writing a fresh directory:
+
+```sh
+python3 tools/inspect_linux_wifi_trace.py build/linux-wifi-trace-2/trace.txt --output build/linux-wifi-decoded
+```
+
+The first successful Linux capture is in `build/linux-wifi-trace/` (Linux
+7.0.0-38, same WCN7850 and firmware). It records one 328-byte INIT and
+`ready result=0`, stops automatically, and reports zero overruns and dropped
+events on every CPU. Comparing its payload with the original host CE-DMA
+packet at physical `0x06b2f000` in `WIFI0009.DMP` finds exactly two differing
+DWORDs: payload words 52 and 76, resource words 44 (`flag1`) and 68 (`flags2`).
+Linux sends `0x40020` and `0x210`; RetroOS sent zero for both. Linux v7.0
+`ath12k/wmi.h` and `ath12k_wmi_copy_resource_config()` identify these as
+64-bit BSS channel information, ACK RSSI, RX peer metadata version 1, and
+next-DTIM-count calculation. The WCN7850 profile now supplies those flags,
+and a regression test checks all 73 resource words against the successful
+capture (with the separately negotiated regulatory service flag excluded).
+This aligns the INIT payload with observed Linux behavior; a physical
+RetroOS boot is still needed to determine whether it resolves the assertion.
+
+Physical build `c77b2778497a` was tested in `KLOG0040.TXT` / `WIFI0010.DMP`.
+It still reaches the same `cmnos_thread_patch.c:1174`, line-386 assertion.
+The original CE-DMA INIT packet at `0x06b2f000` now matches the captured Linux
+328-byte payload byte for byte, including both corrected flags. Those flags
+were missing but were not sufficient to fix startup. The comparison is saved
+in `build/linux-wifi-trace/comparison-boot40.txt`. All 21 packet-engine ring
+entry-size/ID configurations agree with Linux; the only capacity difference
+is REO command ring 20 (Linux 256 entries, RetroOS 128). The extra `0x80` in
+RetroOS's healthy ring-misc readback is hardware idle status. Neither this
+capacity difference nor the already matching INIT identifies the assertion
+cause. The current Linux capture has QMI IDs/capacities but does not contain
+the encoded QMI or HTC negotiation payloads needed for those comparisons.
+
+The version-2 Linux capture in `build/linux-wifi-trace-2/` contains all 15
+selected QMI/HTC packets, a successful firmware-ready result, and zero dropped
+events or overruns. All three outgoing HTC negotiation payloads are identical
+to the original host CE buffers in `WIFI0010.DMP`. QMI registration, target CE
+pipe records and service routing also agree. Linux additionally supplies 36
+ordered shadow-v3 target doorbells in WLAN_CONFIG TLV `0x17` (not `0x16`).
+Its resulting WLAN_CONFIG request is 517 bytes; RetroOS previously omitted
+that TLV. The hardware profile now includes that map and the shared SRNG
+module validates and translates its BAR aliases starting at `0x8fc`. Firmware
+receives the map before mission mode; after successful mode setup and initial
+CE posting, the driver redirects subsequent mapped doorbell writes through
+the aliases. Target reads remain direct. The complete resulting configuration
+TLVs, derived from the profile, match the Linux capture.
+
+Other observed QMI differences remain explicit: Linux queries PHY capabilities,
+enables firmware logging, and advertises MLO with a two-link topology (chip 0,
+group 255, peer limit 32). RetroOS still advertises no MLO and has not implemented
+that topology. The shadow-map change is a focused physical test, not proof that
+the firmware assertion is resolved or that the remaining differences are safe
+to ignore.
+
+Physical build `816e05938c3a` was tested in `KLOG0041.TXT` / `WIFI0011.DMP`.
+WLAN_CONFIG accepted its 510-byte body, shadow-v3 aliases were enabled, and
+CE/HTC plus all WMI service-ready extensions completed. INIT still matches
+Linux byte for byte, followed by the same line-386 firmware assertion. The
+shadow path works far enough for control traffic but did not resolve startup.
+The next diagnostic build adds Linux's previously omitted PHY_CAP query
+(`0x57`, before registration) and WLAN_INI firmware-logging request (`0x2f`,
+after firmware initialization and before WLAN_CONFIG). PHY count, board ID
+and single-chip MLO support are logged with optional-field length validation;
+no MLO capability is advertised as a result. Explicit negative QMI replies
+to these optional requests are logged and startup continues; transport and
+malformed-packet errors remain errors. Logging acceptance is recorded without
+claiming that a firmware log stream or assertion source has been decoded.
+
+Physical build `dae0591779b5` was tested in `KLOG0042.TXT` / `WIFI0012.DMP`.
+PHY_CAP succeeds and reports two PHYs plus single-chip MLO support; board ID
+is absent in that reply. WLAN_INI accepts firmware logging, but no new decoded
+assertion condition appears: the same line-386 assertion follows INIT. The
+next change supplies the single-chip firmware topology, gated on both the
+verified WCN7850 profile and that positive PHY_CAP response. It encodes logical
+chip 0, group 255, peer limit 32, link IDs 0 and 1, and the fixed-size unused
+partner-chip records. The resulting complete HOST_CAP TLV body matches the
+successful Linux capture, checked by a golden-packet test. Missing/negative
+PHY support retains the non-MLO advertisement; out-of-range reported link
+counts or invalid profile IDs are rejected. Single-chip type-8 firmware memory,
+if requested, receives bounded driver-owned DMA backing and is included in
+the crash trailer. This implements firmware topology bootstrap and retains
+that topology with the device; multi-link association and packet processing
+are still unimplemented. A physical test is required to establish whether
+this remaining HOST_CAP difference caused the assertion.
+
+Physical build `c3d3fab418ba` was tested in the new `KLOG.TXT` (preserved as
+`build/linux-wifi-trace-2/retroos-topology-boot.log`). Firmware accepts the
+85-byte HOST_CAP body and sends additional WMI events after INIT, including
+regulatory event `0x3a003`. There is no new RDDM dump; MHI remains in mission
+execution environment 2 with healthy CE/DP registers. This is evidence that
+the firmware-topology change got beyond the earlier assertion, although the
+host still stops before observing unified-ready.
+
+The new failure is `WMI Packet` while parsing a regulatory event with a
+312-byte fixed field and three ARRAY_STRUCT bodies of 120, 8 and 16 bytes.
+The parser incorrectly required tag 18 to be unique. It now treats the first
+array as the regulatory rules and preserves later arrays as bounded opaque
+extensions, following Linux's positional rule-array layout. Rule counts,
+frequency ranges and all raw NO_IR/DFS/indoor/PSD restrictions remain checked
+and retained. Malformed extensions or invalid rules cannot replace a valid
+stored report. A synthetic 476-byte packet reproduces the observed layout;
+the raw event bytes were not saved in the physical log. Additional error
+context records fixed fields if another regulatory validation fails.
+
+Physical build `3d1a7cf8dcfc` was tested in `KLOG0001.TXT`. It still rejects
+the regulatory report: status 0, PHY 0 of 2, country `00`, and 2/4 rules for
+2G/5G. Firmware remains healthy; this is another host parser validation
+failure, not a recurrence of the firmware assertion. The header summary is
+insufficient to tell whether rule counts, rule contents or nested extension
+encoding caused it. The next diagnostic build logs the rejected packet as
+numbered little-endian DWORDs, bounded to 2,048 bytes with explicit original
+and captured lengths. No regulatory checks are relaxed without the bytes.
+The normal persistent boot log saves this capture automatically. Recover and
+inspect it offline with a fresh output directory:
+
+```sh
+python3 tools/inspect_wifi_event.py /home/retroos/KLOG0002.TXT --output build/wifi-regulatory-event
+```
+
+The tool exports the exact WMI packet plus fixed fields, rule counts and all
+array/child TLVs; incomplete, oversized or reordered captures are rejected.
+
+Physical build `2a6a558ea50f` produced the full rejected 476-byte event in
+`KLOG0002.TXT`, recovered into `build/wifi-regulatory-event/`. Its six rule
+records use legacy WMI tag 608 (`REGULATORY_RULE_STRUCT`) with 16-byte extended
+bodies, rather than extended tag 937. Linux's regulatory parser reads this
+array by record layout and does not impose our former tag-937-only check.
+All fixed fields, counts and nested extension TLVs in this packet are valid.
+The shared WMI parser now accepts both documented structure IDs with the full
+four-word layout and retains each rule's original tag and complete body,
+including trailing fields, for future hardware/protocol extensions. There is
+no PCI-ID or firmware-version quirk in this decoder. Short records still
+fail rather than inventing missing restriction/PSD fields. A regression
+fixture matches every byte of the captured event, and tests verify mixed
+formats, additive fields and preservation of restrictions. A physical boot
+must still confirm that initialization subsequently reaches unified-ready.
+
+Physical build `218a1aede039` succeeds in `KLOG0003.TXT`, preserved at
+`build/linux-wifi-trace-2/retroos-firmware-ready.log`. Both PHY regulatory
+reports parse (country `00`, six rules and two extension arrays each), then
+WMI READY event `0x000002` supplies a valid unicast MAC. The driver reaches
+`WCN785x CE/HTC/WMI ready` and receives later WMI events through normal OS
+polling before user shutdown. No startup error or firmware crash is reported.
+The earlier assertion is no longer observed with the complete startup fixes;
+the topology change was the first boot beyond it, and the shared regulatory
+decoder fixes now allow unified-ready. Event `0x16005` also appears during
+this successful boot, so that notification alone is not a crash indication.
+This is the working firmware-startup baseline. Scanning, association,
+authentication and packet transfer are the next development phase.
+
+The next development build adds an automatic passive scan after startup.
+Shared code in `kernel/src/kernel/wifi/scan.rs` parses beacons and probe
+responses and retains up to 128 networks with BSSID, binary SSID, frequency,
+estimated signal, security advertisements and complete information elements.
+WMI command/event handling lives in `kernel/src/kernel/wmi/scan.rs`; the
+hardware profile supplies the logical pdev and regulatory PHY. WCN7850 uses
+logical pdev 0 and regulatory PHY 0, matching Linux's single-pdev model.
+The scan creates a station interface, configures its NSS and wake policy,
+uploads a passive channel list and requests a passive scan. Channels must
+have full 20-MHz coverage in the firmware report; disabled/no-20-MHz channels
+are excluded, and radar restrictions remain present. The captured world
+report produces 41 channels across 2.4 and 5 GHz. This first scan path excludes
+6 GHz and sends no probes or authentication frames.
+
+After boot, wait about 25 seconds, then use `type proc/wifi` from DOS to see
+scan state and networks. A completed scan also writes its results into the
+automatically saved kernel log. From the Linux shell (`SH` from DOS),
+`echo scan > /proc/wifi` requests another scan; an active or queued scan
+rejects a duplicate request. The DOS command shell does not yet implement
+file redirection. Network names are
+escaped so control characters cannot affect the terminal. Requests and
+completion events are matched by scan ID, requester and interface; timeouts
+cancel the firmware scan. A scan failure leaves the control session intact
+unless the transport itself fails. Scanning still needs a physical test;
+association, authentication and packet transfer remain unimplemented.
+
+Physical scan build `cf789bd4fe89` completes in `KLOG0004.TXT`: station
+interface creation succeeds, STARTED arrives, firmware visits all 41 requested
+frequencies (with interleaved 2.4/5-GHz progress), and COMPLETED has reason 0.
+The reported network count is zero. This build silently discarded management
+decode failures, so the log cannot distinguish missing management events
+from rejected frames. Source review found an error in our receive decoder:
+Linux's `ath12k_wmi_mgmt_rx_params` contains four antenna RSSI words, making
+its fixed body 68 bytes, with `chan_freq` at offset 64. We had required 76
+bytes and used offset 72. The correction accepts the 68-byte base layout and
+additive fields, with a regression fixture in Linux's field order. Scan-end
+logs now include management events received, networks decoded, ignored
+frames, malformed events and queue drops; the first malformed event is
+captured with bounded raw bytes. The next hardware test must establish
+whether this correction exposes nearby networks.
+
+Physical build `988116cfc5d5` in `KLOG0005.TXT` again completes all 41
+frequencies successfully, but reports `management RX=0 decoded=0 ignored=0
+malformed=0 queue-dropped=0`. This rules out the management decoder as the
+cause of that boot's empty result: no management event reached it. The header
+correction remains necessary, but was not the missing receive setup.
+
+The next build adds the missing HTT/RXDMA bootstrap after unified-ready.
+HTT version negotiation requests TCL metadata v2 and requires protocol major
+3. `kernel/src/kernel/htt.rs` encodes firmware ring registration and receive
+filters; `drivers/qca_dp/rx.rs` owns remote DMA head/tail pointers, rings and
+a bounded pool of 8192 2048-byte receive buffers. The hardware profile supplies
+ring IDs, directions, pdev IDs, sizes, return-buffer manager and descriptor
+offsets. WCN7850 registers the host-to-firmware refill ring, two per-MAC
+buffer rings, one exception ring and two monitor-status rings. Monitor capture
+is disabled and those monitor rings remain empty. Main RX filters match
+Linux's WCN7850 MPDU_START/RX_PACKET/MSDU_END selection. Compiling Linux's
+`hal_rx_desc_wcn7850` declaration confirms size 400, MPDU tag offset 144,
+MSDU tag offset 0 and packet-header TLV offset 272.
+
+The shared WMI radio setup configures basic pdev parameters and profile-supplied
+TX/RX chain masks. When firmware advertises RF-kill capability, the profile's
+GPIO configuration is sent and radio-on is requested; physical radio-state
+events are recorded, and a reported hardware-off state prevents new scans.
+Scan completion logs both management counters and all remote ring pointers.
+Firmware consuming a refill descriptor does not establish that packet DMA has
+finished: consumed buffers remain reserved and are never reused. The initial
+receive pool is finite; completion validation and recycling must be implemented
+before continuous packet traffic. Association, authentication and IP packet
+transfer remain unsupported. The next physical boot must validate HTT version
+negotiation, buffer consumption and delivery of management frames.
+
+Physical build `42ee1e1b9ace` succeeds in `KLOG0006.TXT`, preserved as
+`build/linux-wifi-trace-2/retroos-scan-success.log`. HTT negotiates version
+3.129 and an RF-kill event reports radio on. The management fixed TLV is
+68 bytes, confirming the corrected receive-header layout. The passive scan
+completes with reason 0: 55 management frames received and decoded, zero
+ignored/malformed frames or queue drops, and 45 BSSID/frequency results across
+2.4 and 5 GHz. The user's saved `WIFI.TXT` contains the same scan results.
+This is the working passive-scan baseline. The combined receive bootstrap
+and radio configuration enabled discovery; this test does not isolate which
+individual command was decisive. Posted-buffer counts and remote-pointer
+snapshots do not establish continuous packet reception or recycling.
+Association, WPA authentication, validated completions/recycling and packet
+transfer remain the next phase.
+
+QEMU has no WCN7850 model; simulated protocol tests cannot
+validate the real controller or its board-specific behavior.
+
+Install locally available firmware into a persistent VM data disk:
+
+```sh
+python3 tools/wifi_firmware.py --data-image build/data.bin
+```
+
+The helper reads `ath12k/WCN7850/hw2.0` below `/lib/firmware`, unpacks `.zst`
+or `.xz` files, and installs AMSS, M3, board data, and their license under
+`C:\RETROOS\FIRMWARE`. It takes the launcher's disk lock. Alternatively,
+`--directory /mounted/retroos-root` installs below that root's `lib/firmware`.
+The kernel searches `/lib/firmware` and `C:\RETROOS\FIRMWARE`, accepting
+only bounded, complete, uncompressed files.
+
+For a normal directory-backed installation with C: at `/home/retroos`, install
+the firmware on persistent C: and use the normal kernel installer:
+
+```sh
+python3 tools/wifi_firmware.py --c-root /home/retroos
+tools/install_kernel.sh --prepare
+sudo tools/install_kernel.sh
+```
+
+Select the **persistent** GRUB entry to keep diagnostic logs across reboot.
+The protected entry keeps log writes in RAM. Logs are numbered (`KLOG.TXT`,
+`KLOG0001.TXT`, etc.); use the newest file in `/home/retroos`. The live status
+is also available at `C:\PROC\WIFI`, including installations with a separate
+Unix root.
+
+A self-contained native test image can be built without mounting any of the
+laptop's internal filesystems:
+
+```sh
+python3 tools/build_wifi_image.py
+```
+
+The output is `build/native-wifi/retroos-wifi.img`. It includes locally
+installed firmware in the GRUB-loaded RAM filesystem, so the driver does not
+need USB mass-storage support after boot. This helper creates an image file;
+it never flashes a USB device. Boot its default RAM session and inspect
+`C:\KLOG.TXT` for the last `WiFi:` stage and register diagnostics, or
+`C:\PROC\WIFI` for status. Internal disks are not mounted by its boot profile.
+Firmware contents and the generated image remain local build artifacts.

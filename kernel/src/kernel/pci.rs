@@ -28,6 +28,17 @@ pub fn write32<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8, off:
     machine.outl(PCI_CFG_DATA, val);
 }
 
+/// Stop a failed controller from issuing DMA. The injected port-I/O table
+/// also permits this operation from polling paths without an Arch borrow.
+pub fn disable_bus_master(address: (u8, u8, u8)) {
+    let (bus, dev, func) = address;
+    use super::portio;
+    portio::outl(PCI_CFG_ADDR, cfg_addr(bus, dev, func, 4));
+    let command = portio::inl(PCI_CFG_DATA) & 0xffff;
+    portio::outl(PCI_CFG_ADDR, cfg_addr(bus, dev, func, 4));
+    portio::outl(PCI_CFG_DATA, command & !4);
+}
+
 /// PCI capability IDs we care about.
 const CAP_MSI: u8 = 0x05;
 
@@ -50,11 +61,14 @@ pub fn msi_enable<A: crate::Arch>(
         return false;
     }
     let mut c = (read32(machine, bus, dev, func, 0x34) & 0xFC) as u8; // cap pointer
-    while c != 0 {
+    for _ in 0..48 {
+        if !(0x40..=0xfc).contains(&c) { return false; }
         let head = read32(machine, bus, dev, func, c);
         if (head & 0xFF) as u8 == CAP_MSI {
             let ctrl = (head >> 16) as u16;
             let addr64 = ctrl & (1 << 7) != 0;
+            // The address/data fields must remain inside config space.
+            if c > if addr64 { 0xf0 } else { 0xf4 } { return false; }
             write32(machine, bus, dev, func, c + 0x04, (addr as u32) & !0x3);
             if addr64 {
                 write32(machine, bus, dev, func, c + 0x08, (addr >> 32) as u32);

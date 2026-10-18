@@ -45,6 +45,11 @@ rat_ext4() { kvm && bazel_tool && have qemu-system-x86_64 && have grub-mkrescue 
 qemu_serial() { bazel_tool && have qemu-system-i386 && have timeout; }
 qemu_audio() { bazel_tool && have qemu-system-x86_64 && have grub-mkstandalone && have mformat && have mmd && have mcopy && have timeout && have python3 && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/lib/grub/x86_64-efi/modinfo.sh ]; }
 random_tools() { qemu_audio && have gcc && have mkfs.fat; }
+wifi_tools() {
+    local wifi_source="${WIFI_FIRMWARE_SOURCE:-/lib/firmware}/ath12k/WCN7850/hw2.0"
+    qemu_audio && have zstd && have mkfs.ext4 && have debugfs && have grub-mkimage &&
+        { [ -f "$wifi_source/amss.bin" ] || [ -f "$wifi_source/amss.bin.zst" ] || [ -f "$wifi_source/amss.bin.xz" ]; }
+}
 smb_tools() { qemu_audio && have gcc && have nasm && have mkfs.fat && have "${SMB_TEST_SMBD:-smbd}" && have "${SMB_TEST_PDBEDIT:-pdbedit}"; }
 # /dev/kvm opening is NOT the same as "qemu can boot THIS guest with -accel
 # kvm". Under a GitHub runner's nested virtualization qemu accepts -accel kvm
@@ -143,7 +148,7 @@ run() {
     case "$name" in
         physical_memory|xhci_smoke|grub_*|boot_composition|disk_selection|extra_drives|isapnp_smoke|machine_*|dn_state|module_*) group=boot ;;
         os2_*|windows_*|linux_*|rat_commander_*|locales_*|keyboards_*) group=personalities ;;
-        random_interrupts|smb|virtio_net|ata_lba48|shared_disks|hostfs_*|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
+        wifi_*|random_interrupts|smb|virtio_net|ata_lba48|shared_disks|hostfs_*|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
     esac
     if [ -n "${RETRO_TEST_GROUP:-}" ] && [ "$RETRO_TEST_GROUP" != "$group" ]; then
         return
@@ -237,6 +242,12 @@ run audio_matrix qemu_audio bash test/audio_matrix.sh
 run virtio_net qemu_audio python3 test/virtio_net.py
 run smb smb_tools python3 test/smb.py
 run random_interrupts random_tools python3 test/random_interrupts.py
+run wifi_boot wifi_tools python3 test/wifi_boot.py
+run wifi_dump python3_test python3 test/test_inspect_wifi_dump.py
+run wifi_platform python3_test python3 test/test_inspect_wifi_platform.py
+run wifi_recorder python3_test python3 test/test_record_linux_wifi.py
+run wifi_trace python3_test python3 test/test_inspect_linux_wifi_trace.py
+run wifi_event python3_test python3 test/test_inspect_wifi_event.py
 run audio_matrix_kvm qemu_audio_kvm bash test/audio_matrix.sh --kvm
 # Only under KVM: this one measures sustained real-time PCM, and a host that
 # cannot run the guest at real time loses PIT ticks, which crawls the music and

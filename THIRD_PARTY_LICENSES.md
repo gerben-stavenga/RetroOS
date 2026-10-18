@@ -114,3 +114,91 @@ RetroOS changes: Rust implementation, explicit GRUB opt-in, Intel chipset and
 Fintek identity checks, register readback with rollback, and standard ISA DMA
 reset/cascade initialization that preserves the kernel's interrupt masks.
 No endorsement by the original author is implied.
+
+## Qualcomm native Wi-Fi bring-up
+
+The PCI register sequencing in `kernel/src/kernel/drivers/wcn785x/{mod,reset}.rs`
+is adapted from Linux v6.8 `ath12k/pci.c`, `pci.h`, and `mhi.h`, under
+BSD-3-Clause-Clear. WLANFW message fields and startup sequencing in
+`kernel/src/kernel/drivers/wcn785x/wlanfw.rs` follow ath12k `qmi.c`/`qmi.h`
+(Linux v6.8 and current shared ath12k QMI/board-bundle definitions), under the
+same license. The shared CE rings (`kernel/src/kernel/drivers/ce.rs`), HTC
+framing (`kernel/src/kernel/htc.rs`), WMI startup (`kernel/src/kernel/wmi.rs`),
+shared SRNG registers (`kernel/src/kernel/drivers/srng.rs`), packet-engine
+bootstrap (`kernel/src/kernel/drivers/qca_dp.rs`), and WCN7850 hardware profile
+also reference Linux v6.8 ath12k `dp.c`/`dp.h`, `hal.c`/`hal.h`,
+`ce.c`/`ce.h`, `htc.c`/`htc.h`, `wmi.c`/`wmi.h`, and `hw.c`, under the same
+license. The license is included in the WCN785x driver directory.
+Common packet-engine rings and REO global configuration also reference Linux
+v6.17 ath12k `dp.c`/`dp.h`, `hal.c`/`hal.h`, `hal_rx.c`, `hal_desc.h`,
+and `hw.c`, under BSD-3-Clause-Clear.
+The cookie-conversion tables in `kernel/src/kernel/drivers/qca_dp/cookie.rs`
+reference Linux v6.17 ath12k `dp.c`/`dp.h`/`hal.h` and the `pci.c` window
+encoding under that same license.
+The shadow-v3 doorbell mapping, QMI TLV 0x17 encoding, and single-chip
+firmware-topology HOST_CAP fields additionally reference
+Linux v7.0 `ath12k/wifi7/hal.c`, `wifi7/hal.h`, and `qmi.c`/`qmi.h`, and were
+checked against a local successful Linux WCN7850 startup capture. These Linux
+definitions use the same BSD-3-Clause-Clear license as the ath12k sources above.
+The independent SMBIOS reader in `tools/inspect_wifi_platform.py` consults the
+Qualcomm type-248 metadata layout documented by Linux v7.0 ath12k
+`core.c`/`core.h`, also distributed under BSD-3-Clause-Clear.
+Extended regulatory event fields and capability negotiation in
+`kernel/src/kernel/wmi/regulatory.rs` also reference Linux v6.17 ath12k
+`wmi.c`/`wmi.h`, under BSD-3-Clause-Clear.
+The passive-scan command layouts and management-event decoder in
+`kernel/src/kernel/wmi/scan.rs` reference Linux v7.0 ath12k `wmi.c`/`wmi.h`;
+station wake setup and regulatory channel-list units also reference its
+`mac.c` and `reg.c`, under the same BSD-3-Clause-Clear license.
+HTT negotiation, receive-ring registration, buffer descriptors, and RX filters
+in `kernel/src/kernel/htt.rs` and `kernel/src/kernel/drivers/qca_dp/rx.rs`
+reference Linux v7.0 ath12k `dp_htt.c`/`dp_htt.h`, `dp_rx.c`, `hal.c`/`hal.h`,
+`wifi7/dp_rx.c`, `wifi7/hal_wcn7850.c` and `wifi7/hal_rx_desc.h`. Shared radio
+configuration in `kernel/src/kernel/wmi/radio.rs` additionally references
+its `mac.c` and `wmi.c`/`wmi.h`, under the same BSD-3-Clause-Clear license.
+The MHI/QRTR/QMI
+transport (`kernel/src/kernel/drivers/mhi`, `kernel/src/kernel/qrtr.rs`, and
+`kernel/src/kernel/qmi.rs`)
+is implemented in Rust against their wire/register formats. The read-only
+WLANFW ATHDIAG wire fields are documented in Linux ath10k
+`qmi_wlfw_v01.c`/`qmi_wlfw_v01.h`; the Rust request/reply codec is independently
+implemented. No
+Linux kernel runtime is linked. Qualcomm firmware is installed separately
+from the user's local firmware files, with its original `Notice.txt`, and
+is not checked into this repository.
+
+The WCN7850 hot-reset register address follows Linux correction
+[`7588a893cde5`](https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux/+/7588a893cde5385ad308400ff167d29a29913b3a).
+
+The Clear BSD License
+
+Copyright (c) 2018-2021 The Linux Foundation. All rights reserved.
+Copyright (c) 2021-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted (subject to the limitations in the disclaimer
+below) provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+ * Neither the name of [Owner Organization] nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE GRANTED BY
+THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT
+NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER
+OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

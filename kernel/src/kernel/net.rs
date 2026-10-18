@@ -32,6 +32,7 @@ pub fn init<A: crate::Arch>(machine: &mut A) {
     if socket_backend_installed() {
         return;
     }
+    crate::kernel::wifi::init(machine);
     if let Some(device) = crate::kernel::drivers::virtio_net::probe(machine) {
         config::mount();
         stack::install(alloc::boxed::Box::new(device));
@@ -39,6 +40,7 @@ pub fn init<A: crate::Arch>(machine: &mut A) {
 }
 
 pub fn poll() {
+    crate::kernel::wifi::poll();
     stack::poll();
 }
 pub fn native_backend() -> bool {

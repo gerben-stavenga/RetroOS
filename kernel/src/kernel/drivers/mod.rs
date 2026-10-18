@@ -1,7 +1,7 @@
-//! Hardware device drivers.
+//! Hardware device drivers and reusable device transports.
 //!
-//! Everything here talks to a *specific* piece of silicon. Nothing above this
-//! layer names a driver: the kernel-side APIs one level up — `block` (disks),
+//! Chip drivers use shared transports such as DMA and MHI. Kernel-side APIs
+//! one level up — `block` (disks), `wifi` (radios),
 //! `sound` (PCM), `console` (input) — own the policy and dispatch down here,
 //! and the personalities in `dos/` / `linux/` call only those APIs.
 //!
@@ -27,3 +27,9 @@ pub mod uart16550;
 pub mod isa_lpc;
 pub mod virtio_net;
 pub mod rdrand;
+pub mod wcn785x;
+pub mod mhi;
+pub mod ce;
+
+pub mod qca_dp;
+pub(crate) mod srng;
