@@ -5,6 +5,8 @@ use crate::ext4::{
 };
 use crate::{BlockOverlay, Error, GraphJournal, Storage, StorageError};
 
+type Mutation<'a> = dyn FnMut(&mut Graph, &mut dyn Storage) -> Result<Option<Object>, Error> + 'a;
+
 struct RecoveredStorage<'a> {
     base: &'a mut dyn Storage,
     journal: &'a GraphJournal,
@@ -137,23 +139,21 @@ impl Filesystem {
     fn mutate(
         &mut self,
         storage: &mut dyn Storage,
-        operation: &mut dyn FnMut(
-            &mut Graph,
-            &mut dyn Storage,
-        ) -> Result<Option<Object>, Error>,
+        operation: &mut Mutation<'_>,
     ) -> Result<Option<Object>, Error> {
-        let mut recovered = RecoveredStorage::new(storage, &self.journal);
-        let mut overlay = BlockOverlay::new(&mut recovered, self.graph.block_size);
-        let result = match operation(&mut self.graph, &mut overlay) {
-            Ok(result) => result,
-            Err(error) => {
-                drop(overlay);
-                self.graph = Graph::mount(&mut recovered)?;
-                return Err(error);
-            }
+        let (result, dirty) = {
+            let mut recovered = RecoveredStorage::new(storage, &self.journal);
+            let mut overlay = BlockOverlay::new(&mut recovered, self.graph.block_size);
+            let result = match operation(&mut self.graph, &mut overlay) {
+                Ok(result) => result,
+                Err(error) => {
+                    drop(overlay);
+                    self.graph = Graph::mount(&mut recovered)?;
+                    return Err(error);
+                }
+            };
+            (result, overlay.finish())
         };
-        let dirty = overlay.finish();
-        drop(recovered);
         if let Err(error) = self.journal.commit_blocks(&self.graph, storage, dirty) {
             self.graph = Graph::mount(&mut RecoveredStorage::new(storage, &self.journal))?;
             return Err(error);
@@ -209,6 +209,24 @@ impl Filesystem {
         attributes: AttributeUpdate,
     ) -> Result<Object, Error> {
         self.create(storage, parent, name, attributes, ObjectKind::Blob)
+    }
+
+    /// Publish an initialized link blob and its directory edge in one journal
+    /// transaction. Targets are opaque bytes; the caller interprets paths.
+    pub fn create_link(
+        &mut self, storage: &mut dyn Storage, parent: Node, name: &[u8],
+        target: &[u8], mut attributes: AttributeUpdate,
+    ) -> Result<Object, Error> {
+        if target.is_empty() || target.contains(&0) { return Err(Error::InvalidArgument); }
+        attributes.format = Some(0xa000 | (attributes.format.unwrap_or(0o777) & 0x0fff));
+        self.mutate(storage, &mut |graph, storage| {
+            if find(graph, storage, parent, name)?.is_some() { return Err(Error::AlreadyExists); }
+            let detached = graph.create_link(storage, target)?;
+            let object = detached.object();
+            graph.update_attributes(storage, object, attributes)?;
+            graph.attach(storage, parent, name, detached)?;
+            Ok(Some(object))
+        })?.ok_or(Error::InvalidArgument)
     }
 
     pub fn create_node(

@@ -100,6 +100,7 @@ pub trait Filesystem {
             let mut target = alloc::vec![0u8; DIR_PATH_MAX];
             if let Some(size) = self.readlink(path, &mut target) {
                 return Some(Stat {
+                    mtime: self.mtime(path),
                     size: size as u32,
                     mode: 0o777,
                     is_dir: false,
@@ -109,10 +110,11 @@ pub trait Filesystem {
             }
         }
         if self.dir_exists(path) {
-            return Some(Stat { size: 0, mode: 0o755, is_dir: true, is_symlink: false, ino: 0 });
+            return Some(Stat { mtime: self.mtime(path), size: 0, mode: 0o755, is_dir: true, is_symlink: false, ino: 0 });
         }
         let vnode = self.open(path)?;
         let result = Stat {
+            mtime: self.mtime(path),
             size: vnode.size,
             mode: vnode.mode,
             is_dir: false,
@@ -169,6 +171,8 @@ pub trait Filesystem {
 
     fn rmdir(&self, _path: &[u8]) -> i32 { -38 }
     fn rename(&self, _path: &[u8], _new_path: &[u8]) -> i32 { -38 }
+    /// Create a link without interpreting or requiring its target to exist.
+    fn symlink(&self, _target: &[u8], _path: &[u8]) -> i32 { -95 }
     fn supports_directory_mutation(&self) -> bool { false }
     fn flush(&self, _path: &[u8]) -> i32 { 0 }
     /// Persist filesystem-wide buffered data and issue a device barrier.
@@ -179,6 +183,14 @@ pub trait Filesystem {
     fn unmount(&self) -> i32 { self.sync() }
     fn mtime(&self, _path: &[u8]) -> Option<u32> { None }
     fn set_mtime(&self, _path: &[u8], _mtime: u32) -> bool { false }
+    /// Update supported timestamps persistently; None leaves a field alone.
+    fn set_times(&self, path: &[u8], accessed: Option<u32>, modified: Option<u32>) -> i32 {
+        if accessed.is_some() { return -95; }
+        match modified {
+            Some(value) if !self.set_mtime(path, value) => -95,
+            _ => 0,
+        }
+    }
     /// Optional on-disk DOS attributes, independent of Unix ownership/mode.
     fn dos_attributes(&self, _path: &[u8]) -> Option<u8> { None }
 
@@ -229,6 +241,8 @@ pub struct Vnode {
 /// filesystem handle and can describe directories and symbolic links.
 #[derive(Clone, Copy)]
 pub struct Stat {
+    /// Modification time in Unix seconds; None means unavailable.
+    pub mtime: Option<u32>,
     pub size: u32,
     pub mode: u16,
     pub is_dir: bool,
@@ -466,6 +480,7 @@ struct Vfs {
     mtimes: BTreeMap<Vec<u8>, u32>,
     dos_attributes: BTreeMap<Vec<u8>, u8>,
     locks: Vec<FileLock>,
+    record_locks: crate::kernel::fs::record_locks::Table,
     /// Stable open-file indices. Closed slots are reused and the table grows
     /// with demand; process handle limits belong to each process's fd/JFT.
     file_table: Vec<FileEntry>,
@@ -484,6 +499,7 @@ impl Vfs {
             mtimes: BTreeMap::new(),
             dos_attributes: BTreeMap::new(),
             locks: Vec::new(),
+            record_locks: crate::kernel::fs::record_locks::Table::new(),
             file_table: Vec::new(),
             dir_cache: Vec::new(),
             dir_generation: 0,
@@ -499,6 +515,7 @@ impl Vfs {
         self.visit_layers(path, depth, &mut |index, fs, subpath| {
             let stat = if subpath.is_empty() {
                 Some(Stat {
+                    mtime: fs.mtime(subpath),
                     size: 0, mode: 0o755, is_dir: true, is_symlink: false,
                     ino: fs.root_node().unwrap_or(0),
                 })
@@ -947,6 +964,7 @@ impl Vfs {
             return Some(len);
         }
         let object = self.resolve_listed(path, ALIAS_DEPTH, entry.mount_idx, Stat {
+            mtime: (entry.mtime != 0).then_some(entry.mtime),
             size: entry.size,
             mode: entry.mode,
             is_dir: entry.is_dir,
@@ -1045,6 +1063,7 @@ impl Vfs {
             return None;
         }
         let object = self.resolve_listed(path, ALIAS_DEPTH, entry.mount_idx, Stat {
+            mtime: (entry.mtime != 0).then_some(entry.mtime),
             size: entry.size,
             mode: entry.mode,
             is_dir: entry.is_dir,
@@ -1085,6 +1104,7 @@ impl Vfs {
             && let Some(entry) = self.cached_child(parent, name)
         {
             return Some(Stat {
+                mtime: self.mtimes.get(path).copied().or_else(|| (entry.mtime != 0).then_some(entry.mtime)),
                 size: entry.size,
                 mode: override_mode.unwrap_or(u32::from(entry.mode)) as u16,
                 is_dir: entry.is_dir,
@@ -1095,7 +1115,28 @@ impl Vfs {
         let mut stat = self.resolve_object(path, ALIAS_DEPTH)?.stat;
         if let Some(mode) = override_mode { stat.mode = mode as u16; }
         if stat.ino == 0 { stat.ino = path_ino(path); }
+        if let Some(&mtime) = self.mtimes.get(path) { stat.mtime = Some(mtime); }
         Some(stat)
+    }
+
+    fn symlink(&mut self, target: &[u8], path: &[u8]) -> i32 {
+        if target.is_empty() || path.is_empty() { return -2; }
+        if target.contains(&0) || target.len() >= PATH_KEY_MAX { return -36; }
+        let Some(resolved) = self.resolve_parent_symlinks(path) else { return -2 };
+        let path = resolved.as_slice();
+        if self.stat(path, false).is_some() { return -17; }
+        let (midx, fs, subpath) = self.resolve_create_layer(path);
+        if !self.may_write_parent(midx, &subpath) { return -13; }
+        let result = fs.symlink(target, &subpath);
+        if result >= 0 {
+            if !self.claim(midx, &subpath) {
+                fs.remove(&subpath);
+                self.invalidate_dir_cache();
+                return -5;
+            }
+            self.invalidate_dir_cache();
+        }
+        result
     }
 
     fn mkdir(&mut self, path: &[u8]) -> i32 {
@@ -1298,6 +1339,7 @@ impl Vfs {
         let entry = self.file_table.get(usize::try_from(handle).ok()?)?;
         if entry.refcount == 0 { return None; }
         self.resolve_listed(&entry.path, ALIAS_DEPTH, entry.mount_idx, Stat {
+            mtime: None,
             size: entry.vnode.size, mode: entry.vnode.mode,
             is_dir: false, is_symlink: false, ino: 0,
         })
@@ -1334,6 +1376,17 @@ impl Vfs {
         let object = self.handle_object(handle)?;
         let (fs, subpath) = (object.fs, object.subpath());
         fs.mtime(subpath)
+    }
+
+    fn set_times(&mut self, path: &[u8], follow: bool, accessed: Option<u32>, modified: Option<u32>) -> i32 {
+        let Some(path) = self.resolve_symlinks(path, follow) else { return -2 };
+        let Some(object) = self.resolve_object(&path, ALIAS_DEPTH) else { return -2 };
+        if !self.may_write(object.mount_idx, object.subpath()) { return -30; }
+        let status = object.fs.set_times(object.subpath(), accessed, modified);
+        if status < 0 { return status; }
+        if let Some(value) = modified { self.mtimes.insert(path, value); }
+        self.invalidate_dir_cache();
+        0
     }
 
     fn set_handle_mtime(&mut self, handle: i32, mtime: u32) -> i32 {
@@ -1389,26 +1442,29 @@ impl Vfs {
         self.mount_fs(entry.mount_idx).read(entry.vnode.handle, offset, buf, entry.vnode.size)
     }
 
-    fn write_by_handle(&mut self, handle: i32, data: &[u8]) -> i32 {
-        if handle < 0 || (handle as usize) >= self.file_table.len() { return -9; }
-        let h = handle as usize;
-        if self.file_table[h].refcount == 0 { return -9; }
-
-        if !self.file_table[h].writable {
-            return -30; // EROFS — this handle was opened on something not ours
-        }
-        let (mount_idx, fs_handle, offset) = {
-            let e = &self.file_table[h];
-            (e.mount_idx, e.vnode.handle, e.offset)
-        };
+    fn write_at_by_handle(&mut self, handle: i32, offset: u32, data: &[u8]) -> i32 {
+        let Some(e) = self.file_table.get(handle as usize).filter(|e| e.refcount != 0) else { return -9; };
+        if !e.writable { return -30; }
+        let (mount_idx, fs_handle, ino) = (e.mount_idx, e.vnode.handle, e.ino);
         let n = self.mount_fs(mount_idx).write(fs_handle, offset, data);
         if n > 0 {
-            let e = &mut self.file_table[h];
-            e.offset += n as u32;
-            if e.offset > e.vnode.size { e.vnode.size = e.offset; }
+            let end = offset.saturating_add(n as u32);
+            for e in &mut self.file_table {
+                if e.refcount != 0 && e.mount_idx == mount_idx && e.ino == ino {
+                    e.vnode.size = e.vnode.size.max(end);
+                }
+            }
             self.invalidate_dir_cache();
             self.touch_handle(handle);
         }
+        n
+    }
+
+    fn write_by_handle(&mut self, handle: i32, data: &[u8]) -> i32 {
+        let Some(e) = self.file_table.get(handle as usize).filter(|e| e.refcount != 0) else { return -9; };
+        let offset = e.offset;
+        let n = self.write_at_by_handle(handle, offset, data);
+        if n > 0 { self.file_table[handle as usize].offset += n as u32; }
         n
     }
 
@@ -1826,7 +1882,10 @@ pub fn mkdir(path: &[u8]) -> i32 {
 #[inline(never)]
 pub fn rmdir(path: &[u8]) -> i32 { VFS.lock().rmdir(path) }
 #[inline(never)]
+/// Return the namespace path of the object after following symbolic links.
+pub fn canonical_path(path: &[u8]) -> Option<Vec<u8>> { VFS.lock().resolve_symlinks(path, true) }
 pub fn rename(old: &[u8], new: &[u8]) -> i32 { VFS.lock().rename(old, new) }
+pub fn symlink(target: &[u8], path: &[u8]) -> i32 { VFS.lock().symlink(target, path) }
 #[inline(never)]
 pub fn path_exists(path: &[u8]) -> bool { VFS.lock().path_exists(path) }
 #[inline(never)]
@@ -1891,8 +1950,9 @@ pub fn fd_info(fd: i32, fds: &[FdKind; MAX_FDS]) -> Option<(Stat, u32)> {
     let v = VFS.lock();
     let entry = v.file_table.get(handle as usize)?;
     if entry.refcount == 0 { return None; }
-    Some((Stat { size: entry.vnode.size, mode: v.file_mode_by_handle(handle),
-        is_dir: false, is_symlink: false, ino: entry.ino }, v.handle_mtime(handle).unwrap_or(0)))
+    let mtime = v.handle_mtime(handle);
+    Some((Stat { mtime, size: entry.vnode.size, mode: v.file_mode_by_handle(handle),
+        is_dir: false, is_symlink: false, ino: entry.ino }, mtime.unwrap_or(0)))
 }
 
 #[inline(never)]
@@ -2885,3 +2945,63 @@ mod tests {
 
 /// Advisory BSD locks are local to RetroOS; dup/fork share their ownership.
 pub fn flock(handle: i32, operation: u32) -> i32 { VFS.lock().flock(handle, operation) }
+
+/// Advisory process locks coordinate RetroOS clients of any VFS backend.
+/// They do not acquire locks in other machines or Linux host processes.
+pub fn record_lock(handle: i32, owner: i32, kind: Option<crate::kernel::fs::record_locks::Kind>,
+    start: u64, end: u64, query: bool) -> Result<Option<crate::kernel::fs::record_locks::Record>, i32> {
+    use crate::kernel::fs::record_locks::{FileKey, Kind, Record};
+    let mut v = VFS.lock();
+    let e = v.file_table.get(handle as usize).filter(|e| e.refcount != 0).ok_or(-9)?;
+    if !query && let Some(kind) = kind
+        && ((kind == Kind::Read && matches!(e.access, OpenAccess::Write))
+            || (kind == Kind::Write && matches!(e.access, OpenAccess::Read))) { return Err(-9); }
+    let request = Record { file: FileKey(e.mount_idx, e.ino), owner,
+        kind: kind.unwrap_or(Kind::Read), start, end };
+    if query { return Ok(v.record_locks.conflict(request)); }
+    let rc = v.record_locks.set(request, kind.is_none());
+    if rc < 0 { Err(rc) } else { crate::kernel::fs::record_locks::notify_changed(); Ok(None) }
+}
+pub fn record_lock_origin(handle: i32) -> Result<(u32, u32), i32> {
+    let v = VFS.lock();
+    let e = v.file_table.get(handle as usize).filter(|e| e.refcount != 0).ok_or(-9)?;
+    Ok((e.offset, e.vnode.size))
+}
+pub fn release_process_locks(handle: i32, owner: i32) {
+    let mut v = VFS.lock();
+    if let Some(e) = v.file_table.get(handle as usize).filter(|e| e.refcount != 0) {
+        let key = crate::kernel::fs::record_locks::FileKey(e.mount_idx, e.ino);
+        v.record_locks.release(key, owner);
+        crate::kernel::fs::record_locks::notify_changed();
+    }
+}
+
+pub fn configure_handle_access(handle: i32, access: OpenAccess) -> i32 {
+    VFS.lock().configure_open(handle, access, SharePolicy::DenyNone)
+}
+
+/// Positional writes share file contents and size, but never change fd offsets.
+pub fn write_at_by_handle(handle: i32, offset: u32, data: &[u8]) -> i32 {
+    VFS.lock().write_at_by_handle(handle, offset, data)
+}
+pub fn sync_directory(handle: i32) -> i32 {
+    let mut path = [0; DIR_PATH_MAX];
+    let Some(n) = dir_handle_path(handle, &mut path) else { return -9; };
+    let mut v = VFS.lock();
+    let Some(path) = v.resolve_symlinks(&path[..n], true) else { return -2; };
+    let Some(object) = v.resolve_object(&path, ALIAS_DEPTH) else { return -2; };
+    object.fs.sync()
+}
+
+pub fn handle_open_access(handle: i32) -> Option<OpenAccess> {
+    let v = VFS.lock();
+    v.file_table.get(handle as usize).filter(|e| e.refcount != 0).map(|e| e.access)
+}
+
+/// Timestamp changes share namespace resolution and mount write policy.
+pub fn set_times(path: &[u8], follow: bool, accessed: Option<u32>, modified: Option<u32>) -> i32 {
+    VFS.lock().set_times(path, follow, accessed, modified)
+}
+pub fn file_path_by_handle(handle: i32) -> Option<Vec<u8>> {
+    VFS.lock().handle_path(handle).map(|path| path.to_vec())
+}

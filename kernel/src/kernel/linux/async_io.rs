@@ -9,7 +9,6 @@ use alloc::{
     vec::Vec,
 };
 use core::cell::{Cell, RefCell};
-const IDLE: usize = 0x7ff6_0000;
 const FIRST_FD: i32 = 1024;
 #[derive(Clone, Copy)]
 enum Wait {
@@ -21,6 +20,7 @@ enum Wait {
     Select(super::select::Request),
     Random(super::entropy::Request),
     Flock(i32, u32),
+    RecordLock(super::record_lock::Request),
     Read(u8, usize, usize),
     Socket(i32, usize, usize),
     Exited,
@@ -61,13 +61,17 @@ pub(super) struct State {
     contexts: Vec<Context>,
     next_thread: u32,
     active: usize,
-    idle: bool,
-    idle_mapped: bool,
+    parked: bool,
     descriptors: Vec<Option<Descriptor>>,
     nonblock: u64,
     handles: Vec<Option<usize>>,
     cloexec: Vec<bool>,
 }
+pub(super) fn live_task_count(state: &State) -> usize {
+    if state.contexts.is_empty() { 1 }
+    else { state.contexts.iter().filter(|context| !matches!(context.wait, Wait::Exited)).count() }
+}
+
 fn ensure<A: crate::Arch>(
     machine: &mut A,
     kt: &thread::KernelThread<A>,
@@ -86,12 +90,7 @@ fn ensure<A: crate::Arch>(
         wait: Wait::Ready,
     });
     s.next_thread = 1;
-    // Idle in the process's own space so interrupts and wakeups keep working.
-    if !s.idle_mapped {
-        machine.copy_to(IDLE, &[0xb8, 24, 0, 0, 0, 0x0f, 0x05, 0xeb, 0xf7]);
-        machine.set_page_flags(IDLE / 4096, 1, false, true);
-        s.idle_mapped = true;
-    }
+
 }
 fn alloc_fd(s: &mut State, d: Descriptor) -> i32 {
     let object = s.descriptors.len();
@@ -521,6 +520,23 @@ pub(super) fn call<A: crate::Arch>(
             close_virtual(s, fd);
             0
         }
+        32 if descriptor(s, fd).is_some() => {
+            let i = object(s, fd).unwrap();
+            duplicate(s, i, FIRST_FD)
+        }
+        72 if matches!(a.a1, 5..=7) && !s.contexts.is_empty() => {
+            match super::record_lock::Request::read(machine, kt, a, true) {
+                Err(e) => e,
+                Ok(request) => match request.step(machine) {
+                    Some(n) => n,
+                    None => {
+                        ensure(machine, kt, s, regs);
+                        s.contexts[s.active].wait = Wait::RecordLock(request);
+                        0
+                    }
+                }
+            }
+        }
         72 if descriptor(s, fd).is_some() => match a.a1 {
             0 | 1030 => {
                 let i = object(s, fd).unwrap();
@@ -769,9 +785,30 @@ pub(super) fn call<A: crate::Arch>(
     };
     Some(SyscallResult::val(ret))
 }
+/// Observe readiness loss at I/O time. An edge-triggered epoll caller may
+/// drain a socket, receive EAGAIN, and get new data before its next epoll_wait;
+/// sampling only inside epoll_wait would miss that false-to-true transition.
+pub(super) fn after_io<A: crate::Arch>(kt: &thread::KernelThread<A>, linux: &mut LinuxState,
+    nr: u32, args: &Args, result: i64) {
+    let fd = args.a0 as i32;
+    if !matches!(kt.fds.get(fd as usize), Some(FdKind::Socket(_))) { return; }
+    let direction = match nr { 0 | 45 | 47 => 1, 1 | 20 | 44 | 46 => 4, _ => return };
+    let s = &mut linux.async_io;
+    let lost = if result == -11 { direction } else { direction & !ready(kt, s, fd) };
+    for descriptor in &mut s.descriptors {
+        if let Some(Descriptor::Epoll(watches)) = descriptor {
+            for watch in watches.borrow_mut().iter_mut().filter(|w| w.fd == fd) {
+                watch.last &= !lost;
+            }
+        }
+    }
+}
+
+pub(super) fn parked(state: &State) -> bool { state.parked }
+
 pub(super) fn schedule<A: crate::Arch>(
     machine: &mut A,
-    kt: &thread::KernelThread<A>,
+    kt: &mut thread::KernelThread<A>,
     linux: &mut LinuxState,
     regs: &mut Regs,
 ) {
@@ -782,7 +819,7 @@ pub(super) fn schedule<A: crate::Arch>(
     if s.contexts.is_empty() {
         return;
     }
-    if !s.idle {
+    if !s.parked {
         s.contexts[s.active].regs = *regs;
     }
     let now = machine.now();
@@ -808,6 +845,7 @@ pub(super) fn schedule<A: crate::Arch>(
             }
             Wait::Select(request) => request.step(machine, kt),
             Wait::Random(request) => request.step(machine),
+            Wait::RecordLock(request) => request.step(machine),
             Wait::Flock(handle, operation) => {
                 let n = vfs::flock(handle, operation);
                 if n == -11 { None } else { Some(n) }
@@ -842,11 +880,12 @@ pub(super) fn schedule<A: crate::Arch>(
             *s.contexts[s.active].fx.downcast_mut::<A::Fx>().unwrap() = fx;
         }
         s.active = next;
-        s.idle = false;
+        if s.parked { kt.state = thread::ThreadState::Ready; }
+        s.parked = false;
         *regs = s.contexts[next].regs;
     } else {
-        s.idle = true;
-        regs.frame.rip = IDLE as u64;
+        s.parked = true;
+        kt.state = thread::ThreadState::Blocked;
     }
 }
 
@@ -896,7 +935,6 @@ pub(super) fn fork_state(s: &State) -> State {
         handles: s.handles.clone(),
         cloexec: s.cloexec.clone(),
         nonblock: s.nonblock,
-        idle_mapped: s.idle_mapped,
         ..State::default()
     }
 }
@@ -921,15 +959,15 @@ mod tests {
         let input_weak = Rc::downgrade(&input);
         let output_weak = Rc::downgrade(&output);
         let mut parent = State {
-            idle_mapped: true,
+            parked: true,
             ..State::default()
         };
         let r = alloc_fd(&mut parent, Descriptor::Socket(input));
         let w = alloc_fd(&mut parent, Descriptor::Socket(output));
         parent.cloexec[(w - FIRST_FD) as usize] = true;
         let mut child = fork_state(&parent);
-        assert!(child.idle_mapped);
-        assert!(!exec_state(&parent).idle_mapped);
+        assert!(!child.parked);
+        assert!(!exec_state(&parent).parked);
         close_virtual(&mut child, r);
         close_virtual(&mut parent, w);
         assert!(output_weak.upgrade().is_some());
@@ -968,7 +1006,5 @@ mod tests {
 }
 
 pub(super) fn exec_state(s: &State) -> State {
-    let mut inherited = fork_state(s);
-    inherited.idle_mapped = false; // exec discarded the old address space.
-    inherited
+    fork_state(s)
 }

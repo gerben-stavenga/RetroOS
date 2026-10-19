@@ -58,3 +58,5 @@ pub(crate) fn read_image_file(path: &[u8], max: u32) -> Result<Vec<u8>, ImageRea
     crate::kernel::vfs::close_vfs_handle(handle);
     Ok(data)
 }
+
+pub mod record_locks;

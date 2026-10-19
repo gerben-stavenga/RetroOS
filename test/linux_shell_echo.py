@@ -13,12 +13,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
-    subprocess.run(["bazelisk", "build", "//kernel:retroos-host-kvm",
+    subprocess.run(["bazelisk", "build", "//kernel:retroos-host-kvm", "//shell:shell_elf",
                     "--platforms=@platforms//host"], cwd=ROOT, check=True)
+    launcher = subprocess.check_output(["bazelisk", "cquery", "//shell:shell_elf",
+        "--platforms=@platforms//host", "--output=files"], cwd=ROOT, text=True).strip()
     for shell in ("/bin/dash", str(ROOT / "boot-bundle/bin/busybox")):
         with tempfile.TemporaryDirectory(prefix="retroos-shell-echo-") as directory:
             root = Path(directory)
             (root / "bin").mkdir()
+            shutil.copyfile(ROOT / launcher, root / "shell.elf")
             shutil.copyfile(shell, root / "bin/sh")
             shutil.copyfile(ROOT / "boot-bundle/bin/busybox", root / "bin/busybox")
             if shell == "/bin/dash":
@@ -31,7 +34,7 @@ def main():
                         shutil.copyfile(source, target)
             with (root / "terminal").open("wb") as terminal, (root / "klog").open("wb") as log:
                 process = subprocess.Popen([str(ROOT / "bazel-bin/kernel/retroos-host-kvm"),
-                    "--host", directory, "--cmd", "/bin/sh -i", "--cwd", "/"],
+                    "--host", directory, "--cmd", "/shell.elf -i", "--cwd", "/"],
                     stdin=subprocess.PIPE, stdout=terminal, stderr=log)
 
                 def screen():

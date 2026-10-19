@@ -1,6 +1,10 @@
 //! Linux time structures have ABI-sized words, independent of kernel bitness.
 use super::{Args, EFAULT, EINVAL, SyscallResult};
-const TICK_NS: u64 = 10_000_000;
+// Arch::get_ticks is milliseconds (Arch::now / 1_000_000), not 100 Hz.
+const TICK_NS: u64 = 1_000_000;
+fn monotonic_pair(milliseconds: u64) -> (u64, u64) {
+    (milliseconds / 1000, (milliseconds % 1000) * TICK_NS)
+}
 fn supported(clock: u64) -> bool {
     matches!(clock, 0 | 1 | 4 | 5 | 6 | 7)
 }
@@ -37,8 +41,7 @@ pub(super) fn clock_gettime<A: crate::Arch>(
     let (seconds, nanos) = if matches!(args.a0, 0 | 5) {
         (realtime(), 0)
     } else {
-        let ticks = machine.get_ticks();
-        (ticks / 100, (ticks % 100) * TICK_NS)
+        monotonic_pair(machine.get_ticks())
     };
     store(machine, args.a1, seconds, nanos, wide);
     SyscallResult::val(0)
@@ -87,6 +90,14 @@ pub(super) fn time<A: crate::Arch>(machine: &mut A, args: &Args, wide: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn monotonic_milliseconds_match_absolute_wait_nanoseconds() {
+        assert_eq!(monotonic_pair(999), (0, 999_000_000));
+        assert_eq!(monotonic_pair(1000), (1, 0));
+        assert_eq!(monotonic_pair(1234), (1, 234_000_000));
+        let (s, ns) = monotonic_pair(1234);
+        assert_eq!(s * 1_000_000_000 + ns, 1234 * 1_000_000);
+    }
     #[test]
     fn timespec_and_timeval_fields_follow_the_guest_word_size() {
         let (bytes, n) = pair(1_792_345_678, 987_654_321, true);

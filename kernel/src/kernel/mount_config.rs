@@ -64,6 +64,7 @@ pub struct Config {
     pub bundle: Option<Bundle>,
     pub mounts: Vec<Mount>,
     pub environment: Vec<u8>,
+    pub linux_environment: Vec<u8>,
     pub launch: Vec<(String, String)>,
 }
 
@@ -151,7 +152,7 @@ impl Config {
                         grant: "/".to_string(),
                     });
                 } else if !section.eq_ignore_ascii_case("launch")
-                    && !matches!(section, "system" | "locale" | "clock" | "sound" | "environment") {
+                    && !matches!(section, "system" | "locale" | "clock" | "sound" | "environment" | "linux.environment") {
                     return Err("unknown section");
                 }
                 continue;
@@ -161,7 +162,19 @@ impl Config {
             if key.is_empty() || value.as_bytes().contains(&0) {
                 return Err("invalid key/value");
             }
-            if section == "wifi" {
+            if section == "linux.environment" {
+                let name = key.as_bytes();
+                if !name[0].is_ascii_alphabetic() && name[0] != b'_' || name.iter().any(|b| !b.is_ascii_alphanumeric() && *b != b'_') {
+                    return Err("invalid Linux environment name");
+                }
+                if config.linux_environment.len() + key.len() + value.len() + 2 > 32768 {
+                    return Err("Linux environment too large");
+                }
+                config.linux_environment.extend_from_slice(key.as_bytes());
+                config.linux_environment.push(b'=');
+                config.linux_environment.extend_from_slice(value.as_bytes());
+                config.linux_environment.push(0);
+            } else if section == "wifi" {
                 let profile=config.wifi.as_mut().ok_or("missing Wi-Fi section")?;
                 match key {
                     "ssid"=>{if !profile.ssid.is_empty() {return Err("duplicate Wi-Fi SSID");}profile.ssid=value.as_bytes().to_vec();},
@@ -285,6 +298,7 @@ impl Config {
             }
         }
         config.environment.push(0);
+        config.linux_environment.push(0);
         if let Some(bundle) = &mut config.bundle {
             if !canonical(&bundle.subdir) { return Err("bundle subdir must be canonical"); }
             if let Some(id) = bundle.source.strip_prefix("UUID=") {
@@ -348,7 +362,7 @@ impl Config {
     pub fn parse_boot(bytes: &[u8]) -> Result<Self, &'static str> {
         let config = Self::parse(bytes)?;
         if config.bundle.is_none() { return Err("BOOT.INI requires [bundle]"); }
-        if config.environment.iter().any(|b| *b != 0) || !config.launch.is_empty() || !config.smb.is_empty() || config.wifi.is_some() {
+        if config.environment.iter().chain(config.linux_environment.iter()).any(|b| *b != 0) || !config.launch.is_empty() || !config.smb.is_empty() || config.wifi.is_some() {
             return Err("user settings belong in RETROOS.INI");
         }
         Ok(config)
@@ -891,6 +905,17 @@ mod tests {
         assert!(Config::parse_user(b"[mount \"session\"]\nsource=bundle\npath=/\n").is_err());
         let user = Config::parse_user(b"[locale]\nlanguage=it-IT\n[launch]\nALADDIN.EXE=xms32k\n").unwrap();
         assert_eq!(user.launch, [("ALADDIN.EXE".into(), "xms32k".into())]);
+    }
+
+    #[test]
+    fn linux_environment_is_separate_and_names_remain_case_sensitive() {
+        let c = Config::parse_user(b"[environment]\nHOME=C:\\DOS\nPATH=C:\\\n[linux.environment]\nHOME=/home/user\nMixed_case=kept\nPATH=\n").unwrap();
+        assert!(c.environment.starts_with(b"HOME=C:\\DOS\0"));
+        assert!(!c.environment.windows(10).any(|w| w == b"Mixed_case"));
+        assert_eq!(c.linux_environment, b"HOME=/home/user\0Mixed_case=kept\0PATH=\0\0");
+        assert!(Config::parse_user(b"[linux.environment]\n1BAD=value\n").is_err());
+        assert!(Config::parse_user(b"[linux.environment]\nBAD-NAME=value\n").is_err());
+        assert!(Config::parse_boot(b"[bundle]\nsource=module\n[linux.environment]\nHOME=/home/user\n").is_err());
     }
 
     #[test]

@@ -314,6 +314,21 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8]) -> bool {
         ok();
     } else if line.eq_ignore_ascii_case(b"status") {
         status();
+    } else if line.eq_ignore_ascii_case(b"screen") {
+        // Hex UTF-8 keeps arbitrary terminal cells out of the JSON syntax.
+        // The grid is the same source used by VGA and framebuffer renderers.
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        send(b"{\"width\":80,\"height\":25,\"texthex\":\"");
+        for row in lib::term::term().unicode_cells().chunks(80) {
+            for cell in row {
+                let mut utf8 = [0; 4];
+                for byte in cell.character.encode_utf8(&mut utf8).bytes() {
+                    send(&[HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]]);
+                }
+            }
+            send(b"0a");
+        }
+        send(b"\"}\n");
     } else if line.eq_ignore_ascii_case(b"debug dump") {
         ok();
         return true;

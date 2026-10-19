@@ -11,11 +11,12 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BINARY = Path('/usr/local/lib/node_modules/@openai/codex/node_modules/'
-                      '@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex')
+sys.path.insert(0, str(ROOT / 'tools'))
+from setup_codex import setup, DEFAULT_BINARY
 
 
 def main():
@@ -27,23 +28,31 @@ def main():
     with tempfile.TemporaryDirectory(prefix='retroos-codex-') as directory:
         work = Path(directory)
         c_root = work / 'c'
-        for child in ('RETROOS', 'auth', 'tmp', 'work'):
+        for child in ('RETROOS', 'TEMP', 'work'):
             (c_root / child).mkdir(parents=True)
         shutil.copyfile(ROOT / 'etc/RETROOS.INI', c_root / 'RETROOS/RETROOS.INI')
+        auth_home = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')) if args.request else work / 'no-auth'
+        setup(c_root, binary, auth_home)
+        with (c_root / 'RETROOS/RETROOS.INI').open('a') as ini:
+            ini.write('\n[linux.environment]\nMixed_case=from-linux-settings\n')
         if args.request:
-            auth_home = Path(os.environ.get('CODEX_HOME', Path.home() / '.codex'))
-            shutil.copyfile(auth_home / 'auth.json', c_root / 'auth/auth.json')
-            (c_root / 'auth/auth.json').chmod(0o600)
-            command = [str(binary), 'exec', '--ephemeral', '--ignore-user-config',
+            command = ['codex', 'exec', '--ephemeral', '--ignore-user-config',
                        '--skip-git-repo-check', '--sandbox', 'read-only', '--color', 'never',
                        '-C', '/home/retroos/work',
                        'Reply with exactly: Hello from Codex on RetroOS. '
                        'Do not use any tools or read any files.']
         else:
-            command = [str(binary), '--version']
+            command = ['codex', '--version']
         (c_root / 'input.txt').write_text('')
         (c_root / 'run.sh').write_text(
-            'export HOME=/home/retroos CODEX_HOME=/home/retroos/auth TMPDIR=/home/retroos/tmp\n'
+            'set -eu\n'
+            'test "$HOME" = /home/retroos\n'
+            'test "$TMPDIR" = /home/retroos/TEMP\n'
+            'test "$SHELL" = /bin/sh\n'
+            'test "$TERM" = linux\n'
+            'test "$Mixed_case" = from-linux-settings\n'
+            'test -z "${BLASTER+x}"\n'
+            'test "$(command -v codex)" = /home/retroos/bin/codex\n'
             'exec ' + shlex.join(command) +
             ' < /home/retroos/input.txt > /home/retroos/out.txt 2> /home/retroos/err.txt\n')
         profile = work / 'profile.json'
@@ -58,7 +67,7 @@ def main():
         with log_path.open('w') as log:
             process = subprocess.Popen(
                 [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--headless', '--sound', 'none',
-                 '--cmd', '/bin/sh /home/retroos/run.sh', '--', '-m', '2048'],
+                 '--cmd', '/home/retroos/RETROOS/SHELL.ELF /home/retroos/run.sh', '--', '-m', '2048'],
                 cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
             try:
                 process.wait(timeout=180)

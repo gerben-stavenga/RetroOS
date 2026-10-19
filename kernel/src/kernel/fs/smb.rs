@@ -136,8 +136,13 @@ fn path(bytes: &[u8]) -> Option<&str> {
     }
     Some(path.trim_end_matches('/'))
 }
+fn unix_seconds(file_time: u64) -> u32 {
+    (file_time.saturating_sub(116_444_736_000_000_000) / 10_000_000).min(u64::from(u32::MAX)) as u32
+}
+
 fn stat(info: &CreateResponse) -> Stat {
     Stat {
+        mtime: Some(unix_seconds(info.last_write_time.0)),
         size: info.end_of_file.min(u64::from(u32::MAX)) as u32,
         mode: 0o777,
         is_dir: info.file_attributes & 16 != 0,
@@ -186,6 +191,24 @@ impl State {
             mode: 0o666,
         })
     }
+    /// Probe only fixed-size candidates; all namespace interpretation stays
+    /// in VFS, including absolute paths, mount crossings and link-loop limits.
+    fn link_target(&mut self, path: &str) -> Option<Vec<u8>> {
+        let info = self.client.open(path, READ, CreateDisposition::FileOpen, NOT_DIRECTORY).ok()?;
+        let result = (|| {
+            if info.end_of_file != smb2_core::mfsymlink::FILE_SIZE as u64 { return None; }
+            let mut bytes = Vec::new();
+            while bytes.len() < smb2_core::mfsymlink::FILE_SIZE {
+                let part = self.client.read(info.file_id, bytes.len() as u64,
+                    smb2_core::mfsymlink::FILE_SIZE - bytes.len()).ok()?;
+                if part.is_empty() { return None; }
+                bytes.extend_from_slice(&part);
+            }
+            Some(smb2_core::mfsymlink::decode(&bytes)?.to_vec())
+        })();
+        let _ = self.client.close(info.file_id);
+        result
+    }
     fn lookup(&mut self, path: &str) -> Result<CreateResponse> {
         self.client.open(path, READ, CreateDisposition::FileOpen, 0)
     }
@@ -231,9 +254,70 @@ impl Filesystem for SmbFs {
         let p = path(raw)?;
         let mut s = self.0.lock();
         let info = s.lookup(p).ok()?;
-        let result = stat(&info);
+        let mut result = stat(&info);
         let _ = s.client.close(info.file_id);
+        if !result.is_dir && info.end_of_file == smb2_core::mfsymlink::FILE_SIZE as u64
+            && let Some(target) = s.link_target(p) {
+            result.is_symlink = true;
+            result.size = target.len() as u32;
+        }
         Some(result)
+    }
+    fn readlink(&self, raw: &[u8], out: &mut [u8]) -> Option<usize> {
+        let target = self.0.lock().link_target(path(raw)?)?;
+        let count = out.len().min(target.len());
+        out[..count].copy_from_slice(&target[..count]);
+        Some(count)
+    }
+    fn symlink(&self, target: &[u8], raw: &[u8]) -> i32 {
+        let Some(bytes) = smb2_core::mfsymlink::encode(target) else { return -36 };
+        let Some(p) = path(raw) else { return -22 };
+        let mut s = self.0.lock();
+        // Exclusive create protects existing files, including dangling links.
+        let info = match s.client.open(p, WRITE | DELETE, CreateDisposition::FileCreate, NOT_DIRECTORY) {
+            Ok(info) => info,
+            Err(error) => return errno(error),
+        };
+        let result = (|| {
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let count = s.client.write(info.file_id, offset as u64, &bytes[offset..])?;
+                if count == 0 { return Err(Error::Transport); }
+                offset += count;
+            }
+            s.client.flush(info.file_id)
+        })();
+        if result.is_err() {
+            // Delete only our newly created handle, never another path lookup.
+            let _ = s.client.set_info(info.file_id, 13, vec![1]);
+        }
+        let close = s.client.close(info.file_id);
+        result.and(close).map_or_else(errno, |_| 0)
+    }
+    fn set_times(&self, raw: &[u8], accessed: Option<u32>, modified: Option<u32>) -> i32 {
+        let Some(p) = path(raw) else { return -22 };
+        let mut s = self.0.lock();
+        let info = match s.client.open(p, READ | 0x100, CreateDisposition::FileOpen, 0) {
+            Ok(info) => info,
+            Err(error) => return errno(error),
+        };
+        // MS-FSCC FileBasicInformation: zero means leave a field unchanged.
+        let mut basic = vec![0; 40];
+        for (offset, seconds) in [(8, accessed), (16, modified)] {
+            if let Some(seconds) = seconds {
+                let ticks = (u64::from(seconds) + 11_644_473_600) * 10_000_000;
+                basic[offset..offset + 8].copy_from_slice(&ticks.to_le_bytes());
+            }
+        }
+        let result = s.client.set_info(info.file_id, 4, basic);
+        let close = s.client.close(info.file_id);
+        result.and(close).map_or_else(errno, |_| 0)
+    }
+    fn set_mtime(&self, raw: &[u8], modified: u32) -> bool {
+        self.set_times(raw, None, Some(modified)) == 0
+    }
+    fn mtime(&self, raw: &[u8]) -> Option<u32> {
+        self.stat(raw, true)?.mtime
     }
     fn dir_exists(&self, raw: &[u8]) -> bool {
         self.stat(raw, true).is_some_and(|s| s.is_dir)
@@ -391,13 +475,20 @@ impl Filesystem for SmbFs {
                 }
                 let name = e.file_name.into_bytes();
                 let name_len = name.len();
+                let mut link = None;
+                if e.file_attributes & 16 == 0 && e.end_of_file == smb2_core::mfsymlink::FILE_SIZE as u64 {
+                    let mut candidate = raw.to_vec();
+                    if !candidate.is_empty() && !candidate.ends_with(b"/") { candidate.push(b'/'); }
+                    candidate.extend_from_slice(&name);
+                    if let Some(p) = path(&candidate) { link = s.link_target(p); }
+                }
                 out.push(DirEntry {
                     name,
                     name_len,
                     short_name: None,
-                    size: e.end_of_file.min(u64::from(u32::MAX)) as u32,
+                    size: link.as_ref().map_or(e.end_of_file.min(u64::from(u32::MAX)) as u32, |target| target.len() as u32),
                     is_dir: e.file_attributes & 16 != 0,
-                    is_symlink: false,
+                    is_symlink: link.is_some(),
                     mode: 0o777,
                     dos_attributes: Some(e.file_attributes as u8),
                     mount_idx: 0,

@@ -1,9 +1,10 @@
-load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 load("//toolchain:musl_transition.bzl", "musl_binary")
+load("//toolchain:host_transition.bzl", "host_platform_test")
 
 rust_binary(
     name = "shell_bin",
-    srcs = ["src/main.rs"],
+    srcs = ["src/main.rs", "src/environment.rs"],
     edition = "2024",
     # no_std launcher (see src/main.rs): the Rust crate is std-free (no SSE2/cmov
     # codegen), but we keep the musl C runtime — crt0 → __libc_start_main → main,
@@ -25,4 +26,16 @@ musl_binary(
     name = "shell_elf",
     binary = ":shell_bin",
     visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "environment_test_host",
+    srcs = ["src/environment.rs"],
+    crate_root = "src/environment.rs",
+    edition = "2024",
+)
+
+host_platform_test(
+    name = "environment_test",
+    test = ":environment_test_host",
 )

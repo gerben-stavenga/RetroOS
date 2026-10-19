@@ -644,6 +644,7 @@ impl<A: crate::Arch> KernelThread<A> {
         if fd >= MAX_FDS { return; }
         match self.fds[fd] {
             FdKind::Vfs(idx) => {
+                crate::kernel::vfs::release_process_locks(idx, self.tid);
                 crate::kernel::vfs::close_vfs_handle(idx);
             }
             FdKind::PipeRead(idx) => {

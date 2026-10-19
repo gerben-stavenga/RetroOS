@@ -5,6 +5,7 @@ extern crate alloc;
 pub mod auth;
 pub mod client;
 pub mod msg;
+pub mod mfsymlink;
 pub mod name;
 pub mod pack;
 pub mod types;

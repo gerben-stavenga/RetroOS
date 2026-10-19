@@ -68,3 +68,27 @@ fn response_offsets_are_honored_and_truncated_payloads_fail() {
     setup.pop();
     assert!(SessionSetupResponse::unpack(&mut ReadCursor::new(&setup)).is_err());
 }
+
+#[test]
+fn mfsymlinks_match_linux_wire_format_and_reject_corruption() {
+    use smb2_core::mfsymlink::{decode, encode, FILE_SIZE};
+    let wire = encode(b"hello").unwrap();
+    assert_eq!(wire.len(), FILE_SIZE);
+    // Independent published MD5 test vector, not computed with the encoder.
+    assert_eq!(&wire[..49], b"XSym\n0005\n5d41402abc4b2a76b9719d911017c592\nhello\n");
+    assert_eq!(decode(&wire), Some(b"hello".as_slice()));
+    for index in [0, 5, 9, 10, 41, 42, 43] {
+        let mut corrupt = wire.clone();
+        corrupt[index] ^= 1;
+        assert!(decode(&corrupt).is_none(), "corrupt byte {index}");
+    }
+    for length in [1, 1023, 1024] {
+        let target = vec![b'x'; length];
+        assert_eq!(decode(&encode(&target).unwrap()), Some(target.as_slice()));
+    }
+    assert!(encode(b"").is_none());
+    assert!(encode(b"nul\0byte").is_none());
+    assert!(encode(&vec![b'x'; 1025]).is_none());
+    assert!(decode(&vec![0; FILE_SIZE]).is_none());
+    assert!(decode(&wire[..FILE_SIZE - 1]).is_none());
+}

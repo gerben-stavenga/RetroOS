@@ -101,7 +101,135 @@ with `root` and `c_root` directory paths. Run `python3 test/live_root.py` for
 GNU userspace from the live root, DOS/Linux C: writes, application symlinks,
 persistent settings, and rejection of writes through the root view.
 
-The installed native Linux Codex binary can be exercised in the same VM:
+`C:\RETROOS\SHELL.ELF` starts a Linux shell session. It supplies `PATH` with
+`HOME/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` and the sbin directories,
+`TMPDIR=HOME/TEMP`, `SHELL=/bin/sh` and `TERM=linux`. HOME defaults to the C:
+mount's Unix path; LANG follows the selected locale. Arguments such as `-i`,
+`-c` or a script filename are forwarded to the selected shell. GNU `/bin/sh`
+is used when available, with a BusyBox fallback for a missing or unsupported
+default shell. Linux children inherit exactly the environment their parent
+passes, including an explicitly empty environment.
+
+Optional overrides go in the user INI, separately from DOS variables:
+
+```ini
+[linux.environment]
+HOME=/home/retroos
+# PATH=/home/retroos/bin:/usr/local/bin:/usr/bin:/bin
+# CODEX_HOME=/home/retroos/.codex
+```
+
+Names are case-sensitive. Shell defaults fill missing values; explicit values
+are preserved. The kernel supplies Linux entry settings to ELF launches and
+does not export the DOS `[environment]` into Linux processes.
+
+`python3 tools/try_self_build.py` attempts `//kernel:kernel` with Linux Bazel
+inside QEMU/KVM running RetroOS. It shares sources/tools read-only and keeps
+guest outputs in `build/ci/self-build/c`; `klog.txt` and `c/build.err` retain
+diagnostics. The launcher's host build prepares the boot image only. Supply
+`--install-base /path/to/existing/bazel/install` to skip slow runtime extraction
+over SMB. The current attempt reaches Bazel initialization, not compilation.
+Directory `access(F_OK)`, modification timestamps, longer metadata paths and
+SMB installation symlinks now work. Linux provides `getcpu`, the three legacy
+x86-64 vsyscall entries, allocator-backed `sysinfo`, and resource-limit queries.
+Limit changes that are not enforced return an error instead of silent success.
+Linux processes with no runnable internal threads are blocked in the kernel;
+the event loop polls their waits and resumes a ready thread. There is no
+user-mode waiting stub or reserved executable page. The mapping allocator
+avoids the loaded ELF interpreter and fixed mappings; large JVM reservations
+previously collided with read-only code. Fixed mappings replace old user
+pages before loading, preserving fork isolation. Anonymous reservations discard
+old backing and supply zero pages on demand, so reserving a large JVM address
+range does not allocate that much physical RAM. Run
+`python3 test/linux_vsyscall.py` for both syscall ABIs, real legacy CALL/return
+paths, system information, limits, mapping bounds and rejected invalid calls.
+`python3 test/linux_runtime.py` covers sleeping threads and wakeups. A retry
+with `--jvm-arg=-Xmx512m --jvm-arg=-XX:CompressedClassSpaceSize=64m
+--jvm-arg=-XX:ReservedCodeCacheSize=64m` no longer panics, but exits during JVM
+initialization with a `ClassFormatError` (illegal constant pool index in
+`java/lang/String`). Its cause remains unconfirmed; compilation has not yet
+started. The existing runtime can remain read-only: Bazel ignores `EROFS` when
+updating its directory's last-use timestamp. Returning `ENOSYS` for this
+operation previously made that optional update fatal. The guest cache and
+outputs remain writable. `python3 test/linux_timestamps.py` checks 32/64-bit
+Linux stat layouts, file/directory descriptors, ext4 links, and persistent
+SMB timestamp updates. Linux `utimensat` uses shared VFS mount policy and
+backend updates, including `UTIME_NOW`, `UTIME_OMIT` and no-follow semantics.
+Existing timestamps retain one-second precision; Linux `statx` reports
+unsupported access/change timestamp reads as unavailable.
+
+To expose the locally installed native Codex executable and seed its separate
+RetroOS login, run as your Linux user:
+
+```sh
+python3 tools/setup_codex.py
+```
+
+This installs links under `/home/retroos/bin` for Codex and its code-mode
+helper, bypassing the npm Node launcher. It copies saved CLI authentication
+into a private `/home/retroos/.codex` only when no RetroOS login exists.
+Existing login state is preserved. After installing the updated kernel and
+runtime, start `SHELL.ELF` and run `codex --version` or `codex exec`.
+The same setup is used with live QEMU files and the physical-machine root.
+
+Interactive Codex 0.163.0 has returned `Hello from interactive Codex on
+RetroOS.` in the actual QEMU/KVM terminal, with a prompt entered through the
+guest keyboard and the assistant reply verified from the terminal grid.
+From `SHELL.ELF`, the tested response-only configuration is:
+
+```sh
+codex --no-daemon --disable apps --disable shell_snapshot
+```
+
+The default background server still requests the unsupported
+`clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` process-spawning mode. The test uses
+the in-process server and disables Apps and shell snapshots; model-generated
+tool execution and the normal daemon mode are not covered by this result.
+
+Run `python3 test/linux_codex_interactive.py` to reproduce the interactive
+request with a private copy of saved authentication, a separate temporary home,
+and live SMB files. It retains terminal text and a QEMU screenshot under
+`build/ci/codex-interactive`, then removes the private login. Since SMB follows
+host symlinks without exposing their target bytes, this test invokes the native
+package entrypoint explicitly; metal uses the ordinary `~/bin/codex` link.
+
+SQLite uses shared VFS process-owned advisory byte-range locks. Linux exposes
+`F_GETLK`, `F_SETLK`, and `F_SETLKW`, including both i386 flock layouts. Closing
+any descriptor for a file releases that process's record locks; fork does not
+inherit them. Lock intervals support shared readers, exclusive writers, partial
+unlocks, conversions and ranges beyond 4 GiB. These locks coordinate RetroOS
+processes, not other SMB clients or Linux host processes. Positioned writes
+preserve the open-file offset and update size for other open descriptions.
+Run `python3 test/linux_record_lock.py` for native ABI and blocking-wait checks.
+
+Linux monotonic clocks use the architecture's millisecond tick units; absolute
+futex waits use the same time base. Socket I/O also records loss of readiness
+for edge-triggered epoll, so EAGAIN followed by new data before the next wait
+still produces an event. `python3 test/linux_epoll_network.py` checks this with
+real UDP packets over VirtIO; `python3 test/linux_runtime.py` covers absolute
+futex deadlines, Rust threads, TLS and synchronization.
+
+Linux `dup` shares file offsets, socket/pipe ownership and virtual event
+counters, and clears close-on-exec. `renameat` resolves both directory
+arguments independently. `/proc/self/exe` reports the executable after following
+symlinks, so package resources are found beside the installed native binary.
+
+Codex creates helper aliases using Linux `symlink`/`symlinkat`. These calls
+use the shared VFS and create persistent ext4 symlinks with parent-directory
+write checks. Both inline and block-backed targets are journaled atomically.
+Run `python3 test/linux_symlink.py` for both Linux ABIs, Linux fsck validation,
+and an installed Codex version check without the helper-alias warning.
+The SMB2 adapter creates persistent Minshall–French (`mfsymlinks`) files,
+compatible with Linux CIFS's mount option of that name. It validates the fixed
+1067-byte format and target checksum before treating a file as a symlink.
+VFS handles absolute/relative targets, directory links, mount crossings and
+loop limits for all personalities. On the server's local filesystem these
+appear as encoded ordinary files, rather than native Unix links. Existing
+native server links continue to be followed by Samba. Run
+`python3 test/linux_smb_symlink.py` for both Linux ABIs, independent wire-format
+checks and resolution after a guest reboot. FAT still returns `EOPNOTSUPP`.
+
+The installed native Linux Codex binary can be exercised in QEMU:
 
 ```sh
 python3 test/linux_codex.py
@@ -110,11 +238,12 @@ python3 test/linux_codex.py --request
 
 The first command checks `--version` without a model request. The second
 copies saved CLI authentication into a private temporary C:, requests one
-short response without tool calls, and removes the copy on exit. Both use
-2 GiB guest RAM and the live host root; `--binary /absolute/path/to/codex`
-selects another native executable. Results are saved under `build/ci/codex-*`.
-This invokes the native executable directly; `/usr/local/bin/codex` may be
-a Node launcher. The request test does not validate interactive terminal
+short response without tool calls, and removes the copy on exit. Both start
+`SHELL.ELF` and resolve `codex` through its normal PATH, without exporting
+HOME/PATH/TMPDIR in the test script. They use 2 GiB guest RAM and the live host
+root; `--binary /absolute/path/to/codex` selects another native executable.
+Results are saved under `build/ci/codex-*`.
+The request test does not validate interactive terminal
 operation or execution of model-generated tools.
 
 Codex CLI 0.163.0 has returned `Hello from Codex on RetroOS.` from a real

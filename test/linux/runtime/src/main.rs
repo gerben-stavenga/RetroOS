@@ -23,10 +23,15 @@ unsafe extern "C" {
     fn read(fd: i32, ptr: *mut u64, size: usize) -> isize;
     fn write(fd: i32, ptr: *const u64, size: usize) -> isize;
     fn close(fd: i32) -> i32;
+    fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, value: i32) -> i32;
     fn prctl(option: i32, name: *mut u8) -> i32;
+    fn clock_gettime(clock: i32, result: *mut Timespec) -> i32;
+    fn syscall(number: std::ffi::c_long, ...) -> std::ffi::c_long;
     fn poll(ptr: *mut u8, count: usize, timeout: i32) -> i32;
 }
+#[repr(C)]
+struct Timespec { seconds: i64, nanos: i64 }
 fn main() {
     let mode = std::env::args().nth(1);
     if mode.as_deref() == Some("--environment-child") {
@@ -42,6 +47,16 @@ fn main() {
     }
     let expected_locale = std::env::args().nth(1).unwrap_or_else(|| "en_US.UTF-8".into());
     assert_eq!(std::env::var("LANG").unwrap(), expected_locale);
+    unsafe {
+        // realpath implementations use access(F_OK) on directories. Opening
+        // them as regular files incorrectly reports ENOENT to build tools.
+        assert_eq!(access(c"/".as_ptr(), 0), 0);
+        assert_eq!(access(c".".as_ptr(), 0), 0);
+        assert_eq!(access(c"/probe.elf".as_ptr(), 0), 0);
+        assert_eq!(syscall(439, -100i32, c"/".as_ptr(), 0i32, 0i32), 0);
+        assert_eq!(access(c"/missing-access-probe".as_ptr(), 0), -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(2));
+    }
     unsafe {
         assert!(!setlocale(0, c"".as_ptr()).is_null()); // LC_CTYPE from the environment.
         let mut scalar = 0;
@@ -137,6 +152,20 @@ fn main() {
         let start = Instant::now();
         assert_eq!(poll(std::ptr::null_mut(), 0, 10), 0);
         assert!(start.elapsed() >= Duration::from_millis(10));
+        // Futex absolute deadlines and userspace Instant must use the same
+        // monotonic time base. A clock running 10x fast used to delay this
+        // wait by seconds and froze the interactive Codex UI.
+        let mut until = Timespec { seconds: 0, nanos: 0 };
+        assert_eq!(clock_gettime(1, &mut until), 0);
+        until.nanos += 50_000_000;
+        if until.nanos >= 1_000_000_000 { until.seconds += 1; until.nanos -= 1_000_000_000; }
+        let word = 0u32;
+        let start = Instant::now();
+        assert_eq!(syscall(202, &word as *const u32, 137i32, 0i32,
+            &until as *const Timespec, 0usize, u32::MAX), -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(110));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(40) && elapsed < Duration::from_secs(1), "{elapsed:?}");
     }
     std::fs::create_dir("probe").unwrap();
     std::fs::write("probe/café-Ж.txt", "Unicode filename and contents: Ж€").unwrap();

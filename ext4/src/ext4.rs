@@ -16,6 +16,8 @@ use core::mem::{offset_of, size_of};
 
 use crate::{Corrupt, Error, Storage, Unsupported};
 
+type RawInodeEdit<'a> = dyn FnMut(&mut [u8], &mut Inode128, Inode) -> Result<(), Error> + 'a;
+
 pub(crate) const SUPERBLOCK_OFFSET: u64 = 1024;
 pub(crate) const SUPERBLOCK_SIZE: usize = 1024;
 pub const INODE_BASE_SIZE: usize = 128;
@@ -2426,7 +2428,7 @@ impl Ext4 {
         &self,
         storage: &mut dyn Storage,
         number: u32,
-        edit: &mut dyn FnMut(&mut [u8], &mut Inode128, Inode) -> Result<(), Error>,
+        edit: &mut RawInodeEdit<'_>,
     ) -> Result<Inode, Error> {
         let offset = self.inode_offset(storage, number)?;
         let mut raw = Vec::new();
@@ -3421,6 +3423,31 @@ impl Ext4 {
             object: Object::Blob(Blob(number)),
             generation,
         })
+    }
+
+    /// Create an initialized symlink inode. Short targets and their NUL
+    /// terminator fit in i_block; longer targets use ordinary extent storage.
+    pub fn create_link(&mut self, storage: &mut dyn Storage, target: &[u8]) -> Result<Detached, Error> {
+        if target.is_empty() || target.len() >= self.block_size as usize || target.contains(&0) { return Err(Error::InvalidArgument); }
+        let detached = self.create_blob(storage)?;
+        let Object::Blob(blob) = detached.object else { return Err(Error::InvalidArgument) };
+        if target.len() < 60 {
+            self.edit_inode(storage, blob.0, &mut |base, _| {
+                base.mode.set(MODE_SYMLINK | 0o777);
+                base.flags.set(0);
+                base.size_lo.set(target.len() as u32);
+                base.size_hi.set(0);
+                base.block.fill(0);
+                base.block[..target.len()].copy_from_slice(target);
+                Ok(())
+            })?;
+        } else {
+            self.write(storage, blob, 0, target)?;
+            self.update_attributes(storage, detached.object, AttributeUpdate {
+                format: Some(MODE_SYMLINK | 0o777), ..AttributeUpdate::default()
+            })?;
+        }
+        Ok(detached)
     }
 
     #[inline(never)]

@@ -474,6 +474,7 @@ impl Filesystem for PortableExt4Fs {
     fn stat(&self, path: &[u8], _follow_final: bool) -> Option<Stat> {
         let info = self.resolve(Self::path(path)?).ok()?;
         Some(Stat {
+            mtime: Some(info.modified),
             size: info.size.min(u64::from(u32::MAX)) as u32,
             mode: info.format & 0x0fff,
             is_dir: info.node().is_some(),
@@ -626,6 +627,19 @@ impl Filesystem for PortableExt4Fs {
             .map_or(-5, |_| 0)
     }
 
+    fn symlink(&self, target: &[u8], path: &[u8]) -> i32 {
+        let Some(path) = Self::path(path) else { return -22 };
+        let Some((parent_path, name)) = Self::split_parent(path) else { return -22 };
+        let parent_info = match self.resolve(parent_path) { Ok(info) => info, Err(_) => return -2 };
+        let Some(parent) = parent_info.node() else { return -20 };
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        match filesystem.create_link(storage, parent, name, target, AttributeUpdate {
+            format: Some(TYPE_SYMLINK | 0o777), owner: Some(parent_info.owner), group: Some(parent_info.group),
+            ..AttributeUpdate::default()
+        }) { Ok(_) => 0, Err(Error::AlreadyExists) => -17, Err(_) => -5 }
+    }
+
     fn supports_mkdir(&self) -> bool {
         true
     }
@@ -712,6 +726,19 @@ impl Filesystem for PortableExt4Fs {
 
     fn mtime(&self, path: &[u8]) -> Option<u32> {
         Some(self.resolve(Self::path(path)?).ok()?.modified)
+    }
+
+    fn set_times(&self, path: &[u8], accessed: Option<u32>, modified: Option<u32>) -> i32 {
+        let Some(path) = Self::path(path) else { return -22 };
+        let Ok(info) = self.resolve(path) else { return -2 };
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        match filesystem.update_attributes(storage, info.object, AttributeUpdate {
+            accessed, modified, ..AttributeUpdate::default()
+        }) {
+            Ok(()) => 0,
+            Err(_) => -5,
+        }
     }
 
     fn set_mtime(&self, path: &[u8], mtime: u32) -> bool {

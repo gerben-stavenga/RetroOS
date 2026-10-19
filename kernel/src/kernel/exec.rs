@@ -389,7 +389,7 @@ fn absolute_dos_cwd(cwd: &[u8]) -> Vec<u8> {
 /// holding the resolved path with no leading slash.
 pub fn resolve_path<'a>(path: &[u8], cwd: &[u8], buf: &'a mut [u8]) -> &'a [u8] {
     // Build the raw concatenation first (cwd + path for relatives).
-    let mut tmp = [0u8; 164];
+    let mut tmp = [0u8; crate::kernel::vfs::PATH_KEY_MAX];
     let mut tlen = 0;
     let raw: &[u8] = if !path.is_empty() && path[0] == b'/' {
         // Absolute — strip leading slashes.

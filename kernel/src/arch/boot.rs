@@ -281,6 +281,13 @@ unsafe fn prepare_boot(
         kernel_pages,
     );
 
+    // Leave offset segments before touching runtime globals. Their physical
+    // addresses can lie beyond the temporary low-4-MiB identity mapping as
+    // the kernel grows; the kernel's high mapping covers the entire image.
+    let arch_stack_top = (&raw const crate::ARCH_STACK_TOP) as u32 - 16;
+    descriptors::setup_descriptor_tables(arch_stack_top);
+    descriptors::setup_syscall();
+
     // The text aperture moves with paging: point the terminal at the mapped
     // low-memory B8000 before anything prints. Its grid comes along, so what
     // the bootloader already put on screen survives the move.
@@ -321,11 +328,6 @@ unsafe fn prepare_boot(
         is_metal: true,
     });
 
-    // Switch to flat GDT (base=0) + IDT + TSS immediately after paging.
-    // Offset segments are no longer needed — paging maps KERNEL_BASE to KERNEL_PHYS.
-    let arch_stack_top = (&raw const crate::ARCH_STACK_TOP) as u32 - 16;
-    descriptors::setup_descriptor_tables(arch_stack_top);
-    descriptors::setup_syscall();
 
     // UEFI-class machine (loader handed us a linear framebuffer, there is no
     // VGA text mode): console cells go to a RAM buffer instead of B8000.

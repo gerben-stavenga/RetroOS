@@ -1040,3 +1040,44 @@ fn handle_filesystem_journals_runtime_block_sizes() {
         );
     }
 }
+
+#[test]
+fn symlink_creation_is_atomic_across_power_loss() {
+    use portable_ext4::Filesystem;
+    use portable_ext4::ext4::AttributeUpdate;
+    use portable_ext4::test_support::EffectKind;
+    for target in [b"dir/hello.txt".as_slice(), b"directory-with-a-name-long-enough-to-force-block-backed-symbolic-links/hello.txt"] {
+        let source = image();
+        let mut successful = ModelStorage::new(source.clone());
+        let mut fs = Filesystem::mount(&mut successful).unwrap();
+        let root = fs.root(&mut successful).unwrap();
+        let start = successful.effects().len();
+        fs.create_link(&mut successful, root, b"atomic-link", target, AttributeUpdate::default()).unwrap();
+        let sequences: Vec<_> = successful.effects()[start..].iter()
+            .filter(|e| !matches!(e.kind, EffectKind::Read)).map(|e| e.sequence).collect();
+        let mut saw_old = false;
+        let mut saw_new = false;
+        for sequence in sequences {
+            let mut storage = ModelStorage::new(source.clone()).with_injection(Inject::PowerLossAt(sequence));
+            let mut fs = Filesystem::mount(&mut storage).unwrap();
+            let root = fs.root(&mut storage).unwrap();
+            assert!(fs.create_link(&mut storage, root, b"atomic-link", target, AttributeUpdate::default()).is_err());
+            let mut recovered = ModelStorage::new(storage.durable_bytes().to_vec());
+            let mut fs = Filesystem::mount(&mut recovered).unwrap();
+            let root = fs.root(&mut recovered).unwrap();
+            match fs.find(&mut recovered, root, b"atomic-link").unwrap() {
+                None => saw_old = true,
+                Some((_, object)) => {
+                    saw_new = true;
+                    let info = fs.inspect(&mut recovered, object).unwrap();
+                    assert_eq!(info.format & 0xf000, 0xa000);
+                    assert_eq!(info.size as usize, target.len());
+                    let mut bytes = vec![0; target.len()];
+                    assert_eq!(fs.read(&mut recovered, info.blob().unwrap(), 0, &mut bytes).unwrap(), target.len());
+                    assert_eq!(bytes, target);
+                }
+            }
+        }
+        assert!(saw_old && saw_new);
+    }
+}

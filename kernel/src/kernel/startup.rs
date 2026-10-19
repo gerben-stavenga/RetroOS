@@ -614,6 +614,7 @@ fn mount_filesystems(
                 .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e));
             let disk_settings = config.mounts.iter().any(|m| m.drive == Some(b'C') && m.source != "bundle");
             expose_user_config(bytes, disk_settings);
+            crate::kernel::linux::environment::configure(user.linux_environment);
             crate::kernel::wifi::configure(user.wifi);
             *BOOT_ENV.lock() = Some(user.environment);
         }
@@ -675,6 +676,7 @@ fn load_master_env() -> alloc::vec::Vec<u8> {
         Ok(bytes) => {
             let user=crate::kernel::mount_config::Config::parse_user(&bytes)
                 .unwrap_or_else(|error| lib::compact_panic!("RETROOS.INI: {}", error));
+            crate::kernel::linux::environment::configure(user.linux_environment);
             crate::kernel::wifi::configure(user.wifi);
             user.environment
         },
@@ -1519,6 +1521,7 @@ fn event_loop<A: crate::Arch>(
     let mut klog_check_passes = 0u32;
 
     loop {
+        crate::kernel::linux::refresh_system_tasks(threads);
         if display.is_none() {
             windows.release_output_buffers();
         }
@@ -1548,6 +1551,7 @@ fn event_loop<A: crate::Arch>(
         let execute_irq_exit = irq_clock_wakeup;
         let clock_wakeup = tick_wakeup || execute_irq_exit;
         if clock_wakeup { crate::kernel::net::poll(); }
+        crate::kernel::linux::wake_record_locks(threads, ctx.tid, &mut ctx.regs);
         let world_now_ns = if clock_wakeup {
             irq_clock_wakeup = false;
             machine.now()
@@ -1853,7 +1857,11 @@ fn event_loop<A: crate::Arch>(
         // to unblock it (above) or the F12 window picker to move on.
         let thread = ctx.thread(threads);
         if thread.kernel.state == thread::ThreadState::Blocked {
-            match crate::kernel::sched::focus_request(threads, ctx.tid) {
+            let dependency_wait = matches!(&thread.personality, thread::Personality::Linux(linux)
+                if linux.waits_for_record_lock());
+            let next = crate::kernel::sched::focus_request(threads, ctx.tid)
+                .or_else(|| if dependency_wait { thread::schedule(threads, ctx.tid) } else { None });
+            match next {
                 Some(next) => switch_focus_and_run(
                     machine,
                     &mut *bios_workspace,
@@ -2220,6 +2228,10 @@ fn dispatch<A: crate::Arch>(
         // A VGA planar-trap access (A0000 unmapped while unchained graphics
         // needs the write/read planar logic) is decoded + emulated here, not a
         // SEGV. Same path on both backends — both deliver this PageFault.
+        if matches!(thread.personality, thread::Personality::Linux(_))
+            && crate::kernel::linux::try_vsyscall(machine, regs, addr) {
+            return thread::KernelAction::Done;
+        }
         if thread.personality.try_vga_fault(machine, regs, addr) {
             return thread::KernelAction::Done;
         }
