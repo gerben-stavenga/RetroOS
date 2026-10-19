@@ -18,7 +18,10 @@ void __attribute__((force_align_arg_pointer)) _start(void) {
  check(call(__NR_write,fd,(word)"start",5,0)==5,14);
  check(call(__NR_epoll_wait,ep,(word)&event,1,3000)==1,15);
  char byte;
+ int available=0;
+ check(call(__NR_ioctl,fd,0x541b,(word)&available,0)==0 && available==1,22);
  check(call(__NR_read,fd,(word)&byte,1,0)==1 && byte=='A',16);
+ check(call(__NR_ioctl,fd,0x541b,(word)&available,0)==0 && available==0,23);
  check(call(__NR_read,fd,(word)&byte,1,0)==-11,17);
  check(call(__NR_write,fd,(word)"next",4,0)==4,18);
  /* New data arrives while this context sleeps, before epoll samples again. */
@@ -26,6 +29,17 @@ void __attribute__((force_align_arg_pointer)) _start(void) {
  check(call(__NR_nanosleep,(word)duration,0,0,0)==0,19);
  check(call(__NR_epoll_wait,ep,(word)&event,1,3000)==1,20);
  check(call(__NR_read,fd,(word)&byte,1,0)==1 && byte=='B',21);
+ long tcp=call(__NR_socket,2,1|0x800,0,0);check(tcp>=0,24);
+ address[2]=TCP_PORT>>8;address[3]=TCP_PORT&255;
+ long result=call(__NR_connect,tcp,(word)address,16,0);check(result==0 || result==-115,25);
+ check(call(__NR_epoll_ctl,ep,1,tcp,(word)&event)==0,26);
+ check(call(__NR_epoll_wait,ep,(word)&event,1,3000)==1,27);
+ check(call(__NR_ioctl,tcp,0x541b,(word)&available,0)==0 && available==5,28);
+ char bytes[5];check(call(__NR_read,tcp,(word)bytes,2,0)==2 && bytes[0]=='H' && bytes[1]=='E',29);
+ check(call(__NR_ioctl,tcp,0x541b,(word)&available,0)==0 && available==3,30);
+ check(call(__NR_read,tcp,(word)bytes,3,0)==3 && bytes[0]=='L' && bytes[2]=='O',31);
+ check(call(__NR_ioctl,tcp,0x541b,(word)&available,0)==0 && available==0,32);
+ check(call(__NR_write,tcp,(word)"done",4,0)==4,33);
  call(__NR_write,2,(word)"EPOLL SOCKET PASS\n",18,0);
  call(__NR_exit,0,0,0,0);for(;;){}
 }

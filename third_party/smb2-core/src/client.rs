@@ -35,6 +35,7 @@ pub struct Client<T> {
     credits: u32,
     key: Option<Vec<u8>>,
     failed: bool,
+    failure: Option<Error>,
     pub max_read: u32,
     pub max_write: u32,
 }
@@ -80,6 +81,7 @@ impl<T: Transport> Client<T> {
             credits: 1,
             key: None,
             failed: false,
+            failure: None,
             max_read: 32768,
             max_write: 32768,
         };
@@ -209,6 +211,7 @@ impl<T: Transport> Client<T> {
             .as_ref()
             .is_err_and(|e| !matches!(e, Error::Status(_)))
         {
+            self.failure = result.as_ref().err().cloned();
             self.failed = true;
             self.transport.disconnect();
         }
@@ -319,6 +322,10 @@ impl<T: Transport> Client<T> {
         self.transport.disconnect();
         result
     }
+
+    /// The original failure that made this connection unusable. Later calls
+    /// return Transport without attempting to reuse a broken message stream.
+    pub fn failure_reason(&self) -> Option<&Error> { self.failure.as_ref() }
 
     pub fn open(
         &mut self,

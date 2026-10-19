@@ -128,6 +128,9 @@ pub trait Filesystem {
     /// Read from a file identified by handle at given byte offset (Tread).
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32;
 
+    /// Override file-position behavior for a device; None uses regular-file seek.
+    fn seek(&self, _handle: u64, _offset: i32, _whence: i32) -> Option<i32> { None }
+
     /// Append up to `max` directory entries to `out`, resuming at `cookie`
     /// (`READDIR_START` begins a fresh enumeration). Returns the cookie to
     /// resume from, or `None` once the directory is exhausted.
@@ -231,7 +234,7 @@ pub trait Filesystem {
 pub struct Vnode {
     pub handle: u64,  // filesystem-specific opaque handle
     pub size: u32,
-    /// POSIX permission bits (lower 12 — perms + setuid/setgid/sticky).
+    /// POSIX permission bits, optionally including file-type bits for devices.
     /// Carried through from the backing filesystem (TAR's USTAR mode field,
     /// ext4's stat, etc.). Linux personality returns these in stat64.
     pub mode: u16,
@@ -1433,7 +1436,7 @@ impl Vfs {
             (e.mount_idx, e.vnode.handle, e.offset, e.vnode.size)
         };
         let n = self.mount_fs(mount_idx).read(fs_handle, offset, buf, size);
-        if n > 0 { self.file_table[h].offset += n as u32; }
+        if n > 0 && self.file_table[h].vnode.mode & 0o170000 != 0o20000 { self.file_table[h].offset += n as u32; }
         n
     }
 
@@ -1447,6 +1450,7 @@ impl Vfs {
         if !e.writable { return -30; }
         let (mount_idx, fs_handle, ino) = (e.mount_idx, e.vnode.handle, e.ino);
         let n = self.mount_fs(mount_idx).write(fs_handle, offset, data);
+        if self.file_table[handle as usize].vnode.mode & 0o170000 == 0o20000 { return n; }
         if n > 0 {
             let end = offset.saturating_add(n as u32);
             for e in &mut self.file_table {
@@ -1464,7 +1468,7 @@ impl Vfs {
         let Some(e) = self.file_table.get(handle as usize).filter(|e| e.refcount != 0) else { return -9; };
         let offset = e.offset;
         let n = self.write_at_by_handle(handle, offset, data);
-        if n > 0 { self.file_table[handle as usize].offset += n as u32; }
+        if n > 0 && self.file_table[handle as usize].vnode.mode & 0o170000 != 0o20000 { self.file_table[handle as usize].offset += n as u32; }
         n
     }
 
@@ -1489,6 +1493,12 @@ impl Vfs {
         if handle < 0 || (handle as usize) >= self.file_table.len() { return -9; }
         let h = handle as usize;
         if self.file_table[h].refcount == 0 { return -9; }
+
+        let entry = &self.file_table[h];
+        if let Some(result) = self.mount_fs(entry.mount_idx).seek(entry.vnode.handle, offset, whence) {
+            if result >= 0 { self.file_table[h].offset = result as u32; }
+            return result;
+        }
 
         let size = self.file_table[h].vnode.size;
 
@@ -2075,66 +2085,60 @@ pub fn mount_child(parent: &[u8], name: &[u8]) -> Option<&'static [u8]> {
 // An opendir'd fd must remember WHICH directory it names: getdents64 reads the
 // path back through this table. (Listing the thread's cwd instead was a
 // busybox-era shortcut — busybox only ever opendir'd "." — that broke
-// `ls /path` from real coreutils.) Fixed-size and refcounted like FILE_TABLE;
-// fork/dup add a reference, close releases the slot at zero.
+// `ls /path` from real coreutils.) The table grows as needed; fork/dup add a
+// reference, and close releases the path and reusable slot at zero.
 
-const DIR_HANDLES: usize = 32;
 pub const DIR_PATH_MAX: usize = PATH_KEY_MAX;
 
-#[derive(Clone, Copy)]
 struct DirHandle {
-    path: [u8; DIR_PATH_MAX],
-    len: u16,
-    refcount: u8,
+    path: Vec<u8>,
+    refcount: u32,
 }
 
-static DIR_TABLE: Mutex<[DirHandle; DIR_HANDLES]> =
-    Mutex::new([DirHandle { path: [0; DIR_PATH_MAX], len: 0, refcount: 0 }; DIR_HANDLES]);
+// Directory handles are shared across processes. Per-process descriptor
+// limits already bound opens; a second fixed global limit rejected valid fds.
+static DIR_TABLE: Mutex<Vec<DirHandle>> = Mutex::new(Vec::new());
 
-/// Allocate a directory handle recording `path` (refcount 1), or -24 (EMFILE).
+/// Allocate a stable directory identity; freed slots are reused.
 pub fn open_dir_handle(path: &[u8]) -> i32 {
     if path.len() > DIR_PATH_MAX { return -36; }
-    let mut t = DIR_TABLE.lock();
-    for (i, e) in t.iter_mut().enumerate() {
-        if e.refcount == 0 {
-            let n = path.len().min(DIR_PATH_MAX);
-            e.path[..n].copy_from_slice(&path[..n]);
-            e.len = n as u16;
-            e.refcount = 1;
-            return i as i32;
-        }
+    let mut table = DIR_TABLE.lock();
+    let index = table.iter().position(|entry| entry.refcount == 0).unwrap_or(table.len());
+    if index >= i32::MAX as usize { return -24; }
+    let mut bytes = Vec::new();
+    if bytes.try_reserve_exact(path.len()).is_err() { return -12; }
+    bytes.extend_from_slice(path);
+    let entry = DirHandle { path: bytes, refcount: 1 };
+    if index == table.len() {
+        if table.try_reserve(1).is_err() { return -12; }
+        table.push(entry);
+    } else {
+        table[index] = entry;
     }
-    -24
+    index as i32
 }
 
-/// Copy a live handle's directory path into `buf`. Root has length zero;
-/// `None` identifies a dead/invalid handle without confusing it with root.
+/// Copy a live handle's path. Root is Some(0), unlike an invalid handle.
 pub fn dir_handle_path(idx: i32, buf: &mut [u8; DIR_PATH_MAX]) -> Option<usize> {
-    if !(0..DIR_HANDLES as i32).contains(&idx) {
-        return None;
-    }
-    let t = DIR_TABLE.lock();
-    let e = &t[idx as usize];
-    if e.refcount == 0 {
-        return None;
-    }
-    buf[..e.len as usize].copy_from_slice(&e.path[..e.len as usize]);
-    Some(e.len as usize)
+    let table = DIR_TABLE.lock();
+    let entry = table.get(idx as usize).filter(|entry| entry.refcount != 0)?;
+    buf[..entry.path.len()].copy_from_slice(&entry.path);
+    Some(entry.path.len())
 }
 
-/// Increment a dir handle's refcount (Linux fork/dup).
+/// Increment a directory identity's refcount (fork/dup).
 pub fn add_dir_ref(idx: i32) {
-    if let Some(e) = DIR_TABLE.lock().get_mut(idx as usize)
-        && e.refcount > 0
-    {
-        e.refcount += 1;
+    if let Some(entry) = DIR_TABLE.lock().get_mut(idx as usize)
+        && entry.refcount != 0 {
+        entry.refcount += 1;
     }
 }
 
-/// Decrement a dir handle's refcount; the slot frees at zero.
+/// Release storage when the last reference closes, retaining the reusable slot.
 pub fn close_dir_handle(idx: i32) {
-    if let Some(e) = DIR_TABLE.lock().get_mut(idx as usize) {
-        e.refcount = e.refcount.saturating_sub(1);
+    if let Some(entry) = DIR_TABLE.lock().get_mut(idx as usize) {
+        entry.refcount = entry.refcount.saturating_sub(1);
+        if entry.refcount == 0 { entry.path = Vec::new(); }
     }
 }
 
@@ -2318,6 +2322,7 @@ mod tests {
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    static DIRECTORY_HANDLE_TESTS: spin::Mutex<()> = spin::Mutex::new(());
     static CREATE_CALLED: AtomicBool = AtomicBool::new(false);
     static READDIR_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PATH_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -2325,6 +2330,7 @@ mod tests {
 
     #[test]
     fn root_directory_handle_is_distinct_from_invalid_handle() {
+        let _guard = DIRECTORY_HANDLE_TESTS.lock();
         let handle = super::open_dir_handle(b"");
         assert!(handle >= 0);
         let mut path = [0; super::DIR_PATH_MAX];
@@ -2335,6 +2341,28 @@ mod tests {
         assert_eq!(super::dir_handle_path(handle, &mut path), Some(0));
         super::close_dir_handle(handle);
         assert_eq!(super::dir_handle_path(handle, &mut path), None);
+    }
+
+    #[test]
+    fn directory_identities_grow_and_keep_independent_lifetimes() {
+        let _guard = DIRECTORY_HANDLE_TESTS.lock();
+        let mut handles = Vec::new();
+        for index in 0..96 {
+            let path = alloc::format!("parent/directory{index}");
+            let handle = super::open_dir_handle(path.as_bytes());
+            assert!(handle >= 0 && !handles.contains(&handle));
+            let mut bytes = [0; super::DIR_PATH_MAX];
+            let length = super::dir_handle_path(handle, &mut bytes).unwrap();
+            assert_eq!(&bytes[..length], path.as_bytes());
+            handles.push(handle);
+        }
+        super::add_dir_ref(handles[0]);
+        for &handle in &handles { super::close_dir_handle(handle); }
+        let mut bytes = [0; super::DIR_PATH_MAX];
+        assert_eq!(super::dir_handle_path(handles[0], &mut bytes), Some(b"parent/directory0".len()));
+        for &handle in &handles[1..] { assert_eq!(super::dir_handle_path(handle, &mut bytes), None); }
+        super::close_dir_handle(handles[0]);
+        assert_eq!(super::dir_handle_path(handles[0], &mut bytes), None);
     }
 
     #[test]

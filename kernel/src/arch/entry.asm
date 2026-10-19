@@ -576,3 +576,41 @@ align 8
 zrh_ret_ptr:
     dd zero_rsp_high.back   ; 32-bit offset (m16:32)
     dw 0x08                 ; compat code segment
+
+; Save/restore all sixteen XMM registers. FXSAVE executed in compatibility
+; mode only handles XMM0..7. The 32-bit C ABI passes the aligned state pointer
+; on the stack; briefly select the existing long-mode code segment so the
+; instruction includes the full x86-64 SIMD state. Only call in long mode.
+[bits 32]
+global save_fx_long_mode
+save_fx_long_mode:
+    mov eax, [esp + 4]
+    jmp 0x10:save_fx_64
+.back:
+    ret
+
+global restore_fx_long_mode
+restore_fx_long_mode:
+    mov eax, [esp + 4]
+    jmp 0x10:restore_fx_64
+.back:
+    ret
+
+[bits 64]
+save_fx_64:
+    mov eax, eax
+    fxsave64 [rax]
+    jmp far dword [rel save_fx_ret_ptr]
+restore_fx_64:
+    mov eax, eax
+    fxrstor64 [rax]
+    jmp far dword [rel restore_fx_ret_ptr]
+
+[bits 32]
+align 8
+save_fx_ret_ptr:
+    dd save_fx_long_mode.back
+    dw 0x08
+restore_fx_ret_ptr:
+    dd restore_fx_long_mode.back
+    dw 0x08

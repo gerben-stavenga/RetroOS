@@ -17,6 +17,8 @@ pub struct Interp;
 impl Arch for Interp {
     type PageTable = RootPageTable;
     type Fx = crate::machine::FxState;
+    fn fx_state_bytes(fx: &Self::Fx) -> Option<&[u8; 512]> { Some(&fx.0) }
+    fn fx_state_bytes_mut(fx: &mut Self::Fx) -> Option<&mut [u8; 512]> { Some(&mut fx.0) }
 
     // ── Port I/O ──
     fn inb(&mut self, port: u16) -> u8 { crate::machine::inb(port) }

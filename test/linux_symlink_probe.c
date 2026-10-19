@@ -77,6 +77,16 @@ void _start(void) {
  call(WRITE,2,(word)"SMB REBOOT PASS\n",16);call(EXIT,0,0,0);for(;;){}
 #endif
  char executable[128];
+ check(call(READLINK,(word)HOME "no-such-link",(word)executable,sizeof executable)==-2,86);
+ check(call(READLINK,(word)HOME "target",(word)executable,sizeof executable)==-22,87);
+ check(call(READLINK,(word)HOME "target",(word)executable,0)==-22,88);
+ static const char long_cwd[]=HOME "directory-with-a-name-long-enough-to-require-a-block-backed-symbolic-link";
+ check(call(__NR_chdir,(word)long_cwd,0,0)==0,93);
+ check(call(__NR_getcwd,(word)executable,sizeof executable,0)==sizeof long_cwd,94);
+ for(word i=0;i<sizeof long_cwd;i++)check(executable[i]==long_cwd[i],95);
+ contents("target");
+ check(call(__NR_chdir,(word)"..",0,0)==0,96);
+ check(call(__NR_chdir,(word)".",0,0)==0,97);
 #ifdef SMB
  check(call(READLINK,(word)"/proc/self/exe",(word)executable,sizeof(executable))==19,84);
  check(executable[0]=='/' && executable[6]=='r' && executable[18]=='e',85);

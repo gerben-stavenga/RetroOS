@@ -108,6 +108,19 @@ pub fn nonblocking(h: i32) -> bool {
     })
     .unwrap_or(false)
 }
+pub(super) fn available_bytes(h: i32) -> Result<i32, Error> {
+    with(|network| {
+        let entry = network.entries[network.index(h)?];
+        if entry.read_shutdown { return Ok(0); }
+        let count = if entry.kind == Kind::Tcp {
+            network.sockets.get::<tcp::Socket>(entry.handle).recv_queue()
+        } else {
+            let socket = network.sockets.get_mut::<udp::Socket>(entry.handle);
+            if socket.can_recv() { socket.peek().map(|(bytes, _)| bytes.len()).unwrap_or(0) } else { 0 }
+        };
+        Ok(count.min(i32::MAX as usize) as i32)
+    })
+}
 pub fn set_nonblocking(h: i32, value: bool) {
     with(|n| {
         if let Some(e) = n.entries.iter_mut().find(|e| e.id == h) {

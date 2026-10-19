@@ -205,6 +205,10 @@ pub trait Arch: Sized + GuestBytes {
     /// owns that live execution context.
     fn switch_fx(&mut self, fx: &mut Self::Fx);
 
+    /// Standard x86 FXSAVE image for a Linux signal frame, when supported.
+    fn fx_state_bytes(_fx: &Self::Fx) -> Option<&[u8; 512]> { None }
+    fn fx_state_bytes_mut(_fx: &mut Self::Fx) -> Option<&mut [u8; 512]> { None }
+
     // ── Timer ──────────────────────────────────────────────────────────────
 
     /// Monotonic time in nanoseconds. The periodic timer is only a wakeup: it

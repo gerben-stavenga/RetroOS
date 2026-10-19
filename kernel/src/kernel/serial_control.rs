@@ -306,6 +306,9 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8]) -> bool {
         rm_profile();
     } else if line.eq_ignore_ascii_case(b"profile execution") {
         execution_profile(machine);
+    } else if line.eq_ignore_ascii_case(b"trace fs") {
+        super::startup::set_filesystem_trace();
+        ok();
     } else if line.eq_ignore_ascii_case(b"trace on") {
         super::startup::set_trace(true);
         ok();

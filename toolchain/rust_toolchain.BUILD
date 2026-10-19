@@ -36,4 +36,5 @@ filegroup(
     srcs = glob(["rust-std-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/lib/*"]),
 )
 
-exports_files(glob(["**/*"]))
+# Consumers use the public filegroups above. Exporting the entire distribution
+# also scans tens of thousands of HTML manuals whenever this package loads.

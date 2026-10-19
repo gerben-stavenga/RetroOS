@@ -9,7 +9,7 @@ pub mod mfsymlink;
 pub mod name;
 pub mod pack;
 pub mod types;
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Error {
     InvalidData(alloc::string::String),
     Transport,

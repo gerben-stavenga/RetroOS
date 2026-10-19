@@ -9,6 +9,7 @@
 
 pub mod cdrom;
 pub mod disk;
+pub mod devices;
 pub mod fat;
 pub mod floppy;
 pub mod grant;

@@ -13,17 +13,20 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = ROOT / 'build/ci'
 
 
-def launch(work, program, label):
+def launch(work, program, label, timeout=120, memory=None):
     env = os.environ.copy()
     env.pop('RETROOS_DATA_IMAGE', None)
     env['RETROOS_QEMU_LIVE_PROFILE'] = str(work / 'profile.json')
     log = ARTIFACTS / (label + '.log')
+    command = [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--headless',
+        '--sound', 'none', '--cmd', '/home/retroos/' + program]
+    if memory is not None:
+        command += ['--', '-m', str(memory)]
     with log.open('w') as output:
-        process = subprocess.Popen([str(ROOT / 'run.sh'), 'qemu', '--kvm', '--headless',
-            '--sound', 'none', '--cmd', '/home/retroos/' + program], cwd=ROOT,
+        process = subprocess.Popen(command, cwd=ROOT,
             env=env, stdout=output, stderr=subprocess.STDOUT)
         try:
-            process.wait(timeout=120)
+            process.wait(timeout=timeout)
         finally:
             if process.poll() is None:
                 process.terminate()

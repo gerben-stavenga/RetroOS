@@ -98,8 +98,9 @@ pub enum KernelAction {
     /// Fork/clone: COW-clone the current process in the executor (after the kt
     /// borrow releases). `child_stack` overrides the child's SP when nonzero
     /// (clone); 0 = plain fork. `on_done` writes the parent's return value
-    /// (child tid, or -errno).
-    Fork { on_done: fn(&mut crate::Regs, i32), child_stack: usize },
+    /// (child tid, or -errno). `shared_until_exec` instead lends the live
+    /// address space to the child while suspending the parent (vfork).
+    Fork { on_done: fn(&mut crate::Regs, i32), child_stack: usize, shared_until_exec: bool },
     /// Switch to a specific thread (already resolved by caller).
     Switch(usize),
     /// ForkExec: fork a child, exec the given path.
@@ -1022,15 +1023,20 @@ pub fn exit_thread<A: crate::Arch>(
         thread.kernel.exit_code = exit_code;
     }
 
-    // Wake blocked parent and write status BEFORE arch_user_clean — the
-    // parent's stack is still accessible through COW-shared pages. Needs the
-    // dying thread and the parent borrowed at once (disjoint via split).
+    crate::kernel::linux::release_vfork(machine, threads, tid);
+
+    // Wake a matching child waiter. A parent blocked in a pipe read or poll
+    // keeps that operation's return value; its I/O is completed after its
+    // own address space is active again.
     let mut woke_parent = false;
     if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS && parent_tid as usize != tid {
         let (thread, parent) = get_two_threads(threads, tid, parent_tid as usize);
         let was_waiting = parent.kernel.state == ThreadState::Blocked
-            && !matches!(&parent.personality, Personality::Os2(os2)
-                if os2.waiting_for_child().is_some_and(|pid| pid != thread.kernel.tid as u32 + 1));
+            && match &parent.personality {
+                Personality::Linux(linux) => linux.waits_for_child(thread.kernel.tid),
+                Personality::Os2(os2) => !os2.waiting_for_child().is_some_and(|pid| pid != thread.kernel.tid as u32 + 1),
+                _ => true,
+            };
         if was_waiting {
             parent.kernel.state = ThreadState::Ready;
             match &mut parent.personality {
@@ -1042,7 +1048,7 @@ pub fn exit_thread<A: crate::Arch>(
                     // status_ptr was saved in sys_wait4 when parent blocked.
                     // Just set the exit code; the deferred write happens
                     // during thread switch when parent's address space is loaded.
-                    linux.wait_exit_code = exit_code;
+                    linux.child_wait_completed(tid, exit_code);
                 }
                 Personality::Os2(os2) => {
                     parent.kernel.vcpu.regs.rax = if os2.waiting_for_child().is_some() { 0 } else { thread.kernel.tid as u64 };
@@ -1081,11 +1087,16 @@ pub fn exit_thread<A: crate::Arch>(
         let parent_state = threads[parent_tid as usize].kernel.state;
         if woke_parent
             || matches!(parent_state, ThreadState::Ready | ThreadState::Running)
+            || parent_state == ThreadState::Blocked
+                && matches!(&threads[parent_tid as usize].personality,
+                    Personality::Linux(linux) if linux.has_blocked_work())
         {
             return parent_tid as usize;
         }
     }
-    schedule(threads, tid).unwrap_or(0)
+    schedule(threads, tid)
+        .or_else(|| crate::kernel::sched::linux_blocked_successor(threads, tid, true))
+        .unwrap_or(0)
 }
 
 /// Look for an exited child without reaping it. Returns (child_tid, exit_code)

@@ -128,7 +128,10 @@ inside QEMU/KVM running RetroOS. It shares sources/tools read-only and keeps
 guest outputs in `build/ci/self-build/c`; `klog.txt` and `c/build.err` retain
 diagnostics. The launcher's host build prepares the boot image only. Supply
 `--install-base /path/to/existing/bazel/install` to skip slow runtime extraction
-over SMB. The current attempt reaches Bazel initialization, not compilation.
+over SMB. `--bazel-command version` runs the full JVM-backed version command;
+`--workspace`, `--bazel-arg` and `--env NAME=VALUE` support isolated build probes.
+`--work-dir` selects a separate guest home and diagnostic directory. The default
+full-build timeout is four hours, including boot-image preparation.
 Directory `access(F_OK)`, modification timestamps, longer metadata paths and
 SMB installation symlinks now work. Linux provides `getcpu`, the three legacy
 x86-64 vsyscall entries, allocator-backed `sysinfo`, and resource-limit queries.
@@ -143,12 +146,98 @@ old backing and supply zero pages on demand, so reserving a large JVM address
 range does not allocate that much physical RAM. Run
 `python3 test/linux_vsyscall.py` for both syscall ABIs, real legacy CALL/return
 paths, system information, limits, mapping bounds and rejected invalid calls.
-`python3 test/linux_runtime.py` covers sleeping threads and wakeups. A retry
-with `--jvm-arg=-Xmx512m --jvm-arg=-XX:CompressedClassSpaceSize=64m
---jvm-arg=-XX:ReservedCodeCacheSize=64m` no longer panics, but exits during JVM
-initialization with a `ClassFormatError` (illegal constant pool index in
-`java/lang/String`). Its cause remains unconfirmed; compilation has not yet
-started. The existing runtime can remain read-only: Bazel ignores `EROFS` when
+`python3 test/linux_runtime.py` covers sleeping threads and wakeups. Bazel 7.4.1
+now completes `version` with its JIT enabled. The helper defaults to a
+512 MiB heap, 64 MiB compressed class space and 64 MiB code cache; repeat
+`--jvm-arg` to override JVM settings. The corrupt `String` class was caused
+by SMB exposing its 32 KiB packet limit as a short regular-file read; reads
+now collect multiple packets through EOF. `python3 test/linux_smb_read.py`
+checks large reads, positioned reads, offsets and EOF through both Linux ABIs.
+The same test checks persisted 8 MiB writes and multi-buffer `writev` output.
+Regular-file `write`/`writev` stage at most 64 KiB of user memory at a time,
+preserve short-write/error progress, and stop at a partial vector. SMB writes
+span negotiated packets, so a large compiler output does not repeatedly copy
+its entire remaining buffer for each 32 KiB sent.
+
+Native thread switches now preserve XMM8–15 as well as XMM0–7. Linux x86-64
+page faults can enter a registered SIGSEGV handler with a Linux signal frame,
+alternate stack and per-thread mask; `rt_sigreturn` restores the user context
+and floating-point state. `ITIMER_REAL` delivers SIGALRM using the same frames
+and masks, including interrupting a sleeping process. CPU-accounting timers
+and general signal sending are not yet implemented. Timers are checked when
+a process runs or its blocked I/O is polled; the foreground process scheduler
+does not yet preempt a child to run a background parent’s timeout handler. `python3 test/linux_xmm_context.py` checks SIMD preservation and
+`python3 test/linux_signal.py` checks fault recovery and rejected invalid
+signal contexts. Working directories use the VFS path limit, missing
+`readlink` paths return ENOENT, and `/proc/self/exe` exec stays absolute.
+`python3 test/linux_glibc_fork.py` covers glibc worker-thread fork/exec with
+large allocations and copy-on-write pages on ext4 and SMB, plus shared-memory
+spawn, missing-executable error propagation, inherited environment and pipe
+redirection. The vfork child owns the live address space while its parent
+is suspended; exec/exit returns that space to the parent before child cleanup.
+The same regression checks one-shot/repeating timers, blocked pending alarms,
+invalid timevals, cleared timers after fork and retained timers after exec.
+
+`python3 test/linux_bazel.py` runs native Bazel 7.4.1, Bash and `cat` inside
+RetroOS, builds a genrule with a fresh declared input, recursively globs 96
+nested directories, and verifies the output bytes and Git version stamp, retaining diagnostics in `build/ci/bazel-smoke`. It discovers the host's
+extracted install base automatically; use
+`--install-base /path/to/install` to select one explicitly. Linux supplies
+`/proc/self/fd`, `/proc/thread-self/fd` and `/dev/fd` directory listings and
+links from the guest process's own descriptors, including epoll/eventfd and
+Unix socket descriptors. This prevents process-launch code from enumerating
+the SMB server's `/proc/self/fd`, which disconnected its root share.
+Pipe `fstat` reports FIFO metadata, matching the proc-fd view and allowing
+Java's normal `jspawnhelper` path to validate its input pipe.
+Blocked Linux processes lend the CPU to peers sharing their terminal; pending
+I/O is polled with the receiving address space active. Child exit wakes only
+matching waiters and reaps consumed waits after switching back. The proc-fd
+test includes repeated fork/exec pipe round trips and nonzero child statuses.
+`python3 test/linux_proc_fd.py` checks both Linux ABIs on ext4 and SMB.
+A kernel device filesystem provides `/dev/null` above the shared root, so
+shell redirection works even with a read-only SMB root. Its character-file
+metadata and seek behavior pass through the shared VFS; discarded writes
+leave its size zero. The proc-fd regression also checks null reads, writes,
+seeks and path/descriptor stat.
+Linux shebang exec resolves nested interpreters before replacing the process;
+`python3 test/linux_script.py` checks arguments, environment and launch errors
+on both filesystems and ABIs. `FIONREAD` reports unread pipe and socket bytes,
+allowing Java to read process output without seeking a pipe. `FIONBIO`,
+`fcntl` and `pipe2` share each pipe endpoint's nonblocking state across dup/fork.
+Pipe queues grow without overwriting unread output and report allocation errors;
+closing the last reader releases queued storage. `python3 test/linux_process_output.py`
+checks Rust `Command::output()` with separate stdout/stderr, exact exit status,
+and 128 KiB per stream. The proc-fd and
+`python3 test/linux_epoll_network.py` tests cover unread-byte queries.
+
+Directory identities grow as needed rather than limiting all processes to 32
+open directories. The proc-fd test holds 48 directory descriptors open and
+checks complete 300-entry listings on ext4 and SMB. Serial `trace fs` records
+Linux filesystem metadata calls while excluding clock and futex noise.
+The same regression creates and removes trees beyond 256 bytes and exercises
+rename, chmod, symlink and unlinkat there. Path mutations use the VFS path
+limit and reject overflow rather than silently changing a truncated path.
+
+The helper defaults to `MALLOC_ARENA_MAX=2`, one loading thread, one globbing
+thread (`--legacy_globbing_threads=1`) and one build job. Java uses its normal
+process-spawn mechanism. This fits the current 3 GiB address space and 64-descriptor process
+limit; Bazel's separate default globbing pool uses 100 threads.
+The Rust distribution exposes named toolchain filegroups rather than exporting
+every file, avoiding a recursive scan of its HTML documentation during analysis.
+`--reuse-repositories /path/to/host/bazel/output-base/external` reads extracted
+repository sources and toolchains from the host instead of unpacking archives
+over SMB. Build outputs remain private in the guest's separate `cache-reused`
+directory; this does not reuse host compilation outputs. A full RetroOS guest
+build has not yet completed.
+The first build is also too slow for practical use. A sampled compiler startup
+spent over 99% of its time in the kernel, dominated by file-backed `mmap`.
+An isolated QEMU/KVM startup probe measured 29 seconds for `rustc --version`
+versus 0.44 seconds for `/bin/true`. File mappings eagerly read regions into
+fresh pages; compiler launches repeatedly load Rust/LLVM libraries totaling
+roughly 350 MB, and loader segment mappings can repeat those reads. Reusing
+file-backed pages or loading them on demand remains performance work; passing
+the genrule regression does not establish practical self-build speed.
+The existing runtime can remain read-only: Bazel ignores `EROFS` when
 updating its directory's last-use timestamp. Returning `ENOSYS` for this
 operation previously made that optional update fatal. The guest cache and
 outputs remain writable. `python3 test/linux_timestamps.py` checks 32/64-bit
@@ -157,6 +246,13 @@ SMB timestamp updates. Linux `utimensat` uses shared VFS mount policy and
 backend updates, including `UTIME_NOW`, `UTIME_OMIT` and no-follow semantics.
 Existing timestamps retain one-second precision; Linux `statx` reports
 unsupported access/change timestamp reads as unavailable.
+
+File mappings currently use eager copies. Writable shared file mappings return
+`ENODEV`; accepting them silently discarded linker output. Mapping failures leave an
+existing `MAP_FIXED` destination intact. `python3 test/linux_rustc.py` compiles,
+links and executes a native Rust program, checking its ELF header and output.
+The proc-fd test covers private-copy isolation and rejected writable shared mappings
+through both Linux ABIs on ext4 and SMB.
 
 To expose the locally installed native Codex executable and seed its separate
 RetroOS login, run as your Linux user:

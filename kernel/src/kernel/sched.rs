@@ -1,15 +1,40 @@
 //! Scheduling policy — who runs next.
 //!
-//! Today's policy, stated in one place instead of inline in the event loop:
-//! the FOCUSED thread runs. Execution leaves it only when an action says so
-//! (exit → the waiting parent or whatever `schedule` finds; an explicit
-//! Switch; a Yield target) or when the F12 window picker moves focus (and
-//! execution follows, because focus implies execution for now). When background execution
-//! arrives, this module is the only thing that should need to change — the
-//! test of whether the factorization around it is right.
+//! The focused thread runs. A blocked Linux process can lend the CPU to peers
+//! sharing its terminal so pipe handshakes and other I/O can complete. Exit,
+//! yield, explicit switches and the F12 picker also choose a successor.
 
 use crate::Regs;
 use crate::kernel::thread;
+
+/// A blocked Linux process may need a peer on its terminal to make progress.
+/// Ready peers run first. Other blocked peers can be activated for kernel I/O
+/// polling; their user code stays parked until the operation completes.
+pub(crate) fn linux_blocked_successor<A: crate::Arch>(
+    threads: &[thread::Thread<A>], current: usize, poll_blocked: bool,
+) -> Option<usize> {
+    let thread::Personality::Linux(owner) = &threads[current].personality else { return None; };
+    for blocked in [false, true] {
+        if blocked && !poll_blocked { break; }
+        for step in 1..threads.len() {
+            let index = (current + step) % threads.len();
+            if index == 0 { continue; }
+            let candidate = &threads[index];
+            let thread::Personality::Linux(linux) = &candidate.personality else { continue; };
+            if !owner.shares_terminal(linux) { continue; }
+            let eligible = if blocked {
+                candidate.kernel.state == thread::ThreadState::Blocked && linux.has_blocked_work()
+            } else {
+                matches!(candidate.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running)
+            };
+            if eligible && !threads.iter().any(|child| {
+                matches!(&child.personality, thread::Personality::Linux(linux)
+                    if linux.borrows_space_from(index))
+            }) { return Some(index); }
+        }
+    }
+    None
+}
 
 /// The scheduler's answer for this iteration.
 pub enum Verdict {
@@ -83,8 +108,8 @@ fn next_after<A: crate::Arch>(
                 on_error, on_success, sb_handoff, display,
             ).map(Verdict::ContinueAs)
         }
-        thread::KernelAction::Fork { on_done, child_stack } => {
-            crate::kernel::linux::handle_fork(machine, threads, regs, tid, child_stack, on_done)
+        thread::KernelAction::Fork { on_done, child_stack, shared_until_exec } => {
+            crate::kernel::linux::handle_fork(machine, threads, regs, tid, child_stack, shared_until_exec, on_done)
                 .map(Verdict::Switch)
         }
         thread::KernelAction::Exec { buffer, path, args, cmdtail, env, cwd, personality_name, policy } => {

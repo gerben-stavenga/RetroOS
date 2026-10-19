@@ -654,6 +654,7 @@ fn expose_user_config(bytes: &[u8], disk_settings: bool) {
 }
 
 fn mount_kernel_log_fs() {
+    vfs::mount_union(b"dev/", &crate::kernel::fs::devices::DEVICES);
     vfs::mount_union(b"proc/", &crate::kernel::klog::KLOG_FS);
 
     let c_root = crate::kernel::dos::c_root();
@@ -1521,6 +1522,7 @@ fn event_loop<A: crate::Arch>(
     let mut klog_check_passes = 0u32;
 
     loop {
+        crate::kernel::linux::reap_waited_child(machine, threads, ctx.tid);
         crate::kernel::linux::refresh_system_tasks(threads);
         if display.is_none() {
             windows.release_output_buffers();
@@ -1538,6 +1540,7 @@ fn event_loop<A: crate::Arch>(
         // safely below its 16-byte FIFO. Poll only on the timer wakeup: doing
         // an IN from COM2 on every guest exit would itself distort profiles.
         if (tick_wakeup || irq_clock_wakeup) && crate::kernel::serial_control::poll(machine, events) {
+            crate::kernel::linux::debug_processes(threads, ctx.tid);
             let thread = ctx.thread(threads);
             let dos = match &thread.personality {
                 thread::Personality::Dos(dos) => Some(&**dos),
@@ -1860,7 +1863,8 @@ fn event_loop<A: crate::Arch>(
             let dependency_wait = matches!(&thread.personality, thread::Personality::Linux(linux)
                 if linux.waits_for_record_lock());
             let next = crate::kernel::sched::focus_request(threads, ctx.tid)
-                .or_else(|| if dependency_wait { thread::schedule(threads, ctx.tid) } else { None });
+                .or_else(|| if dependency_wait { thread::schedule(threads, ctx.tid) } else { None })
+                .or_else(|| crate::kernel::sched::linux_blocked_successor(threads, ctx.tid, clock_wakeup));
             match next {
                 Some(next) => switch_focus_and_run(
                     machine,
@@ -2230,6 +2234,10 @@ fn dispatch<A: crate::Arch>(
         // SEGV. Same path on both backends — both deliver this PageFault.
         if matches!(thread.personality, thread::Personality::Linux(_))
             && crate::kernel::linux::try_vsyscall(machine, regs, addr) {
+            return thread::KernelAction::Done;
+        }
+        if let thread::Personality::Linux(linux) = &mut thread.personality
+            && crate::kernel::linux::try_signal_fault(machine, linux, thread.kernel.tid, regs, addr) {
             return thread::KernelAction::Done;
         }
         if thread.personality.try_vga_fault(machine, regs, addr) {
@@ -3245,14 +3253,35 @@ pub fn profile_enabled() -> bool {
 /// 31h synth AH=02/03) so a log captures just that program. Default OFF so
 /// boot/init/DN startup stay silent until something enables it.
 static mut SYSCALL_TRACE: bool = false;
+static mut FILESYSTEM_TRACE: bool = false;
 
 /// Set the trace gate directly (the COMMAND.COM bracket path).
 pub fn set_trace(on: bool) {
-    unsafe { core::ptr::write_volatile(&raw mut SYSCALL_TRACE, on) };
+    unsafe {
+        core::ptr::write_volatile(&raw mut SYSCALL_TRACE, on);
+        core::ptr::write_volatile(&raw mut FILESYSTEM_TRACE, false);
+    }
+}
+
+/// Trace Linux filesystem metadata without clock/futex traffic obscuring I/O.
+pub fn set_filesystem_trace() {
+    set_trace(true);
+    unsafe { core::ptr::write_volatile(&raw mut FILESYSTEM_TRACE, true) };
+}
+
+pub fn trace_linux_syscall(nr: u32, wide: bool) -> bool {
+    if !trace_enabled() { return false; }
+    if !unsafe { core::ptr::read_volatile(&raw const FILESYSTEM_TRACE) } { return true; }
+    if wide {
+        matches!(nr, 2..=6 | 8 | 21 | 72..=91 | 217 | 257..=269 | 280 | 316 | 332 | 436)
+    } else {
+        matches!(nr, 5 | 6 | 8 | 10 | 12 | 15 | 19 | 33 | 38..=41 | 54 | 55 | 63 | 83 | 85 | 92 | 93 | 99 | 106..=108 | 141 | 195..=197 | 220 | 295..=305 | 383)
+    }
 }
 
 /// Toggle syscall tracing, reporting which way it went (the F12 Trace item).
 pub fn toggle_trace() {
+    unsafe { core::ptr::write_volatile(&raw mut FILESYSTEM_TRACE, false) };
     let on = unsafe {
         let v = !core::ptr::read_volatile(&raw const SYSCALL_TRACE);
         core::ptr::write_volatile(&raw mut SYSCALL_TRACE, v);

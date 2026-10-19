@@ -12,9 +12,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
-    with tempfile.TemporaryDirectory(prefix='retroos-epoll-net-') as directory, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+    with tempfile.TemporaryDirectory(prefix='retroos-epoll-net-') as directory, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
         server.bind(('127.0.0.1', 0))
         server.settimeout(40)
+        tcp.bind(('127.0.0.1', 0))
+        tcp.listen(1)
+        tcp.settimeout(40)
         errors = []
 
         def exchange():
@@ -23,6 +26,16 @@ def main():
                     data, peer = server.recvfrom(100)
                     assert data == expected, data
                     server.sendto(response, peer)
+                connection, _ = tcp.accept()
+                with connection:
+                    connection.settimeout(10)
+                    connection.sendall(b'HELLO')
+                    received = b''
+                    while len(received) < 4:
+                        data = connection.recv(4 - len(received))
+                        assert data, 'TCP client closed before acknowledging the data'
+                        received += data
+                    assert received == b'done'
             except BaseException as error:
                 errors.append(error)
 
@@ -32,7 +45,7 @@ def main():
         tree = work / 'root'
         (tree / 'home/retroos/RETROOS').mkdir(parents=True)
         subprocess.run(['gcc', '-m64', '-nostdlib', '-static', '-no-pie', '-fno-pie',
-            '-fno-stack-protector', f'-DPORT={server.getsockname()[1]}',
+            '-fno-stack-protector', f'-DPORT={server.getsockname()[1]}', f'-DTCP_PORT={tcp.getsockname()[1]}',
             str(ROOT / 'test/linux_epoll_network_probe.c'), '-o', str(tree / 'probe')], check=True)
         data = work / 'data.img'
         with data.open('wb') as stream:

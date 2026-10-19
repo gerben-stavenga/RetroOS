@@ -17,6 +17,11 @@ impl Default for FxState {
 #[inline]
 fn has_fxsr() -> bool { read_cr4() & cr4::OSFXSR != 0 }
 
+unsafe extern "C" {
+    fn save_fx_long_mode(state: *mut FxState);
+    fn restore_fx_long_mode(state: *const FxState);
+}
+
 impl FxState {
     pub const fn zeroed() -> Self { Self([0; 512]) }
 
@@ -24,7 +29,11 @@ impl FxState {
     #[inline]
     pub fn save(&mut self) {
         unsafe {
-            if has_fxsr() {
+            if crate::paging2::cpu_mode() == crate::paging2::CpuMode::Compat {
+                // Compatibility-mode FXSAVE omits XMM8..15 even when the
+                // outgoing application ran in 64-bit mode.
+                save_fx_long_mode(self);
+            } else if has_fxsr() {
                 asm!("fxsave [{}]", in(reg) self as *mut _ as *mut u8, options(nostack));
             } else {
                 asm!("fsave [{}]", in(reg) self as *mut _ as *mut u8, options(nostack));
@@ -36,7 +45,9 @@ impl FxState {
     #[inline]
     pub fn restore(&self) {
         unsafe {
-            if has_fxsr() {
+            if crate::paging2::cpu_mode() == crate::paging2::CpuMode::Compat {
+                restore_fx_long_mode(self);
+            } else if has_fxsr() {
                 asm!("fxrstor [{}]", in(reg) self as *const _ as *const u8, options(nostack));
             } else {
                 asm!("frstor [{}]", in(reg) self as *const _ as *const u8, options(nostack));

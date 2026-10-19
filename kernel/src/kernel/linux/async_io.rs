@@ -10,6 +10,15 @@ use alloc::{
 };
 use core::cell::{Cell, RefCell};
 const FIRST_FD: i32 = 1024;
+pub(super) fn proc_slots(state: &State) -> usize { state.handles.len() }
+pub(super) fn proc_target(state: &State, fd: usize) -> Option<Vec<u8>> {
+    let label = match descriptor(state, i32::try_from(fd).ok()?)? {
+        Descriptor::Socket(_) => "socket",
+        Descriptor::Event { .. } => "anon_inode:[eventfd]",
+        Descriptor::Epoll(_) => "anon_inode:[eventpoll]",
+    };
+    Some(if label == "socket" { alloc::format!("socket:[{}]", fd).into_bytes() } else { label.as_bytes().to_vec() })
+}
 #[derive(Clone, Copy)]
 enum Wait {
     Ready,
@@ -63,7 +72,6 @@ pub(super) struct State {
     active: usize,
     parked: bool,
     descriptors: Vec<Option<Descriptor>>,
-    nonblock: u64,
     handles: Vec<Option<usize>>,
     cloexec: Vec<bool>,
 }
@@ -271,6 +279,21 @@ pub(super) fn call<A: crate::Arch>(
         // wait handling. Return normally so the shared-context scheduler
         // chooses another runnable thread (or polls the idle context).
         24 if !s.contexts.is_empty() => 0,
+        16 if a.a1 as u32 == 0x5421 && matches!(descriptor(s, fd), Some(Descriptor::Socket(_))) => {
+            if a.a2 == 0 || a.a2.checked_add(4).is_none_or(|end| end > 0xc0000000) { return Some(SyscallResult::val(-EFAULT)); }
+            let Some(Descriptor::Socket(end)) = descriptor(s, fd) else { unreachable!() };
+            end.nonblock.set(machine.read::<i32>(a.a2 as usize) != 0);
+            0
+        }
+        16 if a.a1 as u32 == 0x541b && matches!(descriptor(s, fd), Some(Descriptor::Socket(_))) => {
+            if a.a2 == 0 || a.a2.checked_add(4).is_none_or(|end| end > 0xc0000000) { return Some(SyscallResult::val(-EFAULT)); }
+            let Some(Descriptor::Socket(end)) = descriptor(s, fd) else { unreachable!() };
+            let queue = end.packets.borrow();
+            let count = if end.packet_mode { queue.front().map_or(0, Vec::len) }
+                else { queue.iter().map(Vec::len).sum::<usize>() };
+            machine.write::<i32>(a.a2 as usize, count.min(i32::MAX as usize) as i32);
+            0
+        }
         53 => {
             let kind = a.a1 & !(0x80000 | 0x800);
             if a.a0 != 1 || !matches!(kind, 1 | 5) || a.a2 != 0 {
@@ -573,17 +596,6 @@ pub(super) fn call<A: crate::Arch>(
             }
             _ => -EINVAL,
         },
-        72 if fd >= 0 && (fd as usize) < thread::MAX_FDS && a.a1 == 4 => {
-            if let FdKind::Socket(handle) = kt.fds[fd as usize] {
-                crate::kernel::net::set_nonblocking(handle, a.a2 & 0x800 != 0);
-            }
-            if a.a2 & 0x800 != 0 {
-                s.nonblock |= 1u64 << fd;
-            } else {
-                s.nonblock &= !(1u64 << fd);
-            }
-            0
-        }
         0 if fd >= 0 && (fd as usize) < thread::MAX_FDS && !s.contexts.is_empty() => {
             if let FdKind::PipeRead(i) = kt.fds[fd as usize] {
                 let mut data = alloc::vec![0; a.a2 as usize];
@@ -591,7 +603,7 @@ pub(super) fn call<A: crate::Arch>(
                     machine.copy_to(a.a1 as usize, &data[..n]);
                     reset_edge(s, fd);
                     n as i32
-                } else if s.nonblock & (1u64 << fd) != 0 {
+                } else if crate::kernel::kpipe::nonblocking(i, false) {
                     -11
                 } else {
                     s.contexts[s.active].wait = Wait::Read(i, a.a1 as usize, a.a2 as usize);
@@ -601,7 +613,7 @@ pub(super) fn call<A: crate::Arch>(
                 return None;
             }
         }
-        56 if a.a0 & 0x100 != 0 => {
+        56 if a.a0 & 0x100 != 0 && a.a0 != 0x4111 => {
             // CLONE_VM threads require shared files, signal handlers and group.
             const SHARED: u64 = 0x100 | 0x200 | 0x400 | 0x800 | 0x10000;
             const OPTIONAL: u64 = 0x40000 | 0x80000 | 0x100000 | 0x200000 | 0x400000 | 0x1000000;
@@ -617,6 +629,7 @@ pub(super) fn call<A: crate::Arch>(
                     return Some(SyscallResult::val(-11)); // EAGAIN: thread limit.
                 }
                 let id = (((kt.tid as u32) << 16) | s.next_thread) as i32;
+                super::signals::inherit(&mut linux.signals, s.contexts[s.active].id, id);
                 s.next_thread += 1;
                 let mut child = *regs;
                 child.rax = 0;
@@ -772,15 +785,6 @@ pub(super) fn call<A: crate::Arch>(
                 8
             }
         }
-        // No guest signals are delivered yet, but musl needs to register its
-        // per-thread alternate stack. Do not claim previous stack contents.
-        131 => {
-            if a.a1 != 0 {
-                machine.zero(a.a1 as usize, 24);
-                machine.write::<u32>(a.a1 as usize + 8, 2);
-            }
-            0
-        }
         _ => return None,
     };
     Some(SyscallResult::val(ret))
@@ -805,6 +809,22 @@ pub(super) fn after_io<A: crate::Arch>(kt: &thread::KernelThread<A>, linux: &mut
 }
 
 pub(super) fn parked(state: &State) -> bool { state.parked }
+pub(super) fn current_id(state: &State, process: i32) -> i32 {
+    state.contexts.get(state.active).map_or(process, |context| context.id)
+}
+
+/// Interrupt the active wait before entering a signal handler. The register
+/// frame kept by a parked context is restored before changing its return value.
+pub(super) fn interrupt(kt: &mut thread::KernelThread<impl crate::Arch>, s: &mut State, regs: &mut Regs) {
+    if let Some(context) = s.contexts.get_mut(s.active)
+        && !matches!(context.wait, Wait::Ready | Wait::Exited) {
+        if s.parked { *regs = context.regs; }
+        context.wait = Wait::Ready;
+        regs.rax = (-4i64) as u64;
+    }
+    s.parked = false;
+    kt.state = thread::ThreadState::Ready;
+}
 
 pub(super) fn schedule<A: crate::Arch>(
     machine: &mut A,
@@ -934,7 +954,6 @@ pub(super) fn fork_state(s: &State) -> State {
         descriptors: s.descriptors.clone(),
         handles: s.handles.clone(),
         cloexec: s.cloexec.clone(),
-        nonblock: s.nonblock,
         ..State::default()
     }
 }

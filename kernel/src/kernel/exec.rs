@@ -89,7 +89,7 @@ impl ExecutableImage {
 
 pub fn load_executable_resolved(path: &[u8]) -> Result<ExecutableImage, i32> {
     let handle = vfs::open_to_handle(path);
-    if handle < 0 { return Err(2); }
+    if handle < 0 { return Err(-handle); }
     let file = ExecutableFile { handle, size: vfs::file_size_by_handle(handle) as usize };
     let mut bytes = alloc::vec![0; file.size.min(64)];
     file.read_exact(0, &mut bytes)?;

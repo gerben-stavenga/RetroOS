@@ -79,7 +79,13 @@ impl Transport for Socket {
             match net::sendto(self.handle, bytes, None) {
                 Ok(n) if n > 0 => bytes = &bytes[n as usize..],
                 Err(net::Error::WouldBlock) => self.progress()?,
-                _ => return Err(Error::Transport),
+                result => {
+                    if crate::kernel::startup::trace_enabled() {
+                        let detail = alloc::format!("{:?}", result);
+                        crate::compact_println!("[SMB] send socket={} failed: {}", self.handle, detail.as_str());
+                    }
+                    return Err(Error::Transport);
+                }
             }
         }
         Ok(())
@@ -92,7 +98,13 @@ impl Transport for Socket {
             match net::recvfrom(self.handle, bytes, false, &mut None) {
                 Ok(n) if n > 0 => bytes = &mut bytes[n as usize..],
                 Err(net::Error::WouldBlock) => self.progress()?,
-                _ => return Err(Error::Transport),
+                result => {
+                    if crate::kernel::startup::trace_enabled() {
+                        let detail = alloc::format!("{:?}", result);
+                        crate::compact_println!("[SMB] receive socket={} failed: {}", self.handle, detail.as_str());
+                    }
+                    return Err(Error::Transport);
+                }
             }
         }
         Ok(())
@@ -210,7 +222,12 @@ impl State {
         result
     }
     fn lookup(&mut self, path: &str) -> Result<CreateResponse> {
-        self.client.open(path, READ, CreateDisposition::FileOpen, 0)
+        self.client.open(path, READ, CreateDisposition::FileOpen, 0).inspect_err(|error| {
+            if crate::kernel::startup::trace_enabled() {
+                let detail = alloc::format!("{:?}", self.client.failure_reason().unwrap_or(error));
+                crate::compact_println!("[SMB] lookup {} failed: {}", path, detail.as_str());
+            }
+        })
     }
     fn mutate(&mut self, path: &str, directory: bool, rename: Option<&str>) -> Result<()> {
         let info = self.client.open(
@@ -340,21 +357,26 @@ impl Filesystem for SmbFs {
     fn supports_directory_mutation(&self) -> bool {
         true
     }
-    fn read(&self, id: u64, offset: u32, out: &mut [u8], size: u32) -> i32 {
+    fn read(&self, id: u64, offset: u32, out: &mut [u8], _size: u32) -> i32 {
         let mut s = self.0.lock();
         let Some(file) = s.handles.get(&id).map(|h| h.file) else {
             return -9;
         };
-        match s
-            .client
-            .read(file, u64::from(offset), out.len().min(size as usize))
-        {
-            Ok(data) => {
-                out[..data.len()].copy_from_slice(&data);
-                data.len() as i32
+        // The protocol caps each request at the negotiated packet size.
+        // A regular-file read must collect those packets, rather than expose
+        // the transport boundary as a short read to file consumers.
+        let mut done = 0;
+        while done < out.len() {
+            match s.client.read(file, u64::from(offset) + done as u64, out.len() - done) {
+                Ok(data) if data.is_empty() => break,
+                Ok(data) => {
+                    out[done..done + data.len()].copy_from_slice(&data);
+                    done += data.len();
+                }
+                Err(e) => return if done == 0 { errno(e) } else { done as i32 },
             }
-            Err(e) => errno(e),
         }
+        done as i32
     }
     fn write(&self, id: u64, offset: u32, bytes: &[u8]) -> i32 {
         let mut s = self.0.lock();
@@ -383,9 +405,18 @@ impl Filesystem for SmbFs {
         if bytes.is_empty() {
             return 0;
         }
-        s.client
-            .write(file, u64::from(offset), bytes)
-            .map_or_else(errno, |n| n as i32)
+        // A negotiated packet size is a transport boundary, not a regular
+        // file write limit. Preserve actual partial progress on failures.
+        let bytes = &bytes[..bytes.len().min(i32::MAX as usize)];
+        let mut done = 0;
+        while done < bytes.len() {
+            match s.client.write(file, u64::from(offset) + done as u64, &bytes[done..]) {
+                Ok(0) => break,
+                Ok(count) => done += count,
+                Err(error) => return if done == 0 { errno(error) } else { done as i32 },
+            }
+        }
+        done as i32
     }
     fn resize(&self, id: u64, size: u32) -> i32 {
         // Upgrade through the same path used by writes.

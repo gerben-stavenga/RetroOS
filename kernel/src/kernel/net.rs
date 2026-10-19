@@ -56,6 +56,9 @@ pub fn socket_kind(h: i32) -> Result<SocketKind> { stack::socket_kind(h) }
 pub fn nonblocking(h: i32) -> bool {
     stack::nonblocking(h)
 }
+pub fn available_bytes(h: i32) -> Result<i32> {
+    if native_backend() { stack::available_bytes(h) } else { Err(Error::Unsupported) }
+}
 pub fn set_nonblocking(h: i32, value: bool) {
     stack::set_nonblocking(h, value);
 }
