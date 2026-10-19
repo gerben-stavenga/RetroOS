@@ -23,6 +23,7 @@ mod entropy;
 mod record_lock;
 pub(crate) mod environment;
 mod file_mapping;
+mod shared_mapping;
 mod file_io;
 mod tty;
 mod time;
@@ -105,7 +106,7 @@ pub fn render<A: crate::Arch>(
 pub struct LinuxState {
     alarm: itimer::Timer,
     vfork_parent: Option<usize>,
-    keyboard: lib::keyboard::State,
+    keyboard: alloc::sync::Arc<spin::Mutex<lib::keyboard::State>>,
     async_io: async_io::State,
     signals: signals::State,
     tty: alloc::sync::Arc<spin::Mutex<tty::Console>>,
@@ -113,6 +114,7 @@ pub struct LinuxState {
     pub heap_end: usize,
     pub mmap_cursor: usize,
     occupied_ranges: alloc::vec::Vec<(usize, usize)>,
+    shared_mappings: shared_mapping::State,
     pub tls_entry: i32,            // GDT index for TLS (13-15), -1 = none
     pub tls_base: u32,
     pub tls_limit: u32,
@@ -153,7 +155,7 @@ impl LinuxState {
         LinuxState {
             alarm: itimer::Timer::default(),
             vfork_parent: None,
-            keyboard: lib::keyboard::State::new(),
+            keyboard: alloc::sync::Arc::new(spin::Mutex::new(lib::keyboard::State::new())),
             async_io: async_io::State::default(),
             signals: signals::State::default(),
             tty: alloc::sync::Arc::new(spin::Mutex::new(tty::Console::new())),
@@ -161,6 +163,7 @@ impl LinuxState {
             heap_end: 0,
             mmap_cursor: crate::kernel::elf::USER_STACK_TOP - 0x0100_0000,
             occupied_ranges: alloc::vec::Vec::new(),
+            shared_mappings: shared_mapping::State::default(),
             tls_entry: -1,
             tls_base: 0,
             tls_limit: 0,
@@ -213,6 +216,11 @@ impl LinuxState {
 
     pub fn close_virtual_fds(&mut self) { self.async_io = async_io::State::default(); }
 
+    /// Called only after this process's guest aliases have been removed.
+    pub(crate) fn release_mappings<A: crate::Arch>(&mut self, machine: &mut A) {
+        self.shared_mappings.release(machine, 0, usize::MAX);
+    }
+
     pub fn cwd_str(&self) -> &[u8] { &self.cwd[..self.cwd_len] }
 
     /// Path the running image was loaded from (`/proc/self/exe` target).
@@ -241,8 +249,9 @@ impl LinuxState {
     }
 
     /// Feed console input through the terminal settings shared by forked processes.
-    pub fn process_key<A: crate::Arch>(&mut self, _machine: &mut A, fds: &[FdKind; MAX_FDS], scancode: u8) {
-        if !crate::kernel::keyboard::update_console(&mut self.keyboard,scancode) { return; }
+    pub fn process_key<A: crate::Arch>(&mut self, _machine: &mut A, _fds: &[FdKind; MAX_FDS], scancode: u8) {
+        let mut keyboard = self.keyboard.lock();
+        if !crate::kernel::keyboard::update_console(&mut keyboard,scancode) { return; }
         let event = crate::kernel::keyboard::event();
         let navigation = !((0x47..=0x53).contains(&event.scan) && event.length != 0);
         let sequence: &[u8] = match if navigation { scancode } else { 0 } {
@@ -255,7 +264,10 @@ impl LinuxState {
             0x0f if crate::kernel::keyboard::key_down(0x2a) || crate::kernel::keyboard::key_down(0x36) => b"\x1b[Z",
             _ => b"",
         };
-        if let FdKind::PipeRead(idx) = fds[0] {
+        {
+            // Keyboard input belongs to the controlling console, even while
+            // the CPU polls a helper whose stdin is redirected to an IPC pipe.
+            let idx = thread::console_pipe();
             let mut tty = self.tty.lock();
             tty.set_column(lib::term::term().cursor_pos().0);
             let mut feed = |bytes: &[u8]| tty.input(bytes, |data| { crate::kernel::kpipe::write(idx, data); }, || crate::kernel::kpipe::write_eof(idx), |data| {
@@ -263,7 +275,7 @@ impl LinuxState {
                 crate::kernel::term::mark_dirty();
             });
             if !sequence.is_empty() { feed(sequence); return; }
-            if self.keyboard.down(0x38,false) && !self.keyboard.altgr() && event.length != 0 {
+            if keyboard.down(0x38,false) && !keyboard.altgr() && event.length != 0 {
                 feed(b"\x1b");
             }
             for &character in event.characters() {
@@ -585,6 +597,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         55 | 221 if matches!(a.a1, 5..=7 | 12..=14) => record_lock::call(machine, kt, linux, a, false),
         55  => sys_fcntl(kt, a),
         143 => sys_flock(kt, linux, a),
+        144 => shared_mapping::msync(linux, a),
         118 | 148 => sys_fsync(kt, a),
         370 => message::sendmsg(machine, kt, a, false),
         372 => message::recvmsg(machine, kt, a, false),
@@ -684,6 +697,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         22  => sys_pipe(machine, kt, a, false),
         24  => sys_sched_yield(kt, regs),
         25  => sys_mremap(machine, linux, a),
+        26  => shared_mapping::msync(linux, a),
         // statfs(137): -ENOSYS — callers fall back. fadvise64(221): advisory.
         137 => SyscallResult::val(-ENOSYS),
         332 => sys_statx(machine, kt, linux, a),
@@ -1118,6 +1132,7 @@ pub(crate) fn handle_fork<A: crate::Arch>(
         cl.heap_end = pl.heap_end;
         cl.mmap_cursor = pl.mmap_cursor;
         cl.occupied_ranges = pl.occupied_ranges.clone();
+        cl.shared_mappings = pl.shared_mappings.fork();
         cl.signals = signals::fork(&pl.signals, async_io::current_id(&pl.async_io, parent.kernel.tid), child.kernel.tid);
         cl.tls_entry = pl.tls_entry;
         cl.tls_base = pl.tls_base;
@@ -1128,6 +1143,7 @@ pub(crate) fn handle_fork<A: crate::Arch>(
         cl.exec_path = pl.exec_path;
         cl.exec_path_len = pl.exec_path_len;
         cl.tty = pl.tty.clone();
+        cl.keyboard = pl.keyboard.clone();
         cl.async_io = async_io::fork_state(&pl.async_io);
     }
 
@@ -1159,6 +1175,9 @@ pub(crate) fn release_vfork<A: crate::Arch>(machine: &mut A, threads: &mut [thre
         pl.heap_end = cl.heap_end;
         pl.mmap_cursor = cl.mmap_cursor;
         pl.occupied_ranges = cl.occupied_ranges.clone();
+        let mappings = cl.shared_mappings.fork();
+        pl.release_mappings(machine);
+        pl.shared_mappings = mappings;
     }
     parent.kernel.state = thread::ThreadState::Ready;
 }
@@ -1714,7 +1733,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
 
     let inherited_async = if matches!(format, exec::BinaryFormat::Elf) {
         match &thread::get_thread(threads, tid).unwrap().personality {
-            thread::Personality::Linux(linux) => Some((async_io::exec_state(&linux.async_io), linux.tty.clone(),
+            thread::Personality::Linux(linux) => Some((async_io::exec_state(&linux.async_io), linux.tty.clone(), linux.keyboard.clone(),
                 signals::exec(&linux.signals, async_io::current_id(&linux.async_io, tid as i32), tid as i32), linux.alarm)),
             _ => None,
         }
@@ -1727,6 +1746,9 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     if matches!(format, exec::BinaryFormat::Elf | exec::BinaryFormat::Lx
         | exec::BinaryFormat::Ne | exec::BinaryFormat::Pe) {
         machine.free_user_pages();
+        if let thread::Personality::Linux(linux) = &mut thread::get_thread(threads, tid).unwrap().personality {
+            linux.release_mappings(machine);
+        }
     }
 
     let exec_vga = match format {
@@ -1751,7 +1773,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     if let Some(inherited) = inherited_async
         && let thread::Personality::Linux(linux) = &mut thread::get_thread(threads, tid).unwrap().personality
     {
-        (linux.async_io, linux.tty, linux.signals, linux.alarm) = inherited;
+        (linux.async_io, linux.tty, linux.keyboard, linux.signals, linux.alarm) = inherited;
     }
     if let Some(handoff) = exec_display {
         let new = thread::get_thread(threads, tid).unwrap();
@@ -2233,6 +2255,7 @@ fn sys_munmap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args)
     let Some(end) = addr.checked_add(length).and_then(|v| v.checked_add(4095)).map(|v| v & !4095) else { return SyscallResult::val(-EINVAL); };
     if end > elf::USER_STACK_TOP { return SyscallResult::val(-EINVAL); }
     machine.unmap_range(addr / 4096, (end - addr) / 4096);
+    linux.shared_mappings.release(machine, addr, end);
     // Reuse a just-freed region at the current downward allocation frontier.
     if addr == linux.mmap_cursor { linux.mmap_cursor = end; }
     SyscallResult::val(0)
@@ -2285,8 +2308,8 @@ pub(crate) fn handle_wait<A: crate::Arch>(
         linux.waiting_child = Some(pid);
     }
     thread::block_thread(threads, tid);
-    thread::schedule(threads, tid)
-        .or_else(|| crate::kernel::sched::linux_blocked_successor(threads, tid, true))
+    crate::kernel::sched::linux_blocked_successor(threads, tid, true)
+        .or_else(|| thread::schedule(threads, tid))
 }
 
 /// Reap a consumed blocking wait after the exit transaction and space switch.
@@ -2608,11 +2631,9 @@ fn sys_mmap2<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
             _ => return SyscallResult::val(-EBADF),
         }
     } else { None };
-    // File mappings are eager copies. Writable MAP_SHARED needs coherent
-    // writeback, which this backend cannot supply (linkers use mapped output
-    // files). Reject that capability before changing any existing mapping.
-    if file_handle.is_some() && a.a2 & 2 != 0 && matches!(flags & 3, 1 | 3) {
-        return SyscallResult::val(-19);
+    let shared = file_handle.is_some() && matches!(flags & 3, 1 | 3);
+    if shared && let Err(error) = vfs::mapping::validate(file_handle.unwrap(), offset_bytes, alloc_size, a.a2 & 2 != 0) {
+        return SyscallResult::val(error);
     }
 
     let base = if flags & MAP_FIXED != 0 {
@@ -2629,7 +2650,17 @@ fn sys_mmap2<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     // MAP_FIXED replaces existing user pages, including read-only ELF pages.
     // Clear the mappings first so filling the replacement cannot fault on an
     // old protection bit or modify a frame shared with a forked process.
-    if flags & MAP_FIXED != 0 { machine.unmap_range(base / 4096, alloc_size / 4096); }
+    if shared {
+        if let Err(error) = linux.shared_mappings.map(machine, file_handle.unwrap(), offset_bytes, base, alloc_size, a.a2) {
+            return SyscallResult::val(error);
+        }
+        if flags & MAP_FIXED != 0 { linux.occupied_ranges.push((base, base + alloc_size)); }
+        return SyscallResult::val64(base as i64);
+    }
+    if flags & MAP_FIXED != 0 {
+        machine.unmap_range(base / 4096, alloc_size / 4096);
+        linux.shared_mappings.release(machine, base, base + alloc_size);
+    }
 
     // File-backed mapping: read the file region into the (demand-allocated)
     // pages so the dynamic linker can map libc et al. Anonymous mappings stay
@@ -2664,6 +2695,9 @@ fn sys_mremap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args)
     let new_len = a.a2 as usize;
     let flags = a.a3 as u32;
     if old_addr & 0xFFF != 0 || new_len == 0 {
+        return SyscallResult::val(-EINVAL);
+    }
+    if linux.shared_mappings.intersects(old_addr, old_addr.saturating_add(old_len)) {
         return SyscallResult::val(-EINVAL);
     }
     if new_len <= old_len {

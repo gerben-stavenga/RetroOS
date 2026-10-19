@@ -21,6 +21,10 @@ launch() {
     else
         args=(-m 128 -drive "file=$BOOT_IMAGE,format=raw")
     fi
+    # Native Linux applications share this live filesystem with metal. Codex's
+    # client/background server outgrow the small standalone DOS defaults.
+    # Explicit emulator arguments appended below can still override this.
+    [ "$LIVE" != 1 ] || args+=(-m 2048)
     if [ "$FREEDOS" = 0 ] && [ -n "$DATA_IMAGE" ]; then
         args+=(-drive "file=$DATA_IMAGE,if=none,id=data,format=raw")
         case "$HD" in

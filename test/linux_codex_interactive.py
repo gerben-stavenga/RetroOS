@@ -4,6 +4,7 @@
 Uses a private copy of the saved login and a separate home. No model tools are
 requested. Terminal text and a screenshot are retained, credentials are not.
 """
+import argparse
 import json
 import os
 import re
@@ -25,7 +26,10 @@ EXPECTED = 'Hello from interactive Codex on RetroOS.'
 
 
 def main():
-    artifacts = ROOT / 'build/ci/codex-interactive'
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--daemon', action='store_true', help='Exercise the background server')
+    options = parser.parse_args()
+    artifacts = ROOT / 'build/ci' / ('codex-interactive-daemon' if options.daemon else 'codex-interactive')
     artifacts.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='retroos-interactive-') as directory:
         work = Path(directory)
@@ -37,11 +41,14 @@ def main():
         (home / '.codex/config.toml').write_text(
             'model = "gpt-6.1-sol"\nmodel_reasoning_effort = "medium"\n'
             '[projects."/home/retroos/work"]\ntrust_level = "trusted"\n')
-        # The SMB backend follows host symlinks but cannot expose their target
-        # bytes. Invoke the package entrypoint explicitly for resource lookup.
-        command = [str(DEFAULT_BINARY), '--no-daemon', '--no-alt-screen',
+        # Exercise the ordinary PATH launcher, including installed-package
+        # discovery through SMB rather than bypassing it with the binary path.
+        command = ['codex', '--no-alt-screen',
                    '--disable', 'apps', '--disable', 'shell_snapshot',
+                   '--disable', 'plugins', '--disable', 'remote_plugin',
                    '--sandbox', 'read-only', '-C', '/home/retroos/work']
+        if not options.daemon:
+            command.insert(1, '--no-daemon')
         (home / 'run.sh').write_text('exec ' + shlex.join(command) + '\n')
         profile = work / 'profile.json'
         profile.write_text(json.dumps({'root': '/', 'c_root': str(home)}))
@@ -84,6 +91,7 @@ def main():
                 sent = False
                 submitted_at = 0
                 late_trace = False
+                debugged = False
                 while time.monotonic() < deadline:
                     result = request('screen')
                     screen = bytes.fromhex(result['texthex']).decode()
@@ -94,6 +102,9 @@ def main():
                     if sent and not late_trace and os.environ.get('RETROOS_INTERACTIVE_TRACE_DELAY') and time.monotonic() - submitted_at > float(os.environ['RETROOS_INTERACTIVE_TRACE_DELAY']):
                         request('trace on')
                         late_trace = True
+                    if sent and not debugged and time.monotonic() - submitted_at > 20:
+                        request('debug dump')
+                        debugged = True
                     # Only enter a prompt after the interactive editor appears.
                     if not sent and ('Ask Codex to do anything' in screen or 'context left' in screen or 'gpt-6.1-sol' in screen and 'directory:' in screen):
                         prompt = 'Reply exactly: ' + EXPECTED + ' Do not use any tools or read any files.'

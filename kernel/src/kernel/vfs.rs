@@ -25,6 +25,8 @@ use spin::Mutex;
 use crate::kernel::thread::{FdKind, MAX_FDS};
 use crate::kernel::fs::grant::WriteAccess;
 
+pub mod mapping;
+
 /// First usable file descriptor (0=stdin, 1=stdout, 2=stderr)
 const FIRST_FD: usize = 3;
 
@@ -312,7 +314,8 @@ fn path_ino(path: &[u8]) -> u64 {
 pub struct FileEntry {
     pub vnode: Vnode,
     pub offset: u32,
-    pub refcount: u16,
+    /// Includes the backing references held by shared file pages.
+    pub refcount: u32,
     /// Stable per-file inode (FNV hash of the path). fstat reports it so the
     /// dynamic linker's (st_dev, st_ino) dedup distinguishes libraries — without
     /// it every file shares ino 0 and ld.so thinks libc == the main binary.
@@ -487,6 +490,7 @@ struct Vfs {
     /// Stable open-file indices. Closed slots are reused and the table grows
     /// with demand; process handle limits belong to each process's fd/JFT.
     file_table: Vec<FileEntry>,
+    mapped_pages: BTreeMap<mapping::Key, mapping::Page>,
     dir_cache: Vec<DirCache>,
     /// Changes whenever directory-visible metadata may have changed. DOS's
     /// 8.3 cache keys off this so a file grown after create is not forever
@@ -504,6 +508,7 @@ impl Vfs {
             locks: Vec::new(),
             record_locks: crate::kernel::fs::record_locks::Table::new(),
             file_table: Vec::new(),
+            mapped_pages: BTreeMap::new(),
             dir_cache: Vec::new(),
             dir_generation: 0,
         }
@@ -1226,6 +1231,7 @@ impl Vfs {
         if !permitted {
             return -13; // EACCES
         }
+        if self.has_mapped_path(path) { return -16; }
         if let Some(vnode) = fs.create(subpath) {
             if !existed && !self.claim(midx, subpath) {
                 fs.clunk(vnode.handle);
@@ -1276,6 +1282,8 @@ impl Vfs {
         if !self.may_write(old_idx, old_sub)
             || !self.may_write_parent(old_idx, old_sub)
             || !self.may_write_parent(new_idx, new_sub) { return -13; }
+        // Mapped files retain their VFS identity until the last unmap.
+        if self.has_mapped_path(old) { return -16; }
         let rc = old_fs.rename(old_sub, new_sub);
         if rc < 0 { return rc; }
         self.rekey_open_paths(old, new);
@@ -1349,6 +1357,8 @@ impl Vfs {
     }
 
     fn flush_handle(&mut self, handle: i32) -> i32 {
+        let status = self.flush_mappings(handle);
+        if status < 0 { return status; }
         let Some(object) = self.handle_object(handle) else { return -9 };
         let (fs, subpath) = (object.fs, object.subpath());
         let status = fs.flush(subpath);
@@ -1416,6 +1426,7 @@ impl Vfs {
         {
             return -13; // EACCES
         }
+        if self.has_mapped_path(path) { return -16; }
         let r = fs.remove(subpath);
         if r >= 0 {
             self.modes.remove(path);
@@ -1436,13 +1447,16 @@ impl Vfs {
             (e.mount_idx, e.vnode.handle, e.offset, e.vnode.size)
         };
         let n = self.mount_fs(mount_idx).read(fs_handle, offset, buf, size);
+        if n > 0 { self.mapped_read(handle, offset, &mut buf[..n as usize]); }
         if n > 0 && self.file_table[h].vnode.mode & 0o170000 != 0o20000 { self.file_table[h].offset += n as u32; }
         n
     }
 
     fn read_at_by_handle(&self, handle: i32, offset: u32, buf: &mut [u8]) -> i32 {
         let Some(entry) = self.file_table.get(handle as usize).filter(|entry| entry.refcount != 0) else { return -9; };
-        self.mount_fs(entry.mount_idx).read(entry.vnode.handle, offset, buf, entry.vnode.size)
+        let n = self.mount_fs(entry.mount_idx).read(entry.vnode.handle, offset, buf, entry.vnode.size);
+        if n > 0 { self.mapped_read(handle, offset, &mut buf[..n as usize]); }
+        n
     }
 
     fn write_at_by_handle(&mut self, handle: i32, offset: u32, data: &[u8]) -> i32 {
@@ -1452,6 +1466,7 @@ impl Vfs {
         let n = self.mount_fs(mount_idx).write(fs_handle, offset, data);
         if self.file_table[handle as usize].vnode.mode & 0o170000 == 0o20000 { return n; }
         if n > 0 {
+            self.mapped_write(handle, offset, &data[..n as usize]);
             let end = offset.saturating_add(n as u32);
             for e in &mut self.file_table {
                 if e.refcount != 0 && e.mount_idx == mount_idx && e.ino == ino {
@@ -1477,8 +1492,15 @@ impl Vfs {
         if entry.refcount == 0 { return -9; }
         if !entry.writable { return -30; }
         let (mount, fid, ino) = (entry.mount_idx, entry.vnode.handle, entry.ino);
+        let old_size = entry.vnode.size;
+        if size < old_size && self.mapped_pages.range((mount, ino, 0)..=(mount, ino, u32::MAX)).next().is_some() {
+            return -16; // Mapped shrink needs SIGBUS support; never leave stale aliases.
+        }
         let result = self.mount_fs(mount).resize(fid, size);
         if result < 0 { return result; }
+        if size > old_size {
+            self.zero_mapping_growth(handle, old_size, size);
+        }
         for entry in &mut self.file_table {
             if entry.refcount != 0 && entry.mount_idx == mount && entry.ino == ino {
                 entry.vnode.size = size;

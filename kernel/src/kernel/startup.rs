@@ -2287,11 +2287,10 @@ fn dispatch<A: crate::Arch>(
         .handle_event(machine, bios_display, &mut thread.kernel, regs, kevent)
 }
 
-/// Switch console focus and execution together — today's coupling, in one
-/// named place. The event loop runs the focused thread, so every execution
-/// switch is also a focus handoff (release: out-focus screen snapshot with
-/// the old context live; acquire: in-focus repaint with the new context
-/// live). When the scheduler decouples them, this helper is what splits.
+/// Switch console focus and execution together, except that processes sharing
+/// one Linux terminal keep its display in place across CPU ownership changes.
+/// Other switches release the outgoing presentation with its address space
+/// live and acquire the incoming one after switching address spaces.
 ///
 /// Zombies skip the release because `exit_thread` already released the
 /// display before `arch_user_clean` unmapped 0xA0000. On normal DOS return,
@@ -2309,6 +2308,23 @@ fn switch_focus_and_run<A: crate::Arch>(
     display: &mut Option<crate::kernel::display::Display>,
     windows: &mut crate::kernel::gui::WindowManager,
 ) {
+    let focused = crate::kernel::focus::focused();
+    let same_terminal = new_tid != ctx.tid
+        && matches!((&threads[ctx.tid].personality, &threads[new_tid].personality),
+            (thread::Personality::Linux(old), thread::Personality::Linux(new))
+                if old.shares_terminal(new));
+    if same_terminal && (focused == ctx.tid || focused == new_tid)
+        && display.is_some() && exiting_display.is_none()
+    {
+        // A shell and its helpers share the same presentation. A display
+        // handoff clears the framebuffer, so polling their blocked I/O must
+        // only switch registers/address spaces, without selecting or repainting
+        // the window. The focused CPU owner still routes the shared tty input.
+        ctx.switch_to(threads, machine, new_tid);
+        crate::kernel::focus::adopt(new_tid);
+        crate::kernel::linux::foreground_console(new_tid);
+        return;
+    }
     if new_tid == ctx.tid {
         let focused = crate::kernel::focus::focused();
         if focused == new_tid {

@@ -78,6 +78,10 @@ It reads the same GNU programs, shared libraries, CA certificates and user
 edits are visible immediately on the host. Existing C: application symlinks
 retain access to their targets with your Unix user's permissions.
 
+Live-files QEMU defaults to 2 GiB RAM for native Linux applications, including
+Codex's client and background server. Override this with emulator arguments,
+for example `./run.sh qemu --kvm -- -m 4096`.
+
 The launcher starts a private Samba process on loopback, with a random port
 and fresh per-launch credentials. It reuses installed Samba tools or the
 existing user-local RetroOS Samba tools. On Debian/Ubuntu, setup can extract
@@ -247,12 +251,22 @@ backend updates, including `UTIME_NOW`, `UTIME_OMIT` and no-follow semantics.
 Existing timestamps retain one-second precision; Linux `statx` reports
 unsupported access/change timestamp reads as unavailable.
 
-File mappings currently use eager copies. Writable shared file mappings return
-`ENODEV`; accepting them silently discarded linker output. Mapping failures leave an
-existing `MAP_FIXED` destination intact. `python3 test/linux_rustc.py` compiles,
+Private file mappings currently use eager copies. Shared file mappings alias
+kernel-owned VFS pages: overlapping mappings and forked processes see the same
+RAM, regular reads overlay mapped bytes, and regular writes update those pages.
+`msync`, `fsync` and final unmapping write modified pages back to the backend;
+closing the original fd does not invalidate the mapping. Protection changes
+retain page ownership flags so fork and cleanup cannot free kernel-owned RAM.
+Mapping validation/backing reads happen before a shared `MAP_FIXED` replacement.
+Mapped file shrinking, renaming/unlinking mapped files, remapping shared ranges
+and whole pages beyond EOF are explicitly unsupported. Mapped shrinking,
+including `O_TRUNC`, returns `EBUSY` pending SIGBUS support; rename/unlink also
+return `EBUSY` until file identity can survive namespace changes.
+These pages coordinate RetroOS processes, not concurrent external SMB clients.
+Run `python3 test/linux_proc_fd.py` for private isolation, shared visibility,
+fork, fd-close lifetime, overlapping offsets, partial unmap and persistence
+through both Linux ABIs on ext4 and SMB. `python3 test/linux_rustc.py` compiles,
 links and executes a native Rust program, checking its ELF header and output.
-The proc-fd test covers private-copy isolation and rejected writable shared mappings
-through both Linux ABIs on ext4 and SMB.
 
 To expose the locally installed native Codex executable and seed its separate
 RetroOS login, run as your Linux user:
@@ -261,33 +275,49 @@ RetroOS login, run as your Linux user:
 python3 tools/setup_codex.py
 ```
 
-This installs links under `/home/retroos/bin` for Codex and its code-mode
-helper, bypassing the npm Node launcher. It copies saved CLI authentication
+This installs executable wrappers under `/home/retroos/bin` for Codex and its
+code-mode helper, bypassing the npm Node launcher. The wrappers exec the real
+package path so SMB symlink handling does not hide the installed package from
+`/proc/self/exe` discovery. It copies saved CLI authentication
 into a private `/home/retroos/.codex` only when no RetroOS login exists.
 Existing login state is preserved. After installing the updated kernel and
 runtime, start `SHELL.ELF` and run `codex --version` or `codex exec`.
 The same setup is used with live QEMU files and the physical-machine root.
 
-Interactive Codex 0.163.0 has returned `Hello from interactive Codex on
+An earlier interactive Codex 0.163.0 test returned `Hello from interactive Codex on
 RetroOS.` in the actual QEMU/KVM terminal, with a prompt entered through the
 guest keyboard and the assistant reply verified from the terminal grid.
-From `SHELL.ELF`, the tested response-only configuration is:
+From `SHELL.ELF`, that response-only configuration was:
 
 ```sh
 codex --no-daemon --disable apps --disable shell_snapshot
 ```
 
-The default background server still requests the unsupported
-`clone(CLONE_VM | CLONE_VFORK | SIGCHLD)` process-spawning mode. The test uses
-the in-process server and disables Apps and shell snapshots; model-generated
-tool execution and the normal daemon mode are not covered by this result.
+SQLite WAL startup requires shared file pages. Returning `ENODEV` for writable
+shared mappings caused `SQLITE_IOERR_SHMMAP` (5386), which Codex described as a
+damaged local database even for a fresh private home. Shared VFS mappings now
+provide this capability without resetting saved databases or login state.
+Both Codex modes now get past database initialization, but the interactive
+model-response tests still time out; the earlier successful response is not a
+verification of the current full startup path.
+Run `python3 test/linux_sqlite.py` for a focused native SQLite WAL test using
+the host's `libsqlite3.so.0`: concurrent reader snapshots, writer commits,
+checkpoint, reopen, and a host integrity check after the guest exits.
 
 Run `python3 test/linux_codex_interactive.py` to reproduce the interactive
 request with a private copy of saved authentication, a separate temporary home,
 and live SMB files. It retains terminal text and a QEMU screenshot under
-`build/ci/codex-interactive`, then removes the private login. Since SMB follows
-host symlinks without exposing their target bytes, this test invokes the native
-package entrypoint explicitly; metal uses the ordinary `~/bin/codex` link.
+`build/ci/codex-interactive`, then removes the private login. The test invokes
+the ordinary PATH wrapper. Add `--daemon` to test the background server; its
+artifacts are under `build/ci/codex-interactive-daemon`.
+These response-only probes disable Apps, shell snapshots, plugins and remote
+plugins so auxiliary setup does not become part of the model-response check.
+
+Run `python3 test/linux_console_focus.py` to check Linux terminal ownership
+above a ready DOS launcher. It exercises yield, fork and blocking wait, samples
+the framebuffer for clearing/flicker, and delivers keyboard input while stdin
+is redirected to an IPC pipe. Processes sharing a terminal retain its display
+across CPU switches, with shared keyboard modifier state and console input.
 
 SQLite uses shared VFS process-owned advisory byte-range locks. Linux exposes
 `F_GETLK`, `F_SETLK`, and `F_SETLKW`, including both i386 flock layouts. Closing

@@ -886,7 +886,13 @@ pub fn yield_thread<A: crate::Arch>(threads: &mut [Thread<A>], tid: usize, regs:
         k.vcpu.regs = *regs;
         k.state = ThreadState::Ready;
     }
-    schedule(threads, tid)
+    if matches!(threads[tid].personality, Personality::Linux(_)) {
+        // Yield execution within the terminal, not visible focus back to a
+        // ready DOS launcher or another application's console.
+        crate::kernel::sched::linux_blocked_successor(threads, tid, false)
+    } else {
+        schedule(threads, tid)
+    }
 }
 
 /// Set return value in thread's saved state
@@ -1074,6 +1080,9 @@ pub fn exit_thread<A: crate::Arch>(
     }
 
     machine.free_user_pages();
+    if let Personality::Linux(linux) = &mut threads[tid].personality {
+        linux.release_mappings(machine);
+    }
     threads[tid].kernel.state = ThreadState::Zombie;
     crate::compact_dbg_println!("[mem] exit tid={} code={} free_pages={}",
         tid, exit_code, machine.free_page_count());

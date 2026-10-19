@@ -980,7 +980,10 @@ fn set_page_flags_entry<E: paging2::Entry>(entries: &mut [E], vaddr: usize, writ
     let page = paging2::page_idx(vaddr);
     if entries[page].present() {
         let phys = entries[page].page();
-        let mut entry = E::new(phys, writable, true);
+        // Changing protection must retain ownership/cache flags. In particular,
+        // FOREIGN aliases are owned by a kernel allocation, not guest cleanup
+        // or fork COW; rebuilding the entry would turn them into owned frames.
+        let mut entry = entries[page];
         entry.set_writable(writable);
         entry.set_no_execute(!executable);
         let displaced = paging2::replace_entry(&mut entries[page], entry);

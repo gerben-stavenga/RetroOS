@@ -25,17 +25,18 @@ static long call(word n,word a,word b,word c,word d) {
 }
 static void check(int ok,int code){if(!ok){call(__NR_exit,code,0,0,0);for(;;){}}}
 #ifdef __x86_64__
-static long mapping(word base,word flags,word file,word protection){
+static long mapping_region(word base,word flags,word file,word protection,word length,word offset){
  long result;register word fourth __asm__("r10")=flags;
- register word fifth __asm__("r8")=file,sixth __asm__("r9")=0;
- __asm__ volatile("syscall":"=a"(result):"a"(__NR_mmap),"D"(base),"S"(4096UL),"d"(protection),"r"(fourth),"r"(fifth),"r"(sixth):"rcx","r11","memory");
+ register word fifth __asm__("r8")=file,sixth __asm__("r9")=offset;
+ __asm__ volatile("syscall":"=a"(result):"a"(__NR_mmap),"D"(base),"S"(length),"d"(protection),"r"(fourth),"r"(fifth),"r"(sixth):"rcx","r11","memory");
  return result;
 }
 #else
-__attribute__((naked)) static long mapping(word base,word flags,word file,word protection){
- __asm__ volatile("push %ebx; push %esi; push %edi; push %ebp; mov 20(%esp),%ebx; mov $4096,%ecx; mov 32(%esp),%edx; mov 24(%esp),%esi; mov 28(%esp),%edi; xor %ebp,%ebp; mov $192,%eax; int $0x80; pop %ebp; pop %edi; pop %esi; pop %ebx; ret");
+__attribute__((naked)) static long mapping_region(word base,word flags,word file,word protection,word length,word offset){
+ __asm__ volatile("push %ebx; push %esi; push %edi; push %ebp; mov 20(%esp),%ebx; mov 36(%esp),%ecx; mov 32(%esp),%edx; mov 24(%esp),%esi; mov 28(%esp),%edi; mov 40(%esp),%ebp; shr $12,%ebp; mov $192,%eax; int $0x80; pop %ebp; pop %edi; pop %esi; pop %ebx; ret");
 }
 #endif
+static long mapping(word base,word flags,word file,word protection){return mapping_region(base,flags,file,protection,4096,0);}
 static unsigned char buffer[96],seen[2048];
 static char link[256];
 static Stat metadata;
@@ -197,21 +198,58 @@ __attribute__((force_align_arg_pointer)) void _start(void){
   check(call(FSTAT,held[n],(word)&metadata,0,0)==0 && (metadata.st_mode&0170000)==0040000,76);
   call(__NR_close,held[n],0,0,0);
  }
- /* Private copies preserve files; writable shared file maps must not lose data. */
+ /* Private isolation and coherent shared pages across opens, I/O and fork. */
  file=call(__NR_open,(word)"/home/retroos/target",2,0,0);check(file>=0,100);
  word mapped=(word)mapping(0,2,file,3);check(mapped<(word)-4095,101);
  check(*(volatile char *)mapped=='P',102);*(volatile char *)mapped='Q';
  check(call(__NR_munmap,mapped,4096,0,0)==0,103);
  check(call(__NR_read,file,(word)link,1,0)==1 && link[0]=='P',104);
- check(mapping(0,1,file,3)==-19 && mapping(0,3,file,3)==-19,105);
+ word shared=(word)mapping(0,1,file,3);check(shared<(word)-4095,105);
+ long other=call(__NR_open,(word)"/home/retroos/target",2,0,0);check(other>=0,140);
+ word alias=(word)mapping(0,3,other,3);check(alias<(word)-4095,141);
+ *(volatile char *)shared='S';check(*(volatile char *)alias=='S',142);
+ check(call(__NR_lseek,other,0,0,0)==0 && call(__NR_read,other,(word)link,1,0)==1 && link[0]=='S',143);
+ check(call(__NR_lseek,other,0,0,0)==0 && call(__NR_write,other,(word)"T",1,0)==1,144);
+ check(*(volatile char *)shared=='T' && *(volatile char *)alias=='T',145);
+ long child=call(__NR_fork,0,0,0,0);check(child>=0,146);
+ if(!child){*(volatile char *)alias='U';call(__NR_exit,17,0,0,0);for(;;){}}
+ int shared_status=0;check(call(__NR_wait4,child,(word)&shared_status,0,0)==child && shared_status==(17<<8),147);
+ check(*(volatile char *)shared=='U',148);
+ call(__NR_close,other,0,0,0);
+ *(volatile char *)shared='P';check(call(__NR_msync,alias,4096,4,0)==0,149);
+ check(call(__NR_munmap,alias,4096,0,0)==0 && call(__NR_munmap,shared,4096,0,0)==0,150);
  check(mapping(0,1,(word)-9,3)==-9,106);
  mapped=(word)mapping(0,1,file,1);check(mapped<(word)-4095 && *(volatile char *)mapped=='P',107);
  check(call(__NR_munmap,mapped,4096,0,0)==0,111);
  check(call(__NR_read,file,(word)link,1,0)==1 && link[0]=='R',112);
  mapped=0x50000000UL;check((word)mapping(mapped,0x32,(word)-1,3)==mapped,108);
  *(volatile word *)mapped=0x12345678;
- check(mapping(mapped,0x11,file,3)==-19 && *(volatile word *)mapped==0x12345678,109);
+ check(mapping(mapped,0x11,(word)-9,3)==-9 && *(volatile word *)mapped==0x12345678,109);
  check(call(__NR_munmap,mapped,4096,0,0)==0,110);call(__NR_close,file,0,0,0);
+ /* Overlapping file offsets, partial unmap, fd-close lifetime and writeback. */
+ file=call(__NR_open,(word)"/home/retroos/shared-pages",578,0600,0);check(file>=0,151);
+ check(call(__NR_ftruncate,file,12288,0,0)==0,152);
+ mapped=(word)mapping_region(0,1,file,3,12288,0);check(mapped<(word)-4095,153);
+ alias=(word)mapping_region(0,1,file,3,4096,4096);check(alias<(word)-4095,154);
+ *(volatile char *)(mapped+4096)='M';check(*(volatile char *)alias=='M',155);
+ check((word)mapping_region(mapped+4096,0x11,file,3,4096,8192)==mapped+4096,166);
+ *(volatile char *)(mapped+4096)='X';
+ check(*(volatile char *)alias=='M' && *(volatile char *)(mapped+8192)=='X',167);
+ check(call(__NR_ftruncate,file,4096,0,0)==-16,156);
+ check(call(__NR_open,(word)"/home/retroos/shared-pages",514,0600,0)==-16,168);
+ check(call(__NR_unlink,(word)"/home/retroos/shared-pages",0,0,0)==-16,169);
+ check(call(__NR_rename,(word)"/home/retroos/shared-pages",(word)"/home/retroos/renamed-pages",0,0)==-16,170);
+ check(call(__NR_munmap,mapped+4096,4096,0,0)==0,157);
+ *(volatile char *)mapped='A';*(volatile char *)(mapped+8192)='Z';
+ check(call(__NR_close,file,0,0,0)==0,158);
+ *(volatile char *)alias='B';check(call(__NR_msync,alias,4096,4,0)==0,159);
+ check(call(__NR_munmap,alias,4096,0,0)==0,160);
+ check(call(__NR_munmap,mapped,12288,0,0)==0,161);
+ file=call(__NR_open,(word)"/home/retroos/shared-pages",0,0,0);check(file>=0,162);
+ check(call(__NR_read,file,(word)link,1,0)==1 && link[0]=='A',163);
+ check(call(__NR_lseek,file,4096,0,0)==4096 && call(__NR_read,file,(word)link,1,0)==1 && link[0]=='B',164);
+ check(call(__NR_lseek,file,8192,0,0)==8192 && call(__NR_read,file,(word)link,1,0)==1 && link[0]=='Z',165);
+ call(__NR_close,file,0,0,0);
  /* Bazel creates output trees longer than the old 256-byte mutation buffers. */
  char deep[512]="/home/retroos",old[512],overlong[1025];
  unsigned ends[4],length=13;

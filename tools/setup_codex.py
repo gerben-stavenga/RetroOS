@@ -3,10 +3,13 @@
 import argparse
 import os
 from pathlib import Path
+import shlex
 import shutil
+import tempfile
 
 DEFAULT_BINARY = Path('/usr/local/lib/node_modules/@openai/codex/node_modules/'
                       '@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex')
+LAUNCHER_HEADER = '#!/bin/sh\n# Managed by RetroOS tools/setup_codex.py.\n'
 
 
 def setup(home, binary, auth_from):
@@ -22,13 +25,29 @@ def setup(home, binary, auth_from):
         if not target.is_file():
             continue
         link = destination / name
-        if link.is_symlink():
-            if link.resolve() == target:
+        # Samba follows native host symlinks without exposing their target.
+        # Exec the real path so /proc/self/exe identifies the installed package,
+        # allowing Codex to locate its manifest and background-server resources.
+        launcher = LAUNCHER_HEADER + 'exec ' + shlex.quote(str(target)) + ' "$@"\n'
+        if not link.is_symlink() and link.exists():
+            if not link.is_file():
+                raise ValueError(f'Refusing to replace existing file: {link}')
+            with link.open('rb') as existing:
+                current = existing.read(len(launcher.encode()) + 1)
+            if not current.startswith(LAUNCHER_HEADER.encode()):
+                raise ValueError(f'Refusing to replace existing file: {link}')
+            if current == launcher.encode():
                 continue
-            link.unlink()
-        elif link.exists():
-            raise ValueError(f'Refusing to replace existing file: {link}')
-        link.symlink_to(target)
+        with tempfile.NamedTemporaryFile(mode='w', dir=destination,
+                                         prefix='.' + name + '.', delete=False) as output:
+            pending = Path(output.name)
+            try:
+                output.write(launcher)
+                output.flush()
+                pending.chmod(0o755)
+                pending.replace(link)
+            finally:
+                pending.unlink(missing_ok=True)
     state = home / '.codex'
     if state.is_symlink():
         raise ValueError('RetroOS .codex must be a separate directory')
