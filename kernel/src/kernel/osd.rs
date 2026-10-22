@@ -33,7 +33,8 @@ const TAB_SOUND: usize = 1;
 const TAB_DISPLAY: usize = 2;
 const TAB_DISK: usize = 3;
 const TAB_DEBUG: usize = 4;
-const NUM_TABS: usize = 5;
+const TAB_NETWORK: usize = 5;
+const NUM_TABS: usize = 6;
 const TAB_ROWS: usize = 2;
 const DISPLAY_MODES: [crate::kernel::display::DosScaling; 4] = [
     crate::kernel::display::DosScaling::OriginalAspect,
@@ -138,6 +139,7 @@ static DISK_SEL: AtomicUsize = AtomicUsize::new(0);
 static DISK_DEV: AtomicUsize = AtomicUsize::new(0);
 /// First visible row of the Disk tab's scroller.
 static DISK_SCROLL: AtomicUsize = AtomicUsize::new(0);
+static NETWORK_SEL: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_SEL: AtomicUsize = AtomicUsize::new(0);
 static VIF_STATS_VISIBLE: AtomicBool = AtomicBool::new(false);
 static VIF_WINDOWS: AtomicU32 = AtomicU32::new(0);
@@ -183,6 +185,8 @@ pub fn open(borrowed_fullscreen: bool) {
     DISK_SEL.store(0, Ordering::Relaxed);
     DISK_SCROLL.store(0, Ordering::Relaxed);
     DEBUG_SEL.store(0, Ordering::Relaxed);
+    NETWORK_SEL.store(0, Ordering::Relaxed);
+    crate::kernel::net::lan::scanning(true);
     PICKER.store(false, Ordering::Relaxed);
     PRESENTATION_REQ.store(false, Ordering::Relaxed);
     CURRENT_FULLSCREEN.store(borrowed_fullscreen, Ordering::Relaxed);
@@ -197,7 +201,10 @@ pub fn take_repaint_request() -> bool {
     REPAINT.swap(false, Ordering::Relaxed)
 }
 
+pub(crate) fn request_repaint() { REPAINT.store(true, Ordering::Relaxed); }
+
 fn close() {
+    crate::kernel::net::lan::scanning(false);
     PICKER.store(false, Ordering::Relaxed);
     OPEN.store(false, Ordering::Relaxed);
     REPAINT.store(true, Ordering::Relaxed);
@@ -306,6 +313,7 @@ fn active_sel(tab: usize) -> usize {
         TAB_SOUND => SOUND_SEL.load(Ordering::Relaxed),
         TAB_DISPLAY => DISPLAY_SEL.load(Ordering::Relaxed),
         TAB_DISK => DISK_SEL.load(Ordering::Relaxed),
+        TAB_NETWORK => NETWORK_SEL.load(Ordering::Relaxed),
         TAB_DEBUG => DEBUG_SEL.load(Ordering::Relaxed),
         _ => WINDOWS_SEL.load(Ordering::Relaxed),
     }
@@ -316,6 +324,7 @@ fn set_active_sel(tab: usize, sel: usize, sound: SoundView) {
         TAB_SOUND => SOUND_SEL.store(sel.min(sound_item_count(sound) - 1), Ordering::Relaxed),
         TAB_DISPLAY => DISPLAY_SEL.store(sel.min(DISPLAY_MODES.len() - 1), Ordering::Relaxed),
         TAB_DISK => DISK_SEL.store(sel.min(disk_item_count() - 1), Ordering::Relaxed),
+        TAB_NETWORK => NETWORK_SEL.store(sel.min(crate::kernel::net::lan::item_count() - 1), Ordering::Relaxed),
         TAB_DEBUG => DEBUG_SEL.store(sel.min(debug_item_count() - 1), Ordering::Relaxed),
         _ => WINDOWS_SEL.store(sel.min(WINDOWS_NUM_ITEMS - 1), Ordering::Relaxed),
     }
@@ -326,6 +335,7 @@ fn active_item_count(tab: usize, sound: SoundView) -> usize {
         TAB_SOUND => sound_item_count(sound),
         TAB_DISPLAY => DISPLAY_MODES.len(),
         TAB_DISK => disk_item_count(),
+        TAB_NETWORK => crate::kernel::net::lan::item_count(),
         TAB_DEBUG => debug_item_count(),
         _ => WINDOWS_NUM_ITEMS,
     }
@@ -621,6 +631,7 @@ fn active_tab_name(tab: usize) -> &'static [u8] {
         TAB_SOUND => b"Sound",
         TAB_DISPLAY => b"Display",
         TAB_DISK => b"Disk",
+        TAB_NETWORK => b"Network",
         TAB_DEBUG => b"Debug",
         _ => b"Windows",
     }
@@ -939,6 +950,10 @@ fn adjust(up: bool, sound: SoundView) {
         DISK_SCROLL.store(0, Ordering::Relaxed);
         return;
     }
+    if active_tab() == TAB_NETWORK {
+        if active_sel(TAB_NETWORK) == 3 { crate::kernel::net::lan::cycle_cable(up); }
+        return;
+    }
     if active_tab() != TAB_SOUND {
         return;
     }
@@ -1045,6 +1060,10 @@ fn activate<A: crate::Arch>(
             set_active_sel(TAB_DISK, active_sel(TAB_DISK), sound);
             disk_follow_scroll();
         }
+        TAB_NETWORK => {
+            crate::kernel::net::lan::activate(active_sel(TAB_NETWORK));
+            set_active_sel(TAB_NETWORK, active_sel(TAB_NETWORK), sound);
+        },
         TAB_DEBUG => match active_sel(TAB_DEBUG) {
             // Toggle each diagnostic and stay open so the new state shows on the row.
             DEBUG_ITEM_TRACE => crate::kernel::startup::toggle_trace(),
@@ -1389,6 +1408,7 @@ fn paint_tabs(
         (TAB_DISPLAY, b"Display" as &[u8]),
         (TAB_DISK, b"Disk" as &[u8]),
         (TAB_DEBUG, b"Debug" as &[u8]),
+        (TAB_NETWORK, b"Network" as &[u8]),
     ] {
         if tab == TAB_DISK {
             x = tx;
@@ -1515,6 +1535,7 @@ fn display_mode_line(line: &mut Line, item: usize, selected: crate::kernel::disp
 /// Compose one tab row's text into `line`.
 fn item_line(tab: usize, item: usize, line: &mut Line, sound: SoundView) {
     match tab {
+        TAB_NETWORK => line.put(crate::kernel::net::lan::line(item).as_bytes()),
         TAB_DISPLAY => display_mode_line(line, item, crate::kernel::display::dos_scaling()),
         TAB_SOUND => match sound_row_for(sound, item) {
             Some(SoundRow::Status) => sound_status_line(line, sound),

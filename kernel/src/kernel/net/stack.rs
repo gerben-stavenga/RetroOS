@@ -787,3 +787,9 @@ pub fn socket_error(h: i32) -> Result<Option<Error>, Error> {
             .then_some(Error::ConnectionRefused))
     })
 }
+
+pub(super) fn lan_identity() -> Option<([u8; 4], [u8; 6])> {
+    let guard = NETWORK.lock();
+    let n = guard.as_ref()?;
+    Some((n.address?.octets(), n.nic.0.mac_address()))
+}

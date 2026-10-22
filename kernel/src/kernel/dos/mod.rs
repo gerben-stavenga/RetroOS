@@ -38,6 +38,7 @@ macro_rules! dos_trace {
 mod bios;
 pub(crate) use bios::Bda;
 mod dpmi;
+pub(crate) mod ipx;
 mod dfs;
 mod machine;
 mod present;
@@ -133,6 +134,7 @@ impl LaunchPolicy {
 ///     XMS/EMS state, FindFirst/FindNext state, exec-parent chain.
 ///   - `dpmi`: optional DPMI protected-mode state (LDT, memory blocks, callbacks).
 pub struct DosState<A: crate::Arch> {
+    pub(crate) ipx: ipx::IpxState,
     /// Policy-free PC machine state: virtual 8259 PIC, 8253 PIT, PS/2 keyboard,
     /// VGA register set, A20 gate, HMA page tracking.
     ///
@@ -296,6 +298,7 @@ impl<A: crate::Arch> DosState<A> {
         let mut state = alloc::boxed::Box::<Self>::new_uninit();
         let p = state.as_mut_ptr();
         unsafe {
+            core::ptr::addr_of_mut!((*p).ipx).write(ipx::IpxState::new());
             core::ptr::addr_of_mut!((*p).pc).write(machine::PcMachine::new_boxed(machine, vga));
             core::ptr::addr_of_mut!((*p).dta).write(0);
             core::ptr::addr_of_mut!((*p).heap_seg).write(0xA000);
@@ -1734,6 +1737,7 @@ pub fn audio_service<A: crate::Arch>(
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
 pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+    dos.ipx.poll(machine);
     // Keep timer/keyboard delivery from spending the DSP delay inside an IRQ
     // handler. The short step sequence models time passing in the interrupted
     // program, where probe drivers perform their result-byte bookkeeping.
@@ -1788,7 +1792,9 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     let mouse_ready = regs.frame.rflags & (machine::VIF_FLAG as u64) != 0
         && !mouse.cb_in_flight
         && mouse.cb_mask & mouse.pending_cond != 0;
-    if mouse_ready {
+    if ipx::deliver_callback(machine, dos, regs) {
+        // IPX ESRs share the normal real-mode continuation machinery.
+    } else if mouse_ready {
         dos::deliver_mouse_callback(machine, dos, regs);
     } else if let Some(vec) = machine::pick_pending_vec(&mut dos.pc, regs) {
         IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);

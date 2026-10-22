@@ -509,6 +509,8 @@ pub(crate) const SLOT_VBE_WINDOW: u8 = 0x15;
 pub(crate) const SLOT_KBD_INTERCEPT_RETURN: u8 = 0x16;
 /// INT 21h/AH=38h country-information case-map far-call entry.
 pub(super) const SLOT_COUNTRY_UPCASE: u8 = 0x17;
+pub(crate) const SLOT_IPX: u8 = 0x18;
+pub(crate) const SLOT_IPX_RETURN: u8 = 0x19;
 
 /// DOS country-info case map for the active guest code page.
 pub(super) fn country_upcase(ch: u8) -> u8 {
@@ -593,7 +595,7 @@ pub(in crate::kernel::dos) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &
 
     // Hook the DOS/BIOS soft INTs we intercept so guest CD nn lands in our
     // dispatcher (slot index = INT vector).
-    for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x29, 0x2E, 0x2F, 0x33, 0x67] {
+    for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x29, 0x2E, 0x2F, 0x33, 0x67, 0x7A] {
         write_u16(machine, 0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(machine, 0, (int_num as u32) * 4 + 2, STUB_SEG);
     }

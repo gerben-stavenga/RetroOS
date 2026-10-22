@@ -199,6 +199,7 @@ pub(super) use bda_field;
 mod clock;
 pub(super) mod keyboard;
 mod system;
+mod serial;
 pub(super) mod vbe;
 pub(super) mod video;
 
@@ -267,7 +268,8 @@ fn seed_bda<A: crate::Arch>(machine: &mut A) {
     bda_field!(machine, cell_height = 16u16);
     // Bit 0: diskette drives present; bits 7-6: drive count minus one.
     // Two floppy units (the A:/B: image slots), matching the CDS.
-    bda_field!(machine, equipment = 0x0041u16);
+    bda_field!(machine, equipment = 0x0241u16);
+    machine.write::<u16>(0x400, 0x3f8);
     // A real POST leaves the text cursor shape and the CGA compatibility
     // register mirrors set for mode 3; AH=1Bh publishes all three, and a guest
     // reading them back as zero sees a machine with no cursor.
@@ -326,6 +328,7 @@ pub(super) fn dispatch<A: crate::Arch>(
         0x10 => video::int10(machine, bios_display, dos, regs),
         0x11 => system::int11(machine, regs),
         0x12 => system::int12(machine, regs),
+        0x14 => serial::int14(dos, regs),
         0x15 => system::int15(machine, regs),
         0x16 => {
             if keyboard::int16(machine, regs, ip) == keyboard::Parked::Yes {

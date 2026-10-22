@@ -463,6 +463,7 @@ fn exec_load_overlay<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThr
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
 pub(super) fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, parent: ExecParent,
                preserve_pm_env: bool) -> thread::KernelAction {
+    if !preserve_pm_env { dos.ipx.release(machine, dos.current_psp); }
     let mut parent = parent;
     regs.set_ss32(parent.ss as u32);
     regs.set_sp32(parent.sp as u32);
@@ -809,6 +810,7 @@ pub(super) fn return_to_psp_parent<A: crate::Arch>(
     let parent = machine.read::<Psp>(Psp::base(child.parent_psp));
     let saved = parent._ss_sp;
     if parent.int_20 != [0xCD, 0x20] || saved == 0 { return false; }
+    if resident_paras.is_none() { dos.ipx.release(machine, child_seg); }
 
     // The three DOS process vectors belong to the exiting PSP. A loader may
     // have supplied its own INT 22h continuation after AH=55h.

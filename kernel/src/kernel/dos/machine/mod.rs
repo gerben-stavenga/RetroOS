@@ -176,6 +176,7 @@ pub(super) mod vvoodoo;
 // ============================================================================
 // PcMachine — per-thread machine state
 // ============================================================================
+pub(super) mod vuart;
 pub(super) mod vdma;
 pub(super) use vdma::*;
 pub(super) mod vsb;
@@ -223,6 +224,7 @@ pub struct PcMachine {
     pub vpic: VirtualPic,
     pub vrtc: VirtualRtc,
     pub vkbd: VirtualKeyboard,
+    pub uart: vuart::Uart,
     pub mouse: MouseState,
     pub skip_irq: bool,
     pub e0_pending: bool,
@@ -525,6 +527,7 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).vpic).write(VirtualPic::new());
             core::ptr::addr_of_mut!((*p).vrtc).write(VirtualRtc::new(machine));
             core::ptr::addr_of_mut!((*p).vkbd).write(VirtualKeyboard::new());
+            core::ptr::addr_of_mut!((*p).uart).write(vuart::Uart::new());
             core::ptr::addr_of_mut!((*p).mouse).write(MouseState::new());
             core::ptr::addr_of_mut!((*p).skip_irq).write(false);
             core::ptr::addr_of_mut!((*p).e0_pending).write(false);
@@ -597,6 +600,7 @@ fn pit_io<R>(
 
 pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u16) -> u8 {
     match port {
+        0x3f8..=0x3ff => { let value = pc.uart.read(port - 0x3f8); if pc.uart.poll_irq() { pc.vpic.raise(4); } value },
         // VGA Input Status Register 1: bit 3 (vertical retrace) and bit 0
         // (blanking). An EMULATED card has no raster, so the value is
         // synthesized from the same phase clock that schedules whole-shadow
@@ -726,6 +730,7 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
 /// Emulate OUT to a port.
 pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, val: u8) {
     match port {
+        0x3f8..=0x3ff => { pc.uart.write(port - 0x3f8, val); if pc.uart.poll_irq() { pc.vpic.raise(4); } },
         // VGA ports — pass through to hardware (tracking the AC flip-flop +
         // index, which hardware can't read back), or the emulated register
         // file when no card is present (it has its own per-thread flip-flop).
@@ -1089,6 +1094,7 @@ fn dec_rep_count(regs: &mut Regs, addr32: bool) {
 /// `machine` is borrowed). Edge-triggered: the IRR coalesces repeated ticks into
 /// one pending line, so a slow guest loses ticks rather than flooding.
 pub fn advance_timers(pc: &mut PcMachine, now_ns: u64) {
+    if pc.uart.poll_irq() { pc.vpic.raise(4); }
     if pc.vpit.take_pending_irqs(now_ns) > 0 {
         pc.vpic.raise(0);
     }

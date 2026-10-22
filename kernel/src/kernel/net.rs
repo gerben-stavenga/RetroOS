@@ -18,6 +18,7 @@ pub fn install_socket_backend(hooks: SocketHooks) {
 
 mod config;
 mod stack;
+pub(crate) mod lan;
 
 /// The Ethernet seam shared by the IP stack and NIC drivers. Packets exclude
 /// the FCS; ownership transfers out of DMA before receive returns.
@@ -48,6 +49,7 @@ pub(crate) fn install_wifi(device: alloc::boxed::Box<dyn EthernetDevice>) {
 pub fn poll() {
     crate::kernel::wifi::poll();
     stack::poll();
+    lan::poll();
 }
 pub fn native_backend() -> bool {
     stack::installed()

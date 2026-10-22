@@ -402,6 +402,43 @@ calls. BSD file locks belong to VFS open file descriptions and survive
 `dup`/`fork` until the last close. They coordinate RetroOS processes; they
 do not acquire locks in other SMB clients or host applications.
 
+## DOS multiplayer and null modem
+
+Press **F12**, open **Network**, and choose **Create LAN**. On other RetroOS
+machines on the same IPv4 LAN, open that panel and select **Join LAN**.
+Discovery runs while the panel is open; joined machines keep announcing the
+room. Any member can leave without shutting down the room for the others.
+No networking server or entry in `RETROOS.INI` is needed. Select the LAN
+before launching a DOS multiplayer driver.
+
+RetroOS supplies the Novell IPX software interface: discovery through
+`INT 2Fh AX=7A00h`, its far-call entry and `INT 7Ah`, sockets, scatter/gather
+ECBs, real-mode ESR callbacks, cancellation and timed events. IPX remains
+inside the DOS compatibility layer; room datagrams use native IPv4 UDP.
+Run `IPXSETUP -nodes 2 -deathmatch -warp 1 1` in each Doom directory.
+SPX and the Ethernet packet-driver API are not implemented.
+
+For a two-player serial connection, select each other's **COM1 cable** row
+with Enter or Left/Right. Both ends must select their partner; the status
+then becomes **connected**. Run serial software using COM1/IRQ4, such as
+Doom's `SERSETUP -com1`. The virtual UART provides divisor registers,
+loopback, FIFOs, cable connection status and interrupts. An ordered TCP stream carries
+the cable's bytes; baud settings do not throttle the virtual cable.
+Each machine exposes one cable, owned by the first DOS UART user until it
+exits. Changing rooms or partners clears queued cable data.
+
+Rooms use UDP port 1213 for local broadcast discovery and unicast payloads;
+the serial cable uses TCP port 1214. Discovery requires a shared broadcast
+network. Independent QEMU user networks and machines behind separate NATs
+do not discover one another; VMs need a shared virtual Ethernet segment.
+Room membership is a convenience for trusted local networks, without
+authentication or encryption.
+
+`python3 test/ipx.py` exercises the DOS ABI between two VMs joined through
+the actual OSD. `python3 test/ipx_doom.py` tests original Doom/IPXSETUP,
+and `python3 test/ipx_doom.py --serial` tests Doom/SERSETUP through COM1.
+These use private disk snapshots and a shared QEMU Ethernet segment.
+
 ## QEMU networking
 
 The QEMU launchers enable **VirtIO user networking** by default. No TAP

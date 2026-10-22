@@ -38,6 +38,7 @@ pub(crate) use self::lowmem::{
     SLOT_MOUSE_CB_RET, SLOT_PMDOS_INT10, SLOT_PMDOS_INT21, SLOT_PMDOS_INT33, SLOT_PM_TO_REAL,
     SLOT_RAW_REAL_TO_PM, SLOT_RESUME, SLOT_RESUME_CONTINUATION, SLOT_SAVE_RESTORE,
     SLOT_VBE_WINDOW, STUB_BASE, STUB_SEG, ctrl_slot_off, slot_offset, vbe_window_ptr,
+    SLOT_IPX, SLOT_IPX_RETURN,
 };
 #[allow(unused_imports)]
 pub(super) use self::clock::{cmos_date, rtc_ticks_today, rtc_time};
@@ -263,7 +264,14 @@ fn dispatch_kernel_syscall<A: crate::Arch>(
             thread::KernelAction::Done
         }
         0x2E => int_2eh(machine, kt, dos, regs),
+        0x2F if regs.rax as u16 == 0x7a00 => {
+            if let Some(callback) = super::ipx::discover(machine, dos, regs) {
+                suspension = Some(DosSuspension { entry: ResumeEntry::Poll(callback) });
+            }
+            thread::KernelAction::Done
+        }
         0x2F => int_2fh(machine, dos, regs),
+        0x7A => { super::ipx::api(machine, dos, regs); thread::KernelAction::Done }
         0x67 => {
             if !EMS_ENABLED {
                 // No EMS host: AH=80 ("invalid function in handle") so
@@ -293,7 +301,7 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
     let vector = ((ip.wrapping_sub(2)) / 2) as u8;
 
     match vector {
-        0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x27 | 0x28 | 0x29 | 0x2E | 0x2F | 0x33 | 0x67 => {
+        0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x27 | 0x28 | 0x29 | 0x2E | 0x2F | 0x33 | 0x67 | 0x7A => {
             // DOS keeps the interrupted register frame in the current PSP.
             // A manually loaded child created with AH=55h returns through
             // its parent's saved frame when it terminates.
@@ -364,6 +372,8 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
     let slot = ((ip.wrapping_sub(STUB_BASE as u16 + 2)) / 2) as u8;
 
     let action = match slot {
+        SLOT_IPX => { super::ipx::api(machine, dos, regs); thread::KernelAction::Done }
+        SLOT_IPX_RETURN => { super::ipx::callback_return(machine, dos, regs); thread::KernelAction::Done }
         SLOT_XMS => xms_dispatch(machine, dos, regs),
         SLOT_DPMI_ENTRY => {
             dpmi::dpmi_enter(machine, dos, regs);
@@ -426,7 +436,7 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
     // CS/IP. Mode-switching stubs (DPMI entry, raw switch, callbacks)
     // replace all regs; SLOT_RESUME/SLOT_RESUME_CONTINUATION own their
     // unwind — skip.
-    if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE | SLOT_VBE_WINDOW | SLOT_COUNTRY_UPCASE) {
+    if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE | SLOT_VBE_WINDOW | SLOT_COUNTRY_UPCASE | SLOT_IPX) {
         let ret_ip = vm86_pop(machine, regs);
         let ret_cs = vm86_pop(machine, regs);
         set_vm86_ip(regs, ret_ip);
