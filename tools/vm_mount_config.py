@@ -40,7 +40,7 @@ def split_configuration(text):
     for line in text.splitlines(keepends=True):
         section = line.strip()
         if section.startswith('['):
-            target = boot if section == '[bundle]' or section.startswith('[mount ') else user
+            target = boot if section in ('[bundle]', '[session]') or section.startswith('[mount ') else user
         target.append(line)
     return ''.join(boot), ''.join(user)
 

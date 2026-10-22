@@ -52,6 +52,8 @@ def configure_usb(usb, c_uuid=None, c_ram=False, c_dir=None, root_uuid=None, pre
         raise ValueError('RetroOS BOOT.INI not found on USB; flash the USB image first')
     volumes = module.candidates()
     volume = module.choose_c_for_host(volumes, c_uuid, c_ram)
+    if volume and volume['fstype'] == 'ext4' and c_dir is None:
+        c_dir = module.default_c_dir(volume)
     if c_dir is not None:
         if not volume or volume['fstype'] != 'ext4':
             raise ValueError('--c-dir requires an ext4 C: volume')
@@ -75,9 +77,9 @@ def configure_usb(usb, c_uuid=None, c_ram=False, c_dir=None, root_uuid=None, pre
     if any(config[s].get('path') == '/' for s in config.sections()):
         for section in generated.sections():
             if generated[section].get('drive') == 'C' and generated[section].get('path') == '/':
-                generated[section]['path'] = '/home/retroos'
+                generated[section]['path'] = '/dos'
     for section in generated.sections():
-        if section != 'bundle' and section in config:
+        if section not in ('bundle', 'session') and section in config:
             raise ValueError(f'USB mount name conflicts with generated section: {section}')
         config[section] = dict(generated[section])
     text = io.StringIO()
@@ -106,7 +108,7 @@ def main():
     parser.add_argument('--image', '--iso', type=Path, dest='image', help='optional USB/ISO image supplying the core')
     parser.add_argument('--archive', type=Path, help='matched disk-runtime archive')
     parser.add_argument('--destination', type=Path, default=Path('/boot/retroos'))
-    parser.add_argument('--c-root', type=Path, help='C: directory, or mountpoint of a FAT volume')
+    parser.add_argument('--c-root', type=Path, help='C: directory (default: $HOME/DOS), or mountpoint of a FAT volume')
     parser.add_argument('--c-uuid', help='FAT or ext4 C: filesystem UUID')
     parser.add_argument('--c-dir', help='C: directory inside an ext4 volume')
     parser.add_argument('--c-ram', action='store_true', help='use session-only C:')
@@ -136,7 +138,7 @@ def main():
         return
     if os.geteuid() == 0:
         raise PermissionError('prepare as a normal user; installation runs as root')
-    c_root = (args.c_root or Path('/home/retroos')).resolve()
+    c_root = (args.c_root or Path.home() / 'DOS').resolve()
     destination = args.destination.resolve()
     root_fs = disk.filesystem('/')
     boot_fs = filesystem_for(destination)

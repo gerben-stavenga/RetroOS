@@ -31,11 +31,30 @@ RetroOS reads the runtime directly from the selected disk. Kernel files live
 under `/boot/retroos/releases/<version>/` (or `--destination`). `/boot` may
 be separate or Btrfs because only GRUB needs to read those kernel files.
 
-On the default ext4 Linux-root installation, C: is `/home/retroos` and the
+On the default ext4 Linux-root installation, C: is `$HOME/DOS` and the
 Linux filesystem supplies `/`, `/bin` and `/usr/bin`. A separate FAT or
 ext4 data volume uses the bundled BusyBox root unless a Linux root is
 explicitly selected with `--root-uuid`. The RetroOS C: tree is identical.
 Unix command aliases use the same link manifest on both filesystems.
+
+`BOOT.INI` also selects the Linux session home independently of C::
+
+```ini
+[session]
+home=/home/alice
+```
+
+For a Linux-root installation, the installer uses the installing user's home
+and mounts their `DOS` directory as C:. Settings physically live at
+`/home/alice/DOS/RETROOS/RETROOS.INI`, visible as
+`C:\RETROOS\RETROOS.INI`. Use `--c-root` to select another DOS directory.
+On FAT, C: is the volume root, mounted at `/dos` in the bundled Linux namespace.
+`home=/RETROOS/HOME` gives BusyBox a persistent home backed by FAT
+`\RETROOS\HOME`; settings remain at FAT `\RETROOS\RETROOS.INI`.
+The bundle supplies Unix commands, while `/tmp`, `/run`, `C:\TEMP`, and
+`$HOME/TEMP` are RAM-backed. `[linux.environment]` in RETROOS.INI can still
+override Linux environment defaults. Old BOOT.INI files without `[session]`
+retain their previous home behavior; installation does not relocate old trees.
 
 User settings and C: data persist in the persistent entry. Runtime edits use
 a session overlay. Upgrades preserve existing user settings and extra mount
@@ -502,12 +521,13 @@ Linux enumerates FAT and ext4 partitions on non-USB disks. If several could be
 C:, preparation prints their paths and UUIDs; rerun with
 `--c-uuid=ABCD-1234` (FAT) or an ext4 UUID. A selected ext4 volume may be
 unmounted in Linux: installation temporarily mounts it to check or create
-`home/retroos`, then unmounts it. Installation also creates the `retroos`
+the selected DOS directory, then unmounts it. Installation also creates the `retroos`
 group when needed. With no supported
 data volume, the RAM module supplies C:. Use `--c-ram` to choose this explicitly.
 For ext4, add `--c-dir=/path/on/volume` during preparation to use a different
 C: directory; the installer creates that directory and passes the same path
-through the INI mount configuration. The default is `/home/retroos` on the selected ext4 volume.
+through the INI mount configuration. The default is the installing user's
+`DOS` directory when their home is on that volume, otherwise `/DOS`.
 With one eligible FAT/ext4 volume, it is selected automatically, including
 on Btrfs hosts. Multiple candidates require `--c-uuid` or `--c-root`. With
 no supported volume, C: uses RAM. Existing RetroOS files are not required. The RAM module supplies the runtime in `C:\RETROOS`; user and boot INIs on
@@ -582,8 +602,9 @@ example's `/boot/retroos/manual/` becomes `/retroos/manual/`.
 Choose physical filesystems with `lsblk -o NAME,FSTYPE,UUID,MOUNTPOINTS`.
 Copy [etc/BOOT.INI](etc/BOOT.INI) and [etc/RETROOS.INI](etc/RETROOS.INI)
 alongside the kernel, replace the BOOT.INI session mount with your UUID mounts, and set their paths and access modes.
-A FAT C: normally uses `path=/home/retroos`, `drive=C`, and `subdir=/`.
-An ext4 C: can use `subdir=/home/retroos` with a matching `grant` directory.
+A FAT C: normally uses `path=/dos`, `drive=C`, and `subdir=/`.
+An ext4 C: can use `path=/home/alice/DOS`, `subdir=/home/alice/DOS`,
+and a matching `grant` directory, alongside a Linux root mounted at `/`.
 The base module supplies `C:\RETROOS`, `C:\DN`, and `/bin` independently.
 For persistent DN settings, explicitly mount a writable directory at the
 C: namespace's `DN` path; the default bundled DN stores changes in RAM.
@@ -759,7 +780,8 @@ Disk writes: PERSISTENT — physical devices are writable        (in red)
 ### Which disk is at stake
 
 The installed-machine entries select the ext4 filesystem by UUID. `C:` is
-`/home/retroos` on that filesystem. INI layouts mount only their listed sources. Without `ram-overlay`,
+the DOS directory selected in BOOT.INI on that filesystem (by default
+`$HOME/DOS`). INI layouts mount only their listed sources. Without `ram-overlay`,
 permitted writes persist on the selected filesystem.
 
 What it can and cannot reach:
@@ -856,9 +878,10 @@ accepts FAT12/16/32 partitions, unpartitioned FAT media, and raw FAT Multiboot
 modules. On a selected FAT root, `C:` maps to the volume root: put the DOS
 system files in `/RETROOS` (`C:\RETROOS`), alongside the partition's existing
 Windows/DOS files and games. No `/home/retroos` directory is needed on FAT.
-On a Unix/ext4 root, `C:` remains `/home/retroos` even if that directory is
-missing; it never silently falls back to `/`. Explicit C-drive overrides
-still take precedence. FAT root modules use the same mapping as physical FAT.
+Legacy Unix/ext4 boots without explicit mount configuration retain
+`/home/retroos` as C:, even if missing; they never silently fall back to `/`.
+New installations select C: through BOOT.INI as described above. Explicit
+C-drive overrides take precedence. FAT root modules use the same mapping as physical FAT.
 
 Preserve the exact spelling of the VFS startup paths, including `RETROOS`.
 When multiple filesystems are present, `/etc` plus `/usr` take precedence,

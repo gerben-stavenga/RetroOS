@@ -59,6 +59,7 @@ impl core::fmt::Debug for SmbMount {
 
 #[derive(Clone, Default, Debug)]
 pub struct Config {
+    pub home: Option<String>,
     pub wifi: Option<crate::kernel::wifi::config::Profile>,
     pub smb: Vec<SmbMount>,
     pub bundle: Option<Bundle>,
@@ -152,7 +153,7 @@ impl Config {
                         grant: "/".to_string(),
                     });
                 } else if !section.eq_ignore_ascii_case("launch")
-                    && !matches!(section, "system" | "locale" | "clock" | "sound" | "environment" | "linux.environment") {
+                    && !matches!(section, "session" | "system" | "locale" | "clock" | "sound" | "environment" | "linux.environment") {
                     return Err("unknown section");
                 }
                 continue;
@@ -162,7 +163,12 @@ impl Config {
             if key.is_empty() || value.as_bytes().contains(&0) {
                 return Err("invalid key/value");
             }
-            if section == "linux.environment" {
+            if section == "session" {
+                if key != "home" || config.home.is_some() || !canonical(value) {
+                    return Err("session home must be one canonical absolute path");
+                }
+                config.home = Some(value.into());
+            } else if section == "linux.environment" {
                 let name = key.as_bytes();
                 if !name[0].is_ascii_alphabetic() && name[0] != b'_' || name.iter().any(|b| !b.is_ascii_alphanumeric() && *b != b'_') {
                     return Err("invalid Linux environment name");
@@ -370,8 +376,8 @@ impl Config {
 
     pub fn parse_user(bytes: &[u8]) -> Result<Self, &'static str> {
         let config = Self::parse(bytes)?;
-        if config.bundle.is_some() || !config.mounts.is_empty() {
-            return Err("bundle and mounts belong in BOOT.INI");
+        if config.bundle.is_some() || !config.mounts.is_empty() || config.home.is_some() {
+            return Err("bundle, mounts and session home belong in BOOT.INI");
         }
         Ok(config)
     }
@@ -522,6 +528,7 @@ pub fn apply(
     protected: bool,
     extras: Vec<(arch_abi::BootModule, FilesystemVolume)>,
 ) -> Result<(), &'static str> {
+    crate::kernel::linux::environment::configure_home(config.home.as_deref());
     for mount in &config.mounts {
         if let Some(id) = mount.source.strip_prefix("UUID=") {
             let id = uuid(id)?;
@@ -751,6 +758,19 @@ pub fn apply(
         }
     }
     if let Some(source) = settings_source {
+        // Keep BusyBox's standalone home on the physical C: filesystem,
+        // alongside settings, even though runtime files use a bundle view.
+        let home = [source.as_slice(), b"HOME/"].concat();
+        if config.home.as_deref() == Some("/RETROOS/HOME") {
+            if !vfs::dir_exists(&home) && vfs::mkdir(home.strip_suffix(b"/").unwrap()) < 0 {
+                return Err("cannot create persistent session home");
+            }
+            let home = Box::leak(home.into_boxed_slice());
+            vfs::bind(b"RETROOS/HOME/", home);
+            if !c.is_empty() {
+                vfs::bind(Box::leak([c, b"RETROOS/HOME/"].concat().into_boxed_slice()), home);
+            }
+        }
         // Device firmware belongs to persistent C:, independently of the
         // matched runtime directory supplied by the boot bundle above.
         let firmware = [source.as_slice(), b"FIRMWARE/"].concat();
@@ -811,12 +831,29 @@ pub fn apply(
     }
     let session = Box::leak(crate::kernel::fs::session::new());
     session.mkdir(b"TEMP");
+    session.mkdir(b"run");
     vfs::mount(b"sessionfs/", session);
     vfs::hide_mount(b"sessionfs/");
     vfs::bind(
         Box::leak([c, b"TEMP/"].concat().into_boxed_slice()),
         b"sessionfs/TEMP/",
     );
+    if !config.mounts.iter().any(|m| m.path == "/tmp") {
+        vfs::bind(b"tmp/", b"sessionfs/TEMP/");
+    }
+    if !config.mounts.iter().any(|m| m.path == "/run") {
+        vfs::bind(b"run/", b"sessionfs/run/");
+    }
+    if let Some(home) = &config.home {
+        let path = home.trim_matches('/').as_bytes();
+        if !vfs::dir_exists(path) && vfs::mkdir(path) < 0 {
+            return Err("session home does not exist and cannot be created");
+        }
+        let temporary = [prefix_bytes(home), b"TEMP/".to_vec()].concat();
+        if temporary != b"tmp/" {
+            vfs::bind(Box::leak(temporary.into_boxed_slice()), b"sessionfs/TEMP/");
+        }
+    }
     // Optional showcase modules are standalone mounts. Never union them with
     // a physical GAMES directory. G: is a conventional default, overridable.
     for (module, volume) in extras {
@@ -905,6 +942,19 @@ mod tests {
         assert!(Config::parse_user(b"[mount \"session\"]\nsource=bundle\npath=/\n").is_err());
         let user = Config::parse_user(b"[locale]\nlanguage=it-IT\n[launch]\nALADDIN.EXE=xms32k\n").unwrap();
         assert_eq!(user.launch, [("ALADDIN.EXE".into(), "xms32k".into())]);
+    }
+
+    #[test]
+    fn session_home_is_boot_policy_independent_of_c() {
+        let bytes = b"[bundle]\nsource=module\n[session]\nhome=/home/alice\n[mount \"dos\"]\nsource=bundle\npath=/home/alice/DOS\ndrive=C\naccess=ram\n";
+        let config = Config::parse_boot(bytes).unwrap();
+        assert_eq!(config.home.as_deref(), Some("/home/alice"));
+        assert_eq!(config.mounts[0].path, "/home/alice/DOS");
+        assert!(Config::parse_user(b"[session]\nhome=/home/alice\n").is_err());
+        for home in ["relative", "/home/../alice", "/home//alice", "/home/alice/"] {
+            assert!(Config::parse_boot(alloc::format!("[bundle]\nsource=module\n[session]\nhome={home}\n").as_bytes()).is_err());
+        }
+        assert!(Config::parse_boot(b"[bundle]\nsource=module\n[session]\nhome=/first\nhome=/second\n").is_err());
     }
 
     #[test]

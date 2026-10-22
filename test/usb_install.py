@@ -59,7 +59,7 @@ class UsbInstallTest(unittest.TestCase):
         self.ini.write_text(self.original + '[mount "linux"]\nsource=UUID=root\npath=/\naccess=ro\n')
         installer.configure_usb(self.usb, c_ram=True)
         config = self.config()
-        self.assertEqual(config['mount "session"']['path'], '/home/retroos')
+        self.assertEqual(config['mount "session"']['path'], '/dos')
         self.assertEqual(config['mount "linux"']['source'], 'UUID=root')
 
     def test_ext4_directory_and_linux_root(self):

@@ -21,6 +21,34 @@ CUSTOM = Path("/etc/grub.d/40_custom")
 OTHER_MANAGED = Path("/etc/grub.d/42_retroos_module")
 
 
+def default_c_dir(volume):
+    """Use the installing user's DOS directory when it is on this volume."""
+    home = Path.home().resolve()
+    for mountpoint in volume.get("mountpoints", []):
+        if mountpoint and home.is_relative_to(Path(mountpoint).resolve()):
+            relative = (home / "DOS").relative_to(Path(mountpoint).resolve())
+            return "/" + relative.as_posix()
+    return "/DOS"
+
+
+def session_layout(plan):
+    """Choose namespace paths independently of the physical C: subdirectory."""
+    root = plan.get("linux_root") or plan.get("root_uuid")
+    same = root and root == plan.get("c_uuid")
+    c_dir = plan.get("c_dir") or "/"
+    c_path = c_dir if same and c_dir != "/" else "/dos"
+    home = plan.get("session_home")
+    if not home:
+        installing_home = Path.home().resolve()
+        if same and Path(c_dir).is_relative_to(installing_home):
+            home = str(installing_home)
+        elif same and Path(c_dir).name == "DOS" and Path(c_dir).parent != Path('/'):
+            home = str(Path(c_dir).parent)
+        else:
+            home = "/RETROOS/HOME"
+    return c_path, home
+
+
 def runtime_filter(member, destination):
     # This guest link is absolute in RetroOS, not in the installing host.
     guest_links = {'bin/rc': '/COMMANDER/RC/RC.EXE', 'bin/rcedit': 'rc'}
@@ -76,7 +104,7 @@ def storage_layout(c_root, destination, volume=None, c_dir=None, root_uuid=None)
     if boot["fstype"] not in {"ext4", "vfat", "btrfs"} or not boot.get("uuid"):
         raise ValueError("boot files require a UUID-bearing filesystem readable by GRUB")
     if volume:
-        c_dir = c_dir or ("/home/retroos" if volume["fstype"] == "ext4" else "/")
+        c_dir = c_dir or (default_c_dir(volume) if volume["fstype"] == "ext4" else "/")
         if c_dir != "/":
             grub.validate_c_dir(c_dir)
         home = grub.visible_c_home(volume, c_dir)
@@ -121,6 +149,10 @@ def boot_configuration(plan, previous=None):
     config = configparser.ConfigParser(interpolation=None)
     if previous:
         config.read_string(previous)
+    c_path, home = session_layout(plan)
+    if "session" not in config:
+        config["session"] = {"home": home}
+    home = config["session"].get("home", home)
     config["bundle"] = {"source": "UUID=" + plan["c_uuid"], "subdir": plan["runtime_subdir"]}
     for section in list(config.sections()):
         if config[section].get("drive", "").upper() == "C":
@@ -130,9 +162,9 @@ def boot_configuration(plan, previous=None):
         config['mount "linux"'] = {"source": "UUID=" + plan["linux_root"], "path": "/",
                                    "access": "rw" if same else "ro"}
         if same:
-            config['mount "linux"']["grant"] = plan["c_dir"]
+            config['mount "linux"']["grant"] = home if home != "/RETROOS/HOME" else plan["c_dir"]
     config['mount "dos"'] = {"source": "UUID=" + plan["c_uuid"], "subdir": plan["c_dir"],
-        "path": "/home/retroos", "drive": "C", "access": "rw", "grant": plan["c_dir"]}
+        "path": c_path, "drive": "C", "access": "rw", "grant": plan["c_dir"]}
     import io
     text = io.StringIO()
     config.write(text, space_around_delimiters=False)
@@ -443,7 +475,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--archive", type=Path, help="prebuilt matched kernel/runtime tar")
-    parser.add_argument("--c-root", type=Path, default=Path("/home/retroos"))
+    parser.add_argument("--c-root", type=Path, default=Path.home() / "DOS")
     parser.add_argument("--destination", type=Path, default=Path("/boot/retroos"))
     parser.add_argument('--copy-showcase', action=argparse.BooleanOptionalAction, default=None,
                         help='seed C: with showcase files, preserving existing files (default: ask on a terminal only when creating C:, otherwise skip)')

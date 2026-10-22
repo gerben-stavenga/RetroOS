@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Set up /home/retroos as RetroOS's DOS C: on THIS machine, sharing repo
-# content via symlinks (no copy). Run with sudo (creates dirs under /home).
+# Set up $HOME/DOS as RetroOS's DOS C: on THIS machine, sharing repo
+# content via symlinks (no copy). Run as the user who will use this tree.
 #
 # Requires the ext4fs symlink-following support (commit 9f320aa): RetroOS reads
 # the raw ext4 of your Linux root, follows symlinks, but ONLY within the same
-# partition — so the repo must live on the same ext4 as /home/retroos (it does
+# partition — so the repo must live on the same ext4 as the DOS tree (it does
 # if the repo is under /home). Reboot into RetroOS after running this.
 set -euo pipefail
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-C=/home/retroos
+C="${C_ROOT:-$HOME/DOS}"
 
 echo "Repo:   $REPO"
 echo "C: root: $C"

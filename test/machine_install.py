@@ -5,6 +5,7 @@ import sys
 import tempfile
 import tarfile
 import json
+import configparser
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +15,32 @@ import install_machine as unified
 
 
 class ShowcaseTests(unittest.TestCase):
+    def test_session_home_and_dos_root_for_linux_and_fat(self):
+        for backend, root_key in [(installer.boot_configuration, 'linux_root'),
+                                  (unified.module.mount_configuration, 'root_uuid')]:
+            for kind, c_dir, root, expected_c, expected_home in [
+                ('ext4', '/home/alice/DOS', 'data', '/home/alice/DOS', '/home/alice'),
+                ('vfat', '/', None, '/dos', '/RETROOS/HOME'),
+                ('ext4', '/DOS', None, '/dos', '/RETROOS/HOME'),
+            ]:
+                with self.subTest(backend=backend.__name__, kind=kind, root=root):
+                    plan = dict(c_uuid='data', c_fstype=kind, c_dir=c_dir, runtime_subdir='/runtime')
+                    plan[root_key] = root
+                    config = configparser.ConfigParser(interpolation=None)
+                    config.read_string(backend(plan))
+                    c = next(config[s] for s in config if config[s].get('drive') == 'C')
+                    self.assertEqual(c['path'], expected_c)
+                    self.assertEqual(c['subdir'], c_dir)
+                    self.assertEqual(config['session']['home'], expected_home)
+                    if root:
+                        self.assertEqual(config['mount "linux"']['grant'], '/home/alice')
+
+    def test_default_c_directory_uses_installing_users_home(self):
+        with patch.object(installer.Path, 'home', return_value=Path('/home/alice')):
+            self.assertEqual(installer.default_c_dir({'mountpoints': ['/']}), '/home/alice/DOS')
+            self.assertEqual(installer.default_c_dir({'mountpoints': ['/home']}), '/alice/DOS')
+            self.assertEqual(installer.default_c_dir({'mountpoints': []}), '/DOS')
+
     def test_runtime_guest_links_can_be_extracted_repeatedly(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

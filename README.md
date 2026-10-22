@@ -176,9 +176,18 @@ editable session copy at `C:\RETROOS\RETROOS.INI`; persistent USB edits require
 another OS until kernel USB storage works.
 
 Disk installation keeps `/boot/retroos/BOOT.INI` separate from versioned runtime
-files. User settings remain permanently at `/home/retroos/RETROOS/RETROOS.INI`
+files. User settings remain permanently at `$HOME/DOS/RETROOS/RETROOS.INI` on Linux
 (`C:\RETROOS\RETROOS.INI`). GRUB loads that file from its permanent location.
 The installer preserves it and existing mount choices across upgrades.
+
+`BOOT.INI` selects storage mounts, DOS drives and `[session] home`. Linux
+installations default to `$HOME/DOS` for C: while Linux `HOME` stays at the
+installing user's home. FAT installations use the volume root for C: (mounted
+at `/dos` for Linux programs), with a persistent BusyBox home at
+`/RETROOS/HOME`, backed by the FAT `\RETROOS\HOME` directory. Both expose
+settings at `C:\RETROOS\RETROOS.INI`. `/tmp`, `/run`, `C:\TEMP` and the session
+home's `TEMP` directory use RAM. Existing BOOT.INI files without `[session]`
+retain the previous HOME default; no existing data is moved.
 
 | Locale | OEM code page | Windows ANSI | Keyboard |
 | --- | --- | --- | --- |

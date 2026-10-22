@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 import tarfile
 
-from machine_install import copy_showcase_tree, retire_managed
+from machine_install import copy_showcase_tree, retire_managed, default_c_dir, session_layout
 
 ROOT = Path(__file__).resolve().parent.parent
 STAGE_ROOT = ROOT / "build" / "grub-module-install"
@@ -154,17 +154,19 @@ def grub_entries(plan):
 def mount_configuration(plan):
     """Mount policy is a reviewable INI file, independent of GRUB write mode."""
     mounts = []
+    c_path, session_home = session_layout(plan)
     if plan.get("root_uuid"):
-        home = plan.get("c_dir") or "/home/retroos"
-        mounts.append(f'[mount "linux"]\nsource=UUID={plan["root_uuid"]}\npath=/\naccess=rw\ngrant={home}\n')
+        home = session_home if session_home != "/RETROOS/HOME" else (plan.get("c_dir") or "/")
+        access = "rw" if plan.get("c_uuid") == plan["root_uuid"] else "ro"
+        mounts.append(f'[mount "linux"]\nsource=UUID={plan["root_uuid"]}\npath=/\naccess={access}\ngrant={home}\n')
     if plan.get("c_uuid"):
         home = plan.get("c_dir") or "/"
-        mounts.append(f'[mount "data"]\nsource=UUID={plan["c_uuid"]}\npath=/home/retroos\nsubdir={home}\ndrive=C\naccess=rw\ngrant={home}\n')
+        mounts.append(f'[mount "data"]\nsource=UUID={plan["c_uuid"]}\npath={c_path}\nsubdir={home}\ndrive=C\naccess=rw\ngrant={home}\n')
     elif plan.get("root_uuid"):
-        mounts.append('[mount "session"]\nsource=bundle\npath=/home/retroos\ndrive=C\naccess=ram\n')
+        mounts.append('[mount "session"]\nsource=bundle\npath=/dos\ndrive=C\naccess=ram\n')
     if not mounts:
         mounts.append('[mount "session"]\nsource=bundle\npath=/\ndrive=C\naccess=ram\n')
-    return '[bundle]\nsource=module\nsubdir=/\n\n' + "\n".join(mounts)
+    return f'[bundle]\nsource=module\nsubdir=/\n\n[session]\nhome={session_home}\n\n' + "\n".join(mounts)
 
 
 def migrate_boot_configuration(plan, previous):
@@ -177,6 +179,8 @@ def migrate_boot_configuration(plan, previous):
     generated = configparser.ConfigParser(interpolation=None)
     generated.read_string(mount_configuration(plan))
     config["bundle"] = dict(generated["bundle"])
+    if "session" not in config:
+        config["session"] = dict(generated["session"])
     for section in generated.sections():
         if generated[section].get("drive", "").upper() == "C":
             config[section] = dict(generated[section])
@@ -203,9 +207,10 @@ def update_grub(config_path=None):
     subprocess.run([command, "-o", str(destination)], check=True)
 
 
-def c_home(volume, c_dir="/home/retroos"):
+def c_home(volume, c_dir=None):
     if volume["fstype"] != "ext4":
         return None
+    c_dir = c_dir or default_c_dir(volume)
     for mountpoint in volume["mountpoints"]:
         if not mountpoint:
             continue
@@ -239,8 +244,9 @@ def create_c_home(home):
 
 
 @contextmanager
-def mounted_c_home(volume, c_dir="/home/retroos"):
+def mounted_c_home(volume, c_dir=None):
     """Expose the selected C: tree, including unmounted FAT data volumes."""
+    c_dir = c_dir or default_c_dir(volume)
     for mountpoint in volume["mountpoints"]:
         if not mountpoint:
             continue
@@ -269,7 +275,7 @@ def mounted_c_home(volume, c_dir="/home/retroos"):
             subprocess.run(["umount", temporary], check=True)
 
 
-def ensure_c_home(volume, c_dir="/home/retroos"):
+def ensure_c_home(volume, c_dir=None):
     with mounted_c_home(volume, c_dir):
         pass
 
@@ -342,7 +348,7 @@ def prepare(image, destination, requested_c, requested_root, c_ram=False, reques
         raise ValueError("--copy-showcase requires a physical C: volume")
     if requested_dir and (not c_volume or c_volume["fstype"] != "ext4"):
         raise ValueError("--c-dir requires an ext4 C: volume")
-    c_dir = validate_c_dir(requested_dir or "/home/retroos") if c_volume and c_volume["fstype"] == "ext4" else None
+    c_dir = validate_c_dir(requested_dir or default_c_dir(c_volume)) if c_volume and c_volume["fstype"] == "ext4" else None
     home = visible_c_home(c_volume, c_dir) if c_volume else None
     if requested_root:
         if not UUID_FORMAT.fullmatch(requested_root) or len(requested_root) != 36:
@@ -476,7 +482,7 @@ def install():
         os.chown(release / name, 0, 0)
         (release / name).chmod(0o644)
     if plan["c_uuid"]:
-        with mounted_c_home(c_volume, plan["c_dir"] or "/home/retroos") as home:
+        with mounted_c_home(c_volume, plan["c_dir"]) as home:
             copied = seed_c_files(home, stage, plan.get("copy_showcase", False))
             print(f"Configuration: {home}/RETROOS (persistent C:)")
             if plan.get("copy_showcase"):
@@ -521,7 +527,7 @@ def main():
     parser.add_argument("--destination", type=Path, default=Path("/boot/retroos"))
     parser.add_argument("--c-uuid", help="C: filesystem UUID; required when several candidates exist")
     parser.add_argument("--c-ram", action="store_true", help="use the RAM module for C:")
-    parser.add_argument("--c-dir", help="directory inside selected ext4 C: volume (default: /home/retroos)")
+    parser.add_argument("--c-dir", help="directory inside selected ext4 C: volume (default: installing user's DOS directory, or /DOS)")
     parser.add_argument("--copy-showcase", action=argparse.BooleanOptionalAction, default=False,
                         help="copy missing showcase files into the selected physical C: volume")
     parser.add_argument("--root-uuid", help="optional ext4 UUID for Linux /")

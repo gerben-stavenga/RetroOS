@@ -3,13 +3,20 @@
 use alloc::vec::Vec;
 
 static SETTINGS: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
+static HOME: spin::Mutex<Option<Vec<u8>>> = spin::Mutex::new(None);
+
+pub(crate) fn configure_home(home: Option<&str>) {
+    *HOME.lock() = home.map(|home| home.as_bytes().to_vec());
+}
 
 pub(crate) fn configure(settings: Vec<u8>) {
     *SETTINGS.lock() = settings;
 }
 
 pub(super) fn initial(root: &[u8], locale: &str) -> Vec<u8> {
-    build(root, locale, &SETTINGS.lock())
+    // Older BOOT.INI files retain their defaults until a session home is set.
+    let home = HOME.lock();
+    build(home.as_deref().unwrap_or(root), locale, &SETTINGS.lock())
 }
 
 fn build(root: &[u8], locale: &str, settings: &[u8]) -> Vec<u8> {

@@ -49,6 +49,9 @@ pub fn init_editor(volumes: &[FilesystemVolume], config: &Config, boot: &crate::
     if let Some(bundle) = &config.bundle {
         editor.settings.push_str(&alloc::format!("[bundle]\nsource={}\nsubdir={}\n\n", bundle.source, bundle.subdir));
     }
+    if let Some(home) = &config.home {
+        editor.settings.push_str(&alloc::format!("[session]\nhome={}\n\n", home));
+    }
     for volume in volumes {
         if volume.is_esp {
             continue;

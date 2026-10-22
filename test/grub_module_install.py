@@ -94,7 +94,7 @@ class GrubModuleInstallTest(unittest.TestCase):
                          ["mount", "-t", "ext4", "-o", "rw"])
         self.assertEqual(run.call_args_list[0].args[0][5], "UUID=" + volume["uuid"])
         temporary = run.call_args_list[0].args[0][6]
-        self.assertEqual(create.call_args.args[0], Path(temporary) / "home/retroos")
+        self.assertEqual(create.call_args.args[0], Path(temporary) / "DOS")
         self.assertEqual(run.call_args_list[1].args[0], ["umount", temporary])
 
     def test_new_home_uses_installing_users_uid_and_gid(self):
@@ -258,8 +258,8 @@ class GrubModuleInstallTest(unittest.TestCase):
 
     def test_ram_c_with_physical_linux_root_is_explicit(self):
         text = installer.mount_configuration({"root_uuid": "12345678-1234-1234-1234-123456789abc", "c_uuid": None})
-        self.assertIn('source=UUID=12345678-1234-1234-1234-123456789abc\npath=/\naccess=rw', text)
-        self.assertIn('source=bundle\npath=/home/retroos\ndrive=C\naccess=ram', text)
+        self.assertIn('source=UUID=12345678-1234-1234-1234-123456789abc\npath=/\naccess=ro', text)
+        self.assertIn('source=bundle\npath=/dos\ndrive=C\naccess=ram', text)
 
 
 if __name__ == "__main__":
