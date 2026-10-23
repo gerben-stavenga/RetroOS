@@ -120,9 +120,7 @@ impl IpxState {
         if self.session.is_none() {
             self.session = lan::attach();
             if let Some(session) = self.session {
-                let mut address = [0; 10];
-                address[4..].copy_from_slice(&session.node);
-                self.address = Some(address);
+                self.address = Some(session.address);
             }
         }
         let Some(session) = self.session else { return };

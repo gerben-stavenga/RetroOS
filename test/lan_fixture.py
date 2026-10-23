@@ -68,7 +68,7 @@ class LanPair:
         self.wait(lambda: 'LAN: selected ' in self.text(0), 5)
         self.keys(1, ['f12'] + ['tab']*4)
         time.sleep(2)
-        self.keys(1, ['down']*4 + ['ret'])
+        self.keys(1, ['down']*5 + ['ret'])
         self.wait(lambda: 'LAN: selected ' in self.text(1), 5)
         room = self.text(0).split('LAN: selected ')[-1].splitlines()[0]
         assert room != '0000000000000000' and ('LAN: selected '+room) in self.text(1), self.details()
@@ -99,10 +99,10 @@ class LanPair:
             time.sleep(.5 if key=='f12' else .2)
     def start(self,serial=False):
         if serial:
-            # Creator selection is row 1; joiner's selection resets to row 3
-            # when its joined room disappears from the list.
+            # Creator selection is row 1; joiner's selection resets to row 4
+            # when its joined room disappears from the list. COM1 is row 3.
             self.keys(0,['down','down','ret'])
-            self.keys(1,['ret'])
+            self.keys(1,['up','ret'])
             self.wait(lambda: 'LAN: null-modem connected' in self.text(0),10)
         for index in range(2): self.keys(index,['esc'])
         for index in (1,0): self.keys(index,['ret'])

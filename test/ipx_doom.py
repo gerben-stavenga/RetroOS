@@ -28,8 +28,8 @@ def traffic(pair,serial):
             if serial:
                 if packet[23]==6 and 1214 in struct.unpack_from('!HH',packet,ip):
                     count += struct.unpack_from('!H',packet,16)[0] > (ip-14)+((packet[ip+12]>>4)*4)
-            elif packet[23]==17 and packet[ip+8:ip+14]==b'RLAN\x01\x02':
-                payload = packet[ip+8+30:]
+            elif packet[23]==17 and 213 in struct.unpack_from('!HH',packet,ip):
+                payload = packet[ip+8:]
                 if len(payload)>=42 and struct.unpack_from('<i',payload,30)[0]>=0: count+=1
         counts.append(count)
     return counts

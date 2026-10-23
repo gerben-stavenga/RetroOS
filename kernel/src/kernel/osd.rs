@@ -849,6 +849,7 @@ pub fn key<A: crate::Arch>(
         pick_key(sc);
         return;
     }
+    if active_tab() == TAB_NETWORK && crate::kernel::net::lan::key(sc) { return; }
     match sc {
         K_F12 | K_ESC => close(),
         K_TAB => cycle_tab(),

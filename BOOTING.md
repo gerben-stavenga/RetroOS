@@ -404,40 +404,68 @@ do not acquire locks in other SMB clients or host applications.
 
 ## DOS multiplayer and null modem
 
-Press **F12**, open **Network**, and choose **Create LAN**. On other RetroOS
-machines on the same IPv4 LAN, open that panel and select **Join LAN**.
-Discovery runs while the panel is open; joined machines keep announcing the
-room. Any member can leave without shutting down the room for the others.
-No networking server or entry in `RETROOS.INI` is needed. Select the LAN
-before launching a DOS multiplayer driver.
+Press **F12**, open **Network**, and choose **Create LAN**. This starts a
+DOSBox-compatible IPXNET relay on UDP port 213. On other RetroOS machines on
+the same IPv4 LAN, select **Join LAN**. The creator must remain in the LAN
+while playing. No `RETROOS.INI` networking entries are needed. Select the LAN
+and wait for **Connected** (or **Hosting**) before launching a DOS game.
+
+To play with DOSBox, enable `ipx=true` in its configuration, then run:
+
+```text
+IPXNET CONNECT <RetroOS-IP> 213
+IPXSETUP -nodes 2 -deathmatch -warp 1 1
+```
+
+Alternatively, run `IPXNET STARTSERVER 1213` in DOSBox and choose **Join DOSBox
+server...** in RetroOS's OSD. Type the server's IPv4 address and optional port,
+for example `192.168.1.20:1213`, then Enter. Omitting the port uses 213.
+Backspace edits the address; Escape cancels. Run the same Doom version and WAD
+on both machines, with `IPXSETUP -nodes 2 -deathmatch -warp 1 1` on RetroOS too.
 
 RetroOS supplies the Novell IPX software interface: discovery through
 `INT 2Fh AX=7A00h`, its far-call entry and `INT 7Ah`, sockets, scatter/gather
-ECBs, real-mode ESR callbacks, cancellation and timed events. IPX remains
-inside the DOS compatibility layer; room datagrams use native IPv4 UDP.
-Run `IPXSETUP -nodes 2 -deathmatch -warp 1 1` in each Doom directory.
-SPX and the Ethernet packet-driver API are not implemented.
+ECBs, real-mode ESR callbacks, cancellation and timed events. IPX uses DOSBox's
+raw IPX-over-UDP framing and socket-2 registration; the relay assigns node
+addresses and forwards broadcasts and directed packets. There is no custom
+RetroOS wrapper around game packets. SPX and the Ethernet packet-driver API
+are not implemented. The relay accepts up to 16 remote registrations; leaving
+and recreating the LAN clears its registration table.
 
-For a two-player serial connection, select each other's **COM1 cable** row
-with Enter or Left/Right. Both ends must select their partner; the status
-then becomes **connected**. Run serial software using COM1/IRQ4, such as
-Doom's `SERSETUP -com1`. The virtual UART provides divisor registers,
-loopback, FIFOs, cable connection status and interrupts. An ordered TCP stream carries
-the cable's bytes; baud settings do not throttle the virtual cable.
-Each machine exposes one cable, owned by the first DOS UART user until it
-exits. Changing rooms or partners clears queued cable data.
+For a two-player serial connection between RetroOS machines, select each
+other's **COM1 cable** row with Enter or Left/Right. Both ends must select
+their partner; the status then becomes **connected**. Run serial software
+using COM1/IRQ4, such as Doom's `SERSETUP -com1`. The virtual UART provides
+divisor registers, loopback, FIFOs, cable connection status and interrupts.
+An ordered TCP stream carries the cable's bytes; baud settings do not throttle
+the virtual cable. Each machine exposes one cable, owned by the first DOS UART
+user until it exits. Changing rooms or partners clears queued cable data.
+This serial transport is separate from DOSBox IPXNET compatibility.
 
-Rooms use UDP port 1213 for local broadcast discovery and unicast payloads;
-the serial cable uses TCP port 1214. Discovery requires a shared broadcast
-network. Independent QEMU user networks and machines behind separate NATs
-do not discover one another; VMs need a shared virtual Ethernet segment.
-Room membership is a convenience for trusted local networks, without
-authentication or encryption.
+RetroOS discovery uses UDP port 1213 and requires a shared broadcast network;
+the serial cable uses TCP port 1214. IPXNET game traffic uses UDP port 213 on a
+RetroOS host, or the selected external server port. Explicit server addresses
+work without discovery. For QEMU user networking, a DOSBox server on the host
+is reachable at `10.0.2.2:<port>`. To host in RetroOS and connect from DOSBox on
+the host, add a UDP forward:
+
+```sh
+./run.sh qemu --net none -- \
+  -netdev user,id=net0,hostfwd=udp:127.0.0.1:1213-:213 \
+  -device virtio-net-pci,netdev=net0
+```
+
+Then DOSBox uses `IPXNET CONNECT 127.0.0.1 1213`. Discovery and rooms provide
+no authentication or encryption.
 
 `python3 test/ipx.py` exercises the DOS ABI between two VMs joined through
 the actual OSD. `python3 test/ipx_doom.py` tests original Doom/IPXSETUP,
 and `python3 test/ipx_doom.py --serial` tests Doom/SERSETUP through COM1.
-These use private disk snapshots and a shared QEMU Ethernet segment.
+`python3 test/ipx_dosbox.py` runs original Doom between RetroOS/QEMU and DOSBox
+with RetroOS hosting; add `--dosbox-server` to reverse the roles. Install
+DOSBox or set `DOSBOX_BIN` to its executable. The interoperability tests check
+advancing game ticks in both directions and retain packet captures, logs and
+a RetroOS screenshot. All tests use private game copies and disk snapshots.
 
 ## QEMU networking
 
