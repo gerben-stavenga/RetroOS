@@ -1,5 +1,8 @@
 name: CI
 on: push
+concurrency:
+  group: release-ci-diagnostics
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
@@ -8,7 +11,25 @@ jobs:
     timeout-minutes: 20
     steps:
     - uses: actions/checkout@v4
-    - uses: ./.github/actions/setup-build
+    - name: Minimal diagnostic tools
+      run: |
+        sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' /etc/apt/sources.list.d/ubuntu.sources
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends nasm samba samba-common-bin
+        python3 -m pip install --break-system-packages -r test/requirements.txt
+        sudo chmod a+rw /dev/kvm
+        sudo curl -fsSL -o /usr/local/bin/bazelisk https://github.com/bazelbuild/bazelisk/releases/download/v1.20.0/bazelisk-linux-amd64
+        sudo chmod +x /usr/local/bin/bazelisk
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/bazel-disk
+          ~/.cache/bazel-repo
+        key: diagnostic-unused
+        restore-keys: bazel-Linux-
+    - run: |
+        echo 'build --disk_cache=~/.cache/bazel-disk' >> ~/.bazelrc
+        echo 'build --repository_cache=~/.cache/bazel-repo' >> ~/.bazelrc
     - name: Diagnose Samba
       env:
         SMB_TEST_SUDO: '1'
