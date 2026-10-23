@@ -34,6 +34,7 @@ def main():
                 time.sleep(delay)
                 if process.poll() is not None:
                     raise AssertionError("Rat Commander exited before input completed")
+                print("SEND", repr(keys), flush=True)
                 process.stdin.write(keys)
                 process.stdin.flush()
             def wait_for(description, predicate, timeout=20):
