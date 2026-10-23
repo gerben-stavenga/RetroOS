@@ -1290,6 +1290,9 @@ fn launch_elf<A: crate::Arch>(
         },
     );
     if let thread::Personality::Linux(linux) = &mut threads[tid].personality {
+        // Startup uses an empty VFS path for the root directory; chdir("")
+        // is correctly rejected by the Linux syscall interface.
+        let cwd = if cwd.is_empty() { b"/".as_slice() } else { cwd };
         let status = crate::kernel::linux::do_chdir(cwd, &mut linux.cwd, &mut linux.cwd_len);
         if status < 0 { lib::compact_panic!("ELF initial cwd failed: errno {}", status); }
     }

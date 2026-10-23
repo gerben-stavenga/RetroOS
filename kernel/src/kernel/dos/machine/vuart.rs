@@ -155,7 +155,7 @@ impl Uart {
             3 => self.lcr,
             4 => self.mcr,
             5 => {
-                let value = 0x60 * self.tx.is_empty() as u8
+                let value = (0x60 * self.tx.is_empty() as u8)
                     | (!self.rx.is_empty()) as u8
                     | ((self.overrun as u8) << 1);
                 self.overrun = false;

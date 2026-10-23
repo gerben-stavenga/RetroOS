@@ -210,24 +210,26 @@ impl Lan {
                 }
             }
         }
-        if self.stream.is_none() && self.identity.unwrap().1 < peer.mac && time >= self.retry_at {
-            if let Ok(fd) = super::socket(SocketKind::Tcp, true) {
-                let _ = super::setsockopt(fd, SocketOption::TcpNoDelay(true));
-                match super::connect(
-                    fd,
-                    Endpoint {
-                        address: peer.endpoint.address,
-                        port: SERIAL_PORT,
-                    },
-                ) {
-                    Ok(_) | Err(Error::InProgress) | Err(Error::WouldBlock) => {
-                        self.stream = Some(fd);
-                        self.connect_until = time + 3000;
-                    }
-                    Err(_) => {
-                        super::close(fd);
-                        self.retry_at = time + 500;
-                    }
+        if self.stream.is_none()
+            && self.identity.unwrap().1 < peer.mac
+            && time >= self.retry_at
+            && let Ok(fd) = super::socket(SocketKind::Tcp, true)
+        {
+            let _ = super::setsockopt(fd, SocketOption::TcpNoDelay(true));
+            match super::connect(
+                fd,
+                Endpoint {
+                    address: peer.endpoint.address,
+                    port: SERIAL_PORT,
+                },
+            ) {
+                Ok(_) | Err(Error::InProgress) | Err(Error::WouldBlock) => {
+                    self.stream = Some(fd);
+                    self.connect_until = time + 3000;
+                }
+                Err(_) => {
+                    super::close(fd);
+                    self.retry_at = time + 500;
                 }
             }
         }
@@ -649,18 +651,17 @@ impl Lan {
         if (self.server.is_some() || self.remote.is_some())
             && self.clients.len() < 16
             && !self.clients.iter().any(|c| c.session.id == 0)
+            && let Some(connection) = ipx_tunnel::Connection::new(self.remote, ip)
         {
-            if let Some(connection) = ipx_tunnel::Connection::new(self.remote, ip) {
-                self.clients.push(Client {
-                    connection,
-                    session: Session {
-                        id: 0,
-                        epoch: self.epoch,
-                        address: [0; 10],
-                    },
-                    packets: VecDeque::new(),
-                });
-            }
+            self.clients.push(Client {
+                connection,
+                session: Session {
+                    id: 0,
+                    epoch: self.epoch,
+                    address: [0; 10],
+                },
+                packets: VecDeque::new(),
+            });
         }
         for _ in 0..32 {
             let Some(packet) = self.server.as_mut().and_then(|s| s.receive()) else {
@@ -727,10 +728,10 @@ pub(crate) fn key(sc: u8) -> bool {
                 0x27 => Some(b':'),
                 _ => None,
             };
-            if let Some(byte) = byte {
-                if lan.input.len() < 21 {
-                    lan.input.push(byte as char);
-                }
+            if let Some(byte) = byte
+                && lan.input.len() < 21
+            {
+                lan.input.push(byte as char);
             }
         }
     }
