@@ -32,7 +32,7 @@ def boot(work, iso, disk, expected):
         'qemu-system-i386', '-m', '128', '-cdrom', str(iso), '-boot', 'order=d',
         '-drive', f'file={disk},format=raw', '-display', 'none', '-serial', 'none',
         '-debugcon', f'file:{log}', '-no-reboot',
-        '-fw_cfg', 'name=opt/cmdline,string=/home/retroos/PROBE.ELF',
+        '-fw_cfg', 'name=opt/cmdline,string=/dos/PROBE.ELF',
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         deadline = time.monotonic() + 45
@@ -87,9 +87,9 @@ void _start(void) {
  if(sh<0 || call(3,sh,(int)elf,4)!=4 || elf[0]!=127 || elf[1]!='E') goto fail;
  call(6,sh,0,0);
  error=12;
- int state=call(5,(int)"/home/retroos/STATE.DAT",0,0), again=state>=0;
+ int state=call(5,(int)"/dos/STATE.DAT",0,0), again=state>=0;
  if(again) call(6,state,0,0);
- char *paths[]={"/home/retroos/RETROOS/RETROOS.INI","/home/retroos/RETROOS/BOOT.INI"};
+ char *paths[]={"/dos/RETROOS/RETROOS.INI","/dos/RETROOS/BOOT.INI"};
  char marker[]="\n# MACHINE_CONFIG_EDIT\n", b[8192];
  for(int i=0;i<2;i++) {
   error=20+i*10;
@@ -101,7 +101,7 @@ void _start(void) {
   call(6,f,0,0);
  }
  error=16;
- state=call(5,(int)"/home/retroos/STATE.DAT",0x241,0644);
+ state=call(5,(int)"/dos/STATE.DAT",0x241,0644);
  if(state<0 || call(4,state,(int)"YES",3)!=3) goto fail;
  call(6,state,0,0); call(1,again?2:0,0,0);
 fail: call(1,error,0,0); for(;;) {}

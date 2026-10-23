@@ -43,7 +43,7 @@ def session(work, disk, save_config):
             time.sleep(.1)
         else:
             raise AssertionError("DN did not start: " + text)
-        time.sleep(2)
+        time.sleep(5)  # The banner precedes loading DN.PRG on slow TCG hosts.
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(5)
             connection.connect(str(sock))
@@ -75,7 +75,12 @@ def session(work, disk, save_config):
                     key(name)
             for name in ("alt-x", "ret"):
                 key(name)
-            time.sleep(2)
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if "Startup program exited, restarting" in log.read_text(errors="replace"):
+                    break
+                assert process.poll() is None, log.read_text(errors="replace")
+                time.sleep(.1)
             call("quit")
         process.wait(timeout=5)
     finally:

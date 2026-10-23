@@ -36,7 +36,7 @@ def main():
             ("lib/os2/viocalls/VIOCALLS.DLL", "RETROOS/OS2/DLL/VIOCALLS.DLL"),
         ]:
             shutil.copyfile(ROOT / "bazel-bin" / source, root / dest)
-        shutil.copyfile(ROOT / linux, root / "LINUX.ELF")
+        shutil.copyfile(ROOT / linux, root / "probe.elf")
         (root / "TEST.COM").write_bytes(bytes.fromhex("803e80000d750c803e8100227505b8254ccd21b8014ccd21"))
         cases = [
             ("", "en_US.UTF-8", 1, 437, 0, 0x2e, 0),
@@ -57,7 +57,7 @@ def main():
                    f"date={order:04X} decimal={decimal:04X} currency={currency:04X}")
             for command, marker in [
                 ("/DOS.COM", dos), ("/WIN.EXE", "LOCALE WINDOWS PASS"),
-                ("/OS2.EXE", "LOCALE OS2 PASS"), (f"/LINUX.ELF {lang}", "LINUX RUNTIME PASS"),
+                ("/OS2.EXE", "LOCALE OS2 PASS"), (f"/probe.elf {lang}", "LINUX RUNTIME PASS"),
             ]:
                 try:
                     result = subprocess.run([

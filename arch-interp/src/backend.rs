@@ -59,7 +59,8 @@ impl Arch for Interp {
     // not_unsafe_ptr_arg_deref: the `*mut Fx`/`*mut u64` args are the trait's
     // fixed signature; the deref is guarded by the `is_null` check above.
     #[allow(clippy::deref_addrof, clippy::not_unsafe_ptr_arg_deref)]
-    fn activate(&mut self, incoming: RootPageTable, fx_ptr: *mut Self::Fx, _hash_ptr: *mut u64) -> RootPageTable {
+    fn activate(&mut self, mut incoming: RootPageTable, fx_ptr: *mut Self::Fx, _hash_ptr: *mut u64) -> RootPageTable {
+        if incoming.0 == u32::MAX { incoming = RootPageTable(crate::mmu::new_space()); }
         // Swap the live FPU with the thread's save area (null ⇒ transient
         // kernel-only swap, skip). KVM: state is the vcpu's XSAVE; TCG: no-op.
         if !fx_ptr.is_null() {

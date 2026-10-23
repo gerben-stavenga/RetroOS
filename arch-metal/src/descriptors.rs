@@ -491,9 +491,6 @@ pub fn setup_descriptor_tables(arch_stack_top: u32) {
     let (_, _, _, edx) = x86::cpuid(1);
     if edx & (1 << 1) != 0 {
         unsafe { x86::write_cr4(x86::read_cr4() | x86::cr4::VME); }
-        lib::compact_println!("VME enabled");
-    } else {
-        lib::compact_println!("VME not supported, using software VM86 monitor");
     }
 
     // Enable SSE if supported; always init x87.

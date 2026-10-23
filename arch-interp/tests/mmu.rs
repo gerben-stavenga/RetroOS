@@ -63,3 +63,18 @@ fn kernel_owned_shared_pages_are_coherent_across_guest_fork() {
     assert_eq!(unsafe { *memory.as_ptr().add(8197) }, 0x79);
     unsafe { machine.free_shared_pages(memory, 3); }
 }
+
+#[test]
+fn default_space_does_not_alias_a_suspended_vfork_parent() {
+    arch::init_guest_ram(0);
+    let mut machine = arch::Interp;
+    arch::mem().write::<u32>(HI, 0xCAFE_BABE);
+    // vfork parks the shared image while child exit/exec cleans a fresh space.
+    let parent = machine.activate(arch::RootPageTable::default(), null_mut(), null_mut());
+    assert_eq!(arch::mem().read::<u32>(HI), 0);
+    arch::mem().write::<u32>(HI, 0x1234_5678);
+    machine.free_user_pages();
+    let mut empty = machine.activate(parent, null_mut(), null_mut());
+    assert_eq!(arch::mem().read::<u32>(HI), 0xCAFE_BABE);
+    machine.destroy_space(&mut empty);
+}

@@ -5,7 +5,7 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 fail() { echo "run.sh: $*" >&2; exit 1; }
 BACKEND=qemu FIRMWARE=bios ARCH=686 SOUND=hda SOUND_EXPLICIT=0 HEADLESS=0 KVM=0 FREEDOS=0
 HD= COMMAND= SB_AUDIO= VM_PID=
-NETWORK=
+NETWORK= LIVE=0
 DATA_IMAGE="${RETROOS_DATA_IMAGE:-$SCRIPT_DIR/data.img}"
 PASS=()
 while [ $# -gt 0 ]; do

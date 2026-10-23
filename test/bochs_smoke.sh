@@ -50,7 +50,7 @@ run_probe() {
     pid=$!
     # Also stop on an early guest exit or panic; marker checks below still
     # require success. DPMI includes benchmarks, so allow slower CI CPUs.
-    if ! qemu_wait_for_log "$log" "$completion\|All commands done\|KERNEL PANIC\|panicked\|SEGV" 300 "$pid"; then
+    if ! qemu_wait_for_log "$log" "$completion\|All commands done\|KERNEL PANIC\|panicked\|SEGV" 600 "$pid"; then
         qemu_dump_log "$name" "$log"
         return 1
     fi

@@ -300,6 +300,12 @@ unsafe fn prepare_boot(
     // Install the kernel's metal log sink before any normal startup output.
     lib::log::set_debug_sink(log_byte);
     lib::log::set_fatal_handler(fatal_finish);
+    let (_, _, _, cpu_features) = x86::cpuid(1);
+    if cpu_features & (1 << 1) != 0 {
+        lib::compact_println!("VME enabled");
+    } else {
+        lib::compact_println!("VME not supported, using software VM86 monitor");
+    }
     // Inject the metal backend into the (backend-agnostic) kernel: port I/O
     // for the deep driver call sites, and the host-environment facts the
     // platform probe reads (real 0xE9 debugcon, GOP fbcon detection, metal).

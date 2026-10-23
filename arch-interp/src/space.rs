@@ -15,7 +15,9 @@ impl RootPageTable {
 }
 
 impl Default for RootPageTable {
-    fn default() -> Self { RootPageTable::empty() }
+    // A vacant saved slot must not alias the live boot address space.
+    // Allocate its page tables only when it is first activated.
+    fn default() -> Self { RootPageTable(u32::MAX) }
 }
 
 /// Interpreter analogue of the metal kernel's statically-allocated page-table

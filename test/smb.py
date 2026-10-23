@@ -158,7 +158,7 @@ valid users = {username}
     config.chmod(0o600)
     run(pdbedit,'-t','-a','-u',username,'-s',config,input=b'retrotest\nretrotest\n')
     with (work/'samba-stderr').open('w') as errors:
-        server=subprocess.Popen([smbd,'-F','--no-process-group','-s',str(config)],stdout=errors,stderr=errors,start_new_session=True)
+        server=subprocess.Popen([smbd,'-F','--no-process-group','--debug-stdout','-s',str(config)],stdout=errors,stderr=errors,start_new_session=True)
         try:
             deadline=time.monotonic()+5
             while True:
@@ -180,6 +180,7 @@ valid users = {username}
                 try:vm(work/fault,proxy.port,fault=fault)
                 finally:proxy.close()
         finally:
-            os.killpg(server.pid,signal.SIGTERM);server.wait(timeout=5)
+            if server.poll() is None: os.killpg(server.pid,signal.SIGTERM)
+            server.wait(timeout=5)
 
 if __name__=='__main__':main()
