@@ -250,8 +250,6 @@ impl LinuxState {
 
     /// Feed console input through the terminal settings shared by forked processes.
     pub fn process_key<A: crate::Arch>(&mut self, _machine: &mut A, _fds: &[FdKind; MAX_FDS], scancode: u8) {
-        crate::compact_dbg_println!("KEY scan={:02X}", scancode);
-        if scancode == 0x3e { TRACE_IO.store(5000, core::sync::atomic::Ordering::Relaxed); }
         let mut keyboard = self.keyboard.lock();
         if !crate::kernel::keyboard::update_console(&mut keyboard,scancode) { return; }
         let event = crate::kernel::keyboard::event();
@@ -292,8 +290,6 @@ impl LinuxState {
 // =============================================================================
 // Extracted syscall arguments (mode-independent)
 // =============================================================================
-
-static TRACE_IO: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Clone, Copy)]
 struct Args {
@@ -1199,7 +1195,6 @@ fn sys_read<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
         thread::FdKind::PipeRead(idx) => {
             let mut tmp = alloc::vec![0u8; len];
             if let Some(n) = crate::kernel::kpipe::read_event(idx, &mut tmp) {
-                crate::compact_dbg_println!("READ single fd={} bytes={:?}", fd, &tmp[..n]);
                 machine.copy_to(buf, &tmp[..n]);
                 return SyscallResult::val(n as i32);
             }

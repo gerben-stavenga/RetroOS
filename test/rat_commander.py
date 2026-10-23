@@ -34,7 +34,6 @@ def main():
                 time.sleep(delay)
                 if process.poll() is not None:
                     raise AssertionError("Rat Commander exited before input completed")
-                print("SEND", repr(keys), flush=True)
                 process.stdin.write(keys)
                 process.stdin.flush()
             def wait_for(description, predicate, timeout=20):
@@ -115,12 +114,9 @@ def main():
                 send(b"\x1b[F")  # End: select note.txt after the copy refresh.
                 wait_for("note.txt selection", lambda: "note.txt" in terminal_text().splitlines()[21][:40])
                 send(b"\x1bOS", 2)  # F4, after the asynchronous copy refresh settles.
-                try:
-                    wait_for("editor contents", lambda: "Original text" in terminal_text())
-                except AssertionError:
-                    print("F4 did not open editor; retrying F4", flush=True)
-                    send(b"\x1bOS")
-                    wait_for("editor contents after retry", lambda: "Original text" in terminal_text())
+                started = time.monotonic()
+                wait_for("editor contents", lambda: "Original text" in terminal_text(), timeout=90)
+                print(f"Editor startup: {time.monotonic() - started:.1f}s", flush=True)
                 send(b"\x1b[H.x\r", 1.5)
                 send(b"\x1bOQ")  # F2: save
                 send(b"\r")  # Confirm save if configured.

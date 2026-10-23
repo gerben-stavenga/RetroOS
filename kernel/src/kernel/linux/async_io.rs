@@ -600,7 +600,6 @@ pub(super) fn call<A: crate::Arch>(
             if let FdKind::PipeRead(i) = kt.fds[fd as usize] {
                 let mut data = alloc::vec![0; a.a2 as usize];
                 if let Some(n) = crate::kernel::kpipe::read_event(i, &mut data) {
-                    crate::compact_dbg_println!("READ async fd={} ctx={} n={} first={:02X} second={:02X} third={:02X}", fd, s.active, n, data.first().copied().unwrap_or(0), data.get(1).copied().unwrap_or(0), data.get(2).copied().unwrap_or(0));
                     machine.copy_to(a.a1 as usize, &data[..n]);
                     reset_edge(s, fd);
                     n as i32
@@ -788,9 +787,6 @@ pub(super) fn call<A: crate::Arch>(
         }
         _ => return None,
     };
-    if super::TRACE_IO.fetch_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |v| v.checked_sub(1)).is_ok() {
-        crate::compact_dbg_println!("IO ctx={} nr={} a0={:X} a1={:X} a2={:X} ret={}", s.active, nr, a.a0, a.a1, a.a2, ret);
-    }
     Some(SyscallResult::val(ret))
 }
 /// Observe readiness loss at I/O time. An edge-triggered epoll caller may
@@ -881,7 +877,6 @@ pub(super) fn schedule<A: crate::Arch>(
             Wait::Read(pipe, out, count) => {
                 let mut data = alloc::vec![0; count];
                 if let Some(n) = crate::kernel::kpipe::read_event(pipe, &mut data) {
-                    crate::compact_dbg_println!("READ deferred ctx={} n={} first={:02X}", i, n, data.first().copied().unwrap_or(0));
                     machine.copy_to(out, &data[..n]);
                     Some(n as i32)
                 } else {
@@ -891,9 +886,6 @@ pub(super) fn schedule<A: crate::Arch>(
             _ => None,
         };
         if let Some(result) = result {
-            if super::TRACE_IO.load(core::sync::atomic::Ordering::Relaxed) != 0 {
-                crate::compact_dbg_println!("WAKE ctx={} result={}", i, result);
-            }
             s.contexts[i].regs.rax = result as i64 as u64;
             s.contexts[i].wait = Wait::Ready;
         }
