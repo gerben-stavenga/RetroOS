@@ -159,8 +159,9 @@ valid users = {username}
     run(pdbedit,'-t','-a','-u',username,'-s',config,input=b'retrotest\nretrotest\n')
     # Distribution Samba services require root; opt in on disposable CI runners.
     service_prefix = ["sudo", "-n"] if os.environ.get("SMB_TEST_SUDO") == "1" else []
+    # Foreground smbd exits on stdin EOF; CI itself has no open input.
     with (work/'samba-stderr').open('w') as errors:
-        server=subprocess.Popen(service_prefix + [smbd,'-F','--no-process-group','--debug-stdout','-s',str(config)],stdout=errors,stderr=errors,start_new_session=True)
+        server=subprocess.Popen(service_prefix + [smbd,'-F','--no-process-group','--debug-stdout','-s',str(config)],stdin=subprocess.PIPE,stdout=errors,stderr=errors,start_new_session=True)
         try:
             deadline=time.monotonic()+5
             while True:
