@@ -64,7 +64,7 @@ passed db 'USB INPUT PASS',13,10,'$'
 '''
 
 
-def session(work, disk, name, controllers, keyboard, mouse, uefi=False):
+def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0):
     log = work / (name + '.log')
     qmp = work / (name + '.sock')
     boot = prepare_boot(work, disk)
@@ -85,8 +85,14 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False):
                  '-drive', f'if=pflash,format=raw,file={variables}']
     for index in range(controllers):
         args += ['-device', f'qemu-xhci,id=usb{index}']
-    args += ['-device', f'usb-kbd,id=kbd,bus=usb{keyboard}.0',
-             '-device', f'usb-mouse,id=mouse,bus=usb{mouse}.0']
+    chain = '1'
+    for index in range(hubs):
+        args += ['-device', f'usb-hub,id=hub{index},bus=usb{keyboard}.0,port={chain},port-power=on']
+        chain += '.3'
+    key_port = ',port=' + chain[:-1] + '2' if hubs else ''
+    mouse_port = ',port=' + chain[:-1] + '4' if hubs and mouse == keyboard else ''
+    args += ['-device', f'usb-kbd,id=kbd,bus=usb{keyboard}.0{key_port}',
+             '-device', f'usb-mouse,id=mouse,bus=usb{mouse}.0{mouse_port}']
     with (work / (name + '.stderr')).open('w') as errors:
         proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=errors,
                                 stdin=subprocess.DEVNULL)
@@ -129,6 +135,7 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False):
                 text = wait_for('All commands done')
             assert 'USB INPUT PASS' in text, text
             assert text.count('xHCI: running') == min(controllers, 4), text
+            assert text.count('xHCI: hub ready') == hubs, text
             for expected in ('xHCI: keyboard ready', 'xHCI: mouse ready',
                              'IRQ: no i8042'):
                 assert expected in text, text
@@ -158,6 +165,11 @@ def main():
         subprocess.run(['mcopy', '-i', str(disk), str(probe), '::INPUT.COM'], check=True)
         subprocess.run(['mmd', '-i', str(disk), '::RETROOS'], check=True)
         subprocess.run(['mcopy', '-i', str(disk), str(ROOT / 'etc/RETROOS.INI'), '::RETROOS/RETROOS.INI'], check=True)
+        session(work, disk, 'hub', 1, 0, 0, hubs=1)
+        session(work, disk, 'nested-hubs', 1, 0, 0, hubs=2)
+        session(work, disk, 'deep-hubs', 1, 0, 0, hubs=5)
+        session(work, disk, 'hub-split', 2, 0, 1, hubs=1)
+        session(work, disk, 'uefi-hub', 1, 0, 0, uefi=True, hubs=1)
         session(work, disk, 'shared', 1, 0, 0)
         session(work, disk, 'split', 2, 0, 1)
         session(work, disk, 'empty-first', 3, 1, 2)

@@ -17,8 +17,10 @@ pub(super) const REPORT1_OFF: usize = 0xD000;
 pub(super) const INT2_OFF: usize = 0xE000;
 pub(super) const REPORT2_OFF: usize = 0xF000;
 // The ten-bit scratchpad count can require 1023 pointers (two pages).
-pub(super) const SCRATCH_OFF: usize = 0x10000;
-pub(super) const DMA_PAGES: usize = 18;
+// Six additional context/control-ring pairs for hubs and downstream devices.
+pub(super) const EXTRA_DEVICES_OFF: usize = 0x10000;
+pub(super) const SCRATCH_OFF: usize = 0x1C000;
+pub(super) const DMA_PAGES: usize = 30;
 
 /// Fill the array before publishing it to the controller. Scratchpad pages
 /// need not be contiguous. The allocator returns permanent, zeroed DMA pages;
@@ -44,10 +46,13 @@ mod tests {
     fn x99_requires_sixteen_separate_zeroed_pages() {
         let mut array = [0; 1024];
         let mut allocated = 0;
-        assert_eq!(scratchpads(0x84000054, &mut array, || {
-            allocated += 1;
-            Some(allocated * 0x3000)
-        }), Some(16));
+        assert_eq!(
+            scratchpads(0x84000054, &mut array, || {
+                allocated += 1;
+                Some(allocated * 0x3000)
+            }),
+            Some(16)
+        );
         assert_eq!(allocated, 16);
         assert_eq!(&array[..3], &[0x3000, 0x6000, 0x9000]);
         assert_eq!(array[15], 16 * 0x3000);
@@ -57,14 +62,30 @@ mod tests {
     #[test]
     fn full_ten_bit_count_fits_without_touching_other_dma_structures() {
         let mut array = [0; (DMA_PAGES * 4096 - SCRATCH_OFF) / 8];
-        assert_eq!(scratchpads((31 << 21) | (31 << 27), &mut array,
-                              || Some(0x100000)), Some(1023));
+        assert_eq!(
+            scratchpads((31 << 21) | (31 << 27), &mut array, || Some(0x100000)),
+            Some(1023)
+        );
         assert_eq!(array[1022], 0x100000);
         assert_eq!(array[1023], 0);
-        let regions = [DCBAA_OFF, CMD_OFF, EVT_OFF, ERST_OFF, INCTX_OFF,
-                       DEVCTX0_OFF, EP0_0_OFF, XFER_OFF, INT0_OFF, REPORT0_OFF,
-                       DEVCTX1_OFF, EP0_1_OFF, INT1_OFF, REPORT1_OFF,
-                       INT2_OFF, REPORT2_OFF];
+        let regions = [
+            DCBAA_OFF,
+            CMD_OFF,
+            EVT_OFF,
+            ERST_OFF,
+            INCTX_OFF,
+            DEVCTX0_OFF,
+            EP0_0_OFF,
+            XFER_OFF,
+            INT0_OFF,
+            REPORT0_OFF,
+            DEVCTX1_OFF,
+            EP0_1_OFF,
+            INT1_OFF,
+            REPORT1_OFF,
+            INT2_OFF,
+            REPORT2_OFF,
+        ];
         for (i, offset) in regions.iter().enumerate() {
             assert!(offset + 4096 <= SCRATCH_OFF);
             assert_eq!(offset % 4096, 0);
@@ -73,17 +94,37 @@ mod tests {
     }
 
     #[test]
+    fn all_device_lanes_fit_before_scratchpads_and_next_controller() {
+        for lane in 2..super::super::DEVICE_LANES {
+            let context = super::super::device_context_off(lane);
+            let ep0 = super::super::ep0_off(lane);
+            assert_eq!(context, EXTRA_DEVICES_OFF + (lane - 2) * 8192);
+            assert_eq!(ep0, context + 4096);
+            assert!(ep0 + 4096 <= SCRATCH_OFF);
+        }
+        assert!(0x10000 + (DMA_PAGES + 1) * 4096 <= super::super::CONTROLLER_STRIDE);
+    }
+
+    #[test]
     fn zero_scratchpads_and_allocation_failure() {
-        assert_eq!(scratchpads(0, &mut [], || panic!("must not allocate")), Some(0));
+        assert_eq!(
+            scratchpads(0, &mut [], || panic!("must not allocate")),
+            Some(0)
+        );
         let mut array = [0; 16];
         let mut calls = 0;
-        assert_eq!(scratchpads(0x84000054, &mut array, || {
-            calls += 1;
-            (calls < 4).then_some(0x100000)
-        }), None);
+        assert_eq!(
+            scratchpads(0x84000054, &mut array, || {
+                calls += 1;
+                (calls < 4).then_some(0x100000)
+            }),
+            None
+        );
         assert_eq!(calls, 4);
         assert_eq!(array[3], 0);
-        assert_eq!(scratchpads(0x84000054, &mut [0; 8],
-                              || panic!("array too small")), None);
+        assert_eq!(
+            scratchpads(0x84000054, &mut [0; 8], || panic!("array too small")),
+            None
+        );
     }
 }

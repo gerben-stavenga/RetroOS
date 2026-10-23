@@ -1027,17 +1027,28 @@ the personality BIOS's INT 09. Machines with USB-only input are handled by the
 xHCI USB-HID boot-keyboard driver, which works on real full-speed hardware
 (verified on a Razer Blade — SkyRoads played from USB keyboard input).
 
-USB input currently supports xHCI controllers and directly attached HID boot
-keyboards and mice, including composite devices that expose both interfaces
-(such as some KVMs). Boot interfaces are switched to boot protocol; a legacy
-report-ID keyboard layout is also supported for certain gaming keyboards.
-Each of up to four controllers can retain two devices with at most two keyboard
-endpoints and one mouse endpoint. Input devices must be connected at boot.
-External USB hubs and their downstream devices, hotplug, EHCI/OHCI/UHCI,
-USB game controllers, and general HID report-descriptor parsing are not yet
-supported. A KVM that exposes a hub may therefore need a dedicated keyboard
-or mouse emulation port. In KLOG, `keyboard ready` / `mouse ready` means
-endpoint setup succeeded; it does not confirm that input reports arrived.
+USB input supports xHCI controllers and HID boot keyboards and mice attached
+directly or through USB 1.x/2.0 hubs, including composite devices exposing both
+interfaces. Hub enumeration powers and resets downstream ports, constructs
+nested route strings, and supplies transaction-translator ancestry for
+low/full-speed devices below a high-speed hub. High-speed hubs use their
+default single-TT alternate setting. Input devices must be connected at boot.
+
+Each of up to four controllers retains at most eight devices, including hubs,
+with at most two keyboard endpoints and one mouse endpoint. Routes support
+five downstream tiers and hub ports 1–15. Boot interfaces are switched to boot
+protocol; a legacy report-ID layout supports certain gaming keyboards.
+SuperSpeed hubs, hotplug, EHCI/OHCI/UHCI, USB game controllers, and general HID
+report-descriptor parsing remain unsupported. In KLOG, `keyboard ready` /
+`mouse ready` means endpoint setup succeeded, not that input reports arrived.
+
+Run `python3 test/xhci_smoke.py` for direct devices, powered hubs, nested hubs
+(including a five-hub chain), split controllers and BIOS/UEFI. PS/2 is disabled;
+the DOS probe must receive a keyboard press, mouse motion and a click. QEMU's
+hub model is full-speed, so physical high-speed hub/TT operation and the KVM
+switch reported in issue #71 still require testing on the affected hardware.
+`bazelisk test //arch-metal:xhci_dma_test` also checks route limits, inherited
+TT ancestry, both context sizes and nonoverlapping DMA storage.
 
 Caveats on real hardware (vs the `run_uefi.sh` mock):
 - fbcon accepts packed 16/24/32bpp direct-RGB framebuffers and converts its pixels using the

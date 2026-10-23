@@ -204,3 +204,27 @@ fn failed_boot_protocol_request_does_not_publish_an_input_pipe() {
     assert_eq!(f.controller.cmd_enq, 0);
     assert!(!f.controller.pipes[0].ready);
 }
+
+#[test]
+fn downstream_address_context_keeps_route_and_transaction_translator() {
+    for stride in [32, 64] {
+        let mut f = Fixture::new();
+        let route = Route::root(7)
+            .child(3, 4, 3, 1)
+            .unwrap()
+            .child(2, 5, 1, 2)
+            .unwrap();
+        f.event(0, 33, 6, 0, 1, 0);
+        assert!(f.controller.address_device(6, 7, route, 2, stride));
+        unsafe {
+            let ctx = f.controller.dma_va + INCTX_OFF + stride;
+            assert_eq!(*(ctx as *const u32), (1 << 27) | (2 << 20) | 0x23);
+            assert_eq!(*((ctx + 4) as *const u32), 7 << 16);
+            assert_eq!(*((ctx + 8) as *const u32), 4 | (3 << 8));
+            assert_eq!(
+                *((f.controller.dma_va + DCBAA_OFF + 6 * 8) as *const u64),
+                f.controller.dma_phys + device_context_off(7) as u64
+            );
+        }
+    }
+}

@@ -1,5 +1,5 @@
 //! Compact xHCI USB host-controller driver for USB-HID keyboard and mouse input.
-//! Each controller retains at most two addressed root-port devices and three
+//! Each controller retains up to eight devices (including USB 1/2 hubs) and three
 //! interrupt-IN endpoints: two keyboards and a mouse. Reports feed the same
 //! `irq::QUEUE` as i8042 input, so nothing above the arch boundary depends on
 //! the physical input bus.
@@ -56,7 +56,7 @@ fn for_each_xhci(mut found: impl FnMut(u8, u8, u8)) {
 
 // ── Controller MMIO ────────────────────────────────────────────────────────
 // Four disjoint windows above the framebuffer and LAPIC/HPET/IOAPIC mappings.
-// Each reserves 64 KiB MMIO + 64 KiB DMA + one scratchpad mapping page.
+// Each reserves 64 KiB MMIO + 120 KiB DMA + one scratchpad mapping page.
 // The 192 KiB stride leaves space between controllers and below the VA ceiling.
 const MMIO_BASE: usize = 0xFFF1_0000;
 const CONTROLLER_STRIDE: usize = 0x30000;
@@ -69,16 +69,20 @@ const MAX_CONTROLLERS: usize = 4;
 mod dma;
 #[path = "xhci/handoff.rs"]
 mod handoff;
+#[path = "xhci/hub.rs"]
+mod hub;
 #[path = "xhci/port.rs"]
 mod port;
 use dma::*;
+use hub::Route;
 const RING_TRBS: usize = 256;
-const DEVICE_LANES: usize = 2;
+const DEVICE_LANES: usize = 8;
 
 fn device_context_off(lane: usize) -> usize {
     match lane {
         0 => DEVCTX0_OFF,
         1 => DEVCTX1_OFF,
+        2..DEVICE_LANES => EXTRA_DEVICES_OFF + (lane - 2) * 0x2000,
         _ => unreachable!(),
     }
 }
@@ -87,6 +91,7 @@ fn ep0_off(lane: usize) -> usize {
     match lane {
         0 => EP0_0_OFF,
         1 => EP0_1_OFF,
+        2..DEVICE_LANES => EXTRA_DEVICES_OFF + (lane - 2) * 0x2000 + 0x1000,
         _ => unreachable!(),
     }
 }
@@ -246,10 +251,9 @@ struct EpInfo {
     interval: u32,
 }
 
-/// Classification of one connected root-hub port, built once during init. The
-/// inventory separates enumeration (what's on each port) from role selection
-/// (which device drives the keyboard and mouse), so each root port is probed
-/// only once.
+/// Classification of one root or downstream device, built once during init.
+/// Enumeration and HID role selection share this inventory to avoid resetting
+/// an already-addressed device. `port` identifies its controller root port.
 #[derive(Clone, Copy)]
 struct PortDevice {
     lane: usize,
@@ -590,9 +594,17 @@ impl Controller {
     /// mask and completion rules. Return the negotiated post-reset port status.
     fn reset_port(&self, op: usize, port: u32) -> Option<u32> {
         let off = op + OP_PORTSC + (port as usize - 1) * 0x10;
-        let state = port::reset(|| self.r32(off), |v| self.w32(off, v), || crate::irq::now(false));
+        let state = port::reset(
+            || self.r32(off),
+            |v| self.w32(off, v),
+            || crate::irq::now(false),
+        );
         if state.is_none() {
-            lib::compact_println!("xHCI: port {} reset failed (portsc={:#x})", port, self.r32(off));
+            lib::compact_println!(
+                "xHCI: port {} reset failed (portsc={:#x})",
+                port,
+                self.r32(off)
+            );
         }
         state
     }
@@ -623,7 +635,7 @@ impl Controller {
         &mut self,
         slot: u32,
         lane: usize,
-        port: u32,
+        route: Route,
         speed: u32,
         stride: usize,
     ) -> bool {
@@ -636,8 +648,17 @@ impl Controller {
             // Slot Context: Context Entries = 1 (27:31), Speed (20:23); Root-Hub
             // Port Number (16:23 of dword 1).
             let slotc = inctx + stride;
-            core::ptr::write_volatile(slotc as *mut u32, (1 << 27) | (speed << 20));
-            core::ptr::write_volatile((slotc + 4) as *mut u32, port << 16);
+            core::ptr::write_volatile(slotc as *mut u32, (1 << 27) | (speed << 20) | route.string);
+            core::ptr::write_volatile((slotc + 4) as *mut u32, route.root_port << 16);
+            core::ptr::write_volatile(
+                (slotc + 8) as *mut u32,
+                route.tt_slot | (route.tt_port << 8),
+            );
+            core::ptr::write_bytes(
+                (self.dma_va + device_context_off(lane)) as *mut u8,
+                0,
+                0x1000,
+            );
             // EP0 Context: EP Type = Control (4) at 3:5, Max Packet Size at 16:31,
             // CErr = 3 at 1:2; TR Dequeue Pointer (64-bit) with DCS = 1.
             let mps: u32 = match speed {
@@ -693,12 +714,9 @@ impl Controller {
             core::ptr::write_bytes(inctx as *mut u8, 0, 0x1000);
             // Input Control Context: add Slot (bit 0) + this endpoint (bit dci).
             core::ptr::write_volatile((inctx + 4) as *mut u32, 1 | (1 << dci));
-            // Slot Context: COPY the controller's live output slot context, then only
-            // bump Context Entries to the new highest DCI. Address Device fills in
-            // derived fields (TT hub/port, routing, speed) needed to run split
-            // transactions to a full-speed device on the high-speed root hub; a fresh
-            // slot context (speed/port only) zeroes those, and the re-evaluation then
-            // leaves the endpoint "Running" but never polled — no transfers at all.
+            // Preserve routing and TT ancestry when adding endpoints. The root
+            // port, downstream route string and translator belong to the device,
+            // independently of which HID interfaces have been configured.
             let slotc = inctx + stride;
             core::ptr::copy_nonoverlapping(
                 (self.dma_va + device_context_off(lane)) as *const u8,
@@ -735,14 +753,18 @@ impl Controller {
             Some((cc, returned_slot)) => {
                 lib::compact_println!(
                     "xHCI: Configure Endpoint slot {} ep {} failed: completion={} returned_slot={}",
-                    slot, ep.ep, cc, returned_slot
+                    slot,
+                    ep.ep,
+                    cc,
+                    returned_slot
                 );
                 false
             }
             None => {
                 lib::compact_println!(
                     "xHCI: Configure Endpoint slot {} ep {} timed out",
-                    slot, ep.ep
+                    slot,
+                    ep.ep
                 );
                 false
             }
@@ -898,7 +920,10 @@ impl Controller {
                     if index < 2 {
                         let id_prefixed = self.pipes[index].keyboard_report_id;
                         Self::process_keyboard_report(
-                            &mut self.pipes[index].prev, &report, len, id_prefixed,
+                            &mut self.pipes[index].prev,
+                            &report,
+                            len,
+                            id_prefixed,
                         );
                     } else {
                         process_mouse_report(&report, len);
@@ -928,8 +953,16 @@ impl Controller {
         stride: usize,
     ) -> Option<(u32, u32)> {
         let off = op + OP_PORTSC + (port as usize - 1) * 0x10;
-        if !port::debounce(|| self.r32(off), |v| self.w32(off, v), || crate::irq::now(false)) {
-            lib::compact_println!("xHCI: port {} connection unstable (portsc={:#x})", port, self.r32(off));
+        if !port::debounce(
+            || self.r32(off),
+            |v| self.w32(off, v),
+            || crate::irq::now(false),
+        ) {
+            lib::compact_println!(
+                "xHCI: port {} connection unstable (portsc={:#x})",
+                port,
+                self.r32(off)
+            );
             return None;
         }
         let state = self.reset_port(op, port)?;
@@ -938,27 +971,38 @@ impl Controller {
             lib::compact_println!("xHCI: port {} Enable Slot failed", port);
             return None;
         };
-        if !self.address_device(slot, lane, port, speed, stride) {
-            lib::compact_println!("xHCI: port {} Address Device failed (slot {} speed {})", port, slot, speed);
+        if !self.address_device(slot, lane, Route::root(port), speed, stride) {
+            lib::compact_println!(
+                "xHCI: port {} Address Device failed (slot {} speed {})",
+                port,
+                slot,
+                speed
+            );
             self.disable_slot(slot);
             return None;
         }
-        // We address with the safe minimum MPS 8; read bMaxPacketSize0 (fits one
-        // 8-byte packet) and, if larger, update EP0 before any bigger transfer or a
-        // full-speed config read babbles. High-speed is always 64.
-        if !self.control(slot, lane, 0x80, 0x06, 0x0100, 0, 8) {
-            lib::compact_println!("xHCI: port {} device descriptor failed (slot {})", port, slot);
-            self.disable_slot(slot);
-            return None;
-        }
-        let mps0 =
-            unsafe { core::ptr::read_volatile((self.dma_va + XFER_OFF + 7) as *const u8) } as u32;
-        if mps0 > 8 && !self.evaluate_ep0_mps(slot, lane, mps0, stride) {
-            lib::compact_println!("xHCI: port {} EP0 packet size update failed (slot {} mps {})", port, slot, mps0);
+        if !self.read_device_header(slot, lane, speed, stride) {
+            lib::compact_println!(
+                "xHCI: port {} device descriptor failed (slot {})",
+                port,
+                slot
+            );
             self.disable_slot(slot);
             return None;
         }
         Some((slot, speed))
+    }
+
+    fn read_device_header(&mut self, slot: u32, lane: usize, speed: u32, stride: usize) -> bool {
+        if !self.control(slot, lane, 0x80, 0x06, 0x0100, 0, 8) {
+            return false;
+        }
+        let mps0 =
+            unsafe { core::ptr::read_volatile((self.dma_va + XFER_OFF + 7) as *const u8) } as u32;
+        // Only full-speed EP0 varies. SuperSpeed encodes an exponent, not bytes.
+        speed != 1
+            || (matches!(mps0, 8 | 16 | 32 | 64)
+                && (mps0 == 8 || self.evaluate_ep0_mps(slot, lane, mps0, stride)))
     }
 
     /// Read the configuration descriptor of an ALREADY-ADDRESSED device (its slot
@@ -984,7 +1028,8 @@ impl Controller {
         if self.control(slot, lane, 0x80, 0x06, 0x0200, 0, 255) {
             dev.cfg_value = rd(5);
             let total = ((rd(2) | (rd(3) << 8)) as usize).min(255);
-            let (mut cur_iface, mut is_kbd, mut is_boot_kbd, mut is_mouse) = (0u32, false, false, false);
+            let (mut cur_iface, mut is_kbd, mut is_boot_kbd, mut is_mouse) =
+                (0u32, false, false, false);
             let mut i = rd(0) as usize;
             while i + 2 <= total {
                 let (blen, btype) = (rd(i) as usize, rd(i + 1));
@@ -1026,7 +1071,11 @@ impl Controller {
                 i += blen;
             }
         } else {
-            lib::compact_println!("xHCI: port {} configuration descriptor failed (slot {})", port, slot);
+            lib::compact_println!(
+                "xHCI: port {} configuration descriptor failed (slot {})",
+                port,
+                slot
+            );
         }
         dev
     }
@@ -1048,8 +1097,12 @@ impl Controller {
             // layout only after SET_PROTOCOL(boot). Packet size alone cannot
             // tell whether report protocol prepends an ID or uses wider fields.
             if !self.control(slot, dev.lane, 0x21, 0x0B, 0, ep.iface, 0) {
-                lib::compact_println!("xHCI: port {} SET_PROTOCOL(boot) failed (slot {} iface {})",
-                    dev.port, slot, ep.iface);
+                lib::compact_println!(
+                    "xHCI: port {} SET_PROTOCOL(boot) failed (slot {} iface {})",
+                    dev.port,
+                    slot,
+                    ep.iface
+                );
                 return false;
             }
         }
@@ -1071,8 +1124,17 @@ impl Controller {
             let _ = compact_fmt::writeln!(
                 &mut lib::log::DebugCon,
                 "xHCI: port {} {} endpoint setup failed (slot {} iface {} ep {} mps {} interval {})",
-                dev.port, if matches!(role, HidRole::Keyboard) { "keyboard" } else { "mouse" },
-                slot, ep.iface, ep.ep, ep.mps, interval
+                dev.port,
+                if matches!(role, HidRole::Keyboard) {
+                    "keyboard"
+                } else {
+                    "mouse"
+                },
+                slot,
+                ep.iface,
+                ep.ep,
+                ep.mps,
+                interval
             );
             return false;
         }
@@ -1170,10 +1232,13 @@ impl Controller {
             |offset, value| self.w32(offset, value),
             || crate::irq::now(false),
         ) {
-            lib::compact_println!("xHCI: firmware handoff failed ({}) - skipping", match error {
-                handoff::Error::InvalidCapability => "invalid capability chain",
-                handoff::Error::BiosOwned => "BIOS retains ownership",
-            });
+            lib::compact_println!(
+                "xHCI: firmware handoff failed ({}) - skipping",
+                match error {
+                    handoff::Error::InvalidCapability => "invalid capability chain",
+                    handoff::Error::BiosOwned => "BIOS retains ownership",
+                }
+            );
             return;
         }
 
@@ -1206,70 +1271,41 @@ impl Controller {
             return;
         }
 
-        // Retain up to two keyboard devices and one mouse. A composite device
-        // can provide both roles while using just one addressed device lane.
-        let mut keyboards: [Option<(u32, PortDevice, EpInfo)>; 2] = [None; 2];
-        let mut mouse: Option<(u32, PortDevice, EpInfo)> = None;
-        let mut devices: [Option<(u32, PortDevice)>; DEVICE_LANES] = [None; DEVICE_LANES];
-        let mut retained_lanes = 0usize;
+        let mut inventory = hub::Inventory::new();
         for p in 1..=max_ports {
-            let portsc = self.r32(op + OP_PORTSC + (p as usize - 1) * 0x10);
-            if portsc & 1 == 0 {
-                continue; // CCS = 0: nothing connected
-            }
-            if retained_lanes == DEVICE_LANES {
-                break;
-            }
-            let lane = retained_lanes;
-            let Some((slot, speed)) = self.address_port(op, lane, p, stride) else {
+            if self.r32(op + OP_PORTSC + (p as usize - 1) * 0x10) & 1 == 0 {
                 continue;
-            };
-            let dev = self.classify_addressed(slot, lane, p, speed);
-            let _ = compact_fmt::writeln!(
-                &mut lib::log::DebugCon,
-                "xHCI: port {} speed {} class {} keyboard={} mouse={}",
-                p,
-                speed,
-                dev.dev_class,
-                dev.keyboard.is_some(),
-                dev.mouse.is_some()
-            );
-            if dev.dev_class == 9 {
-                lib::compact_println!("xHCI: port {} USB hub unsupported; downstream devices not enumerated", p);
             }
-            let mut retained = false;
-            if let Some(ep) = dev.keyboard
-                && let Some(index) = keyboards.iter().position(Option::is_none)
-            {
-                keyboards[index] = Some((slot, dev, ep));
-                retained = true;
-            }
-            if mouse.is_none()
-                && let Some(ep) = dev.mouse
-            {
-                mouse = Some((slot, dev, ep));
-                retained = true;
-            }
-            if retained {
-                devices[lane] = Some((slot, dev));
-                retained_lanes += 1;
-            } else {
-                self.disable_slot(slot);
-            }
-            if keyboards.iter().all(Option::is_some) && mouse.is_some() {
+            if inventory.used == DEVICE_LANES {
+                lib::compact_println!("xHCI: device limit reached (including hubs)");
                 break;
+            }
+            let lane = inventory.used;
+            if let Some((slot, speed)) = self.address_port(op, lane, p, stride) {
+                self.enumerate_device(slot, lane, Route::root(p), speed, stride, &mut inventory);
             }
         }
+        let hub::Inventory {
+            keyboards,
+            mouse,
+            devices,
+            ..
+        } = inventory;
 
         // Configure each distinct device once before adding its endpoints.
         let mut configured = [false; DEVICE_LANES];
         for (lane, selected) in devices.iter().enumerate() {
             if let Some((slot, dev)) = selected {
+                if dev.dev_class == 9 {
+                    continue;
+                } // Hubs are already configured; do not reset their ports.
                 configured[lane] = self.control(*slot, dev.lane, 0x00, 0x09, dev.cfg_value, 0, 0);
                 if !configured[lane] {
                     lib::compact_println!(
                         "xHCI: port {} SET_CONFIGURATION {} failed (slot {})",
-                        dev.port, dev.cfg_value, *slot
+                        dev.port,
+                        dev.cfg_value,
+                        *slot
                     );
                 }
             }
@@ -1286,7 +1322,13 @@ impl Controller {
                 let _ = compact_fmt::writeln!(
                     &mut lib::log::DebugCon,
                     "xHCI: keyboard ready (slot {} port {} ep {} mps {}) at {:02x}:{:02x}.{}",
-                    *slot, dev.port, ep.ep, ep.mps, self.pci.0, self.pci.1, self.pci.2
+                    *slot,
+                    dev.port,
+                    ep.ep,
+                    ep.mps,
+                    self.pci.0,
+                    self.pci.1,
+                    self.pci.2
                 );
             }
         }
