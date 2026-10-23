@@ -250,6 +250,7 @@ impl LinuxState {
 
     /// Feed console input through the terminal settings shared by forked processes.
     pub fn process_key<A: crate::Arch>(&mut self, _machine: &mut A, _fds: &[FdKind; MAX_FDS], scancode: u8) {
+        crate::compact_dbg_println!("KEY scan={:02X}", scancode);
         let mut keyboard = self.keyboard.lock();
         if !crate::kernel::keyboard::update_console(&mut keyboard,scancode) { return; }
         let event = crate::kernel::keyboard::event();
@@ -1195,6 +1196,7 @@ fn sys_read<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
         thread::FdKind::PipeRead(idx) => {
             let mut tmp = alloc::vec![0u8; len];
             if let Some(n) = crate::kernel::kpipe::read_event(idx, &mut tmp) {
+                crate::compact_dbg_println!("READ single fd={} bytes={:?}", fd, &tmp[..n]);
                 machine.copy_to(buf, &tmp[..n]);
                 return SyscallResult::val(n as i32);
             }

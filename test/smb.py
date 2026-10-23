@@ -160,7 +160,7 @@ valid users = {username}
     # Distribution Samba services require root; opt in on disposable CI runners.
     service_prefix = ["sudo", "-n"] if os.environ.get("SMB_TEST_SUDO") == "1" else []
     with (work/'samba-stderr').open('w') as errors:
-        server=subprocess.Popen(service_prefix + [smbd,'-F','--no-process-group','--debug-stdout','-d','5','-s',str(config)],stdout=errors,stderr=errors,start_new_session=True)
+        server=subprocess.Popen(service_prefix + [smbd,'-F','--no-process-group','--debug-stdout','-d','5','-s',str(config)],stdin=subprocess.PIPE,stdout=errors,stderr=errors,start_new_session=True)
         try:
             deadline=time.monotonic()+5
             while True:

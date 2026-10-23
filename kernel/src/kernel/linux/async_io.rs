@@ -600,6 +600,7 @@ pub(super) fn call<A: crate::Arch>(
             if let FdKind::PipeRead(i) = kt.fds[fd as usize] {
                 let mut data = alloc::vec![0; a.a2 as usize];
                 if let Some(n) = crate::kernel::kpipe::read_event(i, &mut data) {
+                    crate::compact_dbg_println!("READ async fd={} ctx={} bytes={:?}", fd, s.active, &data[..n]);
                     machine.copy_to(a.a1 as usize, &data[..n]);
                     reset_edge(s, fd);
                     n as i32
@@ -877,6 +878,7 @@ pub(super) fn schedule<A: crate::Arch>(
             Wait::Read(pipe, out, count) => {
                 let mut data = alloc::vec![0; count];
                 if let Some(n) = crate::kernel::kpipe::read_event(pipe, &mut data) {
+                    crate::compact_dbg_println!("READ deferred ctx={} bytes={:?}", i, &data[..n]);
                     machine.copy_to(out, &data[..n]);
                     Some(n as i32)
                 } else {
