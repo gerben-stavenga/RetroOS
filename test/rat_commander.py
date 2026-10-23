@@ -114,7 +114,10 @@ def main():
                 send(b"\x1b[F")  # End: select note.txt after the copy refresh.
                 wait_for("note.txt selection", lambda: "note.txt" in terminal_text().splitlines()[21][:40])
                 send(b"\x1bOS", 2)  # F4, after the asynchronous copy refresh settles.
-                wait_for("editor contents", lambda: "Original text" in terminal_text())
+                # The first editor launch initializes the syntax database and
+                # can exceed the normal UI deadline on a shared CI runner.
+                # Send F4 once: retrying it opens Replace once loading finishes.
+                wait_for("editor contents", lambda: "Original text" in terminal_text(), timeout=90)
                 send(b"\x1b[H.x\r", 1.5)
                 send(b"\x1bOQ")  # F2: save
                 send(b"\r")  # Confirm save if configured.
