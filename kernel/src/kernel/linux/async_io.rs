@@ -788,6 +788,9 @@ pub(super) fn call<A: crate::Arch>(
         }
         _ => return None,
     };
+    if super::TRACE_IO.fetch_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |v| v.checked_sub(1)).is_ok() {
+        crate::compact_dbg_println!("IO ctx={} nr={} a0={:X} a1={:X} a2={:X} ret={}", s.active, nr, a.a0, a.a1, a.a2, ret);
+    }
     Some(SyscallResult::val(ret))
 }
 /// Observe readiness loss at I/O time. An edge-triggered epoll caller may
@@ -888,6 +891,9 @@ pub(super) fn schedule<A: crate::Arch>(
             _ => None,
         };
         if let Some(result) = result {
+            if super::TRACE_IO.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+                crate::compact_dbg_println!("WAKE ctx={} result={}", i, result);
+            }
             s.contexts[i].regs.rax = result as i64 as u64;
             s.contexts[i].wait = Wait::Ready;
         }
