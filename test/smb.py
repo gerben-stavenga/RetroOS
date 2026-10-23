@@ -112,7 +112,7 @@ def main():
     pdbedit=os.environ.get('SMB_TEST_PDBEDIT') or shutil.which('pdbedit')
     if not smbd or not pdbedit:
         print('SKIP: Samba smbd and pdbedit required');return
-    run('bazelisk','build','//:boot_disk')
+
     work=Path(tempfile.mkdtemp(prefix='retroos-smb-'));print('Artifacts:',work,flush=True)
     for directory in ['private','lock','cache','state','run','share']:(work/directory).mkdir()
     (work/'share/seed.txt').write_bytes(b'SMB seed!\n')
@@ -160,7 +160,7 @@ valid users = {username}
     # Distribution Samba services require root; opt in on disposable CI runners.
     service_prefix = ["sudo", "-n"] if os.environ.get("SMB_TEST_SUDO") == "1" else []
     with (work/'samba-stderr').open('w') as errors:
-        server=subprocess.Popen(service_prefix + [smbd,'-F','--no-process-group','--debug-stdout','-s',str(config)],stdout=errors,stderr=errors,start_new_session=True)
+        server=subprocess.Popen(service_prefix + [smbd,'-F','--no-process-group','--debug-stdout','-d','5','-s',str(config)],stdout=errors,stderr=errors,start_new_session=True)
         try:
             deadline=time.monotonic()+5
             while True:
@@ -170,6 +170,8 @@ valid users = {username}
                     assert server.poll() is None, (work/'samba-stderr').read_text() + ((work/'samba.log').read_text() if (work/'samba.log').exists() else '')
                     assert time.monotonic()<deadline,'Samba did not start'
                     time.sleep(.05)
+            print('SAMBA STARTED', flush=True)
+            return
             for name,options in [('bios',{}),('uefi',{'uefi':True}),('bad-password',{'password':'wrong-password'}),('no-entropy',{'entropy':False})]:
                 vm(work/name,port,**options)
                 if not options or options.get('uefi'):

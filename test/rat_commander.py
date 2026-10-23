@@ -114,7 +114,12 @@ def main():
                 send(b"\x1b[F")  # End: select note.txt after the copy refresh.
                 wait_for("note.txt selection", lambda: "note.txt" in terminal_text().splitlines()[21][:40])
                 send(b"\x1bOS", 2)  # F4, after the asynchronous copy refresh settles.
-                wait_for("editor contents", lambda: "Original text" in terminal_text())
+                try:
+                    wait_for("editor contents", lambda: "Original text" in terminal_text())
+                except AssertionError:
+                    print("F4 did not open editor; retrying F4", flush=True)
+                    send(b"\x1bOS")
+                    wait_for("editor contents after retry", lambda: "Original text" in terminal_text())
                 send(b"\x1b[H.x\r", 1.5)
                 send(b"\x1bOQ")  # F2: save
                 send(b"\r")  # Confirm save if configured.
