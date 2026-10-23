@@ -157,15 +157,17 @@ valid users = {username}
 ''')
     config.chmod(0o600)
     run(pdbedit,'-t','-a','-u',username,'-s',config,input=b'retrotest\nretrotest\n')
+    # Distribution Samba services require root; opt in on disposable CI runners.
+    service_prefix = ["sudo", "-n"] if os.environ.get("SMB_TEST_SUDO") == "1" else []
     with (work/'samba-stderr').open('w') as errors:
-        server=subprocess.Popen([smbd,'-F','--no-process-group','--debug-stdout','-s',str(config)],stdout=errors,stderr=errors,start_new_session=True)
+        server=subprocess.Popen(service_prefix + [smbd,'-F','--no-process-group','--debug-stdout','-s',str(config)],stdout=errors,stderr=errors,start_new_session=True)
         try:
             deadline=time.monotonic()+5
             while True:
                 try:
                     with socket.create_connection(('127.0.0.1',port),timeout=.2):break
                 except OSError:
-                    assert server.poll() is None,(work/'samba-stderr').read_text()
+                    assert server.poll() is None, (work/'samba-stderr').read_text() + ((work/'samba.log').read_text() if (work/'samba.log').exists() else '')
                     assert time.monotonic()<deadline,'Samba did not start'
                     time.sleep(.05)
             for name,options in [('bios',{}),('uefi',{'uefi':True}),('bad-password',{'password':'wrong-password'}),('no-entropy',{'entropy':False})]:
@@ -180,7 +182,11 @@ valid users = {username}
                 try:vm(work/fault,proxy.port,fault=fault)
                 finally:proxy.close()
         finally:
-            if server.poll() is None: os.killpg(server.pid,signal.SIGTERM)
+            if server.poll() is None:
+                if service_prefix:
+                    subprocess.run(service_prefix + ['kill', '-TERM', '--', '-' + str(server.pid)], check=False)
+                else:
+                    os.killpg(server.pid,signal.SIGTERM)
             server.wait(timeout=5)
 
 if __name__=='__main__':main()

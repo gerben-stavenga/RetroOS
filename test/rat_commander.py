@@ -16,6 +16,11 @@ def main():
     with tempfile.TemporaryDirectory(prefix="retroos-rat-") as directory:
         root = Path(directory)
         (root / "bin").mkdir()
+        # Direct launches need the session settings normally supplied by shell.elf.
+        (root / "RETROOS").mkdir()
+        (root / "RETROOS/RETROOS.INI").write_text(
+            "[linux.environment]\nPATH=/bin\nSHELL=/bin/sh\nTERM=linux\nTMPDIR=/tmp\n")
+        (root / "tmp").mkdir()
         shutil.copyfile(ROOT / "showcase-bundle/COMMANDER/RC/RC.EXE", root / "bin/rc")
         shutil.copyfile(ROOT / "boot-bundle/bin/busybox", root / "bin/busybox")
         (root / "bin/sh").symlink_to("busybox")
@@ -24,7 +29,7 @@ def main():
         (work / "child").mkdir(parents=True)
         (work / "note.txt").write_text("Original text\n")
         with (root / "guest.log").open("wb") as log, (root / "terminal.log").open("wb") as terminal:
-            process = subprocess.Popen([str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--host", directory, "--cmd", "/bin/rc", "--cwd", "/work"], stdin=subprocess.PIPE, stdout=terminal, stderr=log)
+            process = subprocess.Popen([str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--host", directory, "--c-root", "/", "--cmd", "/bin/rc", "--cwd", "/work"], stdin=subprocess.PIPE, stdout=terminal, stderr=log)
             def send(keys, delay=0.8):
                 time.sleep(delay)
                 if process.poll() is not None:
@@ -108,7 +113,7 @@ def main():
                 # Edit note.txt. Period and Enter must insert.
                 send(b"\x1b[F")  # End: select note.txt after the copy refresh.
                 wait_for("note.txt selection", lambda: "note.txt" in terminal_text().splitlines()[21][:40])
-                send(b"\x1bOS")  # F4
+                send(b"\x1bOS", 2)  # F4, after the asynchronous copy refresh settles.
                 wait_for("editor contents", lambda: "Original text" in terminal_text())
                 send(b"\x1b[H.x\r", 1.5)
                 send(b"\x1bOQ")  # F2: save

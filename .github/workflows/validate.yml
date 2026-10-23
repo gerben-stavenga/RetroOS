@@ -106,6 +106,7 @@ jobs:
         done
     - name: Personality and hardware integration tests
       env:
+        SMB_TEST_SUDO: '1'
         RETRO_REQUIRE_PUBLIC: '1'
         RETRO_TEST_EXCLUDE: unit
         RETRO_TEST_GROUP: ${{ matrix.suite }}

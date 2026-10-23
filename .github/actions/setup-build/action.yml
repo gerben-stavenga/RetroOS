@@ -11,6 +11,12 @@ runs:
     shell: bash
   - name: Install test tools
     run: |
+      # Some runner-local Azure mirrors throttle large firmware/tool downloads.
+      for sources in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+        if [ -f "$sources" ]; then
+          sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' "$sources"
+        fi
+      done
       sudo apt-get update
       sudo apt-get install -y nasm qemu-system-x86 ovmf bochs bochs-sdl bochsbios vgabios grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools dosfstools e2fsprogs fdisk gcc-multilib samba samba-common-bin linux-firmware zstd
     shell: bash
