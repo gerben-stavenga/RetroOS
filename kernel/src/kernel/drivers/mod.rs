@@ -26,6 +26,7 @@ pub mod uart16550;
 
 pub mod isa_lpc;
 pub mod virtio_net;
+pub mod e1000;
 pub mod rdrand;
 pub mod wcn785x;
 pub mod mhi;

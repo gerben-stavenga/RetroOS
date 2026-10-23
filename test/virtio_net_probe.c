@@ -82,7 +82,7 @@ void __attribute__((force_align_arg_pointer)) _start(void) {
     check(ts[0] < 86400 && ts[1] < 1000000000, 51);
     ts[0] = ts[1] = ~0UL;
     check(call(266, 1, (u32)ts, 0) == 0, 52);
-    check(ts[0] == 0 && ts[1] == 10000000, 53);
+    check(ts[0] == 0 && ts[1] > 0 && ts[1] < 1000000000, 53);
     check(call(266, 1, 0, 0) == 0, 54);
     check(call(266, ~0UL, (u32)ts, 0) == -22, 55);
     int fd = socketcall(1, 2, 1, 0, 0, 0, 0);

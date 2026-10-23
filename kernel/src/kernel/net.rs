@@ -37,6 +37,9 @@ pub fn init<A: crate::Arch>(machine: &mut A) {
     if let Some(device) = crate::kernel::drivers::virtio_net::probe(machine) {
         config::mount();
         stack::install(alloc::boxed::Box::new(device));
+    } else if let Some(device) = crate::kernel::drivers::e1000::probe(machine) {
+        config::mount();
+        stack::install(alloc::boxed::Box::new(device));
     }
 }
 

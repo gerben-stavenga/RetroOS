@@ -44,9 +44,10 @@ launch() {
     fi
     qemu="${RETROOS_QEMU_BIN:-$qemu}"
     args+=(-nic none)
-    if [ "$NETWORK" = virtio ]; then
-        args+=(-netdev user,id=net0 -device virtio-net-pci,netdev=net0)
-    fi
+    case "$NETWORK" in
+        virtio) args+=(-netdev user,id=net0 -device virtio-net-pci,netdev=net0) ;;
+        e1000|e1000e) args+=(-netdev user,id=net0 -device "$NETWORK,netdev=net0") ;;
+    esac
     [ "$LIVE" != 1 ] || cpu=(-cpu max)
     [ "$KVM" = 0 ] || cpu=(-accel kvm -cpu host)
     if [ "$FIRMWARE" = bios ]; then

@@ -446,12 +446,14 @@ device or host bridge is needed. Use `--net none` to disable it:
 
 ```sh
 ./run.sh qemu --net virtio
+./run.sh qemu --net e1000
+./run.sh qemu --net e1000e
 ./run.sh qemu --net none
 ```
 
-RetroOS discovers a VirtIO 1.0+ PCI Ethernet interface and obtains its IPv4
-address, default gateway and DNS servers by DHCP. QEMU normally assigns
-`10.0.2.15`, with the host reachable at `10.0.2.2`. DHCP supplies a volatile
+RetroOS discovers a VirtIO 1.0+ PCI Ethernet interface or a supported Intel
+controller and obtains its IPv4 address, default gateway and DNS servers by
+DHCP. QEMU normally assigns `10.0.2.15`, with the host reachable at `10.0.2.2`. DHCP supplies a volatile
 `/etc/resolv.conf` when no direct resolver is configured. Inherited loopback
 DNS stubs such as Linux systemd-resolved at `127.0.0.53` are replaced in the
 RetroOS namespace; the host file is untouched. Explicit direct DNS servers
@@ -483,8 +485,29 @@ network first so the custom transport is the only one:
 ```
 
 Both default transitional and modern-only VirtIO devices are supported through
-their modern PCI interface. Legacy-only VirtIO, other NIC drivers, IPv6,
-static addressing, raw sockets, and DOS/OS2/Windows network APIs are not implemented.
+their modern PCI interface. The native Intel driver supports the 82540EM
+(`8086:100e`, QEMU `e1000`) and 82574L (`8086:10d3`, QEMU `e1000e`). Both use
+one shared legacy-descriptor RX/TX implementation. Following Linux’s driver
+structure, PCI IDs select controller descriptions with MAC, PHY and NVM
+operation tables. Model-specific Rust functions handle reset and configuration;
+common helpers handle shared register protocols and link setup. Packet buffers
+and descriptor rings use the common DMA allocator; the event loop polls completions with
+interrupts and checksum offloads disabled. VirtIO takes priority when both
+supported NIC types are present.
+
+The Intel models are tested in QEMU under BIOS and UEFI; physical Intel boards
+have not been validated. Integrated I217/I218/I219 controllers need additional
+PCH/PHY initialization and are deliberately not claimed by this driver. Intel
+I225/I226 and other Ethernet controllers are also unsupported. Legacy-only
+VirtIO, IPv6, static addressing, raw sockets and DOS Ethernet packet drivers
+are not implemented. DOS IPX and COM1 networking use the OSD LAN described above;
+OS/2 sockets and Windows Winsock remain unimplemented.
+
+Run `python3 test/e1000.py` to exercise both Intel models with BIOS/32-bit and
+UEFI/64-bit Linux socket clients: DHCP/DNS, TCP transfers larger than the DMA
+rings, UDP, incoming connections and a BusyBox HTTP download. The same socket
+probe is used by `python3 test/virtio_net.py`.
+
 The first interface is used, with up to 64 live/closing sockets. Each listener
 holds one pending connection; UDP payloads are limited to 1472 bytes because
 IP fragmentation is disabled. Hardware queues are polled from the event loop.

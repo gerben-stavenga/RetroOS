@@ -31,7 +31,7 @@ def run(*args):
     subprocess.run(list(map(str, args)), cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
 
 
-def session(work, name, device, uefi=False, bits=32):
+def session(work, name, device, uefi=False, bits=32, driver_ready="virtio-net: ready"):
     work.mkdir()
     tcp = socket.socket()
     tcp.bind(('127.0.0.1', 0))
@@ -119,7 +119,7 @@ def session(work, name, device, uefi=False, bits=32):
     run('gcc', f'-m{bits}', '-static', '-nostdlib', '-no-pie', '-fno-pic', '-fno-stack-protector',
         '-O2', '-e', '_start', *flags, ROOT / 'test/virtio_net_probe.c', '-o', work / 'NET.ELF')
     run('mcopy', '-i', data, work / 'NET.ELF', '::NET.ELF')
-    commands = 'NET.ELF'
+    commands = '/home/retroos/NET.ELF'
     if device:
         commands += f';/bin/busybox wget -q -O /home/retroos/NETWORK.TXT http://10.0.2.2:{http_server.server_port}/probe'
     boot = prepare_boot(work, data, '[environment]\nTEST=' + commands + '\n')
@@ -149,7 +149,7 @@ def session(work, name, device, uefi=False, bits=32):
             assert exits == (['0', '0'] if device else ['0']), text[-10000:]
             assert not any(s in text for s in ('PANIC', 'FATAL')), text
             if device:
-                assert 'virtio-net: ready' in text and 'Network: DHCP IPv4 10.0.2.15/24' in text, text
+                assert driver_ready in text and 'Network: DHCP IPv4 10.0.2.15/24' in text, text
                 assert incoming_done.wait(2), failures
                 assert not failures, failures
                 saved = subprocess.check_output(['mtype', '-i', str(data), '::NETWORK.TXT'])

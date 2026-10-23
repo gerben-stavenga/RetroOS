@@ -13,7 +13,7 @@ Usage: ./run.sh [qemu|bochs|86box|unipcemu|rust-dos|rust-dos-games|hosted] [opti
   --arch 386|686|x64      CPU selection (default: 386, UniPCemu: 686)
   --hd ata|ahci|nvme       QEMU data controller; UniPCemu accepts ATA
   --sound sb|ac97|hda|none QEMU sound (default: hda; other emulators: sb)
-  --net virtio|none       QEMU user networking (default: virtio for RetroOS)
+  --net virtio|e1000|e1000e|none  QEMU NIC (default: virtio for RetroOS)
   --sb-audio native|mixed QEMU guest audio policy
   --cmd, -c, -r COMMAND   Run a startup command
   --headless, -T          No window (QEMU or hosted)
@@ -83,7 +83,7 @@ case "$HD" in ''|ata|ahci|nvme) ;; *) fail "unknown disk controller: $HD" ;; esa
 [ -z "$HD" ] || [ "$BACKEND" = qemu ] || [ "$BACKEND" = rust-dos ] || { [ "$BACKEND" = unipcemu ] && [ "$HD" = ata ]; } || fail "--hd requires QEMU or Rust-DOS (UniPCemu accepts ATA)"
 [ -n "$HD" ] || { if [ "$FIRMWARE" = uefi ]; then HD=nvme; else HD=ata; fi; }
 case "$SOUND" in sb|ac97|hda|none) ;; *) fail "unknown sound: $SOUND" ;; esac
-case "$NETWORK" in ''|virtio|none) ;; *) fail "unknown network: $NETWORK" ;; esac
+case "$NETWORK" in ''|virtio|e1000|e1000e|none) ;; *) fail "unknown network: $NETWORK" ;; esac
 [ -z "$NETWORK" ] || [ "$BACKEND" = qemu ] || fail "--net requires QEMU"
 [ -n "$NETWORK" ] || { if [ "$BACKEND" = qemu ] && [ "$FREEDOS" = 0 ]; then NETWORK=virtio; else NETWORK=none; fi; }
 case "$ARCH" in 386|686|x64) ;; *) fail "unknown architecture: $ARCH" ;; esac
