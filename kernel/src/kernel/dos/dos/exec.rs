@@ -658,14 +658,14 @@ fn populate_program<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &mut 
     // Latch this program's BLASTER A/I/D/H into the SB-DMA layer so the
     // virtual 8237 traps the right channel and the IRQ relay uses the
     // right vector. Missing BLASTER leaves the SB16 defaults.
-    dos.pc.sb.configure_from_env(&env);
+    dos.pc.audio.lock().sb.configure_from_env(&env);
     // ULTRASND makes the (emulated) GUS exist for this program and sets its
     // base/DMA/IRQ wiring; without it the card stays absent.
-    dos.pc.gus.configure_from_env(&env);
+    dos.pc.audio.lock().gus.configure_from_env(&env);
     // BLASTER's P<port> makes the MPU-401 / General MIDI device exist. Its
     // GM bank is a boot asset (the same .PAT set the GUS plays), so it is
     // handed in here rather than fetched by the device.
-    dos.pc.mpu.configure_from_env(&env, crate::kernel::midi_bank::get());
+    dos.pc.audio.lock().mpu.configure_from_env(&env, crate::kernel::midi_bank::get());
     init_psp(machine, regs, psp_seg, env_seg, parent.psp_seg);
     dos.current_psp = psp_seg;
     dos_set_program_block_owner(machine, dos, regs, env_seg, psp_seg, psp_seg);

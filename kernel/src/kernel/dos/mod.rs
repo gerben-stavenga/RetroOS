@@ -41,6 +41,8 @@ mod dpmi;
 pub(crate) mod ipx;
 mod dfs;
 mod machine;
+pub(crate) use machine::AudioDevices;
+pub(crate) use machine::vvoodoo::VoodooOutput;
 mod present;
 mod xms;
 mod ems;
@@ -368,11 +370,11 @@ impl<A: crate::Arch> DosState<A> {
         self.xms = None;
         // Hand the single global ISA-DMA pool back; a dying thread that
         // armed SB DMA must not poison it for the next program.
-        self.pc.sb.release_dma_pool(machine, regs);
+        self.pc.audio.lock().sb.release_dma_pool(machine, regs);
         let pc = &mut self.pc;
-        pc.gus.reset(machine, &mut pc.vpic);
-        pc.mpu.reset();
-        pc.spk.reset();
+        pc.audio.lock().gus.reset(machine, &mut pc.vpic);
+        pc.audio.lock().mpu.reset();
+        pc.audio.lock().spk.reset();
     }
 
     /// Called by the context-switch code when this thread becomes the running
@@ -825,7 +827,7 @@ fn handle_debug_trap<A: crate::Arch>(
     sources: u8,
 ) -> thread::KernelAction {
     if sources & TF_DELAY != 0
-        && dos.pc.sb.complete_probe_step().is_some_and(|done| done)
+        && dos.pc.audio.lock().sb.complete_probe_step().is_some_and(|done| done)
     {
         set_tf_source(dos, TF_DELAY, false);
     }
@@ -1015,7 +1017,7 @@ fn handle_event_inner<A: crate::Arch>(
         }
         KE::Out { port, size } => {
             machine::handle_out_event(machine, bios_display, &mut dos.pc, regs, port, size.bytes());
-            let delay = dos.pc.sb.probe_is_stepping();
+            let delay = dos.pc.audio.lock().sb.probe_is_stepping();
             set_tf_source(dos, TF_DELAY, delay);
             regs.project_tf();
             thread::KernelAction::Done
@@ -1294,11 +1296,11 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     // In-place exec replaces (drops) the old DosState — release its SB
     // DMA pool binding first, else the global pool stays held forever.
     if let thread::Personality::Dos(old) = &mut current.personality {
-        old.pc.sb.release_dma_pool(machine, &mut current.kernel.vcpu);
+        old.pc.audio.lock().sb.release_dma_pool(machine, &mut current.kernel.vcpu);
         let pc = &mut old.pc;
-        pc.gus.reset(machine, &mut pc.vpic);
-        pc.mpu.reset();
-        pc.spk.reset();
+        pc.audio.lock().gus.reset(machine, &mut pc.vpic);
+        pc.audio.lock().mpu.reset();
+        pc.audio.lock().spk.reset();
     }
     // Construct directly in the personality's final storage. Keeping a
     // `new_state: DosState` local makes rustc reserve another ~16 KiB copy on
@@ -1441,11 +1443,11 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
     let dos_name = &dos_name[..dos_len];
 
     if let thread::Personality::Dos(old) = &mut t.personality {
-        old.pc.sb.release_dma_pool(machine, &mut t.kernel.vcpu);
+        old.pc.audio.lock().sb.release_dma_pool(machine, &mut t.kernel.vcpu);
         let pc = &mut old.pc;
-        pc.gus.reset(machine, &mut pc.vpic);
-        pc.mpu.reset();
-        pc.spk.reset();
+        pc.audio.lock().gus.reset(machine, &mut pc.vpic);
+        pc.audio.lock().mpu.reset();
+        pc.audio.lock().spk.reset();
     }
     let vga = DosVideo::Vga(EmulatedVga::initial_mode3());
     t.personality = thread::Personality::Dos(DosState::new_boxed(machine, vga));
@@ -1741,7 +1743,7 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // Keep timer/keyboard delivery from spending the DSP delay inside an IRQ
     // handler. The short step sequence models time passing in the interrupted
     // program, where probe drivers perform their result-byte bookkeeping.
-    if dos.pc.sb.probe_is_stepping() {
+    if dos.pc.audio.lock().sb.probe_is_stepping() {
         return;
     }
     // Never inject while the guest sits on the resume-continuation park —

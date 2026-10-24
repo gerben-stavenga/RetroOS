@@ -240,16 +240,16 @@ impl<A: crate::Arch> Personality<A> {
             || matches!(self, Self::Dos(d) if !d.pc.vga.is_fullscreen())
     }
 
-    pub fn physical_sb(&self) -> Option<&crate::kernel::drivers::sb16::Sb16> {
+    pub fn physical_sb(&self) -> Option<(u16, Option<u8>, bool)> {
         match self {
-            Self::Dos(dos) => dos.pc.sb.physical(),
+            Self::Dos(dos) => dos.pc.audio.lock().sb.physical().map(|sb| (sb.base, sb.dma16, sb.has_ct1745())),
             Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => None,
         }
     }
 
     pub fn set_physical_sb_master<A2: crate::Arch>(&self, machine: &mut A2, raw: u8) -> bool {
         match self {
-            Self::Dos(dos) => dos.pc.sb.set_physical_master(machine, raw),
+            Self::Dos(dos) => dos.pc.audio.lock().sb.set_physical_master(machine, raw),
             Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => false,
         }
     }
@@ -257,7 +257,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn set_physical_sb_source<A2: crate::Arch>(&self, machine: &mut A2,
         source: crate::kernel::osd::SbSource, level: u8) -> bool {
         match self {
-            Self::Dos(dos) => dos.pc.sb.set_physical_source(machine, source, level),
+            Self::Dos(dos) => dos.pc.audio.lock().sb.set_physical_source(machine, source, level),
             Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => false,
         }
     }
@@ -279,7 +279,7 @@ impl<A: crate::Arch> Personality<A> {
     {
         match (self, card) {
             (Self::Dos(d), Some(card)) => {
-                d.pc.sb.adopt_card(machine, card);
+                d.pc.audio.lock().sb.adopt_card(machine, card);
                 None
             }
             (_, card) => card,
@@ -292,7 +292,7 @@ impl<A: crate::Arch> Personality<A> {
         machine: &mut A2,
     ) -> Option<crate::kernel::drivers::sb16::Sb16> {
         match self {
-            Self::Dos(d) => d.pc.sb.release_card(machine),
+            Self::Dos(d) => d.pc.audio.lock().sb.release_card(machine),
             Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => None,
         }
     }

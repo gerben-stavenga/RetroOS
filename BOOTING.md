@@ -11,19 +11,30 @@ Voodoo rasterization and linear framebuffer presentation. Other CPUs remain
 parked. The boot log reports `core 1: Media worker: audio and graphics ready`.
 Single-core machines and hosted execution use the same operations inline.
 
-The media worker polls two bounded mailboxes. Audio takes priority; Voodoo
-triangle/fill and framebuffer-copy batches check for audio between rows or
-small copy chunks. Jobs use resident kernel buffers and do not allocate,
-free pages, read guest mappings or invoke BIOS calls. Every handoff refreshes
-the worker's kernel root and TLB before accessing the buffers.
+Audio is a persistent service on core 1. It samples its own clock, advances
+sources and feeds the physical output once per millisecond, including at
+checkpoints within graphics work. Core 0 does not submit mixing jobs or wait
+for a quantum. It captures guest DMA windows, processes device commands and
+delivers pending virtual IRQs. Sound-device state is protected at that boundary;
+an unavailable device lock defers per-slice service without losing timer time.
+The output log reports `core 1: sink: first frame played`.
 
-Voodoo draw commands and framebuffer presentation can overlap guest execution.
-Reads, subsequent card mutations, buffer swaps and display-mode changes fence
-outstanding work. Presentation uses a retained snapshot so the producer can
-reuse its source. VGA decoding, composition and audio mixing borrow live state
-and join before that state is reused; guest DMA reads and IRQ updates stay on
-core 0. Banked BIOS presentation also remains on core 0. This is a dedicated
-polling worker, not a general multicore guest scheduler.
+Rendering is also a persistent service, paced at 70 Hz for virtual VGA and
+60 Hz for Voodoo. Core 0 captures raw guest VRAM and scene inputs into resident
+snapshots; core 1 decodes, composes, scales and presents them. A busy renderer
+causes core 0 to skip publication and try again on a later kernel exit, rather
+than wait for the frame. Missed refreshes are dropped. Mode changes fence
+rendering before replacing mappings. Banked BIOS presentation remains on core 0.
+The log reports `core 1: Video service: rendering at 70 Hz` for VGA.
+
+Voodoo writes use an ordered, bounded command ring. Rasterization runs on core 1;
+reads fence pending commands, and a full ring applies producer backpressure.
+Graphics checks audio between rows or small copy chunks. Worker callbacks use
+resident kernel buffers and do not allocate, free pages, access guest mappings
+or invoke BIOS calls. Core 0 allocates snapshot and output storage. Each job or
+due service refreshes the worker's kernel root and TLB before accessing published
+storage. Idle polling does not flush the TLB. The worker polls rather than
+sleeping; PIT interrupts remain on core 0.
 
 To exercise the dual-core paths:
 

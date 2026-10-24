@@ -1241,8 +1241,9 @@ pub fn route_isa_irq(line: u8) {
 
 /// High-resolution monotonic time in nanoseconds, also sampled at IRQ entry.
 /// TSC/64-bit HPET are read-only; PIT2 and 32-bit HPET extension state needs
-/// an interrupt-masked critical section on this single-CPU backend.
+/// an interrupt-masked cross-core critical section.
 pub fn now(init: bool) -> u64 {
+    static CLOCK_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     static mut PIT2_LAST_COUNT: u16 = 0;
     static mut PIT2_CYCLES: u64 = 0;
     static mut HPET_LAST_COUNTER: u64 = 0;
@@ -1278,6 +1279,9 @@ pub fn now(init: bool) -> u64 {
             // 32-bit HPET extension just like the PIT extension below.
             let restore_if = crate::x86::interrupts_enabled();
             crate::x86::cli();
+            while CLOCK_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                core::hint::spin_loop();
+            }
             let total = unsafe {
                 let count = hpet_counter(clock.hpet_mask);
                 let elapsed = count.wrapping_sub(HPET_LAST_COUNTER) & clock.hpet_mask;
@@ -1285,12 +1289,16 @@ pub fn now(init: bool) -> u64 {
                 HPET_CYCLES = HPET_CYCLES.wrapping_add(elapsed);
                 HPET_CYCLES
             };
+            CLOCK_LOCK.store(false, Ordering::Release);
             if restore_if { crate::x86::sti(); }
             total
         },
         ClockSource::Pit2 => {
             let restore_if = crate::x86::interrupts_enabled();
             crate::x86::cli();
+            while CLOCK_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                core::hint::spin_loop();
+            }
             let count = pit2_count();
             let total = unsafe {
                 let elapsed = PIT2_LAST_COUNT.wrapping_sub(count) as u64;
@@ -1298,6 +1306,7 @@ pub fn now(init: bool) -> u64 {
                 PIT2_CYCLES = PIT2_CYCLES.wrapping_add(elapsed);
                 PIT2_CYCLES
             };
+            CLOCK_LOCK.store(false, Ordering::Release);
             if restore_if { crate::x86::sti(); }
             total
         }

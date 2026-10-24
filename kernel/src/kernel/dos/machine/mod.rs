@@ -239,18 +239,7 @@ pub struct PcMachine {
     /// shared by every DMA-using card model (SB today, GUS next), so it
     /// lives here rather than inside any one card.
     pub dma: Dma8237,
-    /// Sound Blaster card state (the thread's BLASTER channel/IRQ map +
-    /// DSP passthrough/emulation). Observes `dma` for its transfers.
-    pub sb: SoundBlaster,
-    /// Gravis UltraSound card state (ULTRASND wiring + the GF1 over the
-    /// unified sampler engine). Absent until the env declares it.
-    pub gus: Gus,
-    /// MPU-401 / General MIDI. Absent until BLASTER declares a `P<port>`.
-    pub mpu: Mpu,
-    /// The PC speaker. Always present — it is the one sound device a PC has
-    /// no configuration for — and driven entirely by the port dispatch above:
-    /// PIT channel 2's reload for pitch, port 61h bits 0-1 for the gate.
-    pub spk: sound::speaker::Speaker,
+    pub audio: alloc::sync::Arc<crate::kernel::media::Shared<AudioDevices>>,
     /// Last value written to CMOS index port 0x70 (NMI bit masked off).
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
@@ -260,6 +249,41 @@ pub struct PcMachine {
     /// `locked_stack.other_stack` (an `(SS, SP)` pair) when user is on
     /// rm side. See `mode_transitions::stack_for`.
     pub locked_stack: super::mode_transitions::LockedStackState,
+}
+
+/// Shared only at the sound-device boundary; guest CPU/PIC state stays local.
+pub struct AudioDevices {
+    pub sb: SoundBlaster,
+    pub gus: Gus,
+    pub mpu: Mpu,
+    pub spk: sound::speaker::Speaker,
+    pub pending_irqs: u16,
+    service_ns: Option<u64>,
+}
+impl AudioDevices {
+    fn new() -> Self {
+        Self { sb: SoundBlaster::new(), gus: Gus::new(), mpu: Mpu::new(),
+            spk: sound::speaker::Speaker::new(), pending_irqs: 0, service_ns: None }
+    }
+}
+
+impl AudioDevices {
+    /// Media-core mixer: resident sample storage only; IRQ delivery is deferred
+    /// to the guest core. The surrounding Shared guard excludes port accesses.
+    pub fn mix(&mut self, now_ns: u64, span: crate::kernel::sound::AudioSpan<'_>) {
+        let mut irq = VirtualPic::new();
+        if let SbDevice::Emulated(sb) = &mut self.sb.device {
+            let _ = sb.take_restart();
+            sb.mix_resident(span.rate, span.frames, span.physical_sb, None);
+            sb.clock_tick(now_ns, &mut irq, self.sb.blaster.irq);
+        }
+        self.gus.mix_into(span.rate, span.base_frame, span.frames);
+        self.mpu.mix_into(span.rate, span.base_frame, span.frames);
+        let gain = vsb::SPEAKER_SCALE_Q16;
+        self.spk.mix_into(span.rate, (gain, gain), span.frames);
+        self.gus.deliver_events(&mut irq);
+        for line in 0..16 { if irq.is_requested(line) { self.pending_irqs |= 1 << line; } }
+    }
 }
 
 /// Microsoft Mouse driver (INT 33h) state. Updated by the IRQ 12 packet
@@ -538,10 +562,8 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).scanout)
                 .write(crate::kernel::display::Scanout::new_boxed());
             core::ptr::addr_of_mut!((*p).dma).write(Dma8237::new());
-            core::ptr::addr_of_mut!((*p).sb).write(SoundBlaster::new());
-            core::ptr::addr_of_mut!((*p).gus).write(Gus::new());
-            core::ptr::addr_of_mut!((*p).mpu).write(Mpu::new());
-            core::ptr::addr_of_mut!((*p).spk).write(sound::speaker::Speaker::new());
+            core::ptr::addr_of_mut!((*p).audio).write(alloc::sync::Arc::new(
+                crate::kernel::media::Shared::new(AudioDevices::new())));
             core::ptr::addr_of_mut!((*p).cmos_index).write(0);
             core::ptr::addr_of_mut!((*p).locked_stack)
                 .write(super::mode_transitions::LockedStackState::new());
@@ -577,8 +599,9 @@ const PORT_TRACE: bool = false;
 /// emulated or when the owner explicitly routes MIDI through HDA while keeping
 /// the physical SB's DSP and FM ports native.
 fn emulated_mpu(pc: &PcMachine, p: u16) -> bool {
-    (matches!(pc.sb.device, SbDevice::Emulated(_))
-        || crate::kernel::osd::midi_hda_enabled()) && pc.mpu.owns(p)
+    let audio = pc.audio.lock();
+    (matches!(audio.sb.device, SbDevice::Emulated(_))
+        || crate::kernel::osd::midi_hda_enabled()) && audio.mpu.owns(p)
 }
 
 /// A PIT read must expose the counter and its IRQ edge at the same instant.
@@ -705,18 +728,18 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
             machine.inb(0x71)
         }
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
-        p if pc.sb.owns(p) => {
-            pc.sb.sb_read(machine, p)
+        p if pc.audio.with(|audio| audio.sb.owns(p)) => {
+            pc.audio.lock().sb.sb_read(machine, p)
         }
         // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
-        p if pc.gus.owns(p) => pc.gus.io_read(machine, p),
+        p if pc.audio.with(|audio| audio.gus.owns(p)) => pc.audio.lock().gus.io_read(machine, p),
         // MPU-401 / General MIDI — exists only when BLASTER declared P<port>.
-        p if emulated_mpu(pc, p) => pc.mpu.io_read(p),
+        p if emulated_mpu(pc, p) => pc.audio.lock().mpu.io_read(p),
         // Virtual 8237 DMA controller. SB channel count register is
         // served from the interpolated current-count model (drivers
         // poll it for DMA progress, not just completion).
         p if Dma8237::owns(p) =>
-            pc.sb.dma_read(machine, &mut pc.dma, p),
+            pc.audio.lock().sb.dma_read(machine, &mut pc.dma, p),
         // Unknown ports read as an unpopulated ISA bus and are logged for missing-device coverage.
         _ => {
             if PORT_TRACE {
@@ -766,7 +789,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // Master PIC command
         0x20 => {
             if let Some(retired_irq) = pc.vpic.master_ocw2(val) {
-                pc.sb.acknowledge_irq(machine, retired_irq);
+                pc.audio.lock().sb.acknowledge_irq(machine, retired_irq);
             }
         }
         // Gameport one-shot trigger: no card is present on this ISA window.
@@ -788,7 +811,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // of its level expression (gate and data); the rest is 8042 business.
         0x61 => {
             pc.vkbd.write_port61(val);
-            pc.spk.set_port61(val);
+            pc.audio.lock().spk.set_port61(val);
         }
         // Keyboard controller command
         0x64 => {}
@@ -798,7 +821,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // own, so hand it the new reload as the guest completes it.
         0x42 => {
             pit_io(&mut pc.vpit, &mut pc.vpic, machine.now(), |pit| pit.write_counter(2, val));
-            pc.spk.set_divisor(pc.vpit.ch2_reload());
+            pc.audio.lock().spk.set_divisor(pc.vpit.ch2_reload());
         }
         0x41 => {}
         // CMOS index: latch for the next data-port read. Mask off the NMI
@@ -810,19 +833,19 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         0x71 if VirtualRtc::owns(pc.cmos_index) => pc.vrtc.write(machine, pc.cmos_index, val),
         0x71 => {}
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
-        p if pc.sb.owns(p) => {
-            pc.sb.sb_write(machine, &pc.dma, p, val);
+        p if pc.audio.with(|audio| audio.sb.owns(p)) => {
+            pc.audio.lock().sb.sb_write(machine, &pc.dma, p, val);
         }
         // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
-        p if pc.gus.owns(p) => pc.gus.io_write(machine, &pc.dma, &mut pc.vpic, p, val),
+        p if pc.audio.with(|audio| audio.gus.owns(p)) => pc.audio.lock().gus.io_write(machine, &pc.dma, &mut pc.vpic, p, val),
         // MPU-401 / General MIDI — exists only when BLASTER declared P<port>.
-        p if emulated_mpu(pc, p) => pc.mpu.io_write(p, val),
+        p if emulated_mpu(pc, p) => pc.audio.lock().mpu.io_write(p, val),
         // Virtual 8237 DMA controller (generic). After capturing the
         // write, re-check whether the BLASTER channel just armed and, if
         // so, remap the guest buffer contiguous + program the real 8237.
         p if Dma8237::owns(p) => {
             pc.dma.io_write(machine, p, val);
-            pc.sb.maybe_remap(machine, regs, &mut pc.dma);
+            pc.audio.lock().sb.maybe_remap(machine, regs, &mut pc.dma);
         }
         // Unknown port writes are dropped and logged for missing-device coverage.
         _ => {
@@ -1139,11 +1162,11 @@ impl PcmSource<'_> {
         match self {
             Self::SoundBlaster(Some(sb), physical_sb) => sb.mix_into(machine, rate, block, *physical_sb),
             Self::SoundBlaster(None, _) => {}
-            Self::Gus(gus) => gus.mix_into(machine, rate, base, block),
-            Self::Midi(mpu) => mpu.mix_into(machine, rate, base, block),
+            Self::Gus(gus) => gus.mix_into(rate, base, block),
+            Self::Midi(mpu) => mpu.mix_into(rate, base, block),
             Self::Speaker(spk) => {
                 let g = vsb::SPEAKER_SCALE_Q16;
-                unsafe { crate::kernel::media::audio(|| spk.mix_into(rate, (g, g), block)); }
+                spk.mix_into(rate, (g, g), block);
             }
         }
     }
@@ -1174,11 +1197,18 @@ pub fn audio_service<A: crate::Arch>(
     dt_ns: u64,
     pushed: u64,
 ) {
-    let PcMachine { sb, gus, mpu, vpic, .. } = pc;
+    let Some(mut audio) = pc.audio.try_lock() else { return };
+    // A busy mixer must not discard a GF1 timer interval or DMA capture.
+    let dt_ns = audio.service_ns.replace(now_ns).map_or(dt_ns, |last| now_ns.saturating_sub(last));
+    let AudioDevices { sb, gus, mpu, pending_irqs, .. } = &mut *audio;
+    let vpic = &mut pc.vpic;
+    for irq in 0..16 { if *pending_irqs & (1 << irq) != 0 { vpic.raise(irq); } }
+    *pending_irqs = 0;
     // Latched probe/trigger IRQs are the emulated card's business: a real one
     // raises its own line and the relay carries it.
     let SoundBlaster { blaster, device } = sb;
     if let SbDevice::Emulated(emu) = device {
+        if dt_ns != 0 && crate::kernel::media::enabled() { emu.capture_dma(machine); }
         emu.deliver_trigger_irq(vpic, blaster.irq);
         emu.deliver_probe_irq(now_ns, vpic, blaster.irq);
     }
@@ -1195,7 +1225,9 @@ pub fn audio_tick<A: crate::Arch>(
     now_ns: u64,
     span: crate::kernel::sound::AudioSpan<'_>,
 ) {
-    let PcMachine { sb, gus, mpu, spk, vpic, .. } = pc;
+    let mut audio = pc.audio.lock();
+    let AudioDevices { sb, gus, mpu, spk, .. } = &mut *audio;
+    let vpic = &mut pc.vpic;
     // The source clock advances emulated sources only. A thread holding the real card
     // has nothing here: its DSP streams from the guest ring over the ISA bus
     // and its OPL is the card's own, so neither produces frames for us and
@@ -1256,7 +1288,8 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
         }
         Irq::Hw(line) => {
             // Only the card this guest actually holds has a line to relay.
-            let SbDevice::Native { pt, .. } = &pc.sb.device else { return };
+            let audio = pc.audio.lock();
+            let SbDevice::Native { pt, .. } = &audio.sb.device else { return };
             if line != pt.card.irq {
                 return;
             }
@@ -1264,8 +1297,8 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
             // declared for a card that cannot report it). Relay it to the
             // guest's BLASTER IRQ, leaving the host line masked until the
             // guest completes the virtual interrupt with a PIC EOI.
-            if !pc.vpic.is_requested(pc.sb.blaster.irq) {
-                pc.vpic.raise(pc.sb.blaster.irq);
+            if !pc.vpic.is_requested(audio.sb.blaster.irq) {
+                pc.vpic.raise(audio.sb.blaster.irq);
             }
         }
         // MSI identities are kernel-owned and never map onto the guest's ISA

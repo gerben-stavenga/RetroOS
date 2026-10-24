@@ -234,9 +234,8 @@ impl Gus {
     /// the chip: the GF1's output is the mixer's reference level — 86Box
     /// `gus_get_buffer` adds it straight in — and the GUS has no guest master
     /// volume, the per-voice ramps already carry it.
-    pub(super) fn mix_into<A: crate::Arch>(
+    pub(super) fn mix_into(
         &mut self,
-        _machine: &mut A,
         rate: u32,
         _base: u64,
         block: &mut [(i32, i32)],
@@ -244,7 +243,7 @@ impl Gus {
         let g = super::vsb::GUS_SCALE_Q16;
         let card = &mut self.card;
         // Resident wavetable RAM; no guest reads or allocations in the mixer.
-        unsafe { crate::kernel::media::audio(|| card.mix_into(rate, (g, g), block)); }
+        card.mix_into(rate, (g, g), block);
     }
 }
 

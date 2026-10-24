@@ -296,6 +296,7 @@ struct SwitcherComposition {
 }
 
 struct SwitcherRegions<'a> {
+    local: bool,
     layout: Option<SwitcherComposition>,
     damage: &'a [Rect],
     focused: Option<EndpointId>,
@@ -836,7 +837,7 @@ impl WindowManager {
         }
         desktop.scene.compose_switcher_regions_with(
             &resolve, width, height, format, composed,
-            SwitcherRegions { layout: switcher, damage: &damage, focused: desktop.focused() },
+            SwitcherRegions { local: false, layout: switcher, damage: &damage, focused: desktop.focused() },
         )?;
         if !damage.is_empty()
             && let Some(point) = desktop.pointer
@@ -1343,6 +1344,7 @@ impl Scene {
             u32::try_from(height).unwrap_or(u32::MAX),
         );
         let target = Target {
+            local: false,
             width,
             height,
             format,
@@ -1372,7 +1374,7 @@ impl Scene {
     where
         F: Fn(SurfaceId) -> Option<PixelBuffer<'a>>,
     {
-        let SwitcherRegions { layout: switcher, damage, focused } = regions;
+        let SwitcherRegions { local, layout: switcher, damage, focused } = regions;
         if !valid_format(format) {
             return Err(ComposeError::InvalidOutputFormat);
         }
@@ -1385,7 +1387,7 @@ impl Scene {
             output.clear();
             output.resize(len, 0);
         }
-        let target = Target { width, height, format, pixels: output };
+        let target = Target { local, width, height, format, pixels: output };
         let mut target = target;
         let mut compose_clip = |clip: Rect| {
             let Some(clip) = intersect(canvas, clip) else { return };
@@ -1659,6 +1661,7 @@ impl Scene {
 }
 
 struct Target<'a> {
+    local: bool,
     width: usize,
     height: usize,
     format: vga::PixelFormat,
@@ -1670,6 +1673,7 @@ fn fill_color_rect(target: &mut Target<'_>, rect: Rect, clip: Rect, rgb: u32) {
     let Some(draw) = intersect(rect, clip).and_then(|rect| intersect(rect, canvas)) else { return };
     let encoded = target.format.encode(rgb);
     for y in draw.y as usize..draw.y as usize + draw.height as usize {
+        if target.local { crate::kernel::media::checkpoint(); }
         for x in draw.x as usize..draw.x as usize + draw.width as usize {
             write_encoded_target(target, x, y, encoded);
         }
@@ -1700,6 +1704,7 @@ fn clear_rect(target: &mut Target<'_>, rect: Rect) {
         .clamp(0, target.height as i64) as usize;
     if x >= right || y >= bottom { return; }
     for row in y..bottom {
+        if target.local { crate::kernel::media::checkpoint(); }
         let step = usize::from(target.format.bytes_per_pixel);
         let start = (row * target.width + x) * step;
         let end = (row * target.width + right) * step;
@@ -1862,6 +1867,10 @@ fn blit_scaled(
     opacity: u8,
     target: &mut Target<'_>,
 ) {
+    if target.local {
+        blit_scaled_local(source, destination, clip, opacity, target);
+        return;
+    }
     // Profiling remains on the BSP; only the pixel loops cross cores.
     if source.width == 0 || source.height == 0 || destination.width == 0 || destination.height == 0 { return; }
     let canvas = Rect::new(0, 0, target.width as u32, target.height as u32);
@@ -2211,7 +2220,7 @@ mod tests {
             let source = PixelBuffer::new(1, 1, step, format, &red[..step]).unwrap();
             let mut output = vec![0xEE; 3 * step];
             output[step..2 * step].copy_from_slice(&blue[..step]);
-            let mut target = Target { width: 3, height: 1, format, pixels: &mut output };
+            let mut target = Target { local: false, width: 3, height: 1, format, pixels: &mut output };
             blit_scaled(source, Rect::new(1, 0, 1, 1), Rect::new(0, 0, 3, 1), 128, &mut target);
             assert_eq!(&output[step..2 * step], &format.encode(0x80007F).to_le_bytes()[..step]);
             assert!(output[..step].iter().chain(output[2 * step..].iter()).all(|&b| b == 0xEE));
@@ -2257,7 +2266,7 @@ mod tests {
                                 }
                             }
                         }
-                        let mut target = Target { width: 5, height: 4, format, pixels: &mut pixels };
+                        let mut target = Target { local: false, width: 5, height: 4, format, pixels: &mut pixels };
                         blit_scaled(source, destination, clip, 255, &mut target);
                         assert_eq!(pixels, expected, "format={format:?} destination={destination:?} clip={clip:?}");
                     }
@@ -2599,6 +2608,35 @@ mod tests {
     }
 
     #[test]
+    fn resident_scene_owns_background_and_uses_current_decoded_vga() {
+        let mut manager = WindowManager::new(Presentation::Desktop);
+        for (endpoint, key, x) in [(WINDOWS, SurfaceKey(2), 0), (OS2, SurfaceKey(1), 2)] {
+            let surface = manager.desktop.ensure_surface(endpoint, key).unwrap();
+            let node = manager.desktop.ensure_node(endpoint, PresentationKey(1), Rect::new(x, 0, 2, 1)).unwrap();
+            let mut tx = Transaction::new(endpoint);
+            tx.attach(node, Some(surface)).set_visible(node, true);
+            manager.desktop.commit(tx).unwrap();
+        }
+        let mut live = [0x00ff0000u32.to_le_bytes(); 2].concat();
+        let mut retained = [0x000000ffu32.to_le_bytes(); 2].concat();
+        let resolve = |owner, _| PixelBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE,
+            if owner == WINDOWS { &live } else { &retained }).ok();
+        let expected = manager.compose_processes(resolve, 4, 1, vga::PixelFormat::NATIVE).unwrap().pixels.to_vec();
+        let snapshot = manager.snapshot_processes(|owner, _| PixelBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE,
+            if owner == WINDOWS { &live } else { &retained }).ok(), Some(WINDOWS), vga::PixelFormat::NATIVE);
+        retained.fill(0);
+        let mut output = vec![0; 16];
+        snapshot.render(PixelBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE, &live).ok(),
+            4, 1, vga::PixelFormat::NATIVE, &mut output);
+        assert_eq!(output, expected);
+        live.copy_from_slice(&[0x0000ff00u32.to_le_bytes(); 2].concat());
+        snapshot.render(PixelBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE, &live).ok(),
+            4, 1, vga::PixelFormat::NATIVE, &mut output);
+        assert_eq!(&output[..8], &live);
+        assert_eq!(&output[8..], &expected[8..]);
+    }
+
+    #[test]
     fn fullscreen_is_presentation_not_window_identity() {
         let window = WindowManager::primary_window(WINDOWS);
         let mut manager = WindowManager::new(Presentation::Desktop);
@@ -2620,5 +2658,79 @@ mod tests {
         assert_eq!(manager.presentation(), Presentation::Desktop);
         manager.select_window(windows);
         assert_eq!(manager.presentation(), Presentation::Fullscreen(windows));
+    }
+}
+
+
+/// Owned scene and source snapshots. Built by the guest core, consumed without
+/// allocation by the media core. The live VGA surface is decoded there too.
+pub(crate) struct CompositionSnapshot {
+    scene: Scene,
+    sources: Vec<SnapshotSource>,
+    live: Option<SurfaceId>,
+    switcher: Option<SwitcherComposition>,
+    focused: Option<EndpointId>,
+    pointer: Option<Point>,
+}
+struct SnapshotSource {
+    id: SurfaceId, width: usize, height: usize, stride: usize,
+    format: vga::PixelFormat, pixels: Vec<u8>,
+}
+impl SnapshotSource {
+    fn new(id: SurfaceId, source: PixelBuffer<'_>) -> Self {
+        Self { id, width: source.width, height: source.height, stride: source.stride,
+            format: source.format, pixels: source.pixels.to_vec() }
+    }
+    fn buffer(&self) -> PixelBuffer<'_> {
+        PixelBuffer { width: self.width, height: self.height, stride: self.stride,
+            format: self.format, pixels: &self.pixels }
+    }
+}
+impl WindowManager {
+    pub(crate) fn snapshot_processes<'a>(
+        &mut self,
+        resolve: impl Fn(EndpointId, SurfaceKey) -> Option<PixelBuffer<'a>>,
+        live_owner: Option<EndpointId>, format: vga::PixelFormat,
+    ) -> CompositionSnapshot {
+        let desktop = &mut self.desktop;
+        let mut sources = Vec::new();
+        let mut live = None;
+        for surface in &desktop.surfaces {
+            if Some(surface.owner) == live_owner && surface.key == SurfaceKey(2) {
+                live = Some(surface.id);
+            } else if surface.owner == EndpointId(u32::MAX) && surface.key == SurfaceKey(u64::MAX) {
+                if crate::kernel::osd::is_open()
+                    && let Some(rect) = self.osd_rect
+                    && let Ok(buffer) = PixelBuffer::new(rect.width as usize, rect.height as usize,
+                        rect.width as usize * usize::from(format.bytes_per_pixel), format, &self.osd_pixels)
+                { sources.push(SnapshotSource::new(surface.id, buffer)); }
+            } else if let Some(buffer) = resolve(surface.owner, surface.key) {
+                sources.push(SnapshotSource::new(surface.id, buffer));
+            }
+        }
+        let switcher = match (self.switcher_active, self.switcher_highlighted,
+            self.switcher_node, self.switcher_target) {
+            (Some(active), Some(highlighted), Some(node), Some(target)) =>
+                Some(SwitcherComposition { active, highlighted, node, target }),
+            _ => None,
+        };
+        let result = CompositionSnapshot { scene: desktop.scene.clone(), sources, live,
+            switcher, focused: desktop.focused(), pointer: desktop.pointer };
+        desktop.finish_damage();
+        result
+    }
+}
+impl CompositionSnapshot {
+    pub(crate) fn render(&self, live: Option<PixelBuffer<'_>>, width: usize, height: usize,
+        format: vga::PixelFormat, output: &mut Vec<u8>) {
+        let resolve = |id| {
+            if self.live == Some(id) { live }
+            else { self.sources.iter().find(|s| s.id == id).map(SnapshotSource::buffer) }
+        };
+        let damage = [Rect::new(0, 0, width as u32, height as u32)];
+        self.scene.compose_switcher_regions_with(&resolve, width, height, format, output,
+            SwitcherRegions { local: true, layout: self.switcher, damage: &damage, focused: self.focused })
+            .expect("resident composition dimensions");
+        if let Some(point) = self.pointer { draw_pointer(output, width, height, format, point); }
     }
 }

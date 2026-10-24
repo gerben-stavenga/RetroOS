@@ -253,6 +253,11 @@ impl Fbi {
     /// surplus bytes; the caller provides three writable padding bytes after
     /// the logical frame for the final pixel.
     pub fn scanout(&self, fb: &[u8], clut: &Clut, dac: &Dac, out: &mut [u8], out_pitch: usize) {
+        self.scanout_with_checkpoint(fb, clut, dac, out, out_pitch, || {});
+    }
+
+    pub fn scanout_with_checkpoint(&self, fb: &[u8], clut: &Clut, dac: &Dac,
+        out: &mut [u8], out_pitch: usize, checkpoint: fn()) {
         let base = self.rgboffs[self.frontbuf as usize];
         if base == NO_BUFFER {
             return;
@@ -261,6 +266,7 @@ impl Fbi {
         let step = dac.bytes as usize;
         let width = (self.width as usize).min(out_pitch / step.max(1));
         for y in 0..self.height as usize {
+            checkpoint();
             let src = base as usize + y * self.rowpixels as usize * 2;
             let dst = y * out_pitch;
             if width != 0 && dst + (width - 1) * step + 4 > out.len() {

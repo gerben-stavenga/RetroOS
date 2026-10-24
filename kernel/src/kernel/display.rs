@@ -9,6 +9,7 @@
 //! Pixels may occupy 2, 3, or 4 bytes. Channel layout and width are consumed
 //! when the 256-entry palette is built, not in the per-pixel VGA decoder.
 
+mod video;
 pub use vga::PixelFormat;
 
 /// Runtime policy for standalone DOS framebuffer images. Native desktop
@@ -100,6 +101,7 @@ pub struct Display {
     present_pixels: alloc::vec::Vec<u8>,
     last_packed_output: Option<(usize, usize)>,
     presentation: Option<crate::kernel::media::Graphics<Presentation>>,
+    video: Option<crate::kernel::media::VideoService<video::Video>>,
     backend: Backend,
 }
 
@@ -269,11 +271,16 @@ impl core::fmt::Debug for Display {
 
 impl Display {
     fn wait_presentation(&self) {
+        if let Some(video) = &self.video {
+            video.pause();
+            if let Some(mut state) = video.try_lock() { state.invalidate(); }
+        }
         if let Some(work) = &self.presentation { work.wait(); }
     }
 
     fn queue_presentation(&mut self, width: usize, height: usize, pixels: &[u8], output: (usize, usize), regions: Option<&[crate::kernel::gui::Rect]>) -> Option<usize> {
         if !crate::kernel::media::enabled() { return None; }
+        if let Some(video) = &self.video { video.pause(); }
         let fb = *self.framebuffer()?;
         let bytes = width.checked_mul(height)?.checked_mul(usize::from(self.rgb.bytes_per_pixel))?;
         if width == 0 || height == 0 || pixels.len() < bytes { return Some(0); }
@@ -355,6 +362,7 @@ impl Display {
             voodoo_ramp_generation: None, present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
             presentation: None,
+            video: None,
             backend: Backend::Linear(framebuffer) }
     }
 
@@ -389,6 +397,7 @@ impl Display {
             present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
             presentation: None,
+            video: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::Mode13 {
@@ -443,6 +452,7 @@ impl Display {
             present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
             presentation: None,
+            video: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeLinear { framebuffer, pages },
@@ -472,6 +482,7 @@ impl Display {
             present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
             presentation: None,
+            video: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeBanked { mode, current_bank: 0 },
@@ -485,6 +496,7 @@ impl Display {
             present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
             presentation: None,
+            video: None,
             backend: Backend::Host }
     }
 
@@ -494,6 +506,7 @@ impl Display {
             present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
             presentation: None,
+            video: None,
             backend: Backend::Headless }
     }
 
@@ -540,8 +553,8 @@ impl Display {
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) {
-        self.wait_presentation();
         if self.voodoo_ramp_generation.is_none() { return; }
+        self.wait_presentation();
         let mut ramp = [0u8; 256 * 4];
         for (v, entry) in ramp.chunks_exact_mut(4).enumerate() {
             entry.copy_from_slice(&[v as u8, v as u8, v as u8, 0]);
@@ -1656,6 +1669,7 @@ fn raster_shadow(
     s: &mut Scanout,
     format: PixelFormat,
     frame: &vga::Frame,
+    local: bool,
 ) -> bool {
     let (w, h) = vga::dimensions(frame.mode);
     if w == 0 || h == 0 {
@@ -1676,20 +1690,21 @@ fn raster_shadow(
     if matches!(frame.mode, vga::VgaMode::Planar16 { .. } | vga::VgaMode::Text { .. }) {
         s.pal.sync_planar(frame.ac);
     }
-    // Guest execution remains joined while these live VRAM pages are read.
-    // Palette and destination storage are already resident.
-    unsafe { crate::kernel::media::graphics(|| {
-    for sy in 0..h {
-        crate::kernel::media::checkpoint();
-        vga::render_row_packed(
-            frame,
-            sy,
-            &s.pal,
-            &mut s.surface[sy * w * usize::from(format.bytes_per_pixel)
-                ..(sy + 1) * w * usize::from(format.bytes_per_pixel) + vga::PACKED_ROW_PADDING],
-        );
-    }
-    }); }
+    // The worker uses an owned snapshot; fallback callers join while reading
+    // live VRAM. Palette and destination storage are already resident.
+    let mut render = || {
+        for sy in 0..h {
+            crate::kernel::media::checkpoint();
+            vga::render_row_packed(
+                frame,
+                sy,
+                &s.pal,
+                &mut s.surface[sy * w * usize::from(format.bytes_per_pixel)
+                    ..(sy + 1) * w * usize::from(format.bytes_per_pixel) + vga::PACKED_ROW_PADDING],
+            );
+        }
+    };
+    if local { render(); } else { unsafe { crate::kernel::media::graphics(render); } }
     true
 }
 
@@ -1698,7 +1713,7 @@ pub fn render_shadow(
     format: PixelFormat,
     frame: &vga::Frame,
 ) -> bool {
-    if !raster_shadow(s, format, frame) {
+    if !raster_shadow(s, format, frame, false) {
         return false;
     }
     s.ready = true;
@@ -1721,7 +1736,7 @@ pub fn render_frame(s: &mut Scanout, format: PixelFormat, frame: &vga::Frame) ->
     s.geo = (w, h, w, h, w, h);
     s.mode = Some(frame.mode);
     s.ready = false;
-    raster_shadow(s, format, frame)
+    raster_shadow(s, format, frame, false)
 }
 
 /// Cheap diagnostic signature of the completed packed shadow. Sampling one

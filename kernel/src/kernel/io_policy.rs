@@ -48,12 +48,13 @@ pub(super) fn key<A: crate::Arch>(
     if let Personality::Dos(dos) = personality {
         key.dos = true;
         key.native_vga = dos.pc.vga.native_legacy_vga(bios);
-        if let crate::kernel::dos::SbDevice::Native { pt, .. } = &dos.pc.sb.device {
+        let audio = dos.pc.audio.lock();
+        if let crate::kernel::dos::SbDevice::Native { pt, .. } = &audio.sb.device {
             key.native_sb = true;
-            key.sb_base = dos.pc.sb.blaster.io_base;
-            key.sb_trap_mask = pt.trap_mask(&dos.pc.sb.blaster);
-            if dos.pc.mpu.present && !crate::kernel::osd::midi_hda_enabled() {
-                key.mpu_base = dos.pc.mpu.base;
+            key.sb_base = audio.sb.blaster.io_base;
+            key.sb_trap_mask = pt.trap_mask(&audio.sb.blaster);
+            if audio.mpu.present && !crate::kernel::osd::midi_hda_enabled() {
+                key.mpu_base = audio.mpu.base;
             }
         }
     }

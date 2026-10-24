@@ -373,6 +373,7 @@ pub fn display_tick<A: crate::Arch>(
         crate::kernel::gui::EndpointId,
     )>,
 ) {
+    if let Some(voodoo) = pc.voodoo.as_mut() { voodoo.service_commands(); }
     // A physical Voodoo board takes the monitor away from the VGA card with
     // its pass-through relay.  Our Voodoo is a software producer, so on a
     // native-VGA machine it instead needs the adapter converted into a packed
@@ -396,6 +397,26 @@ pub fn display_tick<A: crate::Arch>(
             DosVideo::Fullscreen(_) => unreachable!("Voodoo display detach left fullscreen VGA active"),
         });
         crate::compact_println!("Display: Voodoo acquired packed scanout from native VGA");
+    }
+
+    if crate::kernel::media::enabled()
+        && let Some(voodoo) = pc.voodoo.as_mut().filter(|voodoo| voodoo.active())
+    {
+        let display = external.as_deref_mut().or(match &mut pc.vga {
+            DosVideo::Fullscreen(FullscreenVga::Emulated(_, display)) => Some(display),
+            _ => None,
+        });
+        if let Some(display) = display {
+            display.restore_voodoo_ramp(machine, bios);
+            let owner = presentation.as_ref().map(|(_, endpoint)| *endpoint);
+            if display.capture_voodoo(&voodoo.output(), owner) {
+                let (w, h) = voodoo.dimensions();
+                if let Some((desktop, endpoint)) = presentation.as_mut() {
+                    publish_vga_surface(w as usize, h as usize, desktop, *endpoint);
+                }
+                return;
+            }
+        }
     }
 
     // A Glide program that has mapped the Voodoo owns the display: the card
@@ -425,6 +446,21 @@ pub fn display_tick<A: crate::Arch>(
     let svga_start = dev.state.svga().map_or(0, |svga| svga.display_byte_offset());
     let vga = &dev.state;
     if display.is_headless() { return; }
+    if crate::kernel::media::enabled() && !display.is_host() {
+        let Some(frame) = scanout(vga, machine, regs, svga_start) else { return };
+        let owner = presentation.as_ref().map(|(_, endpoint)| *endpoint);
+        if display.capture_vga(&frame, owner) {
+            // Guest beam/retained geometry stay cheap and local. Pixel work is
+            // owned by the persistent renderer, not joined by the guest loop.
+            let (w, h) = ::vga::dimensions(frame.mode);
+            let _ = crate::kernel::display::scanout_action(&mut pc.scanout, display,
+                frame.mode, now_ns, 70, 70, owner.map(|_| (w, h)));
+            if let Some((desktop, endpoint)) = presentation.as_mut() {
+                publish_vga_surface(w, h, desktop, *endpoint);
+            }
+            return;
+        }
+    }
     if !display.is_host() {
         // Direct framebuffer: phase zero is guest-visible retrace. Its
         // trailing edge renders one complete immutable shadow; the following

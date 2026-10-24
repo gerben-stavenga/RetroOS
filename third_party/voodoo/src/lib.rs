@@ -338,22 +338,20 @@ impl Voodoo {
     pub fn render(&self, fb: &[u8], dac: &Dac, out: &mut [u8], out_pitch: usize) {
         // `fbiInit1` bit 12 blanks the display without disturbing memory.
         if fbiinit1_software_blank(self.reg[fbiInit1]) {
-            for p in out.iter_mut() {
-                *p = 0;
-            }
+            for chunk in out.chunks_mut(16 * 1024) { (self.cooperate)(); chunk.fill(0); }
             return;
         }
-        self.fbi.scanout(fb, &self.clut, dac, out, out_pitch);
+        self.fbi.scanout_with_checkpoint(fb, &self.clut, dac, out, out_pitch, self.cooperate);
     }
 
     /// Scan out without applying the SST-1 CLUT. Used when a programmable
     /// physical RAMDAC applies the expanded CLUT after reading the surface.
     pub fn render_raw(&self, fb: &[u8], dac: &Dac, out: &mut [u8], out_pitch: usize) {
         if fbiinit1_software_blank(self.reg[fbiInit1]) {
-            out.fill(0);
+            for chunk in out.chunks_mut(16 * 1024) { (self.cooperate)(); chunk.fill(0); }
             return;
         }
-        self.fbi.scanout(fb, &Clut::new(), dac, out, out_pitch);
+        self.fbi.scanout_with_checkpoint(fb, &Clut::new(), dac, out, out_pitch, self.cooperate);
     }
 
     pub fn vbe_ramp(&self, out: &mut [u8; 256 * 4]) -> u64 {

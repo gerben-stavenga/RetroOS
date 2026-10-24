@@ -70,6 +70,8 @@ def main():
                 time.sleep(0.1)
             if args.cpus > 1 and "core 1: Media worker: audio and graphics ready" not in log.read_text(errors="replace"):
                 dump(log, "media worker did not start")
+            if args.cpus > 1 and "core 1: sink: first frame played" not in log.read_text(errors="replace"):
+                dump(log, "audio output did not run on core 1")
             # Wait for the game to be RUNNING, not for a fixed delay: DOOM's
             # own startup banner is the only host-speed-independent signal.
             # A slow TCG runner spent the whole fixed settle+window still in

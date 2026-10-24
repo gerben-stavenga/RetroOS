@@ -38,6 +38,28 @@ static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 /// Times the dashpot pushed the mixing rate far from `s`; see [`advance`].
 static RATE_SPIKES: AtomicU32 = AtomicU32::new(0);
 
+static FRONTIER_SEQ: AtomicU32 = AtomicU32::new(0);
+static FRONTIER_LO: AtomicU32 = AtomicU32::new(0);
+static FRONTIER_HI: AtomicU32 = AtomicU32::new(0);
+
+/// Lock-free observation of the single audio producer's frame frontier.
+pub fn produced_frames() -> u64 {
+    loop {
+        let seq = FRONTIER_SEQ.load(Ordering::Acquire);
+        if seq & 1 != 0 { core::hint::spin_loop(); continue; }
+        let lo = FRONTIER_LO.load(Ordering::Relaxed);
+        let hi = FRONTIER_HI.load(Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::Acquire);
+        if FRONTIER_SEQ.load(Ordering::Relaxed) == seq { return (u64::from(hi) << 32) | u64::from(lo); }
+    }
+}
+fn publish_frontier(value: u64) {
+    FRONTIER_SEQ.fetch_add(1, Ordering::AcqRel);
+    FRONTIER_LO.store(value as u32, Ordering::Relaxed);
+    FRONTIER_HI.store((value >> 32) as u32, Ordering::Relaxed);
+    FRONTIER_SEQ.fetch_add(1, Ordering::Release);
+}
+
 /// One real-time window's worth of pump accounting, for when the mix rate
 /// wanders and the sampled spike log cannot say why. Reported per ~3s of TSC;
 /// read it against the sink itself rather than a TSC frequency, which is not
@@ -429,9 +451,16 @@ impl Clock {
 pub fn advance<A: crate::Arch>(
     machine: &mut A,
     clock: &mut Clock,
-    mut sink: Option<&mut Sink>,
+    sink: Option<&mut Sink>,
     dt_ns: u64,
     mut mix: impl FnMut(&mut A, AudioSpan<'_>),
+) {
+    advance_resident(clock, sink, dt_ns, machine.rdtsc(), |span| mix(machine, span));
+}
+
+fn advance_resident(
+    clock: &mut Clock, mut sink: Option<&mut Sink>, dt_ns: u64, stamp: u64,
+    mut mix: impl FnMut(AudioSpan<'_>),
 ) {
     let mut elapsed_ns = dt_ns;
     let mut written = 0;
@@ -524,7 +553,7 @@ pub fn advance<A: crate::Arch>(
     while remaining > 0 {
         let run = usize::try_from(remaining.min(MIX_CHUNK as u64)).unwrap();
         frames[..run].fill((0, 0));
-        mix(machine, AudioSpan {
+        mix(AudioSpan {
             rate: mix_rate,
             base_frame: base,
             physical_sb: sink.as_ref().is_some_and(|output| output.is_sb()),
@@ -542,6 +571,7 @@ pub fn advance<A: crate::Arch>(
     // longer describes anything audible. The instantaneous rate and its
     // deviation from `s` stay visible through the trace/census diagnostics.
     publish_mixing_rate_q16(pitch_rate_q16);
+    publish_frontier(clock.produced_frames());
 
     let Some(output) = sink else { return };
 
@@ -551,7 +581,7 @@ pub fn advance<A: crate::Arch>(
     // drained, both of which are unit-free.
     if crate::kernel::startup::trace_enabled() {
         let c = &mut output.census;
-        let now = machine.rdtsc();
+        let now = stamp;
         if c.tsc0 == 0 {
             c.tsc0 = now;
         }
@@ -591,5 +621,48 @@ pub fn advance<A: crate::Arch>(
                 n,
             );
         }
+    }
+}
+
+
+/// Owned by the media service for an event-loop session. Core 0 only changes
+/// routing/controls and publishes the active resident device set.
+pub struct Engine {
+    pub sink: Option<Sink>,
+    pub clock: Clock,
+    source: Option<alloc::sync::Arc<crate::kernel::media::Shared<super::dos::AudioDevices>>>,
+    last_ns: u64,
+}
+impl Engine {
+    pub fn new(sink: Option<Sink>, now_ns: u64) -> Self {
+        publish_frontier(0);
+        Self { sink, clock: Clock::new(), source: None, last_ns: now_ns }
+    }
+    pub fn source(&mut self, source: Option<&alloc::sync::Arc<crate::kernel::media::Shared<super::dos::AudioDevices>>>) {
+        let same = match (&self.source, source) {
+            (Some(a), Some(b)) => alloc::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same { self.source = source.cloned(); }
+    }
+    pub fn due() -> bool {
+        static LAST_MS: AtomicU32 = AtomicU32::new(u32::MAX);
+        let now = (super::portio::now_ns() / 1_000_000) as u32;
+        LAST_MS.swap(now, Ordering::Relaxed) != now
+    }
+    pub fn poll(&mut self) {
+        let now = super::portio::now_ns();
+        let elapsed = now.saturating_sub(self.last_ns);
+        if elapsed == 0 { return; }
+        // Don't stall the media core behind a guest DMA copy or port access.
+        let mut source = match self.source.as_ref() {
+            Some(source) => match source.try_lock() { Some(source) => Some(source), None => return },
+            None => None,
+        };
+        self.last_ns = now;
+        advance_resident(&mut self.clock, self.sink.as_mut(), elapsed, now, |span| {
+            if let Some(source) = source.as_mut() { source.mix(now, span); }
+        });
     }
 }

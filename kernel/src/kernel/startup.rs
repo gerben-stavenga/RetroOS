@@ -1384,6 +1384,7 @@ fn present_desktop<A: crate::Arch>(
         sound,
     );
     osd_sample.finish(machine, crate::kernel::osd_profile::Stage::Osd, 0);
+    let format = display.rgb;
     let resolve = |endpoint: crate::kernel::gui::EndpointId,
                    key: crate::kernel::gui::SurfaceKey| {
         if endpoint == crate::kernel::linux::CONSOLE_ENDPOINT {
@@ -1393,8 +1394,9 @@ fn present_desktop<A: crate::Arch>(
         threads
             .get(endpoint.0 as usize)?
             .personality
-            .surface_buffer(key, display.rgb)
+            .surface_buffer(key, format)
     };
+    if display.capture_composition(windows, canvas_width, canvas_height, resolve) { return; }
     let scene_sample = crate::kernel::osd_profile::Sample::start(machine);
     let frame = windows
         .compose_processes(resolve, canvas_width, canvas_height, display.rgb)
@@ -1436,7 +1438,12 @@ fn event_loop<A: crate::Arch>(
     // Either is only permission to resample the real clock.
     let mut irq_clock_wakeup = false;
     let mut exiting_display = None;
-    let mut audio_clock = crate::kernel::sound::Clock::new();
+    let audio = unsafe { crate::kernel::media::AudioService::new(
+        crate::kernel::sound::Engine::new(sink.take(), machine.now()),
+        crate::kernel::sound::Engine::due,
+        crate::kernel::sound::Engine::poll,
+    ) };
+    let mut audio_source = None;
     let mut execution_profile_on = false;
     let mut pending_events = crate::kernel::irq_dispatch::PendingEvents::default();
     // Diagnose a running guest whose display/audio never advance because the
@@ -1588,6 +1595,16 @@ fn event_loop<A: crate::Arch>(
                 "desktop presentation lost the compositor display",
             );
 
+            let source = match &thread.personality {
+                thread::Personality::Dos(dos) => Some(&dos.pc.audio),
+                _ => None,
+            };
+            let source_id = source.map_or(0, |source| alloc::sync::Arc::as_ptr(source) as usize);
+            if audio_source != Some(source_id) {
+                audio.lock().source(source);
+                audio_source = Some(source_id);
+            }
+            let audio_frontier = crate::kernel::sound::produced_frames();
             // Audio precedes display publication: a synchronous framebuffer
             // write may be slow, but cannot delay the samples due this tick.
             thread.personality.advance_world(
@@ -1596,7 +1613,7 @@ fn event_loop<A: crate::Arch>(
                 &ctx.regs,
                 world_now_ns,
                 elapsed_ns,
-                audio_clock.produced_frames(),
+                audio_frontier,
             );
             stats.mark(machine, PROFILE_DEVICES);
             if thread.kernel.state == thread::ThreadState::Blocked
@@ -1604,10 +1621,12 @@ fn event_loop<A: crate::Arch>(
             {
                 thread.kernel.state = thread::ThreadState::Ready;
             }
-            if elapsed_ns != 0 {
+            if elapsed_ns != 0 && !crate::kernel::media::enabled() {
+                let mut engine = audio.lock();
+                let crate::kernel::sound::Engine { clock, sink, .. } = &mut *engine;
                 crate::kernel::sound::advance(
                     machine,
-                    &mut audio_clock,
+                    clock,
                     sink.as_mut(),
                     elapsed_ns,
                     |machine, span| thread.personality.audio_tick(machine, world_now_ns, span),
@@ -1655,24 +1674,25 @@ fn event_loop<A: crate::Arch>(
         if osd_composite_due
             && let Some(display) = display.as_mut()
         {
+            let sound = sound_view(
+                audio.lock().sink.as_ref(),
+                sb_handoff.as_ref(),
+                threads.get(ctx.tid).map(|thread| &thread.personality),
+            );
             present_desktop(
                 machine,
                 &mut *bios_workspace,
                 threads,
                 display,
                 &mut windows,
-                sound_view(
-                    sink.as_ref(),
-                    sb_handoff.as_ref(),
-                    threads.get(ctx.tid).map(|thread| &thread.personality),
-                ),
+                sound,
             );
         }
         stats.mark(machine, PROFILE_DISPLAY);
         {
             if !events.is_empty() {
                 let sound = sound_view(
-                    sink.as_ref(),
+                    audio.lock().sink.as_ref(),
                     sb_handoff.as_ref(),
                     threads.get(ctx.tid).map(|thread| &thread.personality),
                 );
@@ -1736,12 +1756,12 @@ fn event_loop<A: crate::Arch>(
                 threads,
                 ctx.tid,
                 &mut sb_handoff,
-                sink,
+                &mut audio.lock().sink,
                 request,
             );
         }
         if crate::kernel::osd::take_midi_route_request()
-            && sink.as_ref().is_some_and(crate::kernel::sound::Sink::is_hda)
+            && audio.lock().sink.as_ref().is_some_and(crate::kernel::sound::Sink::is_hda)
         {
             let software = !crate::kernel::osd::midi_hda_enabled();
             if software && crate::kernel::midi_bank::get().is_none() {
@@ -1753,9 +1773,9 @@ fn event_loop<A: crate::Arch>(
                 for thread in threads.iter_mut() {
                     if let thread::Personality::Dos(dos) = &mut thread.personality {
                         if software {
-                            dos.pc.mpu.start_software_route();
+                            dos.pc.audio.lock().mpu.start_software_route();
                         } else {
-                            dos.pc.mpu.stop_software_route();
+                            dos.pc.audio.lock().mpu.stop_software_route();
                         }
                     }
                 }
@@ -1763,7 +1783,7 @@ fn event_loop<A: crate::Arch>(
                 if !software
                     && let Some(base) = thread::get_thread(threads, ctx.tid).and_then(|thread| {
                         if let thread::Personality::Dos(dos) = &thread.personality {
-                            dos.pc.mpu.present.then_some(dos.pc.mpu.base)
+                            { let audio = dos.pc.audio.lock(); audio.mpu.present.then_some(audio.mpu.base) }
                         } else {
                             None
                         }
@@ -1789,7 +1809,7 @@ fn event_loop<A: crate::Arch>(
             }
         }
         if let Some(raw) = crate::kernel::osd::take_sb_master_request() {
-            let applied = sink.as_ref().is_some_and(|sink| sink.set_sb_master(machine, raw))
+            let applied = audio.lock().sink.as_ref().is_some_and(|sink| sink.set_sb_master(machine, raw))
                 || sb_handoff.as_ref().is_some_and(|card| {
                     card.set_master(machine, raw);
                     true
@@ -1800,7 +1820,7 @@ fn event_loop<A: crate::Arch>(
             }
         }
         while let Some((source, level)) = crate::kernel::osd::take_sb_source_request() {
-            let applied = sink.as_ref().is_some_and(|sink| sink.set_sb_source(machine, source, level))
+            let applied = audio.lock().sink.as_ref().is_some_and(|sink| sink.set_sb_source(machine, source, level))
                 || sb_handoff.as_ref().is_some_and(|card| {
                     card.set_source(machine, source, level);
                     true
@@ -1946,6 +1966,11 @@ fn event_loop<A: crate::Arch>(
                 thread::reap_all_zombies(threads, machine);
                 // Every owner is gone, so both capabilities are back in this
                 // frame — hand them to whoever runs the next program.
+                {
+                    let mut engine = audio.lock();
+                    engine.source(None);
+                    *sink = engine.sink.take();
+                }
                 return (
                     match display.take() {
                         Some(display) => display,
@@ -2088,12 +2113,12 @@ fn sound_view<A: crate::Arch>(
         },
         None if let Some(card) = sink.and_then(crate::kernel::sound::Sink::parked_sb) =>
             SoundView::KernelHda { can_native: true, can_sb: card.dma16 == Some(5) },
-        None => match handoff.or_else(|| personality.and_then(thread::Personality::physical_sb)) {
-            Some(device) => SoundView::NativeSb {
-                port: device.base,
+        None => match handoff.map(|sb| (sb.base, sb.dma16, sb.has_ct1745())).or_else(|| personality.and_then(thread::Personality::physical_sb)) {
+            Some((port, dma16, has_mixer)) => SoundView::NativeSb {
+                port,
                 can_mix: sink.is_some_and(crate::kernel::sound::Sink::is_hda)
-                    || device.dma16 == Some(5),
-                has_mixer: device.has_ct1745(),
+                    || dma16 == Some(5),
+                has_mixer,
                 hda_midi: sink.is_some_and(crate::kernel::sound::Sink::is_hda),
             },
             None => match crate::kernel::platform::get().audio {
@@ -3160,12 +3185,13 @@ fn dump_virtual_hw<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>) {
     );
 
     crate::kernel::dos::dump_if_ring();
-    dos.pc.gus.dump_state();
-    if dos.pc.gus.present && dos.pc.gus.irq < 16 {
-        let vector = if dos.pc.gus.irq < 8 {
-            0x08u8 + dos.pc.gus.irq
+    let audio = dos.pc.audio.lock();
+    audio.gus.dump_state();
+    if audio.gus.present && audio.gus.irq < 16 {
+        let vector = if audio.gus.irq < 8 {
+            0x08u8 + audio.gus.irq
         } else {
-            0x70u8 + dos.pc.gus.irq - 8
+            0x70u8 + audio.gus.irq - 8
         };
         let (pm_sel, pm_off) = dos.pm_vectors[vector as usize];
         let ivt = usize::from(vector) * 4;
@@ -3173,7 +3199,7 @@ fn dump_virtual_hw<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>) {
         let rm_seg = machine.read::<u16>(ivt + 2);
         crate::compact_dbg_println!(
             "[GUSIRQ] irq={} vector={:02X} pm={:04X}:{:08X} rm={:04X}:{:04X}",
-            dos.pc.gus.irq, vector, pm_sel, pm_off, rm_seg, rm_off
+            audio.gus.irq, vector, pm_sel, pm_off, rm_seg, rm_off
         );
         // DOS extenders may install a callback on a remapped or chained IRQ
         // vector. Show the whole legacy IRQ ranges while diagnosing silence.
@@ -3224,13 +3250,13 @@ pub fn profile_enabled() -> bool {
 /// monitor's Trace item, and bracketed by COMMAND.COM around a child exec (INT
 /// 31h synth AH=02/03) so a log captures just that program. Default OFF so
 /// boot/init/DN startup stay silent until something enables it.
-static mut SYSCALL_TRACE: bool = false;
+static SYSCALL_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static mut FILESYSTEM_TRACE: bool = false;
 
 /// Set the trace gate directly (the COMMAND.COM bracket path).
 pub fn set_trace(on: bool) {
     unsafe {
-        core::ptr::write_volatile(&raw mut SYSCALL_TRACE, on);
+        SYSCALL_TRACE.store(on, core::sync::atomic::Ordering::Relaxed);
         core::ptr::write_volatile(&raw mut FILESYSTEM_TRACE, false);
     }
 }
@@ -3254,16 +3280,12 @@ pub fn trace_linux_syscall(nr: u32, wide: bool) -> bool {
 /// Toggle syscall tracing, reporting which way it went (the F12 Trace item).
 pub fn toggle_trace() {
     unsafe { core::ptr::write_volatile(&raw mut FILESYSTEM_TRACE, false) };
-    let on = unsafe {
-        let v = !core::ptr::read_volatile(&raw const SYSCALL_TRACE);
-        core::ptr::write_volatile(&raw mut SYSCALL_TRACE, v);
-        v
-    };
+    let on = !SYSCALL_TRACE.fetch_xor(true, core::sync::atomic::Ordering::Relaxed);
     crate::compact_println!("[trace] syscall tracing {}", if on { "ON" } else { "off" });
 }
 
 pub fn trace_enabled() -> bool {
-    unsafe { core::ptr::read_volatile(&raw const SYSCALL_TRACE) }
+    SYSCALL_TRACE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 const PROFILE_LOOP: usize = 0;

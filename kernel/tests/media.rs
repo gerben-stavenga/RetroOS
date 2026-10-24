@@ -43,6 +43,9 @@ fn voodoo_frame() -> Vec<u8> {
             card.write8((reg * 4 + i) as u32, byte);
         }
     };
+    // More than two complete command-ring wraps, followed by the checked
+    // framebuffer operation below. All register writes must retain order.
+    for value in 0..600 { write(&mut card, color1, value); }
     for (reg, value) in [
         (fbiInit1, 10 << 4),
         (fbiInit2, 150 << 11),
@@ -69,7 +72,7 @@ fn voodoo_frame() -> Vec<u8> {
 #[test]
 fn two_core_priority_handoff_and_drop_fences() {
     // No AP: identical jobs execute inline.
-    assert_eq!(unsafe { media::audio(|| 17) }, 17);
+
     let mut inline = media::Graphics::new(3usize);
     unsafe {
         inline.start(|value| *value *= 2);
@@ -107,9 +110,25 @@ fn two_core_priority_handoff_and_drop_fences() {
     unsafe {
         queued.start(|value| *value = 91);
     }
-    unsafe {
-        media::audio(|| AUDIO_RAN.store(true, Ordering::Release));
-    }
+    static POLLS: AtomicUsize = AtomicUsize::new(0);
+    static DUE: AtomicBool = AtomicBool::new(false);
+    let service = unsafe { media::AudioService::new((), || DUE.load(Ordering::Acquire), |_| {
+        POLLS.fetch_add(1, Ordering::Relaxed);
+        AUDIO_RAN.store(true, Ordering::Release);
+    }) };
+    let refreshes = REFRESHES.load(Ordering::Acquire);
+    for _ in 0..100 { std::thread::yield_now(); }
+    assert_eq!(POLLS.load(Ordering::Acquire), 0);
+    assert_eq!(REFRESHES.load(Ordering::Acquire), refreshes,
+        "an audio checkpoint before the deadline must not refresh mappings");
+    DUE.store(true, Ordering::Release);
+    // No mix submission or guest tick is required: the service continues to
+    // run while the producer does unrelated work.
+    while POLLS.load(Ordering::Acquire) < 100 { std::thread::yield_now(); }
+    drop(service);
+    let stopped = POLLS.load(Ordering::Acquire);
+    for _ in 0..100 { std::thread::yield_now(); }
+    assert_eq!(POLLS.load(Ordering::Acquire), stopped);
     assert_eq!(*drawing.get(), 42);
     assert_eq!(*queued.get_mut(), 91);
 
@@ -138,5 +157,32 @@ fn two_core_priority_handoff_and_drop_fences() {
     assert!(DROPPED.load(Ordering::Acquire));
     assert!(REFRESHES.load(Ordering::Relaxed) >= 131);
     assert_eq!(voodoo_frame(), expected_pixels);
+    static VIDEO_TICKS: AtomicUsize = AtomicUsize::new(0);
+    static HOLD_VIDEO: AtomicBool = AtomicBool::new(true);
+    static VIDEO_STARTED: AtomicBool = AtomicBool::new(false);
+    let old_video = unsafe { media::VideoService::new((), || true, |_| {
+        VIDEO_STARTED.store(true, Ordering::Release);
+        while HOLD_VIDEO.load(Ordering::Acquire) { media::checkpoint(); }
+        VIDEO_TICKS.fetch_add(1, Ordering::Release);
+    }) };
+    old_video.activate();
+    while !VIDEO_STARTED.load(Ordering::Acquire) { std::thread::yield_now(); }
+    assert!(old_video.try_lock().is_none(), "publication must skip a running frame, never join it");
+    HOLD_VIDEO.store(false, Ordering::Release);
+    while VIDEO_TICKS.load(Ordering::Acquire) < 10 { std::thread::yield_now(); }
+    let video = unsafe { media::VideoService::new((), || true, |_| {
+        VIDEO_TICKS.fetch_add(1, Ordering::Release);
+    }) };
+    video.activate();
+    drop(old_video); // Retiring an old display must not unregister its successor.
+    let before = VIDEO_TICKS.load(Ordering::Acquire);
+    while VIDEO_TICKS.load(Ordering::Acquire) == before { std::thread::yield_now(); }
+    video.pause();
+    let stopped = VIDEO_TICKS.load(Ordering::Acquire);
+    for _ in 0..100 { std::thread::yield_now(); }
+    assert_eq!(VIDEO_TICKS.load(Ordering::Acquire), stopped);
+    video.activate();
+    while VIDEO_TICKS.load(Ordering::Acquire) == stopped { std::thread::yield_now(); }
+    drop(video);
     assert_eq!(WORKER_ALLOCATIONS.load(Ordering::Relaxed), 0);
 }

@@ -152,9 +152,8 @@ impl Mpu {
     /// the GUS's, and is *not* the GUS's: the bank is the same, but a GM
     /// sequence drives far more simultaneous voices, so it needs its own
     /// measured level (see `vsb::GM_SCALE_Q16`).
-    pub(super) fn mix_into<A: crate::Arch>(
+    pub(super) fn mix_into(
         &mut self,
-        _machine: &mut A,
         rate: u32,
         base: u64,
         block: &mut [(i32, i32)],
@@ -163,7 +162,7 @@ impl Mpu {
         if let Some(s) = self.synth.as_mut() {
             // The synth and boot ROM bank are resident; mixing only updates
             // fixed voices and consumes queued MIDI bytes.
-            unsafe { crate::kernel::media::audio(|| s.mix_into(rate, base, (g, g), block)); }
+            s.mix_into(rate, base, (g, g), block);
         }
     }
 }

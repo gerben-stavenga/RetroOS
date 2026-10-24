@@ -214,11 +214,14 @@ impl SbDevice {
 /// The machine side of the EMULATED card: `//lib:sound`'s passive chip plus
 /// the two things a passive chip cannot own — a between-pump position
 /// estimate, and somewhere to land the guest's ring bytes.
+type DmaCopy<'a> = &'a mut dyn FnMut(usize, &mut [u8]);
+
 pub struct EmulatedSb {
     /// The library card: DSP register file + command FSM, CT1745 mixer, OPL.
     core: sound::sb::Sb,
     /// Guest address belongs to the machine, never the card model.
     dma_base: u32,
+    dma_image: alloc::vec::Vec<u8>,
     /// Incremental DSP source position in Q32.32 frames. The output mix rate
     /// may change to regulate physical pipe depth, so reconstructing this from
     /// an absolute output frame and the latest rate would warp its history.
@@ -228,15 +231,14 @@ pub struct EmulatedSb {
     /// 8237 count to find the play position (Pinball Fantasies) sees it
     /// frozen, then leaping ~512 transfers, and its coherency loop never
     /// converges. Count reads instead extrapolate from the last pump on the
-    /// guest's fine clock (`rdtsc`): `est_frames` + elapsed·`est_slope`,
+    /// guest's fine clock (`now`): `est_frames` + elapsed·`est_slope`,
     /// where the slope is measured pump-over-pump from the producer clock
-    /// itself (frames per 2^32 TSC ticks, EWMA-smoothed) — no TSC frequency
-    /// calibration anywhere. Clamped to `est_cap` (nothing past what the
+    /// itself (frames per nanosecond in Q32, EWMA-smoothed). Clamped to `est_cap` (nothing past what the
     /// sink was handed, never across an un-raised block IRQ) and monotonic
     /// via `est_served` (a pump reconciling behind the estimate holds, never
     /// rewinds).
     est_frames: u64,
-    est_tsc: u64,
+    est_ns: u64,
     est_cap: u64,
     est_slope: u64,
     est_served: u64,
@@ -268,8 +270,9 @@ impl EmulatedSb {
         Box::new(Self {
             core: sound::sb::Sb::new(),
             dma_base: 0,
+            dma_image: alloc::vec::Vec::new(),
             mix_pos_q32: 0,
-            est_frames: 0, est_tsc: 0, est_cap: 0, est_slope: 0, est_served: 0,
+            est_frames: 0, est_ns: 0, est_cap: 0, est_slope: 0, est_served: 0,
             probe_steps: 0,
             dsp_scratch: [0; DSP_SCRATCH_BYTES],
         })
@@ -592,6 +595,10 @@ impl EmulatedSb {
         let (gpa, len) = chan_gpa_len(&prog, is16);
         self.dma_base = gpa;
         self.core.begin(start, len);
+        if crate::kernel::media::enabled() {
+            self.dma_image.resize(len as usize, 0);
+            machine.copy_from(self.dma_base as usize, &mut self.dma_image);
+        }
         self.probe_steps = if self.core.short_probe_active() {
             PROBE_DELAY_STEPS
         } else {
@@ -635,7 +642,7 @@ impl EmulatedSb {
         }
         self.mix_pos_q32 = 0;
         self.est_frames = 0;
-        self.est_tsc = 0;
+        self.est_ns = 0;
         self.est_cap = 0;
         self.est_served = 0;
         true
@@ -655,30 +662,46 @@ impl EmulatedSb {
         block: &mut [(i32, i32)],
         physical_sb: bool,
     ) {
+        self.mix_resident(rate, block, physical_sb, Some(&mut |addr, bytes| machine.copy_from(addr, bytes)));
+    }
+
+    pub(super) fn capture_dma<A: crate::Arch>(&mut self, machine: &A) {
+        if !self.core.playing() || self.dma_image.is_empty() { return; }
+        let format = self.core.dsp_state();
+        let frame_bytes = usize::from(format.bits / 8) * if format.stereo { 2 } else { 1 };
+        if frame_bytes == 0 { return; }
+        let ring = self.dma_image.len();
+        let ring_frames = ring / frame_bytes;
+        if ring_frames == 0 { return; }
+        let start = ((self.mix_pos_q32 >> 32) % ring_frames as u64) as usize * frame_bytes;
+        // A few milliseconds ahead plus one maximum mixer quantum. Copy only
+        // the DMA window the consumer is approaching, not a whole 128 KiB ring
+        // on every kernel tick. Start-playback captures the initial full ring.
+        let count = ((self.core.rate() as usize / 250 + 128) * frame_bytes).min(ring);
+        let first = count.min(ring - start);
+        machine.copy_from(self.dma_base as usize + start, &mut self.dma_image[start..start + first]);
+        if first < count { machine.copy_from(self.dma_base as usize, &mut self.dma_image[..count - first]); }
+    }
+
+    pub(super) fn mix_resident(
+        &mut self, rate: u32, block: &mut [(i32, i32)], physical_sb: bool,
+        mut copy: Option<DmaCopy<'_>>,
+    ) {
         let step_q32 = ((u64::from(self.core.rate().max(1))) << 32)
             / u64::from(rate.max(1));
         let start_q32 = self.mix_pos_q32;
         let step = sound::sb::Step::Mix {
             rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
         };
-        // Only the passive card runs on the worker; DMA copies still use the
-        // current guest address space on the BSP.
-        let core = &mut self.core;
-        let request = unsafe { crate::kernel::media::audio(|| {
-            match core.advance(step, None).dma {
-                Some(sound::dma::Request::Read { offset, bytes, wrap_bytes }) => Some((offset, bytes, wrap_bytes)),
-                _ => None,
-            }
-        }) };
+        let request = match self.core.advance(step, None).dma {
+            Some(sound::dma::Request::Read { offset, bytes, wrap_bytes }) => Some((offset, bytes, wrap_bytes)),
+            _ => None,
+        };
         if let Some((offset, bytes, wrap_bytes)) = request {
             let Some(scratch) = self.dsp_scratch.get_mut(..bytes) else {
-                debug_assert!(false, "SB DMA request exceeds fixed mixer block");
-                let core = &mut self.core;
-                unsafe { crate::kernel::media::audio(|| {
-                    core.advance(sound::sb::Step::Mix {
-                        rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
-                    }, Some(sound::dma::Completion::Read { bytes: &[], terminal_count: false }));
-                }); }
+                self.core.advance(sound::sb::Step::Mix {
+                    rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
+                }, Some(sound::dma::Completion::Read { bytes: &[], terminal_count: false }));
                 return;
             };
             let ring = wrap_bytes.expect("SB source is cyclic");
@@ -686,15 +709,16 @@ impl EmulatedSb {
             while copied < bytes {
                 let pos = (offset + copied) % ring;
                 let run = (bytes - copied).min(ring - pos);
-                machine.copy_from(self.dma_base as usize + pos, &mut scratch[copied..copied + run]);
+                if let Some(copy) = copy.as_mut() {
+                    copy(self.dma_base as usize + pos, &mut scratch[copied..copied + run]);
+                } else {
+                    scratch[copied..copied + run].copy_from_slice(&self.dma_image[pos..pos + run]);
+                }
                 copied += run;
             }
-            let core = &mut self.core;
-            unsafe { crate::kernel::media::audio(|| {
-                core.advance(sound::sb::Step::Mix {
-                    rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
-                }, Some(sound::dma::Completion::Read { bytes: scratch, terminal_count: false }));
-            }); }
+            self.core.advance(sound::sb::Step::Mix {
+                rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
+            }, Some(sound::dma::Completion::Read { bytes: scratch, terminal_count: false }));
         }
         if self.core.playing() {
             self.mix_pos_q32 = self.mix_pos_q32
@@ -706,11 +730,16 @@ impl EmulatedSb {
     /// the CPU-clocked producer and put its interrupt line up when it asks.
     pub fn dsp_clock_tick<A: crate::Arch>(
         &mut self,
-        machine: &mut A,
+        _machine: &mut A,
         now_ns: u64,
         vpic: &mut super::vpic::VirtualPic,
         irq: u8,
     ) {
+        self.clock_tick(now_ns, vpic, irq);
+    }
+
+    pub(super) fn clock_tick(&mut self, now_ns: u64,
+        vpic: &mut super::vpic::VirtualPic, irq: u8) {
         let produced = self.mix_pos_q32 >> 32;
         if self.probe_steps == 0
             && self.core.advance(sound::sb::Step::Clock { now: now_ns, produced }, None).irq
@@ -719,15 +748,14 @@ impl EmulatedSb {
             vpic.raise(irq);
         }
         // Re-anchor the count-read estimator on the reconciled cursor and
-        // measure the frames-per-TSC slope from this pump interval. A cursor
+        // measure the frames-per-nanosecond slope from this pump interval. A cursor
         // behind the previous anchor is a session restart — drop the
         // monotonicity floor with it (the slope survives: the machine's
         // clock ratio didn't change with the transfer).
         let frames = self.core.cursor_frames();
-        let tsc = machine.rdtsc();
         if self.core.playing() {
             let df = frames.wrapping_sub(self.est_frames);
-            let dt = tsc.wrapping_sub(self.est_tsc);
+            let dt = now_ns.wrapping_sub(self.est_ns);
             // Sane interval only: forward, sub-second-ish, cursor moved.
             if (1..1 << 40).contains(&dt) && (1..1 << 20).contains(&df) {
                 let slope = (((df as u128) << 32) / dt as u128) as u64;
@@ -742,16 +770,16 @@ impl EmulatedSb {
             self.est_served = 0;
         }
         self.est_frames = frames;
-        self.est_tsc = tsc;
+        self.est_ns = now_ns;
         self.est_cap = produced.min(self.core.next_irq_frames()).max(frames);
     }
 
     /// The estimated play cursor for a count/address read *between* pumps:
-    /// the last reconciled position plus TSC-elapsed × measured slope,
+    /// the last reconciled position plus elapsed nanoseconds × measured slope,
     /// capped and monotonic (see the `est_*` field docs). With no slope
     /// measured yet this degrades to the pump-quantized cursor.
     fn dma_pos_estimate<A: crate::Arch>(&mut self, machine: &mut A) -> u64 {
-        let dt = machine.rdtsc().wrapping_sub(self.est_tsc);
+        let dt = machine.now().wrapping_sub(self.est_ns);
         let adv = if dt < 1 << 40 {
             ((dt as u128 * self.est_slope as u128) >> 32) as u64
         } else {

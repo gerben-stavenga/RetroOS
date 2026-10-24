@@ -104,7 +104,9 @@ struct WriteCombine {
 }
 
 pub struct VVoodoo {
-    render: crate::kernel::media::Graphics<Render>,
+    output: alloc::sync::Arc<VoodooOutput>,
+    work: crate::kernel::media::Graphics<alloc::sync::Arc<VoodooOutput>>,
+    allocated: bool,
     cfg: Config,
     wc: WriteCombine,
     /// Linear base DPMI handed the guest for the BAR, once it has asked.
@@ -132,20 +134,81 @@ impl Render {
     }
 }
 
+
+#[derive(Clone, Copy)]
+enum Command { Write(u32, u32, u32), Init(u32) }
+
+/// The renderer owns the card and its buffers; guest writes enter an ordered
+/// command ring without joining the preceding triangle.
+pub(crate) struct VoodooOutput {
+    render: crate::kernel::media::Shared<Render>,
+    commands: crate::kernel::media::Commands<Command, 256>,
+    active: core::sync::atomic::AtomicBool,
+    width: core::sync::atomic::AtomicU32,
+    height: core::sync::atomic::AtomicU32,
+    ready: core::sync::atomic::AtomicBool,
+}
+use core::sync::atomic::Ordering;
+impl VoodooOutput {
+    fn publish(&self, render: &Render) {
+        let (w, h) = render.card.dimensions();
+        self.width.store(w, Ordering::Release);
+        self.height.store(h, Ordering::Release);
+        self.active.store(render.card.output_on, Ordering::Release);
+        self.ready.store(render.swapped, Ordering::Release);
+    }
+    fn drain(&self, render: &mut Render) {
+        // Bound each batch so a producer cannot starve timed scanout.
+        for _ in 0..256 {
+            let Some(command) = (unsafe { self.commands.pop() }) else { break };
+            match command {
+                Command::Write(off, data, mask) => { render.command = (off, data, mask); render.execute(); }
+                Command::Init(value) => render.card.set_init_enable(value),
+            }
+            crate::kernel::media::checkpoint();
+        }
+        self.publish(render);
+    }
+    fn run(output: &mut alloc::sync::Arc<Self>) {
+        if let Some(mut render) = output.render.try_lock() { output.drain(&mut render); }
+    }
+    pub(crate) fn dimensions(&self) -> (usize, usize) {
+        (self.width.load(Ordering::Acquire) as usize, self.height.load(Ordering::Acquire) as usize)
+    }
+    /// Media core only: consume commands and clock/display the front buffer.
+    pub(crate) fn scanout(&self, out: &mut [u8], width: usize, height: usize,
+        pitch: usize, dac: &voodoo::Dac) -> bool {
+        let Some(mut render) = self.render.try_lock() else { return false };
+        self.drain(&mut render);
+        let events = render.card.vblank();
+        render.swapped |= events.swap;
+        self.publish(&render);
+        if render.card.dimensions() != (width as u32, height as u32) { return false; }
+        render.card.render(&render.fb, dac, out, pitch);
+        render.swapped = false;
+        self.publish(&render);
+        true
+    }
+}
+
 impl VVoodoo {
     pub fn new() -> Self {
         let mut card = Box::<Voodoo>::new_uninit();
         Voodoo::init(&mut card, Kind::Voodoo1, FB_BYTES, TEX_BYTES);
         let mut card = unsafe { card.assume_init() };
         card.set_checkpoint(crate::kernel::media::checkpoint);
-        Self {
-            render: crate::kernel::media::Graphics::new(Render {
-                card,
-                fb: Vec::new(),
-                tex: Vec::new(),
-                command: (0, 0, 0),
-                swapped: false,
+        let output = alloc::sync::Arc::new(VoodooOutput {
+            render: crate::kernel::media::Shared::new(Render {
+                card, fb: Vec::new(), tex: Vec::new(), command: (0, 0, 0), swapped: false,
             }),
+            commands: crate::kernel::media::Commands::new(),
+            active: core::sync::atomic::AtomicBool::new(false),
+            width: core::sync::atomic::AtomicU32::new(0),
+            height: core::sync::atomic::AtomicU32::new(0),
+            ready: core::sync::atomic::AtomicBool::new(false),
+        });
+        Self {
+            work: crate::kernel::media::Graphics::new(output.clone()), output, allocated: false,
             cfg: Config {
                 command: 0,
                 bar0: BAR_PHYS,
@@ -160,16 +223,42 @@ impl VVoodoo {
     /// True once the guest has mapped the aperture, i.e. a Glide program is
     /// driving the card and its output should own the display.
     pub fn active(&self) -> bool {
-        self.linear_base.is_some() && self.render.get().card.output_on
+        self.linear_base.is_some() && self.output.active.load(Ordering::Acquire)
     }
 
     fn ensure_memory(&mut self) {
-        let render = self.render.get_mut();
-        if render.fb.is_empty() {
+        if !self.allocated {
+            let mut render = self.output.render.lock();
             render.fb.resize(FB_BYTES, 0);
             render.tex.resize(TEX_BYTES, 0);
+            self.allocated = true;
         }
-        self.frame_ready |= core::mem::take(&mut render.swapped);
+        self.frame_ready |= self.output.ready.load(Ordering::Acquire);
+    }
+    fn kick(&mut self) {
+        if !self.work.is_busy() && self.output.commands.pending() {
+            unsafe { self.work.start(VoodooOutput::run); }
+        }
+    }
+    fn submit(&mut self, command: Command) {
+        while !unsafe { self.output.commands.push(command) } {
+            self.kick();
+            core::hint::spin_loop();
+        }
+        self.kick();
+    }
+    fn fence(&mut self) {
+        loop {
+            self.kick();
+            self.work.wait();
+            if !self.output.commands.pending() { break; }
+        }
+    }
+    pub fn service_commands(&mut self) { self.kick(); }
+    pub(crate) fn output(&mut self) -> alloc::sync::Arc<VoodooOutput> {
+        self.flush();
+        self.kick();
+        self.output.clone()
     }
 
     pub fn config_read(&self, off: u8) -> u32 {
@@ -179,7 +268,7 @@ impl VVoodoo {
     pub fn config_write(&mut self, off: u8, val: u32) {
         self.cfg.write(off, val);
         if off & 0xFC == 0x40 {
-            self.render.get_mut().card.set_init_enable(val);
+            self.submit(Command::Init(val));
         }
     }
 
@@ -222,41 +311,35 @@ impl VVoodoo {
         let off = self.wc.dword_off;
         self.wc = WriteCombine::default();
 
-        let render = self.render.get_mut();
-        render.command = (off, data, mask);
-        if render.card.renders(off) {
-            // No allocation or guest-memory access in the passive rasterizer.
-            unsafe {
-                self.render.start(Render::execute);
-            }
-        } else {
-            render.execute();
-            self.frame_ready |= core::mem::take(&mut render.swapped);
-        }
+        self.submit(Command::Write(off, data, mask));
     }
 
     pub fn read8(&mut self, off: u32) -> u8 {
         self.ensure_memory();
         self.flush();
-        let render = self.render.get();
+        self.fence();
+        let render = self.output.render.lock();
         let dword = render.card.read(&render.fb, off & !3, Beam::default());
         (dword >> ((off & 3) * 8)) as u8
     }
 
     /// The host reports a vertical retrace; a deferred swap may complete on it.
     pub fn vblank(&mut self) -> Events {
-        let render = self.render.get_mut();
+        self.fence();
+        let mut render = self.output.render.lock();
         self.frame_ready |= core::mem::take(&mut render.swapped);
         let events = render.card.vblank();
         if events.swap {
             self.frame_ready = true;
         }
+        self.output.publish(&render);
         events
     }
 
     /// Visible resolution the guest programmed.
     pub fn dimensions(&self) -> (u32, u32) {
-        self.render.get().card.dimensions()
+        let (w, h) = self.output.dimensions();
+        (w as u32, h as u32)
     }
 
     /// Clock the visible buffer out into `out`, in whatever encoding `dac`
@@ -264,28 +347,35 @@ impl VVoodoo {
     pub fn scanout(&mut self, out: &mut [u8], pitch: usize, dac: &voodoo::Dac) {
         self.ensure_memory();
         self.flush();
-        let render = self.render.get();
+        self.fence();
+        let render = self.output.render.lock();
         unsafe {
             crate::kernel::media::graphics(|| render.card.render(&render.fb, dac, out, pitch));
         }
-        self.render.get_mut().swapped = false;
+        drop(render);
+        self.output.render.lock().swapped = false;
+        self.output.ready.store(false, Ordering::Release);
         self.frame_ready = false;
     }
 
     pub fn scanout_raw(&mut self, out: &mut [u8], pitch: usize, dac: &voodoo::Dac) {
         self.ensure_memory();
         self.flush();
-        let render = self.render.get();
+        self.fence();
+        let render = self.output.render.lock();
         unsafe {
             crate::kernel::media::graphics(|| render.card.render_raw(&render.fb, dac, out, pitch));
         }
-        self.render.get_mut().swapped = false;
+        drop(render);
+        self.output.render.lock().swapped = false;
+        self.output.ready.store(false, Ordering::Release);
         self.frame_ready = false;
     }
 
     pub fn vbe_ramp(&mut self, out: &mut [u8; 256 * 4]) -> u64 {
         self.flush();
-        self.render.get().card.vbe_ramp(out)
+        self.fence();
+        self.output.render.lock().card.vbe_ramp(out)
     }
 
     /// Which region an aperture offset addresses, for logging and for the
@@ -293,6 +383,10 @@ impl VVoodoo {
     pub fn is_register(&self, off: u32) -> bool {
         matches!(region(off), Region::Register)
     }
+}
+
+impl Drop for VVoodoo {
+    fn drop(&mut self) { self.flush(); self.fence(); }
 }
 
 impl Default for VVoodoo {
@@ -310,21 +404,16 @@ mod tests {
         let mut board = VVoodoo::new();
         let _ = board.config_read(0);
         board.flush();
-        assert!(board.render.get_mut().fb.is_empty() && board.render.get_mut().tex.is_empty());
+        { let render = board.output.render.lock(); assert!(render.fb.is_empty() && render.tex.is_empty()); }
         let _ = board.read8(0);
-        assert_eq!(board.render.get_mut().fb.len(), FB_BYTES);
-        assert_eq!(board.render.get_mut().tex.len(), TEX_BYTES);
-        assert!(
-            board
-                .render
-                .get()
-                .fb
-                .iter()
-                .chain(board.render.get().tex.iter())
-                .all(|&b| b == 0)
-        );
-        board.render.get_mut().fb[0] = 0x5a;
+        assert_eq!(board.output.render.lock().fb.len(), FB_BYTES);
+        assert_eq!(board.output.render.lock().tex.len(), TEX_BYTES);
+        {
+            let render = board.output.render.lock();
+            assert!(render.fb.iter().chain(render.tex.iter()).all(|&b| b == 0));
+        }
+        board.output.render.lock().fb[0] = 0x5a;
         let _ = board.read8(0);
-        assert_eq!(board.render.get_mut().fb[0], 0x5a);
+        assert_eq!(board.output.render.lock().fb[0], 0x5a);
     }
 }

@@ -153,6 +153,8 @@ def main():
                     call('screendump', filename=str(work / (name + '-osd.ppm')))
                     key('esc')
                     check(name, expected)
+                if options.cpus > 1:
+                    assert 'core 1: Video service: rendering at 70 Hz' in log.read_text(errors='replace')
                 call('quit')
         finally:
             if process.poll() is None:
