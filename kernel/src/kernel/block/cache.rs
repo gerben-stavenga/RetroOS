@@ -5,7 +5,7 @@
 //! composed once above those devices, so filesystem adapters contain no cache
 //! policy and writes remain coherent at the block boundary.
 
-use super::{Disk, FlushError, Volume};
+use super::{Disk, FlushError, ReadKind, Volume};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use core::cell::{Cell, RefCell};
@@ -44,9 +44,19 @@ struct Page {
     used: u64,
 }
 
+/// Kernel-owned policy, independent of filesystem implementations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CachePolicy {
+    /// Read-through caching for standalone block consumers without VFS.
+    All,
+    /// File contents belong to the VFS cache; retain only metadata here.
+    MetadataOnly,
+}
+
 /// A 2 MiB LRU, write-through-invalidated cache over one disk.
 pub struct CachedDisk {
     inner: &'static dyn Disk,
+    policy: CachePolicy,
     pages: RefCell<BTreeMap<u64, Page>>,
     clock: Cell<u64>,
 }
@@ -58,6 +68,10 @@ struct VolumeDisk {
 impl Disk for VolumeDisk {
     fn read(&self, lba: u64, buffer: &mut [u8]) -> u32 {
         self.volume.read(lba, buffer)
+    }
+
+    fn read_with_kind(&self, lba: u64, buffer: &mut [u8], kind: ReadKind) -> u32 {
+        self.volume.read_with_kind(lba, buffer, kind)
     }
 
     fn write(&self, lba: u64, buffer: &[u8]) -> u32 {
@@ -87,14 +101,19 @@ pub fn volume(volume: Volume) -> Volume {
 
 impl CachedDisk {
     pub fn wrap(inner: &'static dyn Disk) -> Self {
+        Self::with_policy(inner, CachePolicy::MetadataOnly)
+    }
+
+    pub fn with_policy(inner: &'static dyn Disk, policy: CachePolicy) -> Self {
         Self {
             inner,
+            policy,
             pages: RefCell::new(BTreeMap::new()),
             clock: Cell::new(0),
         }
     }
 
-    fn load_page(&self, page: u64) -> bool {
+    fn load_page(&self, page: u64, kind: ReadKind) -> bool {
         let now = self.clock.get().wrapping_add(1);
         self.clock.set(now);
         let mut pages = self.pages.borrow_mut();
@@ -118,7 +137,7 @@ impl CachedDisk {
             return false;
         }
         let mut data = alloc::vec![0u8; PAGE_SIZE].into_boxed_slice();
-        if self.inner.read(page.saturating_mul(PAGE_SECTORS), &mut data[..available])
+        if self.inner.read_with_kind(page.saturating_mul(PAGE_SECTORS), &mut data[..available], kind)
             as usize
             != available.div_ceil(512)
         {
@@ -156,6 +175,10 @@ impl CachedDisk {
 
 impl Disk for CachedDisk {
     fn read(&self, lba: u64, buffer: &mut [u8]) -> u32 {
+        self.read_with_kind(lba, buffer, ReadKind::Metadata)
+    }
+
+    fn read_with_kind(&self, lba: u64, buffer: &mut [u8], kind: ReadKind) -> u32 {
         let start = lba.saturating_mul(512);
         let valid = self
             .inner
@@ -164,11 +187,18 @@ impl Disk for CachedDisk {
             .saturating_sub(start)
             .min(buffer.len() as u64) as usize;
         buffer[valid..].fill(0);
+        if valid == 0 {
+            return 0;
+        }
+        if self.policy == CachePolicy::MetadataOnly && kind == ReadKind::FileData {
+            self.invalidate(lba, valid);
+            return self.inner.read_with_kind(lba, &mut buffer[..valid], kind);
+        }
         let mut position = start;
         let mut copied = 0;
         while copied < valid {
             let page = position / PAGE_SIZE as u64;
-            if !self.load_page(page) {
+            if !self.load_page(page, kind) {
                 return copied.div_ceil(512) as u32;
             }
             let within = (position % PAGE_SIZE as u64) as usize;
@@ -245,6 +275,35 @@ mod tests {
 
         fn sectors(&self) -> u64 { self.bytes.borrow().len().div_ceil(512) as u64 }
         fn name(&self) -> &str { "cache-test" }
+    }
+
+    #[test]
+    fn metadata_only_policy_bypasses_data_and_keeps_partition_bounds() {
+        use super::{CachePolicy, ReadKind, Volume, VolumeDisk};
+        let inner = Box::leak(Box::new(MemoryDisk {
+            bytes: RefCell::new(vec![0x5a; 4 * PAGE_SIZE]),
+            reads: Cell::new(0),
+            flushes: Cell::new(0),
+        }));
+        let bounded = Box::leak(Box::new(VolumeDisk {
+            volume: Volume::new(inner, 8, 8),
+        }));
+        let cache = CachedDisk::with_policy(bounded, CachePolicy::MetadataOnly);
+        let mut output = [0; 1024];
+        assert_eq!(cache.read(0, &mut output), 2);
+        assert_eq!(cache.read(0, &mut output), 2);
+        assert_eq!(inner.reads.get(), 1);
+        assert_eq!(cache.read_with_kind(0, &mut output, ReadKind::FileData), 2);
+        assert!(cache.pages.borrow().is_empty());
+        assert_eq!(cache.read_with_kind(0, &mut output, ReadKind::FileData), 2);
+        assert_eq!(inner.reads.get(), 3);
+        assert_eq!(cache.read_with_kind(7, &mut output, ReadKind::FileData), 1);
+        assert_eq!(output[..512], [0x5a; 512]);
+        assert_eq!(output[512..], [0; 512]);
+        assert_eq!(cache.read(0, &mut output), 2);
+        assert_eq!(cache.write(0, &[0xaa; 512]), 1);
+        assert_eq!(cache.read(0, &mut output), 2);
+        assert_eq!(output[..512], [0xaa; 512]);
     }
 
     #[test]

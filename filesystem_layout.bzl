@@ -73,10 +73,7 @@ DATA_FILES = {
     "//test/dos/hello_com:hello_com":     "TESTS/HELLO.COM",
     "//test/dos/wr_com:wr_com":           "TESTS/WR.COM",
 
-    "//test/dos/hostfs_commands:hostfs_commands_com": "TESTS/HFSOPS.COM",
 
-    "//test/dos/hostfs_lifecycle:hostfs_probe_com": "TESTS/HFS_PROBE.COM",
-    "//test/dos/hostfs_lifecycle:hostfs_recover_com": "TESTS/HFSRECV.COM",
     "//test/dos/gfx_com:gfx_com":         "TESTS/GFX.COM",
     "//test/dos/svgaprobe:svgaprobe_com": "TESTS/SVGAPROBE.COM",
     "//test/dos/lfnprobe:lfnprobe_com": "TESTS/LFNPROBE.COM",

@@ -3,13 +3,11 @@
 //! The kernel drives hardware through `arch::inb/inw/outb`; on the interpreter
 //! those land here. Devices implement the [`PortIo`] trait and are `register`ed
 //! for an inclusive port range, so the hosted `main` composes the platform by
-//! hooking ports — a disk image on the ATA ports, a host directory on COM1, the
+//! hooking ports — a disk image on the ATA ports, the
 //! debug console on 0xE9. Ports with no registered device read the ISA "no
 //! device" value 0xFF and drop writes.
 
-use crate::hostfs::HostFs;
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -276,70 +274,6 @@ pub fn attach_boot_disk(path: &str) -> std::io::Result<()> {
     let file = File::open(path)?;
     register(0x170, 0x177, Box::new(SecondaryAta(Ata::new(file))));
     Ok(())
-}
-
-// ── COM1 16550 UART → native host filesystem ────────────────────────────────
-
-const COM1: u16 = 0x3F8;
-
-struct Uart {
-    fs: HostFs,
-    tx: Vec<u8>,
-    rx: VecDeque<u8>,
-    scratch: u8,
-    dlab: bool,
-}
-
-impl Uart {
-    fn new(fs: HostFs) -> Uart {
-        Uart { fs, tx: Vec::new(), rx: VecDeque::new(), scratch: 0, dlab: false }
-    }
-
-    fn read_reg(&mut self, off: u16) -> u8 {
-        match off {
-            0 => self.rx.pop_front().unwrap_or(0),                 // RBR (data)
-            5 => 0x60 | if self.rx.is_empty() { 0 } else { 0x01 }, // LSR: THRE+TEMT (+DR)
-            6 => 0x30,                                             // MSR: CTS+DSR (peer present)
-            7 => self.scratch,                                     // scratch (presence probe)
-            _ => 0,
-        }
-    }
-
-    fn write_reg(&mut self, off: u16, val: u8) {
-        match off {
-            0 if !self.dlab => {
-                // The client sends a whole command, then reads the reply, so the
-                // command's last byte completes it here and the reply is queued
-                // synchronously — no blocking, no external process.
-                self.tx.push(val);
-                let Uart { fs, tx, rx, .. } = self;
-                while let Some((consumed, reply)) = fs.try_command(tx) {
-                    tx.drain(..consumed);
-                    rx.extend(reply);
-                    if tx.is_empty() {
-                        break;
-                    }
-                }
-            }
-            3 => self.dlab = val & 0x80 != 0, // LCR (DLAB)
-            7 => self.scratch = val,
-            _ => {} // IER / FCR / MCR / divisor latches: accept & ignore
-        }
-    }
-}
-
-impl PortIo for Uart {
-    fn read(&mut self, port: u16, _width: u8) -> u32 {
-        self.read_reg(port - COM1) as u32
-    }
-    fn write(&mut self, port: u16, _width: u8, val: u32) {
-        self.write_reg(port - COM1, val as u8);
-    }
-}
-
-/// Hook a host directory onto COM1 as the kernel's `/host` filesystem.
-pub fn attach_hostfs(dir: &str) {
-    register(COM1, COM1 + 7, Box::new(Uart::new(HostFs::new(dir))));
 }
 
 // ── QEMU fw_cfg (headless program selection) ────────────────────────────────

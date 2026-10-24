@@ -290,6 +290,15 @@ impl FloppySlot {
 }
 
 impl Filesystem for FloppySlot {
+    fn content_version(&self, handle: u64) -> Result<Option<crate::kernel::vfs::ContentVersion>, i32> {
+        let state = self.state.lock();
+        let (generation, _) = split_handle(handle);
+        if generation != state.generation || state.media.is_none() { return Err(-5); }
+        Ok(Some(crate::kernel::vfs::ContentVersion {
+            revision: [generation as u64, 0, 0], size: None,
+        }))
+    }
+
     fn dos_attributes(&self, path: &[u8]) -> Option<u8> { self.with_media(None, |fs| fs.dos_attributes(path)) }
     fn mtime(&self, path: &[u8]) -> Option<u32> { self.with_media(None, |fs| fs.mtime(path)) }
     fn set_mtime(&self, path: &[u8], mtime: u32) -> bool { self.with_media(false, |fs| fs.set_mtime(path, mtime)) }

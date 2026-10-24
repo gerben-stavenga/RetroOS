@@ -1,6 +1,6 @@
 //! Kernel diagnostic control protocol on a dedicated serial port.
 //!
-//! COM1 may carry arbitrary log text (or HostFS), so control traffic gets its
+//! COM1 may carry arbitrary log text, so control traffic gets its
 //! own UART. The host sends one ASCII command per line and receives exactly
 //! one JSON reply per line. No keyboard or OSD navigation is involved.
 

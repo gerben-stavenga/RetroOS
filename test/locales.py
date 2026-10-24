@@ -60,10 +60,7 @@ def main():
                 ("/OS2.EXE", "LOCALE OS2 PASS"), (f"/probe.elf {lang}", "LINUX RUNTIME PASS"),
             ]:
                 try:
-                    result = subprocess.run([
-                    str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--host", directory,
-                    "--c-root", "/", "--cwd", "/", "--cmd", command,
-                    ], cwd=ROOT, capture_output=True, text=True, timeout=30)
+                    result = subprocess.run(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', directory, '--', str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--c-root", "/", "--cwd", "/", "--cmd", command], cwd=ROOT, capture_output=True, text=True, timeout=30)
                 except subprocess.TimeoutExpired as error:
                     raise SystemExit((error.stdout or b"").decode(errors="replace") + (error.stderr or b"").decode(errors="replace") + f"\n{command} timed out")
                 output = result.stdout + result.stderr

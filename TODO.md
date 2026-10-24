@@ -19,9 +19,6 @@ in Git history.
 - [ ] **Reduce DOS dispatch.** Split the large port-dispatch matches and the
   monolithic `kernel/src/kernel/dos/dos.rs` INT 21 implementation into
   cohesive devices/services.
-- [ ] **Make the hostfs probe truthful.** `hostfs::init` currently treats the
-  presence of a COM1 UART as proof that the host protocol is available; add a
-  protocol handshake and timeout.
 - [ ] **Exercise modern UEFI boot on real hardware.** Validate the existing
   GRUB path, GOP, and storage on the target laptop; add xHCI keyboard support
   if it has no usable i8042 controller.

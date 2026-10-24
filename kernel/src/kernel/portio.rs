@@ -1,4 +1,4 @@
-//! Injected raw port I/O and deadline clock for kernel-side drivers (ATA, hostfs COM1, CMOS,
+//! Injected raw port I/O and deadline clock for kernel-side drivers (ATA, CMOS,
 //! PCI config) that run DEEP below any `machine: &mut A` parameter — the VFS
 //! read path reaches the disk from call sites that never see the arch handle.
 //!

@@ -27,6 +27,15 @@ impl fmt::Debug for StorageError {
     }
 }
 
+/// Semantic purpose of a read. This is a hint, never a correctness requirement.
+/// Storage providers own caching, memory budgets and eviction; the filesystem
+/// merely identifies regular-file payload versus filesystem metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadKind {
+    Metadata,
+    FileData,
+}
+
 /// Exact, synchronous byte I/O over a disk, partition, or image.
 ///
 /// Implementations must not report success for a short operation. `flush`
@@ -38,6 +47,11 @@ pub trait Storage {
 
     /// Fill `dst` from `offset`, or return an error without claiming success.
     fn read(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), StorageError>;
+
+    /// Read with a semantic hint. Existing storage providers may ignore it.
+    fn read_with_kind(&mut self, offset: u64, dst: &mut [u8], _kind: ReadKind) -> Result<(), StorageError> {
+        self.read(offset, dst)
+    }
 
     /// Write all of `src` at `offset`, or return an error.
     fn write(&mut self, offset: u64, src: &[u8]) -> Result<(), StorageError>;

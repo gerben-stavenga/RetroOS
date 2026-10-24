@@ -67,7 +67,7 @@ launch() {
         esac
     fi
     local directive="$COMMAND" cwd=
-    # Host-directory mounts use SMB over the NIC. COM1 has no HostFS bridge.
+    # Host-directory mounts use SMB over the NIC. COM1 is available for diagnostics.
     args+=(-serial none)
     [ -z "$COMMAND" ] || cwd=$(dirname "${COMMAND%% *}")
     if [ "$FREEDOS" = 0 ]; then

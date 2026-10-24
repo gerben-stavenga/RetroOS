@@ -24,7 +24,11 @@ impl Storage for RecoveredStorage<'_> {
     }
 
     fn read(&mut self, offset: u64, output: &mut [u8]) -> Result<(), StorageError> {
-        self.journal.read_storage(self.base, offset, output)
+        self.read_with_kind(offset, output, crate::ReadKind::Metadata)
+    }
+
+    fn read_with_kind(&mut self, offset: u64, output: &mut [u8], kind: crate::ReadKind) -> Result<(), StorageError> {
+        self.journal.read_storage(self.base, offset, output, kind)
     }
 
     fn write(&mut self, offset: u64, input: &[u8]) -> Result<(), StorageError> {

@@ -60,7 +60,11 @@ impl Storage for BlockOverlay<'_> {
     }
 
     fn read(&mut self, offset: u64, output: &mut [u8]) -> Result<(), StorageError> {
-        self.base.read(offset, output)?;
+        self.read_with_kind(offset, output, crate::ReadKind::Metadata)
+    }
+
+    fn read_with_kind(&mut self, offset: u64, output: &mut [u8], kind: crate::ReadKind) -> Result<(), StorageError> {
+        self.base.read_with_kind(offset, output, kind)?;
         if output.is_empty() {
             return Ok(());
         }

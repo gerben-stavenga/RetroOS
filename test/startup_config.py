@@ -53,8 +53,7 @@ cp850 db 'CP850', 13, 10, '$'
         def boot(label, extra=(), repeated=True):
             log = work / (label + '.log')
             with log.open('wb') as output:
-                proc = subprocess.Popen([str(ROOT / 'bazel-bin/kernel/retroos-host'),
-                                         '--host', str(work), *extra],
+                proc = subprocess.Popen(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', str(work), '--', str(ROOT / 'bazel-bin/kernel/retroos-host'), *extra],
                                         stdin=subprocess.DEVNULL, stdout=output,
                                         stderr=subprocess.STDOUT)
                 try:
@@ -67,7 +66,7 @@ cp850 db 'CP850', 13, 10, '$'
                             break
                         time.sleep(.05)
                     else:
-                        raise AssertionError('boot timed out: ' + label)
+                        raise AssertionError('boot timed out: ' + label + '\n' + log.read_text(errors='replace')[-5000:])
                 finally:
                     if proc.poll() is None:
                         proc.terminate()

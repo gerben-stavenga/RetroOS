@@ -59,8 +59,7 @@ def main():
             }
             for command, marker in markers.items():
                 with (root / "out.log").open("wb") as out, (root / "err.log").open("wb") as err:
-                    process = subprocess.Popen([str(ROOT / "bazel-bin/kernel/retroos-host-kvm"),
-                                                "--host", directory, "--c-root", "/", "--cwd", "/", "--cmd", command],
+                    process = subprocess.Popen(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', directory, '--', str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--c-root", "/", "--cwd", "/", "--cmd", command],
                                                cwd=ROOT, stdin=subprocess.PIPE, stdout=out, stderr=err)
                     def output():
                         return (root / "out.log").read_text(errors="replace") + (root / "err.log").read_text(errors="replace")

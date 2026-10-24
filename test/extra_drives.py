@@ -105,7 +105,7 @@ final:
     jc fail
     cmp dword [cwdbuf],00524944h ; DIR\0 retained while other drives changed
     jne fail
-    mov dl,7 ; H must remain absent with no HostFS
+    mov dl,7 ; H must remain absent without an explicit share mount
     mov ah,0eh
     int 21h
     mov ah,19h

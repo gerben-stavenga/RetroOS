@@ -39,8 +39,8 @@ module_qemu() { module_tools && have qemu-system-i386; }
 module_usb_qemu() { module_qemu && have grub-mkstandalone && have mformat && have mcopy && have mmd && [ -f /usr/lib/grub/x86_64-efi/modinfo.sh ]; }
 python3_test() { have python3; }
 hosted_tsr() { have bazelisk && have python3 && have nasm; }
-qemu_hostfs() { bazel_tool && have qemu-system-i386 && have python3 && have timeout; }
-qemu_hostfs_grub() { qemu_hostfs && have grub-mkrescue && have debugfs && have mkfs.ext4; }
+qemu_boot() { bazel_tool && have qemu-system-i386 && have python3 && have timeout; }
+qemu_boot_grub() { qemu_boot && have grub-mkrescue && have debugfs && have mkfs.ext4; }
 rat_ext4() { kvm && bazel_tool && have qemu-system-x86_64 && have grub-mkrescue && have debugfs && have mkfs.ext4; }
 qemu_serial() { bazel_tool && have qemu-system-i386 && have timeout; }
 qemu_audio() { bazel_tool && have qemu-system-x86_64 && have grub-mkstandalone && have mformat && have mmd && have mcopy && have timeout && have python3 && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/lib/grub/x86_64-efi/modinfo.sh ]; }
@@ -109,7 +109,7 @@ bochs_tools() { bazel_tool && have bochs && have python3 && have mcopy && have m
 grub_fat() { have bazelisk && have qemu-system-i386 && have grub-mkrescue && have xorriso && have gcc && have mkfs.fat && have mmd && have mcopy && have python3; }
 machine_layout() { grub_fat && have qemu-system-x86_64 && have mkfs.ext4 && have e2fsck && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/share/OVMF/OVMF_VARS_4M.fd ]; }
 storage_selection() { machine_layout && have nasm && have sfdisk; }
-isapnp_tools() { qemu_hostfs_grub && have nasm; }
+isapnp_tools() { qemu_boot_grub && have nasm; }
 physical_memory_tools() { have bazelisk && have qemu-system-x86_64 && have nasm && have ld && have mkfs.fat && have mmd && have mcopy && have python3; }
 dn_state() { have bazelisk && have qemu-system-i386 && have mkfs.fat && have mmd && have mcopy && have mtype && have mdir && have python3; }
 ata_lba48_tools() { have bazelisk && have qemu-system-x86_64 && have gcc && have mkfs.fat && have mmd && have mcopy && have mtype && have python3; }
@@ -148,7 +148,7 @@ run() {
     case "$name" in
         physical_memory|xhci_smoke|grub_*|boot_composition|disk_selection|extra_drives|isapnp_smoke|machine_*|dn_state|module_*) group=boot ;;
         os2_*|windows_*|linux_*|rat_commander_*|locales_*|keyboards_*) group=personalities ;;
-        wifi_*|random_interrupts|smb|virtio_net|ata_lba48|shared_disks|hostfs_*|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
+        wifi_*|random_interrupts|smb|virtio_net|ata_lba48|shared_disks|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
     esac
     if [ -n "${RETRO_TEST_GROUP:-}" ] && [ "$RETRO_TEST_GROUP" != "$group" ]; then
         return
@@ -181,7 +181,7 @@ run() {
 
 # --- Rust unit tests: pure host builds, no devices at all (CI-safe) --------
 run unit         -         unit
-run xhci_smoke   qemu_hostfs python3 test/xhci_smoke.py
+run xhci_smoke   qemu_boot python3 test/xhci_smoke.py
 run physical_memory physical_memory_tools python3 test/physical_memory.py
 run grub_fat     grub_fat  python3 test/grub_fat.py
 run boot_composition storage_selection python3 test/boot_composition.py
@@ -226,17 +226,15 @@ run dpmi_rm_exception_kvm kvm env ENGINE=kvm python3 test/dpmi_rm_exception.py
 # --- KVM differential: needs /dev/kvm --------------------------------------
 run hosted_diff  kvm       bash test/hosted_diff.sh
 run unit_kvm     kvm       unit_kvm
-# --- HostFS launcher and protocol tests -------------------------------------
+# --- Storage and launcher tests -------------------------------------
 
+run disk_fixture python3_test python3 test/disk_fixture_test.py
 run shared_disks python3_test python3 test/shared_disks.py
 run ata_lba48 ata_lba48_tools python3 test/ata_lba48_qemu.py
-run hostfs_protocol python3_test python3 test/hostfs_protocol.py
-run hostfs_socket python3_test python3 test/hostfs_socket_reconnect.py
 run audio_pcm_unit python3_test python3 test/audio_steady_unit.py
 
-# --- QEMU HostFS integration (requires QEMU and Python) ---------------------
-run qemu_hostfs_lifecycle_com1 qemu_hostfs bash test/qemu_hostfs_lifecycle.sh com1
-run qemu_root_policy qemu_hostfs_grub bash test/qemu_root_failure.sh
+# --- QEMU boot integration (requires QEMU and Python) ---------------------
+run qemu_root_policy qemu_boot_grub bash test/qemu_root_failure.sh
 run qemu_serial_logging qemu_serial bash test/qemu_serial_logging.sh
 run audio_matrix qemu_audio bash test/audio_matrix.sh
 run virtio_net qemu_audio python3 test/virtio_net.py

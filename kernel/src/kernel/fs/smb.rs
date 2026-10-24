@@ -254,7 +254,33 @@ impl State {
         result.and(close)
     }
 }
+fn content_version(bytes: &[u8]) -> core::result::Result<vfs::ContentVersion, i32> {
+    if bytes.len() < 56 { return Err(-5); }
+    let field = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+    let size = u32::try_from(field(40)).map_err(|_| -27)?;
+    Ok(vfs::ContentVersion { revision: [field(0), field(16), field(24)], size: Some(size) })
+}
+
 impl Filesystem for SmbFs {
+    fn file_identity(&self, id: u64) -> Option<u64> {
+        let mut state = self.0.lock();
+        let file = state.handles.get(&id)?.file;
+        // FileInternalInformation is stable across opens and hard-link names;
+        // the SMB FileId itself identifies an open and cannot key file pages.
+        let bytes = state.client.query_info(file, 6, 8).ok()?;
+        let id = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
+        (id != 0).then_some(id)
+    }
+
+    fn content_version(&self, id: u64) -> core::result::Result<Option<vfs::ContentVersion>, i32> {
+        let mut state = self.0.lock();
+        let file = state.handles.get(&id).ok_or(-9)?.file;
+        // FileNetworkOpenInformation: creation, access, write, change,
+        // allocation size, EOF, attributes. Use full-resolution timestamps.
+        let bytes = state.client.query_info(file, 34, 56).map_err(errno)?;
+        content_version(&bytes).map(Some)
+    }
+
     fn format_name(&self) -> &'static str {
         "smb2"
     }
@@ -735,4 +761,21 @@ pub fn mount_configured() {
 }
 struct SelfMount {
     client: Client<Socket>,
+}
+
+#[cfg(test)]
+mod content_version_tests {
+    #[test]
+    fn network_open_information_uses_full_timestamps_and_eof() {
+        let mut bytes = [0; 56];
+        for (offset, value) in [(0, 9u64), (8, 999), (16, 11), (24, 13), (32, 4096), (40, 17)] {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let version = super::content_version(&bytes).unwrap();
+        assert_eq!(version.revision, [9, 11, 13]);
+        assert_eq!(version.size, Some(17));
+        assert_eq!(super::content_version(&bytes[..48]), Err(-5));
+        bytes[40..48].copy_from_slice(&(u32::MAX as u64 + 1).to_le_bytes());
+        assert_eq!(super::content_version(&bytes), Err(-27));
+    }
 }

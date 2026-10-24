@@ -61,7 +61,7 @@ use crate::kernel::bios_display::{DosVideo, EmulatedVga};
 pub(crate) use dos::dos_to_unix_datetime;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.
-pub use dfs::{c_root, set_c_root, set_hostfs_enabled};
+pub use dfs::{c_root, set_c_root};
 pub(crate) use dfs::{DFS_PATH_MAX, vfs_to_dos, extra_drive_prefix};
 
 /// Look up `KEY` in a DOS environment block (the RETROOS.INI master
@@ -323,7 +323,7 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::addr_of_mut!((*p).search_next).write(0);
             core::ptr::addr_of_mut!((*p).fcb_search_drive).write(0);
             core::ptr::addr_of_mut!((*p).fcb_search_ext).write(false);
-            core::ptr::addr_of_mut!((*p).dfs).write(dfs::DfsState::new_with_hostfs(dfs::hostfs_enabled()));
+            core::ptr::addr_of_mut!((*p).dfs).write(dfs::DfsState::new());
             core::ptr::addr_of_mut!((*p).dos_blocks).write(alloc::vec::Vec::new());
             core::ptr::addr_of_mut!((*p).ldt).write(ldt);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).ldt_alloc), 0, 1);

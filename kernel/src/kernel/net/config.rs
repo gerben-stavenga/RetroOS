@@ -61,6 +61,10 @@ pub fn update(servers: &[Ipv4Address]) {
 }
 
 impl Filesystem for Resolver {
+    fn content_version(&self, _: u64) -> Result<Option<crate::kernel::vfs::ContentVersion>, i32> {
+        Ok(None)
+    }
+
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         path.eq_ignore_ascii_case(b"resolv.conf").then(|| Vnode {
             handle: 1,

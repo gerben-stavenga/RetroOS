@@ -93,6 +93,14 @@ impl fatfs::IoBase for VolumeIo { type Error = (); }
 
 impl fatfs::Read for VolumeIo {
     fn read(&mut self, out: &mut [u8]) -> Result<usize, ()> {
+        self.read_with_kind(out, fatfs::ReadKind::Metadata)
+    }
+
+    fn read_with_kind(&mut self, out: &mut [u8], kind: fatfs::ReadKind) -> Result<usize, ()> {
+        let kind = match kind {
+            fatfs::ReadKind::Metadata => crate::kernel::block::ReadKind::Metadata,
+            fatfs::ReadKind::FileData => crate::kernel::block::ReadKind::FileData,
+        };
         let count = self.len().saturating_sub(self.position).min(out.len() as u64) as usize;
         if count == 0 { return Ok(0); }
         if let Some((off, n)) = self.fat_hit(self.position, count) {
@@ -103,13 +111,13 @@ impl fatfs::Read for VolumeIo {
         let within = (self.position % 512) as usize;
         let n = if within == 0 && count >= 512 {
             let n = count / 512 * 512;
-            if self.volume.read(self.position / 512, &mut out[..n]) as usize != n / 512 {
+            if self.volume.read_with_kind(self.position / 512, &mut out[..n], kind) as usize != n / 512 {
                 return Err(());
             }
             n
         } else {
             let mut sector = [0; 512];
-            if self.volume.read(self.position / 512, &mut sector) != 1 { return Err(()); }
+            if self.volume.read_with_kind(self.position / 512, &mut sector, kind) != 1 { return Err(()); }
             let n = count.min(512 - within);
             out[..n].copy_from_slice(&sector[within..within + n]);
             n
@@ -339,12 +347,17 @@ pub(crate) mod tests {
     }
 
     pub struct MemoryDisk {
+        reads: RefCell<Vec<crate::kernel::block::ReadKind>>,
         data: RefCell<Vec<u8>>,
         writes: Cell<usize>,
         flushes: Cell<usize>,
     }
 
     impl Disk for MemoryDisk {
+        fn read_with_kind(&self, lba: u64, out: &mut [u8], kind: crate::kernel::block::ReadKind) -> u32 {
+            self.reads.borrow_mut().push(kind);
+            self.read(lba, out)
+        }
         fn read(&self, lba: u64, out: &mut [u8]) -> u32 {
             let offset = lba as usize * 512;
             let data = self.data.borrow();
@@ -370,6 +383,7 @@ pub(crate) mod tests {
 
     fn disk(sectors: usize) -> &'static MemoryDisk {
         Box::leak(Box::new(MemoryDisk {
+            reads: RefCell::new(Vec::new()),
             data: RefCell::new(alloc::vec![0; sectors * 512]),
             writes: Cell::new(0), flushes: Cell::new(0),
         }))
@@ -380,6 +394,35 @@ pub(crate) mod tests {
         let volume = Volume::whole(disk);
         fatfs::format_volume(&mut VolumeIo::new(volume, true), fatfs::FormatVolumeOptions::new().fat_type(kind)).unwrap();
         (disk, volume)
+    }
+
+    #[test]
+    fn fat_payload_and_directory_reads_have_distinct_intent() {
+        use crate::kernel::block::ReadKind;
+        for kind in [fatfs::FatType::Fat12, fatfs::FatType::Fat16, fatfs::FatType::Fat32] {
+            let sectors = match kind {
+                fatfs::FatType::Fat12 => 2880,
+                fatfs::FatType::Fat16 => 32768,
+                fatfs::FatType::Fat32 => 131072,
+            };
+            let (disk, volume) = formatted(kind, sectors);
+            let fs = fatfs::FileSystem::new(VolumeIo::new(volume, true), fatfs::FsOptions::new()).unwrap();
+            let root = fs.root_dir();
+            root.create_dir("directory").unwrap();
+            let mut file = root.create_file("payload").unwrap();
+            file.write_all(&[0x5a; 1024]).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            disk.reads.borrow_mut().clear();
+            let mut out = [0; 1024];
+            file.read_exact(&mut out).unwrap();
+            assert_eq!(out, [0x5a; 1024]);
+            assert!(disk.reads.borrow().contains(&ReadKind::FileData));
+            disk.reads.borrow_mut().clear();
+            assert!(root.iter().all(|entry| entry.is_ok()));
+            assert!(root.open_dir("directory").unwrap().iter().all(|entry| entry.is_ok()));
+            assert!(!disk.reads.borrow().is_empty());
+            assert!(disk.reads.borrow().iter().all(|kind| *kind == ReadKind::Metadata));
+        }
     }
 
     #[test]

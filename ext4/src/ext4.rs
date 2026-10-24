@@ -30,6 +30,7 @@ pub const XATTR_MAGIC: u32 = 0xea02_0000;
 const ROOT_INODE: u32 = 2;
 const MODE_TYPE: u16 = 0xf000;
 const MODE_DIRECTORY: u16 = 0x4000;
+const MODE_REGULAR: u16 = 0x8000;
 const MODE_SYMLINK: u16 = 0xa000;
 const EXTENTS: u32 = 0x0008_0000;
 const INDEXED_NODE: u32 = 0x0000_1000;
@@ -2557,10 +2558,15 @@ impl Ext4 {
                         run += next_count;
                         next += next_count as u64;
                     }
-                    read_storage(
+                    read_storage_with_kind(
                         storage,
                         physical_offset,
                         &mut output[written..written + run],
+                        if inode.mode & MODE_TYPE == MODE_REGULAR {
+                            crate::ReadKind::FileData
+                        } else {
+                            crate::ReadKind::Metadata
+                        },
                     )?;
                     position += run as u64;
                     written += run;
@@ -3839,12 +3845,16 @@ fn validate_indexes(indexes: &[ExtentIndex]) -> Result<(), Error> {
 }
 
 fn read_storage(storage: &mut dyn Storage, offset: u64, output: &mut [u8]) -> Result<(), Error> {
+    read_storage_with_kind(storage, offset, output, crate::ReadKind::Metadata)
+}
+
+fn read_storage_with_kind(storage: &mut dyn Storage, offset: u64, output: &mut [u8], kind: crate::ReadKind) -> Result<(), Error> {
     let end = offset
         .checked_add(output.len() as u64)
         .filter(|end| *end <= storage.len())
         .ok_or(Corrupt::ReadPastEnd)?;
     let _ = end;
-    storage.read(offset, output).map_err(Error::Storage)
+    storage.read_with_kind(offset, output, kind).map_err(Error::Storage)
 }
 
 fn read_record<T: Pod + Zeroable>(storage: &mut dyn Storage, offset: u64) -> Result<T, Error> {

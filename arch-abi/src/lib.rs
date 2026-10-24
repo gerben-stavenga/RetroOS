@@ -205,8 +205,6 @@ pub struct BootConfig {
     pub boot_log_only: bool,
     /// Opt-in dISAppointment LPC/ISA bridge setup.
     pub isa_lpc_disappointment: bool,
-    /// Optional HostFS COM port. `None` leaves HostFS disabled.
-    pub hostfs_port: Option<ComPort>,
     /// Optional kernel serial-console port. `None` leaves UART logging disabled.
     pub serial_console_port: Option<ComPort>,
     /// Optional diagnostic-control port (`mcp=` / fw_cfg `opt/mcp`). `None`
@@ -220,7 +218,6 @@ pub struct BootConfig {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SerialOwner {
-    HostFs,
     Log,
     Mcp,
 }
@@ -233,7 +230,6 @@ impl BootConfig {
             c_root: [0; 128], c_root_len: 0, c_root_explicit: false,
             debug_watch: None, is_qemu: false, audio_mixed: false,
             ram_overlay: false, boot_log_only: false, isa_lpc_disappointment: false,
-            hostfs_port: None,
             serial_console_port: None,
             mcp_port: None,
             boot_modules: [None; MAX_BOOT_MODULES],
@@ -246,15 +242,13 @@ impl BootConfig {
         cfg.c_root_len = d.len();
         cfg
     }
-    /// Apply `hostfs=`, `serial=`, and `mcp=` assignments in command line order.
+    /// Apply `serial=` and `mcp=` assignments in command line order.
     /// Each service owns at most one port and each port has at most one owner;
     /// assigning a shared port evicts its previous owner.
     pub fn set_serial_services_from_cmdline(&mut self, s: &[u8]) {
         cmdline::for_each_key_value(s, |key, value| {
             let Some(port) = ComPort::parse_ascii(value) else { return };
-            if cmdline::key_eq(key, b"hostfs") {
-                self.claim_serial_port(SerialOwner::HostFs, port);
-            } else if cmdline::key_eq(key, b"serial") {
+            if cmdline::key_eq(key, b"serial") {
                 self.claim_serial_port(SerialOwner::Log, port);
             } else if cmdline::key_eq(key, b"mcp") {
                 self.claim_serial_port(SerialOwner::Mcp, port);
@@ -279,9 +273,6 @@ impl BootConfig {
     }
 
     fn claim_serial_port(&mut self, owner: SerialOwner, port: ComPort) {
-        if owner != SerialOwner::HostFs && self.hostfs_port == Some(port) {
-            self.hostfs_port = None;
-        }
         if owner != SerialOwner::Log && self.serial_console_port == Some(port) {
             self.serial_console_port = None;
         }
@@ -289,7 +280,6 @@ impl BootConfig {
             self.mcp_port = None;
         }
         match owner {
-            SerialOwner::HostFs => self.hostfs_port = Some(port),
             SerialOwner::Log => self.serial_console_port = Some(port),
             SerialOwner::Mcp => self.mcp_port = Some(port),
         }
@@ -347,27 +337,27 @@ mod boot_config_tests {
     }
 
     #[test]
-    fn hostfs_directives_are_case_insensitive_and_last_valid_wins() {
+    fn mcp_directives_are_case_insensitive_and_last_valid_wins() {
         let mut config = BootConfig::empty();
-        assert_eq!(config.hostfs_port, None);
-        config.set_cmdline(b"TESTS/X.COM;HOSTFS=COM1 hostfs=COM2 hostfs=invalid");
-        assert_eq!(config.hostfs_port, Some(ComPort::Com2));
+        assert_eq!(config.mcp_port, None);
+        config.set_cmdline(b"TESTS/X.COM;MCP=COM1 mcp=COM2 mcp=invalid");
+        assert_eq!(config.mcp_port, Some(ComPort::Com2));
     }
 
     #[test]
     fn program_entries_and_boot_directives_share_one_parser() {
         let mut config = BootConfig::empty();
-        config.set_cmdline(b"hostfs=com1;retroos.mount=/data;TESTS/X.COM arg");
-        assert_eq!(config.hostfs_port, Some(ComPort::Com1));
-        assert_eq!(config.cmdline(), Some(&b"hostfs=com1;retroos.mount=/data;TESTS/X.COM arg"[..]));
+        config.set_cmdline(b"mcp=com1;retroos.mount=/data;TESTS/X.COM arg");
+        assert_eq!(config.mcp_port, Some(ComPort::Com1));
+        assert_eq!(config.cmdline(), Some(&b"mcp=com1;retroos.mount=/data;TESTS/X.COM arg"[..]));
     }
 
     #[test]
-    fn hosted_hostfs_directive_is_preserved_before_program_setup() {
+    fn serial_directive_is_preserved_before_program_setup() {
         let mut config = BootConfig::empty();
-        config.set_serial_services_from_cmdline(b"hostfs=com1");
+        config.set_serial_services_from_cmdline(b"mcp=com1");
         config.set_cmdline(b"TC/TCC.EXE -ms STUB.C");
-        assert_eq!(config.hostfs_port, Some(ComPort::Com1));
+        assert_eq!(config.mcp_port, Some(ComPort::Com1));
     }
 
     #[test]
@@ -379,43 +369,37 @@ mod boot_config_tests {
     }
 
     #[test]
-    fn hostfs_and_serial_ports_are_parsed_independently() {
+    fn mcp_and_serial_ports_are_parsed_independently() {
         let mut config = BootConfig::empty();
-        config.set_cmdline(b"hostfs=com1 serial=com2;TESTS/X.COM");
-        assert_eq!(config.hostfs_port, Some(ComPort::Com1));
+        config.set_cmdline(b"mcp=com1 serial=com2;TESTS/X.COM");
+        assert_eq!(config.mcp_port, Some(ComPort::Com1));
         assert_eq!(config.serial_console_port, Some(ComPort::Com2));
     }
 
     #[test]
     fn last_assignment_owns_a_shared_port() {
         let mut config = BootConfig::empty();
-        config.set_cmdline(b"hostfs=com1 serial=com1");
-        assert_eq!(config.hostfs_port, None);
+        config.set_cmdline(b"mcp=com1 serial=com1");
+        assert_eq!(config.mcp_port, None);
         assert_eq!(config.serial_console_port, Some(ComPort::Com1));
 
-        config.set_cmdline(b"serial=com2 hostfs=com2");
+        config.set_cmdline(b"serial=com2 mcp=com2");
         assert_eq!(config.serial_console_port, None);
-        assert_eq!(config.hostfs_port, Some(ComPort::Com2));
+        assert_eq!(config.mcp_port, Some(ComPort::Com2));
     }
 
     #[test]
-    fn mcp_port_follows_the_same_exclusive_assignment_rule() {
+    fn fw_cfg_mcp_overrides_serial_ownership() {
         let mut config = BootConfig::empty();
         config.set_cmdline(b"serial=com1 mcp=com2;TESTS/X.COM");
         assert_eq!(config.serial_console_port, Some(ComPort::Com1));
         assert_eq!(config.mcp_port, Some(ComPort::Com2));
-        assert_eq!(config.hostfs_port, None);
-
-        config.set_cmdline(b"mcp=com1 hostfs=com1");
-        assert_eq!(config.mcp_port, None);
-        assert_eq!(config.hostfs_port, Some(ComPort::Com1));
-
-        assert!(config.set_mcp_value(b" com2\n"));
-        assert_eq!(config.mcp_port, Some(ComPort::Com2));
-        assert_eq!(config.hostfs_port, Some(ComPort::Com1));
+        assert!(config.set_mcp_value(b" com1\n"));
+        assert_eq!(config.serial_console_port, None);
+        assert_eq!(config.mcp_port, Some(ComPort::Com1));
         assert!(!config.set_mcp_value(b"ttyS1"));
-        assert_eq!(config.mcp_port, Some(ComPort::Com2));
     }
+
 }
 
 /// Parse an `opt/debug-watch` value (`"addr0[,addr1]"`, hex with optional `0x`)

@@ -115,6 +115,15 @@ fn split_handle(handle: u64) -> (u32, u64) {
 }
 
 impl Filesystem for CdSlot {
+    fn content_version(&self, handle: u64) -> Result<Option<crate::kernel::vfs::ContentVersion>, i32> {
+        let state = self.state.lock();
+        let (generation, _) = split_handle(handle);
+        if generation != state.generation || state.media.is_none() { return Err(-5); }
+        Ok(Some(crate::kernel::vfs::ContentVersion {
+            revision: [generation as u64, 0, 0], size: None,
+        }))
+    }
+
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         let state = self.state.lock();
         let mut vnode = state.media.as_ref()?.open(path)?;

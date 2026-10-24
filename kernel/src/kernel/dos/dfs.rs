@@ -5,7 +5,7 @@
 //! DOSBox: the underlying filesystem is Linux-style; DFS walks it
 //! component-by-component to map each DOS component to the real on-disk
 //! case name. Drive `C:` is the default DOS root; `A:`/`B:` map to the
-//! floppy slots and `H:` to the `host/` mount.
+//! floppy slots; additional letters come from configured mounts.
 //!
 //! Letters are valid per DRIVE, not per media (MS-DOS semantics): A: with
 //! no image inserted selects fine and fails at access time, like a real
@@ -24,24 +24,9 @@
 use crate::kernel::vfs;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 #[path = "dfs_lfn.rs"]
 pub mod lfn;
-
-// Startup sets this before DOS personalities are constructed. Each DfsState
-// snapshots it into owned state, so path operations do not consult mutable
-// process-global state after construction.
-static HOSTFS_DRIVE_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Enable or disable the DOS H: drive to match the VFS HostFS mount.
-pub fn set_hostfs_enabled(enabled: bool) {
-    HOSTFS_DRIVE_ENABLED.store(enabled, Ordering::Relaxed);
-}
-
-pub fn hostfs_enabled() -> bool {
-    HOSTFS_DRIVE_ENABLED.load(Ordering::Relaxed)
-}
 
 pub const DFS_PATH_MAX: usize = 128;
 pub const DFS_CWD_MAX: usize = 64;
@@ -360,16 +345,15 @@ pub fn extra_drive_prefix(drive: u8) -> Option<&'static [u8]> {
         letter == drive && vfs::is_mounted(prefix)).map(|&(_, prefix)| prefix)
 }
 
-pub fn drive_available(drive: u8, hostfs: bool) -> bool {
+pub fn drive_available(drive: u8) -> bool {
     match drive.to_ascii_uppercase() {
         b'A'..=b'D' => true,
-        b'H' => extra_drive_prefix(b'H').is_some() || hostfs,
         drive => extra_drive_prefix(drive).is_some(),
     }
 }
 
-pub fn last_drive(hostfs: bool) -> u8 {
-    (b'A'..=b'Z').rev().find(|&drive| drive_available(drive, hostfs)).unwrap_or(b'D') - b'A' + 1
+pub fn last_drive() -> u8 {
+    (b'A'..=b'Z').rev().find(|&drive| drive_available(drive)).unwrap_or(b'D') - b'A' + 1
 }
 
 /// Return the drive and relative path for an additional mounted partition.
@@ -389,17 +373,12 @@ fn extra_vfs_path(path: &[u8]) -> Option<(u8, &[u8])> {
 pub struct DfsState {
     cwd: [Vec<u8>; 12],
     current_drive: u8,
-    hostfs_enabled: bool,
     pub lfn_searches: lfn::Searches,
 }
 
 impl DfsState {
     pub const fn new() -> Self {
-        Self::new_with_hostfs(false)
-    }
-
-    pub const fn new_with_hostfs(hostfs_enabled: bool) -> Self {
-        Self { cwd: [const { Vec::new() }; 12], current_drive: b'C', hostfs_enabled,
+        Self { cwd: [const { Vec::new() }; 12], current_drive: b'C',
             lfn_searches: lfn::Searches::new() }
     }
 
@@ -431,7 +410,7 @@ impl DfsState {
     }
 
     pub(super) fn drive_available(&self, drive: u8) -> bool {
-        drive_available(drive, self.hostfs_enabled)
+        drive_available(drive)
     }
 
     /// Select an available DOS drive, including additional mounted partitions.
@@ -679,7 +658,6 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8])
         b'B' => b"floppyb/",
         b'C' => c_root(),
         b'D' => b"cdrom/",
-        b'H' => extra_drive_prefix(b'H').unwrap_or(b"host/"),
         drive => extra_drive_prefix(drive).ok_or(15)?,
     };
     // c_root carries a trailing slash (for path concat); the component walk
@@ -908,20 +886,8 @@ mod tests {
     }
 
     #[test]
-    fn drive_h_maps_to_hostfs() {
-        let mut dfs = DfsState::new_with_hostfs(true);
-        let mut dos = [0u8; DFS_PATH_MAX];
-        let mut vfs = [0u8; DFS_PATH_MAX];
-        assert!(dfs.select_drive(b'H'));
-        let len = dfs.resolve(b"SOURCE\\MAIN.C", &mut dos).unwrap();
-        let (prefix_len, rest) = strip_drive_prefix(&dos[..len], &mut vfs).unwrap();
-        assert_eq!(&vfs[..prefix_len], b"host");
-        assert_eq!(rest, b"SOURCE\\MAIN.C");
-    }
-
-    #[test]
-    fn disabled_hostfs_hides_h_drive_from_all_path_operations() {
-        let mut dfs = DfsState::new_with_hostfs(false);
+    fn unmounted_h_drive_is_unavailable() {
+        let mut dfs = DfsState::new();
         let mut out = [0u8; DFS_PATH_MAX];
         assert!(!dfs.select_drive(b'H'));
         assert_eq!(dfs.resolve(b"H:\\FILE.TXT", &mut out), Err(15));

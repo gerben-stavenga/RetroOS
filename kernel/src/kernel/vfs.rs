@@ -36,7 +36,7 @@ pub const PATH_KEY_MAX: usize = 1024;
 type LayerVisitor<'a> =
     dyn FnMut(u8, &'static dyn Filesystem, &[u8]) -> bool + 'a;
 
-/// Filesystem trait — implemented by PortableExt4Fs, FatFs, HostFs, etc.
+/// Filesystem trait — implemented by PortableExt4Fs, FatFs, SmbFs, etc.
 /// VFS resolves names by exact bytes regardless of the storage format. The
 /// DOS personality owns case-folding and its short-name namespace (DFS).
 ///
@@ -59,7 +59,28 @@ pub struct Meta {
     pub mode: u32,
 }
 
+/// Backend freshness information, not cache policy. Local files are mutated
+/// through VFS; externally mutable backends report a version and current size.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentVersion {
+    pub revision: [u64; 3],
+    pub size: Option<u32>,
+}
+
+impl ContentVersion {
+    pub const LOCAL: Self = Self { revision: [0; 3], size: None };
+}
+
 pub trait Filesystem {
+    /// None denotes live/generated contents that cannot be retained. Errors
+    /// must prevent serving stale bytes. Called once per VFS read, not per page.
+    fn content_version(&self, _handle: u64) -> Result<Option<ContentVersion>, i32> {
+        Ok(Some(ContentVersion::LOCAL))
+    }
+    /// Stable identity across opens, when the backend has one. Otherwise VFS
+    /// uses the resolved path. This is distinct from a per-open handle.
+    fn file_identity(&self, _handle: u64) -> Option<u64> { None }
+
     /// Filesystem format shown in mount diagnostics and the disk OSD.
     fn format_name(&self) -> &'static str { "unknown" }
 
@@ -208,7 +229,7 @@ pub trait Filesystem {
     /// Release a fid (Tclunk). Called by the VFS when the last reference to an
     /// open file closes (`close_handle`). Default = no-op, for backends whose
     /// handle owns no per-open resource (TarFs's archive offset). Backends that
-    /// allocate per-open server state — an ext inode, hostfs's COM1 /
+    /// allocate per-open server state — an ext inode or an SMB
     /// native fid, a future 9P client — override this to free it.
     fn clunk(&self, _handle: u64) -> i32 { 0 }
 
@@ -291,7 +312,7 @@ pub struct DirEntry {
     pub dos_attributes: Option<u8>,
     /// Last-modified time, seconds since the Unix epoch. `0` = unknown, which
     /// backends without a clock (tarfs entries predating the field, the COM1
-    /// hostfs wire) report; DOS renders that as an empty date rather than as
+    /// remote backend) report; DOS renders that as an empty date rather than as
     /// 1970, which would look like a real timestamp.
     pub mtime: u32,
     /// Opaque identity supplied by the backing filesystem. A zero identity
@@ -320,6 +341,7 @@ pub struct FileEntry {
     /// dynamic linker's (st_dev, st_ino) dedup distinguishes libraries — without
     /// it every file shares ino 0 and ld.so thinks libc == the main binary.
     pub ino: u64,
+    cache_id: u64,
     /// Index into the mount table (which filesystem owns this file)
     pub mount_idx: u8,
     /// Decided once at open/create, when the PATH was still in hand: may
@@ -490,7 +512,8 @@ struct Vfs {
     /// Stable open-file indices. Closed slots are reused and the table grows
     /// with demand; process handle limits belong to each process's fd/JFT.
     file_table: Vec<FileEntry>,
-    mapped_pages: BTreeMap<mapping::Key, mapping::Page>,
+    file_pages: BTreeMap<mapping::Key, mapping::Page>,
+    page_clock: u64,
     dir_cache: Vec<DirCache>,
     /// Changes whenever directory-visible metadata may have changed. DOS's
     /// 8.3 cache keys off this so a file grown after create is not forever
@@ -508,7 +531,8 @@ impl Vfs {
             locks: Vec::new(),
             record_locks: crate::kernel::fs::record_locks::Table::new(),
             file_table: Vec::new(),
-            mapped_pages: BTreeMap::new(),
+            file_pages: BTreeMap::new(),
+            page_clock: 0,
             dir_cache: Vec::new(),
             dir_generation: 0,
         }
@@ -698,6 +722,7 @@ impl Vfs {
     /// same prefix (single-winner); `Union` stacks on top. The whole table is
     /// built at startup before any open, so this never reindexes live handles.
     fn add_binding(&mut self, prefix: &'static [u8], target: BindTarget, mode: MountMode) {
+        self.drop_clean_pages();
         if mode == MountMode::Replace {
             self.mounts.retain(|b| !eq_ignore_case(b.prefix, prefix));
         }
@@ -733,6 +758,16 @@ impl Vfs {
             .unwrap_or(self.file_table.len())
     }
 
+    fn backend_path_id(&self, mount: u8, path: &[u8]) -> u64 {
+        let mut identity = path_ino(path);
+        self.visit_layers(path, ALIAS_DEPTH, &mut |index, _, subpath| {
+            if index != mount { return false; }
+            identity = path_ino(subpath);
+            true
+        });
+        identity
+    }
+
     fn install_handle(
         &mut self,
         path: &[u8],
@@ -747,6 +782,7 @@ impl Vfs {
             offset: 0,
             refcount: 1,
             ino,
+            cache_id: self.mount_fs(mount_idx).file_identity(vnode.handle).unwrap_or_else(|| self.backend_path_id(mount_idx, path)),
             mount_idx,
             writable,
             mtime_dirty: false,
@@ -785,6 +821,7 @@ impl Vfs {
             let handle = self.file_table[i].vnode.handle;
             let midx = self.file_table[i].mount_idx;
             let closed = self.mount_fs(midx).clunk(handle);
+            if flushed < 0 || closed < 0 { self.drop_clean_pages(); }
             return if flushed < 0 { flushed } else { closed };
         }
         0
@@ -1232,6 +1269,16 @@ impl Vfs {
             return -13; // EACCES
         }
         if self.has_mapped_path(path) { return -16; }
+        // A different hard-link name can still identify a mapped inode.
+        if existed && let Some(vnode) = fs.open(subpath) {
+            let identity = fs.file_identity(vnode.handle)
+                .unwrap_or_else(|| self.backend_path_id(midx, path));
+            let mapped = self.file_pages.range((midx, identity, 0)..=(midx, identity, u32::MAX))
+                .any(|(_, page)| page.pinned());
+            fs.clunk(vnode.handle);
+            if mapped { return -16; }
+            self.file_pages.retain(|&(mount, id, _), page| mount != midx || id != identity || page.pinned());
+        }
         if let Some(vnode) = fs.create(subpath) {
             if !existed && !self.claim(midx, subpath) {
                 fs.clunk(vnode.handle);
@@ -1241,6 +1288,13 @@ impl Vfs {
             }
             self.invalidate_dir_cache();
             let handle = self.install_handle(path, original_ino, midx, vnode, true);
+            self.invalidate_file_pages(handle);
+            let id = self.file_table[handle as usize].cache_id;
+            for entry in &mut self.file_table {
+                if entry.refcount != 0 && entry.mount_idx == midx && entry.cache_id == id {
+                    entry.vnode.size = vnode.size;
+                }
+            }
             self.touch_handle(handle);
             return handle;
         }
@@ -1284,6 +1338,7 @@ impl Vfs {
             || !self.may_write_parent(new_idx, new_sub) { return -13; }
         // Mapped files retain their VFS identity until the last unmap.
         if self.has_mapped_path(old) { return -16; }
+        self.drop_clean_pages();
         let rc = old_fs.rename(old_sub, new_sub);
         if rc < 0 { return rc; }
         self.rekey_open_paths(old, new);
@@ -1295,9 +1350,13 @@ impl Vfs {
     }
 
     fn rekey_open_paths(&mut self, old: &[u8], new: &[u8]) {
-        for e in &mut self.file_table {
+        for index in 0..self.file_table.len() {
+            let e = &self.file_table[index];
             if e.refcount != 0 && e.path == old && new.len() <= PATH_KEY_MAX {
-                e.path = new.to_vec();
+                let identity = self.mount_fs(e.mount_idx).file_identity(e.vnode.handle)
+                    .unwrap_or_else(|| self.backend_path_id(e.mount_idx, new));
+                self.file_table[index].cache_id = identity;
+                self.file_table[index].path = new.to_vec();
             }
         }
     }
@@ -1427,6 +1486,7 @@ impl Vfs {
             return -13; // EACCES
         }
         if self.has_mapped_path(path) { return -16; }
+        self.drop_clean_pages();
         let r = fs.remove(subpath);
         if r >= 0 {
             self.modes.remove(path);
@@ -1442,34 +1502,31 @@ impl Vfs {
         let h = handle as usize;
         if self.file_table[h].refcount == 0 { return -9; }
 
-        let (mount_idx, fs_handle, offset, size) = {
-            let e = &self.file_table[h];
-            (e.mount_idx, e.vnode.handle, e.offset, e.vnode.size)
-        };
-        let n = self.mount_fs(mount_idx).read(fs_handle, offset, buf, size);
-        if n > 0 { self.mapped_read(handle, offset, &mut buf[..n as usize]); }
+        let offset = self.file_table[h].offset;
+        let n = self.cached_read(handle, offset, buf);
         if n > 0 && self.file_table[h].vnode.mode & 0o170000 != 0o20000 { self.file_table[h].offset += n as u32; }
         n
     }
 
-    fn read_at_by_handle(&self, handle: i32, offset: u32, buf: &mut [u8]) -> i32 {
-        let Some(entry) = self.file_table.get(handle as usize).filter(|entry| entry.refcount != 0) else { return -9; };
-        let n = self.mount_fs(entry.mount_idx).read(entry.vnode.handle, offset, buf, entry.vnode.size);
-        if n > 0 { self.mapped_read(handle, offset, &mut buf[..n as usize]); }
-        n
+    fn read_at_by_handle(&mut self, handle: i32, offset: u32, buf: &mut [u8]) -> i32 {
+        self.cached_read(handle, offset, buf)
     }
 
     fn write_at_by_handle(&mut self, handle: i32, offset: u32, data: &[u8]) -> i32 {
         let Some(e) = self.file_table.get(handle as usize).filter(|e| e.refcount != 0) else { return -9; };
         if !e.writable { return -30; }
-        let (mount_idx, fs_handle, ino) = (e.mount_idx, e.vnode.handle, e.ino);
+        let (mount_idx, fs_handle, ino, old_size) = (e.mount_idx, e.vnode.handle, e.cache_id, e.vnode.size);
         let n = self.mount_fs(mount_idx).write(fs_handle, offset, data);
         if self.file_table[handle as usize].vnode.mode & 0o170000 == 0o20000 { return n; }
+        // Failed writes may still modify a prefix. Successful writes update
+        // the same pages ordinary reads and guest mappings already use.
+        if n < 0 { self.invalidate_file_pages(handle); }
         if n > 0 {
-            self.mapped_write(handle, offset, &data[..n as usize]);
             let end = offset.saturating_add(n as u32);
+            if end > old_size { self.zero_mapping_growth(handle, old_size, end); }
+            self.mapped_write(handle, offset, &data[..n as usize]);
             for e in &mut self.file_table {
-                if e.refcount != 0 && e.mount_idx == mount_idx && e.ino == ino {
+                if e.refcount != 0 && e.mount_idx == mount_idx && e.cache_id == ino {
                     e.vnode.size = e.vnode.size.max(end);
                 }
             }
@@ -1491,18 +1548,19 @@ impl Vfs {
         let Some(entry) = self.file_table.get(handle as usize) else { return -9; };
         if entry.refcount == 0 { return -9; }
         if !entry.writable { return -30; }
-        let (mount, fid, ino) = (entry.mount_idx, entry.vnode.handle, entry.ino);
+        let (mount, fid, ino) = (entry.mount_idx, entry.vnode.handle, entry.cache_id);
         let old_size = entry.vnode.size;
-        if size < old_size && self.mapped_pages.range((mount, ino, 0)..=(mount, ino, u32::MAX)).next().is_some() {
+        if size < old_size && self.file_is_mapped(handle) {
             return -16; // Mapped shrink needs SIGBUS support; never leave stale aliases.
         }
+        self.invalidate_file_pages(handle);
         let result = self.mount_fs(mount).resize(fid, size);
         if result < 0 { return result; }
         if size > old_size {
             self.zero_mapping_growth(handle, old_size, size);
         }
         for entry in &mut self.file_table {
-            if entry.refcount != 0 && entry.mount_idx == mount && entry.ino == ino {
+            if entry.refcount != 0 && entry.mount_idx == mount && entry.cache_id == ino {
                 entry.vnode.size = size;
             }
         }

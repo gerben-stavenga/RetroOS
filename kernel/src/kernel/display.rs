@@ -788,7 +788,7 @@ impl Display {
 
 
 /// Backend hook: the frame is finished, show it. Installed by the entry crate
-/// like the portio/hostfs/socket hooks.
+/// like the portio/socket hooks.
 static mut PRESENT_HOOK: fn() = || {};
 
 pub fn set_present_hook(f: fn()) {

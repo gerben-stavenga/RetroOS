@@ -111,3 +111,20 @@ next durability step.
 RetroOS uses `Filesystem<VolumeStorage>` for every ext filesystem. Its adapter
 contains only VFS policy and sector-I/O translation; there is no second ext
 implementation or compatibility fallback in the kernel.
+
+### Storage and caching
+
+`Storage::read_with_kind` reports `Metadata` or `FileData` intent. Regular-file
+payload reads use `FileData`; directory blocks, symlinks, extent trees and inode
+records use `Metadata`. Inline data remains part of its metadata block. Journal
+recovery and transaction overlays preserve the hint and still apply pending
+changes. The hint is advisory: existing `Storage` implementations can use the
+default method, which calls `read`.
+
+The embedding application owns cache allocation, eviction and memory budgets.
+The library has no dependency on kernel pages or a specific cache. Transaction
+buffers and journal recovery state are required for correctness and are not
+read caches. RetroOS translates the hint at its volume adapter and selects block
+cache policy in the kernel. The block cache retains metadata; the common VFS
+file-page cache owns file contents for all backends. This interface does not
+implement demand paging.

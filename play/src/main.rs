@@ -18,7 +18,7 @@ use std::io::Write;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: retroos-play (DISK_IMAGE | --host DIR) [--cmd \"PROG ARGS\"] [--cwd DIR] [--wav FILE]"
+        "usage: retroos-play DISK_IMAGE [--cmd \"PROG ARGS\"] [--cwd DIR] [--wav FILE]"
     );
     std::process::exit(2);
 }
@@ -30,7 +30,6 @@ fn log_byte(b: u8) {
 }
 
 fn main() {
-    let mut host_dir: Option<String> = None;
     let mut boot_disk: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
@@ -41,7 +40,6 @@ fn main() {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--boot-disk" => boot_disk = args.next(),
-            "--host" => host_dir = args.next(),
             "--cmd" => cmd = args.next(),
             "--cwd" => cwd = args.next(),
             "--c-root" => c_root = args.next(),
@@ -50,10 +48,7 @@ fn main() {
             _ => usage(),
         }
     }
-    // Either a disk image or a `--host DIR` (the live host filesystem as root)
-    // is required — the same as `retroos-host`. `--host` alone boots on the real
-    // host tree (`Media::HostRoot`); an image boots the ext4 root (`DiskRoot`).
-    if image.is_none() && host_dir.is_none() {
+    if image.is_none() {
         usage();
     }
 
@@ -112,28 +107,7 @@ fn main() {
         // design); install its present sink to park frames in the backend
         // mailbox the window thread blits from.
         kernel::kernel::display::set_host_present_sink(arch::publish_frame);
-        if let Some(dir) = &host_dir {
-            // Native host-fs backend (the hosted "punch-through"): /host is
-            // served by direct std::fs calls, not byte-serial COM1. Install the
-            // std::fs server root on this (CPU) thread and wire its primitive
-            // hooks into the one kernel library — same injection shape as
-            // install_portio above.
-            arch::install_native_hostfs(dir);
-            kernel::install_host_backend(kernel::HostBackendHooks {
-                open: arch::host_open,
-                read: arch::host_read,
-                readdir: arch::host_readdir,
-                dir_exists: arch::host_dir_exists,
-                create: arch::host_create,
-                write: arch::host_write,
-                resize: arch::host_resize,
-                clunk: arch::host_clunk,
-                remove: arch::host_remove,
-                mkdir: arch::host_mkdir,
-                rmdir: arch::host_rmdir,
-                rename: arch::host_rename,
-            });
-        }
+
         if let Some(path) = &wav {
             arch::attach_audio(path); // canonical audio → WAV (offline check)
         }
@@ -152,7 +126,6 @@ fn main() {
         }
         let mut config = kernel::BootConfig::empty();
         config.is_qemu = true; // no real VGA raster: fabricate 0x3DA, like QEMU
-        if host_dir.is_some() { config.set_serial_services_from_cmdline(b"hostfs=com1"); }
         if let Some(c) = &cmd {
             config.set_cmdline(c.as_bytes());
         }

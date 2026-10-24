@@ -1081,3 +1081,48 @@ fn symlink_creation_is_atomic_across_power_loss() {
         assert!(saw_old && saw_new);
     }
 }
+
+#[test]
+fn read_intent_survives_journal_and_transaction_overlays() {
+    use portable_ext4::{BlockOverlay, Filesystem, ReadKind, Storage, StorageError};
+    use portable_ext4::ext4::{AttributeUpdate, Object};
+    struct Recording {
+        inner: ModelStorage,
+        reads: Vec<ReadKind>,
+    }
+    impl Storage for Recording {
+        fn len(&self) -> u64 { self.inner.len() }
+        fn read(&mut self, offset: u64, out: &mut [u8]) -> Result<(), StorageError> {
+            self.read_with_kind(offset, out, ReadKind::Metadata)
+        }
+        fn read_with_kind(&mut self, offset: u64, out: &mut [u8], kind: ReadKind) -> Result<(), StorageError> {
+            self.reads.push(kind);
+            self.inner.read(offset, out)
+        }
+        fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<(), StorageError> {
+            self.inner.write(offset, bytes)
+        }
+        fn flush(&mut self) -> Result<(), StorageError> { self.inner.flush() }
+    }
+    let mut storage = Recording { inner: ModelStorage::new(image()), reads: Vec::new() };
+    let mut fs = Filesystem::mount(&mut storage).unwrap();
+    let root = fs.root(&mut storage).unwrap();
+    let Object::Blob(blob) = fs.create_blob(&mut storage, root, b"read-intent", AttributeUpdate {
+        format: Some(0x8000 | 0o644), ..AttributeUpdate::default()
+    }).unwrap() else { panic!("expected file") };
+    fs.write(&mut storage, blob, 0, &[0x5a; 8192]).unwrap();
+    storage.reads.clear();
+    let mut data = [0; 8192];
+    assert_eq!(fs.read(&mut storage, blob, 0, &mut data).unwrap(), data.len());
+    assert_eq!(data, [0x5a; 8192]);
+    assert!(storage.reads.contains(&ReadKind::Metadata));
+    assert!(storage.reads.contains(&ReadKind::FileData));
+
+    storage.reads.clear();
+    let mut overlay = BlockOverlay::new(&mut storage, 4096);
+    overlay.write(0, &[0xaa; 4096]).unwrap();
+    overlay.read_with_kind(0, &mut data, ReadKind::FileData).unwrap();
+    assert_eq!(data[..4096], [0xaa; 4096]);
+    drop(overlay);
+    assert_eq!(storage.reads, [ReadKind::FileData]);
+}

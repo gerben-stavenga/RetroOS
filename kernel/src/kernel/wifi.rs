@@ -320,6 +320,10 @@ pub fn save_dump<A: crate::Arch>(machine: &mut A, bytes: &[u8]) -> Result<Vec<u8
     result.and(if status < 0 { Err(status) } else { Ok(path) })
 }
 impl Filesystem for Status {
+    fn content_version(&self, _: u64) -> Result<Option<crate::kernel::vfs::ContentVersion>, i32> {
+        Ok(None)
+    }
+
     fn supports_create(&self) -> bool {
         true
     }

@@ -17,7 +17,7 @@ def main():
         # cmp byte [0080h],13; jne fail; cmp byte [0081h],'"'; jne fail
         # mov ax,4c25h; int21h; fail: mov ax,4c01h; int21h
         (root / "TEST.COM").write_bytes(bytes.fromhex("803e80000d750c803e8100227505b8254ccd21b8014ccd21"))
-        result = subprocess.run([str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--host", directory, "--cmd", "/probe.elf", "--cwd", "/"], cwd=ROOT, capture_output=True, text=True, timeout=20)
+        result = subprocess.run(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', directory, '--', str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--cmd", "/probe.elf", "--cwd", "/"], cwd=ROOT, capture_output=True, text=True, timeout=20)
         log = result.stdout + result.stderr
         if result.returncode or "LINUX RUNTIME PASS" not in log or any(s in log for s in ("SEGV", "PANIC", "panicked", "fatal Exception")):
             raise SystemExit(log)

@@ -405,8 +405,9 @@ impl GraphJournal {
         storage: &mut dyn Storage,
         offset: u64,
         output: &mut [u8],
+        kind: crate::ReadKind,
     ) -> Result<(), crate::StorageError> {
-        storage.read(offset, output)?;
+        storage.read_with_kind(offset, output, kind)?;
         self.overlay
             .apply(u64::from(self.block_size), offset, output);
         Ok(())

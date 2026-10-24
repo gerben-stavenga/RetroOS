@@ -130,9 +130,6 @@ The disk uses RetroOS's ordinary boot storage policy and writable session
 overlay. The copied tree records the starting files; session writes are in
 the guest's RAM overlay and are not exported when the process stops.
 
-`--storage hostfs` exercises the native filesystem instead. Some games currently
-fail in that mode while passing on disk; it is a separate filesystem test.
-
 Each invocation creates `tmp/game-suite/run-.../` containing:
 
 - `report.md` and `report.json`: results and checkpoint metrics; `metadata.json`

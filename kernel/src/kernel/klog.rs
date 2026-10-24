@@ -208,6 +208,10 @@ fn is_klog_path(path: &[u8]) -> bool {
 }
 
 impl Filesystem for KLogFs {
+    fn content_version(&self, _: u64) -> Result<Option<crate::kernel::vfs::ContentVersion>, i32> {
+        Ok(None)
+    }
+
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         if is_klog_path(path) {
             Some(Vnode {

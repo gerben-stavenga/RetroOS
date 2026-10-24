@@ -56,7 +56,6 @@ mod cpu;
 mod desc;
 mod devices;
 mod engine;
-mod hostfs;
 mod net;
 #[cfg(feature = "kvm")]
 mod kvm;
@@ -94,15 +93,8 @@ pub use mmu::new_space;
 // Platform device composition (the hosted `main` hooks ports): the PortIo trait
 // + `register` for custom devices, and convenience hooks for the built-ins.
 pub use devices::{
-    attach_audio, attach_boot_disk, attach_disk, attach_fw_cfg, attach_hostfs, register, register_debugcon,
+    attach_audio, attach_boot_disk, attach_disk, attach_fw_cfg, register, register_debugcon,
     register_debugcon_file, PortIo,
-};
-// Native host-fs backend (hosted "punch-through"): `install_native_hostfs` sets
-// the root; the `host_*` fns are the primitive hooks the kernel's
-// `install_host_backend` points at (direct std::fs, no COM1).
-pub use hostfs::{
-    host_clunk, host_create, host_dir_exists, host_mkdir, host_open, host_read,
-    host_readdir, host_remove, host_resize, host_rmdir, host_rename, host_write, install_native_hostfs,
 };
 // Native socket backend (hosted "punch-through"): `install_native_sockets`
 // enables it; the `host_sock_*` fns implement the typed hooks the kernel's

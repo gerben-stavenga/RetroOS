@@ -632,7 +632,7 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
         ..Default::default()
     });
 
-    let last_drive = dfs::last_drive(crate::kernel::platform::get().hostfs);
+    let last_drive = dfs::last_drive();
     let lol = Lol {
         sft_off: (sft_addr & 0xF) as u16,
         sft_seg: (sft_addr >> 4) as u16,
@@ -656,7 +656,7 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     }
     machine.write::<Sft>(lm_field(core::mem::offset_of!(LowMem, sft)), sft);
 
-    // CDS: C: is the data disk, D: the hot-swappable CD-ROM, H: hostfs.
+    // CDS: C: is the data disk, D: the hot-swappable CD-ROM; other drives follow configured mounts.
     // Programs such as Dos Navigator read this table directly rather than
     // deriving drive validity from AH=0Eh, so it must agree with DFS.
     let mk = |drive_letter: u8| -> CdsEntry {
@@ -676,7 +676,7 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     cds[2] = mk(b'C');
     cds[3] = mk(b'D');
     for letter in b'E'..=b'L' {
-        if dfs::drive_available(letter, crate::kernel::platform::get().hostfs) {
+        if dfs::drive_available(letter) {
             cds[usize::from(letter - b'A')] = mk(letter);
         }
     }

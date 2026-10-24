@@ -1,11 +1,11 @@
 #!/bin/bash
 # Verify that boot without any root filesystem fails immediately.
-# This is generic startup/root-selection policy, not HostFS protocol coverage.
+# This tests startup/root-selection policy.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source test/lib/qemu_common.sh
 
-tmp_dir=$(mktemp -d -t retroos-qemu-hostfs-root.XXXXXX)
+tmp_dir=$(mktemp -d -t retroos-qemu-root.XXXXXX)
 log="$tmp_dir/debugcon.log"
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -15,7 +15,7 @@ cp bazel-bin/kernel/kernel.elf "$tmp_dir/iso/boot/kernel.elf"
 printf '%s\n' \
     'set timeout=0' \
     'set default=0' \
-    'menuentry "RetroOS kernel-only HostFS root probe" {' \
+    'menuentry "RetroOS kernel-only root probe" {' \
     '    terminal_output console' \
     '    insmod multiboot2' \
     '    multiboot2 /boot/kernel.elf' \
@@ -23,8 +23,7 @@ printf '%s\n' \
     '}' > "$tmp_dir/iso/boot/grub/grub.cfg"
 grub-mkrescue -o "$tmp_dir/kernel-only.iso" "$tmp_dir/iso" >/dev/null
 
-# No module or disk filesystem, and no hostfs= parameter: the kernel must fail
-# immediately instead of falling back to an unavailable HostFS root.
+# Without a module or disk filesystem, the kernel must fail immediately.
 # This probe intentionally expects the kernel to halt in its panic path;
 # timeout termination is therefore an accepted result, unlike a QEMU crash.
 qemu_status=0

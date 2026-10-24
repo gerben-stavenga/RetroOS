@@ -1,0 +1,12 @@
+--- a/src/file.rs
++++ b/src/file.rs
+@@ -288,3 +288,8 @@
+             let mut disk = self.fs.disk.borrow_mut();
+             disk.seek(SeekFrom::Start(offset_in_fs))?;
+-            disk.read(&mut buf[..read_size])?
++            let kind = if self.is_dir() {
++                crate::ReadKind::Metadata
++            } else {
++                crate::ReadKind::FileData
++            };
++            disk.read_with_kind(&mut buf[..read_size], kind)?

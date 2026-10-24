@@ -209,8 +209,9 @@ mod tests {
         use crate::kernel::fs::fat::{FatFs, VolumeIo, tests::formatted};
         let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
         let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(FatFs::new(VolumeIo::new(volume, true)).unwrap()));
-        vfs::mount(b"host/", fs);
-        let mut dfs = DfsState::new_with_hostfs(true);
+        vfs::mount(b"lfn-test/", fs);
+        crate::kernel::dos::dfs::configure_drive(b'H', b"lfn-test/");
+        let mut dfs = DfsState::new();
         let path = dfs.lfn_path(b"H:\\Long directory", true).unwrap();
         assert_eq!(vfs::mkdir(&path.vfs), 0);
         dfs.chdir_lfn(b"H:\\lONG DIRECTORY").unwrap();
@@ -229,12 +230,12 @@ mod tests {
         let mut abs = [0; super::super::DFS_PATH_MAX];
         let len = dfs.resolve(b"H:\\caf\x82.txt", &mut abs).unwrap();
         let n = DfsState::to_vfs_create(&abs[..len], &mut legacy).unwrap();
-        assert_eq!(&legacy[..n], "host/CAFÉ.TXT".as_bytes());
+        assert_eq!(&legacy[..n], "lfn-test/CAFÉ.TXT".as_bytes());
         let handle = vfs::create_to_handle(&legacy[..n]);
         assert!(handle >= 0);
         vfs::close_vfs_handle(handle);
         let n = DfsState::to_vfs_open(&abs[..len], &mut legacy).unwrap();
-        assert_eq!(&legacy[..n], "host/CAFÉ.TXT".as_bytes());
+        assert_eq!(&legacy[..n], "lfn-test/CAFÉ.TXT".as_bytes());
     }
     #[test]
     fn lfn_normalization_preserves_spaces_and_case() {

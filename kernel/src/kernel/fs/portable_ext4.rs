@@ -10,7 +10,7 @@ use crate::kernel::vfs::{DirEntry, Filesystem, Meta, Stat, Vnode};
 use portable_ext4::ext4::{
     AttributeUpdate, Blob, EdgeCursor, EdgeHandle, Node, Object, ObjectInfo,
 };
-use portable_ext4::{Error, Filesystem as HandleFilesystem, Storage, StorageError};
+use portable_ext4::{Error, Filesystem as HandleFilesystem, ReadKind, Storage, StorageError};
 
 const TYPE_MASK: u16 = 0xf000;
 const TYPE_NODE: u16 = 0x4000;
@@ -48,7 +48,11 @@ impl VolumeStorage {
     }
 
     #[inline(never)]
-    fn read_direct(&mut self, offset: u64, output: &mut [u8]) -> Result<(), StorageError> {
+    fn read_direct(&mut self, offset: u64, output: &mut [u8], kind: ReadKind) -> Result<(), StorageError> {
+        let kind = match kind {
+            ReadKind::Metadata => crate::kernel::block::ReadKind::Metadata,
+            ReadKind::FileData => crate::kernel::block::ReadKind::FileData,
+        };
         let len = output.len();
         let _end = offset
             .checked_add(len as u64)
@@ -62,7 +66,7 @@ impl VolumeStorage {
         let mut copied = 0;
         if !position.is_multiple_of(512) {
             let mut sector = [0; 512];
-            if self.volume.read(position / 512, &mut sector) != 1 {
+            if self.volume.read_with_kind(position / 512, &mut sector, kind) != 1 {
                 return Err(StorageError::new(VolumeError::ShortRead));
             }
             let within = (position % 512) as usize;
@@ -74,8 +78,8 @@ impl VolumeStorage {
         }
         let middle = (len - copied) / 512 * 512;
         if middle != 0 {
-            let transferred = self.volume.read(
-                position / 512, &mut output[copied..copied + middle],
+            let transferred = self.volume.read_with_kind(
+                position / 512, &mut output[copied..copied + middle], kind,
             ) as usize;
             if transferred != middle / 512 {
                 return Err(StorageError::new(VolumeError::ShortRead));
@@ -85,7 +89,7 @@ impl VolumeStorage {
         }
         if copied < len {
             let mut sector = [0; 512];
-            if self.volume.read(position / 512, &mut sector) != 1 {
+            if self.volume.read_with_kind(position / 512, &mut sector, kind) != 1 {
                 return Err(StorageError::new(VolumeError::ShortRead));
             }
             output[copied..].copy_from_slice(&sector[..len - copied]);
@@ -100,7 +104,11 @@ impl Storage for VolumeStorage {
     }
 
     fn read(&mut self, offset: u64, output: &mut [u8]) -> Result<(), StorageError> {
-        self.read_direct(offset, output)?;
+        self.read_with_kind(offset, output, ReadKind::Metadata)
+    }
+
+    fn read_with_kind(&mut self, offset: u64, output: &mut [u8], kind: ReadKind) -> Result<(), StorageError> {
+        self.read_direct(offset, output, kind)?;
         let end = offset.saturating_add(output.len() as u64);
         for write in &self.writes {
             let write_end = write.offset.saturating_add(write.bytes.len() as u64);
@@ -418,6 +426,10 @@ pub fn is_linux_root(volume: &Volume) -> bool {
 }
 
 impl Filesystem for PortableExt4Fs {
+    fn file_identity(&self, handle: u64) -> Option<u64> {
+        self.open.borrow().get(handle).map(Object::opaque)
+    }
+
     fn format_name(&self) -> &'static str { "ext4" }
 
     fn root_node(&self) -> Option<u64> {

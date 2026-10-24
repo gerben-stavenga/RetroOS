@@ -58,7 +58,7 @@
 ### DOS / DPMI
 - [x] DOS .COM / MZ .EXE execution under VM86
 - [x] DPMI 0.9 (+1.0 extensions): runs Quake, Commander Keen, Hexen, Borland C++ self-builds
-- [x] DFS path-translation VFS layer; hostfs (DOSBox-style hosted root)
+- [x] DFS path-translation VFS layer; SMB network mounts
 
 ### Devices & hosted backend
 - [x] Single emulated VGA model presented through a sink (metal GOP fbcon / hosted window)

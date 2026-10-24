@@ -10,11 +10,8 @@
 # (e.g. `-ms` STUB.C → STUB.EXE, `-mt -lt` COMMAND.C → COMMAND.COM). Flags
 # default to `-ms` (small model MZ .EXE, what the dosrt stub packing needs).
 #
-# Replaces qemu_tcc.sh. The interpreter has a native hostfs (`--host DIR`, a
-# COM1 transport to a host directory), so unlike the QEMU path there is no
-# socket bridge (hostfs.py), no background process to reap, and no VM to boot —
-# which is what made the old genrule flaky. Output is byte-identical to the
-# QEMU build (same in-OS TCC, same input).
+# Source and output live on a private ext4 image. No file-sharing server is
+# needed in this build action; TCC uses the same block-backed VFS as native boot.
 set -e -o pipefail
 
 HOST="$1"; IMAGE="$2"; SRC="$3"; OUT="$4"
@@ -32,17 +29,40 @@ trap 'rm -rf "$STAGE"' EXIT
 # asm-restart.
 sed 's/$/\r/' "$SRC" | LC_ALL=C tr -cd '\11\12\15\40-\176' > "$STAGE/$GUEST_SRC"
 
-# Run TCC headless. `--host $STAGE` mounts the stage dir as the guest's hostfs
-# (/host); cwd `host/` is where TCC reads the source and writes the output.
-# The interpreter shuts down when TCC exits; no wall-clock cap is needed (it's
-# deterministic, and Bazel's action timeout still bounds a real hang).
-# --c-root / : the in-OS toolchain needs DOS C: = root, because TURBOC.CFG
-# pins -IC:\TC\INCLUDE / -LC:\TC\LIB (the image's TC/ lives at the root). The
-# normal-boot default (C: = /home/retroos) would hide C:\TC.
-"$HOST" --host "$STAGE" \
-    --c-root / \
-    --cmd "TC/TCC.EXE $TCC_FLAGS $GUEST_SRC" --cwd "host/" \
-    "$IMAGE" < /dev/null > "$STAGE/run.log" 2>&1 || true
+# Extract the ext4 partition from the immutable build input into a sparse
+# working volume. Modifying the input image would corrupt Bazel's shared cache.
+read -r PART_START PART_BYTES < <(python3 - "$IMAGE" <<'PYIMAGE'
+import struct, sys
+with open(sys.argv[1], 'rb') as stream:
+    stream.seek(0x1ce)
+    entry = stream.read(16)
+start, count = struct.unpack_from('<II', entry, 8)
+print(start * 512, count * 512)
+PYIMAGE
+)
+dd if="$IMAGE" of="$STAGE/disk.img" bs=1M iflag=skip_bytes,count_bytes \
+    skip="$PART_START" count="$PART_BYTES" conv=sparse status=none
+VOLUME_ID="$(blkid -p -s UUID -o value "$STAGE/disk.img")"
+cat > "$STAGE/BOOT.INI" <<INI
+[bundle]
+source=UUID=$VOLUME_ID
+subdir=/
+[mount "build"]
+source=UUID=$VOLUME_ID
+path=/
+drive=C
+access=rw
+grant=/
+INI
+debugfs -w -f /dev/stdin "$STAGE/disk.img" > "$STAGE/stage.log" 2>&1 <<EOF
+rm /RETROOS/BOOT.INI
+write "$STAGE/BOOT.INI" /RETROOS/BOOT.INI
+write "$STAGE/$GUEST_SRC" /$GUEST_SRC
+EOF
+"$HOST" --c-root / --cmd "TC/TCC.EXE $TCC_FLAGS $GUEST_SRC" --cwd / \
+    "$STAGE/disk.img" < /dev/null > "$STAGE/run.log" 2>&1 || true
+debugfs -R "dump /$GUEST_OUT $STAGE/$GUEST_OUT" "$STAGE/disk.img" \
+    >> "$STAGE/stage.log" 2>&1
 
 if [ ! -f "$STAGE/$GUEST_OUT" ]; then
     echo "interp_tcc: TCC did not produce $GUEST_OUT (stage kept: $STAGE)" >&2

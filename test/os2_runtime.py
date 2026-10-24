@@ -57,11 +57,7 @@ def main():
             ):
                 launch = "/" + prefix + command[1:] if command.startswith("/") else prefix + command
                 try:
-                    result = subprocess.run([
-                        str(ROOT / "bazel-bin/kernel" / target), "--host", directory,
-                        "--c-root", prefix or "/", "--cwd", prefix + "OS2/APPS",
-                        "--cmd", launch,
-                    ], cwd=ROOT, capture_output=True, text=True, timeout=30)
+                    result = subprocess.run(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', directory, '--', str(ROOT / "bazel-bin/kernel" / target), "--c-root", prefix or "/", "--cwd", prefix + "OS2/APPS", "--cmd", launch], cwd=ROOT, capture_output=True, text=True, timeout=30)
                 except subprocess.TimeoutExpired as error:
                     raise SystemExit((error.stdout or b"").decode(errors="replace") +
                                      (error.stderr or b"").decode(errors="replace") +

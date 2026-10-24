@@ -67,7 +67,6 @@ pub use arch_abi::{
 pub use kernel::startup::startup;
 pub use kernel::platform::{set_host_env, DebugSink, HostEnv};
 pub use kernel::portio::{install_portio, PortIo};
-pub use kernel::fs::hostfs::{install_host_backend, host_backend_installed, HostBackendHooks};
 pub use kernel::net::{install_socket_backend, socket_backend_installed, SocketHooks};
 
 /// Hosted: the machine has no text aperture, so the terminal keeps its grid

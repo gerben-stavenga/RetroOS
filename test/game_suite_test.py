@@ -109,7 +109,7 @@ class MachineTest(unittest.TestCase):
             output.mkdir()
             args = argparse.Namespace(source=root / "source", host_bin=fake, output=output,
                                       engine="tcg", golden=root / "golden", bless=True, compare=False,
-                                      storage="hostfs")
+                                      storage="disk")
             case = {"id": "test", "directory": "GAMES/TEST", "executable": "TEST.COM",
                     "files": {"TEST.COM": "private copy"}, "timeout": 3,
                     "steps": [{"op": "shot", "name": "picture", "settle": 0,

@@ -13,7 +13,6 @@ pub mod devices;
 pub mod fat;
 pub mod floppy;
 pub mod grant;
-pub mod hostfs;
 pub mod iso9660;
 pub mod portable_ext4;
 pub mod session;

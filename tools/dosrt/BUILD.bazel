@@ -117,10 +117,7 @@ alias(
 )
 
 # ---- stub: Turbo C MZ EXE, compiled by running RetroOS on the interpreter ---
-# `interp_tcc.sh` runs in-OS TCC over the interpreter's native hostfs (no
-# qemu_tcc.sh socket bridge / background reaping). Output is byte-identical to
-# the old QEMU genrule — same in-OS TCC, same input — just deterministic and
-# not flaky.
+# `interp_tcc.sh` stages source and output on a private ext4 volume.
 genrule(
     name = "stub_exe",
     srcs = [

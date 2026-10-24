@@ -2,7 +2,7 @@ load(":filesystem_layout.bzl", "BOOT_FILES", "DATA_FILES", "SHOWCASE_FILES", "LI
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@rules_pkg//pkg:mappings.bzl", "pkg_mklink")
 
-exports_files(["i686-retro-none.json", "hostfs.py"])
+exports_files(["i686-retro-none.json"])
 
 # Static optional content lives in showcase-bundle/, in its C: layout.
 # The single showcase glob includes every added file or directory.

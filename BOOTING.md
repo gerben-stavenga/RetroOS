@@ -260,6 +260,26 @@ fresh pages; compiler launches repeatedly load Rust/LLVM libraries totaling
 roughly 350 MB, and loader segment mappings can repeat those reads. Reusing
 file-backed pages or loading them on demand remains performance work; passing
 the genrule regression does not establish practical self-build speed.
+`python3 test/linux_bazel_rust.py --compare-host` isolates this with a tiny
+workspace: one genrule compiles a fresh Rust source and another runs the binary
+and checks its output. It uses the same installed compiler and extracted Bazel
+runtime on both systems, with separate output caches and no repository downloads.
+Results and Bazel JSON profiles are retained in `build/ci/bazel-rust`;
+`--compiler-timings` additionally enables nightly Rust's `-Ztime-passes` and
+glibc's loader statistics. Bazel's reported elapsed time excludes VM boot;
+the probe also records the full guest wall time separately.
+An initial QEMU/KVM measurement took 112.2 seconds in RetroOS, including an
+83.6-second compile action. A second run with compiler/loader diagnostics and
+pre-extracted Bazel runtimes took 125.1 seconds versus 0.87 seconds on Linux;
+its compile action took 96.8 seconds versus 0.075 seconds. Rust reported only
+0.136 seconds in LLVM passes, but 37.8 seconds waiting for the linker.
+A compiler-startup profile spent 99.8% of sampled time in the kernel,
+dominated by `mmap`. A native loader trace of the same Rust distribution maps
+about 499 MiB from its two Rust/LLVM shared libraries, including overlapping
+segments. Our eager private mappings read these regions again for each process;
+the 32 KiB SMB read cap further turns the loads into thousands of serialized
+requests. This probe measures the bottleneck; it does not implement demand
+paging or a reusable cache of private file-backed pages.
 The existing runtime can remain read-only: Bazel ignores `EROFS` when
 updating its directory's last-use timestamp. Returning `ENOSYS` for this
 operation previously made that optional update fatal. The guest cache and
@@ -1211,11 +1231,11 @@ remain serialized, so a slow server can pause other guest work until the
 operation completes or times out. Failed connections are closed; reboot to
 reconnect. SMB is not currently a boot-root filesystem.
 
-The deprecated `run.sh --host DIR` shortcut and its QEMU serial HostFS bridge
+The deprecated `run.sh --host DIR` shortcut and all native/serial file-sharing backends
 have been removed. Configure `[smb]` mounts explicitly; the launcher does not
-start an SMB server or automatically assign H:. Low-level hosted binaries
-retain their native-directory option for test fixtures and build tooling;
-it is separate from network filesystem support.
+start an SMB server or automatically assign H:. Hosted binaries also require
+disk images. Tests and compiler build actions stage inputs on private ext4
+volumes; they do not install an alternative filesystem backend.
 
 For QEMU's host-directory SMB export, the server is normally `10.0.2.4` and
 the share is `qemu`. Samba must be installed on the host. For example, select

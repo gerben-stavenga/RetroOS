@@ -438,6 +438,21 @@ impl<T: Transport> Client<T> {
             &response.output_buffer,
         )
     }
+    /// Query a file information class through an existing open handle.
+    pub fn query_info(&mut self, file: FileId, class: u8, max_bytes: u32) -> Result<Vec<u8>> {
+        let (_, bytes) = self.call(Command::QueryInfo, &query_info::QueryInfoRequest {
+            info_type: query_info::InfoType::File,
+            file_info_class: class,
+            output_buffer_length: max_bytes,
+            additional_information: 0,
+            flags: 0,
+            file_id: file,
+            input_buffer: Vec::new(),
+        })?;
+        let response = query_info::QueryInfoResponse::unpack(&mut ReadCursor::new(&bytes[64..]))?;
+        Ok(response.output_buffer)
+    }
+
     pub fn set_info(&mut self, file: FileId, class: u8, buffer: Vec<u8>) -> Result<()> {
         self.call(
             Command::SetInfo,

@@ -1,0 +1,25 @@
+--- a/src/io.rs
++++ b/src/io.rs
+@@ -13,6 +13,11 @@
+ ///
+ /// It is based on the `std::io::Read` trait.
+ pub trait Read: IoBase {
++    /// Semantic read purpose; storage providers may ignore this hint.
++    fn read_with_kind(&mut self, buf: &mut [u8], _kind: ReadKind) -> Result<usize, Self::Error> {
++        self.read(buf)
++    }
++
+     /// Pull some bytes from this source into the specified buffer, returning how many bytes were read.
+     ///
+     /// This function does not provide any guarantees about whether it blocks waiting for data, but if an object needs
+@@ -290,3 +295,10 @@
+         self.write_all(&n.to_le_bytes())
+     }
+ }
++
++/// Semantic intent only: cache allocation and eviction belong to the caller.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ReadKind {
++    Metadata,
++    FileData,
++}

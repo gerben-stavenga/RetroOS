@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build CWSDPMI.EXE inside RetroOS using TC 2.01 + TASM (copied from BC++ 3.1).
 #
-# Stages cwsdpmi/ sources into a host workspace, mounts it via hostfs,
+# Stages cwsdpmi/ sources and the toolchain on a private ext4 volume,
 # boots RetroOS with a `;`-separated cmdline that runs TASM on each .ASM,
 # TCC on each .C, then TLINK to combine. RetroOS shuts down when the last
 # command exits; outputs land in the stage dir.
@@ -58,4 +58,21 @@ echo "Stage:   $STAGE"
 echo "Cmdline: $CMD"
 echo
 
-exec "$ROOT/run_qemu.sh" 386 -i image -r "$CMD" -h "$STAGE"
+cd "$ROOT"
+bazelisk build //:image_min
+bazelisk build //kernel:retroos-host --platforms=@platforms//host
+VOLUME="$(mktemp -t retroos-cwsdpmi-volume.XXXXXX)"
+trap 'rm -f "$VOLUME"' EXIT
+read -r PART_START PART_BYTES < <(python3 - <<'PYIMAGE'
+import struct
+with open('bazel-bin/image_min.bin', 'rb') as stream:
+    stream.seek(0x1ce)
+    start, count = struct.unpack_from('<II', stream.read(16), 8)
+print(start * 512, count * 512)
+PYIMAGE
+)
+dd if=bazel-bin/image_min.bin of="$VOLUME" bs=1M iflag=skip_bytes,count_bytes \
+    skip="$PART_START" count="$PART_BYTES" conv=sparse status=none
+debugfs -R "rdump /TC $STAGE" "$VOLUME"
+python3 test/disk_fixture.py --root "$STAGE" -- bazel-bin/kernel/retroos-host \
+    --c-root / --cwd / --cmd "$CMD"

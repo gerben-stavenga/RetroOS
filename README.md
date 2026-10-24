@@ -354,7 +354,7 @@ regeneration instructions are in [lib/fonts/uni-vga](lib/fonts/uni-vga/README.md
 `--freedos` boots FreeDOS directly from the same data disk on a BIOS emulator.
 Host-directory sharing uses authenticated SMB mounts configured in
 `RETROOS/RETROOS.INI`; see [SMB network mounts](BOOTING.md#smb-network-mounts).
-The deprecated `--host DIR` launcher shortcut and automatic serial HostFS
+The deprecated `--host DIR` launcher shortcut and serial file-sharing backend
 setup have been removed. Both QEMU and hosted launches use the disk images.
 `--cmd` is supported on QEMU and hosted; the launcher does not inject
 temporary commands or serial settings into the persistent disk.

@@ -147,7 +147,6 @@ pub struct Platform {
     /// A host filesystem transport answered — the native backend punch-through
     /// (hosted) or the COM1 client (metal / the Python bridge). Whether it ends
     /// up as `/host`, as the root, or unused is `startup`'s mount policy.
-    pub hostfs: bool,
     pub debug: DebugSink,
 }
 
@@ -379,20 +378,6 @@ pub fn probe<A: crate::Arch>(
     boot: &crate::BootConfig,
 ) -> ProbedPlatform {
     let (audio_hw, audio_token) = probe_audio(machine);
-    // HostFS is opt-in. The boot parameter selects the UART on metal; hosted
-    // entries use the same feature gate for their injected backend.
-    let hostfs = match boot.hostfs_port {
-        None => false,
-        Some(port) => {
-            crate::kernel::fs::hostfs::configure(port);
-            crate::kernel::fs::hostfs::host_backend_installed()
-                || crate::kernel::fs::hostfs::init()
-                // Keep the selected COM-backed filesystem mounted when its
-                // server is absent; operations retry the handshake on demand.
-                || crate::kernel::fs::hostfs::uart_present()
-        }
-    };
-
     // Metal: ask the hardware. Hosted: the answers are properties of the
     // backend itself — the interp port bus has no VGA device and its zeroed
     // guest RAM never contains a ROM — and its guest address space doesn't
@@ -471,7 +456,6 @@ pub fn probe<A: crate::Arch>(
             // Policy comes later, when RETROOS.INI is readable
             // (`apply_audio_mode`); until then, the hardware's default.
             audio: audio_hw.default_verdict(),
-            hostfs,
             debug: env.debug,
         }, display)
     };
@@ -488,8 +472,8 @@ pub fn probe<A: crate::Arch>(
     let firmware = match p.firmware { Firmware::NativeBios => "NativeBios", Firmware::Substitute => "Substitute" };
     let debug = match p.debug { DebugSink::Debugcon => "Debugcon", DebugSink::HostStdout => "HostStdout" };
     crate::compact_println!(
-        "Platform: host={} vga_passthrough={} firmware={} audio={} hostfs={} debug={}",
-        host, p.vga_passthrough, firmware, p.audio.name(), p.hostfs, debug,
+        "Platform: host={} vga_passthrough={} firmware={} audio={} debug={}",
+        host, p.vga_passthrough, firmware, p.audio.name(), debug,
     );
     ProbedPlatform { facts: p, display, audio: audio_token }
 }

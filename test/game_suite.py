@@ -247,7 +247,7 @@ def run_case(case, args):
                                stdout=log, stderr=log, check=True)
             command.append(str(image))
         else:
-            command += ["--host", str(drive)]
+            raise Failure("unsupported storage mode")
         (directory / "command.json").write_text(json.dumps(command, indent=2) + "\n")
         machine = Machine(command, directory, case.get("timeout", 60))
         # Require the actual program to enter the kernel's event loop.
@@ -354,8 +354,8 @@ def main():
     parser.add_argument("--source", type=Path, default=ROOT / "showcase-bundle",
                         help="installed games root, with GAMES/... directories")
     parser.add_argument("--engine", choices=("tcg", "kvm"), default="tcg")
-    parser.add_argument("--storage", choices=("disk", "hostfs"), default="disk",
-                        help="fresh ext4 disk (requires mkfs.ext4) or native host filesystem")
+    parser.add_argument("--storage", choices=("disk",), default="disk",
+                        help="fresh ext4 disk (requires mkfs.ext4)")
     parser.add_argument("--host-bin", type=Path, help="override built hosted kernel")
     parser.add_argument("--select", default="", help="comma-separated scenario name substrings")
     parser.add_argument("--jobs", type=int, default=1)

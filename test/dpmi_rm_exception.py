@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise RM/PM exception routing without a disk or application assets."""
+"""Exercise RM/PM exception routing with a minimal private disk and no application assets."""
 import os
 from pathlib import Path
 import shutil
@@ -21,10 +21,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="retroos-rmexception-") as directory:
         shutil.copyfile(ROOT / "bazel-bin/test/dos/rmexception/RMEXCEPT.COM",
                         Path(directory) / "RMEXCEPT.COM")
-        result = subprocess.run([
-            str(ROOT / "bazel-bin/kernel" / target),
-            "--host", directory, "--c-root", "/", "--cmd", "/RMEXCEPT.COM",
-        ], cwd=ROOT, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', directory, '--', str(ROOT / "bazel-bin/kernel" / target), "--c-root", "/", "--cmd", "/RMEXCEPT.COM"], cwd=ROOT, capture_output=True, text=True, timeout=30)
         log = result.stdout + result.stderr
         if (result.returncode != 0 or "RMEXCEPT PASS" not in log
                 or any(marker in log for marker in

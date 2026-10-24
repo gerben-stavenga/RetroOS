@@ -596,7 +596,7 @@ pub(super) fn int_21h<A: crate::Arch>(
                         // opened from (Tomb Raider scans X:\data\title.phd,
                         // then asks the handle which drive answered) — and a
                         // CD-ROM under MSCDEX is a network-REDIRECTOR drive,
-                        // so its files must report remote; hostfs really is.
+                        // so its files must report remote; SMB really is.
                         let info = crate::kernel::vfs::mount_prefix(handle as i32, &kt.fds)
                             .map_or(2u64, |prefix| match prefix {
                                 b"floppya/" => 0,
@@ -698,7 +698,7 @@ pub(super) fn int_21h<A: crate::Arch>(
         0x0E => {
             let drive = b'A'.wrapping_add(regs.rdx as u8);
             let _ = dos.dfs.select_drive(drive);
-            let last_drive = dfs::last_drive(crate::kernel::platform::get().hostfs);
+            let last_drive = dfs::last_drive();
             regs.rax = (regs.rax & !0xFF) | u64::from(last_drive);
             return thread::KernelAction::Done;
         }
@@ -1233,7 +1233,7 @@ pub(super) fn int_21h<A: crate::Arch>(
                 regs.rcx = (regs.rcx & !0xFFFF) | 512;
                 regs.rdx = (regs.rdx & !0xFFFF) | 32768;
             } else if drive == 8 && crate::kernel::vfs::dir_exists(b"host") {
-                // Hostfs has no portable capacity query; report the same
+                // Remote mounts have no portable capacity query; report the same
                 // synthetic geometry as C: while marking it remote via 4409h.
                 regs.rax = (regs.rax & !0xFFFF) | 8;
                 regs.rbx = (regs.rbx & !0xFFFF) | 24576;

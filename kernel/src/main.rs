@@ -1,15 +1,11 @@
 //! Hosted RetroOS entry. Exists only under the `hosted` feature (the metal build
 //! is `#![no_main]` and boots via `entry.asm` → `boot_kernel`). A regular
 //! `fn main()` that composes the interpreter's platform — hooking its device
-//! ports (0xE9→stdout, ATA→image, COM1→host directory) — then hands off to the
+//! ports (0xE9→stdout, ATA→image, sockets→host networking) — then hands off to the
 //! same `kernel::startup()` the metal crt0 calls.
 //!
 //!   retroos-host disk.img                  # boot the real kernel
-//!   retroos-host --host DIR disk.img       # ...with /host = DIR
 //!   retroos-host --cmd "PROG ARGS" disk.img  # boot straight into PROG, then halt
-//!   retroos-host program.elf [args...]     # run one 32-bit Linux ELF directly
-//!   retroos-host boot-bundle/bin/busybox sh   # ...e.g. an interactive BusyBox shell
-//!   retroos-host                           # arch-boundary demo
 //! (build: bazelisk build //kernel:retroos-host --platforms=@platforms//host)
 
 use retroos_arch_interp as arch;
@@ -43,7 +39,6 @@ fn host_console_byte(b: u8) {
 
 fn main() {
 
-    let mut host_dir: Option<String> = None;
     let mut boot_disk: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
@@ -58,7 +53,6 @@ fn main() {
     while let Some(a) = args.next() {
         match a.as_str() {
             "--boot-disk" => boot_disk = args.next(),
-            "--host" | "-h" => host_dir = args.next(),
             // Live-render the guest's VGA text screen to this terminal (for
             // driving a full-screen DOS TUI like DN). 0xE9 debug → retroos.log.
             "--console" => live_console = true,
@@ -87,6 +81,10 @@ fn main() {
             // The live window moved to its own binary: retroos-play.
             "--window" => {
                 eprintln!("retroos-host is headless; use `./run.sh hosted` (retroos-play) for the window");
+                std::process::exit(2);
+            }
+            option if option.starts_with('-') => {
+                eprintln!("retroos-host: unknown option {option}; use a disk image with BOOT.INI and SMB mounts");
                 std::process::exit(2);
             }
             // First positional ends flag parsing; the rest are the program's argv.
@@ -160,58 +158,20 @@ fn main() {
                 std::process::exit(1);
             });
     }
-    // A bare executable is not a second way to boot: serve its directory over
-    // the native host-fs punch-through and let the ordinary path name it, so
-    // the kernel is entered once, through `startup()`, with the machine
-    // probed. argv = the positional tail (so `… boot-bundle/bin/busybox sh` runs
-    // BusyBox's `sh` applet).
-    let elf = magic == *b"\x7fELF";
-    if elf {
-        let path = std::path::Path::new(input.as_deref().unwrap());
-        let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
-        let name = path.file_name().expect("ELF path names a file");
-        if host_dir.is_none() {
-            host_dir = Some(dir.unwrap_or(std::path::Path::new(".")).to_string_lossy().into_owned());
-        }
-        let mut line = name.to_string_lossy().into_owned();
-        for arg in positional.iter().skip(1) {
-            line.push(' ');
-            line.push_str(arg);
-        }
-        cmd = Some(line);
+    if magic == *b"\x7fELF" {
+        eprintln!("retroos-host: supply a disk image and use --cmd for a guest executable");
+        std::process::exit(2);
     }
 
-    if let Some(dir) = &host_dir {
-        // Native host-fs backend (the hosted "punch-through"): /host (or the
-        // root, per Media) is served by direct std::fs calls, not byte-serial
-        // COM1. Same injection shape as install_hosted_backend above.
-        arch::install_native_hostfs(dir);
-        kernel::install_host_backend(kernel::HostBackendHooks {
-            open: arch::host_open,
-            read: arch::host_read,
-            readdir: arch::host_readdir,
-            dir_exists: arch::host_dir_exists,
-            create: arch::host_create,
-            write: arch::host_write,
-            resize: arch::host_resize,
-            clunk: arch::host_clunk,
-            remove: arch::host_remove,
-            mkdir: arch::host_mkdir,
-            rmdir: arch::host_rmdir,
-            rename: arch::host_rename,
-        });
-    }
     if let Some(path) = wav {
         arch::attach_audio(&path); // canonical audio device → WAV file
     }
 
     // Otherwise boot the same kernel::startup() the metal crt0 calls — with
     // the image's ATA disk attached when one was given, diskless otherwise
-    // (the platform Media probe roots on hostfs or the embedded bootfs).
+    // Storage policy comes from BOOT.INI on the boot disk.
     arch::init_guest_ram(0);
-    if let Some(path) = &input
-        && !elf
-    {
+    if let Some(path) = &input {
         arch::attach_disk(path).unwrap_or_else(|e| {
             eprintln!("retroos-host: cannot attach disk {path}: {e}");
             std::process::exit(1);
@@ -239,7 +199,6 @@ fn main() {
     // cmdline/cwd, so there's no fw_cfg port round-trip.
     let mut config = kernel::BootConfig::empty();
     config.is_qemu = true;
-    if host_dir.is_some() { config.set_serial_services_from_cmdline(b"hostfs=com1"); }
     if let Some(c) = &cmd { config.set_cmdline(c.as_bytes()); }
     if let Some(c) = &cwd { config.set_cwd(c.as_bytes()); }
     if let Some(c) = &c_root { config.set_c_root(c.as_bytes()); }

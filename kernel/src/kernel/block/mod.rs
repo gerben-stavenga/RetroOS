@@ -20,11 +20,18 @@ use crate::kernel::drivers::{hdd, nvme::NvmeDisk};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlushError;
 
+/// Semantic read intent; cache policy belongs to the kernel block layer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadKind { Metadata, FileData }
+
 /// One block device: a physical disk, an NVMe namespace, or a wrapper around
 /// either (see the RAM overlay). Addressing is 512-byte LBAs throughout.
 pub trait Disk {
     /// Read `buf.len().div_ceil(512)` sectors from `lba`. Returns sectors read.
     fn read(&self, lba: u64, buf: &mut [u8]) -> u32;
+    fn read_with_kind(&self, lba: u64, buf: &mut [u8], _kind: ReadKind) -> u32 {
+        self.read(lba, buf)
+    }
     /// Write `buf.len().div_ceil(512)` sectors at `lba`. Returns sectors written.
     fn write(&self, lba: u64, buf: &[u8]) -> u32;
     /// Complete earlier writes before later writes are issued, reporting a
@@ -86,13 +93,17 @@ impl Volume {
     /// length: a filesystem that miscalculates an offset gets an obviously
     /// empty block, not plausible garbage from somewhere else on the disk.
     pub fn read(&self, lba: u64, buf: &mut [u8]) -> u32 {
+        self.read_with_kind(lba, buf, ReadKind::Metadata)
+    }
+
+    pub fn read_with_kind(&self, lba: u64, buf: &mut [u8], kind: ReadKind) -> u32 {
         let n = self.clamp(lba, buf.len());
         let (inside, past_end) = buf.split_at_mut(n);
         past_end.fill(0);
         if inside.is_empty() {
             return 0;
         }
-        self.disk.read(self.start + lba, inside)
+        self.disk.read_with_kind(self.start + lba, inside, kind)
     }
 
     /// Write `buf.len().div_ceil(512)` sectors at volume-relative `lba`.

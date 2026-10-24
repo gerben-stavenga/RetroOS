@@ -29,7 +29,7 @@ def main():
         (work / "child").mkdir(parents=True)
         (work / "note.txt").write_text("Original text\n")
         with (root / "guest.log").open("wb") as log, (root / "terminal.log").open("wb") as terminal:
-            process = subprocess.Popen([str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--host", directory, "--c-root", "/", "--cmd", "/bin/rc", "--cwd", "/work"], stdin=subprocess.PIPE, stdout=terminal, stderr=log)
+            process = subprocess.Popen(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', directory, '--', str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--c-root", "/", "--cmd", "/bin/rc", "--cwd", "/work"], stdin=subprocess.PIPE, stdout=terminal, stderr=log)
             def send(keys, delay=0.8):
                 time.sleep(delay)
                 if process.poll() is not None:

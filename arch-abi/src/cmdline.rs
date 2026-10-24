@@ -135,18 +135,18 @@ fn trim_ascii(s: &[u8]) -> &[u8] {
 mod tests {
     use super::{eq_ignore_ascii_case, for_each_key_value, key_eq, launch, parse_key_value, segments};
 
-    fn hostfs_directive(key: &[u8]) -> bool { key_eq(key, b"hostfs") }
+    fn serial_directive(key: &[u8]) -> bool { key_eq(key, b"serial") }
 
     #[test]
     fn compares_keys_case_insensitively() {
-        assert!(key_eq(b"HOSTFS", b"hostfs"));
+        assert!(key_eq(b"SERIAL", b"serial"));
         assert!(eq_ignore_ascii_case(b"COM2", b"com2"));
-        assert!(!key_eq(b"hostfsx", b"hostfs"));
+        assert!(!key_eq(b"serialx", b"serial"));
     }
 
     #[test]
     fn parses_one_token() {
-        assert_eq!(parse_key_value(b"hostfs=com2"), Some((&b"hostfs"[..], &b"com2"[..])));
+        assert_eq!(parse_key_value(b"serial=com2"), Some((&b"serial"[..], &b"com2"[..])));
         assert_eq!(parse_key_value(b"program"), None);
         assert_eq!(parse_key_value(b"=value"), None);
     }
@@ -155,21 +155,21 @@ mod tests {
     fn visits_segments_without_splitting_arguments() {
         let mut found = [&[][..]; 2];
         let mut count = 0;
-        for segment in segments(b" hostfs=com1 ; TESTS/X.COM arg=one; ") {
+        for segment in segments(b" serial=com1 ; TESTS/X.COM arg=one; ") {
             found[count] = segment;
             count += 1;
         }
         assert_eq!(count, 2);
-        assert_eq!(found[0], b"hostfs=com1");
+        assert_eq!(found[0], b"serial=com1");
         assert_eq!(found[1], b"TESTS/X.COM arg=one");
     }
 
     #[test]
     fn visits_all_key_value_tokens_without_semantic_filtering() {
-        let expected_keys = [b"arg".as_slice(), b"hostfs", b"retroos.mount"];
+        let expected_keys = [b"arg".as_slice(), b"serial", b"retroos.mount"];
         let expected_values = [b"one".as_slice(), b"com1", b"/data"];
         let mut count = 0;
-        for_each_key_value(b"TESTS/X.COM arg=one;hostfs=com1 retroos.mount=/data", |key, value| {
+        for_each_key_value(b"TESTS/X.COM arg=one;serial=com1 retroos.mount=/data", |key, value| {
             assert_eq!(key, expected_keys[count]);
             assert_eq!(value, expected_values[count]);
             count += 1;
@@ -180,8 +180,8 @@ mod tests {
     #[test]
     fn filters_only_the_consumer_owned_directive() {
         let parsed = launch(
-            b"hostfs=com1 TESTS/X.COM arg=one retroos.mount=/data",
-            hostfs_directive,
+            b"serial=com1 TESTS/X.COM arg=one retroos.mount=/data",
+            serial_directive,
         ).unwrap();
         assert_eq!(parsed.program(), b"TESTS/X.COM");
         let mut args = parsed.arguments();
@@ -192,17 +192,17 @@ mod tests {
 
     #[test]
     fn directive_only_segment_has_no_launch() {
-        assert!(launch(b"HOSTFS=COM2", hostfs_directive).is_none());
+        assert!(launch(b"SERIAL=COM2", serial_directive).is_none());
     }
 
     #[test]
     fn writes_arguments_with_bounded_space_separation() {
-        let parsed = launch(b"TESTS/X.COM one two", hostfs_directive).unwrap();
+        let parsed = launch(b"TESTS/X.COM one two", serial_directive).unwrap();
         let mut output = [0u8; 7];
         let len = parsed.write_arguments(&mut output);
         assert_eq!(&output[..len], b"one two");
 
-        let parsed = launch(b"TESTS/X.COM abc def", hostfs_directive).unwrap();
+        let parsed = launch(b"TESTS/X.COM abc def", serial_directive).unwrap();
         let mut output = [0u8; 5];
         let len = parsed.write_arguments(&mut output);
         assert_eq!(&output[..len], b"abc d");

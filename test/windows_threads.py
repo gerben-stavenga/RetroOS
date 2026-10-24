@@ -60,10 +60,7 @@ def main():
                 data[pe + 40:pe + 44] = bytes(4)
                 (root / name).write_bytes(data)
         try:
-            result = subprocess.run([
-                str(ROOT / "bazel-bin/kernel" / target), "--host", directory,
-                "--c-root", "/", "--cmd", "/WINTHREAD.EXE",
-            ], cwd=ROOT, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', directory, '--', str(ROOT / "bazel-bin/kernel" / target), "--c-root", "/", "--cmd", "/WINTHREAD.EXE"], cwd=ROOT, capture_output=True, text=True, timeout=30)
         except subprocess.TimeoutExpired as error:
             raise SystemExit((error.stdout or b"").decode(errors="replace") +
                              (error.stderr or b"").decode(errors="replace") +

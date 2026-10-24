@@ -33,8 +33,7 @@ def main():
                         target.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copyfile(source, target)
             with (root / "terminal").open("wb") as terminal, (root / "klog").open("wb") as log:
-                process = subprocess.Popen([str(ROOT / "bazel-bin/kernel/retroos-host-kvm"),
-                    "--host", directory, "--cmd", "/shell.elf -i", "--cwd", "/"],
+                process = subprocess.Popen(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', directory, '--', str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--cmd", "/shell.elf -i", "--cwd", "/"],
                     stdin=subprocess.PIPE, stdout=terminal, stderr=log)
 
                 def screen():

@@ -77,7 +77,7 @@ fn prepare_startup<A: crate::Arch>(
     // It no longer touches storage — the mount decision is made below, from
     // the partition tables, by the layer that owns it.
     let crate::kernel::platform::ProbedPlatform {
-        facts: platform,
+        facts: _,
         display,
         audio,
     } = discover_platform(machine, boot);
@@ -102,7 +102,6 @@ fn prepare_startup<A: crate::Arch>(
         boot,
         disks,
         BootMounts { modules, config: early_config },
-        platform.hostfs,
         &mut screen,
         &mut bios_workspace,
     );
@@ -347,10 +346,6 @@ fn configure_config_serial(boot: &crate::BootConfig, master_env: &[u8]) {
         crate::compact_println!("serial: invalid RETROOS.INI SERIAL value");
         return;
     };
-    if boot.hostfs_port == Some(port) {
-        crate::compact_println!("serial: {:?} already belongs to hostfs", port);
-        return;
-    }
     if crate::kernel::serial_log::init(port) {
         crate::compact_println!("serial: {:?} logging enabled from RETROOS.INI", port);
     } else {
@@ -360,7 +355,7 @@ fn configure_config_serial(boot: &crate::BootConfig, master_env: &[u8]) {
 
 /// Enable the command/reply diagnostic UART. Firmware (`mcp=` on the command
 /// line, or fw_cfg `opt/mcp`) wins over RETROOS.INI `MCP=`. The port must not
-/// share the ambient log or HostFS UART: either stream may contain arbitrary
+/// share the ambient log UART: the stream may contain arbitrary
 /// bytes.
 fn configure_serial_control(boot: &crate::BootConfig, master_env: &[u8]) {
     if let Some(port) = boot.mcp_port {
@@ -387,8 +382,7 @@ fn config_serial_port(master_env: &[u8]) -> Option<arch_abi::ComPort> {
 }
 
 fn start_serial_control(boot: &crate::BootConfig, master_env: &[u8], port: arch_abi::ComPort) {
-    if boot.hostfs_port == Some(port)
-        || boot.serial_console_port == Some(port)
+    if boot.serial_console_port == Some(port)
         || config_serial_port(master_env) == Some(port)
     {
         crate::compact_println!("serial-control: {:?} already has another owner", port);
@@ -514,12 +508,10 @@ fn prepare_storage<A: crate::Arch>(
     boot: &crate::BootConfig,
     disks: alloc::vec::Vec<&'static dyn crate::kernel::block::Disk>,
     bundle: BootMounts,
-    hostfs: bool,
     screen: &mut crate::kernel::console::Console,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
 ) {
     crate::kernel::dos::set_c_root(boot.c_root());
-    crate::kernel::dos::set_hostfs_enabled(hostfs);
 
     crate::compact_screenln!(screen, "Filesystems: scanning partition tables...");
     let mut parts = alloc::vec::Vec::new();
@@ -539,47 +531,23 @@ fn prepare_storage<A: crate::Arch>(
     }
     crate::compact_screenln!(screen, "Filesystems: {} partition(s) found", parts.len());
 
-    let hostfs_is_root = mount_filesystems(&parts, hostfs, screen, bundle.modules, bundle.config, boot);
+    mount_filesystems(&parts, screen, bundle.modules, bundle.config, boot);
     screen.present(machine, bios_workspace);
-    if hostfs_is_root && !crate::kernel::fs::hostfs::is_ready() {
-        lib::compact_panic!("hostfs: mounted as root but its server is unavailable");
-    }
 
     // Stable empty proxies let the OSD insert and eject media later.
     crate::kernel::fs::cdrom::init();
     crate::kernel::fs::floppy::init();
 }
 
-/// The host filesystem on the selected serial transport. Mounted at /host
-/// beside a disk root, or as the root when no other root is available.
-static HOSTFS: crate::kernel::fs::hostfs::HostFs = crate::kernel::fs::hostfs::HostFs::new();
-
-/// The host fs to mount: the injected native `std::fs` backend when the entry
-/// installed one (hosted "punch-through" — direct calls, no serial), else the
-/// selected-port `HOSTFS` client (metal / the Python bridge).
-fn host_fs() -> &'static dyn vfs::Filesystem {
-    if crate::kernel::fs::hostfs::host_backend_installed() {
-        &crate::kernel::fs::hostfs::INJECTED_HOSTFS
-    } else {
-        &HOSTFS
-    }
-}
-
-/// A leaked `&'static [u8]` for a mount prefix built at runtime.
-fn prefix(parts: &[&[u8]]) -> &'static [u8] {
-    alloc::boxed::Box::leak(parts.concat().into_boxed_slice())
-}
-
 /// Build one namespace from physical volumes and optional RAM boot content.
 #[inline(never)]
 fn mount_filesystems(
     parts: &[crate::kernel::block::partition::Partition],
-    hostfs: bool,
     screen: &mut crate::kernel::console::Console,
     modules: crate::multiboot::ModuleVolumes,
     early_config: Option<crate::kernel::mount_config::Config>,
     boot: &crate::BootConfig,
-) -> bool {
+) {
     use crate::kernel::block::partition::PartKind;
     crate::compact_screenln!(screen, "Filesystems: probing ext4/FAT volumes...");
     let volumes: alloc::vec::Vec<_> = parts.iter()
@@ -607,7 +575,6 @@ fn mount_filesystems(
         crate::kernel::mount_editor::init_editor(&volumes, &config, boot);
         crate::kernel::mount_config::apply(&config, bundle, home, &volumes, boot.ram_overlay, modules.extra)
             .unwrap_or_else(|e| lib::compact_panic!("BOOT.INI mounts: {}", e));
-        if hostfs { vfs::mount(b"host/", host_fs()); }
         mount_kernel_log_fs();
         if let Some(bytes) = modules.config.as_ref() {
             let user = crate::kernel::mount_config::Config::parse_user(bytes)
@@ -618,22 +585,9 @@ fn mount_filesystems(
             crate::kernel::wifi::configure(user.wifi);
             *BOOT_ENV.lock() = Some(user.environment);
         }
-        return false;
+        return;
     }
-    if !hostfs { lib::compact_panic!("No boot bundle with BOOT.INI available"); }
-    // Hosted execution exposes the explicitly supplied host directory. It
-    // still reads RETROOS/RETROOS.INI for startup and personality settings.
-    vfs::mount(b"", host_fs());
-    vfs::mount(b"host/", host_fs());
-    crate::compact_screenln!(screen, "hostfs: mounted as root");
-    let session = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
-    assert_eq!(session.mkdir(b"TEMP"), 0);
-    vfs::mount(b"sessionfs/", session);
-    vfs::hide_mount(b"sessionfs/");
-    vfs::bind(prefix(&[boot.c_root(), b"TEMP/"]), b"sessionfs/TEMP/");
-    mount_kernel_log_fs();
-    crate::kernel::stacktrace::init_from_vfs();
-    true
+    lib::compact_panic!("No boot bundle with BOOT.INI available");
 }
 
 /// The supplied user INI is visible to COMMAND.COM and application launch policy.
@@ -831,8 +785,7 @@ fn init_console_pipe() {
 /// Run what the boot asked for: the headless `-fw_cfg opt/cmdline` program
 /// sequence (shut down after), or the configurable interactive startup loop.
 fn is_kernel_launch_directive(key: &[u8]) -> bool {
-    arch_abi::cmdline::key_eq(key, b"hostfs")
-        || arch_abi::cmdline::key_eq(key, b"serial")
+    arch_abi::cmdline::key_eq(key, b"serial")
         || arch_abi::cmdline::key_eq(key, b"mcp")
 }
 

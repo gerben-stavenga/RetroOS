@@ -26,7 +26,7 @@ use core::fmt;
 pub use filesystem::Filesystem;
 pub use journal::GraphJournal;
 pub use overlay::{BlockChanges, BlockOverlay};
-pub use storage::{Storage, StorageError};
+pub use storage::{ReadKind, Storage, StorageError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Corrupt {

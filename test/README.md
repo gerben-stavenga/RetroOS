@@ -12,7 +12,7 @@ the desktop-only 86Box reference remain optional there.
 | --- | --- |
 | Hosted TCG | Unit/MMU tests, Navigator, games, video/sound probes, LFN, HX DPMI, XMS |
 | Hosted KVM | The same hosted integration suites, hardware execution proofs, Navigator screen comparison against TCG |
-| QEMU / metal | FAT and Multiboot storage, guest program execution, HostFS recovery, root policy, serial logging; UEFI AC'97/HDA/silent device matrix and sustained HDA PCM under TCG and KVM; proprietary DPMI/game probes when assets exist |
+| QEMU / metal | FAT and Multiboot storage, guest program execution, SMB shares, root policy, serial logging; UEFI AC'97/HDA/silent device matrix and sustained HDA PCM under TCG and KVM; proprietary DPMI/game probes when assets exist |
 | Bochs / metal | Public XMS, HX DPMI and VBE probes, with SDL's dummy video driver (requires `bochs-sdl`) |
 | 86Box / metal | Native SB16 sustained interrupts, completion protocol and discovery; requires an installed emulator and display |
 
@@ -86,3 +86,8 @@ and closes a file, then checks its bytes in the disk image after shutdown.
 BIOS covers both 386 and 686 CPU configurations; UEFI covers x64. CI uploads the bundles only after
 all required checks pass. `dpmi_hdpmi_pvi` is a local reference test requiring
 an installed FreeDOS disk; it is optional in CI.
+
+Hosted tests that need writable fixture files use `test/disk_fixture.py`.
+It creates a private ext4 disk with explicit BOOT.INI mounts and copies guest
+changes back after exit. This requires `mkfs.ext4` and `debugfs`; it does not
+mount a host directory inside the kernel. Live network-sharing tests use SMB.
