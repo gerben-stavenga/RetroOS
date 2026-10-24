@@ -20,6 +20,9 @@ mod x86 {
         (if leaf == 0x80000000 { 0x80000008 } else { 36 }, 0,0,0)
     }
 }
+mod boot_mem {
+    pub fn allocate_permanent(_: core::alloc::Layout) -> Result<*mut u8, ()> { Err(()) }
+}
 #[path = "src/phys_mm.rs"]
 mod phys_mm;
 

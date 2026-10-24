@@ -56,12 +56,31 @@ SECTIONS
     }
     _edata = .;
 
-    /* ISA DMA storage in .bss needs 128 KB alignment in both its virtual and
-     * physical image; the two kernel bases share that alignment. */
-    .bss ALIGN(128K) : {
+    /* ELF local-exec TLS template. Runtime copies are separate from the
+     * template; GS:0 holds the linked address immediately after each copy.
+     * Page alignment also accommodates CPU-local page-table storage. */
+    .tdata ALIGN(4K) : {
+        TLS_TEMPLATE = .;
+        *(.tdata .tdata.*)
+    }
+    .tbss : {
+        *(.tbss .tbss.*)
+    }
+    TLS_ALIGN = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));
+    TLS_FILE_SIZE = SIZEOF(.tdata);
+    TLS_SIZE = ALIGN(ADDR(.tbss) + SIZEOF(.tbss) - TLS_TEMPLATE, TLS_ALIGN);
+
+    .bss ALIGN(128K) (NOLOAD) : {
         *(.bss .bss.*)
         *(COMMON)
-        /* ARCH_STACK lives at the END of .bss, preceded by a guard page that
+        /* The BSP needs no allocator. AP copies will be dynamically allocated
+         * using the same TLS_SIZE/TLS_ALIGN contract. The word at TP is self. */
+        . = ALIGN(TLS_ALIGN);
+        BOOT_TLS_BASE = .;
+        . += TLS_SIZE;
+        BOOT_TLS_TP = .;
+        . += 8; /* self pointer, espfix stack window */
+        /* ARCH_STACK is preceded by a guard page that
          * boot.rs unmaps. Its overflow can't be reported — #PF would be
          * delivered on the overflowed stack itself — but the unmapped guard
          * turns silent corruption into a triple fault, easy to diagnose.
@@ -79,8 +98,20 @@ SECTIONS
         ARCH_STACK_GUARD   = . - 0x1000;
         ARCH_STACK         = .;     . += 0x4000;   /* 16 KB, 64K-aligned */
         ARCH_STACK_TOP     = .;
+        KERNEL_CORE_END = .;
+        /* Keep this unique input section LAST, outside the .bss.* wildcard.
+         * NOLOAD reserves RAM in the ELF without storing zero bytes on disk. */
+        . = ALIGN(128K);
+        BOOT_POOL_START = .;
+        KEEP(*(.boot_pool))
+        BOOT_POOL_END = .;
     }
     _end = .;
+    ASSERT(KERNEL_CORE_END - KERNEL_BASE <= 0x220000,
+           "kernel excluding boot pool exceeds 2.125 MiB")
+    ASSERT(BOOT_POOL_END == _end, "boot pool must be last in BSS")
+    ASSERT(_end - KERNEL_BASE + KERNEL_PHYS <= 4M - 128K,
+           "kernel and boot pool must leave 128 KiB below physical 4 MiB")
 
     /DISCARD/ : {
         *(.eh_frame)

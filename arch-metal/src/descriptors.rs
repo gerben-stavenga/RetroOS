@@ -342,7 +342,11 @@ const GDT_TLS_START: usize = 13;  // 0x68 — first of 3 per-thread TLS slots
 const GDT_TSS64_LO: usize = 16;   // 0x80 — TSS64 low (16-byte descriptor)
 #[allow(dead_code)] const GDT_TSS64_HI: usize = 17;   // 0x88 (always null — base[63:32] = 0 for <4GB)
 
-const GDT_ENTRIES: usize = 18;
+const GDT_KERNEL_TLS: usize = 18;
+/// CPU-local arch TLS, accessible to ring 0 and ring 1, never ring 3.
+/// Must match KERNEL_TLS_SEL in entry.asm.
+pub const KERNEL_TLS_SEL: u16 = (GDT_KERNEL_TLS as u16 * 8) | 1;
+const GDT_ENTRIES: usize = 19;
 
 /// LDT selector (GDT index 12 * 8 = 0x60)
 pub const LDT_SEL: u16 = 0x60;
@@ -366,16 +370,20 @@ const BOOT_SEG_OFFSET: u32 =
     (super::paging2::KERNEL_PHYS as u32).wrapping_sub(super::paging2::KERNEL_BASE as u32);
 
 /// Boot GDT used by the asm `_start` stub until paging is enabled.
-/// Layout: null / code32 @ 0x08 / data32 @ 0x10. Referenced by name from
+/// Layout: null / code32 @ 0x08 / data32 @ 0x10 / TLS @ 0x90. Referenced from
 /// entry.asm via `extern BOOT_GDT`.
 #[unsafe(no_mangle)]
-static BOOT_GDT: [GdtEntry; 3] = [
-    GdtEntry::null(),
-    GdtEntry::segment32(true, 0).with_base(BOOT_SEG_OFFSET),
-    GdtEntry::segment32(false, 0).with_base(BOOT_SEG_OFFSET),
-];
+static mut BOOT_GDT: [GdtEntry; GDT_ENTRIES] = {
+    let mut table = [GdtEntry::null(); GDT_ENTRIES];
+    table[1] = GdtEntry::segment32(true, 0).with_base(BOOT_SEG_OFFSET);
+    table[2] = GdtEntry::segment32(false, 0).with_base(BOOT_SEG_OFFSET);
+    // entry.asm patches the TLS base to the BSP's physical thread pointer.
+    table[GDT_KERNEL_TLS] = GdtEntry::segment32(false, 1);
+    table
+};
 
-// Static tables
+// Mutable descriptor state belongs to the executing CPU.
+#[thread_local]
 static mut GDT: [GdtEntry; GDT_ENTRIES] = [
     GdtEntry::null(),               // 0x00: Null
     GdtEntry::segment32(true, 0),   // 0x08: Kernel Code 32-bit (ring 0)
@@ -395,8 +403,10 @@ static mut GDT: [GdtEntry; GDT_ENTRIES] = [
     GdtEntry::null(),               // 0x78: TLS slot 2
     GdtEntry::null(),               // 0x80: TSS64 low (filled at runtime)
     GdtEntry::null(),               // 0x88: TSS64 high (always null for <4GB)
+    GdtEntry::null(),               // 0x90: kernel TLS (base filled at runtime)
 ];
 
+// Vector gates are identical on every CPU; initialized once during BSP setup.
 static mut IDT32: Idt32 = Idt32 {
     entries: [IdtEntry32::null(); IDT_ENTRIES],
 };
@@ -405,7 +415,9 @@ static mut IDT64: Idt64 = Idt64 {
     entries: [IdtEntry64::null(); IDT_ENTRIES],
 };
 
+#[thread_local]
 pub static mut TSS32: Tss = Tss::new();
+#[thread_local]
 pub static mut TSS64: Tss = Tss::new();
 
 // External: unified interrupt vector table from entry.asm.
@@ -417,18 +429,26 @@ unsafe extern "C" {
     fn zero_rsp_high();
 }
 
-/// Scratch slot for SYSCALL entry to stash user RSP before switching stacks.
-#[unsafe(no_mangle)]
-static mut SYSCALL_USER_RSP: u64 = 0;
-
-/// Kernel RSP loaded by the SYSCALL entry stub. Kept in sync with TSS64.sp0
-/// by `set_kernel_stack_64`.
-#[unsafe(no_mangle)]
-static mut SYSCALL_KERNEL_RSP: u64 = 0;
+/// SYSCALL enters without switching stacks. IA32_KERNEL_GS_BASE points at
+/// this CPU's pair, reached briefly by SWAPGS before ordinary entry saves the
+/// guest GS base. Offsets 0/8 are part of the entry.asm contract.
+#[repr(C)]
+struct SyscallStack {
+    kernel_rsp: u64,
+    user_rsp: u64,
+}
+#[thread_local]
+static mut SYSCALL_STACK: SyscallStack = SyscallStack { kernel_rsp: 0, user_rsp: 0 };
+const _: () = {
+    assert!(core::mem::offset_of!(SyscallStack, kernel_rsp) == 0);
+    assert!(core::mem::offset_of!(SyscallStack, user_rsp) == 8);
+};
 
 /// Setup GDT, IDT, and TSS
 pub fn setup_descriptor_tables(arch_stack_top: u32) {
     unsafe {
+        // GS:4 is the assembly entry ABI for espfix recovery.
+        ((x86::thread_pointer() + 4) as *mut u32).write(arch_stack_top & 0xffff_0000);
         let tss_limit = core::mem::size_of::<Tss>() as u32 - 1;
 
         // Setup TSS32 with packed SS:ESP, VGA IOPB, and interrupt redirection
@@ -464,19 +484,26 @@ pub fn setup_descriptor_tables(arch_stack_top: u32) {
         // 0x30-0xF7: user-callable (DPL=3) — includes 0x80 syscall, 0x31 DPMI,
         //             0xF0 VM86 stubs
         // 0xF8-0xFF: kernel-only MSI vectors
-        let vector_base_32 = int_vector.as_ptr() as u32;
-        for i in 0..256 {
-            let dpl = if i == 3 || i == 4 || (0x30..0xF8).contains(&i) { 3 } else { 0 };
-            let handler = vector_base_32 + (i as u32) * 8;
-            IDT32.entries[i] = IdtEntry32::interrupt_gate(handler, dpl);
+        if crate::smp::current_core_id() == 0 {
+            let vector_base_32 = int_vector.as_ptr() as u32;
+            for i in 0..256 {
+                let dpl = if i == 3 || i == 4 || (0x30..0xF8).contains(&i) { 3 } else { 0 };
+                let handler = vector_base_32 + (i as u32) * 8;
+                IDT32.entries[i] = IdtEntry32::interrupt_gate(handler, dpl);
+            }
+
+            // Setup 64-bit IDT entries (same vector table, same DPL policy)
+            for i in 0..256 {
+                let dpl = if i == 3 || i == 4 || (0x30..0xF8).contains(&i) { 3 } else { 0 };
+                let handler = vector_base_32 + (i as u32) * 8;
+                IDT64.entries[i] = IdtEntry64::interrupt_gate(handler, dpl);
+            }
         }
 
-        // Setup 64-bit IDT entries (same vector table, same DPL policy)
-        for i in 0..256 {
-            let dpl = if i == 3 || i == 4 || (0x30..0xF8).contains(&i) { 3 } else { 0 };
-            let handler = vector_base_32 + (i as u32) * 8;
-            IDT64.entries[i] = IdtEntry64::interrupt_gate(handler, dpl);
-        }
+        // GS:0 already contains the linked thread pointer under the boot
+        // segments. Its value remains unchanged when DS/CS become flat.
+        GDT[GDT_KERNEL_TLS] = GdtEntry::segment32(false, 1)
+            .with_base(x86::thread_pointer());
 
         // Load GDT
         let gdt_ptr = GdtPtr {
@@ -727,10 +754,13 @@ pub fn setup_syscall() {
         let efer = x86::rdmsr(x86::EFER_MSR);
         x86::wrmsr(x86::EFER_MSR, efer | x86::efer::SCE);
 
-        SYSCALL_KERNEL_RSP = TSS64.sp0;
+        SYSCALL_STACK.kernel_rsp = TSS64.sp0;
+        x86::wrmsr(0xC0000102, (&raw const SYSCALL_STACK) as u64);
     }
 
-    lib::compact_println!("SYSCALL enabled");
+    if crate::smp::current_core_id() == 0 {
+        lib::compact_println!("SYSCALL enabled");
+    }
 }
 
 /// Drop from ring 0 to ring 1 in place.
@@ -743,7 +773,7 @@ pub fn enter_ring1() {
             "mov ds, {ds:e}",
             "mov es, {ds:e}",
             "mov fs, {ds:e}",
-            "mov gs, {ds:e}",
+            "mov gs, {tls:e}",
             // Save ESP before pushes — this is the ESP we want after IRET
             "mov {tmp:e}, esp",
             // Build IRET frame: SS, ESP, EFLAGS, CS, EIP
@@ -764,6 +794,7 @@ pub fn enter_ring1() {
             ss = in(reg) RING1_DS as u32,
             cs = in(reg) RING1_CS as u32,
             ds = in(reg) RING1_DS as u32,
+            tls = in(reg) KERNEL_TLS_SEL as u32,
         );
     }
 }

@@ -1,6 +1,5 @@
-# Build kernel using rules_rust and rules_nasm
+# Build the kernel with arch-metal's separately linked startup object.
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
-load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:host_transition.bzl", "host_platform_test")
 load("//toolchain:retro_platform.bzl", "retro_platform_files")
 load("//toolchain:panic.bzl", "panic_strategy")
@@ -13,17 +12,12 @@ config_setting(
     constraint_values = ["@platforms//os:none"],
 )
 
-nasm_library(
-    name = "entry",
-    srcs = ["src/arch/entry.asm"],
-    copts = ["-f", "elf32"],
-)
-
 # The linker script, materialized into bazel-out so the rust_binary link action
 # stages it reliably (a source file passed via compile_data wasn't found by the
 # linker; bazel-out inputs are).
 genrule(
     name = "kernel_ld",
+    visibility = ["//visibility:public"],
     srcs = ["kernel.ld"],
     outs = ["kernel.generated.ld"],
     cmd = "cp $< $@",
@@ -134,7 +128,7 @@ rust_binary(
     srcs = ["metal_entry.rs"],
     crate_name = "kernel_metal",
     edition = "2024",
-    compile_data = [":kernel_ld", ":entry"],
+    compile_data = [":kernel_ld", "//arch-metal:entry"],
     rustc_flags = [
         "-Cpanic=abort",
         "-Crelocation-model=static",
@@ -144,7 +138,7 @@ rust_binary(
         "-Clinker-flavor=ld.lld",
         "-Clinker=rust-lld",
         "-Clink-arg=-T$(location :kernel_ld)",
-        "-Clink-arg=$(location :entry)",
+        "-Clink-arg=$(location //arch-metal:entry)",
         "-Clink-arg=-nostdlib",
         "-Clink-arg=-no-pie",
     ],

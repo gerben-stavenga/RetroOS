@@ -29,8 +29,8 @@
 //!
 //! ## Constant root page
 //!
-//! The root page table (PD or PDPT) is a constant static page in the
-//! kernel. Kernel entries (recursive, PML4 back-pointer, kernel PTs)
+//! The root page table (PD or PDPT) has a stable address in each CPU
+//! TLS block. Kernel entries (recursive, PML4 back-pointer, kernel PTs)
 //! live in this constant page and are automatically shared by all
 //! processes. Only user entries differ per-process.
 //!
@@ -110,21 +110,21 @@ pub const KERNEL_PHYS: usize = 0x0010_0000;
 /// The kernel heap occupies `[heap_base() .. HEAP_END)` in kernel space. The
 /// demand-paging `#PF` handler grows it on access and the heap allocator carves
 /// within it — but the window itself is a memory-layout fact (the ceiling, and
-/// the base = first page past the kernel image's linker `_end`), owned here, not
+/// the base = first page past the loader-reserved boot pool), owned here, not
 /// allocator policy.
 pub const HEAP_END: usize = arch_abi::DEVICE_WINDOW_BASE;
 
 /// VA window for physical framebuffers. Carved off the top of the heap window.
 pub use arch_abi::{FB_WINDOW_BASE, FB_WINDOW_END};
 
-/// First page after the kernel image (`_end`), aligned up — the heap base.
-pub fn heap_base() -> usize {
-    unsafe extern "C" {
-        static _end: u8;
-    }
-    let end = (&raw const _end) as usize;
-    (end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
-}
+/// First page after the kernel image, including the entire reserved boot pool.
+pub fn heap_base() -> usize { crate::boot_mem::end() }
+
+/// Capacity of the existing initial kernel mapping (image including boot pool).
+pub const BOOT_KERNEL_BYTES: usize = 5 * 1024 * 1024;
+
+/// Temporary physical identity window while boot offset segments remain active.
+pub const BOOT_IDENTITY_END: usize = 4 * 1024 * 1024;
 
 /// Per-thread saved root page table entries.
 ///
@@ -145,6 +145,7 @@ pub union RootPageTable {
 /// Separate from the constant virtual PDPT page.
 #[repr(C, align(32))]
 struct HwPdpt([u64; 4]);
+#[thread_local]
 static mut HW_PDPT: HwPdpt = HwPdpt([0; 4]);
 
 impl Default for RootPageTable {
@@ -517,9 +518,11 @@ impl KernelPages {
 }
 
 /// Kernel pages - statically allocated page tables
+#[thread_local]
 static mut KERNEL_PAGES: KernelPages = KernelPages([const { RawPage([0; PAGE_SIZE]) }; 5]);
 
 /// PML4 for long mode - shared with PAE via PML4[0] = PDPT
+#[thread_local]
 static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 
 /// Set up long mode page tables (call after enable_pae)
@@ -692,6 +695,7 @@ pub fn entries() -> Entries {
 /// so any caller outside the arch syscall handlers (e.g. ring-1 kernel
 /// code calling `entries()`) would #GP. The mode is fixed once
 /// `enable_paging` returns; cache it there and read from this static.
+#[thread_local]
 static IS_PAE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -879,6 +883,7 @@ fn fnv_hash(tree: &PageTree) -> u64 {
     h.finish()
 }
 
+#[thread_local]
 static mut RECORDED_TREES: Option<alloc::collections::BTreeMap<u64, PageTree>> = None;
 
 fn recorded_trees() -> &'static mut alloc::collections::BTreeMap<u64, PageTree> {
@@ -1075,6 +1080,7 @@ pub fn cpu_supports_pat() -> bool {
 
 /// Set when `enable_wc_pat` programmed the WC PAT slot. `fbcon` checks this to
 /// decide whether the framebuffer can be mapped Write-Combining (else UC).
+#[thread_local]
 static mut WC_PAT_ENABLED: bool = false;
 
 /// Whether a Write-Combining PAT slot is available (see `flags::WRITE_COMBINE`).
@@ -1134,6 +1140,7 @@ pub fn enable_wc_pat() {
 }
 
 /// NX enabled flag (set when EFER.NXE is enabled)
+#[thread_local]
 static mut NX_ENABLED: bool = false;
 
 /// Check if NX is currently enabled
@@ -1228,28 +1235,27 @@ pub fn enable_legacy(scratch: &mut PageTable32, kernel_phys: usize, kernel_pages
 /// PAE structure: PDPT (4 entries) -> PD (512 entries) -> PT (512 entries)
 /// With PDPT[3] = PDPT (recursive), PDPT becomes a 512-entry "virtual PD"
 ///
-/// PDPT[0] = scratch (identity, scratch[0] = scratch for self-referential PD+PT)
+/// PDPT[0] = scratch (identity PD and self-referential PT for 0..2 MiB).
+/// pt_pml4 temporarily supplies the identity PT for 2..4 MiB.
 /// PDPT[3] = PDPT itself (recursive, for 0xC0000000-0xFFFFFFFF)
 /// PDPT[4] = pt_pml4 (0xC0800000-0xC09FFFFF, PML4 region)
 /// PDPT[5] = pt_kernel (0xC0A00000-0xC0BFFFFF, low mem + kernel)
-/// Assumes kernel < 1MB (same as legacy mode)
+/// The kernel image including its boot pool may occupy up to BOOT_KERNEL_BYTES.
 ///
 pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: usize) {
     #[allow(static_mut_refs)]
     let kpages = unsafe { KERNEL_PAGES.pae() };
-    // Identity map using scratch as PD: scratch[0] = scratch (self-ref PT for 0-2MB),
-    // scratch[1] = pt_pml4 (PT for 2-4MB, temporarily borrowed)
+    // Reuse the existing bootstrap scratch and PML4 page for the original
+    // physical 0..4 MiB identity window; no additional per-core tables.
     let scratch_page = boot_phys_page(&scratch.0);
     let _ = replace_entry(&mut scratch[0], Entry64::new(scratch_page, true, false));
     let _ = replace_entry(&mut scratch[1], Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false));
     for i in 2..512 {
         let _ = replace_entry(&mut scratch[i], Entry64::new(i as u64, true, false));
     }
-    // pt_pml4 temporarily serves as identity PT for 2-4MB
     for i in 0..512 {
         let _ = replace_entry(&mut kpages.pt_pml4[i], Entry64::new((512 + i) as u64, true, false));
     }
-    // Note: page 0xF is preserved in remove_identity_mapping() for mode switching trampoline
 
     // Map low memory (first 1MB) at LOW_MEM_BASE (0xC0A00000)
     // PT index 0-255 maps physical 0x00000000-0x000FFFFF
@@ -1312,7 +1318,34 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
 /// 52-bit phys; the Blade 14's GOP framebuffer sits at 0x7C_0000_0000, which
 /// pre-paging 32-bit code cannot address at all). The boot life-sign strip is
 /// painted through this and the window is torn down again immediately.
+#[thread_local]
 static mut EARLY_FB_PD: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
+
+/// Map the startup sender's APIC without using the heap or frame allocator.
+/// AP stacks/TLS have priority: this consumes only the finished pool's tail.
+pub(crate) fn map_boot_mmio(va: usize, phys: u64) -> bool {
+    fn map<E: Entry>(entries: &mut [E], va: usize, phys: u64) -> bool {
+        let page = va / PAGE_SIZE;
+        let parent = parent_index::<E>(page);
+        if !entries[parent].present() {
+            let Ok(table) = crate::boot_mem::allocate_permanent(core::alloc::Layout::new::<RawPage>()) else { return false; };
+            unsafe { core::ptr::write_bytes(table, 0, PAGE_SIZE); }
+            let physical = (table as usize - KERNEL_BASE + KERNEL_PHYS) / PAGE_SIZE;
+            let _ = replace_entry(&mut entries[parent], E::new(physical as u64, true, false));
+            flush_tlb();
+        }
+        let mut entry = E::new(phys / PAGE_SIZE as u64, true, false);
+        entry.set_raw(entry.raw() | flags::CACHE_DISABLE);
+        let _ = replace_entry(&mut entries[page], entry);
+        true
+    }
+    let mapped = match entries() {
+        Entries::E32(e) => map(e, va, phys),
+        Entries::E64(e) => map(e, va, phys),
+    };
+    if mapped { flush_tlb(); }
+    mapped
+}
 
 /// Ensure the recursive page-table view can represent a kernel virtual range.
 pub(crate) fn prepare_kernel_mapping(vpage_start: usize, count: usize) {
@@ -1427,7 +1460,7 @@ pub fn enable_paging(scratch: *mut RawPage, kernel_phys: usize, kernel_pages: us
     // + the pt_kernel2/3 overflow tables = 5 MB, 1280 pages). Anything beyond
     // gets silently truncated by the `.min()` in enable_legacy/enable_pae and
     // page-faults at runtime. Trip a clear assert before that happens.
-    assert!(kernel_pages <= 256 + 1024,
+    assert!(kernel_pages <= BOOT_KERNEL_BYTES / PAGE_SIZE,
         "kernel too large: {} pages (>{} pages = 5 MB). Either shrink the \
          kernel or extend the mapping in enable_legacy/enable_pae with more \
          overflow page tables (PDE[772]+).",
@@ -1448,6 +1481,7 @@ pub fn enable_paging(scratch: *mut RawPage, kernel_phys: usize, kernel_pages: us
 
 /// Page-aligned BSS page whose PTE is repurposed to map arbitrary physical
 /// pages. Callers access it via `&mut TEMP_PAGE` after temp_swap.
+#[thread_local]
 static mut TEMP_PAGE: RawPage = RawPage([0; PAGE_SIZE]);
 
 /// Map a physical page at the temp mapping address. Returns the page
@@ -1724,7 +1758,9 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
 /// The boot SCRATCH page cannot be reused here: page-zero COW operations use
 /// it after startup, and a leaf PTE alone is ineffective once PDPT[0] has been
 /// removed by `finish_setup_paging`.
+#[thread_local]
 static mut TRAMPOLINE_PD: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
+#[thread_local]
 static mut TRAMPOLINE_PT: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 
 /// Identity-map the page holding `toggle_prot_compat` so the function can run
@@ -2190,14 +2226,13 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
         static _etext: u8;
         static _erodata: u8;
         static _data: u8;
-        static _end: u8;
     }
 
     let text_start = (&raw const _kernel_start) as usize;
     let text_end = (&raw const _etext) as usize;
     let rodata_end = (&raw const _erodata) as usize;
     let data_start = (&raw const _data) as usize;
-    let data_end = (&raw const _end) as usize;
+    let data_end = crate::boot_mem::end();
 
     let text_start_page = page_idx(text_start);
     let text_end_page = page_idx(text_end + PAGE_SIZE - 1);

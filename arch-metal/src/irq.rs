@@ -34,12 +34,17 @@ pub const MSI_SOURCE_COUNT: u8 = 8;
 /// Global IRQ event queue for discrete events (keyboard and device IRQs).
 /// Timer wakeups are coalesced; all entries retain their arrival timestamp.
 /// Hashing and entropy estimation happen later in the kernel event loop.
+#[thread_local]
 static mut QUEUE: Pipe<(Irq, u64), 256> = Pipe::new((Irq::Hw(0), 0));
 /// Coalesce periodic wakeups: IRQ0 says only that the kernel should resample
 /// its clock, never how many milliseconds elapsed.
+#[thread_local]
 static mut IRQ0_QUEUED: bool = false;
+#[thread_local]
 static IRQ0_HANDLED: AtomicU32 = AtomicU32::new(0);
+#[thread_local]
 static mut DRAIN_PROBE_PASSES: u32 = 0;
+#[thread_local]
 static mut IRQ0_GAP_PROBE: Irq0GapProbe = Irq0GapProbe {
     count: 0,
     last_ns: 0,
@@ -325,9 +330,11 @@ static mut HPET_REGISTER_OFFSET: usize = 0;
 const TIMER_POLL_LIMIT: u32 = 1_000_000;
 
 // false => x2APIC (MSR access); true after we map MMIO for the xAPIC path.
+#[thread_local]
 static mut LAPIC_X2: bool = false;
 /// Set once the LAPIC timer is the live tick source (so handle_irq routes the
 /// vector-0x20 EOI to the LAPIC instead of running the PIC ack dance).
+#[thread_local]
 static mut LAPIC_TIMER_ACTIVE: bool = false;
 
 pub fn lapic_timer_active() -> bool {

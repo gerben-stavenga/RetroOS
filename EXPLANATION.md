@@ -187,7 +187,7 @@ unsafe code and mutable global state.
 The most technically distinctive code is in:
 
 - [`arch-metal/src/paging2.rs`](arch-metal/src/paging2.rs)
-- [`kernel/src/arch/entry.asm`](kernel/src/arch/entry.asm)
+- [`arch-metal/src/entry.asm`](arch-metal/src/entry.asm)
 - [`arch-metal/src/traps.rs`](arch-metal/src/traps.rs)
 
 VM86 cannot execute while the processor is in long mode. RetroOS therefore

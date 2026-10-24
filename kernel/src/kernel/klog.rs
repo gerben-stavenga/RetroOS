@@ -8,7 +8,6 @@ use crate::kernel::vfs::{DirEntry, Filesystem, Vnode};
 
 const KLOG_HANDLE: u64 = 1;
 const KLOG_NAMES: [&[u8]; 2] = [b"klog", b"klog.txt"];
-static mut KLOG_BYTES: [u8; klog::DEFAULT_CAPACITY] = [0; klog::DEFAULT_CAPACITY];
 static SAVED_THROUGH: AtomicUsize = AtomicUsize::new(0);
 const LIVE_FILE_LIMIT: usize = 16 * 1024 * 1024;
 static LIVE_FILE_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -25,13 +24,10 @@ pub struct KLogFs;
 
 pub static KLOG_FS: KLogFs = KLogFs;
 
-/// Attach the kernel-owned static storage to the shared log machinery. Entry
-/// code calls this before installing its debug sink, so no heap is required
-/// and all subsequent boot messages are retained.
+/// Allocate the log ring once the heap is ready. Its backing storage lives
+/// for the kernel's lifetime; recording individual bytes never allocates.
 pub fn init() {
-    unsafe {
-        klog::init(&mut *core::ptr::addr_of_mut!(KLOG_BYTES));
-    }
+    klog::init(alloc::vec![0; klog::DEFAULT_CAPACITY].leak());
 }
 
 pub use klog::line;

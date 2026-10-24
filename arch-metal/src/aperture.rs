@@ -3,7 +3,8 @@
 //! The aperture is a fixed virtual window below the framebuffer.  It is
 //! remapped to one 64 KiB physical chunk at a time and is intentionally
 //! exposed only through copy operations, so callers cannot retain a pointer
-//! after the mapping changes.
+//! after the mapping changes. Mapping-cache and exclusion state are CPU-local,
+//! like the active page tables containing the aperture.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -23,9 +24,13 @@ const _: () = {
     assert!(APERTURE_PAGES == 16);
 };
 
+#[thread_local]
 static BUSY: AtomicBool = AtomicBool::new(false);
+#[thread_local]
 static MAPPED_VALID: AtomicBool = AtomicBool::new(false);
+#[thread_local]
 static MAPPED_LOW: AtomicU32 = AtomicU32::new(0);
+#[thread_local]
 static MAPPED_HIGH: AtomicU32 = AtomicU32::new(0);
 
 struct ApertureGuard;

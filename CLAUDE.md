@@ -50,7 +50,7 @@ backends — `arch-metal` (real CPU, `no_std`/Bazel) and `arch-interp` (Unicorn,
   - `arch-metal/src/phys_mm.rs` - Physical page allocator
   - `arch-metal/src/xhci.rs` - USB-HID boot keyboard; APIC/LAPIC bringup in `irq.rs`
 - `arch-interp/` - Hosted (Unicorn) arch backend: software CPU/MMU/paging/devices
-- `kernel/` - Ring-1 kernel (Rust); `kernel/src/arch/entry.asm` is the asm entry
+- `kernel/` - Ring-1 kernel (Rust); `arch-metal/src/entry.asm` is the asm entry
   - `kernel/src/kernel/thread.rs` - Process/thread, personalities, event dispatch
   - `kernel/src/kernel/sched.rs` - Scheduler
   - `kernel/src/kernel/heap.rs` - Kernel heap allocator
@@ -80,7 +80,7 @@ existing GRUB (`kernel.elf` is multiboot-loadable — see BOOTING.md).
 
 1. **MBR** (`boot/mbr.asm`) - Loads rest of bootloader from sector 1
 2. **Bootloader** (`boot/src/lib.rs`) - Switches to protected mode, sets up GDT, enables A20, reads kernel from TAR filesystem, verifies MD5
-3. **Kernel Entry** (`kernel/src/arch/entry.asm` + `kernel/src/lib.rs`) - Sets up paging, IDT, remaps PIC (or APIC bringup); fbcon console on a GOP framebuffer
+3. **Kernel Entry** (`arch-metal/src/entry.asm` + `kernel/src/lib.rs`) - Sets up paging, IDT, remaps PIC (or APIC bringup); fbcon console on a GOP framebuffer
 4. **Init Process** - Userland init/shell (DN + COMMAND.COM, from `C:\BOOT` on the mounted root) that can fork/exec ELF and DOS programs
 
 ### Memory Layout (Virtual)

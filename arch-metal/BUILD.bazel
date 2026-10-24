@@ -1,8 +1,17 @@
 # Build arch-metal crate (the bare-metal x86 `arch_abi::Arch` backend).
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rust_binary")
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:host_transition.bzl", "host_platform_test")
 
 package(default_visibility = ["//visibility:public"])
+
+# crt0-style startup object: consumers link this explicitly alongside the rlib
+# and supply boot_kernel plus the linker layout. It owns _start and trap entry.
+nasm_library(
+    name = "entry",
+    srcs = ["src/entry.asm"],
+    copts = ["-f", "elf32"],
+)
 
 rust_library(
     name = "arch-metal",
@@ -13,6 +22,7 @@ rust_library(
         "-Cpanic=abort",
         "-Crelocation-model=static",
         "-Cforce-frame-pointers=yes",
+        "-Ztls-model=local-exec",
     ],
     deps = ["//arch-abi", "//lib", "//lib:compact_fmt"],
 )
@@ -44,4 +54,32 @@ rust_test(
 host_platform_test(
     name = "phys_mm_test",
     test = ":phys_mm_test_host",
+)
+
+# Small allocation-owning consumer of the same BSP/AP entry ABI as the kernel.
+rust_binary(
+    name = "smp_example",
+    srcs = ["smp_example.rs"],
+    edition = "2024",
+    compile_data = ["//kernel:kernel_ld", ":entry"],
+    rustc_flags = [
+        "-Cpanic=abort", "-Crelocation-model=static",
+        "-Clink-self-contained=+linker", "-Clinker-flavor=ld.lld", "-Clinker=rust-lld",
+        "-Clink-arg=-T$(location //kernel:kernel_ld)",
+        "-Clink-arg=$(location :entry)", "-Clink-arg=-nostdlib", "-Clink-arg=-no-pie",
+    ],
+    deps = [":arch-metal", "//lib"],
+)
+
+rust_test(
+    name = "boot_mem_test_host",
+    srcs = ["boot_mem_test.rs", "src/boot_mem.rs"],
+    crate_root = "boot_mem_test.rs",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
+)
+
+host_platform_test(
+    name = "boot_mem_test",
+    test = ":boot_mem_test_host",
 )

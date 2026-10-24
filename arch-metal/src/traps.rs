@@ -83,12 +83,14 @@ const _: () = {
 /// memory. `REGS.space` tracks the current thread's address space (set at
 /// thread switch); it is not consulted by the memory API, which always hits
 /// the active page tables.
+#[thread_local]
 pub(crate) static mut REGS: Vcpu = Vcpu::new(Regs::empty(), paging2::RootPageTable::empty());
 
 // While Arch::execute is in flight, point directly at the event loop's
 // register object.  The ring-1 entry and ring-3 exit can then exchange their
 // physical trap frames with that object instead of bouncing the same 216-byte
 // register file through REGS.regs before and after every run.
+#[thread_local]
 static mut EXECUTE_REGS: *mut Regs = core::ptr::null_mut();
 
 pub(crate) fn set_execute_regs(regs: *mut Regs) {
@@ -127,10 +129,15 @@ pub mod arch_call {
     pub const MAP_SHARED_PAGES: u64 = 0x123; // EDX=guest vpage, ECX=kernel address, EBX=count
 }
 
+#[thread_local]
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[thread_local]
 static DEBUG_WATCH_ADDR0: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[thread_local]
 static DEBUG_WATCH_ADDR1: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[thread_local]
 static DEBUG_WATCH_USER_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[thread_local]
 static DEBUG_WATCH_KERNEL_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn debug_watch_value(addr: u32) -> u16 {
@@ -444,19 +451,26 @@ fn arch_switch_to(regs: &mut Regs) {
 #[unsafe(no_mangle)]
 #[allow(private_interfaces)]
 pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
+    #[thread_local]
     static mut VIF: bool = false;
+    #[thread_local]
     static mut VIP: bool = false;
+    #[thread_local]
     static mut USER_TF: bool = false;
+    #[thread_local]
     static mut FORCED_TF: bool = false;
+    #[thread_local]
     static mut PVI_POLICY: bool = false;
     // This handler is the sole owner of CR4.PVI. Keep its state here so the
     // overwhelmingly common trap path does not execute serializing CR4 reads.
+    #[thread_local]
     static mut PVI_ACTIVE: bool = false;
     // Per-thread virtual IOPL (EFLAGS bits 12-13), carried across the iret like
     // VIF/VIP. The run pins the *real* IOPL=1 (so CLI/STI/IN/OUT trap); this
     // stash holds the level the client is *treated* as having, so the dispatch
     // can read the launch policy back. 1 = spec-strict, 2 = learn/tag repair,
     // and 3 = always-step reference mode. The kernel is its single writer.
+    #[thread_local]
     static mut VIOPL: u8 = 1;
     // Read just enough raw fields to classify the trap before canonicalizing.
     // Same-priv (ring 0 → ring 0) traps don't push SS/ESP and never reach VM86

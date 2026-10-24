@@ -3,7 +3,7 @@
 //! Allocation-free debug-log ring shared by boot code and the kernel.
 //!
 //! The console layer feeds bytes here from its common stream. The kernel owns
-//! and attaches the large backing array, then supplies the DOS/VFS adapters
+//! and attaches the backing buffer, then supplies the DOS/VFS adapters
 //! that expose the retained bytes later.
 
 pub const DEFAULT_CAPACITY: usize = 128 * 1024;
@@ -103,8 +103,8 @@ impl KLog {
 
 static mut LOG: KLog = KLog::new();
 
-/// Attach caller-owned static storage and reset the log. Keeping the large
-/// array in the kernel entry avoids charging small `lib` users such as the
+/// Attach caller-owned lifetime-long storage and reset the log. Keeping the
+/// backing allocation in the kernel avoids charging small `lib` users such as the
 /// BIOS bootloader for a log they never expose.
 pub fn init(storage: &'static mut [u8]) {
     unsafe {

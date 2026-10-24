@@ -1,5 +1,6 @@
-; RetroOS Kernel Entry Assembly
-; Multiboot header, boot stub, interrupt entry points.
+; arch-metal startup object (linked directly into each consuming kernel).
+; Multiboot headers, boot stub, interrupt entry points.
+; The consumer supplies boot_kernel and the linker-defined stack symbols.
 ; Supports both 32-bit and 64-bit userspace with unified Regs struct.
 
 %ifidn __OUTPUT_FORMAT__,elf
@@ -12,15 +13,15 @@ section .note.GNU-stack noalloc noexec nowrite progbits
 ; Constants from linker script
 KERNEL_BASE equ 0xC0B00000
 KERNEL_PHYS equ 0x00100000
+KERNEL_TLS_SEL equ 0x91       ; GDT slot 18, DPL/RPL 1 (descriptors.rs)
 
 ; External symbols defined in Rust
 extern BOOT_GDT            ; boot GDT table (descriptors.rs)
 extern KERNEL_STACK_TOP    ; top of kernel stack (kernel.ld)
-extern ARCH_STACK          ; 64K-aligned trap-stack base (kernel.ld)
-extern boot_kernel         ; Rust entry point (arch/boot.rs)
-extern isr_handler         ; ISR dispatcher (arch/traps.rs)
-extern SYSCALL_USER_RSP    ; SYSCALL scratch slot (descriptors.rs)
-extern SYSCALL_KERNEL_RSP  ; SYSCALL kernel stack (descriptors.rs)
+extern boot_kernel         ; consumer-provided Rust entry point
+extern isr_handler         ; arch-metal ISR dispatcher (traps.rs)
+extern TLS_TEMPLATE, TLS_FILE_SIZE, TLS_SIZE
+extern BOOT_TLS_BASE, BOOT_TLS_TP
 
 ; =============================================================================
 ; Multiboot header (must be in first 8KB of binary)
@@ -107,6 +108,8 @@ section .text.boot
 ; -----------------------------------------------------------------------------
 global _start
 _start:
+    cli
+    cld
     ; We arrive here from the bootloader with paging off.
     ; ELF was loaded at KERNEL_PHYS but linked at KERNEL_BASE.
     ; BOOT_GDT's segments have base = KERNEL_PHYS - KERNEL_BASE so that
@@ -115,8 +118,7 @@ _start:
     ;
     ; Multiboot hands us: EAX = bootloader magic (0x2BADB002),
     ;                     EBX = physical pointer to multiboot info.
-    ; Neither is touched by anything below (we use DX for segment loads),
-    ; so we can push them straight into the boot_kernel call.
+    ; Preserve them as boot_kernel's arguments before initializing TLS.
 
     ; Load offset GDT — boot_gdtr/BOOT_GDT are at linked addresses,
     ; so we adjust to physical.
@@ -137,9 +139,31 @@ _start:
     mov esp, KERNEL_STACK_TOP
     xor ebp, ebp
 
-    ; Call boot_kernel(magic, info) — cdecl, push right-to-left
-    push ebx            ; arg 2: multiboot info pointer
-    push eax            ; arg 1: bootloader magic
+    ; Call boot_kernel(core_id, magic, info) — cdecl, push right-to-left
+    sub esp, 4          ; align the three-argument call
+    push ebx            ; arg 3: multiboot info pointer
+    push eax            ; arg 2: bootloader magic
+
+    ; DS/ES have the boot offset, so linked addresses work for both the
+    ; template and the BSP copy. GS gets the physical TP as its segment base,
+    ; but GS:0 contains the linked TP: Rust dereferences it through offset DS.
+    mov edi, BOOT_TLS_BASE
+    mov ecx, TLS_SIZE
+    xor eax, eax
+    rep stosb
+    mov esi, TLS_TEMPLATE
+    mov edi, BOOT_TLS_BASE
+    mov ecx, TLS_FILE_SIZE
+    rep movsb
+    mov dword [BOOT_TLS_TP], BOOT_TLS_TP
+    mov eax, BOOT_TLS_TP - KERNEL_BASE + KERNEL_PHYS
+    mov word [BOOT_GDT + (KERNEL_TLS_SEL & ~7) + 2], ax
+    shr eax, 16
+    mov byte [BOOT_GDT + (KERNEL_TLS_SEL & ~7) + 4], al
+    mov byte [BOOT_GDT + (KERNEL_TLS_SEL & ~7) + 7], ah
+    mov ax, KERNEL_TLS_SEL
+    mov gs, ax
+    push dword 0        ; arg 1: logical core ID (BSP)
     call boot_kernel
     ud2
 
@@ -147,7 +171,7 @@ _start:
 ; GDTR pointing at BOOT_GDT (defined in descriptors.rs)
 ; -----------------------------------------------------------------------------
 boot_gdtr:
-    dw 3 * 8 - 1                              ; limit (3 entries)
+    dw 19 * 8 - 1                             ; includes kernel TLS slot 18
     dd BOOT_GDT - KERNEL_BASE + KERNEL_PHYS   ; physical address of GDT
 
 ; -----------------------------------------------------------------------------
@@ -308,8 +332,12 @@ common_call:
     cmp ax, 0x48
     jne .flat_ss
     mov eax, 0x18
+    mov ds, eax
+    mov edx, KERNEL_TLS_SEL
+    mov gs, edx
+    mov edx, [gs:4]             ; CPU-local espfix stack window
     mov ss, eax
-    add esp, ARCH_STACK
+    add esp, edx
     jmp .data_segs
 .flat_ss:
     mov eax, 0x18
@@ -318,6 +346,7 @@ common_call:
     mov ds, eax
     mov es, eax
     mov fs, eax
+    mov eax, KERNEL_TLS_SEL
     mov gs, eax
 
     ; Call isr_handler(stack_ptr, from_64). cdecl: args right-to-left.
@@ -519,13 +548,18 @@ exit_interrupt_64:
 ; -----------------------------------------------------------------------------
 global syscall_entry_64
 syscall_entry_64:
-    ; Swap to kernel stack — save user RSP in scratch variable
-    mov [rel SYSCALL_USER_RSP], rsp
-    mov rsp, [rel SYSCALL_KERNEL_RSP]
+    ; The parked GS base points to this CPU's SyscallStack (descriptors.rs).
+    ; No user register or user-stack memory is needed to switch stacks.
+    swapgs
+    mov [gs:8], rsp
+    mov rsp, [gs:0]
 
     ; Build Frame64: SS, RSP, RFLAGS, CS, RIP (high address → low)
     push qword 0x2B            ; SS  = USER_DS  (0x28 | 3)
-    push qword [rel SYSCALL_USER_RSP] ; RSP = user stack pointer
+    push qword [gs:8]           ; RSP = user stack pointer
+    ; Restore the guest GS base before entry_wrapper_64 captures it. Normal
+    ; entry will load the kernel TLS selector before calling 32-bit Rust.
+    swapgs
     push r11                    ; RFLAGS (saved by SYSCALL)
     push qword 0x33            ; CS  = USER_CS64 (0x30 | 3)
     push rcx                    ; RIP (saved by SYSCALL)
@@ -614,3 +648,41 @@ save_fx_ret_ptr:
 restore_fx_ret_ptr:
     dd restore_fx_long_mode.back
     dw 0x08
+
+; SIPI image: copied to a caller-reserved page below 1 MiB. There are no
+; relocations within this image except the far jump into the kernel image.
+section .rodata.ap_trampoline align=16
+[bits 16]
+global ap_trampoline, ap_trampoline_end
+ap_trampoline:
+    cli
+    cld
+    mov ax, cs
+    mov ds, ax
+    lgdt [0x800]
+    mov esi, [0x808]            ; linked kernel stack top
+    mov ecx, [0x80c]            ; caller-assigned logical core ID
+    mov eax, cr0
+    or eax, 1
+    mov cr0, eax
+    jmp dword 0x08:ap_entry
+ap_trampoline_end:
+
+section .text.ap_entry
+[bits 32]
+ap_entry:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov ss, ax
+    mov ax, KERNEL_TLS_SEL
+    mov gs, ax
+    mov esp, esi
+    xor ebp, ebp
+    sub esp, 4
+    push dword 0               ; no Multiboot data on an AP
+    push dword 0
+    push ecx
+    call boot_kernel           ; same Rust entry, still paging off
+    ud2

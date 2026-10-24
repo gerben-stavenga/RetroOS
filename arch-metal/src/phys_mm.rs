@@ -129,30 +129,6 @@ pub fn get_ref_count(page: u64) -> u8 {
 #[allow(dead_code)]
 pub fn is_shared(page: u64) -> bool { matches!(get_ref_count(page), 2..=254) }
 
-/// Locate the kernel-owned ISA DMA buffers after the physical memory map is
-/// initialized. Their storage is part of the kernel image at 1 MB, so GRUB
-/// cannot fill the remaining low 16 MB with modules and starve Sound Blaster
-/// DMA. Kernel pages were marked used by `init_phys_mm` already.
-pub fn reserve_dma_regions() {
-    unsafe {
-        let bufs_va = core::ptr::addr_of!(DMA_BUFS_STORAGE) as usize;
-        DMA_BUFS_BASE = kernel_dma_page(
-            bufs_va,
-            DMA_BUFS_PAGES,
-            DMA_BUF_16BIT_PAGES,
-        );
-        // The normal kernel BSS mapping is write-back. The guest aliases
-        // these physical pages uncached for coherent ISA DMA; remove the
-        // unused BSS virtual mapping so the CPU never sees conflicting cache
-        // types. The physical pages remain owned by the kernel image.
-        if DMA_BUFS_BASE != 0 {
-            unmap_dma_storage(bufs_va, DMA_BUFS_PAGES);
-            debug_assert!((DMA_BUFS_BASE..DMA_BUFS_BASE + DMA_BUFS_PAGES)
-                .all(|page| get_ref_count(page as u64) == 1));
-        }
-    }
-}
-
 fn unmap_dma_storage(va: usize, pages: usize) {
     for page in 0..pages {
         crate::paging2::unmap_kernel_page(va + page * PAGE_SIZE);
@@ -176,30 +152,36 @@ fn kernel_dma_page(va: usize, pages: usize, alignment_pages: usize) -> usize {
 
 /// Largest physical page usable for ISA DMA (addresses are 24-bit, < 16 MB).
 const DMA_MAX_PAGE: usize = 0x100_0000 / PAGE_SIZE;
-/// Per-channel permanent ISA-DMA buffers. The 128 KB-aligned kernel BSS owns
-/// them before Multiboot modules are loaded. Layout: four 128 KB buffers for
-/// 16-bit channels, then four 64 KB buffers for 8-bit channels.
-const DMA_BUF_8BIT_PAGES: usize = 0x1_0000 / PAGE_SIZE;   // 64 KB
-const DMA_BUF_16BIT_PAGES: usize = 0x2_0000 / PAGE_SIZE;  // 128 KB
-const DMA_BUFS_PAGES: usize = 4 * DMA_BUF_16BIT_PAGES + 4 * DMA_BUF_8BIT_PAGES;
-#[repr(align(131072))]
-#[allow(dead_code)] // Guest mappings and the 8237 access these bytes by physical address.
-struct AlignedDmaBuffers([u8; DMA_BUFS_PAGES * PAGE_SIZE]);
-static mut DMA_BUFS_STORAGE: AlignedDmaBuffers = AlignedDmaBuffers([0; DMA_BUFS_PAGES * PAGE_SIZE]);
-/// First physical page of the per-channel buffer block (0 = unavailable).
-static mut DMA_BUFS_BASE: usize = 0;
+// Physical pages of lazily allocated channel buffers. usize::MAX serializes
+// first allocation; trap entry has IRQs disabled, so a same-CPU interrupt
+// cannot reenter while its slot is being initialized.
+use core::sync::atomic::{AtomicUsize, Ordering};
+static DMA_CHANNELS: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 
-/// Physical page number of DMA channel `ch`'s permanent buffer (0 = none).
-/// 16-bit channels (4-7) occupy the front of the block, 8-bit (0-3) after.
+/// Physical page of a channel's permanent low-memory buffer (0 if unavailable).
+/// AP stack/TLS reservations must be finished first. Allocate only channels
+/// actually requested; the entire shared pool remains loader-reserved.
 pub fn dma_channel_buf(ch: usize) -> u64 {
-    let base = unsafe { DMA_BUFS_BASE };
-    if base == 0 || ch >= 8 { return 0; }
-    let off = if ch >= 4 {
-        (ch - 4) * DMA_BUF_16BIT_PAGES
-    } else {
-        4 * DMA_BUF_16BIT_PAGES + ch * DMA_BUF_8BIT_PAGES
+    let Some(slot) = DMA_CHANNELS.get(ch) else { return 0; };
+    loop {
+        let page = slot.load(Ordering::Acquire);
+        if page == usize::MAX { core::hint::spin_loop(); continue; }
+        if page != 0 { return page as u64; }
+        if slot.compare_exchange(0, usize::MAX, Ordering::Acquire, Ordering::Relaxed).is_ok() { break; }
+    }
+    let bytes = if ch >= 4 { 128 * 1024 } else { 64 * 1024 };
+    let Ok(storage) = crate::boot_mem::allocate_permanent(Layout::from_size_align(bytes, bytes).unwrap()) else {
+        slot.store(0, Ordering::Release);
+        return 0;
     };
-    (base + off) as u64
+    let page = kernel_dma_page(storage as usize, bytes / PAGE_SIZE, bytes / PAGE_SIZE);
+    assert_ne!(page, 0, "boot pool violates ISA DMA address constraints");
+    // The driver maps these frames uncached. Remove the ordinary cached alias;
+    // physical ownership stays with the pool, already reserved as kernel BSS.
+    unmap_dma_storage(storage as usize, bytes / PAGE_SIZE);
+    debug_assert!((page..page + bytes / PAGE_SIZE).all(|p| get_ref_count(p as u64) == 1));
+    slot.store(page, Ordering::Release);
+    page as u64
 }
 
 /// Allocate physically contiguous DMA memory from the general pool.

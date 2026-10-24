@@ -81,6 +81,7 @@ pub fn fpu_pop() {
 
 /// Clean FPU template captured at boot after `fninit` — used to seed new
 /// threads so they don't inherit stale FPU state from whoever ran before.
+#[thread_local]
 static mut CLEAN_FX: FxState = FxState::zeroed();
 
 /// Capture the current (just-initialized) FPU state as the template for new
@@ -214,9 +215,16 @@ pub fn rdtsc() -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-/// Execute CPUID instruction
+/// Execute CPUID with subleaf zero.
 #[inline]
 pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
+    cpuid_count(leaf, 0)
+}
+
+/// Execute CPUID with an explicit ECX subleaf. Returns zeros on CPUs without
+/// CPUID, so this is also usable during early boot before installing an IDT.
+#[inline]
+pub fn cpuid_count(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     // A 386 and early 486 have no CPUID. The EFLAGS ID bit is writable only
     // when CPUID exists; probing it avoids a #UD before the IDT is installed.
     let id_changed: u32;
@@ -250,12 +258,37 @@ pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
             "cpuid",
             inout("eax") leaf => eax,
             lateout("ebx") ebx,
-            lateout("ecx") ecx,
+            inout("ecx") subleaf => ecx,
             lateout("edx") edx,
             options(nomem, nostack),
         );
     }
     (eax, ebx, ecx, edx)
+}
+
+/// Hardware APIC ID of the executing logical processor (including SMT threads).
+/// IDs may be sparse; this is neither a dense core index nor a BSP indicator.
+/// Does not need paging, TLS, or a mapped/enabled local APIC. Returns `None`
+/// when CPUID or a local APIC is unavailable. The legacy fallback is 8 bits.
+pub fn current_apic_id() -> Option<u32> {
+    let max = cpuid(0).0;
+    if max < 1 {
+        return None;
+    }
+    let (_, legacy_id, _, features) = cpuid(1);
+    if features & (1 << 9) == 0 {
+        return None;
+    }
+    for leaf in [0x1f, 0x0b] {
+        if max >= leaf {
+            let (_, count, _, id) = cpuid_count(leaf, 0);
+            // A maximum leaf alone does not establish topology-leaf support.
+            if count & 0xffff != 0 {
+                return Some(id);
+            }
+        }
+    }
+    Some(legacy_id >> 24)
 }
 
 /// CR4 flags
@@ -627,8 +660,9 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
 ///
 /// # Safety
 ///
-/// The caller must ensure both selectors reference valid descriptors in the
-/// active GDT; the far return reloads CS, so a bad `code_selector` faults.
+/// The caller must ensure both selectors and KERNEL_TLS_SEL reference valid
+/// descriptors in the active GDT. All bases must describe the same linked
+/// address space before returning to Rust. The far return reloads CS.
 #[inline]
 pub unsafe fn reload_segments(data_selector: u16, code_selector: u16) {
     unsafe {
@@ -636,7 +670,7 @@ pub unsafe fn reload_segments(data_selector: u16, code_selector: u16) {
             "mov ds, {0:x}",
             "mov es, {0:x}",
             "mov fs, {0:x}",
-            "mov gs, {0:x}",
+            "mov gs, {tls:x}",
             "mov ss, {0:x}",
             // Far jump to reload CS
             "push {1:e}",
@@ -647,7 +681,16 @@ pub unsafe fn reload_segments(data_selector: u16, code_selector: u16) {
             in(reg) data_selector,
             in(reg) code_selector as u32,
             lateout(reg) _,
-            options(nostack),
+            tls = in(reg) crate::descriptors::KERNEL_TLS_SEL,
         );
     }
+}
+
+/// Linked address of the CPU's TLS thread pointer. Valid from the first Rust
+/// instruction: entry.asm initializes GS and its self-pointer before calling us.
+#[inline]
+pub(crate) fn thread_pointer() -> u32 {
+    let pointer: u32;
+    unsafe { asm!("mov {0:e}, gs:[0]", out(reg) pointer, options(nostack, readonly, preserves_flags)); }
+    pointer
 }

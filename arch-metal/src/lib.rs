@@ -7,7 +7,25 @@
 //! *entry* (`boot.rs`, which calls `kernel::startup`) lives kernel-side and
 //! drives the bring-up functions this crate exposes.
 
+//! CPU-local runtime state uses Rust `#[thread_local]` with ELF local-exec TLS.
+//! The startup object copies `.tdata`, zeroes `.tbss`, and sets GS before the
+//! first Rust call. GS:0 contains the linked thread pointer, even under the
+//! initial offset segments. GS:4 holds the espfix trap-stack window base.
+//! Descriptor setup changes GS's base from physical
+//! to virtual together with DS/CS; the Rust-visible pointer never changes.
+//! Interrupt entry saves the interrupted GS and installs kernel TLS before
+//! Rust; return restores the guest selector or 64-bit base. `SYSCALL` uses a
+//! separate CPU-local stack pair through IA32_KERNEL_GS_BASE before common entry.
+//!
+//! The BSP copy is reserved by the linker using TLS_SIZE/TLS_ALIGN. `smp` starts
+//! secondary CPUs using caller-allocated boot memory and the common Rust entry.
+//! Device state, the physical
+//! allocator and clock-extension state remain shared and still need an SMP
+//! synchronization design. Live TLS must only be accessed by its owning CPU;
+//! the BSP initializes each AP copy before sending its startup IPI.
+
 #![no_std]
+#![feature(thread_local)]
 
 extern crate alloc;
 
@@ -20,6 +38,8 @@ pub mod irq;
 pub mod monitor;
 pub mod aperture;
 pub mod acpi;
+pub mod smp;
+pub mod boot_mem;
 pub mod paging2;
 pub mod phys_mm;
 mod traps;
@@ -32,6 +52,7 @@ pub mod xhci;
 
 /// Scratch / zero page frames the paging bring-up uses.
 pub static ZERO_PAGE: paging2::RawPage = unsafe { core::mem::zeroed() };
+#[thread_local]
 pub static mut SCRATCH: paging2::RawPage = unsafe { core::mem::zeroed() };
 
 // Kernel-stack guard linker symbol (defined in `kernel.ld`); the `#PF` handler
@@ -142,7 +163,7 @@ pub fn halt_forever() -> ! {
 
 // TODO: migrate to arch calls
 pub use x86::{inb, outb, inw, outw, inl, outl, insw, outsw};
-pub use x86::rdtsc;
+pub use x86::{rdtsc, current_apic_id};
 pub use x86::{FxState, clean_fx_template};
 pub use irq::{now, drain};
 

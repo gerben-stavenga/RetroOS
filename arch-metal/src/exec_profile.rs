@@ -3,7 +3,9 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use arch_abi::{ExecutionProfile, ExecutionProfileStage};
 
+#[thread_local]
 static ENABLED: AtomicBool = AtomicBool::new(false);
+#[thread_local]
 static mut PROFILE: ExecutionProfile = ExecutionProfile {
     calls: 0,
     ring1: 0,
@@ -20,6 +22,7 @@ static mut PROFILE: ExecutionProfile = ExecutionProfile {
     bridge_out: 0,
     decode: 0,
 };
+#[thread_local]
 static mut LAST: u64 = 0;
 
 #[inline]

@@ -3,17 +3,15 @@
 //! Mirror of `arch-interp`'s `Interp`: every method delegates to the existing
 //! ring-0 surface (the `int 0x80` call wrappers in `calls.rs`, the `x86`
 //! primitives, the timer/IRQ queue in `irq.rs`, the descriptor/monitor helpers).
-//! Threading `&mut Metal` through the kernel — and folding the `REGS`/timer
-//! statics into it — is the later stage; defining the impl now keeps the two
-//! backends symmetric against the shared `trait Arch`.
+//! CPU execution state lives in arch-owned Rust TLS. The handle addresses the
+//! current CPU; it does not own or synchronize the remaining shared devices.
 
 use super::paging2::RootPageTable;
 use super::x86::FxState;
 use arch_abi::{Arch, ExecutionProfile, ExecutionProfileStage, Irq, KernelEvent, Regs, Vcpu};
 
-/// The bare-metal backend handle. Zero-sized today (state lives in module
-/// statics — `traps::REGS`, the timer/IRQ queue); it gains fields as those
-/// globals migrate into it.
+/// Zero-sized handle to the current CPU. Trap state and its IRQ event queue
+/// live in CPU-local TLS; machine-wide resources remain shared.
 pub struct Metal;
 
 impl Arch for Metal {
@@ -31,10 +29,10 @@ impl Arch for Metal {
     fn outl(&mut self, port: u16, val: u32) { super::x86::outl(port, val) }
     // ── Execution & scheduling ──
     //
-    // Metal keeps the live frame in `traps::REGS` (the int-0x80 trap save area).
+    // Metal keeps the live frame in CPU-local `traps::REGS`.
     // Bridge the loop-owned `Vcpu` to it around each call; the bridge copy is the
     // register file only (~200 B) — the address space / CR3 is touched only at
-    // switch. (The internal frame goes away when the globals migrate into `Metal`.)
+    // switch.
     // `&mut *(&raw mut REGS)` is the deliberate `&raw`-first form that avoids a
     // `static_mut_refs` reference; clippy's `deref_addrof` "simplification"
     // would reintroduce exactly that, so allow it here.

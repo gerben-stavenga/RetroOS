@@ -44,7 +44,6 @@ const MULTIBOOT2_BOOTLOADER_MAGIC: u32 = 0x36D7_6289;
 // Linker symbols
 unsafe extern "C" {
     static _kernel_start: u8;
-    static _end: u8;
 }
 
 /// Physical address P is reachable pre-paging at P + (KERNEL_BASE -
@@ -230,12 +229,19 @@ unsafe fn capture_boot_info_v2(
 ///
 /// Runs with offset segments (base = KERNEL_PHYS - KERNEL_BASE) so linked
 /// addresses access physical memory correctly. Paging is off on entry.
-/// Stack is already set to KERNEL_STACK by the asm stub.
+/// Assembly has installed this core's stack and TLS. `core_id == 0` is the BSP;
+/// APs receive caller-assigned nonzero IDs and do only CPU-local initialization.
 ///
 /// `magic` is the Multiboot bootloader magic (EAX on entry).
 /// `info` is a Multiboot info pointer (physical address, in low memory).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const u8) -> ! {
+pub unsafe extern "C" fn boot_kernel(core_id: u32, magic: u32, info: *const u8) -> ! {
+    if core_id != 0 {
+        unsafe {
+            arch::smp::init_core(core_id);
+            arch::smp::run_secondary();
+        }
+    }
     let config = unsafe { prepare_boot(magic, info) };
 
     // The arch backend handle, threaded as `&mut` through the kernel from here
@@ -268,36 +274,20 @@ unsafe fn prepare_boot(
         unsafe { capture_boot_info(magic, info, &mut mmap_buf, &mut boot_cmdline) };
     let info = &boot_info;
 
-    let kernel_size =
-        core::ptr::addr_of!(_end) as usize - core::ptr::addr_of!(_kernel_start) as usize
-    ;
-    let kernel_pages = kernel_size.div_ceil(PAGE_SIZE);
-
-    // Enable paging (auto-detects Legacy vs PAE)
-    // With offset segments, linked pointers work directly — no delta adjustment needed
-    paging2::enable_paging(
-        &raw mut arch::SCRATCH,
-        KERNEL_PHYS,
-        kernel_pages,
-    );
-
-    // Leave offset segments before touching runtime globals. Their physical
-    // addresses can lie beyond the temporary low-4-MiB identity mapping as
-    // the kernel grows; the kernel's high mapping covers the entire image.
-    let arch_stack_top = (&raw const crate::ARCH_STACK_TOP) as u32 - 16;
-    descriptors::setup_descriptor_tables(arch_stack_top);
-    descriptors::setup_syscall();
+    // The complete pool is loader-reserved and mapped by minimal arch setup.
+    unsafe { arch::smp::init_core(0); }
+    let boot_memory = unsafe { arch::boot_mem::BootMemory::new() };
+    // Reserve all selected AP stacks/TLS here, finish, then start the APs.
+    boot_memory.finish();
+    let kernel_size = arch::boot_mem::end() - (&raw const _kernel_start) as usize;
 
     // The text aperture moves with paging: point the terminal at the mapped
     // low-memory B8000 before anything prints. Its grid comes along, so what
     // the bootloader already put on screen survives the move.
     lib::term::term().set_aperture(Some(LOW_MEM_BASE + 0xB8000));
 
-    // The shared log ring uses kernel-owned static storage, so it is available
-    // before the heap and captures the interrupt/device bring-up below.
-    crate::kernel::klog::init();
-
-    // Install the kernel's metal log sink before any normal startup output.
+    // Early diagnostics go straight to the platform sink. The retained log
+    // ring is allocated below, once the heap and physical allocator are ready.
     lib::log::set_debug_sink(log_byte);
     lib::log::set_fatal_handler(fatal_finish);
     let (_, _, _, cpu_features) = x86::cpuid(1);
@@ -368,7 +358,6 @@ unsafe fn prepare_boot(
     crate::multiboot::reserve_modules(&boot_modules_raw, |start, end| {
         phys_mm::mark_reserved(start, end)
     });
-    phys_mm::reserve_dma_regions();
     lib::compact_println!(
         "ISA DMA: reserved buffer pages ch1={:#x} ch5={:#x}",
         phys_mm::dma_channel_buf(1), phys_mm::dma_channel_buf(5),
@@ -379,6 +368,7 @@ unsafe fn prepare_boot(
     // so the demand-paged heap can safely be enabled here.
     ALLOCATOR.init_with_release(arch::heap_base(), arch::HEAP_END, Some(arch::release_heap_pages));
     phys_mm::complete_initialization();
+    crate::kernel::klog::init();
     arch::aperture::init();
 
     let boot_modules = crate::multiboot::handoff_modules(boot_modules_raw);

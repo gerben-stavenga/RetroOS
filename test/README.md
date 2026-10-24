@@ -57,6 +57,10 @@ count, non-overlapping DMA regions, allocation failure, and BIOS ownership
 handoff. `//arch-metal:phys_mm_test` covers the RAM bitmap, shared refcounts,
 firmware holes, contiguous allocations, and bootstrap metadata.
 
+`python3 test/arch_tls.py` checks guest FS/GS restoration across syscalls and
+timer interrupts under legacy paging, PAE, and a 64-bit guest with a GS base
+above 4 GiB. Add `--kvm` to run the 32/64-bit cases on hardware.
+
 `python3 test/physical_memory.py` touches and releases 300 MiB twice under
 legacy paging, PAE, and a 64-bit client. The latter two give QEMU only 128 MiB
 below 4 GiB, so the probe must use high physical RAM.
@@ -91,3 +95,12 @@ Hosted tests that need writable fixture files use `test/disk_fixture.py`.
 It creates a private ext4 disk with explicit BOOT.INI mounts and copies guest
 changes back after exit. This requires `mkfs.ext4` and `debugfs`; it does not
 mount a host directory inside the kernel. Live network-sharing tests use SMB.
+
+`python3 test/arch_smp.py` boots the small `//arch-metal:smp_example` kernel on
+four CPUs in legacy and PAE modes. It checks the common BSP/AP Rust entry,
+initialized/zeroed and isolated TLS, dynamically allocated stacks, private GDTs
+and page roots, and reuse of the low-memory trampoline after acknowledgement.
+AP stacks/TLS are allocated first from the final BSS pool, then ISA DMA
+buffers use the remaining space. The full image leaves 128 KiB below physical
+4 MiB, and ordinary heap/physical allocations stay outside the pool.
+Add `--kvm` to exercise xAPIC and x2APIC startup with hardware virtualization.
