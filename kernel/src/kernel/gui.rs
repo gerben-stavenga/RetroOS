@@ -677,8 +677,9 @@ pub struct WindowManager {
     desktop: Desktop,
     composed: Vec<u8>,
     osd_pixels: Vec<u8>,
+    osd_paint: Option<crate::kernel::osd::PaintList>,
     osd_rect: Option<Rect>,
-    osd_geometry: Option<(usize, usize, vga::PixelFormat)>,
+    osd_geometry: Option<(usize, usize, vga::PixelFormat, bool)>,
     focused: Option<WindowId>,
     presentation: Presentation,
     modes: Vec<(WindowId, WindowMode)>,
@@ -702,6 +703,7 @@ impl WindowManager {
             desktop: Desktop::new(),
             composed: Vec::new(),
             osd_pixels: Vec::new(),
+            osd_paint: None,
             osd_rect: None,
             osd_geometry: None,
             focused,
@@ -855,6 +857,7 @@ impl WindowManager {
         scale_y: usize,
         format: vga::PixelFormat,
         sound: crate::kernel::osd::SoundView,
+        resident: bool,
     ) {
         const OSD_ENDPOINT: EndpointId = EndpointId(u32::MAX);
         const OSD_SURFACE: SurfaceKey = SurfaceKey(u64::MAX);
@@ -862,7 +865,7 @@ impl WindowManager {
         if width == 0 || height == 0 {
             return;
         }
-        let geometry = (width, height, format);
+        let geometry = (width, height, format, resident);
         let repaint = crate::kernel::osd::take_repaint_request();
         let open = crate::kernel::osd::is_open();
         let frontmost = self.desktop.bindings
@@ -881,18 +884,23 @@ impl WindowManager {
             self.osd_pixels.clear();
             self.osd_rect = crate::kernel::osd::window_size(width, height, scale_y, sound)
                 .map(|(panel_width, panel_height)| {
-                    self.osd_pixels.resize(panel_width * panel_height * step, 0);
-                    crate::kernel::osd::paint(
-                        &mut self.osd_pixels,
-                        panel_width * step,
-                        panel_width,
-                        panel_height,
-                        width,
-                        height,
-                        scale_y,
-                        format,
-                        sound,
-                    );
+                    if resident {
+                        self.osd_paint = Some(crate::kernel::osd::paint_list(
+                            panel_width, panel_height, width, height, scale_y, format, sound));
+                    } else {
+                        self.osd_pixels.resize(panel_width * panel_height * step, 0);
+                        crate::kernel::osd::paint(
+                            &mut self.osd_pixels,
+                            panel_width * step,
+                            panel_width,
+                            panel_height,
+                            width,
+                            height,
+                            scale_y,
+                            format,
+                            sound,
+                        );
+                    }
                     Rect::new(
                         ((width - panel_width) / 2) as i32,
                         ((height - panel_height) / 2) as i32,
@@ -2622,8 +2630,12 @@ mod tests {
         let resolve = |owner, _| PixelBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE,
             if owner == WINDOWS { &live } else { &retained }).ok();
         let expected = manager.compose_processes(resolve, 4, 1, vga::PixelFormat::NATIVE).unwrap().pixels.to_vec();
-        let snapshot = manager.snapshot_processes(|owner, _| PixelBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE,
+        let mut resident = None;
+        manager.publish_processes(&mut resident, |owner, _| PixelBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE,
             if owner == WINDOWS { &live } else { &retained }).ok(), Some(WINDOWS), vga::PixelFormat::NATIVE);
+        manager.publish_processes(&mut resident, |_, _| panic!("unchanged producers must not be sampled"),
+            Some(WINDOWS), vga::PixelFormat::NATIVE);
+        let mut snapshot = resident.unwrap();
         retained.fill(0);
         let mut output = vec![0; 16];
         snapshot.render(PixelBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE, &live).ok(),
@@ -2662,9 +2674,11 @@ mod tests {
 }
 
 
-/// Owned scene and source snapshots. Built by the guest core, consumed without
-/// allocation by the media core. The live VGA surface is decoded there too.
-pub(crate) struct CompositionSnapshot {
+/// Persistent renderer state. Scene transactions and producer publications
+/// update it; rendering never asks the producer to rebuild a frame.
+/// OSD pixels are painted here from an owned list of text/rectangle commands.
+pub(crate) struct ResidentScene {
+    revision: u64,
     scene: Scene,
     sources: Vec<SnapshotSource>,
     live: Option<SurfaceId>,
@@ -2675,11 +2689,12 @@ pub(crate) struct CompositionSnapshot {
 struct SnapshotSource {
     id: SurfaceId, width: usize, height: usize, stride: usize,
     format: vga::PixelFormat, pixels: Vec<u8>,
+    paint: Option<crate::kernel::osd::PaintList>,
 }
 impl SnapshotSource {
     fn new(id: SurfaceId, source: PixelBuffer<'_>) -> Self {
         Self { id, width: source.width, height: source.height, stride: source.stride,
-            format: source.format, pixels: source.pixels.to_vec() }
+            format: source.format, pixels: source.pixels.to_vec(), paint: None }
     }
     fn buffer(&self) -> PixelBuffer<'_> {
         PixelBuffer { width: self.width, height: self.height, stride: self.stride,
@@ -2687,42 +2702,78 @@ impl SnapshotSource {
     }
 }
 impl WindowManager {
-    pub(crate) fn snapshot_processes<'a>(
-        &mut self,
+    pub(crate) fn publish_processes<'a>(
+        &mut self, resident: &mut Option<ResidentScene>,
         resolve: impl Fn(EndpointId, SurfaceKey) -> Option<PixelBuffer<'a>>,
         live_owner: Option<EndpointId>, format: vga::PixelFormat,
-    ) -> CompositionSnapshot {
+    ) {
         let desktop = &mut self.desktop;
-        let mut sources = Vec::new();
-        let mut live = None;
+        let scene = resident.get_or_insert_with(|| ResidentScene {
+            revision: desktop.revision.wrapping_sub(1), scene: Scene::default(), sources: Vec::new(),
+            live: None, switcher: None, focused: None, pointer: None,
+        });
+        if scene.revision != desktop.revision {
+            scene.scene.clone_from(&desktop.scene);
+            scene.revision = desktop.revision;
+        }
+        let live = desktop.surfaces.iter().find(|s|
+            Some(s.owner) == live_owner && s.key == SurfaceKey(2)).map(|s| s.id);
+        scene.sources.retain(|s| Some(s.id) != live && desktop.surfaces.iter().any(|d| d.id == s.id));
         for surface in &desktop.surfaces {
-            if Some(surface.owner) == live_owner && surface.key == SurfaceKey(2) {
-                live = Some(surface.id);
-            } else if surface.owner == EndpointId(u32::MAX) && surface.key == SurfaceKey(u64::MAX) {
-                if crate::kernel::osd::is_open()
-                    && let Some(rect) = self.osd_rect
-                    && let Ok(buffer) = PixelBuffer::new(rect.width as usize, rect.height as usize,
-                        rect.width as usize * usize::from(format.bytes_per_pixel), format, &self.osd_pixels)
-                { sources.push(SnapshotSource::new(surface.id, buffer)); }
+            if Some(surface.id) == live { continue; }
+            let index = scene.sources.iter().position(|s| s.id == surface.id);
+            // A surface publication transfers the producer's latest contents.
+            // Unchanged retained surfaces already belong to the renderer.
+            if !surface.dirty && index.is_some() { continue; }
+            if surface.owner == EndpointId(u32::MAX) && surface.key == SurfaceKey(u64::MAX) {
+                if !crate::kernel::osd::is_open() { continue; }
+                let Some(rect) = self.osd_rect else { continue; };
+                let Some(paint) = self.osd_paint.take() else { continue; };
+                let index = index.unwrap_or_else(|| {
+                    scene.sources.push(SnapshotSource { id: surface.id, width: 0, height: 0,
+                        stride: 0, format, pixels: Vec::new(), paint: None });
+                    scene.sources.len() - 1
+                });
+                let source = &mut scene.sources[index];
+                source.width = rect.width as usize;
+                source.height = rect.height as usize;
+                source.stride = source.width * usize::from(format.bytes_per_pixel);
+                source.format = format;
+                source.pixels.resize(source.stride * source.height, 0);
+                source.paint = Some(paint);
             } else if let Some(buffer) = resolve(surface.owner, surface.key) {
-                sources.push(SnapshotSource::new(surface.id, buffer));
+                if let Some(index) = index {
+                    let source = &mut scene.sources[index];
+                    source.width = buffer.width; source.height = buffer.height;
+                    source.stride = buffer.stride; source.format = buffer.format;
+                    source.pixels.resize(buffer.pixels.len(), 0);
+                    source.pixels.copy_from_slice(buffer.pixels);
+                } else {
+                    scene.sources.push(SnapshotSource::new(surface.id, buffer));
+                }
             }
         }
-        let switcher = match (self.switcher_active, self.switcher_highlighted,
+        scene.live = live;
+        scene.switcher = match (self.switcher_active, self.switcher_highlighted,
             self.switcher_node, self.switcher_target) {
             (Some(active), Some(highlighted), Some(node), Some(target)) =>
                 Some(SwitcherComposition { active, highlighted, node, target }),
             _ => None,
         };
-        let result = CompositionSnapshot { scene: desktop.scene.clone(), sources, live,
-            switcher, focused: desktop.focused(), pointer: desktop.pointer };
+        scene.focused = desktop.focused();
+        scene.pointer = desktop.pointer;
         desktop.finish_damage();
-        result
     }
 }
-impl CompositionSnapshot {
-    pub(crate) fn render(&self, live: Option<PixelBuffer<'_>>, width: usize, height: usize,
+
+impl ResidentScene {
+    pub(crate) fn render(&mut self, live: Option<PixelBuffer<'_>>, width: usize, height: usize,
         format: vga::PixelFormat, output: &mut Vec<u8>) {
+        for source in &mut self.sources {
+            if let Some(paint) = &source.paint {
+                paint.render(&mut source.pixels, source.width, source.height, source.format);
+            }
+        }
         let resolve = |id| {
             if self.live == Some(id) { live }
             else { self.sources.iter().find(|s| s.id == id).map(SnapshotSource::buffer) }

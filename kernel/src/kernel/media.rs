@@ -293,6 +293,7 @@ impl<T: Send + 'static> AudioService<T> {
         service
     }
     pub fn lock(&self) -> Guard<'_, T> { self.state.lock() }
+    pub fn try_lock(&self) -> Option<Guard<'_, T>> { self.state.try_lock() }
 }
 static AUDIO_DUE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static AUDIO_POLL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -326,6 +327,13 @@ impl<T: Send + 'static> VideoService<T> {
     }
     pub fn try_lock(&self) -> Option<Guard<'_, T>> { self.state.try_lock() }
     pub fn activate(&self) {
+        if !enabled() {
+            if (self.due)() && let Some(mut state) = self.state.try_lock() {
+                (self.poll)(&mut state);
+            }
+            return;
+        }
+
         let argument = &*self.state as *const Shared<T> as usize;
         if VIDEO_OWNER.load(Ordering::Acquire) == argument { return; }
         unsafe fn invoke<T>(argument: usize) {

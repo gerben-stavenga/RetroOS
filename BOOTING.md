@@ -20,18 +20,25 @@ an unavailable device lock defers per-slice service without losing timer time.
 The output log reports `core 1: sink: first frame played`.
 
 Rendering is also a persistent service, paced at 70 Hz for virtual VGA and
-60 Hz for Voodoo. Core 0 captures raw guest VRAM and scene inputs into resident
-snapshots; core 1 decodes, composes, scales and presents them. A busy renderer
-causes core 0 to skip publication and try again on a later kernel exit, rather
-than wait for the frame. Missed refreshes are dropped. Mode changes fence
-rendering before replacing mappings. Banked BIOS presentation remains on core 0.
-The log reports `core 1: Video service: rendering at 70 Hz` for VGA.
+60 Hz for Voodoo. Core 1 samples resident VGA memory into its own preallocated
+scratch, then decodes, composes, scales and presents it. Core 0 publishes VGA
+register changes, scene transactions and producer surface updates; it does not
+construct a new frame for each refresh. The renderer retains background surfaces
+and paints OSD text/rectangle commands into its own pixels. Every refresh still
+renders the complete picture, including continuously changing screens.
+
+A short memory gate excludes guest slices and kernel writes while core 1 samples
+VRAM. The gate is released before decoding, OSD painting or presentation. Mode
+and owner changes invalidate old VRAM descriptors and fence output mapping changes.
+Single-core linear output uses the same renderer inline. Banked BIOS presentation
+remains on core 0. The log reports
+`core 1: Video service: rendering at 70 Hz` for VGA.
 
 Voodoo writes use an ordered, bounded command ring. Rasterization runs on core 1;
 reads fence pending commands, and a full ring applies producer backpressure.
 Graphics checks audio between rows or small copy chunks. Worker callbacks use
 resident kernel buffers and do not allocate, free pages, access guest mappings
-or invoke BIOS calls. Core 0 allocates snapshot and output storage. Each job or
+or invoke BIOS calls. Core 0 allocates resident source and output storage. Each job or
 due service refreshes the worker's kernel root and TLB before accessing published
 storage. Idle polling does not flush the TLB. The worker polls rather than
 sleeping; PIT interrupts remain on core 0.

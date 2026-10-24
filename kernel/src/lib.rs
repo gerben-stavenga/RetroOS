@@ -14,7 +14,7 @@
 
 #![no_std]
 #![feature(optimize_attribute)]
-#![cfg_attr(target_arch = "x86", feature(thread_local))]
+#![feature(thread_local)]
 
 extern crate alloc;
 

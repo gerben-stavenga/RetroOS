@@ -1,9 +1,9 @@
 //! Putting the machine's picture on the machine's display.
 //!
-//! The emulated VGA and Voodoo produce process-owned pixels; `platform` says
-//! what this machine can actually show them on. This is where those meet: when
-//! a frame is due, scan the current owner's video into its retained surface.
-//! The event-loop compositor combines that surface with other windows.
+//! The emulated VGA and Voodoo produce process-owned pictures; `platform`
+//! describes the sink. Linear output binds a resident renderer to the device:
+//! the guest core publishes register changes, never a frame on each refresh.
+//! Hosted and banked sinks retain their synchronous presentation paths.
 //!
 //! Kernel work, not machine work, which is why it is here and not beside the
 //! cards. Everything it names on the display side — `Display`,
@@ -83,7 +83,7 @@ fn mode_name(mode: vga::VgaMode) -> &'static str {
 /// register state does not describe a renderable mode.
 fn scanout<'a, A: crate::Arch>(
     state: &'a VgaState, machine: &'a A, _regs: &Regs,
-    svga_start: usize,
+    svga_start: usize, autonomous: bool,
 ) -> Option<::vga::Frame<'a>>
 {
     use ::vga::{Frame, VgaMode};
@@ -166,7 +166,7 @@ fn scanout<'a, A: crate::Arch>(
         font_b: &[],
         font_maps: Some((map_a, map_b)),
         blink: state.ac[0x10] & 0x08 != 0,
-        text_cursor: ::vga::TextCursor::from_crtc(&state.crtc, (machine.now() / 250_000_000).is_multiple_of(2)),
+        text_cursor: ::vga::TextCursor::from_crtc(&state.crtc, autonomous || (machine.now() / 250_000_000).is_multiple_of(2)),
         cga_palette,
         start_offset: if planar || matches!(mode, VgaMode::Text { .. }) { start_latch } else if mode13 { start_latch * 4 } else { 0 },
         pixel_pan,
@@ -356,7 +356,7 @@ pub(super) fn snapshot_retained_surface<A: crate::Arch>(
     let (vga, output) = (&mut pc.vga, &mut pc.scanout);
     let DosVideo::Vga(dev) = vga else { return };
     let svga_start = dev.state.svga().map_or(0, |svga| svga.display_byte_offset());
-    let Some(frame) = scanout(&dev.state, machine, regs, svga_start) else { return };
+    let Some(frame) = scanout(&dev.state, machine, regs, svga_start, false) else { return };
     let format = output.format();
     let _ = crate::kernel::display::render_frame(output, format, &frame);
 }
@@ -399,8 +399,7 @@ pub fn display_tick<A: crate::Arch>(
         crate::compact_println!("Display: Voodoo acquired packed scanout from native VGA");
     }
 
-    if crate::kernel::media::enabled()
-        && let Some(voodoo) = pc.voodoo.as_mut().filter(|voodoo| voodoo.active())
+    if let Some(voodoo) = pc.voodoo.as_mut().filter(|voodoo| voodoo.active())
     {
         let display = external.as_deref_mut().or(match &mut pc.vga {
             DosVideo::Fullscreen(FullscreenVga::Emulated(_, display)) => Some(display),
@@ -409,7 +408,7 @@ pub fn display_tick<A: crate::Arch>(
         if let Some(display) = display {
             display.restore_voodoo_ramp(machine, bios);
             let owner = presentation.as_ref().map(|(_, endpoint)| *endpoint);
-            if display.capture_voodoo(&voodoo.output(), owner) {
+            if display.publish_voodoo(&voodoo.output(), owner) {
                 let (w, h) = voodoo.dimensions();
                 if let Some((desktop, endpoint)) = presentation.as_mut() {
                     publish_vga_surface(w as usize, h as usize, desktop, *endpoint);
@@ -446,15 +445,22 @@ pub fn display_tick<A: crate::Arch>(
     let svga_start = dev.state.svga().map_or(0, |svga| svga.display_byte_offset());
     let vga = &dev.state;
     if display.is_headless() { return; }
-    if crate::kernel::media::enabled() && !display.is_host() {
-        let Some(frame) = scanout(vga, machine, regs, svga_start) else { return };
+    if display.resident_video() {
         let owner = presentation.as_ref().map(|(_, endpoint)| *endpoint);
-        if display.capture_vga(&frame, owner) {
+        if !display.vga_needs_publication(super::machine::vga::scanout_revision(), owner) {
+            display.poll_video();
+            return;
+        }
+        let capture_sample = crate::kernel::osd_profile::Sample::start(machine);
+        let Some(frame) = scanout(vga, machine, regs, svga_start, true) else { return };
+        if display.publish_vga(&frame, owner) {
+            capture_sample.finish(machine, crate::kernel::osd_profile::Stage::Capture, 0);
             // Guest beam/retained geometry stay cheap and local. Pixel work is
             // owned by the persistent renderer, not joined by the guest loop.
             let (w, h) = ::vga::dimensions(frame.mode);
-            let _ = crate::kernel::display::scanout_action(&mut pc.scanout, display,
-                frame.mode, now_ns, 70, 70, owner.map(|_| (w, h)));
+            // Retrace remains the same 70 Hz device clock, read on demand.
+            // Only the renderer allocates pixels or advances presentation.
+            crate::kernel::display::bind_autonomous_beam(&mut pc.scanout, frame.mode, 70);
             if let Some((desktop, endpoint)) = presentation.as_mut() {
                 publish_vga_surface(w, h, desktop, *endpoint);
             }
@@ -491,7 +497,7 @@ pub fn display_tick<A: crate::Arch>(
                 // The source aperture, registers and DAC are captured once for
                 // the whole shadow; no palette generation can split the image.
                 let Some(frame) =
-                    scanout(vga, machine, regs, svga_start)
+                    scanout(vga, machine, regs, svga_start, false)
                 else {
                     return;
                 };
@@ -542,7 +548,7 @@ pub fn display_tick<A: crate::Arch>(
         return;
     }
     // Whole-frame sink: `render` walks every row, so capture the full frame.
-    let Some(frame) = scanout(vga, machine, regs, svga_start) else { return };
+    let Some(frame) = scanout(vga, machine, regs, svga_start, false) else { return };
     let (w, h) = ::vga::dimensions(frame.mode);
     let rendered = crate::kernel::display::render_frame(
         &mut pc.scanout,

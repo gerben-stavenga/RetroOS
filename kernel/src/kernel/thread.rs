@@ -377,8 +377,6 @@ impl<A: crate::Arch> Personality<A> {
     pub fn advance_world(
         &mut self,
         machine: &mut A,
-        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        regs: &Regs,
         now_ns: u64,
         dt_ns: u64,
         audio_pushed: u64,
@@ -399,9 +397,6 @@ impl<A: crate::Arch> Personality<A> {
                 }
                 crate::kernel::dos::audio_service(
                     machine, dos, now_ns, dt_ns, audio_pushed);
-                if dt_ns != 0 && dos.pc.vga.is_fullscreen() {
-                    crate::kernel::dos::pump_fullscreen(machine, bios, dos, regs, now_ns);
-                }
             }
             Self::Os2(os2) => os2.advance_timers(now_ns),
             Self::Linux(_) | Self::Windows(_) => {}

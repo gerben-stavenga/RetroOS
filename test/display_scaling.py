@@ -23,14 +23,23 @@ org 100h
     int 10h
     mov ax, 0a000h
     mov es, ax
+    mov al, 1
+.fill:
     xor di, di
     mov cx, 64000
-    mov al, 1
     rep stosb
 .wait:
     xor ah, ah
     int 16h
-    jmp .wait
+    cmp al, 'r'
+    je .red
+    cmp al, 'b'
+    jne .wait
+    mov al, 1
+    jmp .fill
+.red:
+    mov al, 4
+    jmp .fill
 ready db 'DISPLAY SCALING READY',13,10,'$'
 '''
 
@@ -108,7 +117,7 @@ def main():
                     call('send-key', keys=[{'type': 'qcode', 'data': name}], **{'hold-time': 50})
                     time.sleep(.3)
 
-                def check(name, expected):
+                def check(name, expected, color='blue'):
                     deadline = time.monotonic() + 8
                     while time.monotonic() < deadline:
                         shot = work / (name + '.ppm')
@@ -117,8 +126,9 @@ def main():
                             image = image.convert('RGB')
                             assert image.size == (1280, 800), image.size
                             r, g, b = image.split()
-                            mask = ImageChops.multiply(b.point(lambda v: 255 if v >= 160 else 0),
-                                ImageChops.multiply(r.point(lambda v: 255 if v < 16 else 0),
+                            bright, dark = (b, r) if color == 'blue' else (r, b)
+                            mask = ImageChops.multiply(bright.point(lambda v: 255 if v >= 160 else 0),
+                                ImageChops.multiply(dark.point(lambda v: 255 if v < 16 else 0),
                                                     g.point(lambda v: 255 if v < 16 else 0)))
                             bounds = mask.getbbox()
                             if bounds == expected:
@@ -153,6 +163,12 @@ def main():
                     call('screendump', filename=str(work / (name + '-osd.ppm')))
                     key('esc')
                     check(name, expected)
+                # Change every pixel without any mode, palette, or VGA-port
+                # write. A renderer waiting for a new producer frame stalls here.
+                key('r')
+                check('live-red', (107, 0, 1173, 800), 'red')
+                key('b')
+                check('live-blue', (107, 0, 1173, 800))
                 if options.cpus > 1:
                     assert 'core 1: Video service: rendering at 70 Hz' in log.read_text(errors='replace')
                 call('quit')

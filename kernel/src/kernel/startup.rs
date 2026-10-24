@@ -111,7 +111,7 @@ fn prepare_startup<A: crate::Arch>(
         master_env,
         sb_card,
         sink,
-    } = prepare_audio(machine, boot, audio, &mut screen, &mut bios_workspace);
+    } = prepare_audio(machine, boot, audio);
     screen.present(machine, &mut bios_workspace);
 
     configure_locale(&master_env);
@@ -121,6 +121,10 @@ fn prepare_startup<A: crate::Arch>(
         crate::kernel::dos::config_var(&master_env, b"UTC_OFFSET"),
     ).unwrap_or_else(|error| lib::compact_panic!("RETROOS.INI: {}", error));
     crate::kernel::fs::smb::mount_configured();
+    // C: may be supplied by SMB. Load guest assets only after the final
+    // namespace is mounted, while no guest can yet need the instruments.
+    load_midi_bank(machine, &mut bios_workspace, &mut screen,
+        crate::kernel::platform::get().audio);
     // DOS worlds are cloned from their substitute-BIOS template.
     let dos_template = crate::kernel::dos::DosTemplate::new(machine);
 
@@ -148,8 +152,6 @@ fn prepare_audio<A: crate::Arch>(
     machine: &mut A,
     boot: &crate::BootConfig,
     audio: crate::kernel::platform::AudioToken,
-    screen: &mut crate::kernel::console::Console,
-    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
 ) -> PreparedAudio {
     // RETROOS.INI is readable now: apply its sound-mode policy before anything
     // consumes the verdict (IOPB grants, the bank burn, the first guest).
@@ -312,10 +314,6 @@ fn prepare_audio<A: crate::Arch>(
         .then(|| sb_card.take())
         .flatten();
 
-    // Burn the GM bank ROM while long work is still legal (no guest yet):
-    // the shipped bank lives under the C: root beside the GUS patches. A
-    // native SB loads the bank on demand when it switches to kernel mixing.
-    load_midi_bank(machine, bios_workspace, screen, platform.audio);
     // Take the selected output capability into runtime ownership. `None` is a
     // silent runtime, not a dummy sink.
     let sink = crate::kernel::sound::Sink::new(machine, audio, for_sink);
@@ -1382,6 +1380,7 @@ fn present_desktop<A: crate::Arch>(
         display.composition_scale_y(canvas_height),
         display.rgb,
         sound,
+        display.resident_video(),
     );
     osd_sample.finish(machine, crate::kernel::osd_profile::Stage::Osd, 0);
     let format = display.rgb;
@@ -1396,8 +1395,12 @@ fn present_desktop<A: crate::Arch>(
             .personality
             .surface_buffer(key, format)
     };
-    if display.capture_composition(windows, canvas_width, canvas_height, resolve) { return; }
     let scene_sample = crate::kernel::osd_profile::Sample::start(machine);
+    if display.publish_composition(machine, windows, canvas_width, canvas_height, resolve) {
+        scene_sample.finish(machine, crate::kernel::osd_profile::Stage::Scene, 0);
+        compose_sample.finish(machine, crate::kernel::osd_profile::Stage::Compose, 0);
+        return;
+    }
     let frame = windows
         .compose_processes(resolve, canvas_width, canvas_height, display.rgb)
         .expect("compose process-owned surfaces");
@@ -1444,6 +1447,8 @@ fn event_loop<A: crate::Arch>(
         crate::kernel::sound::Engine::poll,
     ) };
     let mut audio_source = None;
+    let mut cached_sound = crate::kernel::osd::SoundView::KernelSilent;
+    let mut sound_view_tick = u64::MAX;
     let mut execution_profile_on = false;
     let mut pending_events = crate::kernel::irq_dispatch::PendingEvents::default();
     // Diagnose a running guest whose display/audio never advance because the
@@ -1485,6 +1490,10 @@ fn event_loop<A: crate::Arch>(
     let mut klog_check_passes = 0u32;
 
     loop {
+        // Guest aliases can also be written by arbitrary kernel services.
+        // Serialize the whole guest slice with the renderer's brief VRAM
+        // sample. Decoding, composition and presentation never hold this gate.
+        let _live_access = crate::kernel::dos::live_access();
         crate::kernel::linux::reap_waited_child(machine, threads, ctx.tid);
         crate::kernel::linux::refresh_system_tasks(threads);
         if display.is_none() {
@@ -1609,8 +1618,6 @@ fn event_loop<A: crate::Arch>(
             // write may be slow, but cannot delay the samples due this tick.
             thread.personality.advance_world(
                 machine,
-                &mut *bios_workspace,
-                &ctx.regs,
                 world_now_ns,
                 elapsed_ns,
                 audio_frontier,
@@ -1633,6 +1640,15 @@ fn event_loop<A: crate::Arch>(
                 );
             }
             stats.mark(machine, PROFILE_AUDIO);
+            // Fullscreen scanout is display work too. Keeping it inside
+            // advance_world incorrectly charged it to the devices bucket.
+            if elapsed_ns != 0
+                && let thread::Personality::Dos(dos) = &mut thread.personality
+                && dos.pc.vga.is_fullscreen()
+            {
+                crate::kernel::dos::pump_fullscreen(machine, &mut *bios_workspace,
+                    dos, &ctx.regs, world_now_ns);
+            }
             if elapsed_ns != 0
                 && thread.has_primary_window()
                 && let Some(display) = display.as_mut()
@@ -1650,11 +1666,9 @@ fn event_loop<A: crate::Arch>(
             }
             stats.mark(machine, PROFILE_DISPLAY);
         }
-        // OSD publication is deliberately capped at 20 Hz regardless of the
-        // physical sink. DOS scanout keeps its independent guest-visible beam
-        // clock but samples the VGA aperture into its retained surface at this
-        // same rate. Each attempt consumes accumulated scene/surface damage;
-        // an empty damage set is a no-op inside `present_desktop`.
+        // Refresh UI status and publish scene transactions at 20 Hz while
+        // the OSD is open. The resident renderer samples VGA and paints the
+        // complete scene independently at the device refresh rate.
         let osd_composite_due = if elapsed_ns == 0 {
             false
         } else if crate::kernel::osd::is_open() {
@@ -1671,14 +1685,21 @@ fn event_loop<A: crate::Arch>(
             last_osd_composite_period = u64::MAX;
             true
         };
+        // UI status never joins a mixing quantum. Retry next slice if either
+        // media lock is busy; rendering can keep using the previous status.
+        if (crate::kernel::osd::is_open() || !events.is_empty())
+            && sound_view_tick != now_tick
+            && let Some(sound) = try_sound_view(&audio, sb_handoff.as_ref(),
+                threads.get(ctx.tid).map(|thread| &thread.personality))
+        {
+            if cached_sound != sound { crate::kernel::osd::request_repaint(); }
+            cached_sound = sound;
+            sound_view_tick = now_tick;
+        }
         if osd_composite_due
             && let Some(display) = display.as_mut()
         {
-            let sound = sound_view(
-                audio.lock().sink.as_ref(),
-                sb_handoff.as_ref(),
-                threads.get(ctx.tid).map(|thread| &thread.personality),
-            );
+            let sound = cached_sound;
             present_desktop(
                 machine,
                 &mut *bios_workspace,
@@ -1691,11 +1712,7 @@ fn event_loop<A: crate::Arch>(
         stats.mark(machine, PROFILE_DISPLAY);
         {
             if !events.is_empty() {
-                let sound = sound_view(
-                    audio.lock().sink.as_ref(),
-                    sb_handoff.as_ref(),
-                    threads.get(ctx.tid).map(|thread| &thread.personality),
-                );
+                let sound = cached_sound;
                 let thread = ctx.thread(threads);
                 crate::kernel::console::dispatch(
                     machine,
@@ -1971,16 +1988,13 @@ fn event_loop<A: crate::Arch>(
                     engine.source(None);
                     *sink = engine.sink.take();
                 }
-                return (
-                    match display.take() {
-                        Some(display) => display,
-                        None => exiting_display
-                            .take()
-                            .expect("dead display owner lost token")
-                            .into_surface(machine, &mut *bios_workspace),
-                    },
-                    sb_handoff.take(),
-                );
+                let display = match display.take() {
+                    Some(display) => display,
+                    None => exiting_display.take().expect("dead display owner lost token")
+                        .into_surface(machine, &mut *bios_workspace),
+                };
+                display.pause_video();
+                return (display, sb_handoff.take());
             }
         }
     }
@@ -2099,10 +2113,26 @@ fn apply_sound_mode_request<A: crate::Arch>(
     }
 }
 
-fn sound_view<A: crate::Arch>(
-    sink: Option<&crate::kernel::sound::Sink>,
+fn try_sound_view<A: crate::Arch>(
+    audio: &crate::kernel::media::AudioService<crate::kernel::sound::Engine>,
     handoff: Option<&crate::kernel::drivers::sb16::Sb16>,
     personality: Option<&thread::Personality<A>>,
+) -> Option<crate::kernel::osd::SoundView> {
+    let engine = audio.try_lock()?;
+    let physical = match personality {
+        Some(thread::Personality::Dos(dos)) => {
+            let devices = dos.pc.audio.try_lock()?;
+            devices.sb.physical().map(|sb| (sb.base, sb.dma16, sb.has_ct1745()))
+        }
+        _ => None,
+    };
+    Some(sound_view(engine.sink.as_ref(), handoff, physical))
+}
+
+fn sound_view(
+    sink: Option<&crate::kernel::sound::Sink>,
+    handoff: Option<&crate::kernel::drivers::sb16::Sb16>,
+    physical: Option<(u16, Option<u8>, bool)>,
 ) -> crate::kernel::osd::SoundView {
     use crate::kernel::osd::SoundView;
     use crate::kernel::platform::Audio;
@@ -2113,7 +2143,7 @@ fn sound_view<A: crate::Arch>(
         },
         None if let Some(card) = sink.and_then(crate::kernel::sound::Sink::parked_sb) =>
             SoundView::KernelHda { can_native: true, can_sb: card.dma16 == Some(5) },
-        None => match handoff.map(|sb| (sb.base, sb.dma16, sb.has_ct1745())).or_else(|| personality.and_then(thread::Personality::physical_sb)) {
+        None => match handoff.map(|sb| (sb.base, sb.dma16, sb.has_ct1745())).or(physical) {
             Some((port, dma16, has_mixer)) => SoundView::NativeSb {
                 port,
                 can_mix: sink.is_some_and(crate::kernel::sound::Sink::is_hda)

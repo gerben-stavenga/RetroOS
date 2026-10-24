@@ -1131,8 +1131,59 @@ const _: () = assert!(MAX_ROWS * CELL_H + 2 * PAD <= 200, "panel taller than the
 /// are distributed over `cw` Bresenham-style, letting the cell take the
 /// font's natural aspect at whatever height the vertical quantization
 /// produced instead of snapping to multiples of 8.
+/// A panel description contains text and rectangles, never rasterized pixels.
+/// It is built from BSP-owned UI state and painted by the display owner.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PaintList(alloc::vec::Vec<PaintCommand>);
+#[derive(Clone, Debug)]
+enum PaintCommand {
+    Fill { x: usize, y: usize, width: usize, height: usize, color: u32 },
+    Text { x: usize, y: usize, cw: usize, sy: usize, text: [u8; 48], len: usize, fg: u32, bg: u32 },
+}
+enum PaintTarget<'a> {
+    Pixels(&'a mut [u8]),
+    Commands(&'a mut PaintList),
+}
+impl PaintList {
+    pub(crate) fn render(&self, out: &mut [u8], width: usize, height: usize, fmt: PixelFormat) {
+        let stride = width * usize::from(fmt.bytes_per_pixel);
+        for command in &self.0 {
+            match command {
+                PaintCommand::Fill { x, y, width: w, height: h, color } =>
+                    vga::overlay_fill_xscaled(out, stride, width, height, width, *x, *y, *w, *h, *color, fmt),
+                PaintCommand::Text { x, y, cw, sy, text, len, fg, bg } =>
+                    raster_text(out, stride, width, height, width, *x, *y, *cw, *sy, &text[..*len], *fg, *bg, fmt),
+            }
+        }
+    }
+}
 #[allow(clippy::too_many_arguments)]
-fn paint_text(
+fn paint_fill(out: &mut PaintTarget<'_>, stride: usize, w: usize, h: usize, logical_w: usize,
+    x: usize, y: usize, width: usize, height: usize, color: u32, fmt: PixelFormat) {
+    match out {
+        PaintTarget::Pixels(out) => vga::overlay_fill_xscaled(out, stride, w, h, logical_w, x, y, width, height, color, fmt),
+        PaintTarget::Commands(list) => {
+            assert_eq!(logical_w, w);
+            list.0.push(PaintCommand::Fill { x, y, width, height, color });
+        }
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn paint_text(out: &mut PaintTarget<'_>, stride: usize, w: usize, h: usize, logical_w: usize,
+    x: usize, y: usize, cw: usize, sy: usize, s: &[u8], fg: u32, bg: u32, fmt: PixelFormat) {
+    match out {
+        PaintTarget::Pixels(out) => raster_text(out, stride, w, h, logical_w, x, y, cw, sy, s, fg, bg, fmt),
+        PaintTarget::Commands(list) => {
+            assert_eq!(logical_w, w);
+            assert!(s.len() <= 48);
+            let mut text = [0; 48];
+            text[..s.len()].copy_from_slice(s);
+            list.0.push(PaintCommand::Text { x, y, cw, sy, text, len: s.len(), fg, bg });
+        }
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn raster_text(
     out: &mut [u8], stride: usize, w: usize, h: usize,
     logical_w: usize, x: usize, y: usize, cw: usize, sy: usize,
     s: &[u8], fg: u32, bg: u32,
@@ -1252,7 +1303,24 @@ pub fn window_size(
 /// physical row; glyph rows are repeated, never fractionally resampled.
 #[allow(clippy::too_many_arguments)]
 pub fn paint(
-    out: &mut [u8],
+    out: &mut [u8], stride: usize, w: usize, h: usize,
+    canvas_width: usize, canvas_height: usize, scale_y: usize, fmt: PixelFormat, sound: SoundView,
+) {
+    paint_panel(&mut PaintTarget::Pixels(out), stride, w, h, canvas_width, canvas_height, scale_y, fmt, sound);
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn paint_list(w: usize, h: usize, canvas_width: usize, canvas_height: usize,
+    scale_y: usize, fmt: PixelFormat, sound: SoundView) -> PaintList {
+    let mut list = PaintList::default();
+    paint_panel(&mut PaintTarget::Commands(&mut list), w * usize::from(fmt.bytes_per_pixel),
+        w, h, canvas_width, canvas_height, scale_y, fmt, sound);
+    list
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_panel(
+    out: &mut PaintTarget<'_>,
     stride: usize,
     w: usize,
     h: usize,
@@ -1289,10 +1357,10 @@ pub fn paint(
     let x0 = (w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
-    vga::overlay_fill_xscaled(
+    paint_fill(
         out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
     );
-    vga::overlay_fill_xscaled(
+    paint_fill(
         out, stride, w, h, logical_w, x0, y0, panel_w,
         CELL_H * sy + pad_y, TITLE_BG, fmt,
     );
@@ -1323,7 +1391,7 @@ pub fn paint(
         item_line(tab, item, &mut line, sound);
         let selected = item == sel;
         if selected {
-            vga::overlay_fill_xscaled(
+            paint_fill(
                 out, stride, w, h, logical_w, x0 + pad_x / 2, ty,
                 panel_w - pad_x, CELL_H * sy, SEL_BG, fmt,
             );
@@ -1356,7 +1424,7 @@ pub fn paint(
 /// switched with ◄/►.
 #[allow(clippy::too_many_arguments)]
 fn paint_disk_subtabs(
-    out: &mut [u8],
+    out: &mut PaintTarget<'_>,
     stride: usize,
     w: usize,
     h: usize,
@@ -1374,7 +1442,7 @@ fn paint_disk_subtabs(
         let label_w = (label.len() + 1) * cw;
         let selected = dev == active;
         if selected {
-            vga::overlay_fill_xscaled(
+            paint_fill(
                 out, stride, w, h, logical_w, x, ty, label_w, CELL_H * sy, SEL_BG, fmt,
             );
         }
@@ -1389,7 +1457,7 @@ fn paint_disk_subtabs(
 
 #[allow(clippy::too_many_arguments)]
 fn paint_tabs(
-    out: &mut [u8],
+    out: &mut PaintTarget<'_>,
     stride: usize,
     w: usize,
     h: usize,
@@ -1418,7 +1486,7 @@ fn paint_tabs(
         let selected = tab == active;
         let label_w = (label.len() + 1) * cw;
         if selected {
-            vga::overlay_fill_xscaled(
+            paint_fill(
                 out, stride, w, h, logical_w, x, y,
                 label_w, CELL_H * sy, SEL_BG, fmt,
             );
@@ -1435,7 +1503,7 @@ fn paint_tabs(
 /// Paint the window picker: currently one primary window per active endpoint.
 #[allow(clippy::too_many_arguments)]
 fn paint_picker(
-    out: &mut [u8],
+    out: &mut PaintTarget<'_>,
     stride: usize,
     w: usize,
     h: usize,
@@ -1459,10 +1527,10 @@ fn paint_picker(
     let x0 = (w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
-    vga::overlay_fill_xscaled(
+    paint_fill(
         out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
     );
-    vga::overlay_fill_xscaled(
+    paint_fill(
         out, stride, w, h, logical_w, x0, y0, panel_w,
         CELL_H * sy + pad_y, TITLE_BG, fmt,
     );
@@ -1490,7 +1558,7 @@ fn paint_picker(
             window_line(idx, &mut line);
             let selected = idx == sel;
             if selected {
-                vga::overlay_fill_xscaled(
+                paint_fill(
                     out, stride, w, h, logical_w, x0 + pad_x / 2, ty,
                     panel_w - pad_x, CELL_H * sy, SEL_BG, fmt,
                 );
@@ -1869,8 +1937,16 @@ mod tests {
         let width = COLS * CELL_W + 16;
         let height = TAB_ROWS * CELL_H;
         let mut output = alloc::vec![0; width * height * 4];
-        paint_tabs(&mut output, width * 4, width, height, width,
+        paint_tabs(&mut PaintTarget::Pixels(&mut output), width * 4, width, height, width,
             0, 0, TAB_DISPLAY, CELL_W, 1, PixelFormat::NATIVE);
+        let mut commands = PaintList::default();
+        paint_tabs(&mut PaintTarget::Commands(&mut commands), width * 4, width, height, width,
+            0, 0, TAB_DISPLAY, CELL_W, 1, PixelFormat::NATIVE);
+        let mut resident = alloc::vec![0; output.len()];
+        let capacity = resident.capacity();
+        commands.render(&mut resident, width, height, PixelFormat::NATIVE);
+        assert_eq!(resident, output, "deferred painting preserves every pixel");
+        assert_eq!(resident.capacity(), capacity);
         for y in 0..height {
             assert!(output[(y * width + COLS * CELL_W) * 4..(y + 1) * width * 4]
                 .iter().all(|&v| v == 0), "tabs overflow the panel");

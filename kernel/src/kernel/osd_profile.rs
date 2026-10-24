@@ -6,17 +6,18 @@
 //! OSD painting and scene preparation. Pack/bank/copy are nested subdivisions
 //! of banked presentation, not additional time to add to the present total.
 //! Osd and scene subdivide compose; osd includes panel repaint/preparation.
+//! Snapshot construction and worker registration subdivide scene publication.
 //! Pixel counts describe work, not changed pixels; capture counts visible
 //! pixels even when planar VRAM capture reads more backing storage.
 
 #[derive(Clone, Copy)]
-pub(crate) enum Stage { Capture, Raster, Compose, Present, Pack, Bank, Copy, Osd, Scene }
+pub(crate) enum Stage { Capture, Raster, Compose, Present, Pack, Bank, Copy, Osd, Scene, Snapshot, Register }
 
 #[derive(Clone, Copy)]
 struct Counter { calls: u64, cycles: u64, max: u64, pixels: u64 }
 
 const EMPTY: Counter = Counter { calls: 0, cycles: 0, max: 0, pixels: 0 };
-static mut COUNTERS: [Counter; 9] = [EMPTY; 9];
+static mut COUNTERS: [Counter; 11] = [EMPTY; 11];
 
 #[derive(Clone, Copy)]
 pub(crate) enum Blit { Packed, Convert, Scale }
@@ -67,13 +68,13 @@ impl Sample {
 }
 
 pub(crate) fn reset() {
-    unsafe { core::ptr::write(core::ptr::addr_of_mut!(COUNTERS), [EMPTY; 9]); }
+    unsafe { core::ptr::write(core::ptr::addr_of_mut!(COUNTERS), [EMPTY; 11]); }
     unsafe { core::ptr::write(core::ptr::addr_of_mut!(BLITS), [EMPTY_BLIT; 16]); }
 }
 
 pub(crate) fn print() {
     let counters = unsafe { core::ptr::read(core::ptr::addr_of!(COUNTERS)) };
-    for (name, counter) in ["capture", "raster", "compose", "present", "pack", "bank", "copy", "osd", "scene"]
+    for (name, counter) in ["capture", "raster", "compose", "present", "pack", "bank", "copy", "osd", "scene", "snapshot", "register"]
         .into_iter().zip(counters)
     {
         crate::compact_println!(

@@ -752,6 +752,7 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
 
 /// Emulate OUT to a port.
 pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, val: u8) {
+    if (0x3C0..=0x3DF).contains(&port) { vga::scanout_changed(); }
     match port {
         0x3f8..=0x3ff => { pc.uart.write(port - 0x3f8, val); if pc.uart.poll_irq() { pc.vpic.raise(4); } },
         // VGA ports — pass through to hardware (tracking the AC flip-flop +

@@ -1367,6 +1367,7 @@ pub struct Scanout {
     /// the next clock wakeup publishes it.
     phase: usize,
     refresh_hz: u32,
+    autonomous_beam: bool,
     /// Rate at which the beam is sampled into a retained compositor surface.
     /// This may be lower than `refresh_hz` without changing guest retrace.
     raster_hz: u32,
@@ -1396,6 +1397,7 @@ impl Scanout {
             mode: None,
             phase: 0,
             refresh_hz: 0,
+            autonomous_beam: false,
             raster_hz: 0,
             frame: 0,
             ready: false,
@@ -1416,6 +1418,7 @@ impl Scanout {
             core::ptr::addr_of_mut!((*p).mode).write(None);
             core::ptr::addr_of_mut!((*p).phase).write(0);
             core::ptr::addr_of_mut!((*p).refresh_hz).write(0);
+            core::ptr::addr_of_mut!((*p).autonomous_beam).write(false);
             core::ptr::addr_of_mut!((*p).raster_hz).write(0);
             core::ptr::addr_of_mut!((*p).frame).write(0);
             core::ptr::addr_of_mut!((*p).ready).write(false);
@@ -1545,10 +1548,21 @@ fn beam_time(now_ns: u64, refresh_hz: u32) -> (u64, usize) {
     (frame, phase)
 }
 
+/// Bind the guest beam clock without allocating a BSP raster buffer.
+pub fn bind_autonomous_beam(s: &mut Scanout, mode: vga::VgaMode, hz: u32) {
+    let (w, h) = vga::dimensions(mode);
+    s.geo.0 = w; s.geo.1 = h;
+    s.refresh_hz = hz;
+    s.autonomous_beam = true;
+}
+
 /// Guest-visible vertical retrace for an active direct scanout. `None` when
 /// no scanout is live (window sink, unfocused thread, real VGA), so the caller
 /// can use its free-running fallback.
 pub fn beam_vretrace(s: &Scanout, now_tick: u64) -> Option<bool> {
+    if s.autonomous_beam && s.refresh_hz != 0 {
+        return Some(beam_time(now_tick.saturating_mul(1_000_000), s.refresh_hz).1 < VRETRACE_STEPS);
+    }
     if s.geo.1 == 0 || s.refresh_hz == 0
         || now_tick.saturating_sub(s.last_tick) > 100
     {
@@ -1581,6 +1595,7 @@ pub fn scanout_action(
     raster_hz: u32,
     raster_size: Option<(usize, usize)>,
 ) -> ScanoutAction {
+    s.autonomous_beam = false;
     let (w, h) = vga::dimensions(mode);
     if w == 0 || h == 0 || refresh_hz == 0 || raster_hz == 0 {
         return ScanoutAction::None;

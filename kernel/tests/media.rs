@@ -112,9 +112,15 @@ fn two_core_priority_handoff_and_drop_fences() {
     }
     static POLLS: AtomicUsize = AtomicUsize::new(0);
     static DUE: AtomicBool = AtomicBool::new(false);
+    static HOLD_AUDIO: AtomicBool = AtomicBool::new(false);
+    static AUDIO_HELD: AtomicBool = AtomicBool::new(false);
     let service = unsafe { media::AudioService::new((), || DUE.load(Ordering::Acquire), |_| {
         POLLS.fetch_add(1, Ordering::Relaxed);
         AUDIO_RAN.store(true, Ordering::Release);
+        if HOLD_AUDIO.load(Ordering::Acquire) {
+            AUDIO_HELD.store(true, Ordering::Release);
+            while HOLD_AUDIO.load(Ordering::Acquire) { core::hint::spin_loop(); }
+        }
     }) };
     let refreshes = REFRESHES.load(Ordering::Acquire);
     for _ in 0..100 { std::thread::yield_now(); }
@@ -125,6 +131,10 @@ fn two_core_priority_handoff_and_drop_fences() {
     // No mix submission or guest tick is required: the service continues to
     // run while the producer does unrelated work.
     while POLLS.load(Ordering::Acquire) < 100 { std::thread::yield_now(); }
+    HOLD_AUDIO.store(true, Ordering::Release);
+    while !AUDIO_HELD.load(Ordering::Acquire) { std::thread::yield_now(); }
+    assert!(service.try_lock().is_none(), "UI status must not wait for the mixer");
+    HOLD_AUDIO.store(false, Ordering::Release);
     drop(service);
     let stopped = POLLS.load(Ordering::Acquire);
     for _ in 0..100 { std::thread::yield_now(); }

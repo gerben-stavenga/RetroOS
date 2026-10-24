@@ -261,6 +261,8 @@ pub(in crate::kernel::dos) fn install_codepage_font<A: crate::Arch>(
     dos: &mut DosState<A>,
     page: &lib::codepage::CodePage,
 ) -> bool {
+    let _live_access = crate::kernel::dos::machine::vga::live_access();
+    crate::kernel::dos::machine::vga::scanout_changed();
     let fonts = page.fonts();
     let cell_height: u16 = bda_field!(machine, cell_height);
     let height = match cell_height as usize {
@@ -310,6 +312,8 @@ pub(in crate::kernel::dos) fn install_codepage_font<A: crate::Arch>(
 /// clamp: there is no cheap cell-wise scroll there and the C BIOS left it to
 /// direct writers.
 pub(in crate::kernel::dos) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, ch: u8, fg: u8) {
+    let _live_access = crate::kernel::dos::machine::vga::live_access();
+    crate::kernel::dos::machine::vga::scanout_changed();
     let page: u8 = bda_field!(machine, active_page);
     let pos_off = core::mem::offset_of!(Bda, cursor_pos) + (page & 7) as usize * 2;
     let pos: u16 = machine.read(Bda::BASE + pos_off);
@@ -513,6 +517,8 @@ pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
     dos: &mut DosState<A>,
     regs: &mut Regs,
 ) {
+    let _live_access = crate::kernel::dos::machine::vga::live_access();
+    crate::kernel::dos::machine::vga::scanout_changed();
     let ax = regs.rax as u16;
     let ah = (ax >> 8) as u8;
     match ah {
