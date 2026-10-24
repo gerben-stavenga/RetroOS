@@ -1,5 +1,6 @@
-//! Linux entry settings are independent of the legacy process environment.
-//! Session policy (PATH, temporary directory, shell) belongs to shell.elf.
+//! Default Linux entry settings, independent of the legacy DOS environment.
+//! Direct ELF launches need the same defaults as shell.elf; execve preserves
+//! the caller's exact environment and explicit INI settings take precedence.
 use alloc::vec::Vec;
 
 static SETTINGS: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
@@ -36,6 +37,18 @@ fn build(root: &[u8], locale: &str, settings: &[u8]) -> Vec<u8> {
         result.extend_from_slice(entry);
         result.push(0);
     }
+    let home = result.split(|&b| b == 0).find_map(|entry| entry.strip_prefix(b"HOME=")).unwrap_or(b"/home/retroos").to_vec();
+    let home = home.strip_suffix(b"/").unwrap_or(&home);
+    let path = [home, b"/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"].concat();
+    let temporary = [home, b"/TEMP"].concat();
+    for (name, value) in [(b"PATH=".as_slice(), path.as_slice()), (b"TMPDIR=", temporary.as_slice()),
+        (b"SHELL=", b"/bin/sh"), (b"TERM=", b"linux")]
+    {
+        if result.split(|&b| b == 0).any(|entry| entry.starts_with(name)) { continue; }
+        result.extend_from_slice(name);
+        result.extend_from_slice(value);
+        result.push(0);
+    }
     result.push(0);
     result
 }
@@ -45,9 +58,19 @@ mod tests {
     use super::*;
     #[test]
     fn linux_settings_override_boot_defaults_without_legacy_values() {
-        assert_eq!(build(b"home/retroos/", "en_US.UTF-8", b""), b"HOME=/home/retroos\0LANG=en_US.UTF-8\0\0");
-        assert_eq!(build(b"", "en_US.UTF-8", b""), b"HOME=/\0LANG=en_US.UTF-8\0\0");
-        assert_eq!(build(b"home/retroos/", "en_US.UTF-8", b"HOME=/first\0HOME=/custom\0PATH=\0LANG=it_IT.UTF-8\0\0"),
-                   b"HOME=/custom\0PATH=\0LANG=it_IT.UTF-8\0\0");
+        let defaults = build(b"home/retroos/", "en_US.UTF-8", b"");
+        let entries: Vec<_> = defaults.split(|&b| b == 0).collect();
+        assert!(entries.contains(&b"HOME=/home/retroos".as_slice()));
+        assert!(entries.contains(&b"PATH=/home/retroos/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin".as_slice()));
+        assert!(entries.contains(&b"TMPDIR=/home/retroos/TEMP".as_slice()));
+        assert!(entries.contains(&b"SHELL=/bin/sh".as_slice()));
+        assert!(entries.contains(&b"TERM=linux".as_slice()));
+        let root = build(b"", "en_US.UTF-8", b"");
+        assert!(root.split(|&b| b == 0).any(|e| e == b"PATH=/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"));
+        let overrides = build(b"home/retroos/", "en_US.UTF-8", b"HOME=/first\0HOME=/custom/\0PATH=\0LANG=it_IT.UTF-8\0TMPDIR=/tmp\0SHELL=/bin/bash\0TERM=vt100\0\0");
+        for expected in [b"HOME=/custom/".as_slice(), b"PATH=", b"LANG=it_IT.UTF-8", b"TMPDIR=/tmp", b"SHELL=/bin/bash", b"TERM=vt100"] {
+            assert!(overrides.split(|&b| b == 0).any(|e| e == expected));
+        }
+        assert!(!overrides.split(|&b| b == 0).any(|e| e == b"HOME=/first"));
     }
 }

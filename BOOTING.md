@@ -124,7 +124,7 @@ with `root` and `c_root` directory paths. Run `python3 test/live_root.py` for
 GNU userspace from the live root, DOS/Linux C: writes, application symlinks,
 persistent settings, and rejection of writes through the root view.
 
-`C:\RETROOS\SHELL.ELF` starts a Linux shell session. It supplies `PATH` with
+`C:\RETROOS\SHELL.ELF` starts a Linux shell session. Linux entry supplies `PATH` with
 `HOME/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` and the sbin directories,
 `TMPDIR=HOME/TEMP`, `SHELL=/bin/sh` and `TERM=linux`. HOME defaults to the C:
 mount's Unix path; LANG follows the selected locale. Arguments such as `-i`,
@@ -142,9 +142,13 @@ HOME=/home/retroos
 # CODEX_HOME=/home/retroos/.codex
 ```
 
-Names are case-sensitive. Shell defaults fill missing values; explicit values
-are preserved. The kernel supplies Linux entry settings to ELF launches and
-does not export the DOS `[environment]` into Linux processes.
+Names are case-sensitive. Defaults fill missing values; explicit values are
+preserved. Direct ELF launches (including RC started from DOS) receive these
+defaults too, so their child shells search `HOME/bin` before the system npm
+launchers. The kernel does not export DOS `[environment]` into Linux processes;
+`SHELL.ELF` retains fallback defaults when launched with an explicit environment.
+Run `python3 test/linux_codex.py --direct` to check native Codex discovery from
+a shell started without `SHELL.ELF`.
 
 `python3 tools/try_self_build.py` attempts `//kernel:kernel` with Linux Bazel
 inside QEMU/KVM running RetroOS. It shares sources/tools read-only and keeps
@@ -290,6 +294,18 @@ backend updates, including `UTIME_NOW`, `UTIME_OMIT` and no-follow semantics.
 Existing timestamps retain one-second precision; Linux `statx` reports
 unsupported access/change timestamp reads as unavailable.
 
+`madvise(MADV_DONTNEED)` discards private anonymous mmap/brk pages and restores
+demand-zero contents without removing the mapping reservation. Fork siblings
+retain their original COW contents. Range tracking follows fixed replacements,
+partial unmaps, fork, vfork and anonymous remap growth; file/shared ranges are
+rejected rather than zeroed. `MADV_FREE` retains pages lazily; non-destructive
+access, merge, huge-page and core-dump hints are accepted without changing data.
+Other operations, including fork inheritance changes, remain unsupported.
+The proc-fd probe checks both ABIs on ext4 and SMB. Run
+`python3 test/linux_node_gc.py` for repeated Node/V8 collections with fragmented
+old-space pages; missing page-discard support caused V8's
+`DiscardSystemPages` fatal assertion on metal.
+
 Private file mappings currently use eager copies. Shared file mappings alias
 kernel-owned VFS pages: overlapping mappings and forked processes see the same
 RAM, regular reads overlay mapped bytes, and regular writes update those pages.
@@ -323,22 +339,25 @@ Existing login state is preserved. After installing the updated kernel and
 runtime, start `SHELL.ELF` and run `codex --version` or `codex exec`.
 The same setup is used with live QEMU files and the physical-machine root.
 
-An earlier interactive Codex 0.163.0 test returned `Hello from interactive Codex on
-RetroOS.` in the actual QEMU/KVM terminal, with a prompt entered through the
+Interactive Codex 0.163.0 returned `Hello from interactive Codex on
+RetroOS.` in both in-process and daemon modes in the actual QEMU/KVM terminal,
+with a prompt entered through the
 guest keyboard and the assistant reply verified from the terminal grid.
-From `SHELL.ELF`, that response-only configuration was:
+From `SHELL.ELF`, the response-only configuration is:
 
 ```sh
-codex --no-daemon --disable apps --disable shell_snapshot
+codex --no-daemon --disable apps --disable shell_snapshot --disable plugins --disable remote_plugin
 ```
 
 SQLite WAL startup requires shared file pages. Returning `ENODEV` for writable
 shared mappings caused `SQLITE_IOERR_SHMMAP` (5386), which Codex described as a
 damaged local database even for a fresh private home. Shared VFS mappings now
 provide this capability without resetting saved databases or login state.
-Both Codex modes now get past database initialization, but the interactive
-model-response tests still time out; the earlier successful response is not a
-verification of the current full startup path.
+Both Codex modes get past database initialization. The editor appears while
+the session is still loading; pressing Enter then can leave text in a draft
+without starting a model request. Earlier response probes timed out for this
+reason. Wait for the model/status footer before submitting; the interactive
+test now waits for that readiness signal before typing.
 Run `python3 test/linux_sqlite.py` for a focused native SQLite WAL test using
 the host's `libsqlite3.so.0`: concurrent reader snapshots, writer commits,
 checkpoint, reopen, and a host integrity check after the guest exits.
@@ -351,6 +370,34 @@ the ordinary PATH wrapper. Add `--daemon` to test the background server; its
 artifacts are under `build/ci/codex-interactive-daemon`.
 These response-only probes disable Apps, shell snapshots, plugins and remote
 plugins so auxiliary setup does not become part of the model-response check.
+
+The code-mode helper needs three additional Linux behaviors: `setpgid(0, 0)`
+must return zero, `wait4(WNOHANG)` must return immediately while the child is
+alive, and `readv` must support its random-device reads. Returning the
+process ID from `setpgid` made musl report a negative child PID as the spawn
+error (for example, `os error -5`). File and pipe vectored reads now retain the
+open description and iovec snapshot while blocked. Socket and virtual-descriptor
+vectored reads remain unsupported; process groups still use the existing
+per-process job model.
+
+Run `python3 test/linux_code_mode_host.py` to check the installed helper without
+a model request. `python3 test/linux_codex_interactive.py --tools` requests a
+real command and checks its output file in a private VM home. That probe
+explicitly bypasses the Codex process sandbox; `--tools-readonly` instead tests
+the read-only sandbox by asking the command tool to read an unknown marker.
+Neither option changes the normal installation's configuration.
+
+Tool execution remains blocked with the installed 0.163.0 helper. Its V8
+sandbox requests virtual reservations starting above a tebibyte and falls back
+to a final request of roughly 12 GiB. All exceed RetroOS's current 3 GiB user
+address space, and V8 aborts with `Failed to reserve the virtual address space
+for the V8 sandbox`. This is a virtual-address limitation, not a request for
+that much physical RAM. Bypassing the Codex process sandbox does not remove
+V8's internal reservation requirement. Chat responses work; successful helper
+startup or `--help` alone does not establish that tools work.
+Use `python3 test/linux_code_mode_host.py --runtime` for a model-free JavaScript
+runtime probe; it currently fails at this reservation. The same framed request
+was checked successfully against the installed helper on Linux.
 
 Run `python3 test/linux_console_focus.py` to check Linux terminal ownership
 above a ready DOS launcher. It exercises yield, fork and blocking wait, samples

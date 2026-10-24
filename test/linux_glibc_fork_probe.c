@@ -52,6 +52,7 @@ static int shared_child(void *argument) {
  return 19;
 }
 static void check_spawn(void) {
+ if(setpgid(0,0)!=0 || getpgrp()!=getpid())_exit(49);
  void *stack=malloc(65536);if(!stack)_exit(20);
  pid_t child=clone(shared_child,(char *)stack+65536,CLONE_VM|CLONE_VFORK|SIGCHLD,0);
  if(child<0 || shared_spawn_value!=73)_exit(21);
@@ -59,13 +60,17 @@ static void check_spawn(void) {
  free(stack);
  char *args[]={"probe","spawn-child",0};char *env[]={"SPAWN_CHECK=yes",0};
  for(int i=0;i<3;i++){
-  int error=posix_spawn(&child,"/missing-spawn-program",0,0,args,env);
+  posix_spawnattr_t attributes;
+  if(posix_spawnattr_init(&attributes) || posix_spawnattr_setpgroup(&attributes,0) ||
+     posix_spawnattr_setflags(&attributes,POSIX_SPAWN_SETPGROUP))_exit(50);
+  int error=posix_spawn(&child,"/missing-spawn-program",0,&attributes,args,env);
   if(error!=ENOENT)_exit(23);
   int pipefd[2];if(pipe(pipefd))_exit(24);
   posix_spawn_file_actions_t actions;
   if(posix_spawn_file_actions_init(&actions) || posix_spawn_file_actions_adddup2(&actions,pipefd[1],1) ||
      posix_spawn_file_actions_addclose(&actions,pipefd[0]))_exit(25);
-  error=posix_spawn(&child,"/proc/self/exe",&actions,0,args,env);
+  error=posix_spawn(&child,"/proc/self/exe",&actions,&attributes,args,env);
+  posix_spawnattr_destroy(&attributes);
   posix_spawn_file_actions_destroy(&actions);close(pipefd[1]);
   if(error)_exit(26);
   char reply[2];if(read(pipefd[0],reply,2)!=2 || memcmp(reply,"OK",2))_exit(27);
@@ -112,6 +117,7 @@ int main(int argc,char **argv){
  }
  if(argc>1 && !strcmp(argv[1],"child"))return 37;
  if(argc>1 && !strcmp(argv[1],"spawn-child")){
+  if(getpgrp()!=getpid())return 51;
   if(!getenv("SPAWN_CHECK") || strcmp(getenv("SPAWN_CHECK"),"yes"))return 29;
   if(write(1,"OK",2)!=2)return 30;
   return 37;

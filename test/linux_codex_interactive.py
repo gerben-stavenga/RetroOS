@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Ask the interactive Codex TUI for a response in QEMU/KVM with live SMB files.
 
-Uses a private copy of the saved login and a separate home. No model tools are
-requested. Terminal text and a screenshot are retained, credentials are not.
+Uses a private copy of the saved login and a separate home. Tool execution is
+optional. Terminal text and a screenshot are retained, credentials are not.
 """
 import argparse
 import json
 import os
 import re
+import secrets
 from pathlib import Path
 import shlex
 import shutil
@@ -28,8 +29,14 @@ EXPECTED = 'Hello from interactive Codex on RetroOS.'
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--daemon', action='store_true', help='Exercise the background server')
+    parser.add_argument('--tools', action='store_true', help='Execute a command through the code-mode host in the private VM')
+    parser.add_argument('--tools-readonly', action='store_true', help='Read an unknown marker through the command tool with the read-only sandbox')
     options = parser.parse_args()
-    artifacts = ROOT / 'build/ci' / ('codex-interactive-daemon' if options.daemon else 'codex-interactive')
+    if options.tools_readonly:
+        options.tools = True
+    label = 'codex-tools-readonly' if options.tools_readonly else 'codex-tools' if options.tools else 'codex-interactive'
+    artifacts = ROOT / 'build/ci' / (label + ('-daemon' if options.daemon else ''))
+    expected = 'CODEX_READ_PASS_' + secrets.token_hex(8) if options.tools_readonly else 'CODEX_TOOL_PASS' if options.tools else EXPECTED
     artifacts.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='retroos-interactive-') as directory:
         work = Path(directory)
@@ -37,6 +44,8 @@ def main():
         for child in ('RETROOS', 'TEMP', 'work'):
             (home / child).mkdir(parents=True)
         shutil.copyfile(ROOT / 'etc/RETROOS.INI', home / 'RETROOS/RETROOS.INI')
+        if options.tools_readonly:
+            (home / 'work/tool-input.txt').write_text(expected + '\n')
         setup(home, DEFAULT_BINARY, Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')))
         (home / '.codex/config.toml').write_text(
             'model = "gpt-6.1-sol"\nmodel_reasoning_effort = "medium"\n'
@@ -46,7 +55,8 @@ def main():
         command = ['codex', '--no-alt-screen',
                    '--disable', 'apps', '--disable', 'shell_snapshot',
                    '--disable', 'plugins', '--disable', 'remote_plugin',
-                   '--sandbox', 'read-only', '-C', '/home/retroos/work']
+                   '-C', '/home/retroos/work']
+        command += ['--dangerously-bypass-approvals-and-sandbox'] if options.tools and not options.tools_readonly else ['--sandbox', 'read-only']
         if not options.daemon:
             command.insert(1, '--no-daemon')
         (home / 'run.sh').write_text('exec ' + shlex.join(command) + '\n')
@@ -105,9 +115,18 @@ def main():
                     if sent and not debugged and time.monotonic() - submitted_at > 20:
                         request('debug dump')
                         debugged = True
-                    # Only enter a prompt after the interactive editor appears.
-                    if not sent and ('Ask Codex to do anything' in screen or 'context left' in screen or 'gpt-6.1-sol' in screen and 'directory:' in screen):
-                        prompt = 'Reply exactly: ' + EXPECTED + ' Do not use any tools or read any files.'
+                    # The editor appears while the session is still loading;
+                    # Enter then leaves text in the draft instead of starting
+                    # a turn. Wait for the model/status footer before typing.
+                    ready = 'context left' in screen or re.search(r'gpt-6\.1-sol\s+(?:medium|default)\s+·', screen, re.IGNORECASE)
+                    if not sent and ready:
+                        prompt = ('Use your command tool to execute exactly this shell command: `'
+                            "printf '%s\\n' CODEX_TOOL_PASS > /home/retroos/work/tool-result.txt && cat /home/retroos/work/tool-result.txt`. "
+                            'Reply exactly CODEX_TOOL_PASS only after the command succeeds.'
+                            if options.tools else 'Reply exactly: ' + expected + ' Do not use any tools or read any files.')
+                        if options.tools_readonly:
+                            prompt = ('Use your command tool to run cat /home/retroos/work/tool-input.txt. '
+                                'Reply only with the file contents as plain text, without a code fence.')
                         for offset in range(0, len(prompt), 30):
                             request('texthex ' + prompt[offset:offset + 30].encode().hex())
                             time.sleep(.12)
@@ -118,9 +137,14 @@ def main():
                         print('Submitted prompt through the guest keyboard.', flush=True)
                     # The expected phrase must appear in the assistant turn,
                     # not just the input/prompt echoed by the terminal.
-                    if sent and EXPECTED in screen and ('• ' + EXPECTED in screen or '● ' + EXPECTED in screen):
-                        print('PASS: interactive Codex replied: ' + EXPECTED, flush=True)
+                    if sent and expected in screen and ('• ' + expected in screen or '● ' + expected in screen):
+                        if options.tools and not options.tools_readonly:
+                            assert (home / 'work/tool-result.txt').read_text() == 'CODEX_TOOL_PASS\n'
+                        print('PASS: interactive Codex replied: ' + expected, flush=True)
                         break
+                    if options.tools and 'failed to spawn code-mode host' in screen:
+                        request('debug dump')
+                        raise RuntimeError('Code-mode host failed to spawn; see ' + str(artifacts))
                     if process.poll() is not None:
                         raise RuntimeError('Interactive Codex exited; see ' + str(artifacts))
                     time.sleep(2)

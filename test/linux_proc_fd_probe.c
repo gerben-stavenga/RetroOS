@@ -2,6 +2,7 @@
 #include <asm/unistd.h>
 #include <asm/stat.h>
 typedef unsigned long word;
+typedef struct { word pointer, length; } Iovec;
 #ifdef __x86_64__
 typedef struct stat Stat;
 #define LSTAT __NR_lstat
@@ -45,7 +46,9 @@ static void ipc_child(void){
  unsigned char part[97];word total=0;
  while(total<sizeof ipc_message){
   word count=sizeof ipc_message-total;if(count>sizeof part)count=sizeof part;
-  long n=call(__NR_read,0,(word)part,count,0);check(n>0,120);
+  word first=count<13?count:13;
+  Iovec vectors[]={{(word)part,first},{0,0},{(word)(part+first),count-first}};
+  long n=call(__NR_readv,0,(word)vectors,3,0);check(n>0,120);
   for(long i=0;i<n;i++)check(part[i]==(unsigned char)((total+i)*7+5),121);
   total+=n;
  }
@@ -71,6 +74,8 @@ static void ipc_roundtrips(void){
   }
   if(previous)check(child==previous,129);previous=child;
   call(__NR_close,input[0],0,0,0);call(__NR_close,output[1],0,0,0);
+  int pending_status=123;
+  check(call(__NR_wait4,child,(word)&pending_status,1,0)==0 && pending_status==123,200);
   check(call(__NR_write,input[1],(word)ipc_message,sizeof ipc_message,0)==sizeof ipc_message,130);
   call(__NR_close,input[1],0,0,0);
   unsigned char answer[7];word done=0;
@@ -83,6 +88,8 @@ static void ipc_roundtrips(void){
 }
 __attribute__((force_align_arg_pointer)) void _start(void){
  if(call(FSTAT,63,(word)&metadata,0,0)==0)ipc_child();
+ check(call(__NR_setpgid,0,0,0,0)==0,195);
+ check(call(__NR_getpgrp,0,0,0,0)==call(__NR_getpid,0,0,0,0),196);
  check(call(FSTAT,0,(word)&metadata,0,0)==0 && (metadata.st_mode&0170000)==0020000,116);
  long file=call(__NR_open,(word)"/home/retroos/target",0,0,0);check(file==3,1);
  check(call(__NR_fcntl,file,0,20,0)==20,2);
@@ -200,7 +207,14 @@ __attribute__((force_align_arg_pointer)) void _start(void){
  }
  /* Private isolation and coherent shared pages across opens, I/O and fork. */
  file=call(__NR_open,(word)"/home/retroos/target",2,0,0);check(file>=0,100);
+ Iovec file_vectors[]={{(word)buffer,3},{(word)(buffer+3),4}};
+ check(call(__NR_readv,file,(word)file_vectors,2,0)==7,201);
+ for(word n=0;n<7;n++)check(buffer[n]==(unsigned char)"PROCFD\n"[n],202);
+ check(call(__NR_readv,file,(word)file_vectors,1025,0)==-22,203);
+ check(call(__NR_readv,file,(word)-1,1,0)==-14,204);
+ check(call(__NR_lseek,file,0,0,0)==0,205);
  word mapped=(word)mapping(0,2,file,3);check(mapped<(word)-4095,101);
+ check(call(__NR_madvise,mapped,4096,4,0)==-22 && *(volatile char *)mapped=='P',171);
  check(*(volatile char *)mapped=='P',102);*(volatile char *)mapped='Q';
  check(call(__NR_munmap,mapped,4096,0,0)==0,103);
  check(call(__NR_read,file,(word)link,1,0)==1 && link[0]=='P',104);
@@ -232,6 +246,7 @@ __attribute__((force_align_arg_pointer)) void _start(void){
  mapped=(word)mapping_region(0,1,file,3,12288,0);check(mapped<(word)-4095,153);
  alias=(word)mapping_region(0,1,file,3,4096,4096);check(alias<(word)-4095,154);
  *(volatile char *)(mapped+4096)='M';check(*(volatile char *)alias=='M',155);
+ check(call(__NR_madvise,alias,4096,4,0)==-22 && *(volatile char *)alias=='M',172);
  check((word)mapping_region(mapped+4096,0x11,file,3,4096,8192)==mapped+4096,166);
  *(volatile char *)(mapped+4096)='X';
  check(*(volatile char *)alias=='M' && *(volatile char *)(mapped+8192)=='X',167);
@@ -250,6 +265,34 @@ __attribute__((force_align_arg_pointer)) void _start(void){
  check(call(__NR_lseek,file,4096,0,0)==4096 && call(__NR_read,file,(word)link,1,0)==1 && link[0]=='B',164);
  check(call(__NR_lseek,file,8192,0,0)==8192 && call(__NR_read,file,(word)link,1,0)==1 && link[0]=='Z',165);
  call(__NR_close,file,0,0,0);
+ /* Discard releases private anonymous pages, zero-fills reuse, and keeps COW siblings. */
+ mapped=(word)mapping_region(0,0x22,(word)-1,3,12288,0);check(mapped<(word)-4095,173);
+ for(word n=0;n<12288;n++)((volatile unsigned char *)mapped)[n]=(n/4096)+1;
+ check(call(__NR_madvise,mapped+4096,1,4,0)==0,174);
+ for(word n=4096;n<8192;n++)check(((volatile unsigned char *)mapped)[n]==0,175);
+ check(*(volatile char *)mapped==1 && *(volatile char *)(mapped+8192)==3,176);
+ child=call(__NR_fork,0,0,0,0);check(child>=0,177);
+ if(!child){
+  check(call(__NR_madvise,mapped+8192,4096,4,0)==0 && *(volatile char *)(mapped+8192)==0,178);
+  call(__NR_exit,17,0,0,0);for(;;){}
+ }
+ check(call(__NR_wait4,child,(word)&shared_status,0,0)==child && shared_status==(17<<8),179);
+ check(*(volatile char *)(mapped+8192)==3,180);
+ check(call(__NR_madvise,mapped,12288,8,0)==0 && *(volatile char *)mapped==1,181);
+ check(call(__NR_madvise,mapped+1,4096,4,0)==-22 && call(__NR_madvise,mapped,4096,999,0)==-22,182);
+ check(call(__NR_munmap,mapped+4096,4096,0,0)==0,183);
+ check(call(__NR_madvise,mapped,12288,4,0)==-22 && *(volatile char *)mapped==1,184);
+ check((word)mapping_region(mapped+4096,0x32,(word)-1,3,4096,0)==mapped+4096,185);
+ check(call(__NR_madvise,mapped,12288,4,0)==0,186);
+ check(*(volatile char *)mapped==0 && *(volatile char *)(mapped+8192)==0,187);
+ file=call(__NR_open,(word)"/home/retroos/target",2,0,0);check(file>=0,189);
+ check((word)mapping_region(mapped,0x12,file,3,4096,0)==mapped,190);
+ check(call(__NR_madvise,mapped,4096,4,0)==-22 && *(volatile char *)mapped=='P',191);
+ check((word)mapping_region(mapped,0x32,(word)-1,3,4096,0)==mapped,192);
+ check((word)mapping_region(mapped,0x11,file,3,4096,0)==mapped,193);
+ check(call(__NR_madvise,mapped,4096,4,0)==-22 && *(volatile char *)mapped=='P',194);
+ call(__NR_close,file,0,0,0);
+ check(call(__NR_munmap,mapped,12288,0,0)==0,188);
  /* Bazel creates output trees longer than the old 256-byte mutation buffers. */
  char deep[512]="/home/retroos",old[512],overlong[1025];
  unsigned ends[4],length=13;

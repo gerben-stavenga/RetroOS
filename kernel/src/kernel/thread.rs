@@ -143,7 +143,7 @@ pub enum KernelAction {
     },
     /// wait4: reap a zombie child (or block until one exists). Run in the
     /// executor so the child-table scan/reap happens off the parent's borrow.
-    Wait { pid: i32, status_ptr: usize },
+    Wait { pid: i32, status_ptr: usize, options: i32 },
     /// DOS INT-31 synth op on a *child* thread (reap / waitpid probe). Run in
     /// the executor so the cross-thread table
     /// access happens off the caller's `dos`/`kt` borrow. The executor writes

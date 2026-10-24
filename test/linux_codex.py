@@ -23,6 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, default=DEFAULT_BINARY)
     parser.add_argument('--request', action='store_true')
+    parser.add_argument('--direct', action='store_true', help='Start /bin/sh directly, bypassing shell.elf as RC does')
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix='retroos-codex-') as directory:
@@ -62,12 +63,12 @@ def main():
         env['RETROOS_QEMU_LIVE_PROFILE'] = str(profile)
         artifacts = ROOT / 'build/ci'
         artifacts.mkdir(parents=True, exist_ok=True)
-        mode = 'request' if args.request else 'version'
+        mode = ('request' if args.request else 'version') + ('-direct' if args.direct else '')
         log_path = artifacts / f'codex-{mode}.log'
         with log_path.open('w') as log:
             process = subprocess.Popen(
                 [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--headless', '--sound', 'none',
-                 '--cmd', '/home/retroos/RETROOS/SHELL.ELF /home/retroos/run.sh', '--', '-m', '2048'],
+                 '--cmd', ('/bin/sh' if args.direct else '/home/retroos/RETROOS/SHELL.ELF') + ' /home/retroos/run.sh', '--', '-m', '2048'],
                 cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
             try:
                 process.wait(timeout=180)

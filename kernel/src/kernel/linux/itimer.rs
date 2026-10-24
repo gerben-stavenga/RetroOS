@@ -123,6 +123,7 @@ pub(super) fn poll<A: crate::Arch>(
         linux.pending_random = None;
         linux.pending_flock = None;
         linux.pending_record_lock = None;
+        linux.pending_readv = None;
         linux.wait_status_ptr = 0;
         linux.waiting_child = None;
         regs.rax = (-4i64) as u64;

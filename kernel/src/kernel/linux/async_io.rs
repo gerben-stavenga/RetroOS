@@ -31,6 +31,7 @@ enum Wait {
     Flock(i32, u32),
     RecordLock(super::record_lock::Request),
     Read(u8, usize, usize),
+    ReadV,
     Socket(i32, usize, usize),
     Exited,
 }
@@ -41,6 +42,7 @@ struct Context {
     comm: [u8; 16],
     clear_tid: usize,
     wait: Wait,
+    readv: Option<super::readv::Request>,
 }
 #[derive(Clone)]
 struct Watch {
@@ -96,6 +98,7 @@ fn ensure<A: crate::Arch>(
         comm: kt.comm,
         clear_tid: 0,
         wait: Wait::Ready,
+        readv: None,
     });
     s.next_thread = 1;
 
@@ -613,6 +616,22 @@ pub(super) fn call<A: crate::Arch>(
                 return None;
             }
         }
+        19 => {
+            if descriptor(s, fd).is_some() { return Some(SyscallResult::val(-95)); }
+            let request = match super::readv::Request::new(machine, kt, a, true) {
+                Ok(request) => request,
+                Err(error) => return Some(SyscallResult::val(error)),
+            };
+            if let Some(result) = request.step(machine) {
+                reset_edge(s, fd);
+                result
+            } else {
+                ensure(machine, kt, s, regs);
+                s.contexts[s.active].readv = Some(request);
+                s.contexts[s.active].wait = Wait::ReadV;
+                0
+            }
+        }
         56 if a.a0 & 0x100 != 0 && a.a0 != 0x4111 => {
             // CLONE_VM threads require shared files, signal handlers and group.
             const SHARED: u64 = 0x100 | 0x200 | 0x400 | 0x800 | 0x10000;
@@ -658,6 +677,7 @@ pub(super) fn call<A: crate::Arch>(
                         0
                     },
                     wait: Wait::Ready,
+                    readv: None,
                 };
                 if let Some(index) = reuse {
                     s.contexts[index] = context;
@@ -820,6 +840,7 @@ pub(super) fn interrupt(kt: &mut thread::KernelThread<impl crate::Arch>, s: &mut
         && !matches!(context.wait, Wait::Ready | Wait::Exited) {
         if s.parked { *regs = context.regs; }
         context.wait = Wait::Ready;
+        context.readv = None;
         regs.rax = (-4i64) as u64;
     }
     s.parked = false;
@@ -883,9 +904,11 @@ pub(super) fn schedule<A: crate::Arch>(
                     None
                 }
             }
+            Wait::ReadV => s.contexts[i].readv.as_ref().unwrap().step(machine),
             _ => None,
         };
         if let Some(result) = result {
+            s.contexts[i].readv = None;
             s.contexts[i].regs.rax = result as i64 as u64;
             s.contexts[i].wait = Wait::Ready;
         }

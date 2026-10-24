@@ -24,6 +24,8 @@ mod record_lock;
 pub(crate) mod environment;
 mod file_mapping;
 mod shared_mapping;
+mod madvise;
+mod readv;
 mod file_io;
 mod tty;
 mod time;
@@ -115,6 +117,7 @@ pub struct LinuxState {
     pub mmap_cursor: usize,
     occupied_ranges: alloc::vec::Vec<(usize, usize)>,
     shared_mappings: shared_mapping::State,
+    anonymous_mappings: madvise::Anonymous,
     pub tls_entry: i32,            // GDT index for TLS (13-15), -1 = none
     pub tls_base: u32,
     pub tls_limit: u32,
@@ -126,6 +129,7 @@ pub struct LinuxState {
     pending_random: Option<entropy::Request>,
     pending_flock: Option<(i32, u32)>,
     pending_record_lock: Option<record_lock::Request>,
+    pending_readv: Option<readv::Request>,
     pub wait_status_ptr: usize,            // Deferred wait4 status write
     pub wait_exit_code: i32,
     waiting_child: Option<i32>,
@@ -164,6 +168,7 @@ impl LinuxState {
             mmap_cursor: crate::kernel::elf::USER_STACK_TOP - 0x0100_0000,
             occupied_ranges: alloc::vec::Vec::new(),
             shared_mappings: shared_mapping::State::default(),
+            anonymous_mappings: madvise::Anonymous::default(),
             tls_entry: -1,
             tls_base: 0,
             tls_limit: 0,
@@ -175,6 +180,7 @@ impl LinuxState {
             pending_random: None,
             pending_flock: None,
             pending_record_lock: None,
+            pending_readv: None,
             wait_status_ptr: 0,
             wait_exit_code: 0,
             waiting_child: None,
@@ -197,6 +203,7 @@ impl LinuxState {
             || self.pending_socket.is_some() || self.pending_select.is_some()
             || self.pending_random.is_some() || self.pending_flock.is_some()
             || self.pending_record_lock.is_some() || self.waiting_child.is_some()
+            || self.pending_readv.is_some()
             || async_io::parked(&self.async_io)
     }
 
@@ -438,6 +445,14 @@ pub fn complete_pending_io<A: crate::Arch>(machine: &mut A,
         async_io::schedule(machine, kt, linux, regs);
         return;
     }
+    if let Some(request) = &linux.pending_readv {
+        if let Some(result) = request.step(machine) {
+            regs.rax = result as i64 as u64;
+            linux.pending_readv = None;
+            kt.state = thread::ThreadState::Ready;
+        }
+        return;
+    }
     if let Some(request) = linux.pending_record_lock {
         if let Some(result) = request.step(machine) {
             regs.rax = result as i64 as u64;
@@ -584,9 +599,10 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         // setuid32/setgid32/setreuid32/setregid32/setresuid32/setresgid32 —
         // single-user system, accept any change as a no-op.
         203 | 204 | 208 | 210 | 213 | 214 => SyscallResult::val(0),
-        // setpgid(57)/getpgid(132)/setsid(66)/getpgrp(65)/getsid(147) —
+        57 => sys_setpgid(kt, a),
+        // getpgid(132)/setsid(66)/getpgrp(65)/getsid(147) —
         // single-process job model, return our tid as session/group.
-        57 | 66 | 65 | 132 | 147 => SyscallResult::val(kt.tid),
+        66 | 65 | 132 | 147 => SyscallResult::val(kt.tid),
         33  => sys_access(machine, &mut kt.vcpu, linux, a),
         39 => sys_path_mutation(machine, linux, a, 39),
         42  => sys_pipe(machine, kt, a, false),
@@ -624,6 +640,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         125 => SyscallResult::val(0),
         140 => sys_llseek(machine, kt, a),
         146 => sys_writev(machine, kt, a, false),
+        145 => readv::call(machine, kt, linux, a, false),
         158 => sys_sched_yield(kt, regs),
         162 => sys_nanosleep(),
         168 => sys_poll(machine, kt, linux, a, regs),
@@ -636,6 +653,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         196 => sys_stat64(machine, kt, linux, a, false, false),
         197 => sys_fstat64(machine, kt, a, false),
         220 => sys_getdents64(machine, kt, linux, a),
+        219 => madvise::call(machine, linux, a),
         221 => sys_fcntl(kt, a),
         238 => sys_exit(machine, tid, a),
         240 => SyscallResult::val(0),
@@ -693,11 +711,13 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         17  => sys_pread64(machine, kt, a),
         18  => sys_pwrite64(machine, kt, a, true),
         20  => sys_writev(machine, kt, a, true),
+        19  => readv::call(machine, kt, linux, a, true),
         21  => sys_access(machine, &mut kt.vcpu, linux, a),
         22  => sys_pipe(machine, kt, a, false),
         24  => sys_sched_yield(kt, regs),
         25  => sys_mremap(machine, linux, a),
         26  => shared_mapping::msync(linux, a),
+        28  => madvise::call(machine, linux, a),
         // statfs(137): -ENOSYS — callers fall back. fadvise64(221): advisory.
         137 => SyscallResult::val(-ENOSYS),
         332 => sys_statx(machine, kt, linux, a),
@@ -733,11 +753,12 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         96  => time::gettimeofday(machine,a,true),
         102 | 104 | 107 | 108 => SyscallResult::val(0),
         110 => SyscallResult::val(kt.tid),
-        // setpgid(109)/getpgrp(111)/setsid(112)/getpgid(121)/getsid(124):
+        109 => sys_setpgid(kt, a),
+        // getpgrp(111)/setsid(112)/getpgid(121)/getsid(124):
         // single-process job model — return our tid as group/session (mirrors
         // the i386 path) so dash's job-control setup converges (getpgrp ==
         // tcgetpgrp) instead of spinning on getpgrp/kill.
-        109 | 111 | 112 | 121 | 124 => SyscallResult::val(kt.tid),
+        111 | 112 | 121 | 124 => SyscallResult::val(kt.tid),
         62  => SyscallResult::val(0), // kill — no-op (no real job control)
         158 => sys_arch_prctl(machine, kt, linux, a, regs),
         200 => sys_exit(machine, tid, a),
@@ -1086,6 +1107,18 @@ fn fork_set_retval(regs: &mut Regs, ret: i32) {
     regs.rax = ret as i64 as u64;
 }
 
+/// The current job model gives each process its own group. Creating that
+/// group is supported; joining another group needs real session bookkeeping.
+/// Unlike group queries, a successful setpgid MUST return zero. Musl spawn
+/// treats any nonzero result as failure and negates it into the child errno.
+fn sys_setpgid<A: crate::Arch>(kt: &thread::KernelThread<A>, a: &Args) -> SyscallResult {
+    let (pid, group) = (a.a0 as i32, a.a1 as i32);
+    SyscallResult::val(if pid < 0 || group < 0 { -EINVAL }
+        else if pid != 0 && pid != kt.tid { -3 }
+        else if group != 0 && group != kt.tid { -1 }
+        else { 0 })
+}
+
 /// Executor for `KernelAction::Fork`: COW-clone the current process. Runs in
 /// the event loop after the handler's `kt`/`linux` borrow released, so it can
 /// hold both the parent and the new child slot at once. `vcpu` is the live
@@ -1133,6 +1166,7 @@ pub(crate) fn handle_fork<A: crate::Arch>(
         cl.mmap_cursor = pl.mmap_cursor;
         cl.occupied_ranges = pl.occupied_ranges.clone();
         cl.shared_mappings = pl.shared_mappings.fork();
+        cl.anonymous_mappings = pl.anonymous_mappings.clone();
         cl.signals = signals::fork(&pl.signals, async_io::current_id(&pl.async_io, parent.kernel.tid), child.kernel.tid);
         cl.tls_entry = pl.tls_entry;
         cl.tls_base = pl.tls_base;
@@ -1178,6 +1212,7 @@ pub(crate) fn release_vfork<A: crate::Arch>(machine: &mut A, threads: &mut [thre
         let mappings = cl.shared_mappings.fork();
         pl.release_mappings(machine);
         pl.shared_mappings = mappings;
+        pl.anonymous_mappings = cl.anonymous_mappings.clone();
     }
     parent.kernel.state = thread::ThreadState::Ready;
 }
@@ -2111,6 +2146,13 @@ fn sys_brk(linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let ceiling = linux.occupied_ranges.iter().filter(|(start, _)| *start >= linux.heap_base)
         .map(|(start, _)| *start).min().unwrap_or(linux.mmap_cursor).min(linux.mmap_cursor);
     let new_end = addr.max(linux.heap_base).min(ceiling);
+    let old_page_end = linux.heap_end.div_ceil(4096) * 4096;
+    let new_page_end = new_end.div_ceil(4096) * 4096;
+    if new_page_end > old_page_end {
+        linux.anonymous_mappings.add(old_page_end, new_page_end);
+    } else {
+        linux.anonymous_mappings.remove(new_page_end, old_page_end);
+    }
     linux.heap_end = new_end;
     SyscallResult::val64(linux.heap_end as i64)
 }
@@ -2256,6 +2298,7 @@ fn sys_munmap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args)
     if end > elf::USER_STACK_TOP { return SyscallResult::val(-EINVAL); }
     machine.unmap_range(addr / 4096, (end - addr) / 4096);
     linux.shared_mappings.release(machine, addr, end);
+    linux.anonymous_mappings.remove(addr, end);
     // Reuse a just-freed region at the current downward allocation frontier.
     if addr == linux.mmap_cursor { linux.mmap_cursor = end; }
     SyscallResult::val(0)
@@ -2266,8 +2309,8 @@ fn sys_munmap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args)
 fn sys_wait4<A: crate::Arch>(_machine: &mut A, _kt: &mut thread::KernelThread<A>, a: &Args, _regs: &mut Regs) -> SyscallResult {
     let pid = a.a0 as i32;
     let status_ptr = a.a1 as usize;
-    let _options = a.a2 as i32;
-    SyscallResult::act(0, thread::KernelAction::Wait { pid, status_ptr })
+    let options = a.a2 as i32;
+    SyscallResult::act(0, thread::KernelAction::Wait { pid, status_ptr, options })
 }
 
 /// Executor for `KernelAction::Wait`. Runs after the handler's borrow released,
@@ -2285,6 +2328,7 @@ pub(crate) fn handle_wait<A: crate::Arch>(
     tid: usize,
     pid: i32,
     status_ptr: usize,
+    options: i32,
 ) -> Option<usize> {
     let (child_tid, exit_code) = thread::waitpid(threads, machine, tid, pid);
 
@@ -2298,6 +2342,14 @@ pub(crate) fn handle_wait<A: crate::Arch>(
 
     if child_tid == -10 {
         vcpu.rax = (-ECHILD) as i64 as u64;
+        return None;
+    }
+
+    // WNOHANG is a poll, not a request to park this process. In particular,
+    // async child monitors must keep running to feed a live helper's pipes.
+    // No result leaves the caller's status storage untouched.
+    if options & 1 != 0 {
+        vcpu.rax = 0;
         return None;
     }
 
@@ -2654,12 +2706,14 @@ fn sys_mmap2<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
         if let Err(error) = linux.shared_mappings.map(machine, file_handle.unwrap(), offset_bytes, base, alloc_size, a.a2) {
             return SyscallResult::val(error);
         }
+        linux.anonymous_mappings.remove(base, base + alloc_size);
         if flags & MAP_FIXED != 0 { linux.occupied_ranges.push((base, base + alloc_size)); }
         return SyscallResult::val64(base as i64);
     }
     if flags & MAP_FIXED != 0 {
         machine.unmap_range(base / 4096, alloc_size / 4096);
         linux.shared_mappings.release(machine, base, base + alloc_size);
+        linux.anonymous_mappings.remove(base, base + alloc_size);
     }
 
     // File-backed mapping: read the file region into the (demand-allocated)
@@ -2680,6 +2734,9 @@ fn sys_mmap2<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     }
 
     if flags & MAP_FIXED != 0 { linux.occupied_ranges.push((base, base + alloc_size)); }
+    if flags & MAP_ANONYMOUS != 0 && flags & 3 == 2 {
+        linux.anonymous_mappings.add(base, base + alloc_size);
+    }
     SyscallResult::val64(base as i64)
 }
 
@@ -2712,6 +2769,9 @@ fn sys_mremap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args)
     linux.mmap_cursor = base;
     machine.zero(base, alloc_size);
     machine.copy_within(old_addr, base, old_len);
+    if linux.anonymous_mappings.contains(old_addr, old_addr.saturating_add(old_len)) {
+        linux.anonymous_mappings.add(base, base + alloc_size);
+    }
     SyscallResult::val64(base as i64)
 }
 
