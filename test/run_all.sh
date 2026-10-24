@@ -127,7 +127,7 @@ bz()        { if have bazelisk; then bazelisk "$@"; else bazel "$@"; fi; }
 # so a machine without /dev/kvm still runs the rest.
 unit() {
     bz test --platforms=@platforms//host \
-        //arch-abi:arch_abi_test //arch-metal:xhci_dma_test //arch-metal:phys_mm_test //arch-metal:boot_mem_test //kernel:kernel_unit_test \
+        //arch-abi:arch_abi_test //arch-metal:xhci_dma_test //arch-metal:phys_mm_test //arch-metal:boot_mem_test //arch-metal:acpi_test //kernel:kernel_unit_test \
         //lib:sound_test //lib:vga_test //lib:heap_test //lib:compact_fmt_test //lib:term_test \
         //ext4:ext4_test //ext4:modern_image_test //third_party/voodoo:voodoo_test //third_party/smb2-core:protocol_test \
         //arch-interp:arch-interp-test //arch-interp:mmu-test
@@ -146,7 +146,7 @@ run() {
     # Every suite belongs to one group; new unclassified suites remain in DOS.
     local group=dos
     case "$name" in
-        arch_smp|arch_tls|physical_memory|xhci_smoke|grub_*|boot_composition|disk_selection|extra_drives|isapnp_smoke|machine_*|dn_state|module_*) group=boot ;;
+        kernel_smp|arch_smp|arch_tls|physical_memory|xhci_smoke|grub_*|boot_composition|disk_selection|extra_drives|isapnp_smoke|machine_*|dn_state|module_*) group=boot ;;
         os2_*|windows_*|linux_*|rat_commander_*|locales_*|keyboards_*) group=personalities ;;
         wifi_*|random_interrupts|smb|virtio_net|ata_lba48|shared_disks|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
     esac
@@ -182,6 +182,7 @@ run() {
 # --- Rust unit tests: pure host builds, no devices at all (CI-safe) --------
 run unit         -         unit
 run xhci_smoke   qemu_boot python3 test/xhci_smoke.py
+run kernel_smp physical_memory_tools python3 test/kernel_smp.py
 run arch_smp physical_memory_tools python3 test/arch_smp.py
 run arch_tls physical_memory_tools python3 test/arch_tls.py
 run physical_memory physical_memory_tools python3 test/physical_memory.py

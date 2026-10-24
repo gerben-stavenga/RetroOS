@@ -83,3 +83,15 @@ host_platform_test(
     name = "boot_mem_test",
     test = ":boot_mem_test_host",
 )
+
+rust_test(
+    name = "acpi_test_host",
+    srcs = ["acpi_test.rs", "src/acpi.rs"],
+    crate_root = "acpi_test.rs",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
+)
+host_platform_test(
+    name = "acpi_test",
+    test = ":acpi_test_host",
+)

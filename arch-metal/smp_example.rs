@@ -15,7 +15,10 @@ static ROOTS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 static TLS_ADDR: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 static GDT: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 static STACKS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static KERNEL_TABLE: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static PML4_ROOT: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 static MISSING_READY: AtomicU32 = AtomicU32::new(0);
+static SHARED_ADDRESS: AtomicU32 = AtomicU32::new(0);
 static GO: AtomicU32 = AtomicU32::new(0);
 #[thread_local]
 static mut INITIALIZED: u32 = 0x12345678;
@@ -87,6 +90,32 @@ fn check_local(id: u32) {
         let top = STACKS[id as usize].load(Ordering::Acquire);
         assert!(here < top && here >= top - 65536);
     }
+    use arch_metal::paging2::{self, Entries, Entry};
+    if paging2::is_pae() && paging2::cpu_supports_long_mode() {
+        paging2::setup_long_mode_tables();
+        paging2::flush_tlb();
+    }
+    let root = paging2::root_base();
+    let kernel_table = match paging2::entries() {
+        Entries::E32(e) => {
+            assert_eq!(e[root + 768].addr(), paging2::current_root_phys());
+            e[root + 770].page()
+        }
+        Entries::E64(e) => {
+            let own = paging2::current_root_phys();
+            assert_eq!(e[root + 3].addr(), own);
+            if paging2::cpu_supports_long_mode() {
+                let pml4 = e[root + 4].addr();
+                // Use the pool/image affine mapping to inspect the back edge.
+                let linked = pml4 as usize - paging2::KERNEL_PHYS + paging2::KERNEL_BASE;
+                let back = unsafe { (linked as *const u64).read_volatile() };
+                assert_eq!(back & 0x000f_ffff_ffff_f000, own);
+                PML4_ROOT[id as usize].store(pml4 as u32, Ordering::Release);
+            }
+            e[root + 5].page()
+        }
+    };
+    KERNEL_TABLE[id as usize].store(kernel_table as u32, Ordering::Release);
     let mut gdtr = [0u8; 6];
     unsafe {
         core::arch::asm!("sgdt [{}]", in(reg) gdtr.as_mut_ptr(), options(nostack));
@@ -105,7 +134,11 @@ extern "C" fn secondary(id: u32, argument: usize) -> ! {
     while GO.load(Ordering::Acquire) == 0 {
         core::hint::spin_loop();
     }
+    arch_metal::paging2::refresh_kernel_mappings();
+    let shared = SHARED_ADDRESS.load(Ordering::Acquire) as *const u8;
     unsafe {
+        assert_eq!(shared.read_volatile(), 0x5a);
+        assert_eq!(shared.add(3 * 1024 * 1024 - 1).read_volatile(), 0x5a);
         assert_eq!({ INITIALIZED }, id + 100);
         assert_eq!({ ZERO }, id + 200);
     }
@@ -119,8 +152,8 @@ fn allocate_core(
     ready: &'static AtomicU32,
 ) -> smp::CoreStart {
     let mut allocate = |layout| memory.allocate(layout).unwrap();
-    // Allocate the most strongly aligned stack first to avoid wasting pool space.
-    let trap = allocate(Layout::from_size_align(16384, 65536).unwrap());
+    // A 16 KiB-aligned trap stack fits wholly within one 64 KiB espfix window.
+    let trap = allocate(Layout::from_size_align(16384, 16384).unwrap());
     let tls = allocate(smp::tls_layout());
     let stack = allocate(Layout::from_size_align(65536, 16).unwrap());
     smp::CoreStart {
@@ -288,6 +321,10 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
         }
     }
     print("SMP DMA allocated after AP resources\n");
+    // Demand paging creates kernel root entries after AP startup. A generation
+    // refresh must bring them into every private root before kernel access.
+    let shared = alloc::vec![0x5au8; 3 * 1024 * 1024];
+    SHARED_ADDRESS.store(shared.as_ptr() as u32, Ordering::Release);
     GO.store(1, Ordering::Release);
     for id in 1..4 {
         for _ in 0..10000 {
@@ -297,7 +334,17 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
             delay(100);
         }
         assert_eq!(DONE[id].load(Ordering::Acquire), 1);
+        assert_eq!(
+            KERNEL_TABLE[id].load(Ordering::Acquire),
+            KERNEL_TABLE[0].load(Ordering::Acquire)
+        );
         for other in 0..id {
+            if arch_metal::paging2::is_pae() && arch_metal::paging2::cpu_supports_long_mode() {
+                assert_ne!(
+                    PML4_ROOT[id].load(Ordering::Acquire),
+                    PML4_ROOT[other].load(Ordering::Acquire)
+                );
+            }
             assert_ne!(
                 GDT[id].load(Ordering::Acquire),
                 GDT[other].load(Ordering::Acquire)

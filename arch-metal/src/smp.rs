@@ -68,7 +68,7 @@ pub unsafe fn init_core(core_id: u32) {
         unsafe { START.expect("AP missing startup context").trap_stack_top }
     };
     assert!(
-        crate::boot_mem::end() - paging2::KERNEL_BASE + paging2::KERNEL_PHYS
+        crate::boot_mem::pool_start() - paging2::KERNEL_BASE + paging2::KERNEL_PHYS
             <= paging2::BOOT_IDENTITY_END,
         "boot storage exceeds the physical 4 MiB identity window"
     );
@@ -84,6 +84,7 @@ pub unsafe fn init_core(core_id: u32) {
 /// # Safety
 /// `init_core` must have completed on this AP, with interrupts still disabled.
 pub unsafe fn run_secondary() -> ! {
+    paging2::refresh_kernel_mappings();
     let start = unsafe { START.expect("not a secondary core") };
     // The active GDT is now private TLS storage; the trampoline can be reused.
     start.ready.store(start.core_id, Ordering::Release);
@@ -136,7 +137,7 @@ pub unsafe fn start_core(
     }
     let layout = tls_layout();
     let lo = crate::boot_mem::pool_start();
-    let hi = crate::boot_mem::pool_end();
+    let hi = crate::boot_mem::boot_limit();
     let valid = |base: usize, size: usize| {
         base >= lo && base.checked_add(size).is_some_and(|end| end <= hi)
     };

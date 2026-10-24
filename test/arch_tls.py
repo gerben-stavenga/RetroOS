@@ -19,13 +19,13 @@ def run(*args):
                    stdout=subprocess.DEVNULL)
 
 
-def session(work, disk, name, cpu, accel):
+def session(work, disk, name, cpu, accel, extra=(), initialized=None):
     boot = prepare_boot(work, disk)
     log = work / (name + '.log')
     with (work / (name + '.stderr')).open('w') as errors:
         process = subprocess.Popen([
             'qemu-system-x86_64', '-accel', accel, '-cpu', cpu, '-m', '128',
-            '-display', 'none', '-serial', 'none', '-no-reboot',
+            '-display', 'none', '-serial', 'none', '-no-reboot', *extra,
             '-drive', f'file={boot},format=raw,snapshot=on',
             '-drive', f'file={disk},format=raw,snapshot=on',
             '-debugcon', f'file:{log}',
@@ -38,6 +38,10 @@ def session(work, disk, name, cpu, accel):
                                ('PANIC', 'SEGV', 'fatal Exception',
                                 '[mem] exit tid=1 code=1 ')), text
                 if '[mem] exit tid=1 code=0 ' in text:
+                    if initialized is not None:
+                        assert f'SMP: {initialized} CPUs initialized,' in text, text
+                        assert text.count('initialized, parking') == initialized - 1, text
+                        assert 'startup failed' not in text, text
                     print('PASS:', name, 'guest FS/GS across syscalls and timer IRQs', flush=True)
                     return
                 assert process.poll() is None, text + (work / (name + '.stderr')).read_text()

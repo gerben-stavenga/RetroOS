@@ -70,7 +70,7 @@ SECTIONS
     TLS_FILE_SIZE = SIZEOF(.tdata);
     TLS_SIZE = ALIGN(ADDR(.tbss) + SIZEOF(.tbss) - TLS_TEMPLATE, TLS_ALIGN);
 
-    .bss ALIGN(128K) (NOLOAD) : {
+    .bss ALIGN(4K) (NOLOAD) : {
         *(.bss .bss.*)
         *(COMMON)
         /* The BSP needs no allocator. AP copies will be dynamically allocated
@@ -88,30 +88,30 @@ SECTIONS
          * Addresses are linker symbols — Rust references them via extern. */
         . = ALIGN(4K);
         /* espfix invariant (see GDT_ESPFIX_SS in arch-metal/descriptors.rs):
-         * ARCH_STACK is the ring-0 trap stack (TSS.sp0) — 64K-ALIGN it so
+         * ARCH_STACK is the ring-0 trap stack (TSS.sp0) — 16K-ALIGN it so
          * the whole 16 KB stack sits inside one 64K segment window and every
          * ESP's low 16 bits equal its offset from the window base, letting
          * the exit path truncate ESP against the aliased SS. The guard page
          * stays directly below the aligned base. */
         . += 0x1000;
-        . = ALIGN(64K);
+        . = ALIGN(16K);
         ARCH_STACK_GUARD   = . - 0x1000;
-        ARCH_STACK         = .;     . += 0x4000;   /* 16 KB, 64K-aligned */
+        ARCH_STACK         = .;     . += 0x4000;   /* 16 KB, 16K-aligned */
         ARCH_STACK_TOP     = .;
         KERNEL_CORE_END = .;
         /* Keep this unique input section LAST, outside the .bss.* wildcard.
          * NOLOAD reserves RAM in the ELF without storing zero bytes on disk. */
-        . = ALIGN(128K);
+        . = ALIGN(4K);
         BOOT_POOL_START = .;
         KEEP(*(.boot_pool))
         BOOT_POOL_END = .;
     }
     _end = .;
-    ASSERT(KERNEL_CORE_END - KERNEL_BASE <= 0x220000,
-           "kernel excluding boot pool exceeds 2.125 MiB")
+    ASSERT(KERNEL_CORE_END - KERNEL_BASE + KERNEL_PHYS <= 3M + 64K,
+           "kernel excluding boot pool must end below physical 3 MiB + 64 KiB")
     ASSERT(BOOT_POOL_END == _end, "boot pool must be last in BSS")
-    ASSERT(_end - KERNEL_BASE + KERNEL_PHYS <= 4M - 128K,
-           "kernel and boot pool must leave 128 KiB below physical 4 MiB")
+    ASSERT(_end - KERNEL_BASE <= 5M,
+           "reserved pool exceeds the existing high kernel mapping")
 
     /DISCARD/ : {
         *(.eh_frame)

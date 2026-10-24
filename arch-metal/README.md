@@ -12,8 +12,10 @@ GDT, TSS and FPU/syscall state, then switches to flat segments and virtual GS.
 Only `core_id == 0` should initialize devices, shared allocation, or the kernel's
 scheduler. On an AP, call `smp::run_secondary()` after CPU-local initialization;
 it acknowledges startup and invokes the supplied entry function with interrupts
-still disabled. The regular kernel implements this split; it does not yet
-choose or launch additional CPUs automatically.
+still disabled. The regular kernel discovers enabled CPUs through ACPI MADT, allocates as many
+as the pre-paging window permits, before allocating DMA buffers, and starts them before shared
+kernel initialization. Secondary CPUs halt with interrupts disabled; they do not
+run scheduler tasks yet. Its boot policy lives in `kernel/src/arch/smp.rs`.
 
 `smp::start_core(apic_id, page_phys, CoreStart { .. }, delay_us)` starts one
 known offline AP. Hardware APIC IDs and logical core IDs are separate. The
@@ -22,18 +24,20 @@ CPU's stacks and `smp::tls_layout()` bytes, and supplies a calibrated delay.
 Requests are serialized on the BSP with interrupts disabled. Startup works
 with xAPIC and x2APIC senders and has bounded delivery/acknowledgement waits.
 
-The shared low-memory allocator is a **768 KiB array placed last in BSS** by
-`kernel.ld`, using a dedicated `.boot_pool` input section. It is 128 KiB aligned
+The shared low-memory allocator is a **2 MiB array placed last in BSS** by
+`kernel.ld`, using a dedicated `.boot_pool` input section. It is page aligned
 and `NOLOAD`: the ELF reserves its RAM before modules are loaded, without
 storing the zero bytes in the file. `_end` and the ordinary heap follow the
-whole pool, including unused capacity. The linker separately checks:
-
-- Kernel before the pool: at most 2.125 MiB.
-- Complete physical image: at most 3.875 MiB, leaving 128 KiB below 4 MiB.
+whole pool, including unused capacity. The linker checks the kernel's physical
+end excluding the pool against **3 MiB + 64 KiB**, and the full reservation
+against the existing high kernel mapping's capacity. Separately, the boot
+allocator limits actual shared bootstrap tables and AP stacks/TLS to physical
+**3.875 MiB**, leaving 128 KiB below 4 MiB. The unused pool tail is not charged
+against this pre-paging limit; DMA can use that tail after paging is active.
 
 The startup order is:
 
-1. `smp::init_core(0)` performs minimal BSP arch setup and maps the whole image.
+1. `smp::init_core(0)` reserves shared boot tables and maps the whole image.
 2. Claim `boot_mem::BootMemory::new()` and allocate **all** AP stacks/TLS.
 3. `finish()` closes AP allocation and opens the pool's remaining tail to
    permanent allocations. Start the selected APs with `smp::start_core`.
@@ -46,7 +50,8 @@ the same buffer; exhausted pool space returns unavailable. There is no separate
 768 KiB DMA array. The startup sender's APIC page table also uses the remaining
 pool, so engaging APs needs neither the ordinary heap nor the frame allocator.
 
-All storage stays in the original physical 0–4 MiB identity window. Offset
+All storage needed before the flat-segment switch stays in the original
+physical 0–4 MiB identity window. The remainder is covered by the high mapping. Offset
 segments before paging and flat segments afterward resolve the same stack/TLS
 addresses to the same RAM. The trampoline still only enters protected mode,
 loads stack/GS, and calls Rust. The below-1-MiB SIPI page is separately reserved.
@@ -71,3 +76,23 @@ CPU timing out. The example verifies both ISA DMA channel sizes use pool space
 following the AP allocations, and that ordinary heap/physical allocations lie
 outside the pool. `bazelisk test //arch-metal:boot_mem_test` checks allocation
 phase ordering, alignment, exhaustion and overflow.
+
+`acpi::processor_ids` reads enabled Local APIC and x2APIC entries without a heap,
+using the Multiboot2 RSDP or the legacy firmware scan. Boot reads temporarily
+borrow and restore one low-memory alias PTE; the identity mapping stays unchanged.
+Malformed/oversized tables are rejected, unknown records skipped, and duplicate
+APIC IDs collapsed. Missing discovery, a safe SIPI page, or a calibrated delay
+leaves the kernel running on the BSP. CPUs requiring x2APIC addressing are skipped
+when the sender is in xAPIC mode. A startup error stops further launch attempts.
+The kernel uses a CPUID TSC frequency or bounded PIT calibration for startup;
+platforms with neither remain single-CPU for now.
+
+Only the recursive root (PD/PDPT), PML4 and 32-byte hardware PAE PDPT are private
+paging roots in TLS. Kernel leaf tables and the invariant mode-toggle mapping
+are initialized once in the boot pool. Scratch/temp buffers remain CPU-local.
+A canonical kernel-root portion has a lock-protected generation; each CPU
+refreshes its private kernel entries and TLB on kernel entry when stale. This
+adds no stale-fault retry. Ownership and allocator synchronization remain
+requirements before allowing concurrent general kernel work. The SMP example
+checks distinct roots/PML4 back-pointers, shared kernel leaf tables, and refresh
+after the BSP adds heap mappings while APs wait.

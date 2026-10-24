@@ -2,31 +2,13 @@
 //!
 //! The Multiboot v1 entry path does not pass an RSDP pointer, so find the
 //! standard PC RSDP locations, validate the checksums, and walk the root table
-//! to locate the HPET description table. Reads use the existing physical
-//! aperture and do not assume ACPI tables are below 4 GiB.
+//! for hardware descriptions. Boot reads borrow a temporary PTE without a heap.
+//! Call on the BSP at ring 0 with IRQs off, before entering the runtime.
 
-const APERTURE_SIZE: u64 = 64 * 1024;
 const RSDP_SIGNATURE: &[u8; 8] = b"RSD PTR ";
 
-fn read_physical(mut address: u64, mut out: &mut [u8]) -> bool {
-    while !out.is_empty() {
-        let base = address & !(APERTURE_SIZE - 1);
-        let offset = (address - base) as usize;
-        let count = out.len().min(APERTURE_SIZE as usize - offset);
-        if !crate::aperture::remap(base) {
-            return false;
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (crate::aperture::APERTURE_BASE + offset) as *const u8,
-                out.as_mut_ptr(),
-                count,
-            );
-        }
-        address += count as u64;
-        out = &mut out[count..];
-    }
-    true
+fn read_physical(address: u64, out: &mut [u8]) -> bool {
+    crate::paging2::read_boot_physical(address, out)
 }
 
 fn checksum(address: u64, length: usize) -> Option<u8> {
@@ -106,7 +88,12 @@ fn table_header(address: u64) -> Option<([u8; 4], usize)> {
         .then(|| (header[..4].try_into().unwrap(), length))
 }
 
-fn find_hpet_in_root(root: u64, signature: &[u8; 4], entry_bytes: usize) -> Option<u64> {
+fn find_in_root(
+    root: u64,
+    signature: &[u8; 4],
+    entry_bytes: usize,
+    wanted: &[u8; 4],
+) -> Option<u64> {
     let (root_signature, length) = table_header(root)?;
     if &root_signature != signature
         || (length - 36) % entry_bytes != 0
@@ -128,27 +115,14 @@ fn find_hpet_in_root(root: u64, signature: &[u8; 4], entry_bytes: usize) -> Opti
         let Some((child_signature, child_length)) = table_header(address) else {
             continue;
         };
-        if &child_signature != b"HPET" || child_length < 56
-            || checksum(address, child_length) != Some(0)
-        {
-            continue;
-        }
-        let mut hpet = [0u8; 56];
-        if !read_physical(address, &mut hpet) {
-            continue;
-        }
-        // HPET's ACPI Generic Address Structure: System Memory, address at 44.
-        if hpet[40] == 0 && hpet[41] != 0 {
-            let base = u64::from_le_bytes(hpet[44..52].try_into().unwrap());
-            if base != 0 {
-                return Some(base);
-            }
+        if &child_signature == wanted && checksum(address, child_length) == Some(0) {
+            return Some(address);
         }
     }
     None
 }
 
-fn hpet_base_from_rsdp_fields(prefix: &[u8]) -> Option<u64> {
+fn table_from_rsdp_fields(prefix: &[u8], wanted: &[u8; 4]) -> Option<u64> {
     let rsdt = u64::from(u32::from_le_bytes(prefix.get(16..20)?.try_into().ok()?));
     let xsdt = if prefix.get(15).copied()? >= 2 {
         u64::from_le_bytes(prefix.get(24..32)?.try_into().ok()?)
@@ -156,21 +130,23 @@ fn hpet_base_from_rsdp_fields(prefix: &[u8]) -> Option<u64> {
         0
     };
     if xsdt != 0
-        && let Some(base) = find_hpet_in_root(xsdt, b"XSDT", 8)
+        && let Some(base) = find_in_root(xsdt, b"XSDT", 8, wanted)
     {
         return Some(base);
     }
     (rsdt != 0)
-        .then(|| find_hpet_in_root(rsdt, b"RSDT", 4))
+        .then(|| find_in_root(rsdt, b"RSDT", 4, wanted))
         .flatten()
 }
 
-/// Find the HPET register block from a copied Multiboot2 RSDP tag. The tag is
-/// firmware data copied by GRUB; its root-table pointers still address physical
-/// memory, which this module reads through the aperture.
-pub fn hpet_base_from_rsdp(rsdp: &[u8]) -> Option<u64> {
-    if rsdp.len() < 20 || &rsdp[..8] != RSDP_SIGNATURE || rsdp[..20]
-        .iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0
+/// Find a validated table through a copied Multiboot2 RSDP tag.
+fn table_from_rsdp(rsdp: &[u8], wanted: &[u8; 4]) -> Option<u64> {
+    if rsdp.len() < 20
+        || &rsdp[..8] != RSDP_SIGNATURE
+        || rsdp[..20]
+            .iter()
+            .fold(0u8, |sum, byte| sum.wrapping_add(*byte))
+            != 0
     {
         return None;
     }
@@ -180,7 +156,10 @@ pub fn hpet_base_from_rsdp(rsdp: &[u8]) -> Option<u64> {
         }
         let length = u32::from_le_bytes(rsdp[20..24].try_into().ok()?) as usize;
         if !(36..=rsdp.len()).contains(&length)
-            || rsdp[..length].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) != 0
+            || rsdp[..length]
+                .iter()
+                .fold(0u8, |sum, byte| sum.wrapping_add(*byte))
+                != 0
         {
             return None;
         }
@@ -188,12 +167,12 @@ pub fn hpet_base_from_rsdp(rsdp: &[u8]) -> Option<u64> {
     } else {
         &rsdp[..20]
     };
-    hpet_base_from_rsdp_fields(prefix)
+    table_from_rsdp_fields(prefix, wanted)
 }
 
 /// Locate and validate an RSDP through the legacy PC search areas. This is the
 /// fallback for Multiboot1 or a loader that omits the Multiboot2 ACPI tag.
-pub fn hpet_base_from_legacy_scan() -> Option<u64> {
+fn table_from_legacy_scan(wanted: &[u8; 4]) -> Option<u64> {
     let rsdp = find_rsdp()?;
     let mut prefix = [0u8; 36];
     if !read_physical(rsdp, &mut prefix[..20]) {
@@ -210,5 +189,137 @@ pub fn hpet_base_from_legacy_scan() -> Option<u64> {
     if !(20..=prefix.len()).contains(&length) || checksum(rsdp, length) != Some(0) {
         return None;
     }
-    hpet_base_from_rsdp_fields(&prefix)
+    table_from_rsdp_fields(&prefix, wanted)
+}
+
+fn hpet_base(address: u64) -> Option<u64> {
+    if table_header(address)?.1 < 56 {
+        return None;
+    }
+    let mut hpet = [0; 56];
+    if !read_physical(address, &mut hpet) || hpet[40] != 0 || hpet[41] == 0 {
+        return None;
+    }
+    let base = u64::from_le_bytes(hpet[44..52].try_into().ok()?);
+    (base != 0).then_some(base)
+}
+
+pub fn hpet_base_from_rsdp(rsdp: &[u8]) -> Option<u64> {
+    hpet_base(table_from_rsdp(rsdp, b"HPET")?)
+}
+pub fn hpet_base_from_legacy_scan() -> Option<u64> {
+    hpet_base(table_from_legacy_scan(b"HPET")?)
+}
+
+/// Enumerate enabled local APIC/x2APIC IDs into caller storage, without a heap.
+/// Returns the number stored; an oversized list or malformed MADT is rejected.
+/// Disabled/online-capable-only CPUs require hotplug and are not boot targets.
+pub fn processor_ids(rsdp: &[u8], ids: &mut [u32]) -> Option<usize> {
+    let address = table_from_rsdp(rsdp, b"APIC").or_else(|| table_from_legacy_scan(b"APIC"))?;
+    let length = table_header(address)?.1;
+    madt_ids(
+        length,
+        |offset, bytes| read_physical(address + offset as u64, bytes),
+        ids,
+    )
+}
+
+fn madt_ids(
+    length: usize,
+    mut read: impl FnMut(usize, &mut [u8]) -> bool,
+    ids: &mut [u32],
+) -> Option<usize> {
+    if length < 44 {
+        return None;
+    }
+    let mut offset = 44;
+    let mut count = 0;
+    while offset < length {
+        let mut record = [0u8; 16];
+        if length - offset < 2 || !read(offset, &mut record[..2]) {
+            return None;
+        }
+        let size = record[1] as usize;
+        if size < 2 || size > length - offset {
+            return None;
+        }
+        let required = match record[0] {
+            0 => 8,
+            9 => 16,
+            _ => 2,
+        };
+        if size < required || !read(offset, &mut record[..required]) {
+            return None;
+        }
+        let cpu = match record[0] {
+            0 => Some((
+                u32::from(record[3]),
+                u32::from_le_bytes(record[4..8].try_into().ok()?),
+            )),
+            9 => Some((
+                u32::from_le_bytes(record[4..8].try_into().ok()?),
+                u32::from_le_bytes(record[8..12].try_into().ok()?),
+            )),
+            _ => None,
+        };
+        if let Some((id, flags)) = cpu
+            && flags & 1 != 0
+            && !ids[..count].contains(&id)
+        {
+            if count == ids.len() || id == u32::MAX {
+                return None;
+            }
+            ids[count] = id;
+            count += 1;
+        }
+        offset += size;
+    }
+    Some(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn parse(records: &[u8], ids: &mut [u32]) -> Option<usize> {
+        madt_ids(
+            44 + records.len(),
+            |offset, out| {
+                let Some(bytes) = records.get(offset - 44..offset - 44 + out.len()) else {
+                    return false;
+                };
+                out.copy_from_slice(bytes);
+                true
+            },
+            ids,
+        )
+    }
+    #[test]
+    fn enabled_sparse_ids_and_duplicates() {
+        let mut ids = [0; 4];
+        let records = [
+            0, 8, 0, 7, 1, 0, 0, 0, // enabled, BSP need not be zero
+            0, 8, 1, 2, 2, 0, 0, 0, // online-capable only
+            0, 8, 2, 9, 0, 0, 0, 0, // disabled
+            9, 16, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0, 0, 8, 0, 7, 1, 0, 0,
+            0, // duplicate
+            42, 3, 0, // unknown record
+        ];
+        assert_eq!(parse(&records, &mut ids), Some(2));
+        assert_eq!(&ids[..2], &[7, 256]);
+        assert_eq!(parse(&records, &mut [0; 1]), None);
+    }
+    #[test]
+    fn malformed_records_are_rejected() {
+        for records in [
+            &[0][..],
+            &[0, 0],
+            &[0, 2],
+            &[9, 8, 0, 0, 0, 0, 0, 0],
+            &[42, 3],
+        ] {
+            assert_eq!(parse(records, &mut [0; 4]), None);
+        }
+        assert_eq!(madt_ids(43, |_, _| true, &mut [0; 4]), None);
+        assert_eq!(madt_ids(46, |_, _| false, &mut [0; 4]), None);
+    }
 }

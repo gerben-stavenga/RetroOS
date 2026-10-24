@@ -366,7 +366,20 @@ pub trait Entry: Copy + Sized + Default + 'static {
 #[inline]
 #[must_use]
 pub(crate) fn replace_entry<E: Entry>(slot: &mut E, incoming: E) -> E {
-    core::mem::replace(slot, incoming)
+    let outgoing = core::mem::replace(slot, incoming);
+    // The kernel portion of each private root is universal. Lower tables are
+    // shared already; publish new root entries for the next entry refresh.
+    let (root_va, first) = if core::mem::size_of::<E>() == 8 {
+        (0xc060_3000usize, 5)
+    } else {
+        (0xc030_0000usize, 769)
+    };
+    let address = slot as *mut E as usize;
+    if (root_va + first * core::mem::size_of::<E>()..root_va + PAGE_SIZE).contains(&address) {
+        let index = (address - root_va) / core::mem::size_of::<E>();
+        unsafe { publish_kernel_root(index, incoming); }
+    }
+    outgoing
 }
 
 #[inline]
@@ -457,69 +470,116 @@ impl IndexMut<usize> for PageTable64 {
 }
 
 // =============================================================================
-// Kernel page tables - separate structs for each mode, unified via union
+// Private roots and shared lower kernel page tables
 // =============================================================================
 
-/// Legacy mode kernel page tables (3 pages = 12KB)
-///
-/// PD[768] = PD (recursive, 0xC0000000)
-/// PD[770] = pt_kernel (0xC0800000-0xC0BFFFFF: PML4 + low mem + kernel)
-/// Identity mapping uses SCRATCH page (temporary, removed after boot)
-#[derive(Clone)]
+/// Lower kernel mapping tables, initialized once by the BSP in the boot pool.
+/// The private root points to these same frames on every CPU.
 #[repr(C)]
-pub struct LegacyPages {
-    /// Page Directory
-    pub pd: PageTable32,
-    /// Page table for kernel region (0xC0800000-0xC0BFFFFF)
-    /// PT[0-511]: PML4 region, PT[512-767]: low mem, PT[768-1023]: kernel
-    pub pt_kernel: PageTable32,
-    /// Kernel overflow page table (PD[771], 0xC0C00000-0xC0FFFFFF): the
-    /// kernel image past its first 1 MB (the embedded bootfs makes it ~2 MB).
-    pub pt_kernel2: PageTable32,
+struct LegacyPages {
+    pt_kernel: PageTable32,
+    pt_kernel2: PageTable32,
 }
-
-/// PAE mode kernel page tables (5 pages = 20KB)
-///
-/// With PDPT[3] = PDPT (recursive), the PDPT acts as a 512-entry "virtual PD"
-/// for addresses 0xC0000000-0xFFFFFFFF. PDPT[4-511] become kernel PD entries.
-/// Identity mapping uses SCRATCH page as both PD and PT (temporary, removed after boot)
-/// Assumes kernel < 5MB (same as legacy mode)
-#[derive(Clone)]
 #[repr(C)]
-pub struct PaePages {
-    /// PDPT - also acts as "virtual PD" via PDPT[3] recursion
-    /// PDPT[0] = scratch (identity), PDPT[3] = PDPT, PDPT[4] = pt_pml4,
-    /// PDPT[5] = pt_kernel, PDPT[6] = pt_kernel2, PDPT[7] = pt_kernel3
-    pub pdpt: PageTable64,
-    /// Page table for PML4 region (PDPT[4], covers 0xC0800000-0xC09FFFFF)
-    pub pt_pml4: PageTable64,
-    /// Page table for low mem + kernel (PDPT[5], 0xC0A00000-0xC0BFFFFF)
-    pub pt_kernel: PageTable64,
-    /// Kernel overflow page tables (PDPT[6]/[7], 0xC0C00000-0xC0FFFFFF): the
-    /// kernel image past its first 1 MB (the embedded bootfs makes it ~2 MB).
-    pub pt_kernel2: PageTable64,
-    pub pt_kernel3: PageTable64,
+struct PaePages {
+    // Bootstrap identity PT for 2..4 MiB; PDPT[4] later becomes the CPU's
+    // private PML4 back-pointer without changing this shared table.
+    pt_pml4: PageTable64,
+    pt_kernel: PageTable64,
+    pt_kernel2: PageTable64,
+    pt_kernel3: PageTable64,
+    trampoline_pd: PageTable64,
+    trampoline_pt: PageTable64,
 }
 
-/// Kernel page tables (5 pages for PAE, 3 for legacy)
-#[allow(dead_code)]
-pub struct KernelPages([RawPage; 5]);
+// Shared lower tables and mode-toggle hierarchy (six pages in PAE, two in legacy).
+static mut KERNEL_PAGES: *mut RawPage = core::ptr::null_mut();
 
-impl KernelPages {
-    pub fn legacy(&mut self) -> &mut LegacyPages {
-        unsafe { core::mem::transmute(self) }
-    }
-
-    pub fn pae(&mut self) -> &mut PaePages {
-        unsafe {
-            core::mem::transmute(self)
-        }
-    }
-}
-
-/// Kernel pages - statically allocated page tables
+/// Private recursive root: PD in legacy mode, virtual PDPT in PAE/compat.
 #[thread_local]
-static mut KERNEL_PAGES: KernelPages = KernelPages([const { RawPage([0; PAGE_SIZE]) }; 5]);
+static mut ROOT: RawPage = RawPage([0; PAGE_SIZE]);
+
+// One canonical kernel portion, copied to private roots on kernel entry.
+// The lock protects both the snapshot and its generation; it never allocates.
+static mut KERNEL_ROOT: *mut RawPage = core::ptr::null_mut();
+static KERNEL_ROOT_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static KERNEL_GENERATION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[thread_local]
+static LOCAL_KERNEL_GENERATION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+struct KernelRootGuard;
+impl KernelRootGuard {
+    fn lock() -> Self {
+        use core::sync::atomic::Ordering;
+        while KERNEL_ROOT_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+impl Drop for KernelRootGuard {
+    fn drop(&mut self) {
+        KERNEL_ROOT_LOCK.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+unsafe fn copy_kernel_root<E: Entry>(destination: *mut RawPage, source: *mut RawPage) {
+    let first = if core::mem::size_of::<E>() == 8 { 5 } else { 769 };
+    for i in first..entries_per_page::<E>() {
+        unsafe { destination.cast::<E>().add(i).write_volatile(source.cast::<E>().add(i).read_volatile()); }
+    }
+}
+
+unsafe fn register_root<E: Entry>() {
+    use core::sync::atomic::Ordering;
+    let _guard = KernelRootGuard::lock();
+    let mut generation = KERNEL_GENERATION.load(Ordering::Relaxed);
+    if generation == 0 {
+        unsafe { copy_kernel_root::<E>(KERNEL_ROOT, &raw mut ROOT); }
+        generation = 1;
+        KERNEL_GENERATION.store(generation, Ordering::Release);
+    } else {
+        unsafe { copy_kernel_root::<E>(&raw mut ROOT, KERNEL_ROOT); }
+    }
+    LOCAL_KERNEL_GENERATION.store(generation, Ordering::Relaxed);
+}
+
+unsafe fn publish_kernel_root<E: Entry>(index: usize, entry: E) {
+    let _guard = KernelRootGuard::lock();
+    unsafe { KERNEL_ROOT.cast::<E>().add(index).write_volatile(entry); }
+    KERNEL_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Release);
+}
+
+/// Refresh the universal kernel portion before entering kernel work.
+/// No stale-fault recovery: ownership/allocator handoffs must ensure freshness
+/// before accessing reused mappings. APs still park; this is not an SMP heap.
+pub fn refresh_kernel_mappings() {
+    use core::sync::atomic::Ordering;
+    if LOCAL_KERNEL_GENERATION.load(Ordering::Relaxed) == KERNEL_GENERATION.load(Ordering::Acquire) { return; }
+    {
+        let _guard = KernelRootGuard::lock();
+        unsafe {
+            if is_pae() { copy_kernel_root::<Entry64>(&raw mut ROOT, KERNEL_ROOT); }
+            else { copy_kernel_root::<Entry32>(&raw mut ROOT, KERNEL_ROOT); }
+        }
+        LOCAL_KERNEL_GENERATION.store(KERNEL_GENERATION.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+    flush_tlb();
+}
+
+unsafe fn allocate_kernel_pages(layout: core::alloc::Layout) {
+    assert!(unsafe { KERNEL_PAGES.is_null() });
+    unsafe {
+        KERNEL_ROOT = crate::boot_mem::allocate_bootstrap(core::alloc::Layout::new::<RawPage>())
+            .expect("boot pool cannot hold canonical kernel root").cast();
+        core::ptr::write_bytes(KERNEL_ROOT, 0, 1);
+    }
+    let memory = unsafe { crate::boot_mem::allocate_bootstrap(layout) }
+        .expect("boot pool cannot hold shared kernel tables");
+    unsafe {
+        core::ptr::write_bytes(memory, 0, layout.size());
+        KERNEL_PAGES = memory.cast();
+    }
+}
 
 /// PML4 for long mode - shared with PAE via PML4[0] = PDPT
 #[thread_local]
@@ -527,9 +587,8 @@ static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 
 /// Set up long mode page tables (call after enable_pae)
 /// Sets PML4[0] = PDPT so long mode uses same address space.
-/// Note: vroot[4] (pt_pml4) is NOT overwritten — the PML4 page must not
-/// double as a page table, otherwise demand paging writes PTEs into it
-/// and corrupts PML4 entries.
+/// Replace this CPU's bootstrap PDPT[4] entry with its private PML4
+/// back-pointer. The shared bootstrap identity table itself remains unchanged.
 pub fn setup_long_mode_tables() {
     // PAE CR3 points at the compact 32-byte hardware PDPT, while long mode
     // needs the full page-sized virtual root (including recursive entries).
@@ -1178,53 +1237,60 @@ fn boot_phys_addr(page: &RawPage) -> u64 {
 ///   PT[512-767]: low mem (0xC0A00000-0xC0AFFFFF)
 ///   PT[768-1023]: kernel (0xC0B00000-0xC0BFFFFF)
 pub fn enable_legacy(scratch: &mut PageTable32, kernel_phys: usize, kernel_pages: usize) {
-    #[allow(static_mut_refs)]
-    let kpages = unsafe { KERNEL_PAGES.legacy() };
+    let root = unsafe { &mut *(&raw mut ROOT).cast::<PageTable32>() };
+    let bsp = crate::smp::current_core_id() == 0;
+    if bsp { unsafe { allocate_kernel_pages(core::alloc::Layout::new::<LegacyPages>()); } }
     // Identity map first 4MB (1024 pages) using scratch page
     for i in 0..1024 {
         let _ = replace_entry(&mut scratch[i], Entry32::new(i as u64, true, false));
     }
 
-    // Map low memory (first 1MB) at LOW_MEM_BASE (0xC0A00000)
-    // PT index for 0xC0A00000: (0xC0A00000 >> 12) & 0x3FF = 512
-    for i in 0..256 {
-        let mut e = Entry32::new(i as u64, true, false);
-        // VGA framebuffer (0xA0-0xBF) must be uncacheable
-        if (0xA0..0xC0).contains(&i) {
-            e.set_raw(e.raw() | flags::CACHE_DISABLE);
+    if bsp {
+        let kpages = unsafe { &mut *KERNEL_PAGES.cast::<LegacyPages>() };
+        // Map low memory (first 1MB) at LOW_MEM_BASE (0xC0A00000)
+        // PT index for 0xC0A00000: (0xC0A00000 >> 12) & 0x3FF = 512
+        for i in 0..256 {
+            let mut e = Entry32::new(i as u64, true, false);
+            // VGA framebuffer (0xA0-0xBF) must be uncacheable
+            if (0xA0..0xC0).contains(&i) {
+                e.set_raw(e.raw() | flags::CACHE_DISABLE);
+            }
+            let _ = replace_entry(&mut kpages.pt_kernel[512 + i], e);
         }
-        let _ = replace_entry(&mut kpages.pt_kernel[512 + i], e);
-    }
 
-    // Map kernel at KERNEL_BASE (0xC0B00000)
-    // PT index for 0xC0B00000: (0xC0B00000 >> 12) & 0x3FF = 768
-    // Pages past the first 1 MB (PT end) continue in pt_kernel2 (PD[771],
-    // 0xC0C00000+) — the embedded bootfs pushes the kernel past 1 MB.
-    for i in 0..kernel_pages.min(256 + 1024) {
-        let e = Entry32::new((kernel_phys / PAGE_SIZE + i) as u64, true, false);
-        if i < 256 {
-            let _ = replace_entry(&mut kpages.pt_kernel[768 + i], e);
-        } else {
-            let _ = replace_entry(&mut kpages.pt_kernel2[i - 256], e);
+        // Map kernel at KERNEL_BASE (0xC0B00000)
+        // PT index for 0xC0B00000: (0xC0B00000 >> 12) & 0x3FF = 768
+        // Pages past the first 1 MB (PT end) continue in pt_kernel2 (PD[771],
+        // 0xC0C00000+) — the embedded bootfs pushes the kernel past 1 MB.
+        for i in 0..kernel_pages.min(256 + 1024) {
+            let e = Entry32::new((kernel_phys / PAGE_SIZE + i) as u64, true, false);
+            if i < 256 {
+                let _ = replace_entry(&mut kpages.pt_kernel[768 + i], e);
+            } else {
+                let _ = replace_entry(&mut kpages.pt_kernel2[i - 256], e);
+            }
         }
+
     }
+    let kpages = unsafe { &*KERNEL_PAGES.cast::<LegacyPages>() };
 
     // Setup page directory
     // PD[0] = identity (first 4MB) using scratch
-    let _ = replace_entry(&mut kpages.pd[0], Entry32::new(boot_phys_page(&scratch.0), true, false));
+    let _ = replace_entry(&mut root[0], Entry32::new(boot_phys_page(&scratch.0), true, false));
 
     // PD[768] = recursive (0xC0000000 >> 22 = 768)
-    let pd_page = boot_phys_page(&kpages.pd.0);
-    let _ = replace_entry(&mut kpages.pd[768], Entry32::new(pd_page, true, false));
+    let pd_page = boot_phys_page(&root.0);
+    let _ = replace_entry(&mut root[768], Entry32::new(pd_page, true, false));
 
     // PD[770] = kernel region (0xC0800000 >> 22 = 770)
-    let _ = replace_entry(&mut kpages.pd[770], Entry32::new(boot_phys_page(&kpages.pt_kernel.0), true, false));
+    let _ = replace_entry(&mut root[770], Entry32::new(boot_phys_page(&kpages.pt_kernel.0), true, false));
 
     // PD[771] = kernel overflow (0xC0C00000-0xC0FFFFFF)
-    let _ = replace_entry(&mut kpages.pd[771], Entry32::new(boot_phys_page(&kpages.pt_kernel2.0), true, false));
+    let _ = replace_entry(&mut root[771], Entry32::new(boot_phys_page(&kpages.pt_kernel2.0), true, false));
 
     unsafe {
-        crate::x86::write_cr3(boot_phys_addr(&kpages.pd.0) as u32);
+        register_root::<Entry32>();
+        crate::x86::write_cr3(boot_phys_addr(&root.0) as u32);
         let cr0 = crate::x86::read_cr0();
         crate::x86::write_cr0(cr0 | crate::x86::cr0::PG | crate::x86::cr0::WP);
     }
@@ -1243,53 +1309,63 @@ pub fn enable_legacy(scratch: &mut PageTable32, kernel_phys: usize, kernel_pages
 /// The kernel image including its boot pool may occupy up to BOOT_KERNEL_BYTES.
 ///
 pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: usize) {
-    #[allow(static_mut_refs)]
-    let kpages = unsafe { KERNEL_PAGES.pae() };
-    // Reuse the existing bootstrap scratch and PML4 page for the original
-    // physical 0..4 MiB identity window; no additional per-core tables.
+    let root = unsafe { &mut *(&raw mut ROOT).cast::<PageTable64>() };
+    let bsp = crate::smp::current_core_id() == 0;
+    if bsp { unsafe { allocate_kernel_pages(core::alloc::Layout::new::<PaePages>()); } }
+    if bsp {
+        let kpages = unsafe { &mut *KERNEL_PAGES.cast::<PaePages>() };
+        unsafe extern "fastcall" { fn toggle_prot_compat(new_cr3: u32); }
+        let page = (toggle_prot_compat as *const () as usize - KERNEL_BASE + KERNEL_PHYS) / PAGE_SIZE;
+        assert!(page + 1 < 512);
+        let _ = replace_entry(&mut kpages.trampoline_pt[page], Entry64::new(page as u64, true, false));
+        let _ = replace_entry(&mut kpages.trampoline_pt[page + 1], Entry64::new(page as u64 + 1, true, false));
+        let _ = replace_entry(&mut kpages.trampoline_pd[0], Entry64::new(boot_phys_page(&kpages.trampoline_pt.0), true, false));
+        for i in 0..512 {
+            let _ = replace_entry(&mut kpages.pt_pml4[i], Entry64::new((512 + i) as u64, true, false));
+        }
+
+        // Map low memory (first 1MB) at LOW_MEM_BASE (0xC0A00000)
+        // PT index 0-255 maps physical 0x00000000-0x000FFFFF
+        for i in 0..256 {
+            let mut e = Entry64::new(i as u64, true, false);
+            if (0xA0..0xC0).contains(&i) {
+                e.set_raw(e.raw() | flags::CACHE_DISABLE);
+            }
+            let _ = replace_entry(&mut kpages.pt_kernel[i], e);
+        }
+
+        // Map kernel at KERNEL_BASE (0xC0B00000)
+        // PT index 256-511 maps kernel (up to 1MB); pages past that continue in
+        // pt_kernel2/pt_kernel3 (PDPT[6]/[7], 0xC0C00000+, 2MB per table) — the
+        // embedded bootfs pushes the kernel past 1 MB.
+        for i in 0..kernel_pages.min(256 + 1024) {
+            let e = Entry64::new((kernel_phys / PAGE_SIZE + i) as u64, true, false);
+            if i < 256 {
+                let _ = replace_entry(&mut kpages.pt_kernel[256 + i], e);
+            } else if i < 256 + 512 {
+                let _ = replace_entry(&mut kpages.pt_kernel2[i - 256], e);
+            } else {
+                let _ = replace_entry(&mut kpages.pt_kernel3[i - 256 - 512], e);
+            }
+        }
+
+    }
+    let kpages = unsafe { &*KERNEL_PAGES.cast::<PaePages>() };
+    // Private scratch maps 0..2 MiB; the shared bootstrap PT maps 2..4 MiB.
     let scratch_page = boot_phys_page(&scratch.0);
     let _ = replace_entry(&mut scratch[0], Entry64::new(scratch_page, true, false));
     let _ = replace_entry(&mut scratch[1], Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false));
     for i in 2..512 {
         let _ = replace_entry(&mut scratch[i], Entry64::new(i as u64, true, false));
     }
-    for i in 0..512 {
-        let _ = replace_entry(&mut kpages.pt_pml4[i], Entry64::new((512 + i) as u64, true, false));
-    }
-
-    // Map low memory (first 1MB) at LOW_MEM_BASE (0xC0A00000)
-    // PT index 0-255 maps physical 0x00000000-0x000FFFFF
-    for i in 0..256 {
-        let mut e = Entry64::new(i as u64, true, false);
-        if (0xA0..0xC0).contains(&i) {
-            e.set_raw(e.raw() | flags::CACHE_DISABLE);
-        }
-        let _ = replace_entry(&mut kpages.pt_kernel[i], e);
-    }
-
-    // Map kernel at KERNEL_BASE (0xC0B00000)
-    // PT index 256-511 maps kernel (up to 1MB); pages past that continue in
-    // pt_kernel2/pt_kernel3 (PDPT[6]/[7], 0xC0C00000+, 2MB per table) — the
-    // embedded bootfs pushes the kernel past 1 MB.
-    for i in 0..kernel_pages.min(256 + 1024) {
-        let e = Entry64::new((kernel_phys / PAGE_SIZE + i) as u64, true, false);
-        if i < 256 {
-            let _ = replace_entry(&mut kpages.pt_kernel[256 + i], e);
-        } else if i < 256 + 512 {
-            let _ = replace_entry(&mut kpages.pt_kernel2[i - 256], e);
-        } else {
-            let _ = replace_entry(&mut kpages.pt_kernel3[i - 256 - 512], e);
-        }
-    }
-
     // Setup PDPT (virtual root — has R/W bits for COW tracking)
-    let _ = replace_entry(&mut kpages.pdpt[0], Entry64::new(boot_phys_page(&scratch.0), true, false));
-    let pdpt_page = boot_phys_page(&kpages.pdpt.0);
-    let _ = replace_entry(&mut kpages.pdpt[3], Entry64::new(pdpt_page, true, false));
-    let _ = replace_entry(&mut kpages.pdpt[4], Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false));
-    let _ = replace_entry(&mut kpages.pdpt[5], Entry64::new(boot_phys_page(&kpages.pt_kernel.0), true, false));
-    let _ = replace_entry(&mut kpages.pdpt[6], Entry64::new(boot_phys_page(&kpages.pt_kernel2.0), true, false));
-    let _ = replace_entry(&mut kpages.pdpt[7], Entry64::new(boot_phys_page(&kpages.pt_kernel3.0), true, false));
+    let _ = replace_entry(&mut root[0], Entry64::new(boot_phys_page(&scratch.0), true, false));
+    let pdpt_page = boot_phys_page(&root.0);
+    let _ = replace_entry(&mut root[3], Entry64::new(pdpt_page, true, false));
+    let _ = replace_entry(&mut root[4], Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false));
+    let _ = replace_entry(&mut root[5], Entry64::new(boot_phys_page(&kpages.pt_kernel.0), true, false));
+    let _ = replace_entry(&mut root[6], Entry64::new(boot_phys_page(&kpages.pt_kernel2.0), true, false));
+    let _ = replace_entry(&mut root[7], Entry64::new(boot_phys_page(&kpages.pt_kernel3.0), true, false));
 
     // The hardware PAE PDPT has a stricter format than the virtual root:
     // bits 1 (R/W) and 2 (U/S) are reserved in PDPTEs. Keep the full entries
@@ -1297,8 +1373,9 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
     // but load CR3 with the dedicated 32-byte hardware PDPT from the start.
     // QEMU accepts those reserved bits in a CR3-loaded PDPT; real CPUs need
     // them clear and can fault before the first post-paging instruction.
+    unsafe { register_root::<Entry64>(); }
     for i in 0..4 {
-        unsafe { HW_PDPT.0[i] = hardware_pdpte(kpages.pdpt[i]); }
+        unsafe { HW_PDPT.0[i] = hardware_pdpte(root[i]); }
     }
     let hw_pdpt_va = (&raw const HW_PDPT) as usize;
     let hw_pdpt_phys = hw_pdpt_va - KERNEL_BASE + KERNEL_PHYS;
@@ -1312,14 +1389,39 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
     IS_PAE.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Boot-time early framebuffer window: a static PD of 2MB pages installed at
-/// PDPT[2] (VA 0x80000000), usable the instant `enable_pae` returns — no
-/// allocator, no #PF handler, works for ANY physical address (PAE PDEs carry
-/// 52-bit phys; the Blade 14's GOP framebuffer sits at 0x7C_0000_0000, which
-/// pre-paging 32-bit code cannot address at all). The boot life-sign strip is
-/// painted through this and the window is torn down again immediately.
-#[thread_local]
-static mut EARLY_FB_PD: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
+/// Read firmware before the heap exists. Borrow one ROM alias PTE, restoring it
+/// after each copy; no physical storage or extra identity mapping is required.
+/// BSP boot only, ring 0, IRQs off, before entering the runtime.
+pub(crate) fn read_boot_physical(mut physical: u64, mut out: &mut [u8]) -> bool {
+    assert!(!crate::x86::interrupts_enabled());
+    fn copy<E: Entry>(entries: &mut [E], physical: u64, out: &mut [u8]) -> bool {
+        let base = physical & !4095;
+        if base & !E::ADDR_MASK != 0 { return false; }
+        let window = LOW_MEM_BASE + 0xff000;
+        let slot = &raw mut entries[window / PAGE_SIZE];
+        // The CPU page walker observes the temporary store even though Rust
+        // only sees the original value restored. These stores must be volatile.
+        let old = unsafe { slot.read_volatile() };
+        unsafe { slot.write_volatile(E::new(base >> 12, false, false)); }
+        crate::x86::invlpg(window);
+        unsafe { core::ptr::copy_nonoverlapping((window + (physical as usize & 4095)) as *const u8, out.as_mut_ptr(), out.len()); }
+        unsafe { slot.write_volatile(old); }
+        crate::x86::invlpg(window);
+        true
+    }
+    if physical.checked_add(out.len() as u64).is_none() { return false; }
+    while !out.is_empty() {
+        let count = out.len().min(PAGE_SIZE - (physical as usize & 4095));
+        let ok = match entries() {
+            Entries::E32(e) => copy(e, physical, &mut out[..count]),
+            Entries::E64(e) => copy(e, physical, &mut out[..count]),
+        };
+        if !ok { return false; }
+        physical += count as u64;
+        out = &mut out[count..];
+    }
+    true
+}
 
 /// Map the startup sender's APIC without using the heap or frame allocator.
 /// AP stacks/TLS have priority: this consumes only the finished pool's tail.
@@ -1418,39 +1520,6 @@ pub(crate) fn map_kernel_foreign_range(
     }
     flush_tlb();
     true
-}
-
-/// Map 64MB around `fb_phys` and return its VA. PAE/long boot path only
-/// (legacy returns None — pre-PAE machines have a real VGA anyway).
-pub fn map_early_fb(fb_phys: u64) -> Option<usize> {
-    if !cpu_supports_pae() {
-        return None;
-    }
-    const TWO_MB: u64 = 2 * 1024 * 1024;
-    let base = fb_phys & !(TWO_MB - 1);
-    #[allow(static_mut_refs)]
-    let (pd, kpages) = unsafe { (&mut EARLY_FB_PD, KERNEL_PAGES.pae()) };
-    for i in 0..32u64 {
-        // PS (2MB page) + present + write + cache-disable (MMIO).
-        let _ = replace_entry(&mut pd[i as usize], Entry64(
-            (base + i * TWO_MB) | flags::PRESENT | flags::READ_WRITE
-                | flags::PAGE_SIZE_BIT | flags::CACHE_DISABLE,
-        ));
-    }
-    let _ = replace_entry(&mut kpages.pdpt[2], Entry64::new(boot_phys_page(&pd.0), true, false));
-    flush_tlb();
-    Some(0x8000_0000usize + (fb_phys - base) as usize)
-}
-
-/// Tear the early framebuffer window down (PDPT[2] belongs to user space).
-pub fn unmap_early_fb() {
-    if !cpu_supports_pae() {
-        return;
-    }
-    #[allow(static_mut_refs)]
-    let kpages = unsafe { KERNEL_PAGES.pae() };
-    let _ = replace_entry(&mut kpages.pdpt[2], Entry64::default());
-    flush_tlb();
 }
 
 /// Enable paging with auto-detected mode
@@ -1758,35 +1827,17 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
 /// The boot SCRATCH page cannot be reused here: page-zero COW operations use
 /// it after startup, and a leaf PTE alone is ineffective once PDPT[0] has been
 /// removed by `finish_setup_paging`.
-#[thread_local]
-static mut TRAMPOLINE_PD: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
-#[thread_local]
-static mut TRAMPOLINE_PT: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
-
 /// Identity-map the page holding `toggle_prot_compat` so the function can run
 /// at its physical address while paging is briefly disabled during a mode
 /// toggle. The linker places the boot section in the first physical page and
 /// asserts the toggle fits there. Compute its page from the symbol as well.
 /// Returns the previous PDPT[0] value to pass back to `clear_trampoline()`.
 pub fn ensure_trampoline_mapped() -> u64 {
-    unsafe extern "fastcall" {
-        fn toggle_prot_compat(new_cr3: u32);
-    }
-    let stub_phys = toggle_prot_compat as *const () as usize - KERNEL_BASE + KERNEL_PHYS;
-    let page = stub_phys / PAGE_SIZE;
-    // One PT covers 2 MiB; the stub is a few dozen bytes but map its neighbor
-    // too in case it straddles a page boundary.
-    assert!(page + 1 < PAGE_SIZE / 8, "toggle stub beyond the trampoline PT's 2 MiB reach");
     if let Entries::E64(e) = entries() {
         let root = root_base();
         let saved = e[root].0;
-        #[allow(static_mut_refs)]
-        unsafe {
-            let _ = replace_entry(&mut TRAMPOLINE_PT[page], Entry64::new(page as u64, true, false));
-            let _ = replace_entry(&mut TRAMPOLINE_PT[page + 1], Entry64::new(page as u64 + 1, true, false));
-            let _ = replace_entry(&mut TRAMPOLINE_PD[0], Entry64::new(boot_phys_page(&TRAMPOLINE_PT.0), true, false));
-            let _ = replace_entry(&mut e[root], Entry64::new(boot_phys_page(&TRAMPOLINE_PD.0), true, false));
-        }
+        let table = unsafe { &*KERNEL_PAGES.cast::<PaePages>() };
+        let _ = replace_entry(&mut e[root], Entry64::new(boot_phys_page(&table.trampoline_pd.0), true, false));
         // Needed when the target is PAE; harmless when the target is compat.
         sync_hw_pdpt();
         // PAE caches all four PDPTEs on MOV CR3. INVLPG cannot make a newly

@@ -1,13 +1,21 @@
 //! A loader-reserved, physically contiguous pool placed last in kernel BSS.
-//! After minimal BSP arch setup, allocate every AP stack/TLS first. Finishing
+//! Minimal BSP setup reserves the shared kernel tables. Then allocate every
+//! AP stack/TLS before other consumers. Finishing
 //! that phase opens the remaining pool to permanent low-memory allocations.
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-// Six 128 KiB units leave a 128 KiB safety margin below physical 4 MiB.
-// kernel.ld checks the non-pool footprint and the complete physical extent.
-pub const CAPACITY: usize = 768 * 1024;
-#[repr(align(131072))]
+// Reservation capacity is independent of the pre-paging allocation ceiling.
+// The tail can serve ISA DMA after flat segments/paging are established.
+pub const CAPACITY: usize = 2 * 1024 * 1024;
+pub const BOOT_MARGIN: usize = 128 * 1024;
+pub fn boot_limit() -> usize {
+    (crate::paging2::KERNEL_BASE + crate::paging2::BOOT_IDENTITY_END
+        - crate::paging2::KERNEL_PHYS
+        - BOOT_MARGIN)
+        .min(pool_end())
+}
+#[repr(align(4096))]
 struct Pool([u8; CAPACITY]);
 #[used]
 #[unsafe(link_section = ".boot_pool")]
@@ -50,6 +58,19 @@ fn allocation(
     Ok((at, end))
 }
 
+/// Reserve the shared boot page tables before paging exists.
+///
+/// # Safety
+/// BSP only, before claiming BootMemory or starting any AP. Returned addresses
+/// are linked addresses, usable with the boot offset segments as well as paging.
+pub(crate) unsafe fn allocate_bootstrap(layout: Layout) -> Result<*mut u8, OutOfBootMemory> {
+    assert_eq!(PHASE.load(Ordering::Relaxed), 0);
+    let next = NEXT.load(Ordering::Relaxed).max(pool_start());
+    let (at, end) = allocation(next, boot_limit(), layout)?;
+    NEXT.store(end, Ordering::Relaxed);
+    Ok(at as *mut u8)
+}
+
 pub struct BootMemory {
     next: usize,
 }
@@ -66,12 +87,25 @@ impl BootMemory {
                 .is_ok(),
             "boot pool already claimed"
         );
-        Self { next: pool_start() }
+        Self {
+            next: NEXT.load(Ordering::Relaxed).max(pool_start()),
+        }
     }
     pub fn allocate(&mut self, layout: Layout) -> Result<*mut u8, OutOfBootMemory> {
-        let (at, next) = allocation(self.next, pool_end(), layout)?;
+        let (at, next) = allocation(self.next, boot_limit(), layout)?;
         self.next = next;
         Ok(at as *mut u8)
+    }
+    /// Preview a sequence including alignment, without consuming any storage.
+    pub fn can_allocate(&self, layouts: &[Layout]) -> bool {
+        let mut next = self.next;
+        for &layout in layouts {
+            let Ok((_, end)) = allocation(next, boot_limit(), layout) else {
+                return false;
+            };
+            next = end;
+        }
+        true
     }
     /// Close AP allocation before starting CPUs. Remaining pool space can now
     /// supply DMA buffers and other permanent, contiguous low-memory storage.
@@ -105,10 +139,14 @@ mod tests {
     fn ap_allocations_precede_permanent_allocations() {
         let dma = Layout::from_size_align(131072, 131072).unwrap();
         assert_eq!(allocate_permanent(dma), Err(OutOfBootMemory));
+        let tables = unsafe { allocate_bootstrap(Layout::from_size_align(16384, 4096).unwrap()) }
+            .unwrap() as usize;
+        assert_eq!(tables, pool_start());
         let mut boot = unsafe { BootMemory::new() };
         let ap = boot
             .allocate(Layout::from_size_align(65536, 4096).unwrap())
             .unwrap() as usize;
+        assert!(ap >= tables + 16384);
         assert_eq!(allocate_permanent(dma), Err(OutOfBootMemory));
         boot.finish();
         let channel = allocate_permanent(dma).unwrap() as usize;
@@ -120,6 +158,16 @@ mod tests {
             Err(OutOfBootMemory)
         );
         assert_eq!(NEXT.load(Ordering::Relaxed), next);
+    }
+    #[test]
+    fn preview_accounts_for_alignment_without_consuming() {
+        let memory = BootMemory {
+            next: (boot_limit() & !131071) - 131072,
+        };
+        let dma = Layout::from_size_align(131072, 131072).unwrap();
+        assert!(memory.can_allocate(&[dma]));
+        assert!(!memory.can_allocate(&[Layout::new::<u8>(), dma]));
+        assert_eq!(memory.next, (boot_limit() & !131071) - 131072);
     }
     #[test]
     fn alignment_and_exact_exhaustion() {

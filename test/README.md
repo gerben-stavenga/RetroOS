@@ -101,6 +101,13 @@ four CPUs in legacy and PAE modes. It checks the common BSP/AP Rust entry,
 initialized/zeroed and isolated TLS, dynamically allocated stacks, private GDTs
 and page roots, and reuse of the low-memory trampoline after acknowledgement.
 AP stacks/TLS are allocated first from the final BSS pool, then ISA DMA
-buffers use the remaining space. The full image leaves 128 KiB below physical
-4 MiB, and ordinary heap/physical allocations stay outside the pool.
+buffers use the remaining space. Actual CPU boot allocations leave 128 KiB
+below physical 4 MiB; the reserved pool tail may extend beyond it. Ordinary
+heap/physical allocations stay outside the whole pool.
 Add `--kvm` to exercise xAPIC and x2APIC startup with hardware virtualization.
+
+`python3 test/kernel_smp.py` checks actual-kernel MADT discovery and parked APs,
+then runs a guest syscall/IRQ/TLS workload on core 0. Cases cover one CPU, four
+CPUs, pool-limited startup with eight CPUs, sparse APIC IDs, missing ACPI, and
+legacy paging. Add `--kvm` for the hardware cases. `//arch-metal:acpi_test` checks
+enabled/disabled entries, x2APIC IDs, duplicates and malformed MADT records.

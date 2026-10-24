@@ -4,6 +4,9 @@
 //! 1. _start (asm stub: offset GDT, kernel stack, calls boot_kernel)
 //! 2. boot_kernel (enables paging, initializes kernel, drops to ring 1)
 
+#[path = "smp.rs"]
+mod smp;
+
 use arch::{paging2, phys_mm, descriptors, irq, x86};
 use arch::MultibootMmapEntry;
 use paging2::{PAGE_SIZE, LOW_MEM_BASE};
@@ -276,9 +279,6 @@ unsafe fn prepare_boot(
 
     // The complete pool is loader-reserved and mapped by minimal arch setup.
     unsafe { arch::smp::init_core(0); }
-    let boot_memory = unsafe { arch::boot_mem::BootMemory::new() };
-    // Reserve all selected AP stacks/TLS here, finish, then start the APs.
-    boot_memory.finish();
     let kernel_size = arch::boot_mem::end() - (&raw const _kernel_start) as usize;
 
     // The text aperture moves with paging: point the terminal at the mapped
@@ -290,6 +290,7 @@ unsafe fn prepare_boot(
     // ring is allocated below, once the heap and physical allocator are ready.
     lib::log::set_debug_sink(log_byte);
     lib::log::set_fatal_handler(fatal_finish);
+    unsafe { smp::start(&acpi_rsdp[..acpi_rsdp_len], &mmap_buf[..mmap_count], &boot_modules_raw); }
     let (_, _, _, cpu_features) = x86::cpuid(1);
     if cpu_features & (1 << 1) != 0 {
         lib::compact_println!("VME enabled");

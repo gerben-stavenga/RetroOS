@@ -451,6 +451,7 @@ fn arch_switch_to(regs: &mut Regs) {
 #[unsafe(no_mangle)]
 #[allow(private_interfaces)]
 pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
+    paging2::refresh_kernel_mappings();
     #[thread_local]
     static mut VIF: bool = false;
     #[thread_local]
