@@ -1,3 +1,4 @@
+#![feature(thread_local)]
 extern crate alloc;
 #[path = "../src/kernel/media.rs"]
 pub(crate) mod media;
@@ -60,6 +61,14 @@ fn voodoo_frame() -> Vec<u8> {
         (swapbufferCMD, 0),
     ] {
         write(&mut card, reg, value);
+    }
+    // Stop submitting work. The device service must reach the final mode
+    // without any guest tick, scanout call, fence, or graphics-job kick.
+    let output = card.output();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while output.dimensions() != (640, 480) {
+        assert!(std::time::Instant::now() < deadline, "Voodoo needs a producer kick");
+        std::thread::yield_now();
     }
     // Read-after-render and swap must fence the preceding asynchronous clear.
     let _ = card.read8(0);
@@ -131,6 +140,19 @@ fn two_core_priority_handoff_and_drop_fences() {
     // No mix submission or guest tick is required: the service continues to
     // run while the producer does unrelated work.
     while POLLS.load(Ordering::Acquire) < 100 { std::thread::yield_now(); }
+    static BLOCKED: AtomicBool = AtomicBool::new(false);
+    static RELEASE: AtomicBool = AtomicBool::new(false);
+    let mut blocker = media::Graphics::new(());
+    unsafe { blocker.start(|_| {
+        BLOCKED.store(true, Ordering::Release);
+        while !RELEASE.load(Ordering::Acquire) { core::hint::spin_loop(); }
+    }); }
+    while !BLOCKED.load(Ordering::Acquire) { std::thread::yield_now(); }
+    let before = POLLS.load(Ordering::Acquire);
+    for _ in 0..100 { media::checkpoint(); }
+    assert_eq!(POLLS.load(Ordering::Acquire), before, "core 0 must not execute audio checkpoints");
+    RELEASE.store(true, Ordering::Release);
+    blocker.wait();
     HOLD_AUDIO.store(true, Ordering::Release);
     while !AUDIO_HELD.load(Ordering::Acquire) { std::thread::yield_now(); }
     assert!(service.try_lock().is_none(), "UI status must not wait for the mixer");

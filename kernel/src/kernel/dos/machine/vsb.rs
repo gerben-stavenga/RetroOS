@@ -214,7 +214,7 @@ impl SbDevice {
 /// The machine side of the EMULATED card: `//lib:sound`'s passive chip plus
 /// the two things a passive chip cannot own — a between-pump position
 /// estimate, and somewhere to land the guest's ring bytes.
-type DmaCopy<'a> = &'a mut dyn FnMut(usize, &mut [u8]);
+pub(super) type DmaCopy<'a> = &'a mut dyn FnMut(usize, &mut [u8]);
 
 pub struct EmulatedSb {
     /// The library card: DSP register file + command FSM, CT1745 mixer, OPL.
@@ -222,6 +222,7 @@ pub struct EmulatedSb {
     /// Guest address belongs to the machine, never the card model.
     dma_base: u32,
     dma_image: alloc::vec::Vec<u8>,
+    worker_dma: bool,
     /// Incremental DSP source position in Q32.32 frames. The output mix rate
     /// may change to regulate physical pipe depth, so reconstructing this from
     /// an absolute output frame and the latest rate would warp its history.
@@ -271,6 +272,7 @@ impl EmulatedSb {
             core: sound::sb::Sb::new(),
             dma_base: 0,
             dma_image: alloc::vec::Vec::new(),
+            worker_dma: false,
             mix_pos_q32: 0,
             est_frames: 0, est_ns: 0, est_cap: 0, est_slope: 0, est_served: 0,
             probe_steps: 0,
@@ -597,7 +599,8 @@ impl EmulatedSb {
         self.core.begin(start, len);
         if crate::kernel::media::enabled() {
             self.dma_image.resize(len as usize, 0);
-            machine.copy_from(self.dma_base as usize, &mut self.dma_image);
+            self.worker_dma = machine.guest_read_view().is_some();
+            if !self.worker_dma { machine.copy_from(self.dma_base as usize, &mut self.dma_image); }
         }
         self.probe_steps = if self.core.short_probe_active() {
             PROBE_DELAY_STEPS
@@ -648,39 +651,18 @@ impl EmulatedSb {
         true
     }
 
-    /// Mix every producer on this card into the same final PCM block.
-    ///
-    /// The DSP half needs a DMA cycle first: the card names the ring window
-    /// it wants and we move those bytes out of guest memory for it. Fetch in
-    /// ring-sized runs — `copy_from` may cross a VM/backend boundary, and
-    /// doing it once per DSP sample cost thousands of crossings a second and
-    /// starved the shared GUS/SB sink under Doom.
-    pub(super) fn mix_into<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        rate: u32,
-        block: &mut [(i32, i32)],
-        physical_sb: bool,
-    ) {
-        self.mix_resident(rate, block, physical_sb, Some(&mut |addr, bytes| machine.copy_from(addr, bytes)));
-    }
-
     pub(super) fn capture_dma<A: crate::Arch>(&mut self, machine: &A) {
-        if !self.core.playing() || self.dma_image.is_empty() { return; }
-        let format = self.core.dsp_state();
-        let frame_bytes = usize::from(format.bits / 8) * if format.stereo { 2 } else { 1 };
-        if frame_bytes == 0 { return; }
-        let ring = self.dma_image.len();
-        let ring_frames = ring / frame_bytes;
-        if ring_frames == 0 { return; }
-        let start = ((self.mix_pos_q32 >> 32) % ring_frames as u64) as usize * frame_bytes;
-        // A few milliseconds ahead plus one maximum mixer quantum. Copy only
-        // the DMA window the consumer is approaching, not a whole 128 KiB ring
-        // on every kernel tick. Start-playback captures the initial full ring.
-        let count = ((self.core.rate() as usize / 250 + 128) * frame_bytes).min(ring);
-        let first = count.min(ring - start);
-        machine.copy_from(self.dma_base as usize + start, &mut self.dma_image[start..start + first]);
-        if first < count { machine.copy_from(self.dma_base as usize, &mut self.dma_image[..count - first]); }
+        if self.worker_dma { return; }
+        let _ = self.capture_dma_with(&mut |addr, bytes| { machine.copy_from(addr, bytes); true });
+    }
+    pub(super) fn needs_worker_dma(&self) -> bool {
+        self.worker_dma && self.core.playing() && !self.dma_image.is_empty()
+    }
+    pub(super) fn capture_dma_with(&mut self, copy: &mut dyn FnMut(usize, &mut [u8]) -> bool) -> bool {
+        if !self.core.playing() || self.dma_image.is_empty() { return true; }
+        // The worker owns this copy. Sample a complete ring so a delayed
+        // mixer quantum can wrap or catch up without reading stale bytes.
+        copy(self.dma_base as usize, &mut self.dma_image)
     }
 
     pub(super) fn mix_resident(
@@ -724,18 +706,6 @@ impl EmulatedSb {
             self.mix_pos_q32 = self.mix_pos_q32
                 .wrapping_add(step_q32.wrapping_mul(block.len() as u64));
         }
-    }
-
-    /// Drive the emulated DSP's guest-visible clock from frames consumed by
-    /// the CPU-clocked producer and put its interrupt line up when it asks.
-    pub fn dsp_clock_tick<A: crate::Arch>(
-        &mut self,
-        _machine: &mut A,
-        now_ns: u64,
-        vpic: &mut super::vpic::VirtualPic,
-        irq: u8,
-    ) {
-        self.clock_tick(now_ns, vpic, irq);
     }
 
     pub(super) fn clock_tick(&mut self, now_ns: u64,

@@ -43,6 +43,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kvm", action="store_true")
     parser.add_argument("--cpus", type=int, default=1)
+    audio_mode = parser.add_mutually_exclusive_group()
+    audio_mode.add_argument("--music-only", action="store_true", help="Disable Doom sound effects to verify MIDI music independently")
+    audio_mode.add_argument("--effects-only", action="store_true", help="Play Doom demo1 without music to exercise SB DMA independently")
     parser.add_argument("seconds", nargs="?", type=int, default=60)
     args = parser.parse_args()
     if args.seconds < 10:
@@ -54,8 +57,9 @@ def main():
     subprocess.run(["bazelisk", "build", "//:data_disk"], check=True)
     data = work / "data.bin"
     subprocess.run([sys.executable, "test/private_data_disk.py", "bazel-bin/data_disk.bin", str(data)], check=True)
+    game = "GAMES/DOOMS/DOOM.EXE" + (" -nomusic -playdemo demo1" if args.effects_only else " -nosfx -playdemo demo1" if args.music_only else "")
     cmd = ["./run.sh", "qemu", "--arch", "x64", "--firmware", "uefi", "--data-image", str(data),
-           "--sound", "hda", "--cmd", "GAMES/DOOMS/DOOM.EXE"]
+           "--sound", "hda", "--cmd", game]
     if args.kvm:
         cmd.append("--kvm")
     cmd.extend(["--", "-smp", str(args.cpus)])
@@ -117,10 +121,21 @@ def main():
         if sys.byteorder != "little":
             samples.byteswap()
         try:
-            check_pcm(samples, wav.getframerate(), wav.getnchannels(), args.seconds)
+            if args.effects_only:
+                needed = wav.getframerate() * wav.getnchannels() * args.seconds
+                if len(samples) < needed:
+                    raise AssertionError("insufficient DMA recording")
+                # Effects intentionally have silent gaps. Require actual PCM
+                # throughout a window after startup; GM/OPL music is disabled.
+                tail = samples[-needed:]
+                if sum(abs(value) > 32 for value in tail) < len(tail) // 100:
+                    raise AssertionError("no audible Sound Blaster DMA effects")
+            else:
+                check_pcm(samples, wav.getframerate(), wav.getnchannels(), args.seconds)
         except AssertionError as e:
             dump(log, str(e))
-    print(f"PASS: HDA delivered sustained PCM for {args.seconds}s ({work})")
+    kind = "Sound Blaster DMA effects" if args.effects_only else "music-only PCM" if args.music_only else "sustained PCM"
+    print(f"PASS: HDA delivered {kind} for {args.seconds}s ({work})")
 
 
 if __name__ == "__main__":

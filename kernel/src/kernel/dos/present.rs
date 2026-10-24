@@ -373,7 +373,6 @@ pub fn display_tick<A: crate::Arch>(
         crate::kernel::gui::EndpointId,
     )>,
 ) {
-    if let Some(voodoo) = pc.voodoo.as_mut() { voodoo.service_commands(); }
     // A physical Voodoo board takes the monitor away from the VGA card with
     // its pass-through relay.  Our Voodoo is a software producer, so on a
     // native-VGA machine it instead needs the adapter converted into a packed

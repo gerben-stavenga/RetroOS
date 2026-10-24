@@ -1,5 +1,6 @@
 //! One media worker, shared by audio and graphics. The BSP remains the only
-//! allocator and owner of guest mappings. Jobs operate on resident kernel
+//! allocator and owner of guest mappings. Guarded DMA reads borrow an arch
+//! read view; jobs otherwise operate on resident kernel
 //! buffers; an ownership handoff refreshes the worker's mappings and TLB.
 //! Audio runs as an independent service, including at graphics checkpoints.
 
@@ -46,7 +47,58 @@ impl Mailbox {
 }
 static GRAPHICS: Mailbox = Mailbox::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
+#[thread_local]
+static mut ON_WORKER: bool = false;
 static REFRESH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Guest execution and brief media reads share this gate. The guest yields
+/// only at an event-loop boundary, where it holds no service/device locks.
+/// A failed media read requests that next boundary; it never waits inside a
+/// callback. Reads release the handoff before rendering or mixing begins.
+pub(crate) struct GuestMemoryGate {
+    held: AtomicBool,
+    requested: AtomicBool,
+}
+pub(crate) static GUEST_MEMORY: GuestMemoryGate = GuestMemoryGate::new();
+impl GuestMemoryGate {
+    const fn new() -> Self {
+        Self { held: AtomicBool::new(false), requested: AtomicBool::new(false) }
+    }
+    pub(crate) fn enter(&self) {
+        loop {
+            while self.held.load(Ordering::Relaxed) { core::hint::spin_loop(); }
+            if self.held.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() { return; }
+        }
+    }
+    pub(crate) fn leave(&self) { self.held.store(false, Ordering::Release); }
+    pub(crate) fn try_read(&self) -> Option<GuestMemoryRead<'_>> {
+        if self.held.load(Ordering::Relaxed)
+            || self.held.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err()
+        {
+            self.requested.store(true, Ordering::Release);
+            return None;
+        }
+        Some(GuestMemoryRead(self))
+    }
+    /// Guest core only, outside all guest-memory and device/service guards.
+    pub(crate) fn yield_to_reader(&self) {
+        while self.requested.load(Ordering::Acquire) { core::hint::spin_loop(); }
+    }
+    /// A service may be deactivated after requesting a read. A completed
+    /// worker pass must also acknowledge that cancelled request.
+    fn finish_turn(&self) {
+        if !self.held.load(Ordering::Acquire) {
+            self.requested.store(false, Ordering::Release);
+        }
+    }
+}
+pub(crate) struct GuestMemoryRead<'a>(&'a GuestMemoryGate);
+impl Drop for GuestMemoryRead<'_> {
+    fn drop(&mut self) {
+        self.0.requested.store(false, Ordering::Release);
+        self.0.leave();
+    }
+}
 
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
@@ -59,11 +111,14 @@ pub fn enabled() -> bool {
 /// mappings and invalidate translations before accessing handed-off storage.
 #[allow(dead_code)] // Hosted entry deliberately uses the inline path.
 pub unsafe fn worker(refresh: fn()) -> ! {
+    unsafe { ON_WORKER = true; }
     REFRESH.store(refresh as usize, Ordering::Relaxed);
     ENABLED.store(true, Ordering::Release);
     loop {
         audio_checkpoint();
         video_checkpoint();
+        device_checkpoint();
+        GUEST_MEMORY.finish_turn();
         if let Some(command) = GRAPHICS.take() {
             unsafe {
                 execute(command);
@@ -84,7 +139,7 @@ unsafe fn execute(command: Command) {
 
 /// Graphics callbacks invoke this between bounded row batches. Worker only.
 /// Inline fallback never consumes the worker mailbox.
-pub fn audio_checkpoint() {
+fn audio_checkpoint() {
     if let Some(service) = AUDIO_SERVICE.try_lock()
         && let Some(command) = *service
     {
@@ -158,7 +213,6 @@ impl<T: Send + 'static> Graphics<T> {
             }),
         }
     }
-    pub fn is_busy(&self) -> bool { self.state.busy.load(Ordering::Acquire) }
     pub fn wait(&self) {
         while self.state.busy.load(Ordering::Acquire) {
             core::hint::spin_loop();
@@ -213,7 +267,7 @@ impl<T: Send + 'static> Drop for Graphics<T> {
 /// A checkpoint installed in graphics libraries. Inline execution has no
 /// competing worker and therefore nothing to service.
 pub fn checkpoint() {
-    if enabled() {
+    if unsafe { ON_WORKER } {
         audio_checkpoint();
     }
 }
@@ -372,6 +426,72 @@ fn video_checkpoint() {
 }
 
 
+/// Persistent devices are polled independently of guest exits and display
+/// refresh. Registration changes fence callbacks; only the BSP allocates.
+struct DevicePoll { command: Command, ready: unsafe fn(usize) -> bool }
+static DEVICES: Shared<alloc::vec::Vec<DevicePoll>> = Shared::new(alloc::vec::Vec::new());
+static DEVICE_REVISION: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+struct DeviceState<T> { value: T, ready: fn(&T) -> bool, poll: fn(&T) }
+pub struct DeviceService<T: Send + Sync + 'static> {
+    state: Box<DeviceState<T>>,
+    registered: bool,
+}
+impl<T: Send + Sync + 'static> DeviceService<T> {
+    /// # Safety
+    /// `ready` only reads storage resident at registration. `poll` obeys the
+    /// same allocation-free callback contract as AudioService, runs a bounded
+    /// batch and must not register/drop services or recursively poll devices.
+    pub unsafe fn new(value: T, ready: fn(&T) -> bool, poll: fn(&T)) -> Self {
+        let state = Box::new(DeviceState { value, ready, poll });
+        let registered = enabled();
+        if registered {
+            unsafe fn ready<T>(arg: usize) -> bool {
+                let state = unsafe { &*(arg as *const DeviceState<T>) };
+                (state.ready)(&state.value)
+            }
+            unsafe fn invoke<T>(arg: usize) {
+                let state = unsafe { &*(arg as *const DeviceState<T>) };
+                (state.poll)(&state.value);
+            }
+            let mut devices = DEVICES.lock();
+            devices.push(DevicePoll { command: Command { run: invoke::<T>,
+                argument: &*state as *const _ as usize }, ready: ready::<T> });
+            DEVICE_REVISION.fetch_add(1, Ordering::Release);
+        }
+        Self { state, registered }
+    }
+    pub fn poll_inline(&self) {
+        if !self.registered && (self.state.ready)(&self.state.value) {
+            (self.state.poll)(&self.state.value);
+        }
+    }
+}
+impl<T: Send + Sync + 'static> Drop for DeviceService<T> {
+    fn drop(&mut self) {
+        if self.registered {
+            let argument = &*self.state as *const _ as usize;
+            DEVICES.lock().retain(|device| device.command.argument != argument);
+            DEVICE_REVISION.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+fn device_checkpoint() {
+    // Worker only. Refresh before dereferencing newly registered heap storage.
+    static SEEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+    let Some(devices) = DEVICES.try_lock() else { return };
+    let revision = DEVICE_REVISION.load(Ordering::Acquire);
+    if SEEN.load(Ordering::Relaxed) != revision {
+        let refresh: fn() = unsafe { core::mem::transmute(REFRESH.load(Ordering::Relaxed)) };
+        refresh();
+        SEEN.store(revision, Ordering::Relaxed);
+    }
+    for device in devices.iter() {
+        if unsafe { (device.ready)(device.command.argument) } {
+            unsafe { execute(device.command); }
+        }
+    }
+}
+
 /// Fixed-capacity SPSC command ring. One guest core publishes, one media core
 /// consumes. Storage is committed on construction; neither end allocates.
 pub struct Commands<T: Copy, const N: usize> {
@@ -405,5 +525,42 @@ impl<T: Copy, const N: usize> Commands<T, N> {
         let command = unsafe { (*self.entries.get())[tail % N].assume_init_read() };
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         Some(command)
+    }
+}
+
+#[cfg(test)]
+mod guest_memory_tests {
+    use super::*;
+
+    #[test]
+    fn failed_read_reserves_next_guest_boundary_until_copy_finishes() {
+        let gate = GuestMemoryGate::new();
+        gate.enter();
+        assert!(gate.try_read().is_none());
+        gate.finish_turn();
+        assert!(gate.requested.load(Ordering::Acquire));
+        gate.leave();
+        // The next guest slice must yield; the worker owns the next read.
+        assert!(gate.requested.load(Ordering::Acquire));
+        let read = gate.try_read().unwrap();
+        assert!(gate.held.load(Ordering::Acquire));
+        drop(read);
+        // Rendering/mixing after the copy cannot keep the guest waiting.
+        gate.yield_to_reader();
+        gate.enter();
+        gate.leave();
+    }
+
+    #[test]
+    fn cancelled_service_does_not_strand_guest_at_boundary() {
+        let gate = GuestMemoryGate::new();
+        gate.enter();
+        assert!(gate.try_read().is_none());
+        gate.leave();
+        // No callback remains to consume the requested read.
+        gate.finish_turn();
+        gate.yield_to_reader();
+        gate.enter();
+        gate.leave();
     }
 }

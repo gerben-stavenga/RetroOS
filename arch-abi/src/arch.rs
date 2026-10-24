@@ -136,6 +136,31 @@ impl<A: Arch> Vcpu<A> {
 // The backend contract
 // =============================================================================
 
+/// A backend-owned read view of one CPU's active guest address space.
+/// It carries no borrowed Rust references and never exposes a guest pointer.
+#[derive(Clone, Copy)]
+pub struct GuestReadView {
+    context: usize,
+    read: unsafe fn(usize, usize, &mut [u8]) -> bool,
+}
+impl GuestReadView {
+    /// # Safety
+    /// The backend context must remain valid for the kernel's lifetime. The
+    /// callback must restore any temporary mappings before returning and must
+    /// neither allocate nor retain the destination. Missing RAM reads as zero.
+    pub unsafe fn new(context: usize, read: unsafe fn(usize, usize, &mut [u8]) -> bool) -> Self {
+        Self { context, read }
+    }
+    /// # Safety
+    /// Caller must exclude guest execution, address-space switches, mapping
+    /// changes and kernel writes to this guest for the complete operation.
+    /// Run on an idle architecture worker CPU, not the source guest CPU.
+    /// The destination must be kernel storage disjoint from the guest range.
+    pub unsafe fn copy_from(self, address: usize, destination: &mut [u8]) -> bool {
+        unsafe { (self.read)(self.context, address, destination) }
+    }
+}
+
 /// The full kernel→arch boundary. One value implements this per CPU; the kernel
 /// threads `&mut impl Arch` through `startup` and the event loop.
 ///
@@ -146,6 +171,9 @@ impl<A: Arch> Vcpu<A> {
 /// rest of the machine: CPU exec, ports, timer, IRQ lines, the page-table/fork/
 /// LDT/DMA "arch calls", FPU state, and a few x86 segment helpers.
 pub trait Arch: Sized + GuestBytes {
+    /// Optional allocation-free worker read view of this CPU's active guest.
+    fn guest_read_view(&self) -> Option<GuestReadView> { None }
+
     /// Backend page-table root type stored in `Vcpu::space` — an OWNED address
     /// space, so it is **not** `Copy`: a parked `Vcpu` moves rather than
     /// duplicating the space. It is an OPAQUE owned handle — **not** a memory

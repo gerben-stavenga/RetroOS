@@ -18,7 +18,7 @@
 #![no_std]
 
 mod arch;
-pub use arch::{Arch, GuestBytes, Vcpu};
+pub use arch::{Arch, GuestBytes, GuestReadView, Vcpu};
 
 /// Flat, exclusive cycle totals for one guest-entry path. Each elapsed
 /// interval belongs to exactly one field, so the phase values may be summed.

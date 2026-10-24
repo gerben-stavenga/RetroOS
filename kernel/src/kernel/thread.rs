@@ -352,6 +352,7 @@ impl<A: crate::Arch> Personality<A> {
 
     /// Park device memory before another thread can overwrite the live store.
     pub fn on_suspend(&mut self, machine: &mut A) {
+        crate::kernel::sound::dma_owner(0);
         if let Self::Dos(d) = self {
             d.pc.vga.capture_address_space_vram(machine);
         }
@@ -361,6 +362,10 @@ impl<A: crate::Arch> Personality<A> {
     /// becomes the running thread, regardless of whether it's also taking
     /// focus visually.
     pub fn on_resume(&mut self, machine: &mut A) {
+        crate::kernel::sound::dma_owner(match self {
+            Self::Dos(d) => alloc::sync::Arc::as_ptr(&d.pc.audio) as usize,
+            _ => 0,
+        });
         match self {
             Self::Dos(d) => d.on_resume(machine),
             Self::Linux(l) => l.on_resume(machine),
@@ -405,19 +410,6 @@ impl<A: crate::Arch> Personality<A> {
 
     pub fn has_pending_message(&self) -> bool {
         matches!(self, Self::Os2(os2) if os2.has_pending_message())
-    }
-
-    /// Advance one emulated-audio span; its samples may be output or discarded.
-    pub fn audio_tick(
-        &mut self,
-        machine: &mut A,
-        now_ns: u64,
-        span: crate::kernel::sound::AudioSpan<'_>,
-    ) {
-        match self {
-            Self::Dos(dos) => crate::kernel::dos::audio_tick(machine, dos, now_ns, span),
-            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => {}
-        }
     }
 
     /// Render compositor-owned personality state into the event loop's output.

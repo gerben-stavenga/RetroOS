@@ -59,7 +59,7 @@ pub use machine::vsb::SbDevice;
 pub use machine::vga::physical_vga_present;
 pub(crate) use machine::vga::release_fullscreen;
 pub(crate) use machine::vga::reserve_live_vram;
-pub(crate) use machine::vga::{LiveRegion, sample_live, scanout_revision, live_access};
+pub(crate) use machine::vga::{LiveRegion, sample_live, scanout_revision, live_access, try_live_access};
 use crate::kernel::bios_display::{DosVideo, EmulatedVga};
 pub(crate) use dos::dos_to_unix_datetime;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
@@ -1705,16 +1705,6 @@ pub fn attach_retained_surface<A: crate::Arch>(
 ) {
     let Some((width, height, _, _)) = dos.pc.scanout.surface() else { return };
     present::attach_retained_vga_surface(width, height, desktop, endpoint);
-}
-
-/// Advance emulated audio playback and its guest-visible device events.
-pub fn audio_tick<A: crate::Arch>(
-    machine: &mut A,
-    dos: &mut thread::DosState<A>,
-    now_ns: u64,
-    span: crate::kernel::sound::AudioSpan<'_>,
-) {
-    machine::audio_tick(machine, &mut dos.pc, now_ns, span);
 }
 
 /// Per-slice audio device service (trigger IRQs, DMA-probe completions, GF1

@@ -447,17 +447,6 @@ impl Clock {
 /// a sink the same device clocks run at the canonical rate and their samples
 /// are discarded; SB DMA, GF1 voices, MIDI envelopes, and completion events
 /// therefore do not depend on output hardware existing.
-#[inline(never)]
-pub fn advance<A: crate::Arch>(
-    machine: &mut A,
-    clock: &mut Clock,
-    sink: Option<&mut Sink>,
-    dt_ns: u64,
-    mut mix: impl FnMut(&mut A, AudioSpan<'_>),
-) {
-    advance_resident(clock, sink, dt_ns, machine.rdtsc(), |span| mix(machine, span));
-}
-
 fn advance_resident(
     clock: &mut Clock, mut sink: Option<&mut Sink>, dt_ns: u64, stamp: u64,
     mut mix: impl FnMut(AudioSpan<'_>),
@@ -625,6 +614,11 @@ fn advance_resident(
 }
 
 
+static LAST_AUDIO_MS: AtomicU32 = AtomicU32::new(u32::MAX);
+static ACTIVE_DMA_OWNER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Called while the guest-memory gate excludes worker DMA reads.
+pub(crate) fn dma_owner(owner: usize) { ACTIVE_DMA_OWNER.store(owner, Ordering::Release); }
+
 /// Owned by the media service for an event-loop session. Core 0 only changes
 /// routing/controls and publishes the active resident device set.
 pub struct Engine {
@@ -632,11 +626,12 @@ pub struct Engine {
     pub clock: Clock,
     source: Option<alloc::sync::Arc<crate::kernel::media::Shared<super::dos::AudioDevices>>>,
     last_ns: u64,
+    reader: Option<arch_abi::GuestReadView>,
 }
 impl Engine {
-    pub fn new(sink: Option<Sink>, now_ns: u64) -> Self {
+    pub fn new(sink: Option<Sink>, now_ns: u64, reader: Option<arch_abi::GuestReadView>) -> Self {
         publish_frontier(0);
-        Self { sink, clock: Clock::new(), source: None, last_ns: now_ns }
+        Self { sink, clock: Clock::new(), source: None, last_ns: now_ns, reader }
     }
     pub fn source(&mut self, source: Option<&alloc::sync::Arc<crate::kernel::media::Shared<super::dos::AudioDevices>>>) {
         let same = match (&self.source, source) {
@@ -645,14 +640,24 @@ impl Engine {
             _ => false,
         };
         if !same { self.source = source.cloned(); }
+        dma_owner(source.map_or(0, |source| alloc::sync::Arc::as_ptr(source) as usize));
     }
     pub fn due() -> bool {
-        static LAST_MS: AtomicU32 = AtomicU32::new(u32::MAX);
         let now = (super::portio::now_ns() / 1_000_000) as u32;
-        LAST_MS.swap(now, Ordering::Relaxed) != now
+        LAST_AUDIO_MS.load(Ordering::Relaxed) != now
     }
     pub fn poll(&mut self) {
         let now = super::portio::now_ns();
+        self.advance(now, now, self.reader, |source, now, span| source.mix(now, span));
+    }
+    /// The same mixer and device clocks, with direct DMA reads when no worker
+    /// exists. This entry borrows Arch directly; the worker uses its guarded
+    /// read view instead.
+    pub fn poll_inline<A: crate::Arch>(&mut self, machine: &mut A, now: u64) {
+        self.advance(now, machine.rdtsc(), None, |source, now, span| source.mix_guest(machine, now, span));
+    }
+    fn advance(&mut self, now: u64, stamp: u64, reader: Option<arch_abi::GuestReadView>,
+        mut mix: impl FnMut(&mut super::dos::AudioDevices, u64, AudioSpan<'_>)) {
         let elapsed = now.saturating_sub(self.last_ns);
         if elapsed == 0 { return; }
         // Don't stall the media core behind a guest DMA copy or port access.
@@ -660,9 +665,21 @@ impl Engine {
             Some(source) => match source.try_lock() { Some(source) => Some(source), None => return },
             None => None,
         };
+        if let (Some(reader), Some(devices)) = (reader, source.as_mut())
+            && devices.needs_dma()
+        {
+            // Never wait for the guest gate while holding a sound-device
+            // lock: the guest may be waiting to write a device register.
+            let Some(_guest) = super::dos::try_live_access() else { return };
+            if ACTIVE_DMA_OWNER.load(Ordering::Acquire)
+                != self.source.as_ref().map_or(0, |source| alloc::sync::Arc::as_ptr(source) as usize)
+                || !devices.capture_dma(reader)
+            { return; }
+        }
         self.last_ns = now;
-        advance_resident(&mut self.clock, self.sink.as_mut(), elapsed, now, |span| {
-            if let Some(source) = source.as_mut() { source.mix(now, span); }
+        LAST_AUDIO_MS.store((now / 1_000_000) as u32, Ordering::Relaxed);
+        advance_resident(&mut self.clock, self.sink.as_mut(), elapsed, stamp, |span| {
+            if let Some(source) = source.as_mut() { mix(source, now, span); }
         });
     }
 }

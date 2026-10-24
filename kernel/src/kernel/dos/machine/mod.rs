@@ -268,13 +268,32 @@ impl AudioDevices {
 }
 
 impl AudioDevices {
+    pub fn needs_dma(&self) -> bool {
+        matches!(&self.sb.device, SbDevice::Emulated(sb) if sb.needs_worker_dma())
+    }
+    /// Caller holds the guest-memory gate and has verified the active owner.
+    pub fn capture_dma(&mut self, reader: arch_abi::GuestReadView) -> bool {
+        match &mut self.sb.device {
+            SbDevice::Emulated(sb) => sb.capture_dma_with(&mut |addr, bytes|
+                unsafe { reader.copy_from(addr, bytes) }),
+            _ => true,
+        }
+    }
     /// Media-core mixer: resident sample storage only; IRQ delivery is deferred
     /// to the guest core. The surrounding Shared guard excludes port accesses.
     pub fn mix(&mut self, now_ns: u64, span: crate::kernel::sound::AudioSpan<'_>) {
+        self.mix_with(now_ns, span, None);
+    }
+    pub fn mix_guest<A: crate::Arch>(&mut self, machine: &mut A, now_ns: u64,
+        span: crate::kernel::sound::AudioSpan<'_>) {
+        self.mix_with(now_ns, span, Some(&mut |addr, bytes| machine.copy_from(addr, bytes)));
+    }
+    fn mix_with(&mut self, now_ns: u64, span: crate::kernel::sound::AudioSpan<'_>,
+        copy: Option<vsb::DmaCopy<'_>>) {
         let mut irq = VirtualPic::new();
         if let SbDevice::Emulated(sb) = &mut self.sb.device {
             let _ = sb.take_restart();
-            sb.mix_resident(span.rate, span.frames, span.physical_sb, None);
+            sb.mix_resident(span.rate, span.frames, span.physical_sb, copy);
             sb.clock_tick(now_ns, &mut irq, self.sb.blaster.irq);
         }
         self.gus.mix_into(span.rate, span.base_frame, span.frames);
@@ -1136,43 +1155,6 @@ pub fn advance_timers(pc: &mut PcMachine, now_ns: u64) {
     }
 }
 
-/// A PCM producer the source clock advances per block — the one shape
-/// every emulated sound device presents: the SB DSP fills from the guest
-/// ring, OPL from nuked-opl3, the GUS from the wavetable sampler; further
-/// sampler-backed devices (GM, AWE) join by implementing this. Rendering also
-/// advances the device: the destination may be a physical sink or a discard
-/// buffer, but its clock is always the CPU-clocked production
-/// frontier; the final speaker sink trails it by the physical pipe depth.
-enum PcmSource<'a> {
-    /// `None` when this thread holds the real card: silicon mixes itself, and
-    /// there is no emulated card to ask for frames.
-    SoundBlaster(Option<&'a mut EmulatedSb>, bool),
-    Gus(&'a mut Gus),
-    Midi(&'a mut Mpu),
-    Speaker(&'a mut sound::speaker::Speaker),
-}
-
-impl PcmSource<'_> {
-    fn mix_into<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        rate: u32,
-        base: u64,
-        block: &mut [(i32, i32)],
-    ) {
-        match self {
-            Self::SoundBlaster(Some(sb), physical_sb) => sb.mix_into(machine, rate, block, *physical_sb),
-            Self::SoundBlaster(None, _) => {}
-            Self::Gus(gus) => gus.mix_into(rate, base, block),
-            Self::Midi(mpu) => mpu.mix_into(rate, base, block),
-            Self::Speaker(spk) => {
-                let g = vsb::SPEAKER_SCALE_Q16;
-                spk.mix_into(rate, (g, g), block);
-            }
-        }
-    }
-}
-
 /// The nominal canonical mix rate is deliberately *not* borrowed from
 /// whichever device happens to be loudest: a DOS game commonly plays 11 kHz
 /// SB effects over 44 kHz wavetable music, and letting the DSP own the rate
@@ -1217,46 +1199,6 @@ pub fn audio_service<A: crate::Arch>(
         gus.advance(dt_ns, vpic);
     }
     mpu.tick(machine, pushed);
-}
-
-/// Mix one CPU-clocked producer span and advance producer-side device clocks.
-pub fn audio_tick<A: crate::Arch>(
-    machine: &mut A,
-    pc: &mut PcMachine,
-    now_ns: u64,
-    span: crate::kernel::sound::AudioSpan<'_>,
-) {
-    let mut audio = pc.audio.lock();
-    let AudioDevices { sb, gus, mpu, spk, .. } = &mut *audio;
-    let vpic = &mut pc.vpic;
-    // The source clock advances emulated sources only. A thread holding the real card
-    // has nothing here: its DSP streams from the guest ring over the ISA bus
-    // and its OPL is the card's own, so neither produces frames for us and
-    // neither has a cursor for us to clock. Bind it once — every SB question
-    // below is on the emulated payload, which is where they mean anything.
-    let SoundBlaster { blaster, device } = sb;
-    let sb_irq = blaster.irq;
-    let mut sb = match device {
-        SbDevice::Emulated(emu) => Some(&mut **emu),
-        SbDevice::Native { .. } => None,
-    };
-    if let Some(emu) = sb.as_deref_mut() {
-        let _ = emu.take_restart();
-    }
-    let mut sources = [
-        PcmSource::SoundBlaster(sb.as_deref_mut(), span.physical_sb),
-        PcmSource::Gus(gus),
-        PcmSource::Midi(mpu),
-        PcmSource::Speaker(spk),
-    ];
-    for source in &mut sources {
-        source.mix_into(machine, span.rate, span.base_frame, span.frames);
-    }
-
-    if let Some(emu) = sb {
-        emu.dsp_clock_tick(machine, now_ns, vpic, sb_irq);
-    }
-    gus.deliver_events(vpic);
 }
 
 pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, event: crate::Irq) {

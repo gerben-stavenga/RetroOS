@@ -562,20 +562,15 @@ fn rebind_scanout() {
 // Scanout sampling excludes both guest execution and kernel alias accesses.
 // The guest loop holds this gate for one slice; the renderer only holds it
 // while copying into its own scratch, never while decoding or presenting.
-static LIVE_ACCESS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+use crate::kernel::media::GUEST_MEMORY;
 #[thread_local]
 static mut LIVE_ACCESS_DEPTH: usize = 0;
 pub(crate) struct LiveAccess {
     _local: core::marker::PhantomData<*mut ()>,
 }
 pub(crate) fn live_access() -> LiveAccess {
-    use core::sync::atomic::Ordering;
     unsafe {
-        if LIVE_ACCESS_DEPTH == 0 {
-            while LIVE_ACCESS.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-                core::hint::spin_loop();
-            }
-        }
+        if LIVE_ACCESS_DEPTH == 0 { GUEST_MEMORY.enter(); }
         LIVE_ACCESS_DEPTH += 1;
     }
     LiveAccess { _local: core::marker::PhantomData }
@@ -584,14 +579,11 @@ impl Drop for LiveAccess {
     fn drop(&mut self) {
         unsafe {
             LIVE_ACCESS_DEPTH -= 1;
-            if LIVE_ACCESS_DEPTH == 0 { LIVE_ACCESS.store(false, core::sync::atomic::Ordering::Release); }
+            if LIVE_ACCESS_DEPTH == 0 { GUEST_MEMORY.leave(); }
         }
     }
 }
-struct LiveRead;
-impl Drop for LiveRead {
-    fn drop(&mut self) { LIVE_ACCESS.store(false, core::sync::atomic::Ordering::Release); }
-}
+type LiveRead = crate::kernel::media::GuestMemoryRead<'static>;
 
 /// A range of the permanent device store. It owns no guest-address-space
 /// pointer, and cannot outlive its backing: LiveVram pages are never freed.
@@ -613,7 +605,7 @@ impl LiveRegion {
         (base != 0 && address >= base && address.checked_add(bytes.len())? <= base.checked_add(len)?)
             .then_some(Self { address, len: bytes.len(), epoch })
     }
-    /// Caller holds LIVE_ACCESS. No shared or exclusive slice aliases VRAM.
+    /// Caller holds the guest-memory gate. No shared or exclusive slice aliases VRAM.
     fn sample(self, destination: &mut [u8]) {
         assert_eq!(destination.len(), self.len);
         if self.len != 0 {
@@ -622,14 +614,13 @@ impl LiveRegion {
         }
     }
 }
+pub(crate) fn try_live_access() -> Option<LiveRead> { GUEST_MEMORY.try_read() }
 pub(crate) fn sample_live(vram: LiveRegion, destination: &mut [u8],
     planes: LiveRegion, plane_destination: &mut [u8]) -> bool {
     let inline = !crate::kernel::media::enabled() && unsafe { LIVE_ACCESS_DEPTH != 0 };
     let _guard = if inline { None } else {
-        if LIVE_ACCESS.load(core::sync::atomic::Ordering::Relaxed)
-            || LIVE_ACCESS.compare_exchange(false, true, core::sync::atomic::Ordering::Acquire,
-                core::sync::atomic::Ordering::Relaxed).is_err() { return false; }
-        Some(LiveRead)
+        let Some(guard) = try_live_access() else { return false };
+        Some(guard)
     };
     let epoch = MEMORY_EPOCH.load(core::sync::atomic::Ordering::Relaxed);
     if vram.epoch != epoch || planes.epoch != epoch { return false; }

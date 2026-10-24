@@ -15,6 +15,7 @@ use arch_abi::{Arch, ExecutionProfile, ExecutionProfileStage, Irq, KernelEvent, 
 pub struct Metal;
 
 impl Arch for Metal {
+    fn guest_read_view(&self) -> Option<arch_abi::GuestReadView> { Some(super::paging2::guest_read_view()) }
     type PageTable = RootPageTable;
     type Fx = FxState;
     fn fx_state_bytes(fx: &Self::Fx) -> Option<&[u8; 512]> { Some(&fx.0) }

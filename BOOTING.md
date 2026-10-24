@@ -14,8 +14,11 @@ Single-core machines and hosted execution use the same operations inline.
 Audio is a persistent service on core 1. It samples its own clock, advances
 sources and feeds the physical output once per millisecond, including at
 checkpoints within graphics work. Core 0 does not submit mixing jobs or wait
-for a quantum. It captures guest DMA windows, processes device commands and
-delivers pending virtual IRQs. Sound-device state is protected at that boundary;
+for a quantum. It processes device commands and delivers pending virtual IRQs.
+Core 1 samples guest DMA through an arch read view while holding the same short
+guest-memory gate as VGA. The view temporarily borrows the source CPU's user
+page-table entries and restores the worker root before returning; it never
+allocates or retains guest pointers. Sound-device state is protected at that boundary;
 an unavailable device lock defers per-slice service without losing timer time.
 The output log reports `core 1: sink: first frame played`.
 
@@ -28,17 +31,22 @@ and paints OSD text/rectangle commands into its own pixels. Every refresh still
 renders the complete picture, including continuously changing screens.
 
 A short memory gate excludes guest slices and kernel writes while core 1 samples
-VRAM. The gate is released before decoding, OSD painting or presentation. Mode
+VRAM. A failed media read requests the next guest-slice boundary; core 0
+hands over that brief copy window instead of immediately retaking the gate.
+The gate is released before mixing, decoding, OSD painting or presentation. Mode
 and owner changes invalidate old VRAM descriptors and fence output mapping changes.
 Single-core linear output uses the same renderer inline. Banked BIOS presentation
 remains on core 0. The log reports
 `core 1: Video service: rendering at 70 Hz` for VGA.
 
-Voodoo writes use an ordered, bounded command ring. Rasterization runs on core 1;
-reads fence pending commands, and a full ring applies producer backpressure.
+Voodoo writes use an ordered, bounded command ring. A persistent device service
+on core 1 drains bounded batches without guest ticks or graphics-job submissions.
+Reads fence completed commands, and a full ring applies producer backpressure.
+One-core Voodoo and audio use the same device/mixer routines inline.
 Graphics checks audio between rows or small copy chunks. Worker callbacks use
-resident kernel buffers and do not allocate, free pages, access guest mappings
-or invoke BIOS calls. Core 0 allocates resident source and output storage. Each job or
+resident kernel buffers and do not allocate, free pages or invoke BIOS calls.
+Guest DMA access is limited to the guarded arch read view above. Core 0 allocates
+resident source and output storage. Each job or
 due service refreshes the worker's kernel root and TLB before accessing published
 storage. Idle polling does not flush the TLB. The worker polls rather than
 sleeping; PIT interrupts remain on core 0.
@@ -48,6 +56,7 @@ To exercise the dual-core paths:
 ```sh
 python3 test/display_scaling.py --cpus 2 --kvm
 python3 test/audio_steady.py --cpus 2 --kvm 10
+python3 test/audio_steady.py --cpus 2 --kvm --effects-only 10
 ```
 
 ## Machine installation (ext4 or FAT)

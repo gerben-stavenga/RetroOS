@@ -105,7 +105,7 @@ struct WriteCombine {
 
 pub struct VVoodoo {
     output: alloc::sync::Arc<VoodooOutput>,
-    work: crate::kernel::media::Graphics<alloc::sync::Arc<VoodooOutput>>,
+    work: crate::kernel::media::DeviceService<alloc::sync::Arc<VoodooOutput>>,
     allocated: bool,
     cfg: Config,
     wc: WriteCombine,
@@ -169,7 +169,7 @@ impl VoodooOutput {
         }
         self.publish(render);
     }
-    fn run(output: &mut alloc::sync::Arc<Self>) {
+    fn run(output: &alloc::sync::Arc<Self>) {
         if let Some(mut render) = output.render.try_lock() { output.drain(&mut render); }
     }
     pub(crate) fn dimensions(&self) -> (usize, usize) {
@@ -208,7 +208,8 @@ impl VVoodoo {
             ready: core::sync::atomic::AtomicBool::new(false),
         });
         Self {
-            work: crate::kernel::media::Graphics::new(output.clone()), output, allocated: false,
+            work: unsafe { crate::kernel::media::DeviceService::new(output.clone(),
+                |output| output.commands.pending(), VoodooOutput::run) }, output, allocated: false,
             cfg: Config {
                 command: 0,
                 bar0: BAR_PHYS,
@@ -235,11 +236,7 @@ impl VVoodoo {
         }
         self.frame_ready |= self.output.ready.load(Ordering::Acquire);
     }
-    fn kick(&mut self) {
-        if !self.work.is_busy() && self.output.commands.pending() {
-            unsafe { self.work.start(VoodooOutput::run); }
-        }
-    }
+    fn kick(&mut self) { self.work.poll_inline(); }
     fn submit(&mut self, command: Command) {
         while !unsafe { self.output.commands.push(command) } {
             self.kick();
@@ -250,11 +247,12 @@ impl VVoodoo {
     fn fence(&mut self) {
         loop {
             self.kick();
-            self.work.wait();
+            // The last command leaves the ring before it finishes executing.
+            // Taking the render lock fences that execution as well.
+            let _render = self.output.render.lock();
             if !self.output.commands.pending() { break; }
         }
     }
-    pub fn service_commands(&mut self) { self.kick(); }
     pub(crate) fn output(&mut self) -> alloc::sync::Arc<VoodooOutput> {
         self.flush();
         self.kick();

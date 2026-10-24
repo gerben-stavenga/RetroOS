@@ -750,6 +750,64 @@ pub fn entries() -> Entries {
     }
 }
 
+/// The CPU-local root lives for the kernel lifetime. The kernel serializes
+/// guest slices and DMA reads; the worker borrows user entries only while
+/// that exclusion is held. Kernel/recursive mappings stay worker-local.
+pub(crate) fn guest_read_view() -> arch_abi::GuestReadView {
+    unsafe { arch_abi::GuestReadView::new((&raw const ROOT) as usize | usize::from(is_pae()), read_guest_view) }
+}
+unsafe fn read_guest_view(context: usize, address: usize, destination: &mut [u8]) -> bool {
+    let pae = context & 1 != 0;
+    let root = context & !1;
+    if pae != is_pae() || root == (&raw const ROOT) as usize
+        || address.checked_add(destination.len()).is_none_or(|end| end > 0xC0000000)
+    { return false; }
+    if pae { unsafe { read_guest_root::<Entry64, 3>(root, address, destination) } }
+    else { unsafe { read_guest_root::<Entry32, 768>(root, address, destination) } }
+    true
+}
+struct BorrowedGuestRoot<E: Entry, const N: usize> { saved: [E; N] }
+impl<E: Entry, const N: usize> Drop for BorrowedGuestRoot<E, N> {
+    fn drop(&mut self) {
+        for (i, entry) in self.saved.iter().enumerate() {
+            unsafe { (&raw mut ROOT).cast::<E>().add(i).write_volatile(*entry); }
+        }
+        flush_tlb();
+    }
+}
+unsafe fn read_guest_root<E: Entry, const N: usize>(source: usize, mut address: usize, mut destination: &mut [u8]) {
+    let local = (&raw mut ROOT).cast::<E>();
+    let saved = core::array::from_fn(|i| unsafe { local.add(i).read_volatile() });
+    let _restore = BorrowedGuestRoot::<E, N> { saved };
+    for i in 0..N {
+        unsafe { local.add(i).write_volatile((source as *const E).add(i).read_volatile()); }
+    }
+    flush_tlb();
+    while !destination.is_empty() {
+        let page = address / PAGE_SIZE;
+        let root_index = if N == 3 { address >> 30 } else { address >> 22 };
+        let root = unsafe { local.add(root_index).read_volatile() };
+        let entries = PAGE_TABLE_BASE as *const E;
+        let present = if !root.present() { false }
+            else if root.raw() & flags::PAGE_SIZE_BIT != 0 { true }
+            else if N == 3 {
+                let parent = unsafe { entries.add(parent_index::<E>(page)).read_volatile() };
+                parent.present() && (parent.raw() & flags::PAGE_SIZE_BIT != 0
+                    || unsafe { entries.add(page).read_volatile() }.present())
+            } else { unsafe { entries.add(page).read_volatile() }.present() };
+        let count = destination.len().min(PAGE_SIZE - address % PAGE_SIZE);
+        let (part, rest) = destination.split_at_mut(count);
+        crate::x86::invlpg(address);
+        if present {
+            arch_abi::GuestBytes::copy_from(&crate::backend::Metal, address, part);
+        } else { part.fill(0); }
+        // Do not retain even a global guest translation after this scope.
+        crate::x86::invlpg(address);
+        address += count;
+        destination = rest;
+    }
+}
+
 /// Cached `is_pae()` result. `cpu_mode()` reads CR4 + EFER (ring-0-only),
 /// so any caller outside the arch syscall handlers (e.g. ring-1 kernel
 /// code calling `entries()`) would #GP. The mode is fixed once

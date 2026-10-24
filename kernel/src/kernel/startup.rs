@@ -1442,7 +1442,7 @@ fn event_loop<A: crate::Arch>(
     let mut irq_clock_wakeup = false;
     let mut exiting_display = None;
     let audio = unsafe { crate::kernel::media::AudioService::new(
-        crate::kernel::sound::Engine::new(sink.take(), machine.now()),
+        crate::kernel::sound::Engine::new(sink.take(), machine.now(), machine.guest_read_view()),
         crate::kernel::sound::Engine::due,
         crate::kernel::sound::Engine::poll,
     ) };
@@ -1493,6 +1493,7 @@ fn event_loop<A: crate::Arch>(
         // Guest aliases can also be written by arbitrary kernel services.
         // Serialize the whole guest slice with the renderer's brief VRAM
         // sample. Decoding, composition and presentation never hold this gate.
+        crate::kernel::media::GUEST_MEMORY.yield_to_reader();
         let _live_access = crate::kernel::dos::live_access();
         crate::kernel::linux::reap_waited_child(machine, threads, ctx.tid);
         crate::kernel::linux::refresh_system_tasks(threads);
@@ -1629,15 +1630,7 @@ fn event_loop<A: crate::Arch>(
                 thread.kernel.state = thread::ThreadState::Ready;
             }
             if elapsed_ns != 0 && !crate::kernel::media::enabled() {
-                let mut engine = audio.lock();
-                let crate::kernel::sound::Engine { clock, sink, .. } = &mut *engine;
-                crate::kernel::sound::advance(
-                    machine,
-                    clock,
-                    sink.as_mut(),
-                    elapsed_ns,
-                    |machine, span| thread.personality.audio_tick(machine, world_now_ns, span),
-                );
+                audio.lock().poll_inline(machine, world_now_ns);
             }
             stats.mark(machine, PROFILE_AUDIO);
             // Fullscreen scanout is display work too. Keeping it inside
