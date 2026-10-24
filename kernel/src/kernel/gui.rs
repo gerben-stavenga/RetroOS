@@ -1862,6 +1862,29 @@ fn blit_scaled(
     opacity: u8,
     target: &mut Target<'_>,
 ) {
+    // Profiling remains on the BSP; only the pixel loops cross cores.
+    if source.width == 0 || source.height == 0 || destination.width == 0 || destination.height == 0 { return; }
+    let canvas = Rect::new(0, 0, target.width as u32, target.height as u32);
+    let Some(draw) = intersect(destination, clip).and_then(|r| intersect(r, canvas)) else { return };
+    let unscaled = source.width == destination.width as usize && source.height == destination.height as usize;
+    let path = if opacity == u8::MAX && unscaled {
+        if source.format == target.format { crate::kernel::osd_profile::Blit::Packed }
+        else { crate::kernel::osd_profile::Blit::Convert }
+    } else { crate::kernel::osd_profile::Blit::Scale };
+    crate::kernel::osd_profile::blit(path, source.width, source.height,
+        draw.width as usize * draw.height as usize);
+    // Surface pixels and the composition target are resident kernel storage.
+    // Join before resolving another surface or mutating the retained scene.
+    unsafe { crate::kernel::media::graphics(|| {
+        blit_scaled_local(source, destination, clip, opacity, target);
+    }); }
+}
+
+#[optimize(speed)]
+fn blit_scaled_local(
+    source: PixelBuffer<'_>, destination: Rect, clip: Rect,
+    opacity: u8, target: &mut Target<'_>,
+) {
     if source.width == 0 || source.height == 0 || destination.width == 0 || destination.height == 0
     {
         return;
@@ -1888,10 +1911,8 @@ fn blit_scaled(
         let sx = (left as i64 - i64::from(destination.x)) as usize;
         let sy = (top as i64 - i64::from(destination.y)) as usize;
         let width = right - left;
-        crate::kernel::osd_profile::blit(
-            crate::kernel::osd_profile::Blit::Packed,
-            source.width, source.height, width * (bottom - top));
         for y in top..bottom {
+            crate::kernel::media::checkpoint();
             let row = sy + y - top;
             let step = usize::from(target.format.bytes_per_pixel);
             let target_start = (y * target.width + left) * step;
@@ -1908,9 +1929,8 @@ fn blit_scaled(
     {
         let ox = destination.x;
         let oy = destination.y;
-        crate::kernel::osd_profile::blit(crate::kernel::osd_profile::Blit::Convert,
-            source.width, source.height, right.saturating_sub(left) * bottom.saturating_sub(top));
         for y in top..bottom {
+            crate::kernel::media::checkpoint();
             for x in left..right {
                 let sx = (x as i64 - i64::from(ox)) as usize;
                 let sy = (y as i64 - i64::from(oy)) as usize;
@@ -1919,9 +1939,8 @@ fn blit_scaled(
         }
         return;
     }
-    crate::kernel::osd_profile::blit(crate::kernel::osd_profile::Blit::Scale,
-        source.width, source.height, right.saturating_sub(left) * bottom.saturating_sub(top));
     for y in top..bottom {
+        crate::kernel::media::checkpoint();
         let local_y = i64::try_from(y).unwrap_or(i64::MAX) - i64::from(destination.y);
         let source_y = (local_y as u64 * source.height as u64 / u64::from(destination.height))
             .min(source.height as u64 - 1) as usize;

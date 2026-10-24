@@ -104,15 +104,7 @@ struct WriteCombine {
 }
 
 pub struct VVoodoo {
-    /// Boxed: the card's register files are ~20 KB, and `PcMachine` is built
-    /// by value on the 64 KB kernel stack. Inline it and construction alone
-    /// overflows the guard page.
-    card: Box<Voodoo>,
-    /// Video memory. The guest maps no part of it directly yet — see the
-    /// module docs on the LFB fast path.
-    fb: Vec<u8>,
-    /// TMU 0 texture memory.
-    tex: Vec<u8>,
+    render: crate::kernel::media::Graphics<Render>,
     cfg: Config,
     wc: WriteCombine,
     /// Linear base DPMI handed the guest for the BAR, once it has asked.
@@ -121,17 +113,44 @@ pub struct VVoodoo {
     pub frame_ready: bool,
 }
 
+// Only resident card-owned buffers cross to the media worker. PCI state,
+// guest addresses and allocation stay with the BSP.
+struct Render {
+    card: Box<Voodoo>,
+    fb: Vec<u8>,
+    tex: Vec<u8>,
+    command: (u32, u32, u32),
+    swapped: bool,
+}
+impl Render {
+    fn execute(&mut self) {
+        let (off, data, mask) = self.command;
+        let events = self
+            .card
+            .write(&mut self.fb, &mut [&mut self.tex], off, data, mask);
+        self.swapped |= events.swap;
+    }
+}
+
 impl VVoodoo {
     pub fn new() -> Self {
         let mut card = Box::<Voodoo>::new_uninit();
         Voodoo::init(&mut card, Kind::Voodoo1, FB_BYTES, TEX_BYTES);
+        let mut card = unsafe { card.assume_init() };
+        card.set_checkpoint(crate::kernel::media::checkpoint);
         Self {
-            card: unsafe { card.assume_init() },
-            // PCI presence alone must not consume 4 MiB per DOS process.
-            // Back the card only when a client actually accesses its MMIO.
-            fb: Vec::new(),
-            tex: Vec::new(),
-            cfg: Config { command: 0, bar0: BAR_PHYS, init_enable: 0 },
+            render: crate::kernel::media::Graphics::new(Render {
+                card,
+                fb: Vec::new(),
+                tex: Vec::new(),
+                command: (0, 0, 0),
+                swapped: false,
+            }),
+            cfg: Config {
+                command: 0,
+                bar0: BAR_PHYS,
+                init_enable: 0,
+            },
             wc: WriteCombine::default(),
             linear_base: None,
             frame_ready: false,
@@ -141,14 +160,16 @@ impl VVoodoo {
     /// True once the guest has mapped the aperture, i.e. a Glide program is
     /// driving the card and its output should own the display.
     pub fn active(&self) -> bool {
-        self.linear_base.is_some() && self.card.output_on
+        self.linear_base.is_some() && self.render.get().card.output_on
     }
 
     fn ensure_memory(&mut self) {
-        if self.fb.is_empty() {
-            self.fb.resize(FB_BYTES, 0);
-            self.tex.resize(TEX_BYTES, 0);
+        let render = self.render.get_mut();
+        if render.fb.is_empty() {
+            render.fb.resize(FB_BYTES, 0);
+            render.tex.resize(TEX_BYTES, 0);
         }
+        self.frame_ready |= core::mem::take(&mut render.swapped);
     }
 
     pub fn config_read(&self, off: u8) -> u32 {
@@ -158,7 +179,7 @@ impl VVoodoo {
     pub fn config_write(&mut self, off: u8, val: u32) {
         self.cfg.write(off, val);
         if off & 0xFC == 0x40 {
-            self.card.set_init_enable(val);
+            self.render.get_mut().card.set_init_enable(val);
         }
     }
 
@@ -201,23 +222,32 @@ impl VVoodoo {
         let off = self.wc.dword_off;
         self.wc = WriteCombine::default();
 
-        let mut tex: [&mut [u8]; 1] = [&mut self.tex];
-        let events = self.card.write(&mut self.fb, &mut tex, off, data, mask);
-        if events.swap {
-            self.frame_ready = true;
+        let render = self.render.get_mut();
+        render.command = (off, data, mask);
+        if render.card.renders(off) {
+            // No allocation or guest-memory access in the passive rasterizer.
+            unsafe {
+                self.render.start(Render::execute);
+            }
+        } else {
+            render.execute();
+            self.frame_ready |= core::mem::take(&mut render.swapped);
         }
     }
 
     pub fn read8(&mut self, off: u32) -> u8 {
         self.ensure_memory();
         self.flush();
-        let dword = self.card.read(&self.fb, off & !3, Beam::default());
+        let render = self.render.get();
+        let dword = render.card.read(&render.fb, off & !3, Beam::default());
         (dword >> ((off & 3) * 8)) as u8
     }
 
     /// The host reports a vertical retrace; a deferred swap may complete on it.
     pub fn vblank(&mut self) -> Events {
-        let events = self.card.vblank();
+        let render = self.render.get_mut();
+        self.frame_ready |= core::mem::take(&mut render.swapped);
+        let events = render.card.vblank();
         if events.swap {
             self.frame_ready = true;
         }
@@ -226,7 +256,7 @@ impl VVoodoo {
 
     /// Visible resolution the guest programmed.
     pub fn dimensions(&self) -> (u32, u32) {
-        self.card.dimensions()
+        self.render.get().card.dimensions()
     }
 
     /// Clock the visible buffer out into `out`, in whatever encoding `dac`
@@ -234,20 +264,28 @@ impl VVoodoo {
     pub fn scanout(&mut self, out: &mut [u8], pitch: usize, dac: &voodoo::Dac) {
         self.ensure_memory();
         self.flush();
-        self.card.render(&self.fb, dac, out, pitch);
+        let render = self.render.get();
+        unsafe {
+            crate::kernel::media::graphics(|| render.card.render(&render.fb, dac, out, pitch));
+        }
+        self.render.get_mut().swapped = false;
         self.frame_ready = false;
     }
 
     pub fn scanout_raw(&mut self, out: &mut [u8], pitch: usize, dac: &voodoo::Dac) {
         self.ensure_memory();
         self.flush();
-        self.card.render_raw(&self.fb, dac, out, pitch);
+        let render = self.render.get();
+        unsafe {
+            crate::kernel::media::graphics(|| render.card.render_raw(&render.fb, dac, out, pitch));
+        }
+        self.render.get_mut().swapped = false;
         self.frame_ready = false;
     }
 
     pub fn vbe_ramp(&mut self, out: &mut [u8; 256 * 4]) -> u64 {
         self.flush();
-        self.card.vbe_ramp(out)
+        self.render.get().card.vbe_ramp(out)
     }
 
     /// Which region an aperture offset addresses, for logging and for the
@@ -272,13 +310,21 @@ mod tests {
         let mut board = VVoodoo::new();
         let _ = board.config_read(0);
         board.flush();
-        assert!(board.fb.is_empty() && board.tex.is_empty());
+        assert!(board.render.get_mut().fb.is_empty() && board.render.get_mut().tex.is_empty());
         let _ = board.read8(0);
-        assert_eq!(board.fb.len(), FB_BYTES);
-        assert_eq!(board.tex.len(), TEX_BYTES);
-        assert!(board.fb.iter().chain(board.tex.iter()).all(|&b| b == 0));
-        board.fb[0] = 0x5a;
+        assert_eq!(board.render.get_mut().fb.len(), FB_BYTES);
+        assert_eq!(board.render.get_mut().tex.len(), TEX_BYTES);
+        assert!(
+            board
+                .render
+                .get()
+                .fb
+                .iter()
+                .chain(board.render.get().tex.iter())
+                .all(|&b| b == 0)
+        );
+        board.render.get_mut().fb[0] = 0x5a;
         let _ = board.read8(0);
-        assert_eq!(board.fb[0], 0x5a);
+        assert_eq!(board.render.get_mut().fb[0], 0x5a);
     }
 }

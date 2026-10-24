@@ -242,7 +242,9 @@ impl Gus {
         block: &mut [(i32, i32)],
     ) {
         let g = super::vsb::GUS_SCALE_Q16;
-        self.card.mix_into(rate, (g, g), block);
+        let card = &mut self.card;
+        // Resident wavetable RAM; no guest reads or allocations in the mixer.
+        unsafe { crate::kernel::media::audio(|| card.mix_into(rate, (g, g), block)); }
     }
 }
 

@@ -128,7 +128,7 @@ bz()        { if have bazelisk; then bazelisk "$@"; else bazel "$@"; fi; }
 unit() {
     bz test --platforms=@platforms//host \
         //arch-abi:arch_abi_test //arch-metal:xhci_dma_test //arch-metal:phys_mm_test //arch-metal:boot_mem_test //arch-metal:acpi_test //kernel:kernel_unit_test \
-        //lib:sound_test //lib:vga_test //lib:heap_test //lib:compact_fmt_test //lib:term_test \
+        //lib:sound_test //lib:vga_test //lib:heap_test //lib:compact_fmt_test //lib:term_test //lib:log_test //kernel:media_test \
         //ext4:ext4_test //ext4:modern_image_test //third_party/voodoo:voodoo_test //third_party/smb2-core:protocol_test \
         //arch-interp:arch-interp-test //arch-interp:mmu-test
 }

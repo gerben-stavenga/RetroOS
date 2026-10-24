@@ -99,7 +99,37 @@ pub struct Display {
     /// Retained producers keep their unscaled packed content.
     present_pixels: alloc::vec::Vec<u8>,
     last_packed_output: Option<(usize, usize)>,
+    presentation: Option<crate::kernel::media::Graphics<Presentation>>,
     backend: Backend,
+}
+
+// Worker-owned snapshot: the producer may redraw its surface immediately.
+// All resizing happens on the BSP before publication.
+struct Presentation {
+    fb: Framebuffer,
+    format: PixelFormat,
+    width: usize,
+    height: usize,
+    output: (usize, usize),
+    pixels: alloc::vec::Vec<u8>,
+    row: alloc::vec::Vec<u8>,
+    clear: bool,
+    regions: alloc::vec::Vec<crate::kernel::gui::Rect>,
+    partial: bool,
+}
+impl Presentation {
+    fn render(&mut self) {
+        if self.clear { clear_packed_bars_cooperative(&self.fb, self.format, self.output, crate::kernel::media::checkpoint); }
+        if self.partial {
+            blit_regions_cooperative(&self.fb, self.format, self.output.0, self.output.1,
+                self.height, &self.pixels, &self.regions, crate::kernel::media::checkpoint);
+        } else {
+            blit_packed_cooperative(&self.fb, self.format, self.output, PackedSource {
+                width: self.width, height: self.height, pixels: &self.pixels, row: &mut self.row,
+            }, crate::kernel::media::checkpoint);
+        }
+        finish_present();
+    }
 }
 
 /// Scanout ownership between complete personality states. A physical handoff
@@ -238,6 +268,39 @@ impl core::fmt::Debug for Display {
 }
 
 impl Display {
+    fn wait_presentation(&self) {
+        if let Some(work) = &self.presentation { work.wait(); }
+    }
+
+    fn queue_presentation(&mut self, width: usize, height: usize, pixels: &[u8], output: (usize, usize), regions: Option<&[crate::kernel::gui::Rect]>) -> Option<usize> {
+        if !crate::kernel::media::enabled() { return None; }
+        let fb = *self.framebuffer()?;
+        let bytes = width.checked_mul(height)?.checked_mul(usize::from(self.rgb.bytes_per_pixel))?;
+        if width == 0 || height == 0 || pixels.len() < bytes { return Some(0); }
+        let clear = self.last_packed_output != Some(output);
+        self.last_packed_output = Some(output);
+        let work = self.presentation.get_or_insert_with(|| crate::kernel::media::Graphics::new(Presentation {
+            fb, format: self.rgb, width, height, output, pixels: alloc::vec::Vec::new(),
+            row: alloc::vec::Vec::new(), clear, regions: alloc::vec::Vec::new(), partial: false,
+        }));
+        let frame = work.get_mut();
+        frame.fb = fb;
+        frame.format = self.rgb;
+        frame.width = width;
+        frame.height = height;
+        frame.output = output;
+        frame.clear = clear;
+        frame.partial = regions.is_some();
+        frame.regions.clear();
+        if let Some(regions) = regions { frame.regions.extend_from_slice(regions); }
+        frame.pixels.resize(bytes, 0);
+        frame.pixels.copy_from_slice(&pixels[..bytes]);
+        frame.row.resize(output.0 * usize::from(self.rgb.bytes_per_pixel), 0);
+        // Storage is fully resident; Display fences before mode/mapping changes.
+        unsafe { work.start(Presentation::render); }
+        Some(output.0 * output.1)
+    }
+
     /// Construct the kernel display mode selected once during BIOS discovery.
     /// `Platform::vbe_mode == None` means Mode 13h was the startup selection;
     /// it is not a per-call recovery policy.
@@ -291,6 +354,7 @@ impl Display {
         Self { shadow_width, rgb, programmable_ramp: false,
             voodoo_ramp_generation: None, present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
+            presentation: None,
             backend: Backend::Linear(framebuffer) }
     }
 
@@ -324,6 +388,7 @@ impl Display {
             voodoo_ramp_generation: None,
             present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
+            presentation: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::Mode13 {
@@ -377,6 +442,7 @@ impl Display {
             voodoo_ramp_generation: None,
             present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
+            presentation: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeLinear { framebuffer, pages },
@@ -405,6 +471,7 @@ impl Display {
             voodoo_ramp_generation: None,
             present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
+            presentation: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeBanked { mode, current_bank: 0 },
@@ -417,6 +484,7 @@ impl Display {
             programmable_ramp: false, voodoo_ramp_generation: None,
             present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
+            presentation: None,
             backend: Backend::Host }
     }
 
@@ -425,6 +493,7 @@ impl Display {
             programmable_ramp: false, voodoo_ramp_generation: None,
             present_pixels: alloc::vec::Vec::new(),
             last_packed_output: None,
+            presentation: None,
             backend: Backend::Headless }
     }
 
@@ -443,6 +512,7 @@ impl Display {
         generation: u64,
         ramp: &mut [u8; 256 * 4],
     ) -> bool {
+        self.wait_presentation();
         if !self.programmable_ramp { return false; }
         if self.voodoo_ramp_generation == Some(generation) { return true; }
         let Backend::Vga { native, .. } = &mut self.backend else { return false };
@@ -470,6 +540,7 @@ impl Display {
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) {
+        self.wait_presentation();
         if self.voodoo_ramp_generation.is_none() { return; }
         let mut ramp = [0u8; 256 * 4];
         for (v, entry) in ramp.chunks_exact_mut(4).enumerate() {
@@ -498,12 +569,14 @@ impl Display {
         (out_h / shadow_height.max(1)).max(1)
     }
     pub fn vga_capability(&self) -> Option<&crate::kernel::platform::VgaCap> {
+        self.wait_presentation();
         match &self.backend {
             Backend::Vga { native, .. } => Some(native),
             _ => None,
         }
     }
     pub(crate) fn vga_capability_mut(&mut self) -> Option<&mut crate::kernel::platform::VgaCap> {
+        self.wait_presentation();
         match &mut self.backend {
             Backend::Vga { native, .. } => Some(native),
             _ => None,
@@ -515,6 +588,7 @@ impl Display {
         self,
         machine: &mut A,
     ) -> Result<crate::kernel::platform::VgaCap, Self> {
+        self.wait_presentation();
         match self.backend {
             Backend::Vga { native, scanout } => {
                 match scanout {
@@ -540,6 +614,7 @@ impl Display {
         }
     }
     fn clear_visible_framebuffer(&self) {
+        self.wait_presentation();
         let Some(fb) = self.framebuffer() else { return };
         let row_bytes = fb.width * usize::from(self.rgb.bytes_per_pixel);
         for y in 0..fb.height {
@@ -598,6 +673,7 @@ impl Display {
         } else {
             native_output_size(canvas.0, canvas.1, width, height)
         };
+        if let Some(copied) = self.queue_presentation(width, height, pixels, output, None) { return copied; }
         let clear_bars = self.last_packed_output != Some(output);
         self.last_packed_output = Some(output);
         let scratch = &mut self.present_pixels;
@@ -651,6 +727,7 @@ impl Display {
         {
             return self.present_packed(machine, bios, width, height, pixels);
         }
+        if let Some(copied) = self.queue_presentation(width, height, pixels, (width, height), Some(regions)) { return copied; }
         let format = self.rgb;
         let clear_bars = self.last_packed_output != Some((width, height));
         self.last_packed_output = Some((width, height));
@@ -693,6 +770,7 @@ impl Display {
         if height == 0 || shadow.len() < stride * height {
             return 0;
         }
+        if let Some(copied) = self.queue_presentation(self.shadow_width, height, shadow, (out_w, out_h), None) { return copied; }
         if matches!(self.backend, Backend::Linear(_)) {
             return self.present_linear(height, shadow).unwrap_or(0);
         }
@@ -735,6 +813,7 @@ impl Display {
         }
         let format = self.rgb;
         let (out_w, out_h) = self.fit();
+        if let Some(copied) = self.queue_presentation(self.shadow_width, height, shadow, (out_w, out_h), Some(regions)) { return copied; }
         let copied = match &mut self.backend {
             Backend::Linear(framebuffer)
             | Backend::Vga {
@@ -754,6 +833,7 @@ impl Display {
     }
 
     fn present_linear(&mut self, height: usize, shadow: &[u8]) -> Option<usize> {
+        self.wait_presentation();
         let format = self.rgb;
         let (out_w, out_h) = self.fit();
         let Backend::Linear(framebuffer) = &mut self.backend else { return None };
@@ -771,6 +851,7 @@ impl Display {
     }
 
     pub fn panic_present_packed(&mut self, width: usize, height: usize, pixels: &[u8]) -> usize {
+        self.wait_presentation();
         let format = self.rgb;
         let canvas = self.composition_size(width, height);
         let output = if (width, height) == canvas { canvas } else { self.fit() };
@@ -963,12 +1044,16 @@ fn blit(
 /// Only one packed destination row is staged; it is stretched once and reused
 /// for every vertical repetition of that source row.
 fn clear_packed_bars(fb: &Framebuffer, format: PixelFormat, output: (usize, usize)) {
+    clear_packed_bars_cooperative(fb, format, output, || {});
+}
+fn clear_packed_bars_cooperative(fb: &Framebuffer, format: PixelFormat, output: (usize, usize), cooperate: fn()) {
     let (out_w, out_h) = output;
     if out_w > fb.width || out_h > fb.height { return; }
     let step = usize::from(format.bytes_per_pixel);
     let bx = (fb.width - out_w) / 2;
     let by = (fb.height - out_h) / 2;
     for y in 0..fb.height {
+        cooperate();
         let row = fb.va + y * fb.pitch;
         unsafe {
             if y < by || y >= by + out_h {
@@ -989,6 +1074,13 @@ fn blit_packed(
     output: (usize, usize),
     source: PackedSource<'_>,
 ) -> usize {
+    blit_packed_cooperative(fb, format, output, source, || {})
+}
+#[optimize(speed)]
+fn blit_packed_cooperative(
+    fb: &Framebuffer, format: PixelFormat, output: (usize, usize),
+    source: PackedSource<'_>, cooperate: fn(),
+) -> usize {
     let PackedSource { width: source_w, height: source_h, pixels: source, row } = source;
     let (out_w, out_h) = output;
     let step = usize::from(format.bytes_per_pixel);
@@ -1004,12 +1096,16 @@ fn blit_packed(
     let origin = fb.va + by * fb.pitch + bx * step;
     if source_w == out_w && source_h == out_h && row_bytes == fb.pitch {
         // A dense mode-sized canvas is already the framebuffer's byte layout.
-        unsafe { copy_bytes(origin as *mut u8, source.as_ptr(), row_bytes * out_h, fb.wide); }
+        for (i, chunk) in source[..row_bytes * out_h].chunks(16384).enumerate() {
+            cooperate();
+            unsafe { copy_bytes((origin + i * 16384) as *mut u8, chunk.as_ptr(), chunk.len(), fb.wide); }
+        }
         return out_w * out_h;
     }
     let mut oy = 0usize;
     let mut yerr = 0usize;
     for sy in 0..source_h {
+        cooperate();
         let src = &source[sy * source_w * step..(sy + 1) * source_w * step];
         let src = if source_w == out_w {
             src
@@ -1046,6 +1142,14 @@ fn blit_regions(
     shadow: &[u8],
     regions: &[crate::kernel::gui::Rect],
 ) -> usize {
+    blit_regions_cooperative(fb, format, out_w, out_h, vga_height, shadow, regions, || {})
+}
+#[allow(clippy::too_many_arguments)]
+#[optimize(speed)]
+fn blit_regions_cooperative(
+    fb: &Framebuffer, format: PixelFormat, out_w: usize, out_h: usize,
+    vga_height: usize, shadow: &[u8], regions: &[crate::kernel::gui::Rect], cooperate: fn(),
+) -> usize {
     let step = format.bytes_per_pixel as usize;
     let row_bytes = out_w * step;
     if vga_height == 0 || shadow.len() < row_bytes * vga_height {
@@ -1059,6 +1163,7 @@ fn blit_regions(
     let mut oy = 0usize;
     let mut yerr = 0usize;
     for sy in 0..vga_height {
+        cooperate();
         yerr += yrem;
         let carry = (yerr >= vga_height) as usize;
         let rows = ybase + carry;
@@ -1571,7 +1676,11 @@ fn raster_shadow(
     if matches!(frame.mode, vga::VgaMode::Planar16 { .. } | vga::VgaMode::Text { .. }) {
         s.pal.sync_planar(frame.ac);
     }
+    // Guest execution remains joined while these live VRAM pages are read.
+    // Palette and destination storage are already resident.
+    unsafe { crate::kernel::media::graphics(|| {
     for sy in 0..h {
+        crate::kernel::media::checkpoint();
         vga::render_row_packed(
             frame,
             sy,
@@ -1580,6 +1689,7 @@ fn raster_shadow(
                 ..(sy + 1) * w * usize::from(format.bytes_per_pixel) + vga::PACKED_ROW_PADDING],
         );
     }
+    }); }
     true
 }
 

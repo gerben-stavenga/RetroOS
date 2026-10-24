@@ -76,6 +76,12 @@ pub unsafe fn init_core(core_id: u32) {
     paging2::enable_paging(&raw mut crate::SCRATCH, paging2::KERNEL_PHYS, pages);
     descriptors::setup_descriptor_tables(stack);
     descriptors::setup_syscall();
+    if core_id != 0 && paging2::is_pae() {
+        // Before READY: the BSP will harden shared PTEs and publish WC device
+        // mappings. Their interpretation must already match on every AP.
+        paging2::enable_nx();
+        paging2::enable_wc_pat();
+    }
 }
 
 /// Complete the AP branch of the common Rust entry. No shared allocator,

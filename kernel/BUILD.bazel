@@ -88,6 +88,17 @@ rust_library(
     }),
 )
 
+# One BSP producer and one worker; integration tests share that worker.
+rust_test(
+    name = "media_test",
+    srcs = ["tests/media.rs", "src/kernel/media.rs", "src/kernel/dos/machine/vvoodoo.rs"],
+    crate_root = "tests/media.rs",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
+    deps = ["//third_party/voodoo"],
+    args = ["--test-threads=1"],
+)
+
 # Host unit coverage for the Multiboot capsule and its pure parser/storage
 # tests. The metal-only boot entry remains cfg-gated out of this test.
 rust_test(

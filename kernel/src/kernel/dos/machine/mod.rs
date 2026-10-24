@@ -1143,7 +1143,7 @@ impl PcmSource<'_> {
             Self::Midi(mpu) => mpu.mix_into(machine, rate, base, block),
             Self::Speaker(spk) => {
                 let g = vsb::SPEAKER_SCALE_Q16;
-                spk.mix_into(rate, (g, g), block)
+                unsafe { crate::kernel::media::audio(|| spk.mix_into(rate, (g, g), block)); }
             }
         }
     }

@@ -3,6 +3,35 @@
 GRUB supplies the kernel and two ordinary configuration files: `BOOT.INI`
 for bundle backing and mounts, and `RETROOS.INI` for user settings.
 
+## CPU use
+
+On a machine with at least two initialized CPUs, core 0 runs guests, device
+commands and allocation. Core 1 runs audio mixing, VGA decoding, composition,
+Voodoo rasterization and linear framebuffer presentation. Other CPUs remain
+parked. The boot log reports `core 1: Media worker: audio and graphics ready`.
+Single-core machines and hosted execution use the same operations inline.
+
+The media worker polls two bounded mailboxes. Audio takes priority; Voodoo
+triangle/fill and framebuffer-copy batches check for audio between rows or
+small copy chunks. Jobs use resident kernel buffers and do not allocate,
+free pages, read guest mappings or invoke BIOS calls. Every handoff refreshes
+the worker's kernel root and TLB before accessing the buffers.
+
+Voodoo draw commands and framebuffer presentation can overlap guest execution.
+Reads, subsequent card mutations, buffer swaps and display-mode changes fence
+outstanding work. Presentation uses a retained snapshot so the producer can
+reuse its source. VGA decoding, composition and audio mixing borrow live state
+and join before that state is reused; guest DMA reads and IRQ updates stay on
+core 0. Banked BIOS presentation also remains on core 0. This is a dedicated
+polling worker, not a general multicore guest scheduler.
+
+To exercise the dual-core paths:
+
+```sh
+python3 test/display_scaling.py --cpus 2 --kvm
+python3 test/audio_steady.py --cpus 2 --kvm 10
+```
+
 ## Machine installation (ext4 or FAT)
 
 ```sh

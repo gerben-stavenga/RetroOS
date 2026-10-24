@@ -661,13 +661,24 @@ impl EmulatedSb {
         let step = sound::sb::Step::Mix {
             rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
         };
-        let request = self.core.advance(step, None).dma;
-        if let Some(sound::dma::Request::Read { offset, bytes, wrap_bytes }) = request {
+        // Only the passive card runs on the worker; DMA copies still use the
+        // current guest address space on the BSP.
+        let core = &mut self.core;
+        let request = unsafe { crate::kernel::media::audio(|| {
+            match core.advance(step, None).dma {
+                Some(sound::dma::Request::Read { offset, bytes, wrap_bytes }) => Some((offset, bytes, wrap_bytes)),
+                _ => None,
+            }
+        }) };
+        if let Some((offset, bytes, wrap_bytes)) = request {
             let Some(scratch) = self.dsp_scratch.get_mut(..bytes) else {
                 debug_assert!(false, "SB DMA request exceeds fixed mixer block");
-                self.core.advance(sound::sb::Step::Mix {
-                    rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
-                }, Some(sound::dma::Completion::Read { bytes: &[], terminal_count: false }));
+                let core = &mut self.core;
+                unsafe { crate::kernel::media::audio(|| {
+                    core.advance(sound::sb::Step::Mix {
+                        rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
+                    }, Some(sound::dma::Completion::Read { bytes: &[], terminal_count: false }));
+                }); }
                 return;
             };
             let ring = wrap_bytes.expect("SB source is cyclic");
@@ -678,9 +689,12 @@ impl EmulatedSb {
                 machine.copy_from(self.dma_base as usize + pos, &mut scratch[copied..copied + run]);
                 copied += run;
             }
-            self.core.advance(sound::sb::Step::Mix {
-                rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
-            }, Some(sound::dma::Completion::Read { bytes: scratch, terminal_count: false }));
+            let core = &mut self.core;
+            unsafe { crate::kernel::media::audio(|| {
+                core.advance(sound::sb::Step::Mix {
+                    rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
+                }, Some(sound::dma::Completion::Read { bytes: scratch, terminal_count: false }));
+            }); }
         }
         if self.core.playing() {
             self.mix_pos_q32 = self.mix_pos_q32

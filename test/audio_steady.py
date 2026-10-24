@@ -42,6 +42,7 @@ def dump(log, why):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kvm", action="store_true")
+    parser.add_argument("--cpus", type=int, default=1)
     parser.add_argument("seconds", nargs="?", type=int, default=60)
     args = parser.parse_args()
     if args.seconds < 10:
@@ -57,6 +58,7 @@ def main():
            "--sound", "hda", "--cmd", "GAMES/DOOMS/DOOM.EXE"]
     if args.kvm:
         cmd.append("--kvm")
+    cmd.extend(["--", "-smp", str(args.cpus)])
     with log.open("wb") as output:
         proc = subprocess.Popen(cmd, stdout=output, stderr=subprocess.STDOUT,
                                 env=env, start_new_session=True)
@@ -66,6 +68,8 @@ def main():
                 if proc.poll() is not None or time.monotonic() > deadline:
                     dump(log, f"HDA did not start (qemu rc={proc.poll()})")
                 time.sleep(0.1)
+            if args.cpus > 1 and "core 1: Media worker: audio and graphics ready" not in log.read_text(errors="replace"):
+                dump(log, "media worker did not start")
             # Wait for the game to be RUNNING, not for a fixed delay: DOOM's
             # own startup banner is the only host-speed-independent signal.
             # A slow TCG runner spent the whole fixed settle+window still in

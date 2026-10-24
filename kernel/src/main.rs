@@ -37,7 +37,15 @@ fn host_console_byte(b: u8) {
     let _ = out.flush();
 }
 
+std::thread_local! {
+    static LOG_LINE: std::cell::UnsafeCell<lib::log::LineBuffer> = const {
+        std::cell::UnsafeCell::new(lib::log::LineBuffer::new())
+    };
+}
+fn log_line() -> *mut lib::log::LineBuffer { LOG_LINE.with(|line| line.get()) }
+
 fn main() {
+    unsafe { lib::log::set_line_context(log_line); }
 
     let mut boot_disk: Option<String> = None;
     let mut cmd: Option<String> = None;

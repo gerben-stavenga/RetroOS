@@ -30,8 +30,6 @@ struct Geom {
     slow: bool,
     /// Bare metal (no hypervisor): wide NT stores for device-row copies.
     wide: bool,
-    /// The mapping is Write-Combining, so a finished frame has to be drained.
-    wc: bool,
 }
 static mut GEOM: Option<Geom> = None;
 
@@ -39,9 +37,9 @@ static mut GEOM: Option<Geom> = None;
 const TEXT_W: usize = 640;
 const TEXT_H: usize = 400;
 
-fn geom() -> &'static mut Option<Geom> {
-    let p = &raw mut GEOM;
-    unsafe { &mut *p }
+fn geom() -> &'static Option<Geom> {
+    // Published once during BSP boot, before the media worker is released.
+    unsafe { &*core::ptr::addr_of!(GEOM) }
 }
 
 /// Whether the framebuffer console owns the display (a linear framebuffer
@@ -72,30 +70,17 @@ pub fn framebuffer() -> Option<crate::kernel::display::Display> {
     ))
 }
 
-/// End of frame. The framebuffer is Write-Combining: stores sit in the CPU's WC
-/// buffers until something drains them, and a display controller scanning out —
-/// or QEMU's refresh — reads memory, so an undrained buffer leaves the frame
-/// invisible until the next one happens to evict it.
-///
-/// Only a WC mapping needs this. `framebuffer_map_policy` asks for WC solely
-/// where PAT offers it and the backend is not QEMU-TCG; everything else is
-/// mapped strong-UC, whose stores reach memory as they are issued, with nothing
-/// buffered to drain. A Pentium has no PAT, so the machines most likely to
-/// choke on the drain are exactly the ones that never needed it.
-///
-/// SFENCE is then always available: WC here means PAT (CPUID.01H:EDX[16]),
-/// which arrives with the Pentium III alongside SSE, and on AMD with the K7,
-/// which implements SFENCE among its MMX extensions. Running it unconditionally
-/// was the bug — Bochs' default `pentium` model has no PAT, so its VBE linear
-/// framebuffer is strong-UC, and F12's composite took #UD for a drain that had
-/// nothing to drain. (SSE2's MOVNTDQ in `retroos_fb_copy32_wide` is a different
-/// matter: SSE2 really does postdate PAT, so that path keeps its own gate.)
+/// Drain posted framebuffer stores before releasing display ownership. This
+/// covers loader-provided GOP and BIOS-created VBE mappings on every CPU.
+/// The target's full fence avoids assuming SFENCE exists on older machines.
 pub fn present() {
-    let Some(g) = geom() else { return };
-    if !g.wc {
+    // A BIOS-created VBE sink also needs a drain even when no boot GOP
+    // geometry exists. Use a full fence supported by the compilation target;
+    // this also works on older CPUs without the SFENCE instruction.
+    if !paging2::wc_pat_enabled() {
         return;
     }
-    unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Best-effort panic publication.  Reconstructing this immutable view does
@@ -251,7 +236,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
     }
 
     lib::compact_screenln!(screen, "fbcon: format accepted, native_blit={}", format.is_native());
-    *geom() = Some(Geom {
+    unsafe { core::ptr::addr_of_mut!(GEOM).write(Some(Geom {
         va: paging2::FB_WINDOW_BASE + page_off,
         pitch,
         width,
@@ -259,8 +244,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
         format,
         slow: policy.slow,
         wide: policy.wide,
-        wc: policy.flags & paging2::flags::WRITE_COMBINE != 0,
-    });
+    })); }
 
     // Wipe the boot splash (the pre-paging life-sign strip boot_kernel
     // paints) now that the console owns the pixels.

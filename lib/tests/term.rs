@@ -121,6 +121,8 @@ fn terminal_output_does_not_enter_the_debug_log_stream() {
     assert_eq!(DEBUG.load(Ordering::Relaxed), 0);
     assert_eq!(CONSOLE.load(Ordering::Relaxed), redraw.len());
     lib::log::debug_byte(b'K');
-    assert_eq!(DEBUG.load(Ordering::Relaxed), 1);
+    assert_eq!(DEBUG.load(Ordering::Relaxed), 0);
+    lib::log::debug_byte(b'\n');
+    assert_eq!(DEBUG.load(Ordering::Relaxed), 2);
     assert_eq!(CONSOLE.load(Ordering::Relaxed), redraw.len());
 }

@@ -153,6 +153,7 @@ const OFFSET_BASE: u32 = 0xc0_0000 / 4;
 const LFB_BASE: u32 = 0x80_0000 / 4;
 
 pub struct Voodoo {
+    cooperate: fn(),
     pub kind: Kind,
     /// Raw register file, indexed by dword register number.
     pub reg: [u32; 0x400],
@@ -197,6 +198,7 @@ impl Voodoo {
         debug_assert!(fb_bytes.is_power_of_two());
         let p = dst.as_mut_ptr();
         unsafe {
+            core::ptr::addr_of_mut!((*p).cooperate).write(|| {});
             core::ptr::addr_of_mut!((*p).kind).write(kind);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).reg), 0, 1);
             core::ptr::addr_of_mut!((*p).fbi).write(Fbi::new(fb_bytes));
@@ -230,6 +232,7 @@ impl Voodoo {
     pub fn new(kind: Kind, fb_bytes: usize, tex_bytes: usize) -> Self {
         debug_assert!(fb_bytes.is_power_of_two());
         Self {
+            cooperate: || {},
             kind,
             reg: [0; 0x400],
             fbi: Fbi::new(fb_bytes),
@@ -253,6 +256,20 @@ impl Voodoo {
             fog: FogTable::default(),
             clut: Clut::new(),
         }
+    }
+
+    /// Host scheduling checkpoint between raster rows. The callback must not
+    /// access this card or any of its borrowed memory.
+    pub fn set_checkpoint(&mut self, cooperate: fn()) { self.cooperate = cooperate; }
+
+    /// Commands whose execution may rasterize a large rectangle or triangle.
+    pub fn renders(&self, addr: u32) -> bool {
+        let offset = (addr >> 2) & OFFSET_MASK;
+        if offset & OFFSET_BASE != 0 { return false; }
+        let reg = if (offset & 0x800c0) == 0x80000 && self.alt_regmap {
+            REGISTER_ALIAS_MAP[(offset & 0x3f) as usize] as usize
+        } else { (offset & 0xff) as usize };
+        matches!(reg, triangleCMD | ftriangleCMD | fastfillCMD)
     }
 
     /// PCI config-space `initEnable` (offset 0x40): it gates the fbiInit
@@ -457,7 +474,7 @@ impl Voodoo {
                 }
             }
 
-            fastfillCMD => self.fbi.fastfill(&self.reg, fb),
+            fastfillCMD => self.fbi.fastfill_with_checkpoint(&self.reg, fb, self.cooperate),
 
             swapbufferCMD => {
                 // Bit 0 asks for the swap to wait for vertical retrace; bits
@@ -821,7 +838,7 @@ impl Voodoo {
             // 0xf0 on a Voodoo 1, 0xff on a Voodoo 2.
             bilinear_mask: 0xf0,
         };
-        let stats = raster::draw_triangle(&poly, verts, &mut scene);
+        let stats = raster::draw_triangle_with_checkpoint(&poly, verts, &mut scene, self.cooperate);
 
         self.reg[fbiPixelsIn] = self.reg[fbiPixelsIn].wrapping_add(stats.pixels_in);
         self.reg[fbiPixelsOut] = self.reg[fbiPixelsOut].wrapping_add(stats.pixels_out);

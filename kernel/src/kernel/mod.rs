@@ -58,6 +58,7 @@ pub mod portio;
 pub mod midi_bank;
 pub mod term;
 pub mod sound;
+pub(crate) mod media;
 pub mod vfs;
 // pipe.rs moved to crate root (shared between arch and kernel)
 

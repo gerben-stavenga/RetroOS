@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Select DOS scaling through the real OSD and inspect UEFI framebuffer pixels."""
+import argparse
 import json
 from pathlib import Path
 import shutil
@@ -39,6 +40,10 @@ def run(*args):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--cpus', type=int, default=1)
+    parser.add_argument('--kvm', action='store_true')
+    options = parser.parse_args()
     run('bazelisk', 'build', '//:boot_disk')
     work = Path(tempfile.mkdtemp(prefix='retroos-display-scaling-'))
     print('Artifacts:', work, flush=True)
@@ -61,12 +66,14 @@ def main():
     run('mcopy', '-o', '-i', f'{boot}@@1048576', work / 'BOOTX64.EFI', '::EFI/BOOT/BOOTX64.EFI')
     shutil.copyfile('/usr/share/OVMF/OVMF_VARS_4M.fd', work / 'vars.fd')
     qmp, log = work / 'qmp', work / 'klog'
-    args = ['qemu-system-x86_64', '-m', '256', '-display', 'none', '-serial', 'none',
+    args = ['qemu-system-x86_64', '-smp', str(options.cpus), '-m', '256', '-display', 'none', '-serial', 'none',
             '-drive', 'if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd',
             '-drive', f'if=pflash,format=raw,file={work / "vars.fd"}',
             '-drive', f'file={boot},format=raw,snapshot=on',
             '-drive', f'file={data},format=raw,snapshot=on',
             '-debugcon', f'file:{log}', '-qmp', f'unix:{qmp},server=on,wait=off', '-no-reboot']
+    if options.kvm:
+        args.extend(['-accel', 'kvm', '-cpu', 'host'])
     with (work / 'stderr').open('w') as errors:
         process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=errors)
         try:
@@ -75,6 +82,8 @@ def main():
                 text = log.read_text(errors='replace') if log.exists() else ''
                 assert not any(marker in text for marker in ('PANIC', 'FATAL')), text
                 if 'DISPLAY SCALING READY' in text:
+                    if options.cpus > 1:
+                        assert 'core 1: Media worker: audio and graphics ready' in text, text
                     break
                 assert process.poll() is None, (text, (work / 'stderr').read_text())
                 time.sleep(.1)

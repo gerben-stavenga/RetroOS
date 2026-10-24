@@ -1,15 +1,32 @@
-//! BSP-only boot policy. APs initialize their private arch state and halt;
-//! they never enter shared devices, the heap, or the scheduler yet.
+//! BSP boot policy. Core 1 waits for the resident-buffer media worker;
+//! remaining APs park. Allocation and guest execution stay on the BSP.
 use arch::{MultibootMmapEntry, boot_mem::BootMemory, smp, x86};
 use core::alloc::Layout;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const MAX_CPUS: usize = 64;
 static READY: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 static TICKS_PER_US: AtomicU32 = AtomicU32::new(0);
+static MEDIA_START: AtomicBool = AtomicBool::new(false);
+static MEDIA_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn park(_id: u32, _argument: usize) -> ! {
-    arch::halt_forever()
+extern "C" fn park(id: u32, _argument: usize) -> ! {
+    if id != 1 { arch::halt_forever(); }
+    while !MEDIA_START.load(Ordering::Acquire) { core::hint::spin_loop(); }
+    fn refresh() {
+        arch::paging2::refresh_kernel_mappings();
+        // Leaf mappings may have been released/reused without changing a root.
+        arch::paging2::flush_tlb();
+    }
+    refresh();
+    lib::compact_println!("Media worker: audio and graphics ready");
+    unsafe { crate::kernel::media::worker(refresh) }
+}
+
+pub(super) fn enable_media() {
+    if !MEDIA_AVAILABLE.load(Ordering::Acquire) { return; }
+    MEDIA_START.store(true, Ordering::Release);
+    while !crate::kernel::media::enabled() { core::hint::spin_loop(); }
 }
 
 // No shared clock or interrupts yet. Prefer the architectural TSC ratio;
@@ -103,6 +120,7 @@ fn trampoline(
 }
 
 pub(super) unsafe fn start(
+    screen: &mut lib::term::Term,
     rsdp: &[u8],
     map: &[MultibootMmapEntry],
     modules: &[Option<crate::multiboot::AcceptedModule>; arch_abi::MAX_BOOT_MODULES],
@@ -116,15 +134,18 @@ pub(super) unsafe fn start(
     let mut starts = [None; MAX_CPUS];
     let mut selected = 0;
     let can_start = if count.is_none() {
-        lib::compact_println!("SMP: no usable MADT containing the BSP; keeping one CPU");
+        lib::compact_screenln!(
+            screen,
+            "SMP: no usable MADT containing the BSP; keeping one CPU"
+        );
         false
     } else if count == Some(1) {
         false
     } else if page.is_none() {
-        lib::compact_println!("SMP: no safe trampoline page; keeping one CPU");
+        lib::compact_screenln!(screen, "SMP: no safe trampoline page; keeping one CPU");
         false
     } else if !calibrate() {
-        lib::compact_println!("SMP: no reliable startup delay; keeping one CPU");
+        lib::compact_screenln!(screen, "SMP: no reliable startup delay; keeping one CPU");
         false
     } else {
         true
@@ -168,7 +189,9 @@ pub(super) unsafe fn start(
         match unsafe { smp::start_core(id, page.unwrap(), start, delay) } {
             Ok(()) => {
                 online += 1;
-                lib::compact_println!(
+                if start.core_id == 1 { MEDIA_AVAILABLE.store(true, Ordering::Release); }
+                lib::compact_screenln!(
+                    screen,
                     "SMP: core {} APIC {} initialized, parking",
                     start.core_id,
                     id
@@ -183,7 +206,8 @@ pub(super) unsafe fn start(
                     smp::StartError::DeliveryTimeout => "delivery timeout",
                     smp::StartError::StartupTimeout => "startup timeout",
                 };
-                lib::compact_println!(
+                lib::compact_screenln!(
+                    screen,
                     "SMP: APIC {} startup failed: {}; stopping AP startup",
                     id,
                     reason
@@ -193,7 +217,8 @@ pub(super) unsafe fn start(
             }
         }
     }
-    lib::compact_println!(
+    lib::compact_screenln!(
+        screen,
         "SMP: {} CPUs initialized, {} firmware CPUs, {} APs selected",
         online,
         count.unwrap_or(1),

@@ -30,8 +30,17 @@ static ALLOCATOR: lib::heap::DemandHeap = lib::heap::DemandHeap::new();
 static mut BOOT_CONFIG: core::mem::MaybeUninit<crate::BootConfig> =
     core::mem::MaybeUninit::uninit();
 
-/// Metal log sink: preserve the emulator debug port and mirror to the optional
-/// physical serial logger. The kernel only hands bytes to this platform sink.
+// Kernel-owned pending line; arch only supplies the CPU-local TLS mechanism.
+#[thread_local]
+static mut LOG_LINE: lib::log::LineBuffer = lib::log::LineBuffer::new();
+
+fn init_log_context() {
+    fn line() -> *mut lib::log::LineBuffer { &raw mut LOG_LINE }
+    unsafe { lib::log::set_line_context(line); }
+    lib::log::set_core_id_source(arch::smp::current_core_id);
+}
+
+/// Mirror a serialized log line to the emulator debug port and optional UART.
 fn log_byte(b: u8) {
     // Preserve the emulator debug console sink; harmless on real hardware.
     x86::outb(0xE9, b);
@@ -286,11 +295,11 @@ unsafe fn prepare_boot(
     // the bootloader already put on screen survives the move.
     lib::term::term().set_aperture(Some(LOW_MEM_BASE + 0xB8000));
 
-    // Early diagnostics go straight to the platform sink. The retained log
-    // ring is allocated below, once the heap and physical allocator are ready.
+    // Retain early messages, then grow the ring after heap initialization.
+    init_log_context();
+    crate::kernel::klog::init_early();
     lib::log::set_debug_sink(log_byte);
     lib::log::set_fatal_handler(fatal_finish);
-    unsafe { smp::start(&acpi_rsdp[..acpi_rsdp_len], &mmap_buf[..mmap_count], &boot_modules_raw); }
     let (_, _, _, cpu_features) = x86::cpuid(1);
     if cpu_features & (1 << 1) != 0 {
         lib::compact_println!("VME enabled");
@@ -336,6 +345,8 @@ unsafe fn prepare_boot(
     // to the terminal directly. Once `startup` builds a `Console`, on-screen
     // kernel text needs that value; ambient println! stays log-only throughout.
     let screen = lib::term::term();
+
+    unsafe { smp::start(screen, &acpi_rsdp[..acpi_rsdp_len], &mmap_buf[..mmap_count], &boot_modules_raw); }
 
     lib::compact_screenln!(screen, "\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
@@ -462,6 +473,7 @@ unsafe fn prepare_boot(
     // freeze-at-first-IRQ on real hardware is readable instead of a black hang.
     irq::timer_selftest(screen);
 
+    smp::enable_media();
     descriptors::enter_ring1();
     irq::timer_delivery_selftest(screen);
 

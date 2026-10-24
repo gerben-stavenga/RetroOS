@@ -161,7 +161,9 @@ impl Mpu {
     ) {
         let g = super::vsb::GM_SCALE_Q16;
         if let Some(s) = self.synth.as_mut() {
-            s.mix_into(rate, base, (g, g), block);
+            // The synth and boot ROM bank are resident; mixing only updates
+            // fixed voices and consumes queued MIDI bytes.
+            unsafe { crate::kernel::media::audio(|| s.mix_into(rate, base, (g, g), block)); }
         }
     }
 }

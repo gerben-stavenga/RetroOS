@@ -270,6 +270,11 @@ pub struct Scene<'a> {
 /// Rasterize one triangle. `verts` are the three vertices in 12.4 fixed point
 /// (the `vertexA/B/C` registers).
 pub fn draw_triangle(poly: &Poly, verts: [(i32, i32); 3], scene: &mut Scene<'_>) -> Stats {
+    draw_triangle_with_checkpoint(poly, verts, scene, || {})
+}
+
+/// As `draw_triangle`, yielding to the host between scanlines.
+pub fn draw_triangle_with_checkpoint(poly: &Poly, verts: [(i32, i32); 3], scene: &mut Scene<'_>, cooperate: fn()) -> Stats {
     let mut stats = Stats::default();
 
     // Sort by Y; the edge walk needs top, middle, bottom. Coordinates stay in
@@ -307,6 +312,7 @@ pub fn draw_triangle(poly: &Poly, verts: [(i32, i32); 3], scene: &mut Scene<'_>)
 
     // Walk the pixel centres: y + 0.5 is `(y << 4) + 8` in 12.4.
     for y in starty..stopy {
+        cooperate();
         let fully = ((y as i64) << 4) + 8;
         let along = |from: (i32, i32), dxdy: i64| -> i32 {
             (from.0 as i64 + (((fully - (from.1 as i64)) * dxdy) >> 16)) as i32

@@ -42,9 +42,7 @@ impl KLog {
     }
 
     fn byte_at(&self, start: usize, offset: usize) -> u8 {
-        unsafe {
-            *((self.bytes + (start + offset) % self.capacity) as *const u8)
-        }
+        unsafe { *((self.bytes + (start + offset) % self.capacity) as *const u8) }
     }
 
     fn set_byte(&mut self, offset: usize, byte: u8) {
@@ -102,38 +100,72 @@ impl KLog {
 }
 
 static mut LOG: KLog = KLog::new();
+static LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+struct Guard;
+impl Guard {
+    fn lock() -> Self {
+        use core::sync::atomic::Ordering;
+        while LOCK
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self
+    }
+}
+impl Drop for Guard {
+    fn drop(&mut self) {
+        LOCK.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
 
-/// Attach caller-owned lifetime-long storage and reset the log. Keeping the
-/// backing allocation in the kernel avoids charging small `lib` users such as the
-/// BIOS bootloader for a log they never expose.
+/// Attach lifetime-long storage, preserving the early log when growing it.
+/// Callers allocate before entering this function; no allocation occurs locked.
 pub fn init(storage: &'static mut [u8]) {
+    let _guard = Guard::lock();
     unsafe {
         let log = &mut *core::ptr::addr_of_mut!(LOG);
-        *log = KLog::new();
+        while log.len > storage.len() {
+            log.drop_oldest_line();
+        }
+        for (i, byte) in storage[..log.len].iter_mut().enumerate() {
+            *byte = log.byte_at(log.head, i);
+        }
         log.bytes = storage.as_mut_ptr() as usize;
         log.capacity = storage.len();
+        log.head = 0;
+        log.dumping = false;
     }
 }
 
 /// Append one byte from the common debug stream. During a line-oriented dump,
 /// appends pause so the dump's own console echo cannot grow the snapshot.
 pub fn push_byte(b: u8) {
+    push_bytes(core::slice::from_ref(&b));
+}
+
+/// Append one complete record atomically with respect to readers and writers.
+pub fn push_bytes(bytes: &[u8]) {
+    let _guard = Guard::lock();
     unsafe {
         let log = &mut *core::ptr::addr_of_mut!(LOG);
         if log.capacity == 0 || log.dumping {
             return;
         }
-        match b {
-            b'\r' => {}
-            b'\n' => {
-                log.append(b);
-                log.cur_len = 0;
+        for &b in bytes {
+            match b {
+                b'\r' => {}
+                b'\n' => {
+                    log.append(b);
+                    log.cur_len = 0;
+                }
+                _ if log.cur_len < MAX_LINE_LEN => {
+                    log.append(b);
+                    log.cur_len += 1;
+                }
+                _ => {}
             }
-            _ if log.cur_len < MAX_LINE_LEN => {
-                log.append(b);
-                log.cur_len += 1;
-            }
-            _ => {}
         }
     }
 }
@@ -141,6 +173,7 @@ pub fn push_byte(b: u8) {
 /// Copy completed line `idx` (zero is oldest) into `out`. Calls made in order
 /// scan the snapshot once; an out-of-order index restarts from its beginning.
 pub fn line(idx: usize, out: &mut [u8]) -> Option<usize> {
+    let _guard = Guard::lock();
     unsafe {
         let log = &mut *core::ptr::addr_of_mut!(LOG);
         if log.capacity == 0 {
@@ -173,12 +206,14 @@ pub fn line(idx: usize, out: &mut [u8]) -> Option<usize> {
 
 /// Current number of retained bytes, including an unterminated final line.
 pub fn byte_len() -> u32 {
+    let _guard = Guard::lock();
     unsafe { (*core::ptr::addr_of!(LOG)).len as u32 }
 }
 
 /// Monotonic position of the next byte in the stream. Unlike `byte_len`, this
 /// continues advancing when old ring lines are evicted.
 pub fn total_bytes() -> usize {
+    let _guard = Guard::lock();
     unsafe { (*core::ptr::addr_of!(LOG)).total }
 }
 
@@ -186,6 +221,7 @@ pub fn total_bytes() -> usize {
 /// already evicted that position, return its oldest retained position instead.
 /// The caller can then append the returned bytes to a durable log file.
 pub fn read_since(offset: usize, out: &mut [u8]) -> (usize, usize) {
+    let _guard = Guard::lock();
     unsafe {
         let log = &*core::ptr::addr_of!(LOG);
         if log.capacity == 0 {
@@ -203,6 +239,7 @@ pub fn read_since(offset: usize, out: &mut [u8]) -> (usize, usize) {
 
 /// Read the ring as a flat byte stream at `offset`.
 pub fn read(offset: u32, out: &mut [u8]) -> usize {
+    let _guard = Guard::lock();
     unsafe {
         let log = &*core::ptr::addr_of!(LOG);
         if log.capacity == 0 {

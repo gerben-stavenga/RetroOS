@@ -26,6 +26,7 @@ def main():
     accel, cpu = ('kvm', 'host') if options.kvm else ('tcg', 'max')
     cases = [
         ('single', ('-smp', '1'), 1),
+        ('dual', ('-smp', '2'), 2),
         ('four', ('-smp', '4'), 4),
         ('capacity', ('-smp', '8'), 7),
         ('sparse', ('-smp', '4,sockets=2,cores=3,threads=1,maxcpus=6'), 4),

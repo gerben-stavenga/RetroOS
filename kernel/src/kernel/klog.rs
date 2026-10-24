@@ -24,6 +24,15 @@ pub struct KLogFs;
 
 pub static KLOG_FS: KLogFs = KLogFs;
 
+/// Small boot ring before the ordinary allocator exists. Promoted by init().
+pub fn init_early() {
+    static mut EARLY: [u8; 8192] = [0; 8192];
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::AcqRel) { return; }
+    // One BSP boot call, before any other logger can use this storage.
+    unsafe { klog::init(&mut *core::ptr::addr_of_mut!(EARLY)); }
+}
+
 /// Allocate the log ring once the heap is ready. Its backing storage lives
 /// for the kernel's lifetime; recording individual bytes never allocates.
 pub fn init() {
@@ -39,9 +48,9 @@ pub fn save_boot_snapshot<A: crate::Arch>(machine: &mut A) -> Result<(), i32> {
 
     // Copy before filesystem I/O, which can itself append diagnostics. Start
     // the later live writer at this point so no subsequent byte is skipped.
-    let captured_through = klog::total_bytes();
     let mut bytes = alloc::vec![0; klog::byte_len() as usize];
-    let len = klog::read(0, &mut bytes);
+    let (start, len) = klog::read_since(0, &mut bytes);
+    let captured_through = start + len;
     bytes.truncate(len);
     let (index, path) = next_backing_path().ok_or(-28)?;
     let mut fds = [FdKind::None; MAX_FDS];

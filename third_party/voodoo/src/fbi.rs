@@ -171,6 +171,10 @@ impl Fbi {
     /// `fastfill` — fill the clip rectangle with `color1` (dithered, as the
     /// hardware does) and/or the aux buffer with `zaColor`.
     pub fn fastfill(&self, reg: &[u32], fb: &mut [u8]) {
+        self.fastfill_with_checkpoint(reg, fb, || {});
+    }
+
+    pub fn fastfill_with_checkpoint(&self, reg: &[u32], fb: &mut [u8], cooperate: fn()) {
         let fbz = reg[fbzMode];
         if !fbzmode_rgb_buffer_mask(fbz) && !fbzmode_aux_buffer_mask(fbz) {
             return;
@@ -188,6 +192,7 @@ impl Fbi {
                 // which is why the hardware builds a 4x4 pattern up front.
                 let c = Rgba::from_argb(reg[color1]);
                 for y in sy..ey {
+                    cooperate();
                     let dither = Dither::new(y as i32, fbz);
                     let row = y * self.rowpixels as usize;
                     for x in sx..ex {
@@ -203,7 +208,7 @@ impl Fbi {
         if fbzmode_aux_buffer_mask(fbz) && self.auxoffs != NO_BUFFER {
             let max = (self.mask + 1 - self.auxoffs) / 2;
             let depth = (reg[zaColor] & 0xffff) as u16;
-            self.fill_rect(fb, self.auxoffs, max, sx, ex, sy, ey, depth);
+            self.fill_rect(fb, self.auxoffs, max, sx, ex, sy, ey, depth, cooperate);
         }
     }
 
@@ -218,8 +223,10 @@ impl Fbi {
         sy: usize,
         ey: usize,
         pixel: u16,
+        cooperate: fn(),
     ) {
         for y in sy..ey {
+            cooperate();
             let row = y * self.rowpixels as usize;
             for x in sx..ex {
                 let off = row + x;
