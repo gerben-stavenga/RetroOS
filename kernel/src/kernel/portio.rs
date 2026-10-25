@@ -90,3 +90,34 @@ pub fn outsw(port: u16, buf: &[u16]) {
 /// Elapsed-time clock for hardware command deadlines (not guest CPU time).
 #[inline]
 pub fn now_ns() -> u64 { (hooks().now_ns)() }
+
+/// Sparse wall-clock diagnostics for operations which can block interaction.
+/// No allocation or per-poll output; nested scopes report the innermost slow
+/// operation first. Rate limiting also prevents live log flushes feeding back
+/// into a stream of stall reports.
+pub(crate) struct StallWatch {
+    operation: &'static str,
+    start: u64,
+}
+#[thread_local]
+static mut LAST_STALL_REPORT: Option<u64> = None;
+impl StallWatch {
+    pub(crate) fn new(operation: &'static str) -> Self {
+        Self { operation, start: now_ns() }
+    }
+}
+impl Drop for StallWatch {
+    fn drop(&mut self) {
+        let now = now_ns();
+        let elapsed = now.saturating_sub(self.start);
+        if elapsed < 50_000_000 { return; }
+        unsafe {
+            if LAST_STALL_REPORT.is_some_and(|last| now.saturating_sub(last) < 1_000_000_000) {
+                return;
+            }
+            LAST_STALL_REPORT = Some(now);
+        }
+        crate::compact_println!("[stall] {} took {} ms at {} ms",
+            self.operation, elapsed / 1_000_000, now / 1_000_000);
+    }
+}

@@ -660,6 +660,7 @@ impl Engine {
         mut mix: impl FnMut(&mut super::dos::AudioDevices, u64, AudioSpan<'_>)) {
         let elapsed = now.saturating_sub(self.last_ns);
         if elapsed == 0 { return; }
+        let _stall = super::portio::StallWatch::new("audio service");
         // Don't stall the media core behind a guest DMA copy or port access.
         let mut source = match self.source.as_ref() {
             Some(source) => match source.try_lock() { Some(source) => Some(source), None => return },

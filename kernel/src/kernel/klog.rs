@@ -163,6 +163,7 @@ pub fn sync_live() {
     if next >= end && !LIVE_DIRTY.load(Ordering::Acquire) {
         return;
     }
+    let _stall = crate::kernel::portio::StallWatch::new("klog disk flush");
     let mut chunk = [0u8; 1024];
     while next < end {
         let (start, available) = klog::read_since(next, &mut chunk);

@@ -50,6 +50,7 @@ pub(crate) fn install_wifi(device: alloc::boxed::Box<dyn EthernetDevice>) {
     }
 }
 pub fn poll() {
+    let _stall = crate::kernel::portio::StallWatch::new("network poll");
     crate::kernel::wifi::poll();
     stack::poll();
     lan::poll();

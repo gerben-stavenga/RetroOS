@@ -99,6 +99,7 @@ impl Video {
     }
     fn render(&mut self) {
         if self.owner.is_some() && self.scene.is_none() { return; }
+        let _stall = crate::kernel::portio::StallWatch::new("video render/present");
         if let Some(voodoo) = &self.voodoo {
             let w = self.scanout.geo.0;
             let h = self.scanout.geo.1;

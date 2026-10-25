@@ -1493,8 +1493,10 @@ fn event_loop<A: crate::Arch>(
         // Guest aliases can also be written by arbitrary kernel services.
         // Serialize the whole guest slice with the renderer's brief VRAM
         // sample. Decoding, composition and presentation never hold this gate.
+        let handoff_stall = crate::kernel::portio::StallWatch::new("guest/media handoff");
         crate::kernel::media::GUEST_MEMORY.yield_to_reader();
         let _live_access = crate::kernel::dos::live_access();
+        drop(handoff_stall);
         crate::kernel::linux::reap_waited_child(machine, threads, ctx.tid);
         crate::kernel::linux::refresh_system_tasks(threads);
         if display.is_none() {
@@ -1691,6 +1693,7 @@ fn event_loop<A: crate::Arch>(
         if osd_composite_due
             && let Some(display) = display.as_mut()
         {
+            let _stall = crate::kernel::portio::StallWatch::new("OSD/desktop publication");
             let sound = cached_sound;
             present_desktop(
                 machine,
@@ -1704,6 +1707,7 @@ fn event_loop<A: crate::Arch>(
         stats.mark(machine, PROFILE_DISPLAY);
         {
             if !events.is_empty() {
+                let _stall = crate::kernel::portio::StallWatch::new("input dispatch");
                 let sound = cached_sound;
                 let thread = ctx.thread(threads);
                 crate::kernel::console::dispatch(
