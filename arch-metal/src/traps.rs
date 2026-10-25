@@ -127,6 +127,7 @@ pub mod arch_call {
     pub const REMAP_PHYSICAL_APERTURE: u64 = 0x121; // EDX/ECX=physical base low/high
     pub const RELEASE_HEAP: u64 = 0x122; // EDX=heap address, ECX=byte length
     pub const MAP_SHARED_PAGES: u64 = 0x123; // EDX=guest vpage, ECX=kernel address, EBX=count
+    pub const REPLACE_INTERRUPT_HANDLERS: u64 = 0x124; // EDX=in/out handler pair, ECX=vector
 }
 
 #[thread_local]
@@ -353,6 +354,12 @@ fn arch_dispatch(regs: &mut Regs) {
                 }
             }
         }
+        arch_call::REPLACE_INTERRUPT_HANDLERS => unsafe {
+            let handlers = regs.rdx as *mut arch_abi::InterruptHandlers;
+            let previous = crate::descriptors::replace_interrupt_handlers(
+                regs.rcx as u8, core::ptr::read(handlers));
+            core::ptr::write(handlers, previous);
+        },
         _ => lib::compact_panic!("Unknown arch call: {:#x}", regs.rax),
     }
 }

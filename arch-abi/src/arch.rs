@@ -208,6 +208,14 @@ pub trait Arch: Sized + GuestBytes {
     /// event, leaving `regs` holding the post-run register state.
     fn execute(&mut self, regs: &mut Regs, io: &crate::IoPolicy) -> KernelEvent;
 
+    /// Replace both native IDT entries, returning the previous handler pair.
+    /// Backends without a native IDT leave this operation unused.
+    ///
+    /// # Safety
+    /// Each entry must obey its mode's interrupt-frame and return conventions.
+    /// Restore both entries before their code or associated state expires.
+    unsafe fn replace_interrupt_handlers(&mut self, _vector: u8, handlers: crate::InterruptHandlers) -> crate::InterruptHandlers { handlers }
+
     /// Whether this backend can run 64-bit user code (`UserMode::Mode64`).
     /// On metal this is a CPU fact (long mode available); the hosted machine
     /// model is 32-bit non-PAE, so both hosted engines answer false. Exec
