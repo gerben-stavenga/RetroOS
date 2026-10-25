@@ -229,7 +229,10 @@ impl Config {
                 }
                 if value.split_ascii_whitespace().any(|flag|
                     !["loadfix", "dos32a", "repair", "iopl3", "xms32k"]
-                        .iter().any(|known| flag.eq_ignore_ascii_case(known))) {
+                        .iter().any(|known| flag.eq_ignore_ascii_case(known))
+                    && !(flag.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("cpu"))
+                        && flag[3..].bytes().all(|b| b.is_ascii_digit())
+                        && flag[3..].parse::<u8>().is_ok_and(|n| (5..=100).contains(&n) && n % 5 == 0))) {
                     return Err("unknown launch flag");
                 }
                 if config.launch.len() == 32 {
@@ -942,6 +945,18 @@ mod tests {
         assert!(Config::parse_user(b"[mount \"session\"]\nsource=bundle\npath=/\n").is_err());
         let user = Config::parse_user(b"[locale]\nlanguage=it-IT\n[launch]\nALADDIN.EXE=xms32k\n").unwrap();
         assert_eq!(user.launch, [("ALADDIN.EXE".into(), "xms32k".into())]);
+    }
+
+    #[test]
+    fn launch_cpu_percent_is_validated() {
+        for flag in ["cpu5", "cpu25", "CPU100"] {
+            let ini = alloc::format!("[launch]\nGAME.EXE=repair {}\n", flag);
+            assert!(Config::parse_user(ini.as_bytes()).is_ok());
+        }
+        for flag in ["cpu", "cpu0", "cpu1", "cpu26", "cpu101", "cpu999999", "cpu+25", "cpu25x"] {
+            let ini = alloc::format!("[launch]\nGAME.EXE={}\n", flag);
+            assert!(Config::parse_user(ini.as_bytes()).is_err());
+        }
     }
 
     #[test]

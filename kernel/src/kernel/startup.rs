@@ -1871,10 +1871,31 @@ fn event_loop<A: crate::Arch>(
             continue;
         }
 
+        // Keep servicing input, audio and real-time virtual devices while a
+        // DOS client's explicit CPU duty limit delays its next guest slice.
+        let paced = matches!(&thread.personality, thread::Personality::Dos(dos)
+            if dos.cpu_pacer.limited());
+        let run_started = if paced {
+            let now = machine.now();
+            if let thread::Personality::Dos(dos) = &thread.personality
+                && !dos.cpu_pacer.ready(now)
+            {
+                // Hosted execution normally supplies clock wakeups on return
+                // from a guest slice. There is no slice while pacing it.
+                irq_clock_wakeup = true;
+                core::hint::spin_loop();
+                continue;
+            }
+            now
+        } else { 0 };
+
         // Lend the CPU; canonicalize the outcome into an action.
         stats.pre_run(machine, &ctx.regs);
         let event_sample = super::event_profile::Sample::start(machine);
         let kevent = ctx.run(machine, bios_workspace, &mut thread.personality);
+        if paced && let thread::Personality::Dos(dos) = &mut thread.personality {
+            dos.cpu_pacer.charge(run_started, machine.now());
+        }
         if matches!(&kevent, crate::KernelEvent::Irq) {
             // Hosted backends express their periodic preemption kick directly
             // as KernelEvent::Irq rather than through the metal IRQ queue.

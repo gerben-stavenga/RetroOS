@@ -35,6 +35,7 @@ macro_rules! dos_trace {
     ($($arg:tt)*) => {{}};
 }
 
+pub(crate) mod cpu_pacing;
 mod bios;
 pub(crate) use bios::Bda;
 mod dpmi;
@@ -108,21 +109,25 @@ const TF_DELAY: u8 = 4;
 #[derive(Clone, Copy)]
 pub struct LaunchPolicy {
     pub viopl: u8,
+    pub cpu_percent: u8,
     pub xms32k: bool,
     /// A program forked by the outer COMMAND.COM may run nested /C shells.
     pub tsr_session: bool,
 }
 
 impl Default for LaunchPolicy {
-    fn default() -> Self { Self { viopl: 1, xms32k: false, tsr_session: false } }
+    fn default() -> Self { Self { viopl: 1, cpu_percent: 0, xms32k: false, tsr_session: false } }
 }
 
 impl LaunchPolicy {
     /// Synth INT 31h: CL selects virtual IOPL; CH bit 0 limits XMS reports.
+    /// CX bits 10..15 carry CPU percent / 5; bit 9 remains in-place EXEC.
+    /// Zero leaves environment policy in charge.
     pub fn from_synth(cx: u16) -> Self {
         Self {
             viopl: match cx as u8 { 2 => 2, 3 => 3, _ => 1 },
             xms32k: cx & 0x0100 != 0,
+            cpu_percent: match (cx >> 10) as u8 { n @ 1..=20 => n * 5, _ => 0 },
             tsr_session: false,
         }
     }
@@ -170,6 +175,8 @@ pub struct DosState<A: crate::Arch> {
     /// EXEC in this address space so resident code and interrupt hooks remain
     /// visible until the launched program exits.
     pub tsr_session: bool,
+    pub cpu_pacer: cpu_pacing::CpuPacer,
+    pub cpu_limit_override: u8,
     pub xms: Option<alloc::boxed::Box<xms::XmsState>>,
     pub ems: Option<alloc::boxed::Box<ems::EmsState>>,
     /// One committed extended-memory pool shared by XMS, EMS and every DPMI
@@ -319,6 +326,8 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::addr_of_mut!((*p).last_dos_error).write(0);
             core::ptr::addr_of_mut!((*p).exec_parent).write(None);
             core::ptr::addr_of_mut!((*p).tsr_session).write(false);
+            core::ptr::addr_of_mut!((*p).cpu_pacer).write(cpu_pacing::CpuPacer::default());
+            core::ptr::addr_of_mut!((*p).cpu_limit_override).write(0);
             core::ptr::addr_of_mut!((*p).xms).write(None);
             core::ptr::addr_of_mut!((*p).ems).write(None);
             core::ptr::addr_of_mut!((*p).memory).write(memory::DosMemory::new());
@@ -476,6 +485,8 @@ impl Default for DosSearch {
 /// Saved parent state for returning from EXEC'd child.
 /// Chained via `prev` so nested exec works (e.g. DN.COM→DN.PRG→gfx.com).
 pub struct ExecParent {
+    pub cpu_pacer: cpu_pacing::CpuPacer,
+    pub cpu_limit_override: u8,
     /// PSP loaded by this EXEC. A guest-created AH=55h child may run inside
     /// it without ending the EXEC relationship when that child terminates.
     pub child_psp: u16,
@@ -1344,6 +1355,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         _ => unreachable!("just set Dos personality"),
     };
     dos_state.tsr_session = policy.tsr_session;
+    dos_state.cpu_limit_override = policy.cpu_percent;
     dos_state.pc.vga.initialize_active_address_space(machine);
     dpmi::install_kernel_ldt_slots(dos_state);
     dos_state.dfs.init_from_vfs(&parent_cwd);

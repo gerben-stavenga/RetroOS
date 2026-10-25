@@ -124,14 +124,12 @@ in Git history.
   gives its client ring-0-style ownership of paging, descriptors, interrupts,
   and I/O, so native backends cannot safely expose it as an ordinary DOS
   thread; the interpreter can virtualize it more naturally.
-- [ ] **Pace native DOS CPU execution independently of display work.** F22's
-  startup calibrates a `DEC ECX` busy loop against a timer counter. On KVM with
-  native VGA, even a nearly full 32-bit count completes below its 120-tick
-  threshold, the count wraps, and calibration retries for minutes. QEMU/UEFI
-  and the OSD mask this by spending time on software rendering; TCG masks it
-  through interpreter overhead. Add an explicit DOS CPU-speed/throttling policy
-  so timing never depends on the display backend. Do not special-case F22,
-  joystick port `0x201`, or restore needless native-VGA presentation.
+- [x] **Pace native DOS CPU execution independently of display work.**
+  Per-program `cpu5`–`cpu100` launch flags and `DOS_CPU_PERCENT` provide an
+  explicit duty limit while device clocks and media keep advancing. F22's
+  calibration overflow reproduces at full native KVM speed; `repair cpu25`
+  reaches its main menu. The default launch profile includes that setting.
+  This does not special-case guest instructions or joystick hardware.
 - [ ] **Ironman Off-Road Racing:** fix the timer ISR's polling of port `0x3DA`.
   It requires a runtime-derived number of consecutive samples and can grind
   to a halt when emulated retrace advances independently of guest polling.

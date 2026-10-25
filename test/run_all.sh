@@ -213,6 +213,7 @@ run windows_threads hosted_tsr env ENGINE=tcg python3 test/windows_threads.py
 run dpmi_rm_exception hosted_tsr env ENGINE=tcg python3 test/dpmi_rm_exception.py
 run dpmi_hdpmi_pvi freedos_hdd bash test/dpmi_hdpmi_pvi.sh
 run hosted_games_kvm kvm   env ENGINE=kvm bash test/hosted_games.sh
+run dos_cpu_pacing kvm     python3 test/dos_cpu_pacing.py
 run lfn_kvm      kvm       env ENGINE=kvm python3 test/lfn.py
 run dpmi_hx_kvm  kvm       env ENGINE=kvm bash test/dpmi_hx.sh
 run xms_kvm      kvm       env ENGINE=kvm bash test/xms.sh

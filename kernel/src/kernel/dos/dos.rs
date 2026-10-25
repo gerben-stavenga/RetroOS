@@ -713,6 +713,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         }
         // AH=09h — SYNTH_SET_VIOPL: set THIS thread's virtual IOPL (`IfMode`).
         // CL = 1 iopl1 (spec-strict) | 2 repair | 3 iopl3; CH bit 0 = xms32k.
+        // CX bits 10..15 = CPU duty percent / 5.
         // CF=0 always.
         //
         // Fork-exec (AH=01h) carries the child's vIOPL in CL because the child
@@ -724,6 +725,8 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         0x09 => {
             let policy = super::LaunchPolicy::from_synth(regs.rcx as u16);
             super::xms::set_report_limit(dos, policy.xms32k);
+            dos.cpu_limit_override = policy.cpu_percent;
+            dos.cpu_pacer = super::cpu_pacing::CpuPacer::from_percent(policy.cpu_percent);
             let mode = u64::from(policy.viopl);
             let f = &mut regs.frame.rflags;
             *f = (*f & !(3u64 << 12)) | (mode << 12);

@@ -59,6 +59,31 @@ python3 test/audio_steady.py --cpus 2 --kvm 10
 python3 test/audio_steady.py --cpus 2 --kvm --effects-only 10
 ```
 
+## DOS CPU speed
+
+For games whose startup timing overflows on fast CPUs, add `cpu5` through
+`cpu100` (in steps of 5) to their `RETROOS.INI` `[launch]` entry. For example:
+
+```ini
+[launch]
+F22.EXE=repair cpu25
+```
+
+COMMAND.COM passes the limit with the launch policy, including batch and
+LOADFIX launches. `cpu25` limits guest execution to roughly 25% duty; it does
+not promise a particular MHz. Unlisted programs retain full speed. The default
+configuration includes this F22 entry. Existing installations can add it after
+updating both the kernel and COMMAND.COM.
+
+For direct executable launches, `DOS_CPU_PERCENT=25` in `[environment]` supplies
+the same policy; a `cpuN` launch flag overrides it. The valid range is 1–100;
+missing or invalid environment values leave execution unlimited. CPU pacing
+uses the monotonic clock independently of VGA, the OSD and rendering. The
+event loop continues servicing input, audio and device clocks between guest
+slices. Long host pauses do not accumulate unbounded pacing debt. This is a
+compatibility speed control, not a host CPU-utilization limit: the kernel
+continues polling services during the delay.
+
 ## Machine installation (ext4 or FAT)
 
 ```sh

@@ -254,6 +254,8 @@ pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::Ker
     let parent_heap_base = dos.heap_base_seg;
     let parent_blocks = dos.dos_blocks.clone();
     let parent_dta = dos.dta;
+    let parent_cpu_pacer = dos.cpu_pacer;
+    let parent_cpu_limit_override = dos.cpu_limit_override;
 
     // Do NOT reset the MCB chain. Real DOS keeps a single chain across EXEC:
     // the parent's blocks stay allocated while the child runs, and the child's
@@ -274,6 +276,7 @@ pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::Ker
                 dos.heap_base_seg = parent_heap_base;
                 dos.current_psp = parent_rm_psp;
                 dos.dta = parent_dta;
+                dos.cpu_pacer = parent_cpu_pacer;
                 dos.dos_blocks = parent_blocks;
                 crate::kernel::dos::sync_mcb_chain(machine, dos, regs);
                 regs.rax = (regs.rax & !0xFFFF) | 11;
@@ -327,6 +330,8 @@ pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::Ker
     // Reload LDTR after swapping in the child LDT.
     dos.on_resume(machine);
     dos.exec_parent = Some(ExecParent {
+        cpu_pacer: parent_cpu_pacer,
+        cpu_limit_override: parent_cpu_limit_override,
         child_psp: loaded.psp_seg,
         ss: vm86_ss(regs),
         sp: vm86_sp(regs),
@@ -535,6 +540,8 @@ pub(super) fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::Dos
     // LDTR currently points at the child's LDT — reload (same box if we
     // preserved it, parent's box if we restored).
     dos.on_resume(machine);
+    dos.cpu_pacer = parent.cpu_pacer;
+    dos.cpu_limit_override = parent.cpu_limit_override;
     dos.exec_parent = parent.prev.map(|b| *b);
     thread::KernelAction::Done
 }
@@ -654,6 +661,14 @@ fn populate_program<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &mut 
     // read the BLASTER config from the same buffer (no second guest read).
     let mut env = alloc::vec![0u8; (ENV_PARAS as usize) * 16];
     fill_env(&mut env, parent.env, prog_name);
+    dos.cpu_pacer = if dos.cpu_limit_override != 0 {
+        crate::kernel::dos::cpu_pacing::CpuPacer::from_percent(dos.cpu_limit_override)
+    } else {
+        crate::kernel::dos::cpu_pacing::CpuPacer::from_env(&env)
+    };
+    if dos.cpu_pacer.limited() {
+        crate::compact_println!("DOS CPU limit: {}%", dos.cpu_pacer.percent());
+    }
     machine.copy_to(((env_seg as u32) << 4) as usize, &env);
     // Latch this program's BLASTER A/I/D/H into the SB-DMA layer so the
     // virtual 8237 traps the right channel and the IRQ relay uses the

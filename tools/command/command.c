@@ -91,10 +91,11 @@ static void trace(int on) {
  *     follows DPMI 0.9 more strictly.
  *
  * RETROOS.INI [launch] format: BASENAME=keyword [keyword...]. Keywords:
- *   loadfix (default if none), dos32a, iopl3, repair, xms32k. Combinable.
+ *   loadfix (default if none), dos32a, iopl3, repair, xms32k, cpu5..cpu100 (steps of 5).
  *
  * COMMAND.COM reads the config; kernel policies travel in synth syscall CX.
- * CL selects virtual IOPL, CH bit 0 caps classic XMS reports at 32767 KiB. */
+ * CL selects virtual IOPL, CH bit 0 caps classic XMS reports at 32767 KiB.
+ * CH bit 1 is in-place EXEC; bits 10..15 encode CPU duty percent / 5. */
 
 #define LF_MAX_NAMES 32
 #define LF_NAME_LEN  16
@@ -105,7 +106,7 @@ static void trace(int on) {
 #define LF_F_XMS32K  0x10
 
 static char          loadfix_names[LF_MAX_NAMES][LF_NAME_LEN];
-static unsigned char loadfix_flags[LF_MAX_NAMES];
+static unsigned int  loadfix_flags[LF_MAX_NAMES];
 static int           loadfix_count = 0;
 
 /* Last component of a DOS path: skip past any '\\', '/', or ':'. */
@@ -122,12 +123,21 @@ static int has_ext(const char *name, const char *ext) {
 }
 
 /* Parse a flag token; 0 = unrecognised. */
-static unsigned char parse_flag(const char *tok) {
+static unsigned int parse_flag(const char *tok) {
     if (stricmp(tok, "loadfix") == 0) return LF_F_LOADFIX;
     if (stricmp(tok, "dos32a")  == 0) return LF_F_DOS32A;
     if (stricmp(tok, "iopl3")   == 0) return LF_F_IOPL3;
     if (stricmp(tok, "repair")  == 0) return LF_F_REPAIR;
     if (stricmp(tok, "xms32k")  == 0) return LF_F_XMS32K;
+    if (strnicmp(tok, "cpu", 3) == 0 && tok[3]) {
+        unsigned int n = 0;
+        const char *p = tok + 3;
+        while (*p) {
+            if (*p < '0' || *p > '9' || n > 100) return 0;
+            n = n * 10 + (*p++ - '0');
+        }
+        if (n >= 5 && n <= 100 && n % 5 == 0) return (n / 5) << 10;
+    }
     return 0;
 }
 
@@ -142,7 +152,7 @@ static void load_launch_config(void) {
     while (loadfix_count < LF_MAX_NAMES && fgets(line, sizeof(line), f) != 0) {
         char *p = line + strspn(line, " \t");
         char *name, *tok;
-        unsigned char flags = 0;
+        unsigned int flags = 0;
         int overlong = strchr(line, '\n') == 0 && !feof(f);
         /* A line longer than the buffer arrives in pieces, and the TAIL does not
          * start with '#' -- so it would be parsed as a program entry, quietly
@@ -190,7 +200,11 @@ static void load_launch_config(void) {
             tok = p;
             while (*p && *p != ' ' && *p != '\t') p++;
             if (*p) *p++ = 0;
-            flags |= parse_flag(tok);
+            {
+                unsigned int parsed = parse_flag(tok);
+                if (parsed & 0xFC00) flags = (flags & 0x03FF) | parsed;
+                else flags |= parsed;
+            }
         }
         if (flags == 0) flags = LF_F_LOADFIX;   /* legacy default */
         strcpy(loadfix_names[loadfix_count], name);
@@ -200,7 +214,7 @@ static void load_launch_config(void) {
     fclose(f);
 }
 
-static unsigned char lookup_flags(const char *name) {
+static unsigned int lookup_flags(const char *name) {
     const char *base = basename_of(name);
     int i;
     for (i = 0; i < loadfix_count; i++) {
@@ -606,7 +620,7 @@ static int run_external_raw(char **argv, int argc, int interactive, unsigned int
  * own argv slots and we hand a pointer slice to run_external_raw. */
 static int dispatch_external(char **argv, int prog_idx, int argc, int interactive) {
     char resolved[80];
-    unsigned char flags;
+    unsigned int flags;
     unsigned int policy;
     if (prog_idx >= argc) return 0;
     assert(prog_idx >= 2);
@@ -646,6 +660,7 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
      * A client that re-enables IF the sloppy way HANGS at iopl1 (DOOM et al),
      * so `repair` is what games want; `iopl3` stays available to fall back to. */
     policy = (flags & LF_F_IOPL3) ? 3 : (flags & LF_F_REPAIR) ? 2 : 1;
+    policy |= flags & 0xFC00; /* CPU duty / 5 in CX bits 10..15. */
     if (flags & LF_F_XMS32K) policy |= 0x0100; /* CH bit 0: signed XMS report */
     if (flags & LF_F_DOS32A) {
         /* Spawn DOS/32A.EXE with prog + args as its tail. DOS/32A loads

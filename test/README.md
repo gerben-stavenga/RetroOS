@@ -41,6 +41,11 @@ The EMS probe covers simultaneous aliases, saved page maps, cross-page
 move/exchange, overlapping regions, rejected mappings, and handle resizing.
 It exercises the services used by Aladdin without requiring the game assets.
 
+`python3 test/dos_cpu_pacing.py` uses KVM to compare an unthrottled DOS
+busy loop with a per-program `cpu25` launch. It checks BIOS timer progress,
+COMMAND.COM fork and LOADFIX launches, and a batch that returns to full speed
+for its next program. It needs `nasm`, `mkfs.ext4`, `debugfs` and KVM access.
+
 The host unit group includes formatting, heap, ext4 (including independently
 generated filesystem images), and Voodoo tests in addition to kernel, CPU,
 VGA, and sound coverage. Sustained audio records a minute of actual HDA PCM
