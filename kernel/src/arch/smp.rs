@@ -16,7 +16,10 @@ extern "C" fn park(id: u32, _argument: usize) -> ! {
     fn refresh() {
         arch::paging2::refresh_kernel_mappings();
         // Leaf mappings may have been released/reused without changing a root.
-        arch::paging2::flush_tlb();
+        // This handoff does not change the worker's user-root entries, so its
+        // hardware PDPT is already current. Only invalidate translations;
+        // rebuilding that PDPT repeatedly probes the CPU paging mode.
+        x86::flush_tlb();
     }
     refresh();
     lib::compact_println!("Media worker: audio and graphics ready");

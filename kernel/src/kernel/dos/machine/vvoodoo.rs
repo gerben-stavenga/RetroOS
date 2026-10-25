@@ -245,13 +245,16 @@ impl VVoodoo {
         self.kick();
     }
     fn fence(&mut self) {
-        loop {
+        // Leave the consumer's lock alone while it still has queued work.
+        // Repeatedly acquiring it here can starve the worker's try_lock.
+        while self.output.commands.pending() {
             self.kick();
-            // The last command leaves the ring before it finishes executing.
-            // Taking the render lock fences that execution as well.
-            let _render = self.output.render.lock();
-            if !self.output.commands.pending() { break; }
+            core::hint::spin_loop();
         }
+        // The last command leaves the ring before it finishes executing.
+        // This sole producer cannot enqueue more commands during the fence;
+        // taking the lock once therefore waits for all preceding execution.
+        let _render = self.output.render.lock();
     }
     pub(crate) fn output(&mut self) -> alloc::sync::Arc<VoodooOutput> {
         self.flush();

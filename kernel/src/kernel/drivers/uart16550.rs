@@ -1,4 +1,4 @@
-//! Minimal polling driver for 16550-compatible ISA UARTs.
+//! Minimal driver for 16550-compatible ISA UARTs.
 //!
 //! This module owns UART hardware mechanics only. Higher-level protocols and
 //! a future serial console must remain above it and decide what a timeout means
@@ -52,6 +52,15 @@ pub struct Uart16550 {
 }
 
 impl Uart16550 {
+    pub const fn irq(self) -> u8 {
+        match self.port { ComPort::Com1 => 4, ComPort::Com2 => 3 }
+    }
+
+    /// Receive-data and FIFO-timeout interrupts only; TX remains polled.
+    pub fn receive_interrupts(self, enabled: bool) {
+        outb(self.base() + 1, u8::from(enabled));
+    }
+
     pub const fn new(port: ComPort) -> Self {
         Self { port }
     }

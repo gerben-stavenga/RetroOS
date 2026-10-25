@@ -16,6 +16,7 @@ const TX_READY_POLLS: u32 = 100_000;
 
 static LIVE: AtomicBool = AtomicBool::new(false);
 static PORT: AtomicU8 = AtomicU8::new(0);
+static RX_PENDING: AtomicBool = AtomicBool::new(false);
 static mut RX: [u8; RX_CAPACITY] = [0; RX_CAPACITY];
 static mut RX_LEN: usize = 0;
 static mut DISCARDING: bool = false;
@@ -31,13 +32,15 @@ fn uart() -> Option<Uart16550> {
     }
 }
 
-pub fn init(port: ComPort) -> bool {
+pub fn init<A: crate::Arch>(machine: &mut A, port: ComPort) -> bool {
     let endpoint = Uart16550::new(port);
     if !endpoint.is_present() { return false; }
     endpoint.initialize(UartConfig::UART_115200_8N1);
     endpoint.drain_rx();
     PORT.store(match port { ComPort::Com1 => 1, ComPort::Com2 => 2 }, Ordering::Relaxed);
     LIVE.store(true, Ordering::Relaxed);
+    machine.route_isa_irq(endpoint.irq());
+    endpoint.receive_interrupts(true);
     true
 }
 
@@ -45,6 +48,7 @@ fn send(bytes: &[u8]) {
     let Some(endpoint) = uart() else { return };
     for &byte in bytes {
         if endpoint.write_byte(TX_READY_POLLS, byte).is_err() {
+            endpoint.receive_interrupts(false);
             LIVE.store(false, Ordering::Relaxed);
             return;
         }
@@ -387,12 +391,17 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8]) -> bool {
 
 /// Drain a bounded amount of RX work before returning to the guest. `true`
 /// asks the event-loop owner to dump its current register/personality state.
-pub fn poll<A: crate::Arch>(machine: &mut A, events: &mut alloc::vec::Vec<crate::Irq>) -> bool {
+pub fn poll<A: crate::Arch>(machine: &mut A, events: &mut alloc::vec::Vec<crate::Irq>, tick: bool) -> bool {
     if !LIVE.load(Ordering::Relaxed) { return false; }
     let Some(endpoint) = uart() else { return false };
+    // Consume our physical UART IRQ instead of forwarding it to the guest.
+    // An idle diagnostic channel must not cause a port-I/O VM exit every ms.
+    let irq = take_irq(events, endpoint.irq());
+    let receive = irq || RX_PENDING.load(Ordering::Relaxed);
+    let mut pending = receive;
     let mut dump = false;
-    for _ in 0..RX_PER_POLL {
-        let Ok(byte) = endpoint.read_byte(1) else { break };
+    for _ in 0..if receive { RX_PER_POLL } else { 0 } {
+        let Ok(byte) = endpoint.read_byte(1) else { pending = false; break };
         unsafe {
             if byte == b'\n' || byte == b'\r' {
                 if DISCARDING {
@@ -415,15 +424,39 @@ pub fn poll<A: crate::Arch>(machine: &mut A, events: &mut alloc::vec::Vec<crate:
             }
         }
     }
-    if let Some(scancode) = pop_injected() {
+    RX_PENDING.store(pending, Ordering::Relaxed);
+    if receive { machine.rearm_irq(endpoint.irq()); }
+    // Keep injected make/break pacing independent of RX interrupt frequency.
+    if tick && let Some(scancode) = pop_injected() {
         events.push(crate::Irq::Key(scancode));
     }
     dump
 }
 
+fn take_irq(events: &mut alloc::vec::Vec<crate::Irq>, line: u8) -> bool {
+    let mut pending = false;
+    events.retain(|event| {
+        if matches!(event, crate::Irq::Hw(irq) if *irq == line) {
+            pending = true;
+            false
+        } else { true }
+    });
+    pending
+}
+
 #[cfg(test)]
 mod tests {
-    use super::trim;
+    use super::{take_irq, trim};
+
+    #[test]
+    fn uart_irq_is_consumed_without_disturbing_other_events() {
+        use crate::Irq;
+        let mut events = alloc::vec![Irq::Hw(0), Irq::Hw(3), Irq::Key(0x1e), Irq::Hw(4), Irq::Hw(3)];
+        assert!(take_irq(&mut events, 3));
+        assert!(matches!(events.as_slice(), [Irq::Hw(0), Irq::Key(0x1e), Irq::Hw(4)]));
+        assert!(!take_irq(&mut events, 3));
+        assert_eq!(events.len(), 3);
+    }
 
     #[test]
     fn command_whitespace_is_not_semantic() {

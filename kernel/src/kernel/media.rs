@@ -49,6 +49,12 @@ static GRAPHICS: Mailbox = Mailbox::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
 #[thread_local]
 static mut ON_WORKER: bool = false;
+#[thread_local]
+static mut IN_CHECKPOINT: bool = false;
+#[thread_local]
+static mut READ_DEFERRED: bool = false;
+#[thread_local]
+static mut AUDIO_READ_PENDING: bool = false;
 static REFRESH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Guest execution and brief media reads share this gate. The guest yields
@@ -75,10 +81,19 @@ impl GuestMemoryGate {
         if self.held.load(Ordering::Relaxed)
             || self.held.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err()
         {
-            self.requested.store(true, Ordering::Release);
+            // A checkpoint resumes an unfinished graphics operation. It
+            // must not leave the guest waiting for the next row batch.
+            if !unsafe { IN_CHECKPOINT } {
+                self.requested.store(true, Ordering::Release);
+                unsafe { READ_DEFERRED = true; }
+            }
             return None;
         }
         Some(GuestMemoryRead(self))
+    }
+    fn cancel_request(&self) {
+        self.requested.store(false, Ordering::Release);
+        unsafe { AUDIO_READ_PENDING = false; }
     }
     /// Guest core only, outside all guest-memory and device/service guards.
     pub(crate) fn yield_to_reader(&self) {
@@ -87,8 +102,8 @@ impl GuestMemoryGate {
     /// A service may be deactivated after requesting a read. A completed
     /// worker pass must also acknowledge that cancelled request.
     fn finish_turn(&self) {
-        if !self.held.load(Ordering::Acquire) {
-            self.requested.store(false, Ordering::Release);
+        if !self.held.load(Ordering::Acquire) && !unsafe { AUDIO_READ_PENDING } {
+            self.cancel_request();
         }
     }
 }
@@ -115,11 +130,16 @@ pub unsafe fn worker(refresh: fn()) -> ! {
     REFRESH.store(refresh as usize, Ordering::Relaxed);
     ENABLED.store(true, Ordering::Release);
     loop {
-        audio_checkpoint();
-        video_checkpoint();
+        // Retry a DMA read deferred by this poll before starting a frame.
+        // A video read requested last pass must still get its own retry.
+        if !audio_checkpoint() { video_checkpoint(); }
         device_checkpoint();
         GUEST_MEMORY.finish_turn();
         if let Some(command) = GRAPHICS.take() {
+            // The guest may be joining this job while holding guest memory.
+            // Let it run; checkpoints may read opportunistically but cannot
+            // hold the guest at a boundary while graphics work continues.
+            GUEST_MEMORY.cancel_request();
             unsafe {
                 execute(command);
             }
@@ -139,14 +159,25 @@ unsafe fn execute(command: Command) {
 
 /// Graphics callbacks invoke this between bounded row batches. Worker only.
 /// Inline fallback never consumes the worker mailbox.
-fn audio_checkpoint() {
+fn audio_checkpoint() -> bool {
     if let Some(service) = AUDIO_SERVICE.try_lock()
         && let Some(command) = *service
     {
         let due: fn() -> bool = unsafe { core::mem::transmute(AUDIO_DUE.load(Ordering::Relaxed)) };
-        if due() { unsafe { execute(command); } }
+        if due() {
+            // A video sample may have requested the guest at the end of the
+            // previous pass. Do not hold it there while this poll mixes.
+            // Preserve an audio request across retries: cancelling it before
+            // try_read lets the guest reclaim memory ahead of the DMA copy.
+            if !unsafe { AUDIO_READ_PENDING } { GUEST_MEMORY.cancel_request(); }
+            unsafe { READ_DEFERRED = false; execute(command); }
+            unsafe { AUDIO_READ_PENDING = READ_DEFERRED; }
+            return unsafe { READ_DEFERRED };
+        }
     }
-
+    // Deactivation or a deadline change cancels an outstanding audio read.
+    if unsafe { AUDIO_READ_PENDING } { GUEST_MEMORY.cancel_request(); }
+    false
 }
 
 struct Scoped<F, R> {
@@ -268,7 +299,10 @@ impl<T: Send + 'static> Drop for Graphics<T> {
 /// competing worker and therefore nothing to service.
 pub fn checkpoint() {
     if unsafe { ON_WORKER } {
+        let previous = unsafe { IN_CHECKPOINT };
+        unsafe { IN_CHECKPOINT = true; }
         audio_checkpoint();
+        unsafe { IN_CHECKPOINT = previous; }
     }
 }
 
@@ -487,6 +521,10 @@ fn device_checkpoint() {
     }
     for device in devices.iter() {
         if unsafe { (device.ready)(device.command.argument) } {
+            // A guest-side command fence must be able to finish before the
+            // guest can offer its memory. Do not leave a read request behind
+            // while executing a potentially expensive rendering command.
+            GUEST_MEMORY.cancel_request();
             unsafe { execute(device.command); }
         }
     }
@@ -549,6 +587,25 @@ mod guest_memory_tests {
         gate.yield_to_reader();
         gate.enter();
         gate.leave();
+    }
+
+    #[test]
+    fn graphics_checkpoint_cannot_request_a_future_guest_stall() {
+        let gate = GuestMemoryGate::new();
+        gate.enter();
+        unsafe { IN_CHECKPOINT = true; }
+        assert!(gate.try_read().is_none());
+        unsafe { IN_CHECKPOINT = false; }
+        assert!(!gate.requested.load(Ordering::Acquire));
+        gate.leave();
+        // Once the worker returns to its main loop, the usual fair handoff
+        // remains available; this must not bring back reader starvation.
+        gate.enter();
+        assert!(gate.try_read().is_none());
+        assert!(gate.requested.load(Ordering::Acquire));
+        gate.leave();
+        drop(gate.try_read().unwrap());
+        gate.yield_to_reader();
     }
 
     #[test]

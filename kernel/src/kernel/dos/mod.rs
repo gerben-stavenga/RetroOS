@@ -1052,6 +1052,9 @@ fn handle_event_inner<A: crate::Arch>(
         }
         KE::Outs { size, rep, addr32 } => {
             machine::handle_outs_event(machine, bios_display, &mut dos.pc, regs, size.bytes(), rep, addr32);
+            let delay = dos.pc.audio.lock().sb.probe_is_stepping();
+            set_tf_source(dos, TF_DELAY, delay);
+            regs.project_tf();
             thread::KernelAction::Done
         }
         KE::Exception(n) => {
@@ -1757,7 +1760,10 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // Keep timer/keyboard delivery from spending the DSP delay inside an IRQ
     // handler. The short step sequence models time passing in the interrupted
     // program, where probe drivers perform their result-byte bookkeeping.
-    if dos.pc.audio.lock().sb.probe_is_stepping() {
+    // OUT/OUTS records this guest-owned delay; its final single-step clears
+    // it. Reading mixer state here would either block or defer unrelated
+    // timer IRQs whenever the worker owns the audio devices.
+    if dos.tf_sources & TF_DELAY != 0 {
         return;
     }
     // Never inject while the guest sits on the resume-continuation park —

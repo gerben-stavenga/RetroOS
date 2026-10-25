@@ -159,7 +159,7 @@ fn prepare_audio<A: crate::Arch>(
     // for testing without editing the disk.
     let master_env = load_master_env();
     configure_config_serial(boot, &master_env);
-    configure_serial_control(boot, &master_env);
+    configure_serial_control(machine, boot, &master_env);
     crate::kernel::drivers::hda::configure_output_route(crate::kernel::dos::config_var(
         &master_env,
         b"HDA_OUTPUT",
@@ -355,9 +355,9 @@ fn configure_config_serial(boot: &crate::BootConfig, master_env: &[u8]) {
 /// line, or fw_cfg `opt/mcp`) wins over RETROOS.INI `MCP=`. The port must not
 /// share the ambient log UART: the stream may contain arbitrary
 /// bytes.
-fn configure_serial_control(boot: &crate::BootConfig, master_env: &[u8]) {
+fn configure_serial_control<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[u8]) {
     if let Some(port) = boot.mcp_port {
-        start_serial_control(boot, master_env, port);
+        start_serial_control(machine, boot, master_env, port);
         return;
     }
     let Some(value) = crate::kernel::dos::config_var(master_env, b"MCP") else {
@@ -370,7 +370,7 @@ fn configure_serial_control(boot: &crate::BootConfig, master_env: &[u8]) {
         crate::compact_println!("serial-control: invalid RETROOS.INI MCP value");
         return;
     };
-    start_serial_control(boot, master_env, port);
+    start_serial_control(machine, boot, master_env, port);
 }
 
 fn config_serial_port(master_env: &[u8]) -> Option<arch_abi::ComPort> {
@@ -379,14 +379,14 @@ fn config_serial_port(master_env: &[u8]) -> Option<arch_abi::ComPort> {
         .and_then(arch_abi::ComPort::parse_ascii)
 }
 
-fn start_serial_control(boot: &crate::BootConfig, master_env: &[u8], port: arch_abi::ComPort) {
+fn start_serial_control<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[u8], port: arch_abi::ComPort) {
     if boot.serial_console_port == Some(port)
         || config_serial_port(master_env) == Some(port)
     {
         crate::compact_println!("serial-control: {:?} already has another owner", port);
         return;
     }
-    if crate::kernel::serial_control::init(port) {
+    if crate::kernel::serial_control::init(machine, port) {
         crate::compact_println!("serial-control: {:?} enabled at 115200 8N1", port);
     } else {
         crate::compact_println!("serial-control: {:?} unavailable", port);
@@ -1507,12 +1507,11 @@ fn event_loop<A: crate::Arch>(
         }
         stats.slice_begin(machine);
         pending_events.drain(machine);
+        stats.part(machine, PROFILE_IRQ);
         let tick_wakeup = pending_events.tick_wakeup;
         let events = &mut pending_events.events;
-        // A 115200-baud UART can deliver fewer than 12 bytes per millisecond,
-        // safely below its 16-byte FIFO. Poll only on the timer wakeup: doing
-        // an IN from COM2 on every guest exit would itself distort profiles.
-        if (tick_wakeup || irq_clock_wakeup) && crate::kernel::serial_control::poll(machine, events) {
+        // RX IRQs wake the diagnostic UART; timer ticks only pace injected keys.
+        if crate::kernel::serial_control::poll(machine, events, tick_wakeup || irq_clock_wakeup) {
             crate::kernel::linux::debug_processes(threads, ctx.tid);
             let thread = ctx.thread(threads);
             let dos = match &thread.personality {
@@ -1523,7 +1522,7 @@ fn event_loop<A: crate::Arch>(
             };
             dump_interrupted_thread(machine, &ctx.regs, dos);
         }
-        stats.part(machine, PROFILE_IRQ);
+        stats.part(machine, PROFILE_SERIAL_CONTROL);
         let execute_irq_exit = irq_clock_wakeup;
         let clock_wakeup = tick_wakeup || execute_irq_exit;
         if clock_wakeup { crate::kernel::net::poll(); }
@@ -3320,17 +3319,21 @@ const PROFILE_INPUT: usize = 5;
 const PROFILE_DISPATCH: usize = 6;
 const PROFILE_SCHEDULER: usize = 7;
 const PROFILE_BUCKETS: usize = 8;
+// Internal subdivision of IRQ time; the public eight-part breakdown still
+// includes this in IRQ so existing OSD/accounting semantics remain intact.
+const PROFILE_SERIAL_CONTROL: usize = PROFILE_BUCKETS;
 
 #[derive(Clone, Copy)]
 pub struct ProfileSnapshot {
     pub guest: u32,
     pub kernel: u32,
     pub parts: [u32; PROFILE_BUCKETS],
+    pub irq_parts: [u32; 2],
     pub cycles: u64,
 }
 
 impl ProfileSnapshot {
-    const EMPTY: Self = Self { guest: 0, kernel: 0, parts: [0; PROFILE_BUCKETS], cycles: 0 };
+    const EMPTY: Self = Self { guest: 0, kernel: 0, parts: [0; PROFILE_BUCKETS], irq_parts: [0; 2], cycles: 0 };
 }
 
 static mut PROFILE_SNAPSHOT: ProfileSnapshot = ProfileSnapshot::EMPTY;
@@ -3393,6 +3396,10 @@ pub fn print_profile() {
         (b"dispatch", s.parts[PROFILE_DISPATCH] as u64),
         (b"scheduler", s.parts[PROFILE_SCHEDULER] as u64),
     ]);
+    profile_line(b"irq-detail-permille", &[
+        (b"drain", s.irq_parts[0] as u64),
+        (b"serial", s.irq_parts[1] as u64),
+    ]);
     if profile_enabled() {
         crate::kernel::osd_profile::print();
         super::event_profile::print();
@@ -3407,7 +3414,7 @@ struct EventStats {
     last_tsc: u64,
     last_publish: u64,
     guest_cycles: u64,
-    kernel_cycles: [u64; PROFILE_BUCKETS],
+    kernel_cycles: [u64; PROFILE_BUCKETS + 1],
 }
 
 impl EventStats {
@@ -3420,7 +3427,7 @@ impl EventStats {
             last_tsc: now,
             last_publish: now,
             guest_cycles: 0,
-            kernel_cycles: [0; PROFILE_BUCKETS],
+            kernel_cycles: [0; PROFILE_BUCKETS + 1],
         }
     }
 
@@ -3439,7 +3446,7 @@ impl EventStats {
             self.active = true;
             self.last_publish = now;
             self.guest_cycles = 0;
-            self.kernel_cycles = [0; PROFILE_BUCKETS];
+            self.kernel_cycles = [0; PROFILE_BUCKETS + 1];
         }
         self.last_tsc = now;
     }
@@ -3498,10 +3505,15 @@ impl EventStats {
         for (part, &cycles) in parts.iter_mut().zip(&self.kernel_cycles) {
             *part = share(cycles, kernel);
         }
+        let drain = self.kernel_cycles[PROFILE_IRQ];
+        let serial = self.kernel_cycles[PROFILE_SERIAL_CONTROL];
+        let irq = drain.wrapping_add(serial);
+        parts[PROFILE_IRQ] = share(irq, kernel);
         ProfileSnapshot {
             guest: share(self.guest_cycles, total),
             kernel: share(kernel, total),
             parts,
+            irq_parts: [share(drain, irq), share(serial, irq)],
             cycles: total,
         }
     }
@@ -3511,4 +3523,25 @@ fn trim_ascii(s: &[u8]) -> &[u8] {
     let start = s.iter().position(|&c| c > b' ').unwrap_or(s.len());
     let end = s.iter().rposition(|&c| c > b' ').map_or(start, |i| i + 1);
     &s[start..end]
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn irq_detail_preserves_total_kernel_time() {
+        let mut stats = EventStats {
+            active: true, last_tsc: 0, last_publish: 0, guest_cycles: 800,
+            kernel_cycles: [0; PROFILE_BUCKETS + 1],
+        };
+        stats.kernel_cycles[PROFILE_IRQ] = 120;
+        stats.kernel_cycles[PROFILE_SERIAL_CONTROL] = 40;
+        stats.kernel_cycles[PROFILE_DISPATCH] = 40;
+        let snapshot = stats.snapshot();
+        assert_eq!((snapshot.guest, snapshot.kernel, snapshot.cycles), (800, 200, 1000));
+        assert_eq!(snapshot.parts[PROFILE_IRQ], 800);
+        assert_eq!(snapshot.parts[PROFILE_DISPATCH], 200);
+        assert_eq!(snapshot.irq_parts, [750, 250]);
+    }
 }
