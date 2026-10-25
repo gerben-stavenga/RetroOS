@@ -60,10 +60,13 @@ def main():
         run("grub-mkrescue", "-o", iso, work / "iso")
         log = work / "guest.log"
         qmp = work / "qmp.sock"
+        control_path = work / "control.sock"
         process = subprocess.Popen([
             "qemu-system-x86_64", "-accel", "tcg", "-cpu", "max", "-m", "512",
             "-cdrom", str(iso), "-boot", "order=d",
             "-drive", f"file={image},format=raw", "-display", "none", "-serial", "none",
+            "-serial", f"unix:{control_path},server=on,wait=off",
+            "-fw_cfg", "name=opt/mcp,string=COM2",
             "-debugcon", f"file:{log}", "-no-reboot",
             "-qmp", f"unix:{qmp},server=on,wait=off",
             "-fw_cfg", "name=opt/cmdline,string=/home/retroos/RC/RC.EXE",
@@ -88,13 +91,33 @@ def main():
 
         try:
             wait_for(lambda output: "event_loop entered" in output)
-            # RC probes terminal capabilities before its first frame.
-            time.sleep(5)
-            with socket.socket(socket.AF_UNIX) as connection:
+            with socket.socket(socket.AF_UNIX) as connection, socket.socket(socket.AF_UNIX) as control:
                 connection.connect(str(qmp))
                 connection.settimeout(5)
-                with connection.makefile("rwb") as stream:
+                control.connect(str(control_path))
+                control.settimeout(30)
+                with connection.makefile("rwb") as stream, control.makefile("rb") as responses:
                     stream.readline()
+
+                    def screen():
+                        control.sendall(b"screen\n")
+                        result = json.loads(responses.readline())
+                        return bytes.fromhex(result["texthex"]).decode().splitlines()
+
+                    def wait_screen(description, predicate):
+                        deadline = time.monotonic() + 60
+                        while time.monotonic() < deadline:
+                            lines = screen()
+                            if predicate(lines):
+                                return
+                            time.sleep(.1)
+                        raise AssertionError(f"Timed out waiting for {description}:\n" + "\n".join(lines))
+
+                    def selected(name):
+                        wait_screen("selection " + name, lambda lines: name in lines[21][:40])
+
+                    def directory(name):
+                        wait_screen("directory " + name, lambda lines: name in lines[1][:40])
 
                     def call(command, **arguments):
                         stream.write((json.dumps(dict(execute=command, arguments=arguments)) + "\n").encode())
@@ -115,24 +138,31 @@ def main():
                         for letter in name:
                             key(letter)
                         key("ret")
-                        time.sleep(1)
+                        selected(name)
 
                     # Sorted listing: .., @Alleycat, @Belmont, RC.EXE.
                     # Create markers only after entering each link; their on-disk
                     # location proves that Enter reached the target directory.
+                    wait_screen("initial panels", lambda lines: "Name" in lines[2][:40])
                     key("home")
+                    selected("..")
                     key("down")
+                    selected("Alleycat")
                     key("ret")
-                    time.sleep(2)
+                    directory("/RC/Alleycat")
                     mkdir("absolute")
                     key("home")
+                    selected("..")
                     key("ret")  # .. back to RC
-                    time.sleep(2)
+                    wait_screen("parent directory", lambda lines: "/RC " in lines[1][:40])
                     key("home")
+                    selected("..")
                     key("down")
+                    selected("Alleycat")
                     key("down")
+                    selected("Belmont")
                     key("ret")
-                    time.sleep(2)
+                    directory("/RC/Belmont")
                     mkdir("relative")
                     call("human-monitor-command", **{"command-line": "sendkey f10"})
                     time.sleep(.5)

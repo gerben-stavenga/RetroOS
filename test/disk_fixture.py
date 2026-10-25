@@ -49,6 +49,7 @@ def main():
         volume_id = str(uuid.uuid4())
         c_root = command[command.index('--c-root') + 1] if '--c-root' in command else (
             '/home/retroos' if (tree / 'home/retroos').is_dir() else '/')
+        c_root = '/' + c_root.strip('/')
         settings = (f'[bundle]\nsource=UUID={volume_id}\nsubdir=/\n'
                     f'[mount "fixture"]\nsource=UUID={volume_id}\npath=/\naccess=rw\ngrant=/\n')
         if c_root.strip('/'):

@@ -55,7 +55,7 @@ def main():
         out.truncate(32 * 1024 * 1024)
     run('mkfs.fat', '-F', '16', disk)
     run('mmd', '-i', disk, '::RETROOS')
-    (work / 'RETROOS.INI').write_text('[environment]\nTEST=MEMORY.ELF\n')
+    (work / 'RETROOS.INI').write_text('[system]\nstart=C:\\MEMORY.ELF\n')
     run('mcopy', '-i', disk, work / 'RETROOS.INI', '::RETROOS/RETROOS.INI')
     run('mcopy', '-i', disk, work / 'MEMORY.ELF', '::MEMORY.ELF')
     session(work, disk, 'legacy-32', 'pentium', 'pc', 'tcg')

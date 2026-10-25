@@ -99,14 +99,14 @@ def main():
                 wait_for("work after root", lambda: left_directory() == "/work")
                 send(b"\x1b[18~")  # F7
                 send(b"created\r")
-                wait_for("created directory", lambda: (work / "created").is_dir())
+                # The disk fixture copies changes back only after guest exit.
+                # Synchronize on the guest UI here; verify persisted files below.
                 wait_for("created selection", lambda: "created" in terminal_text().splitlines()[21][:40])
                 # Copy note.txt under a new name; the destination starts selected.
                 send(b"\x1b[F")  # End
                 wait_for("copy source selection", lambda: "note.txt" in terminal_text().splitlines()[21][:40])
                 send(b"\x1b[15~")  # F5
                 send(b"/work/copied.txt\r")
-                wait_for("completed copy", lambda: (work / "copied.txt").exists() and (work / "copied.txt").read_text() == "Original text\n")
                 # TaskDone reloads the panels and focuses the copied file after
                 # the bytes are written. Wait for that visible refresh first.
                 wait_for("copy panel refresh", lambda: "copied.txt" in terminal_text().splitlines()[21][:40])
@@ -121,7 +121,6 @@ def main():
                 send(b"\x1b[H.x\r", 1.5)
                 send(b"\x1bOQ")  # F2: save
                 send(b"\r")  # Confirm save if configured.
-                wait_for("saved editor contents", lambda: (work / "note.txt").read_text().startswith(".x\n"))
                 send(b"\x1b[21~")  # Close editor.
                 wait_for("manager after editor", lambda: "Name" in terminal_text().splitlines()[2][:40])
                 send(b"/TEST.COM\r")  # Launch DOS through Rust -> shell -> exec.
