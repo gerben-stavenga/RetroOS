@@ -3273,6 +3273,7 @@ pub fn reset_profile() {
     unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, ProfileSnapshot::EMPTY) };
     crate::kernel::osd_profile::reset();
     super::event_profile::reset();
+    super::voodoo_profile::reset();
 }
 
 /// Set profiling explicitly; unlike the OSD toggle this is idempotent, which
@@ -3428,6 +3429,7 @@ pub fn print_profile() {
     if profile_enabled() {
         crate::kernel::osd_profile::print();
         super::event_profile::print();
+        super::voodoo_profile::print();
         PROFILE_REBASE.store(true, core::sync::atomic::Ordering::Relaxed);
     }
 }

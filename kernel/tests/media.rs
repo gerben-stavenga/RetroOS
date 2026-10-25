@@ -4,6 +4,14 @@ extern crate alloc;
 pub(crate) mod media;
 mod kernel {
     pub(crate) use super::media;
+    // This worker/ordering fixture runs with profiling disabled.
+    pub(crate) mod voodoo_profile {
+        pub(crate) fn swap() {}
+        pub(crate) enum Stage { Read, StatusFence, OtherFence, QueueFull }
+        pub(crate) struct Sample;
+        impl Sample { pub(crate) fn start(_: Stage) -> Self { Self } }
+        impl Drop for Sample { fn drop(&mut self) {} }
+    }
 }
 #[allow(dead_code)]
 #[path = "../src/kernel/dos/machine/vvoodoo.rs"]
@@ -46,7 +54,7 @@ fn voodoo_frame() -> Vec<u8> {
     };
     // More than two complete command-ring wraps, followed by the checked
     // framebuffer operation below. All register writes must retain order.
-    for value in 0..600 { write(&mut card, color1, value); }
+    for value in 0..(vvoodoo::COMMAND_CAPACITY as u32 * 2 + 88) { write(&mut card, color1, value); }
     for (reg, value) in [
         (fbiInit1, 10 << 4),
         (fbiInit2, 150 << 11),

@@ -37,6 +37,9 @@ pub use sound::RATE_FP_SHIFT;
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 /// Times the dashpot pushed the mixing rate far from `s`; see [`advance`].
 static RATE_SPIKES: AtomicU32 = AtomicU32::new(0);
+pub(crate) fn diagnostic_counts() -> (u32, u32) {
+    (UNDERRUNS.load(Ordering::Relaxed), RATE_SPIKES.load(Ordering::Relaxed))
+}
 
 static FRONTIER_SEQ: AtomicU32 = AtomicU32::new(0);
 static FRONTIER_LO: AtomicU32 = AtomicU32::new(0);
@@ -671,12 +674,16 @@ impl Engine {
         {
             // Never wait for the guest gate while holding a sound-device
             // lock: the guest may be waiting to write a device register.
-            let Some(_guest) = super::dos::try_live_access() else { return };
+            let Some(_guest) = super::dos::try_live_access() else {
+                super::voodoo_profile::dma_deferred();
+                return;
+            };
             if ACTIVE_DMA_OWNER.load(Ordering::Acquire)
                 != self.source.as_ref().map_or(0, |source| alloc::sync::Arc::as_ptr(source) as usize)
                 || !devices.capture_dma(reader)
             { return; }
         }
+        super::voodoo_profile::audio_gap(elapsed);
         self.last_ns = now;
         LAST_AUDIO_MS.store((now / 1_000_000) as u32, Ordering::Relaxed);
         advance_resident(&mut self.clock, self.sink.as_mut(), elapsed, stamp, |span| {

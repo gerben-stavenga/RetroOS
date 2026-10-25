@@ -27,6 +27,7 @@ pub mod locale;
 pub mod focus;
 pub mod gui;
 pub(crate) mod osd_profile;
+pub(crate) mod voodoo_profile;
 mod event_profile;
 pub mod io_policy;
 pub mod irq_dispatch;

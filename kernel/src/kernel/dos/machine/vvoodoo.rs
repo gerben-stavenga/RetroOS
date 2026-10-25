@@ -10,10 +10,14 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use voodoo::{Beam, Events, Kind, Voodoo};
+use crate::kernel::voodoo_profile::{Sample, Stage};
 
 /// A retail Voodoo Graphics board: 2 MB of frame buffer, 2 MB on the TMU.
 const FB_BYTES: usize = 2 << 20;
 const TEX_BYTES: usize = 2 << 20;
+
+/// Buffer bursts without increasing the worker's 256-command service batch.
+pub(crate) const COMMAND_CAPACITY: usize = 4096;
 
 /// The synthetic physical address the BAR reports. The guest asks DPMI to map
 /// it, and DPMI hands back a linear window whose pages we deliberately leave
@@ -130,6 +134,7 @@ impl Render {
         let events = self
             .card
             .write(&mut self.fb, &mut [&mut self.tex], off, data, mask);
+        if events.swap { crate::kernel::voodoo_profile::swap(); }
         self.swapped |= events.swap;
     }
 }
@@ -142,7 +147,7 @@ enum Command { Write(u32, u32, u32), Init(u32) }
 /// command ring without joining the preceding triangle.
 pub(crate) struct VoodooOutput {
     render: crate::kernel::media::Shared<Render>,
-    commands: crate::kernel::media::Commands<Command, 256>,
+    commands: crate::kernel::media::Commands<Command, COMMAND_CAPACITY>,
     active: core::sync::atomic::AtomicBool,
     width: core::sync::atomic::AtomicU32,
     height: core::sync::atomic::AtomicU32,
@@ -181,6 +186,7 @@ impl VoodooOutput {
         let Some(mut render) = self.render.try_lock() else { return false };
         self.drain(&mut render);
         let events = render.card.vblank();
+        if events.swap { crate::kernel::voodoo_profile::swap(); }
         render.swapped |= events.swap;
         self.publish(&render);
         if render.card.dimensions() != (width as u32, height as u32) { return false; }
@@ -238,9 +244,13 @@ impl VVoodoo {
     }
     fn kick(&mut self) { self.work.poll_inline(); }
     fn submit(&mut self, command: Command) {
-        while !unsafe { self.output.commands.push(command) } {
-            self.kick();
-            core::hint::spin_loop();
+        if !unsafe { self.output.commands.push(command) } {
+            let _sample = Sample::start(Stage::QueueFull);
+            loop {
+                self.kick();
+                core::hint::spin_loop();
+                if unsafe { self.output.commands.push(command) } { break; }
+            }
         }
         self.kick();
     }
@@ -316,10 +326,15 @@ impl VVoodoo {
     }
 
     pub fn read8(&mut self, off: u32) -> u8 {
+        let _sample = Sample::start(Stage::Read);
         self.ensure_memory();
         self.flush();
+        let wait = Sample::start(if off < 0x40_0000 && (off >> 2) & 0xff == 0 {
+            Stage::StatusFence
+        } else { Stage::OtherFence });
         self.fence();
         let render = self.output.render.lock();
+        drop(wait);
         let dword = render.card.read(&render.fb, off & !3, Beam::default());
         (dword >> ((off & 3) * 8)) as u8
     }

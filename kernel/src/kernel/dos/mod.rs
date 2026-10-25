@@ -716,6 +716,7 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     if let Some(off) = dos.pc.voodoo.as_ref()
         .and_then(|voodoo| voodoo.aperture_offset(addr))
     {
+        let _sample = super::voodoo_profile::Sample::start(super::voodoo_profile::Stage::Mmio);
         let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
         let voodoo = dos.pc.voodoo.as_mut().unwrap();
         let mut target = machine::mmio::MmioTarget::Voodoo(voodoo);
