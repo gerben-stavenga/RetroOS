@@ -272,6 +272,7 @@ pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::Ker
         match load_exe(machine, regs, dos, &parent, &buf, &abs_dos[..abs_len]) {
             Some(l) => l,
             None => {
+                dos.exec_parent = prev;
                 dos.heap_seg = parent_heap;
                 dos.heap_base_seg = parent_heap_base;
                 dos.current_psp = parent_rm_psp;
@@ -330,6 +331,7 @@ pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::Ker
     // Reload LDTR after swapping in the child LDT.
     dos.on_resume(machine);
     dos.exec_parent = Some(ExecParent {
+        files: thread::SavedFdTable::capture(kt),
         cpu_pacer: parent_cpu_pacer,
         cpu_limit_override: parent_cpu_limit_override,
         child_psp: loaded.psp_seg,
@@ -466,10 +468,13 @@ fn exec_load_overlay<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThr
 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
-pub(super) fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, parent: ExecParent,
+pub(super) fn exec_return<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs, parent: ExecParent,
                preserve_pm_env: bool) -> thread::KernelAction {
     if !preserve_pm_env { dos.ipx.release(machine, dos.current_psp); }
     let mut parent = parent;
+    // TSRs deliberately retain their open handles in the resident session.
+    // Normal termination instead closes the child and restores the parent.
+    if !preserve_pm_env { parent.files.restore(kt); }
     regs.set_ss32(parent.ss as u32);
     regs.set_sp32(parent.sp as u32);
     // The live frame still belongs to the exiting child until the real-mode
@@ -863,7 +868,7 @@ pub(super) fn return_to_psp_parent<A: crate::Arch>(
 /// Terminate a DOS program while retaining `keep` paragraphs from its PSP.
 /// INT 27h and INT 21h/AH=31h differ only in how that count is supplied.
 pub(super) fn terminate_resident<A: crate::Arch>(
-    machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, keep: u16,
+    machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs, keep: u16,
 ) -> thread::KernelAction {
     if dos.exec_parent.as_ref().is_some_and(|parent| parent.child_psp == dos.current_psp)
         && let Some(parent) = dos.exec_parent.take()
@@ -883,7 +888,7 @@ pub(super) fn terminate_resident<A: crate::Arch>(
         // to RM via 0306, then TSRs — leaves the PM session usable
         // by subsequent programs that enter via the raw-switch
         // trampoline.
-        let action = exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/true);
+        let action = exec_return(machine, kt, dos, regs, parent, /*preserve_pm_env=*/true);
         dos_keep_resident_block(machine, dos, regs, child_psp_seg, keep, child_psp_seg);
         return action;
     }

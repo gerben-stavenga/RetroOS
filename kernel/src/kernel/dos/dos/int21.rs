@@ -512,7 +512,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             {
                 // Termination type 00h (normal) | return code in AL.
                 dos.last_child_exit_status = u16::from(status);
-                return exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/false);
+                return exec_return(machine, kt, dos, regs, parent, /*preserve_pm_env=*/false);
             }
             if return_to_psp_parent(machine, dos, regs, u16::from(status), None) {
                 return thread::KernelAction::Done;
@@ -528,7 +528,7 @@ pub(super) fn int_21h<A: crate::Arch>(
         // child's code at heap_seg+offset is still mapped.
         0x31 => {
             let keep = regs.rdx as u16;
-            return terminate_resident(machine, dos, regs, keep);
+            return terminate_resident(machine, kt, dos, regs, keep);
         }
         // AH=0x48: Allocate memory (BX=paragraphs needed)
         0x48 => {

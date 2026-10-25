@@ -234,7 +234,7 @@ fn dispatch_kernel_syscall<A: crate::Arch>(
                 && let Some(parent) = dos.exec_parent.take()
             {
                 dos.last_child_exit_status = 0x0000;
-                return (exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/false), None);
+                return (exec_return(machine, kt, dos, regs, parent, /*preserve_pm_env=*/false), None);
             }
             if return_to_psp_parent(machine, dos, regs, 0, None) {
                 thread::KernelAction::Done
@@ -247,7 +247,7 @@ fn dispatch_kernel_syscall<A: crate::Arch>(
         // the resident image, measured from the PSP segment.
         0x27 => {
             let keep = (regs.rdx as u16).div_ceil(16).max(0x10);
-            terminate_resident(machine, dos, regs, keep)
+            terminate_resident(machine, kt, dos, regs, keep)
         }
         0x33 => int_33h(machine, dos, regs),
         // INT 25h/26h — Absolute Disk Read/Write — return error

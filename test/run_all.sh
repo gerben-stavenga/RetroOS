@@ -203,6 +203,7 @@ run module_program module_usb_qemu   bash test/grub_module_program.sh
 # --- Hosted TCG: no QEMU / KVM / proprietary needed (CI-safe) ---------------
 run hosted_games -         env ENGINE=tcg bash test/hosted_games.sh
 run tsr_session  hosted_tsr python3 test/tsr_session.py
+run dos_handle_lifetime hosted_tsr python3 test/dos_handle_lifetime.py --engine interp
 run lfn          -         env ENGINE=tcg python3 test/lfn.py
 run dpmi_hx      -         env ENGINE=tcg bash test/dpmi_hx.sh
 run xms          -         env ENGINE=tcg bash test/xms.sh
@@ -214,6 +215,7 @@ run dpmi_rm_exception hosted_tsr env ENGINE=tcg python3 test/dpmi_rm_exception.p
 run dpmi_hdpmi_pvi freedos_hdd bash test/dpmi_hdpmi_pvi.sh
 run hosted_games_kvm kvm   env ENGINE=kvm bash test/hosted_games.sh
 run dos_cpu_pacing kvm     python3 test/dos_cpu_pacing.py
+run dos_handle_lifetime_kvm kvm python3 test/dos_handle_lifetime.py
 run lfn_kvm      kvm       env ENGINE=kvm python3 test/lfn.py
 run dpmi_hx_kvm  kvm       env ENGINE=kvm bash test/dpmi_hx.sh
 run xms_kvm      kvm       env ENGINE=kvm bash test/xms.sh

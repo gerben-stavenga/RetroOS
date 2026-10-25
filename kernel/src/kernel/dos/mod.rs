@@ -363,6 +363,7 @@ impl<A: crate::Arch> DosState<A> {
     /// calls separately before `arch_user_clean` unmaps the 0xA0000
     /// framebuffer. Called from `thread::exit_thread`.
     pub fn on_exit(&mut self, machine: &mut A, regs: &mut Regs, capture_vga: bool) {
+        self.exec_parent = None; // Release descriptors owned by suspended EXEC parents.
         if capture_vga {
             // The live aperture belongs to this address space. Complete the
             // detached snapshot before the address space disappears. Normal
@@ -485,6 +486,7 @@ impl Default for DosSearch {
 /// Saved parent state for returning from EXEC'd child.
 /// Chained via `prev` so nested exec works (e.g. DN.COM→DN.PRG→gfx.com).
 pub struct ExecParent {
+    pub(crate) files: thread::SavedFdTable,
     pub cpu_pacer: cpu_pacing::CpuPacer,
     pub cpu_limit_override: u8,
     /// PSP loaded by this EXEC. A guest-created AH=55h child may run inside

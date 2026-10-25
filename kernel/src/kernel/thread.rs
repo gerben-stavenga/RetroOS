@@ -22,6 +22,65 @@ pub const MAX_THREADS: usize = 1024;
 // sentinels at 98/99 (EMS_DEVICE_HANDLE / NULL_FILE_HANDLE).
 pub const MAX_FDS: usize = 64;
 
+impl FdKind {
+    fn retain(self) {
+        match self {
+            FdKind::Vfs(idx) => crate::kernel::vfs::add_vfs_ref(idx),
+            FdKind::PipeRead(idx) => crate::kernel::kpipe::add_reader(idx),
+            FdKind::PipeWrite(idx) => crate::kernel::kpipe::add_writer(idx),
+            FdKind::Socket(h) => crate::kernel::net::add_ref(h),
+            FdKind::Dir { handle, .. } => crate::kernel::vfs::add_dir_ref(handle),
+            FdKind::ConsoleOut | FdKind::None => {}
+        }
+    }
+    fn release(self) {
+        match self {
+            FdKind::Vfs(idx) => {
+                crate::kernel::vfs::close_vfs_handle(idx);
+            }
+            FdKind::PipeRead(idx) => {
+                crate::kernel::kpipe::close_reader(idx);
+            }
+            FdKind::PipeWrite(idx) => {
+                crate::kernel::kpipe::close_writer(idx);
+            }
+            FdKind::Socket(h) => {
+                crate::kernel::net::close(h);
+            }
+            FdKind::Dir { handle, .. } => {
+                crate::kernel::vfs::close_dir_handle(handle);
+            }
+            FdKind::ConsoleOut | FdKind::None => {}
+        }
+    }
+}
+
+/// Owns an extra reference to each suspended DOS parent's descriptor.
+/// Drop also handles an EXEC chain abandoned by an OSD kill or failed session.
+pub(crate) struct SavedFdTable {
+    fds: [FdKind; MAX_FDS],
+    cloexec: u64,
+}
+impl SavedFdTable {
+    pub(crate) fn capture<A: crate::Arch>(thread: &KernelThread<A>) -> Self {
+        let saved = Self { fds: thread.fds, cloexec: thread.cloexec };
+        for fd in saved.fds { fd.retain(); }
+        saved
+    }
+    pub(crate) fn restore<A: crate::Arch>(mut self, thread: &mut KernelThread<A>) {
+        thread.close_all_fds();
+        core::mem::swap(&mut self.fds, &mut thread.fds);
+        core::mem::swap(&mut self.cloexec, &mut thread.cloexec);
+        // The parent references now live in the thread; this empty snapshot
+        // drops without closing them or releasing their process locks.
+    }
+}
+impl Drop for SavedFdTable {
+    fn drop(&mut self) {
+        for fd in self.fds { fd.release(); }
+    }
+}
+
 /// What a file descriptor refers to
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FdKind {
@@ -630,25 +689,10 @@ impl<A: crate::Arch> KernelThread<A> {
     /// Close a single fd, decrementing pipe/VFS refcounts as needed.
     pub fn close_fd(&mut self, fd: usize) {
         if fd >= MAX_FDS { return; }
-        match self.fds[fd] {
-            FdKind::Vfs(idx) => {
-                crate::kernel::vfs::release_process_locks(idx, self.tid);
-                crate::kernel::vfs::close_vfs_handle(idx);
-            }
-            FdKind::PipeRead(idx) => {
-                crate::kernel::kpipe::close_reader(idx);
-            }
-            FdKind::PipeWrite(idx) => {
-                crate::kernel::kpipe::close_writer(idx);
-            }
-            FdKind::Socket(h) => {
-                crate::kernel::net::close(h);
-            }
-            FdKind::Dir { handle, .. } => {
-                crate::kernel::vfs::close_dir_handle(handle);
-            }
-            FdKind::ConsoleOut | FdKind::None => {}
+        if let FdKind::Vfs(idx) = self.fds[fd] {
+            crate::kernel::vfs::release_process_locks(idx, self.tid);
         }
+        self.fds[fd].release();
         self.fds[fd] = FdKind::None;
         self.cloexec &= !(1 << fd);
     }
@@ -675,22 +719,7 @@ impl<A: crate::Arch> KernelThread<A> {
         dst.fds = self.fds;
         dst.cloexec = self.cloexec;
         for i in 0..MAX_FDS {
-            match dst.fds[i] {
-                FdKind::Vfs(idx) => {
-                    crate::kernel::vfs::add_vfs_ref(idx);
-                }
-                FdKind::PipeRead(idx) => {
-                    crate::kernel::kpipe::add_reader(idx);
-                }
-                FdKind::PipeWrite(idx) => {
-                    crate::kernel::kpipe::add_writer(idx);
-                }
-                FdKind::Socket(h) => crate::kernel::net::add_ref(h),
-                FdKind::Dir { handle, .. } => {
-                    crate::kernel::vfs::add_dir_ref(handle);
-                }
-                FdKind::ConsoleOut | FdKind::None => {}
-            }
+            dst.fds[i].retain();
         }
     }
 }
@@ -1191,4 +1220,23 @@ pub fn init_threading<A: crate::Arch>() -> alloc::vec::Vec<Thread<A>> {
     threads[0].kernel.state = ThreadState::Running;
     // root stays empty — idle thread doesn't use user pages
     threads
+}
+
+#[cfg(test)]
+mod saved_file_tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_parent_table_releases_its_references() {
+        let pipe = crate::kernel::kpipe::alloc().unwrap();
+        let mut fds = [FdKind::None; MAX_FDS];
+        fds[0] = FdKind::PipeRead(pipe);
+        fds[0].retain(); // Suspended parent plus the active child's copy.
+        let parent = SavedFdTable { fds, cloexec: 0 };
+        fds[0].release(); // Child closes its inherited endpoint.
+        assert_eq!(crate::kernel::kpipe::write(pipe, b"x"), 1);
+        drop(parent); // Session abort must also release the suspended table.
+        assert_eq!(crate::kernel::kpipe::write(pipe, b"x"), -1);
+        crate::kernel::kpipe::close_writer(pipe);
+    }
 }
