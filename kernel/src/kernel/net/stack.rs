@@ -176,9 +176,14 @@ pub fn install(device: Box<dyn EthernetDevice>) {
     });
     crate::compact_println!("Network: IPv4 DHCP started");
     poll();
+}
+
+pub(super) fn wait_for_initial_lease() {
     // Give the initial lease a short startup window so programs that resolve
     // names immediately can read DHCP's resolv.conf. Renewals and slower DHCP
     // servers continue in the ordinary event-loop poll path.
+    // Never call this during Wi-Fi attachment: its adapter queues packets for
+    // wifi::poll(), which cannot progress while this stack-only loop spins.
     let deadline = now() + Duration::from_secs(3);
     while now() < deadline && !with(|n| Ok(n.address.is_some())).unwrap_or(false) {
         poll();
@@ -792,4 +797,33 @@ pub(super) fn lan_identity() -> Option<([u8; 4], [u8; 6])> {
     let guard = NETWORK.lock();
     let n = guard.as_ref()?;
     Some((n.address?.octets(), n.nic.0.mac_address()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DeferredAdapter { polls: usize }
+    impl EthernetDevice for DeferredAdapter {
+        fn mac_address(&self) -> [u8; 6] { [2, 0, 0, 0, 0, 1] }
+        fn receive(&mut self) -> Option<Vec<u8>> { None }
+        fn can_transmit(&mut self) -> bool {
+            self.polls += 1;
+            // Like Wi-Fi, this adapter cannot deliver a DHCP response until
+            // the outer event loop gets control back. Fail boundedly if
+            // installation starts spinning for a lease again.
+            assert!(self.polls <= 32, "network installation waited for DHCP");
+            true
+        }
+        fn transmit(&mut self, _: &[u8]) -> bool { true }
+    }
+
+    #[test]
+    fn attachment_returns_before_a_deferred_adapter_has_a_lease() {
+        install(Box::new(DeferredAdapter { polls: 0 }));
+        let network = NETWORK.lock().take().unwrap();
+        assert!(network.address.is_none());
+        // This is the only unit test which installs the native socket backend.
+        unsafe { super::super::SOCKET_BACKEND = None; }
+    }
 }

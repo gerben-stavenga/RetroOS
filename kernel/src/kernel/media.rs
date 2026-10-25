@@ -402,31 +402,47 @@ static VIDEO_OWNER: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 /// Resident display state. The active display is polled independently of the
 /// guest loop. Inactive displays retain their storage until their owner drops.
 pub struct VideoService<T: Send + 'static> {
-    state: Box<Shared<T>>,
+    state: Box<VideoState<T>>,
     due: fn() -> bool,
     poll: fn(&mut T),
+}
+struct VideoState<T> {
+    value: Shared<T>,
+    publication_pending: AtomicBool,
 }
 impl<T: Send + 'static> VideoService<T> {
     /// # Safety
     /// Same resident/no-allocation contract as AudioService. `due` only reads
     /// permanent storage. Registration, updates and destruction are BSP-only.
     pub unsafe fn new(value: T, due: fn() -> bool, poll: fn(&mut T)) -> Self {
-        Self { state: Box::new(Shared::new(value)), due, poll }
+        Self { state: Box::new(VideoState {
+            value: Shared::new(value), publication_pending: AtomicBool::new(false),
+        }), due, poll }
     }
-    pub fn try_lock(&self) -> Option<Guard<'_, T>> { self.state.try_lock() }
+    pub fn try_lock(&self) -> Option<Guard<'_, T>> { self.state.value.try_lock() }
+    /// Defer the next frame until the BSP retries a busy scene publication.
+    /// The current frame may finish; the producer never waits for it.
+    /// A failed attempt must be retried, or cancelled with `pause`.
+    pub fn try_publish(&self) -> Option<Guard<'_, T>> {
+        self.state.publication_pending.store(true, Ordering::Release);
+        let guard = self.state.value.try_lock()?;
+        self.state.publication_pending.store(false, Ordering::Release);
+        Some(guard)
+    }
     pub fn activate(&self) {
         if !enabled() {
-            if (self.due)() && let Some(mut state) = self.state.try_lock() {
+            if (self.due)() && let Some(mut state) = self.state.value.try_lock() {
                 (self.poll)(&mut state);
             }
             return;
         }
 
-        let argument = &*self.state as *const Shared<T> as usize;
+        let argument = &*self.state as *const VideoState<T> as usize;
         if VIDEO_OWNER.load(Ordering::Acquire) == argument { return; }
         unsafe fn invoke<T>(argument: usize) {
-            let state = unsafe { &*(argument as *const Shared<T>) };
-            if let Some(mut state) = state.try_lock() {
+            let state = unsafe { &*(argument as *const VideoState<T>) };
+            if state.publication_pending.load(Ordering::Acquire) { return; }
+            if let Some(mut state) = state.value.try_lock() {
                 let poll: fn(&mut T) = unsafe { core::mem::transmute(VIDEO_POLL.load(Ordering::Relaxed)) };
                 poll(&mut state);
             }
@@ -438,12 +454,13 @@ impl<T: Send + 'static> VideoService<T> {
     }
     /// Fence scanout before changing the physical mode or releasing mappings.
     pub fn pause(&self) {
-        let argument = &*self.state as *const Shared<T> as usize;
+        let argument = &*self.state as *const VideoState<T> as usize;
         let mut slot = VIDEO_SERVICE.lock();
         if slot.as_ref().is_some_and(|slot| slot.command.argument == argument) {
             *slot = None;
             VIDEO_OWNER.store(0, Ordering::Release);
         }
+        self.state.publication_pending.store(false, Ordering::Release);
     }
 }
 static VIDEO_POLL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);

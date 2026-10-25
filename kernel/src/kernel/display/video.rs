@@ -224,7 +224,7 @@ impl Display {
         resolve: impl Fn(gui::EndpointId, gui::SurfaceKey) -> Option<gui::PixelBuffer<'a>>,
     ) -> bool {
         let Some(service) = self.video_service() else { return false };
-        if let Some(mut video) = service.try_lock() {
+        if let Some(mut video) = service.try_publish() {
             let sample = crate::kernel::osd_profile::Sample::start(machine);
             let owner = video.owner;
             let format = video.format;

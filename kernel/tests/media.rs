@@ -267,7 +267,16 @@ fn two_core_priority_handoff_and_drop_fences() {
     old_video.activate();
     while !VIDEO_STARTED.load(Ordering::Acquire) { std::thread::yield_now(); }
     assert!(old_video.try_lock().is_none(), "publication must skip a running frame, never join it");
+    assert!(old_video.try_publish().is_none(), "scene publication must not join the running frame");
     HOLD_VIDEO.store(false, Ordering::Release);
+    // A completed graphics job proves the worker finished its previous frame
+    // and returned through its poll loop. It must leave the next video turn
+    // available to the deferred publisher instead of rendering repeatedly.
+    unsafe { media::graphics(|| ()); }
+    assert_eq!(VIDEO_TICKS.load(Ordering::Acquire), 1);
+    let publication = old_video.try_publish().expect("deferred publisher gets the next turn");
+    assert_eq!(VIDEO_TICKS.load(Ordering::Acquire), 1);
+    drop(publication);
     while VIDEO_TICKS.load(Ordering::Acquire) < 10 { std::thread::yield_now(); }
     let video = unsafe { media::VideoService::new((), || true, |_| {
         VIDEO_TICKS.fetch_add(1, Ordering::Release);

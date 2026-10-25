@@ -41,6 +41,11 @@ pub fn init<A: crate::Arch>(machine: &mut A) {
         config::mount();
         stack::install(alloc::boxed::Box::new(device));
     }
+    // Only wired devices installed during boot may wait for an initial lease.
+    // Wi-Fi attaches later from poll(), while guests and UI are already live.
+    if stack::installed() {
+        stack::wait_for_initial_lease();
+    }
 }
 
 pub(crate) fn install_wifi(device: alloc::boxed::Box<dyn EthernetDevice>) {
