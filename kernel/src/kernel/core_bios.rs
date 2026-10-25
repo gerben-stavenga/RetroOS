@@ -52,6 +52,7 @@ pub struct EmulatedVga {
 /// A VGA paired with an output target. Native VGA intrinsically owns physical
 /// scanout; an emulated VGA targets a real, composited, hosted, or headless
 /// display.
+#[allow(clippy::large_enum_variant)] // Inline output ownership avoids allocation on display handoff.
 pub enum FullscreenVga {
     Native(crate::kernel::platform::NativeVga),
     Emulated(EmulatedVga, crate::kernel::display::Display),

@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 /// Device ownership supplied by the process-creation path. Binary detection
 /// and device construction are deliberately separate: DOS fork hands in its
 /// cloned VGA, while a non-DOS image must not carry one at all.
+#[allow(clippy::large_enum_variant)] // Single ownership handoff; keep it allocation-free.
 pub enum ExecVga {
     None,
     Dos(crate::kernel::bios_display::DosVideo),

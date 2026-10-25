@@ -77,9 +77,10 @@ jobs:
       env:
         RUST_BACKTRACE: '1'
       run: |
+        guest_root=$(mktemp -d)
         for src in hello outlive_composite; do
           gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start \
-            -o "/tmp/$src.elf" "test/hosted/$src.c"
+            -o "$guest_root/$src.elf" "test/hosted/$src.c"
         done
         # The program prints its greeting then exit(0)s; cap with timeout.
         runners=retroos-host
@@ -92,7 +93,8 @@ jobs:
           # inside $out, which is how a SIGABRT here first showed up as a bare
           # "exit code 134" with no message to diagnose.
           set +e
-          out=$(timeout 30 "bazel-bin/kernel/$runner" "/tmp/$guest.elf" 2>&1)
+          out=$(timeout 30 python3 test/disk_fixture.py --root "$guest_root" -- \
+            "bazel-bin/kernel/$runner" --cmd "/$guest.elf" --cwd / 2>&1)
           rc=$?
           set -e
           echo "$out"
@@ -101,7 +103,7 @@ jobs:
             exit 1
           fi
           echo "$out" | grep -q "Hello from an interpreted 32-bit Linux ELF!"
-          if echo "$out" | grep -q "panicked"; then echo "kernel panicked on the bare-ELF path"; exit 1; fi
+          if echo "$out" | grep -q "panicked"; then echo "kernel panicked on the hosted ELF path"; exit 1; fi
          done
         done
     - name: Personality and hardware integration tests
