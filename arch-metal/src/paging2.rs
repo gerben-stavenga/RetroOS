@@ -551,7 +551,8 @@ unsafe fn publish_kernel_root<E: Entry>(index: usize, entry: E) {
 
 /// Refresh the universal kernel portion before entering kernel work.
 /// No stale-fault recovery: ownership/allocator handoffs must ensure freshness
-/// before accessing reused mappings. APs still park; this is not an SMP heap.
+/// before accessing reused mappings. Leaf removals also advance the generation;
+/// physical allocation remains confined to the owner core.
 pub fn refresh_kernel_mappings() {
     use core::sync::atomic::Ordering;
     if LOCAL_KERNEL_GENERATION.load(Ordering::Relaxed) == KERNEL_GENERATION.load(Ordering::Acquire) { return; }
@@ -1059,17 +1060,27 @@ pub fn release_heap_pages(addr: usize, bytes: usize) {
         let parent = parent_index::<E>(idx);
         (parent == idx || present(entries, parent)) && entries[idx].present()
     }
-    fn release<E: Entry>(entries: &mut [E], addr: usize, bytes: usize) {
+    fn release<E: Entry>(entries: &mut [E], addr: usize, bytes: usize) -> bool {
+        let mut changed = false;
         for idx in addr / PAGE_SIZE..(addr + bytes) / PAGE_SIZE {
             if present(entries, idx) {
                 replace_mapping(&mut entries[idx], E::default());
                 crate::x86::invlpg(idx * PAGE_SIZE);
+                changed = true;
             }
         }
+        changed
     }
-    match entries() {
+    let changed = match entries() {
         Entries::E32(e) => release(e, addr, bytes),
         Entries::E64(e) => release(e, addr, bytes),
+    };
+    if changed {
+        // Shared lower tables changed even though the root itself did not.
+        // Ownership handoff excludes live users of the released pages; the
+        // next worker entry must still discard its cached old translations
+        // before a new allocation can reuse these virtual addresses.
+        KERNEL_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Release);
     }
 }
 

@@ -1490,9 +1490,10 @@ fn event_loop<A: crate::Arch>(
     let mut klog_check_passes = 0u32;
 
     loop {
-        // Guest aliases can also be written by arbitrary kernel services.
-        // Serialize the whole guest slice with the renderer's brief VRAM
-        // sample. Decoding, composition and presentation never hold this gate.
+        // Service synchronous VGA before handling queued kernel events.
+        // Audio DMA and the linear VBE fallback still use the guest-memory
+        // handoff; legacy VGA reads its atomic device memory independently.
+        super::media::kernel_entry();
         let handoff_stall = crate::kernel::portio::StallWatch::new("guest/media handoff");
         crate::kernel::media::GUEST_MEMORY.yield_to_reader();
         let _live_access = crate::kernel::dos::live_access();
@@ -1903,6 +1904,7 @@ fn event_loop<A: crate::Arch>(
         }
         stats.post_run(machine, &kevent, &ctx.regs);
         let event_dispatch = event_sample.returned(machine, &kevent, &ctx.regs, &thread.personality);
+        super::media::kernel_entry();
         let had_window = thread.has_primary_window();
         let action = dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent);
         let hide_window = had_window && !thread.has_primary_window();

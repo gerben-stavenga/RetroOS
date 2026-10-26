@@ -2,7 +2,7 @@
 //!
 //! The emulated VGA and Voodoo produce process-owned pictures; `platform`
 //! describes the sink. Linear output binds a resident renderer to the device:
-//! the guest core publishes register changes, never a frame on each refresh.
+//! legacy VGA shares its device with scanout; VBE publishes linear configuration.
 //! Hosted and banked sinks retain their synchronous presentation paths.
 //!
 //! Kernel work, not machine work, which is why it is here and not beside the
@@ -52,16 +52,16 @@ fn diagnose_shadow(state: &VgaState, mode: ::vga::VgaMode, nonzero: usize, hash:
         return;
     };
     let (width, height) = ::vga::dimensions(mode);
-    let start = u16::from_be_bytes([state.crtc[0x0C], state.crtc[0x0D]]);
+    let start = u16::from_be_bytes([state.crtc.get(0x0C), state.crtc.get(0x0D)]);
     crate::compact_dbg_println!(
         "[vgascan] mode={:?} {}x{} black={} nz={} hash={:08X} seq={:02X?} gc5={:02X} gc6={:02X} acidx={:02X} ac10={:02X} pan={:02X} start={:04X} offset={:02X} cr17={:02X} compare={:03X} dacmask={:02X}",
-        mode_name(mode), width, height, black as u8, nonzero, hash, &state.seq[..],
-        state.gc[5], state.gc[6], state.ac_state.index, state.ac[0x10],
-        state.ac[0x13], start, state.crtc[0x13], state.crtc[0x17],
-        state.crtc[0x18] as u16
-            | (u16::from(state.crtc[7] & 0x10) << 4)
-            | (u16::from(state.crtc[9] & 0x40) << 3),
-        state.dac_mask,
+        mode_name(mode), width, height, black as u8, nonzero, hash, &state.seq.read()[..],
+        state.gc.get(5), state.gc.get(6), state.ac_state.index, state.ac.get(0x10),
+        state.ac.get(0x13), start, state.crtc.get(0x13), state.crtc.get(0x17),
+        state.crtc.get(0x18) as u16
+            | (u16::from(state.crtc.get(7) & 0x10) << 4)
+            | (u16::from(state.crtc.get(9) & 0x40) << 3),
+        state.dac_mask.get(),
     );
 }
 
@@ -96,6 +96,7 @@ fn scanout<'a, A: crate::Arch>(
         let end = svga_start.checked_add(size)?;
         let vram = live.get(svga_start..end)?;
         return Some(Frame {
+            memory: None,
             plane_layout: ::vga::VramLayout::PlaneMinor,
             mode: VgaMode::LinearSvga {
                 w: svga.config.width,
@@ -105,8 +106,8 @@ fn scanout<'a, A: crate::Arch>(
             },
             vram,
             planes: &[],
-            ac: &[0; 21],
-            palette: &svga.palette.rgb,
+            ac: [0; 21],
+            palette: svga.palette.rgb,
             dac_mask: svga.palette.mask(),
             font: &lib::vga_fonts::FONT_8X16,
             font_b: &lib::vga_fonts::FONT_8X16,
@@ -127,8 +128,8 @@ fn scanout<'a, A: crate::Arch>(
     // returned frame is consumed. No IRQ handler accesses this store.
     let live = super::machine::vga::live_planes(machine);
     let vram = if matches!(mode, VgaMode::Mode13h) { &live[..0x10000] } else { &[] };
-    let map_b = (state.seq[3] & 0x03) << 1 | (state.seq[3] >> 4) & 1;
-    let map_a = ((state.seq[3] >> 2) & 0x03) << 1 | (state.seq[3] >> 5) & 1;
+    let map_b = (state.seq.get(3) & 0x03) << 1 | (state.seq.get(3) >> 4) & 1;
+    let map_a = ((state.seq.get(3) >> 2) & 0x03) << 1 | (state.seq.get(3) >> 5) & 1;
     // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
     // line-compare (split-screen) apply to the planar families and to linear
     // Mode 13h. The display-start latch is in word units for the planar
@@ -140,37 +141,38 @@ fn scanout<'a, A: crate::Arch>(
     // advance one logical colour pixel. Planar 16-colour scanout uses the
     // full three-bit pixel count.
     let pixel_pan = if matches!(mode, VgaMode::ModeX { .. } | VgaMode::Mode13h) {
-        ((state.ac[0x13] >> 1) & 0x03) as usize
+        ((state.pixel_pan() >> 1) & 0x03) as usize
     } else if planar {
-        (state.ac[0x13] & 0x07) as usize
+        (state.pixel_pan() & 0x07) as usize
     } else { 0 };
-    let start_latch = ((state.crtc[0x0C] as usize) << 8) | state.crtc[0x0D] as usize;
+    let start_latch = usize::from(state.display_start());
     // CGA palettes come from the Mode-Control/Colour-Select registers. The
     // 640×200 2-colour mode's foreground is the Colour-Select low nibble
     // (background black); the 320×200 4-colour set is the register-resolved
     // palette. Other modes ignore this field.
     let cga_palette = match mode {
-        VgaMode::Cga4 => ::vga::cga4_palette(state.cga_mode_ctl, state.cga_color_select),
-        VgaMode::Cga2 => [0x000000, ::vga::CGA16[(state.cga_color_select & 0x0F) as usize], 0, 0],
+        VgaMode::Cga4 => ::vga::cga4_palette(state.cga_mode_ctl.get(), state.cga_color_select.get()),
+        VgaMode::Cga2 => [0x000000, ::vga::CGA16[(state.cga_color_select.get() & 0x0F) as usize], 0, 0],
         _ => [0; 4],
     };
     Some(Frame {
+            memory: None,
         plane_layout: state.layout(),
         mode,
         vram,
         planes: live,
-        ac: &state.ac,
-        palette: &state.dac,
-        dac_mask: state.dac_mask,
+        ac: state.ac.read(),
+        palette: state.dac.read(),
+        dac_mask: state.dac_mask.get(),
         font: &[],
         font_b: &[],
         font_maps: Some((map_a, map_b)),
-        blink: state.ac[0x10] & 0x08 != 0,
-        text_cursor: ::vga::TextCursor::from_crtc(&state.crtc, autonomous || (machine.now() / 250_000_000).is_multiple_of(2)),
+        blink: state.ac.get(0x10) & 0x08 != 0,
+        text_cursor: ::vga::TextCursor::from_crtc(&state.crtc.read(), autonomous || (machine.now() / 250_000_000).is_multiple_of(2)),
         cga_palette,
         start_offset: if planar || matches!(mode, VgaMode::Text { .. }) { start_latch } else if mode13 { start_latch * 4 } else { 0 },
         pixel_pan,
-        split_pixel_pan: if state.ac[0x10] & 0x20 != 0 { 0 } else { pixel_pan },
+        split_pixel_pan: if state.ac.get(0x10) & 0x20 != 0 { 0 } else { pixel_pan },
         line_compare: if planar || mode13 { state.line_compare(h) } else { usize::MAX },
         blank_start: if planar || mode13 { state.vertical_blank_start(h) } else { usize::MAX },
     })
@@ -446,13 +448,25 @@ pub fn display_tick<A: crate::Arch>(
     if display.is_headless() { return; }
     if display.resident_video() {
         let owner = presentation.as_ref().map(|(_, endpoint)| *endpoint);
-        if !display.vga_needs_publication(super::machine::vga::scanout_revision(), owner) {
+        if let Some(state) = vga.legacy() {
+            if display.bind_legacy(state, super::machine::vga::live_memory(),
+                super::machine::vga::scanout_epoch(), owner) {
+                if let Some(mode) = state.classify_mode() {
+                    let (w, h) = ::vga::dimensions(mode);
+                    if let Some((desktop, endpoint)) = presentation.as_mut() {
+                        publish_vga_surface(w, h, desktop, *endpoint);
+                    }
+                }
+                return;
+            }
+        }
+        if !display.linear_needs_publication(super::machine::vga::scanout_revision(), owner) {
             display.poll_video();
             return;
         }
         let capture_sample = crate::kernel::osd_profile::Sample::start(machine);
         let Some(frame) = scanout(vga, machine, regs, svga_start, true) else { return };
-        if display.publish_vga(&frame, owner) {
+        if display.publish_linear(&frame, owner) {
             capture_sample.finish(machine, crate::kernel::osd_profile::Stage::Capture, 0);
             // Guest beam/retained geometry stay cheap and local. Pixel work is
             // owned by the persistent renderer, not joined by the guest loop.

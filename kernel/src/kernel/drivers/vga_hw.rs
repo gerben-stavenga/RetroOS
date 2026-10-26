@@ -205,11 +205,11 @@ pub fn save(
     state.gc_index = inb(0x3CE);
 
     // Save all registers
-    state.misc_output = inb(0x3CC);
-    state.feature_ctl = inb(0x3CA);
-    for i in 0..5u8 { outb(0x3C4, i); state.seq[i as usize] = inb(0x3C5); }
-    for i in 0..25u8 { outb(0x3D4, i); state.crtc[i as usize] = inb(0x3D5); }
-    for i in 0..9u8 { outb(0x3CE, i); state.gc[i as usize] = inb(0x3CF); }
+    state.misc_output.set(inb(0x3CC));
+    state.feature_ctl.set(inb(0x3CA));
+    for i in 0..5u8 { outb(0x3C4, i); state.seq.set(i as usize, inb(0x3C5)); }
+    for i in 0..25u8 { outb(0x3D4, i); state.crtc.set(i as usize, inb(0x3D5)); }
+    for i in 0..9u8 { outb(0x3CE, i); state.gc.set(i as usize, inb(0x3CF)); }
 
     // Cirrus makes the otherwise-hidden state readable. The regular CRTC/GC
     // indices and GC4 value are already in `state`, so this participates in
@@ -228,7 +228,7 @@ pub fn save(
         // Only the QEMU compatibility aperture reads below need the original
         // read-map selection before the flat plane walk takes control.
         if QEMU_COMPAT {
-            outb(0x3CF, state.gc[4]);
+            outb(0x3CF, state.gc.get(4));
         }
         state.latches_valid = true;
     } else {
@@ -244,7 +244,7 @@ pub fn save(
     for i in 0..21u8 {
         let _ = inb(0x3DA);
         outb(0x3C0, i);
-        state.ac[i as usize] = inb(0x3C1);
+        state.ac.set(i as usize, inb(0x3C1));
     }
 
     // Restore hardware AC to the program's tracked state. Always write the
@@ -258,9 +258,9 @@ pub fn save(
     }
 
     crate::compact_dbg_println!("VGA save: seq4={:02X} gc5={:02X} gc6={:02X} crtc14={:02X} crtc17={:02X} ac10={:02X} misc={:02X} start={:04X} dacmask={:02X}",
-        state.seq[4], state.gc[5], state.gc[6], state.crtc[0x14], state.crtc[0x17], state.ac[0x10], state.misc_output,
-        (state.crtc[0x0C] as u16) << 8 | state.crtc[0x0D] as u16,
-        state.dac_mask);
+        state.seq.get(4), state.gc.get(5), state.gc.get(6), state.crtc.get(0x14), state.crtc.get(0x17), state.ac.get(0x10), state.misc_output.get(),
+        (state.crtc.get(0x0C) as u16) << 8 | state.crtc.get(0x0D) as u16,
+        state.dac_mask.get());
 
     // QEMU VGA workaround: a conforming VGA's four flat plane reads are a
     // complete capture, but QEMU can expose a different backing interpretation
@@ -301,7 +301,7 @@ pub fn save(
     // the user sees a brief frame of scrambled pixels.
     // SEQ Index 1 bit 5 = "Screen Off" — DAC output forced to 0
     // without touching any other register. Restored at the bottom.
-    outb(0x3C4, 1); outb(0x3C5, state.seq[1] | 0x20);
+    outb(0x3C4, 1); outb(0x3C5, state.seq.get(1) | 0x20);
 
     // Force flat planar mode for reading planes:
     // SEQ mem mode = sequential access (no chain-4, no odd/even)
@@ -354,11 +354,11 @@ pub fn save(
     // directly into the ordering implied by this exact saved VGA state.
 
     // Restore registers we temporarily changed (incl. SEQ[1] to unblank)
-    outb(0x3C4, 1); outb(0x3C5, state.seq[1]);
-    outb(0x3C4, 4); outb(0x3C5, state.seq[4]);
-    outb(0x3CE, 4); outb(0x3CF, state.gc[4]);
-    outb(0x3CE, 5); outb(0x3CF, state.gc[5]);
-    outb(0x3CE, 6); outb(0x3CF, state.gc[6]);
+    outb(0x3C4, 1); outb(0x3C5, state.seq.get(1));
+    outb(0x3C4, 4); outb(0x3C5, state.seq.get(4));
+    outb(0x3CE, 4); outb(0x3CF, state.gc.get(4));
+    outb(0x3CE, 5); outb(0x3CF, state.gc.get(5));
+    outb(0x3CE, 6); outb(0x3CF, state.gc.get(6));
     // Restore the program's tracked index registers
     outb(0x3C4, state.seq_index);
     outb(0x3D4, state.crtc_index);
@@ -384,18 +384,18 @@ pub fn save_dac(_cap: &crate::kernel::platform::VgaCap, state: &mut LegacyVgaSta
     // scanout is using the normal all-bits mask. Replaying that fabricated
     // zero during a display handoff makes every indexed VBE pixel select DAC
     // entry zero. A zero mask is therefore unknowable on this backend.
-    state.dac_mask = if crate::kernel::platform::get().host
+    state.dac_mask.set(if crate::kernel::platform::get().host
         == crate::kernel::platform::Host::Qemu
         && dac_mask == 0
     {
         0xFF
     } else {
         dac_mask
-    };
+    });
     state.dac_index = inb(0x3C8);
     state.dac_state = inb(0x3C7);
     outb(0x3C7, 0);
-    for i in 0..768 { state.dac[i] = inb(0x3C9); }
+    for i in 0..768 { state.dac.set(i, inb(0x3C9)); }
 }
 
 /// RetroOS VBE 4F09h over an indexed native mode. VBE palette entries are
@@ -438,7 +438,7 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
     // Step 1: Write planes in forced flat planar mode.
     // Need misc_output for clock source, but force sequential planar access.
     outb(0x3C4, 0); outb(0x3C5, 0x01); // sync reset
-    outb(0x3C2, state.misc_output);
+    outb(0x3C2, state.misc_output.get());
     outb(0x3C4, 2); outb(0x3C5, 0x0F); // map mask: all planes
     outb(0x3C4, 4); outb(0x3C5, 0x06); // mem mode: sequential, no chain-4
     outb(0x3C4, 0); outb(0x3C5, 0x03); // release reset
@@ -486,24 +486,24 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
     // Step 2: Set target mode registers.
     // Bracket SEQ writes with sync reset so a dot-clock change in
     // misc_output/seq[1] doesn't glitch the sequencer mid-cycle.
-    // Reverse iteration so SEQ[0] = state.seq[0] is the last write
+    // Reverse iteration so SEQ[0] = state.seq.get(0) is the last write
     // and naturally acts as the release.
     outb(0x3C4, 0); outb(0x3C5, 0x01); // assert sync reset
-    outb(0x3C2, state.misc_output);
-    outb(0x3DA, state.feature_ctl); // FCR (color mode write port)
+    outb(0x3C2, state.misc_output.get());
+    outb(0x3DA, state.feature_ctl.get()); // FCR (color mode write port)
     // SEQ restore: hold screen-off (bit 5) through SEQ[1] so the CRTC/AC/DAC
     // reprogramming below stays dark. The final explicit SEQ[1] write at
     // the end of this function unblanks.
     for i in (0..5u8).rev() {
-        let v = if i == 1 { state.seq[1] | 0x20 } else { state.seq[i as usize] };
+        let v = if i == 1 { state.seq.get(1) | 0x20 } else { state.seq.get(i as usize) };
         outb(0x3C4, i); outb(0x3C5, v);
     }
 
     // CRTC — unlock first (clear protect bit in reg 0x11)
-    outb(0x3D4, 0x11); outb(0x3D5, state.crtc[0x11] & 0x7F);
-    for i in 0..25u8 { outb(0x3D4, i); outb(0x3D5, state.crtc[i as usize]); }
+    outb(0x3D4, 0x11); outb(0x3D5, state.crtc.get(0x11) & 0x7F);
+    for i in 0..25u8 { outb(0x3D4, i); outb(0x3D5, state.crtc.get(i as usize)); }
     // Graphics Controller
-    for i in 0..9u8 { outb(0x3CE, i); outb(0x3CF, state.gc[i as usize]); }
+    for i in 0..9u8 { outb(0x3CE, i); outb(0x3CF, state.gc.get(i as usize)); }
 
     // QEMU VGA workaround corresponding to the save-side linear capture.
     // A conforming VGA is fully restored by the flat four-plane write above;
@@ -521,7 +521,7 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
         outb(0x3C4, 2); outb(0x3C5, 0x0F); // all chain-selected planes enabled
         outb(0x3CE, 1); outb(0x3CF, 0x00); // disable set/reset
         outb(0x3CE, 3); outb(0x3CF, 0x00); // no rotate/ALU operation
-        outb(0x3CE, 5); outb(0x3CF, state.gc[5] & !0x03); // write mode 0
+        outb(0x3CE, 5); outb(0x3CF, state.gc.get(5) & !0x03); // write mode 0
         outb(0x3CE, 8); outb(0x3CF, 0xFF); // pass every CPU data bit
 
         let chained_window = (crate::LOW_MEM_BASE + 0xA0000) as *mut u8;
@@ -529,9 +529,9 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
             unsafe { core::ptr::write_volatile(chained_window.add(i), src); }
         }
 
-        outb(0x3C4, 2); outb(0x3C5, state.seq[2]);
+        outb(0x3C4, 2); outb(0x3C5, state.seq.get(2));
         for i in [1u8, 3, 5, 8] {
-            outb(0x3CE, i); outb(0x3CF, state.gc[i as usize]);
+            outb(0x3CE, i); outb(0x3CF, state.gc.get(i as usize));
         }
     }
 
@@ -558,7 +558,7 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
         outb(0x3C4, 2); outb(0x3C5, 0x03); // char plane 0 + attribute plane 1
         outb(0x3CE, 1); outb(0x3CF, 0x00); // disable set/reset
         outb(0x3CE, 3); outb(0x3CF, 0x00); // no rotate/ALU operation
-        outb(0x3CE, 5); outb(0x3CF, state.gc[5] & !0x03); // write mode 0
+        outb(0x3CE, 5); outb(0x3CF, state.gc.get(5) & !0x03); // write mode 0
         outb(0x3CE, 8); outb(0x3CF, 0xFF); // pass every CPU data bit
 
         let text_window = (crate::LOW_MEM_BASE + 0xB8000) as *mut u8;
@@ -566,14 +566,14 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
             unsafe { core::ptr::write_volatile(text_window.add(i), src); }
         }
 
-        outb(0x3C4, 2); outb(0x3C5, state.seq[2]);
+        outb(0x3C4, 2); outb(0x3C5, state.seq.get(2));
         for i in [1u8, 3, 5, 8] {
-            outb(0x3CE, i); outb(0x3CF, state.gc[i as usize]);
+            outb(0x3CE, i); outb(0x3CF, state.gc.get(i as usize));
         }
     }
     // Attribute Controller — write all 21 registers
     let _ = inb(0x3DA);
-    for i in 0..21u8 { outb(0x3C0, i); outb(0x3C0, state.ac[i as usize]); }
+    for i in 0..21u8 { outb(0x3C0, i); outb(0x3C0, state.ac.get(i as usize)); }
     // Restore the program's AC state. Same pattern as `save`.
     let _ = inb(0x3DA);
     let ac_index = if state.ac_pas_valid {
@@ -590,9 +590,9 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
     }
     unsafe { AC = AcState { index: ac_index, pending_data: state.ac_state.pending_data }; }
     // DAC
-    outb(0x3C6, state.dac_mask);
+    outb(0x3C6, state.dac_mask.get());
     outb(0x3C8, 0);
-    for i in 0..768 { outb(0x3C9, state.dac[i]); }
+    for i in 0..768 { outb(0x3C9, state.dac.get(i)); }
     // Restore the program's DAC index latch + read/write mode.
     // dac_state bits[1:0]: 0x03 = read-mode (set via 0x3C7),
     //                      0x00 = write-mode (set via 0x3C8).
@@ -604,7 +604,7 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
     // Unblank: rewrite SEQ[1] with the saved (bit-5-cleared) value now
     // that CRTC/GC/AC/DAC are all loaded. Has to happen before the index
     // restore below, which sets SEQ index to whatever the program had.
-    outb(0x3C4, 1); outb(0x3C5, state.seq[1]);
+    outb(0x3C4, 1); outb(0x3C5, state.seq.get(1));
 
     // Restore index registers
     outb(0x3C4, state.seq_index);
@@ -640,9 +640,9 @@ pub fn enable_palette_output(
 /// palette and PEL mask.
 pub fn restore_dac(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
     use crate::kernel::portio::outb;
-    outb(0x3C6, state.dac_mask);
+    outb(0x3C6, state.dac_mask.get());
     outb(0x3C8, 0);
-    for &component in &state.dac {
+    for &component in &state.dac.read() {
         outb(0x3C9, component);
     }
     if state.dac_state & 3 == 3 {

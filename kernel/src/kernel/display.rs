@@ -121,14 +121,14 @@ struct Presentation {
 }
 impl Presentation {
     fn render(&mut self) {
-        if self.clear { clear_packed_bars_cooperative(&self.fb, self.format, self.output, crate::kernel::media::checkpoint); }
+        if self.clear { clear_packed_bars_cooperative(&self.fb, self.format, self.output, &mut crate::kernel::media::checkpoint); }
         if self.partial {
             blit_regions_cooperative(&self.fb, self.format, self.output.0, self.output.1,
-                self.height, &self.pixels, &self.regions, crate::kernel::media::checkpoint);
+                self.height, &self.pixels, &self.regions, &mut crate::kernel::media::checkpoint);
         } else {
             blit_packed_cooperative(&self.fb, self.format, self.output, PackedSource {
                 width: self.width, height: self.height, pixels: &self.pixels, row: &mut self.row,
-            }, crate::kernel::media::checkpoint);
+            }, &mut crate::kernel::media::checkpoint);
         }
         finish_present();
     }
@@ -379,14 +379,14 @@ impl Display {
         );
         let mut state = vga::LegacyVgaState::new();
         let regs = vga::bios_mode13_regs();
-        state.misc_output = regs.misc;
-        state.seq = regs.seq;
-        state.gc = regs.gc;
-        state.crtc = regs.crtc;
-        for i in 0..16 { state.ac[i] = i as u8; }
-        state.ac[0x10] = 0x41;
-        state.ac[0x12] = 0x0f;
-        state.dac = vga::palette_rgb332();
+        state.misc_output.set(regs.misc);
+        state.seq.write(regs.seq);
+        state.gc.write(regs.gc);
+        state.crtc.write(regs.crtc);
+        for i in 0..16 { state.ac.set(i, i as u8); }
+        state.ac.set(0x10, 0x41);
+        state.ac.set(0x12, 0x0f);
+        state.dac.write(vga::palette_rgb332());
         state.planes.resize(4 * 0x10000, 0);
         crate::kernel::drivers::vga_hw::restore(&native, &state);
         Self {
@@ -1057,9 +1057,9 @@ fn blit(
 /// Only one packed destination row is staged; it is stretched once and reused
 /// for every vertical repetition of that source row.
 fn clear_packed_bars(fb: &Framebuffer, format: PixelFormat, output: (usize, usize)) {
-    clear_packed_bars_cooperative(fb, format, output, || {});
+    clear_packed_bars_cooperative(fb, format, output, &mut || {});
 }
-fn clear_packed_bars_cooperative(fb: &Framebuffer, format: PixelFormat, output: (usize, usize), cooperate: fn()) {
+fn clear_packed_bars_cooperative(fb: &Framebuffer, format: PixelFormat, output: (usize, usize), cooperate: &mut dyn FnMut()) {
     let (out_w, out_h) = output;
     if out_w > fb.width || out_h > fb.height { return; }
     let step = usize::from(format.bytes_per_pixel);
@@ -1087,12 +1087,12 @@ fn blit_packed(
     output: (usize, usize),
     source: PackedSource<'_>,
 ) -> usize {
-    blit_packed_cooperative(fb, format, output, source, || {})
+    blit_packed_cooperative(fb, format, output, source, &mut || {})
 }
 #[optimize(speed)]
 fn blit_packed_cooperative(
     fb: &Framebuffer, format: PixelFormat, output: (usize, usize),
-    source: PackedSource<'_>, cooperate: fn(),
+    source: PackedSource<'_>, cooperate: &mut dyn FnMut(),
 ) -> usize {
     let PackedSource { width: source_w, height: source_h, pixels: source, row } = source;
     let (out_w, out_h) = output;
@@ -1155,13 +1155,13 @@ fn blit_regions(
     shadow: &[u8],
     regions: &[crate::kernel::gui::Rect],
 ) -> usize {
-    blit_regions_cooperative(fb, format, out_w, out_h, vga_height, shadow, regions, || {})
+    blit_regions_cooperative(fb, format, out_w, out_h, vga_height, shadow, regions, &mut || {})
 }
 #[allow(clippy::too_many_arguments)]
 #[optimize(speed)]
 fn blit_regions_cooperative(
     fb: &Framebuffer, format: PixelFormat, out_w: usize, out_h: usize,
-    vga_height: usize, shadow: &[u8], regions: &[crate::kernel::gui::Rect], cooperate: fn(),
+    vga_height: usize, shadow: &[u8], regions: &[crate::kernel::gui::Rect], cooperate: &mut dyn FnMut(),
 ) -> usize {
     let step = format.bytes_per_pixel as usize;
     let row_bytes = out_w * step;
@@ -1698,12 +1698,12 @@ fn raster_shadow(
         return false;
     }
     if matches!(frame.mode, vga::VgaMode::LinearSvga { .. }) {
-        s.pal.sync_vbe(frame.palette, frame.dac_mask, format, &mut s.pal_cache);
+        s.pal.sync_vbe(&frame.palette, frame.dac_mask, format, &mut s.pal_cache);
     } else {
-        s.pal.sync(frame.palette, frame.dac_mask, format, &mut s.pal_cache);
+        s.pal.sync(&frame.palette, frame.dac_mask, format, &mut s.pal_cache);
     }
     if matches!(frame.mode, vga::VgaMode::Planar16 { .. } | vga::VgaMode::Text { .. }) {
-        s.pal.sync_planar(frame.ac);
+        s.pal.sync_planar(&frame.ac);
     }
     // The worker uses an owned snapshot; fallback callers join while reading
     // live VRAM. Palette and destination storage are already resident.

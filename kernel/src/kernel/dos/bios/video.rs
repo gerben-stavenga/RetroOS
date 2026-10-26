@@ -329,7 +329,7 @@ pub(in crate::kernel::dos) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mu
             // framebuffer. Text modes write the char byte at the cursor cell.
             if !machine::vga::bios_draw_glyph(machine, &mut dos.pc.vga, mode, ch, col, row, fg) {
                 let at = text_cell(machine, page, row, col);
-                machine.write::<u8>(at, ch);
+                machine::vga::copy_to_guest(machine, &mut dos.pc.vga, at, &[ch]);
             }
             col += 1;
             if col >= cols as u32 {
@@ -340,7 +340,7 @@ pub(in crate::kernel::dos) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mu
     }
     let max_row: u8 = bda_field!(machine, rows_minus1);
     if row > max_row as u32 {
-        scroll_text_page(machine, page, cols, max_row);
+        scroll_text_page(machine, dos, page, cols, max_row);
         row = max_row as u32;
     }
     machine.write::<u16>(Bda::BASE + pos_off, ((row << 8) | col) as u16);
@@ -349,7 +349,7 @@ pub(in crate::kernel::dos) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mu
 
 /// Scroll a text page up one line, blanking the last. A no-op in a graphics
 /// mode, where there are no character cells to move.
-fn scroll_text_page<A: crate::Arch>(machine: &mut A, page: u8, cols: u16, max_row: u8) {
+fn scroll_text_page<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, page: u8, cols: u16, max_row: u8) {
     let mode = Bda::video_mode(machine);
     if !is_text_mode(mode) {
         return;
@@ -361,14 +361,14 @@ fn scroll_text_page<A: crate::Arch>(machine: &mut A, page: u8, cols: u16, max_ro
     for r in 1..rows {
         for c in 0..cols {
             let v: u16 = machine.read(base + (r * cols + c) * 2);
-            machine.write::<u16>(base + ((r - 1) * cols + c) * 2, v);
+            machine::vga::copy_to_guest(machine, &mut dos.pc.vga, base + ((r - 1) * cols + c) * 2, &v.to_le_bytes());
         }
     }
     // Blank with the attribute the vacated line already carried, so a coloured
     // screen scrolls in its own colour rather than reverting to grey-on-black.
     let attr = machine.read::<u16>(base + ((rows - 1) * cols) * 2) & 0xFF00;
     for c in 0..cols {
-        machine.write::<u16>(base + ((rows - 1) * cols + c) * 2, attr | b' ' as u16);
+        machine::vga::copy_to_guest(machine, &mut dos.pc.vga, base + ((rows - 1) * cols + c) * 2, &(attr | b' ' as u16).to_le_bytes());
     }
 }
 
@@ -471,7 +471,7 @@ fn set_cga_compat_palette<A: crate::Arch>(
 ///
 /// Graphics modes are left alone: scrolling a pixel buffer needs the mode's
 /// plane layout, and no guest we serve asks for it.
-fn scroll_window<A: crate::Arch>(machine: &mut A, regs: &mut Regs, up: bool) {
+fn scroll_window<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, up: bool) {
     let mode = Bda::video_mode(machine);
     if !is_text_mode(mode) {
         return;
@@ -506,7 +506,7 @@ fn scroll_window<A: crate::Arch>(machine: &mut A, regs: &mut Regs, up: bool) {
                 None => blank,
             };
             let to = text_cell(machine, page, dst, c);
-            machine.write::<u16>(to, val);
+            machine::vga::copy_to_guest(machine, &mut dos.pc.vga, to, &val.to_le_bytes());
         }
     }
 }
@@ -613,7 +613,7 @@ pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
                 sync_cursor_position(machine, dos);
             }
         }
-        0x06 | 0x07 => scroll_window(machine, regs, ah == 0x06),
+        0x06 | 0x07 => scroll_window(machine, dos, regs, ah == 0x06),
         0x08 => {
             // Read the character + attribute under the cursor (BH = page).
             let page = ((regs.rbx >> 8) & 7) as u8;
@@ -655,9 +655,9 @@ pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
                 if !machine::vga::bios_draw_glyph(machine, &mut dos.pc.vga, mode, ch, c, r, attr) {
                     let at = text_cell(machine, page, r, c);
                     if ah == 0x09 {
-                        machine.write::<u16>(at, ((attr as u16) << 8) | ch as u16);
+                        machine::vga::copy_to_guest(machine, &mut dos.pc.vga, at, &[ch, attr]);
                     } else {
-                        machine.write::<u8>(at, ch);
+                        machine::vga::copy_to_guest(machine, &mut dos.pc.vga, at, &[ch]);
                     }
                 }
             }

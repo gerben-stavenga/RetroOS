@@ -61,7 +61,7 @@ pub use machine::vsb::SbDevice;
 pub use machine::vga::physical_vga_present;
 pub(crate) use machine::vga::release_fullscreen;
 pub(crate) use machine::vga::reserve_live_vram;
-pub(crate) use machine::vga::{LiveRegion, sample_live, scanout_revision, live_access, try_live_access};
+pub(crate) use machine::vga::{LiveRegion, sample_live, scanout_revision, scanout_epoch, live_access, try_live_access};
 use crate::kernel::bios_display::{DosVideo, EmulatedVga};
 pub(crate) use dos::dos_to_unix_datetime;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from

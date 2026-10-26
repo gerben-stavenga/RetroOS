@@ -23,6 +23,11 @@
 
 extern crate alloc;
 
+pub mod beam;
+pub mod registers;
+pub mod memory;
+pub mod scanout;
+
 /// Which VGA mode the video memory is laid out for. The caller derives this from
 /// the CRTC/SEQ/GC registers (or the INT 10h mode set); only the renderable
 /// distinctions are named here.
@@ -81,9 +86,10 @@ impl TextCursor {
     }
 }
 
-/// One frame's worth of renderable VGA state. Borrowed — the renderer copies
-/// nothing it doesn't have to.
+/// Registers used to decode a row or an owned snapshot. Register values are
+/// local to the fetch; VRAM is either borrowed storage or shared device memory.
 pub struct Frame<'a> {
+    pub memory: Option<memory::Memory<'a>>,
     pub mode: VgaMode,
     /// Linear video memory: the A0000 window (mode 13h) or the B8000 buffer
     /// (text, CGA). Used by the chained/linear modes; planar modes read
@@ -100,10 +106,10 @@ pub struct Frame<'a> {
     /// with the colour-select bits to form the DAC index). Index 16..20 are
     /// mode-control/overscan/etc; the renderer reads [16] (mode control) only
     /// via `blink`. AC[0x14] is the colour-select register.
-    pub ac: &'a [u8; 21],
+    pub ac: [u8; 21],
     /// DAC palette: 256 entries × (R,G,B), each component 6-bit (0..63) as the
     /// VGA stores it. Used by all indexed modes.
-    pub palette: &'a [u8; 768],
+    pub palette: [u8; 768],
     /// VGA PEL mask (port 3C6h). The pixel/attribute-derived DAC address is
     /// ANDed with this before palette lookup. Normally 0xFF.
     pub dac_mask: u8,
@@ -1274,16 +1280,37 @@ fn row_origin(frame: &Frame, sy: usize) -> (usize, usize, usize) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Reader<'a> { bytes: &'a [u8], live: Option<memory::Memory<'a>> }
+impl Reader<'_> {
+    #[inline] fn get(self, index: usize) -> Option<u8> {
+        if let Some(memory) = self.live { memory.get(index) }
+        else { self.bytes.get(index).copied() }
+    }
+}
+impl Frame<'_> {
+    fn linear(&self) -> Reader<'_> { Reader { bytes: self.vram, live: self.memory } }
+    fn planar(&self) -> Reader<'_> { Reader { bytes: self.planes, live: self.memory } }
+    fn has_linear(&self) -> bool {
+        !self.vram.is_empty() || self.memory.is_some()
+            && matches!(self.mode, VgaMode::Mode13h | VgaMode::LinearSvga { .. })
+    }
+}
+
 fn row_mode13(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usize) {
     let (start, pan, ry) = row_origin(frame, sy);
     let base = start + ry * w + pan;
-    row_indexed_wrapped(frame.vram, base, VGA_PLANE_BYTES, pal, st, w);
+    row_indexed_wrapped(frame.linear(), base, VGA_PLANE_BYTES, pal, st, w);
 }
 
 /// Validate the source span once, then run only the palette lookup and store
 /// in the indexed writer's pixel loop.
-fn row_indexed(vram: &[u8], base: usize, pal: &Pal, st: &mut impl PixelRow, w: usize) {
-    let available = vram.get(base..).unwrap_or(&[]);
+fn row_indexed(vram: Reader<'_>, base: usize, pal: &Pal, st: &mut impl PixelRow, w: usize) {
+    if vram.live.is_some() {
+        for x in 0..w { st.put(pal.lut[vram.get(base + x).unwrap_or(0) as usize]); }
+        return;
+    }
+    let available = vram.bytes.get(base..).unwrap_or(&[]);
     let source = &available[..available.len().min(w)];
     st.indexed(pal, source);
     for _ in source.len()..w {
@@ -1294,7 +1321,7 @@ fn row_indexed(vram: &[u8], base: usize, pal: &Pal, st: &mut impl PixelRow, w: u
 /// VGA scanout address counters wrap at the end of their addressable VRAM.
 /// Emit each contiguous portion before wrapping so indexed rows keep the
 /// palette lookup fast even when a scrolling viewport straddles the end.
-fn row_indexed_wrapped(vram: &[u8], base: usize, span: usize, pal: &Pal, st: &mut impl PixelRow, w: usize) {
+fn row_indexed_wrapped(vram: Reader<'_>, base: usize, span: usize, pal: &Pal, st: &mut impl PixelRow, w: usize) {
     let mut offset = base % span;
     let mut remaining = w;
     while remaining != 0 {
@@ -1322,17 +1349,14 @@ fn row_modex<const ODD_EVEN: bool>(frame: &Frame, sy: usize, pal: &Pal, st: &mut
         // Plane-minor backing interleaves adjacent pixels. The VGA CRTC has
         // only a 16-bit address within each plane, so a virtual scanline can
         // cross the 64 KiB plane boundary and continue at address zero.
-        row_indexed_wrapped(frame.planes, (start + ry * rb) * 4 + pan,
+        row_indexed_wrapped(frame.planar(), (start + ry * rb) * 4 + pan,
             VGA_PLANE_BYTES * 4, pal, st, w);
         return;
     }
     for x in 0..w {
         let sx = x + pan;
         let off = (start + ry * rb + sx / 4) & (VGA_PLANE_BYTES - 1);
-        let idx = frame
-            .planes
-            .get(plane_index::<ODD_EVEN>(sx & 3, off))
-            .copied()
+        let idx = frame.planar().get(plane_index::<ODD_EVEN>(sx & 3, off))
             .unwrap_or(0);
         st.put(pal.lut[idx as usize]);
     }
@@ -1348,10 +1372,10 @@ fn row_planar16<const ODD_EVEN: bool>(frame: &Frame, sy: usize, pal: &Pal, st: &
     let (mut x, mut bit, mut sbyte) = (0usize, pan & 7, pan / 8);
     while x < w {
         let off = (base + sbyte) & (VGA_PLANE_BYTES - 1);
-        let p0 = frame.planes.get(plane_index::<ODD_EVEN>(0, off)).copied().unwrap_or(0) as usize;
-        let p1 = frame.planes.get(plane_index::<ODD_EVEN>(1, off)).copied().unwrap_or(0) as usize;
-        let p2 = frame.planes.get(plane_index::<ODD_EVEN>(2, off)).copied().unwrap_or(0) as usize;
-        let p3 = frame.planes.get(plane_index::<ODD_EVEN>(3, off)).copied().unwrap_or(0) as usize;
+        let p0 = frame.planar().get(plane_index::<ODD_EVEN>(0, off)).unwrap_or(0) as usize;
+        let p1 = frame.planar().get(plane_index::<ODD_EVEN>(1, off)).unwrap_or(0) as usize;
+        let p2 = frame.planar().get(plane_index::<ODD_EVEN>(2, off)).unwrap_or(0) as usize;
+        let p3 = frame.planar().get(plane_index::<ODD_EVEN>(3, off)).unwrap_or(0) as usize;
         let pix = SPREAD[p0] | (SPREAD[p1] << 1) | (SPREAD[p2] << 2) | (SPREAD[p3] << 3);
         while bit < 8 && x < w {
             st.put(pal.planar[((pix >> (4 * bit)) & 0xF) as usize]);
@@ -1369,11 +1393,11 @@ fn row_cga4(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usiz
     let bank = (sy & 1) * 0x2000 + (sy >> 1) * (w / 4);
     for x in 0..w {
         let address = bank + x / 4;
-        let byte = if frame.vram.is_empty() {
-            frame.planes.get(frame.plane_layout.index(address & 1, address >> 1))
-                .copied().unwrap_or(0)
+        let byte = if !frame.has_linear() {
+            frame.planar().get(frame.plane_layout.index(address & 1, address >> 1))
+                .unwrap_or(0)
         } else {
-            frame.vram.get(address).copied().unwrap_or(0)
+            frame.linear().get(address).unwrap_or(0)
         };
         st.put(c[((byte >> (6 - (x & 3) * 2)) & 0x03) as usize]);
     }
@@ -1384,11 +1408,11 @@ fn row_cga2(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usiz
     let bank = (sy & 1) * 0x2000 + (sy >> 1) * (w / 8);
     for x in 0..w {
         let address = bank + x / 8;
-        let byte = if frame.vram.is_empty() {
-            frame.planes.get(frame.plane_layout.index(0, address))
-                .copied().unwrap_or(0)
+        let byte = if !frame.has_linear() {
+            frame.planar().get(frame.plane_layout.index(0, address))
+                .unwrap_or(0)
         } else {
-            frame.vram.get(address).copied().unwrap_or(0)
+            frame.linear().get(address).unwrap_or(0)
         };
         st.put(if byte & (0x80 >> (x & 7)) != 0 { fg } else { bg });
     }
@@ -1409,12 +1433,12 @@ fn row_text(
     let repeat = cell_w / dot_w;
     for col in 0..cols {
         let cell = ((frame.start_offset + trow * cols + col) & 0xFFFF) * 2;
-        let (ch, attr) = if frame.vram.is_empty() {
-            let Some(&ch) = frame.planes.get(frame.plane_layout.index(0, cell / 2)) else { return };
-            let Some(&attr) = frame.planes.get(frame.plane_layout.index(1, cell / 2)) else { return };
+        let (ch, attr) = if !frame.has_linear() {
+            let Some(ch) = frame.planar().get(frame.plane_layout.index(0, cell / 2)) else { return };
+            let Some(attr) = frame.planar().get(frame.plane_layout.index(1, cell / 2)) else { return };
             (ch as usize, attr)
         } else {
-            let Some((&ch, &attr)) = frame.vram.get(cell).zip(frame.vram.get(cell + 1)) else { return };
+            let Some((ch, attr)) = frame.linear().get(cell).zip(frame.linear().get(cell + 1)) else { return };
             (ch as usize, attr)
         };
         let fg = pal.planar[(attr & 0x0F) as usize];
@@ -1427,9 +1451,9 @@ fn row_text(
         // Map B is selected when it is clear (Sequencer register 3).
         let bits = if let Some((map_a, map_b)) = frame.font_maps {
             let map = if attr & 0x08 != 0 { map_a } else { map_b };
-            frame.planes.get(frame.plane_layout.index(
+            frame.planar().get(frame.plane_layout.index(
                 2, usize::from(map) * 0x2000 + ch * 32 + gy,
-            )).copied().unwrap_or(0)
+            )).unwrap_or(0)
         } else {
             let font = if attr & 0x08 != 0 { frame.font } else { frame.font_b };
             font[ch * cell_h + gy]
@@ -1467,9 +1491,9 @@ fn row_text(
 fn row_svga(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usize, bpp: u8, pitch: usize) {
     let bpp8 = (bpp as usize).div_ceil(8);
     let pitch = if pitch == 0 { w * bpp8 } else { pitch };
-    let vram = frame.vram;
-    let rd16 = |p: usize| (vram.get(p).copied().unwrap_or(0) as u16)
-        | ((vram.get(p + 1).copied().unwrap_or(0) as u16) << 8);
+    let vram = frame.linear();
+    let rd16 = |p: usize| (vram.get(p).unwrap_or(0) as u16)
+        | ((vram.get(p + 1).unwrap_or(0) as u16) << 8);
     let base = sy * pitch;
     if bpp == 8 {
         row_indexed(vram, base, pal, st, w);
@@ -1480,7 +1504,7 @@ fn row_svga(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usiz
         // 8bpp is a DAC index like every other mode; the direct-colour depths
         // carry their own channels and need encoding per pixel.
         st.put(match bpp {
-            8 => pal.lut[vram.get(p).copied().unwrap_or(0) as usize],
+            8 => pal.lut[vram.get(p).unwrap_or(0) as usize],
             15 => {
                 let v = rd16(p);
                 pal.fmt.encode(((((v >> 10) & 0x1F) as u32 * 255 / 31) << 16)
@@ -1494,9 +1518,9 @@ fn row_svga(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usiz
                     | ((v & 0x1F) as u32 * 255 / 31))
             }
             _ => {
-                let b = vram.get(p).copied().unwrap_or(0) as u32;
-                let g = vram.get(p + 1).copied().unwrap_or(0) as u32;
-                let r = vram.get(p + 2).copied().unwrap_or(0) as u32;
+                let b = vram.get(p).unwrap_or(0) as u32;
+                let g = vram.get(p + 1).unwrap_or(0) as u32;
+                let r = vram.get(p + 2).unwrap_or(0) as u32;
                 pal.fmt.encode((r << 16) | (g << 8) | b)
             }
         });
@@ -1509,6 +1533,17 @@ fn row_svga(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usiz
 /// so the caller need not pre-zero; any slack beyond `w*h` is left untouched.
 pub fn render(frame: &Frame, out: &mut [u32]) -> (usize, usize) {
     let (w, h) = dimensions(frame.mode);
+    if frame.memory.is_some() {
+        let mut pal = Pal::new();
+        pal.sync(&frame.palette, frame.dac_mask, PixelFormat::NATIVE, &mut [0; 768]);
+        pal.sync_planar(&frame.ac);
+        for row in 0..h {
+            if let Some(out) = out.get_mut(row * w..(row + 1) * w) {
+                render_row(frame, row, &pal, out);
+            }
+        }
+        return (w, h);
+    }
     let n = (w * h).min(out.len());
     let out = &mut out[..n];
     for px in out.iter_mut() {
@@ -1549,7 +1584,7 @@ fn render_svga(frame: &Frame, out: &mut [u32], w: usize, h: usize, bpp: u8, pitc
             let p = base + x * bpp8;
             *px = match bpp {
                 8 => pal_rgb_width(
-                    frame.palette,
+                    &frame.palette,
                     vram.get(p).copied().unwrap_or(0) & frame.dac_mask,
                     true,
                 ),
@@ -1599,7 +1634,7 @@ fn render_mode13(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
         let row = &mut out[y * w..y * w + w];
         for (x, px) in row.iter_mut().enumerate() {
             *px = pal_rgb(
-                frame.palette,
+                &frame.palette,
                 vram.get((base + x) & (VGA_PLANE_BYTES - 1)).copied().unwrap_or(0) & frame.dac_mask,
             );
         }
@@ -1728,8 +1763,8 @@ fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes
     let colours: [u32; 16] =
         core::array::from_fn(|i| {
             pal_rgb(
-                frame.palette,
-                planar_dac_index(frame.ac, i as u8) & frame.dac_mask,
+                &frame.palette,
+                planar_dac_index(&frame.ac, i as u8) & frame.dac_mask,
             )
         });
     for y in 0..h {
@@ -1793,7 +1828,7 @@ fn render_modex(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: u
                 .get(frame.plane_layout.index(plane, off))
                 .copied()
                 .unwrap_or(0);
-            out[y * w + x] = pal_rgb(frame.palette, idx & frame.dac_mask);
+            out[y * w + x] = pal_rgb(&frame.palette, idx & frame.dac_mask);
         }
     }
 }
@@ -1834,11 +1869,11 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
         let Some((&ch, &attr)) = frame.vram.get(cell).zip(frame.vram.get(cell + 1)) else { return };
         (ch as usize, attr)
     };
-    let fg = pal_rgb(frame.palette, planar_dac_index(frame.ac, attr & 0x0F) & frame.dac_mask);
+    let fg = pal_rgb(&frame.palette, planar_dac_index(&frame.ac, attr & 0x0F) & frame.dac_mask);
     let bg_mask = if frame.blink { 0x07 } else { 0x0F };
     let bg = pal_rgb(
-        frame.palette,
-        planar_dac_index(frame.ac, (attr >> 4) & bg_mask) & frame.dac_mask,
+        &frame.palette,
+        planar_dac_index(&frame.ac, (attr >> 4) & bg_mask) & frame.dac_mask,
     );
     let compact_font = if attr & 0x08 != 0 { frame.font } else { frame.font_b };
     let font_map = frame.font_maps
@@ -2122,10 +2157,11 @@ mod tests {
         for i in 0..16 { ac[i] = i as u8; }
         let pal = fallback_palette();
         let frame = Frame {
+            memory: None,
             plane_layout: VramLayout::PlaneMinor,
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
-            ac: &ac, palette: &pal, dac_mask: 0xFF,
+            ac: ac, palette: pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, split_pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 8];
@@ -2181,10 +2217,11 @@ mod tests {
         let ac = [0u8; 21];
         let pal = fallback_palette();
         let frame = Frame {
+            memory: None,
             plane_layout: VramLayout::PlaneMinor,
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
-            ac: &ac, palette: &pal, dac_mask: 0xFF,
+            ac: ac, palette: pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, split_pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 4];
@@ -2205,10 +2242,11 @@ mod tests {
         let ac = [0u8; 21];
         let pal = fallback_palette();
         let frame = Frame {
+            memory: None,
             plane_layout: VramLayout::PlaneMinor,
             mode: VgaMode::ModeX { w: 4, h: 4, row_bytes: 1 },
             vram: &[], planes: &planes,
-            ac: &ac, palette: &pal, dac_mask: 0xFF,
+            ac: ac, palette: pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4],
             start_offset: 0x100, pixel_pan: 0, split_pixel_pan: 0, line_compare: 2, blank_start: usize::MAX,
         };
@@ -2227,10 +2265,11 @@ mod tests {
         let ac = [0u8; 21];
         let pal = fallback_palette();
         let frame = Frame {
+            memory: None,
             plane_layout: VramLayout::PlaneMinor,
             mode: VgaMode::ModeX { w: 4, h: 4, row_bytes: 1 },
             vram: &[], planes: &planes,
-            ac: &ac, palette: &pal, dac_mask: 0xFF,
+            ac: ac, palette: pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16,
             font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, split_pixel_pan: 0,
             line_compare: usize::MAX, blank_start: 3,
@@ -2251,8 +2290,8 @@ mod tests {
     #[test]
     fn tim_vertical_blank_starts_at_row_470() {
         let mut state = LegacyVgaState::new();
-        state.crtc = bios_mode_regs(0x12).unwrap().crtc;
-        state.crtc[0x15] = 0xD6;
+        state.crtc.write(bios_mode_regs(0x12).unwrap().crtc);
+        state.crtc.set(0x15, 0xD6);
         assert_eq!(state.vertical_blank_start(480), 470);
     }
 
@@ -2340,10 +2379,11 @@ mod tests {
         let ac = [0u8; 21];
         let pal = fallback_palette();
         let frame = Frame {
+            memory: None,
             plane_layout: VramLayout::PlaneMinor,
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
-            ac: &ac, palette: &pal, dac_mask: 0xFF,
+            ac: ac, palette: pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, split_pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 4];
@@ -2363,10 +2403,11 @@ mod tests {
         let ac = [0u8; 21];
         let pal = fallback_palette();
         let frame = Frame {
+            memory: None,
             plane_layout: VramLayout::PlaneMinor,
             mode: VgaMode::Mode13h,
             vram: &vram, planes: &[],
-            ac: &ac, palette: &pal, dac_mask: 0xFF,
+            ac: ac, palette: pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4],
             start_offset: 320, pixel_pan: 3, split_pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
         };
@@ -2385,9 +2426,10 @@ mod tests {
         let ac = [0u8; 21];
         let mk = |mode, vram: &[u8]| {
             let frame = Frame {
+            memory: None,
                 plane_layout: VramLayout::PlaneMinor,
                 mode, vram, planes: &[],
-                ac: &ac, palette: &pal, dac_mask: 0xFF,
+                ac: ac, palette: pal, dac_mask: 0xFF,
                 font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4],
                 start_offset: 0, pixel_pan: 0, split_pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
             };
@@ -2507,27 +2549,25 @@ pub struct PortWrite {
     pub vram_transition: Option<VramTransition>,
 }
 
+/// Current VGA beam status and counts of elapsed register-latch edges.
+#[derive(Clone, Copy, Debug)]
+pub struct Beam {
+    pub status: u8,
+    pub address_epoch: u64,
+    pub panning_epoch: u64,
+}
+
 /// Per-process VGA state: 256KB framebuffer (4 planes) + all registers.
 /// Saved/restored on context switch so each process has its own screen.
 #[derive(Clone)]
 pub struct LegacyVgaState {
     /// 4 planes × 64KB = 256KB framebuffer (flat: plane 0 at [0..65536], etc.)
     pub planes: alloc::vec::Vec<u8>,
-    // ── Registers ──
-    pub misc_output: u8,
-    pub feature_ctl: u8,
-    /// CGA Mode-Control (0x3D8) and Colour-Select (0x3D9). The CGA renderer
-    /// resolves its 4-colour palette from these (palette 0/1, foreground
-    /// intensity, background/border colour); real-VGA passthrough honours them
-    /// in hardware, so they matter only on the emulated (UEFI/hosted) path.
-    pub cga_mode_ctl: u8,
-    pub cga_color_select: u8,
-    pub seq: [u8; 5],
-    pub crtc: [u8; 25],
-    pub gc: [u8; 9],
-    pub ac: [u8; 21],
-    pub dac: [u8; 768],
-    pub dac_mask: u8,
+    pub registers: registers::RegisterFile,
+    scanout_frame: u64,
+    scanout_start: u16,
+    panning_frame: u64,
+    scanout_pan: u8,
     // ── Port index / state ──
     pub seq_index: u8,
     pub crtc_index: u8,
@@ -2565,6 +2605,11 @@ pub struct LegacyVgaState {
     pub latches_valid: bool,
 }
 
+impl core::ops::Deref for LegacyVgaState {
+    type Target = registers::Registers;
+    fn deref(&self) -> &Self::Target { &self.registers }
+}
+
 impl Default for LegacyVgaState {
     fn default() -> Self {
         Self::new()
@@ -2572,46 +2617,10 @@ impl Default for LegacyVgaState {
 }
 
 impl LegacyVgaState {
-    /// Allocate and initialize the register file in its final heap location.
-    /// `LegacyVgaState::new()` is almost 1 KiB (chiefly the DAC); embedding that call
-    /// in `PcMachine::new_boxed` made rustc materialize a temporary on the
-    /// already-deep fork/exec kernel stack before copying it into the box.
+    /// The large register file lives behind its own shared allocation; the
+    /// CPU-side indices and latches now fit in a small boxed value.
     pub fn new_boxed() -> alloc::boxed::Box<Self> {
-        let mut boxed = alloc::boxed::Box::<Self>::new_uninit();
-        let p = boxed.as_mut_ptr();
-        unsafe {
-            core::ptr::addr_of_mut!((*p).planes).write(alloc::vec::Vec::new());
-            core::ptr::addr_of_mut!((*p).misc_output).write(0);
-            core::ptr::addr_of_mut!((*p).feature_ctl).write(0);
-            core::ptr::addr_of_mut!((*p).cga_mode_ctl).write(0);
-            core::ptr::addr_of_mut!((*p).cga_color_select).write(0);
-            core::ptr::addr_of_mut!((*p).seq).write([0; 5]);
-            core::ptr::addr_of_mut!((*p).crtc).write([0; 25]);
-            let mut gc = [0; 9];
-            gc[8] = 0xFF;
-            core::ptr::addr_of_mut!((*p).gc).write(gc);
-            let mut ac = [0; 21];
-            ac[0x10] = 0x08;
-            core::ptr::addr_of_mut!((*p).ac).write(ac);
-            let dac = core::ptr::addr_of_mut!((*p).dac);
-            core::ptr::write_bytes(dac.cast::<u8>(), 0, 768);
-            core::ptr::addr_of_mut!((*p).dac_mask).write(0xFF);
-            core::ptr::addr_of_mut!((*p).seq_index).write(0);
-            core::ptr::addr_of_mut!((*p).crtc_index).write(0);
-            core::ptr::addr_of_mut!((*p).gc_index).write(0);
-            core::ptr::addr_of_mut!((*p).ac_state).write(AcState::new());
-            core::ptr::addr_of_mut!((*p).ac_pas_valid).write(true);
-            core::ptr::addr_of_mut!((*p).dac_index).write(0);
-            core::ptr::addr_of_mut!((*p).dac_state).write(0);
-            core::ptr::addr_of_mut!((*p).dac_read_index).write(0);
-            core::ptr::addr_of_mut!((*p).dac_rsub).write(0);
-            core::ptr::addr_of_mut!((*p).dac_wsub).write(0);
-            core::ptr::addr_of_mut!((*p).latches).write([0; 4]);
-            core::ptr::addr_of_mut!((*p).latches_valid).write(true);
-            let mut boxed = boxed.assume_init();
-            fill_fallback_palette(&mut boxed.dac);
-            boxed
-        }
+        alloc::boxed::Box::new(Self::new())
     }
 
     /// A complete power-on DOS display image. This is the same mode 3 that
@@ -2620,17 +2629,17 @@ impl LegacyVgaState {
     /// rendered in software or restored directly to a real VGA.
     pub fn new_mode3_boxed() -> alloc::boxed::Box<Self> {
         let mut state = Self::new_boxed();
-        state.dac = ega_dac();
+        state.dac.write(ega_dac());
         let regs = bios_mode3_regs();
-        state.misc_output = regs.misc;
-        state.seq = regs.seq;
-        state.gc = regs.gc;
-        state.crtc = regs.crtc;
+        state.misc_output.set(regs.misc);
+        state.seq.write(regs.seq);
+        state.gc.write(regs.gc);
+        state.crtc.write(regs.crtc);
         state.planes.resize(4 * 0x10000, 0);
 
-        state.ac[..16].copy_from_slice(&VGA_TEXT_AC_PALETTE);
-        state.ac[0x10] = 0x0C; // text, line-graphics ninth dot, blink
-        state.ac[0x12] = 0x0F; // all colour planes enabled
+        state.ac.write_range(0, &VGA_TEXT_AC_PALETTE);
+        state.ac.set(0x10, 0x0C); // text, line-graphics ninth dot, blink
+        state.ac.set(0x12, 0x0F); // all colour planes enabled
         state.ac_state = AcState::new();
 
         // Mode-3 clear: 80x25 spaces with light-grey-on-black attributes.
@@ -2652,29 +2661,11 @@ impl LegacyVgaState {
     pub fn new() -> Self {
         Self {
             planes: alloc::vec::Vec::new(),
-            // EGA/text DAC defaults so the emulated model renders text in
-            // colour even though text-mode programs never program the DAC
-            // (mode 13h loads overwrite these). Harmless for the metal
-            // snapshot use: vga_hw::restore no-ops until a real save
-            // fills `planes`, which also rewrites the whole DAC.
-            misc_output: 0,
-            feature_ctl: 0,
-            cga_mode_ctl: 0,
-            cga_color_select: 0,
-            seq: [0; 5],
-            crtc: [0; 25],
-            // GC Bit Mask (index 8) resets to 0xFF — every CPU-data bit passes
-            // through; BIOS mode-set leaves it so and Mode X / EGA writes rely
-            // on it. Defaulting it to 0 masked every planar write to the latch.
-            gc: { let mut g = [0u8; 9]; g[8] = 0xFF; g },
-            // AC mode-control (reg 0x10) bit 3 set: blink semantics for
-            // attribute bit 7, the BIOS mode-3 power-on default. TUIs that
-            // want 16 background colors clear it (INT 10h AX=1003 BL=0 or a
-            // direct AC write — both land here); DN's dark-grey panels
-            // (bg=8) rendered black until this was modeled.
-            ac: { let mut a = [0u8; 21]; a[0x10] = 0x08; a },
-            dac: fallback_palette(),
-            dac_mask: 0xFF,
+            registers: registers::RegisterFile::default(),
+            scanout_frame: u64::MAX,
+            scanout_start: 0,
+            panning_frame: u64::MAX,
+            scanout_pan: 0,
             seq_index: 0,
             crtc_index: 0,
             gc_index: 0,
@@ -2690,8 +2681,66 @@ impl LegacyVgaState {
         }
     }
 
+    pub fn scanout_view(&self) -> Self {
+        Self {
+            planes: alloc::vec::Vec::new(), registers: self.registers.share(),
+            scanout_frame: u64::MAX, scanout_start: 0,
+            panning_frame: u64::MAX, scanout_pan: 0,
+            seq_index: 0, crtc_index: 0, gc_index: 0, ac_state: AcState::new(),
+            ac_pas_valid: true, dac_index: 0, dac_state: 0, dac_read_index: 0,
+            dac_rsub: 0, dac_wsub: 0, latches: [0; 4], latches_valid: false,
+        }
+    }
+
+    /// One beam clock drives status reads and both scanout latch edges.
+    /// Time is in nanoseconds; character clocks come from the programmed
+    /// oscillator and sequencer, scanline/frame lengths from the CRTC.
+    pub fn beam(&self, now_ns: u64) -> Beam {
+        let timing = beam::Timing::from_registers(self.misc_output.get(), &self.seq.read(), &self.crtc.read());
+        Beam {
+            status: timing.status(now_ns),
+            address_epoch: timing.latch_epoch(now_ns, timing.retrace_start),
+            panning_epoch: timing.latch_epoch(now_ns, timing.retrace_end),
+        }
+    }
+
+    /// CRTC start-address writes program the next frame; they do not move
+    /// the active scanout immediately. Advance before a timed register write
+    /// and before capture, so a write after retrace cannot affect this frame.
+    pub fn latch_display_start(&mut self, frame: u64) -> bool {
+        if self.scanout_frame == frame { return false; }
+        self.scanout_frame = frame;
+        let start = u16::from_be_bytes([self.crtc.get(0x0c), self.crtc.get(0x0d)]);
+        let changed = self.scanout_start != start;
+        self.scanout_start = start;
+        changed
+    }
+
+    pub fn display_start(&self) -> u16 {
+        if self.scanout_frame == u64::MAX {
+            u16::from_be_bytes([self.crtc.get(0x0c), self.crtc.get(0x0d)])
+        } else { self.scanout_start }
+    }
+
+    /// VGA latches fine panning at retrace end, after the start-address
+    /// latch at retrace start. Writes during the active frame must not mix
+    /// a new fine pan with the previous frame's coarse address.
+    pub fn latch_pixel_pan(&mut self, frame: u64) -> bool {
+        if self.panning_frame == frame { return false; }
+        self.panning_frame = frame;
+        let pan = self.ac.get(0x13);
+        let changed = self.scanout_pan != pan;
+        self.scanout_pan = pan;
+        changed
+    }
+
+    pub fn pixel_pan(&self) -> u8 {
+        if self.panning_frame == u64::MAX { self.ac.get(0x13) }
+        else { self.scanout_pan }
+    }
+
     fn decoded_aperture(&self) -> ApertureRange {
-        let (start_page, end_page) = match (self.gc[6] >> 2) & 3 {
+        let (start_page, end_page) = match (self.gc.get(6) >> 2) & 3 {
             0 => (0xA0, 0xC0),
             1 => (0xA0, 0xB0),
             2 => (0xB0, 0xB8),
@@ -2703,8 +2752,8 @@ impl LegacyVgaState {
     /// Complete physical ordering implied by the sequencer memory-mode
     /// register. Chain-4 and sequential access use plane-minor storage;
     /// odd/even access interleaves the selected plane pair into its 128K set.
-    pub const fn layout(&self) -> VramLayout {
-        if self.seq[4] & 0x08 != 0 || self.seq[4] & 0x04 != 0 {
+    pub fn layout(&self) -> VramLayout {
+        if self.seq.get(4) & 0x08 != 0 || self.seq.get(4) & 0x04 != 0 {
             VramLayout::PlaneMinor
         } else {
             VramLayout::OddEven
@@ -2715,8 +2764,8 @@ impl LegacyVgaState {
     /// addressing. Word-mode scanout uses compact offsets in our backing;
     /// byte-mode scanout (Jazz's scrolling playfield) uses the full offset.
     fn odd_even_offset(&self, address: usize) -> usize {
-        let address = if self.gc[6] & 0x02 != 0 { address & !1 } else { address };
-        let address = if self.crtc[0x17] & 0x40 == 0 { address >> 1 } else { address };
+        let address = if self.gc.get(6) & 0x02 != 0 { address & !1 } else { address };
+        let address = if self.crtc.get(0x17) & 0x40 == 0 { address >> 1 } else { address };
         address & 0xFFFF
     }
 
@@ -2725,13 +2774,13 @@ impl LegacyVgaState {
     /// The returned offset is always an offset *within a plane*; callers then
     /// use `layout()` to locate that byte in the physical backing.
     pub fn cpu_read_address(&self, address: usize) -> (usize, usize) {
-        if self.seq[4] & 0x08 != 0 {
+        if self.seq.get(4) & 0x08 != 0 {
             return ((address >> 2) & 0xFFFF, address & 3);
         }
-        if self.gc[5] & 0x10 != 0 {
-            return (self.odd_even_offset(address), usize::from(self.gc[4] & 2) | (address & 1));
+        if self.gc.get(5) & 0x10 != 0 {
+            return (self.odd_even_offset(address), usize::from(self.gc.get(4) & 2) | (address & 1));
         }
-        (address & 0xFFFF, usize::from(self.gc[4] & 3))
+        (address & 0xFFFF, usize::from(self.gc.get(4) & 3))
     }
 
     /// Resolve one CPU write to its logical per-plane offset and effective map
@@ -2739,12 +2788,12 @@ impl LegacyVgaState {
     /// each pair with A0; sequential addressing leaves the sequencer map mask
     /// untouched.
     pub fn cpu_write_address(&self, address: usize) -> (usize, u8) {
-        let map_mask = self.seq[2] & 0x0F;
-        if self.seq[4] & 0x08 != 0 {
+        let map_mask = self.seq.get(2) & 0x0F;
+        if self.seq.get(4) & 0x08 != 0 {
             let plane = address & 3;
             return ((address >> 2) & 0xFFFF, map_mask & (1 << plane));
         }
-        if self.seq[4] & 0x04 == 0 {
+        if self.seq.get(4) & 0x04 == 0 {
             let parity_mask = if address & 1 == 0 { 0x05 } else { 0x0A };
             return (self.odd_even_offset(address), map_mask & parity_mask);
         }
@@ -2752,10 +2801,10 @@ impl LegacyVgaState {
     }
 
     fn simple_alu(&self) -> bool {
-        self.gc[5] & 0x0B == 0
-            && self.gc[3] & 0x1F == 0
-            && self.gc[1] & 0x0F == 0
-            && self.gc[8] == 0xFF
+        self.gc.get(5) & 0x0B == 0
+            && self.gc.get(3) & 0x1F == 0
+            && self.gc.get(1) & 0x0F == 0
+            && self.gc.get(8) == 0xFF
     }
 
     fn direct_layout(&self) -> Option<VramLayout> {
@@ -2764,18 +2813,18 @@ impl LegacyVgaState {
         }
         // Chain-4 overrides both odd/even controls. A standard VGA exposes
         // only one 64K chained page even when GC6 decodes 128K.
-        if self.seq[4] & 0x08 != 0 {
-            return (self.seq[2] & 0x0F == 0x0F).then_some(self.layout());
+        if self.seq.get(4) & 0x08 != 0 {
+            return (self.seq.get(2) & 0x0F == 0x0F).then_some(self.layout());
         }
         // A direct odd/even alias is valid only for the conventional matched
         // read/write setup, compact word-mode offsets and plane set 0. Other
         // legal combinations remain trapped and use layout-aware indexing.
-        let write_oe = self.seq[4] & 0x04 == 0;
-        let read_oe = self.gc[5] & 0x10 != 0;
+        let write_oe = self.seq.get(4) & 0x04 == 0;
+        let read_oe = self.gc.get(5) & 0x10 != 0;
         if write_oe && read_oe
-            && self.crtc[0x17] & 0x40 == 0
-            && self.seq[2] & 0x0F == 0x03
-            && self.gc[4] & 0x02 == 0
+            && self.crtc.get(0x17) & 0x40 == 0
+            && self.seq.get(2) & 0x0F == 0x03
+            && self.gc.get(4) & 0x02 == 0
         {
             return Some(self.layout());
         }
@@ -2815,20 +2864,20 @@ impl LegacyVgaState {
                 } else {
                     let i = (self.ac_state.index & 0x1F) as usize;
                     if i < 21 {
-                        self.ac[i] = v;
+                        self.ac.set(i, v);
                     }
                 }
                 self.ac_state.pending_data = !self.ac_state.pending_data;
             }
-            0x3C2 => self.misc_output = v,
+            0x3C2 => self.misc_output.set(v),
             0x3C4 => self.seq_index = v,
             0x3C5 => {
                 let i = (self.seq_index & 0x1F) as usize;
                 if i < 5 {
-                    self.seq[i] = v;
+                    self.seq.set(i, v);
                 }
             }
-            0x3C6 => self.dac_mask = v,
+            0x3C6 => self.dac_mask.set(v),
             0x3C7 => {
                 self.dac_read_index = v;
                 self.dac_rsub = 0;
@@ -2841,7 +2890,7 @@ impl LegacyVgaState {
             }
             0x3C9 => {
                 let i = self.dac_index as usize * 3 + self.dac_wsub as usize;
-                self.dac[i] = v & 0x3F;
+                self.dac.set(i, v & 0x3F);
                 self.dac_wsub += 1;
                 if self.dac_wsub == 3 {
                     self.dac_wsub = 0;
@@ -2852,7 +2901,7 @@ impl LegacyVgaState {
             0x3CF => {
                 let i = (self.gc_index & 0x0F) as usize;
                 if i < 9 {
-                    self.gc[i] = v;
+                    self.gc.set(i, v);
                 }
             }
             0x3D4 => self.crtc_index = v,
@@ -2877,9 +2926,9 @@ impl LegacyVgaState {
                 // scanlines to 144 (200 rows to 72), cutting off everything below
                 // the split. Real hardware ignores that write; only the split
                 // moves.
-                if i <= 0x07 && self.crtc[0x11] & 0x80 != 0 {
+                if i <= 0x07 && self.crtc.get(0x11) & 0x80 != 0 {
                     if i == 0x07 {
-                        self.crtc[0x07] = (self.crtc[0x07] & !0x10) | (v & 0x10);
+                        self.crtc.set(0x07, (self.crtc.get(0x07) & !0x10) | (v & 0x10));
                     }
                     return PortWrite {
                         old_aperture,
@@ -2887,11 +2936,11 @@ impl LegacyVgaState {
                         vram_transition: None,
                     };
                 }
-                self.crtc[i] = v;
+                self.crtc.set(i, v);
             }
-            0x3D8 => self.cga_mode_ctl = v,     // CGA Mode Control
-            0x3D9 => self.cga_color_select = v, // CGA Colour Select (palette/bg)
-            0x3DA => self.feature_ctl = v, // FCR write port (colour)
+            0x3D8 => self.cga_mode_ctl.set(v),     // CGA Mode Control
+            0x3D9 => self.cga_color_select.set(v), // CGA Colour Select (palette/bg)
+            0x3DA => self.feature_ctl.set(v), // FCR write port (colour)
             _ => {}
         }
         let new_layout = self.layout();
@@ -2912,19 +2961,19 @@ impl LegacyVgaState {
             0x3C0 => self.ac_state.index,
             0x3C1 => {
                 let i = (self.ac_state.index & 0x1F) as usize;
-                if i < 21 { self.ac[i] } else { 0 }
+                if i < 21 { self.ac.get(i) } else { 0 }
             }
             0x3C2 => 0, // input status 0: no interrupt pending, monitor present
             0x3C4 => self.seq_index,
             0x3C5 => {
                 let i = (self.seq_index & 0x1F) as usize;
-                if i < 5 { self.seq[i] } else { 0 }
+                if i < 5 { self.seq.get(i) } else { 0 }
             }
-            0x3C6 => self.dac_mask,
+            0x3C6 => self.dac_mask.get(),
             0x3C7 => self.dac_state,
             0x3C8 => self.dac_index,
             0x3C9 => {
-                let v = self.dac[self.dac_read_index as usize * 3 + self.dac_rsub as usize];
+                let v = self.dac.get(self.dac_read_index as usize * 3 + self.dac_rsub as usize);
                 self.dac_rsub += 1;
                 if self.dac_rsub == 3 {
                     self.dac_rsub = 0;
@@ -2932,17 +2981,17 @@ impl LegacyVgaState {
                 }
                 v
             }
-            0x3CA => self.feature_ctl,
-            0x3CC => self.misc_output,
+            0x3CA => self.feature_ctl.get(),
+            0x3CC => self.misc_output.get(),
             0x3CE => self.gc_index,
             0x3CF => {
                 let i = (self.gc_index & 0x0F) as usize;
-                if i < 9 { self.gc[i] } else { 0 }
+                if i < 9 { self.gc.get(i) } else { 0 }
             }
             0x3D4 => self.crtc_index,
             0x3D5 => {
                 let i = self.crtc_index as usize;
-                if i < 25 { self.crtc[i] } else { 0 }
+                if i < 25 { self.crtc.get(i) } else { 0 }
             }
             _ => 0xFF,
         }
@@ -2962,7 +3011,7 @@ impl LegacyVgaState {
     /// tweaker's register writes (Doom's unchain, Jazz's wide-stride level,
     /// Dyna Blaster's 256×232) land on top of that base.
     pub fn classify_mode(&self) -> Option<VgaMode> {
-                let rregs = Regs { crtc: self.crtc, seq: self.seq, gc: self.gc, misc: self.misc_output };
+                let rregs = Regs { crtc: self.crtc.read(), seq: self.seq.read(), gc: self.gc.read(), misc: self.misc_output.get() };
         classify(&rregs)
     }
 
@@ -2971,11 +3020,11 @@ impl LegacyVgaState {
     /// panel). All-ones ⇒ no split; converted through the same max-scanline
     /// divisor as mode height to match `h`.
     pub fn line_compare(&self, h: usize) -> usize {
-        let lc = self.crtc[0x18] as usize
-            | (((self.crtc[7] >> 4) & 1) as usize) << 8
-            | (((self.crtc[9] >> 6) & 1) as usize) << 9;
-        let scan_div = ((self.crtc[9] as usize & 0x1F) + 1)
-            * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
+        let lc = self.crtc.get(0x18) as usize
+            | (((self.crtc.get(7) >> 4) & 1) as usize) << 8
+            | (((self.crtc.get(9) >> 6) & 1) as usize) << 9;
+        let scan_div = ((self.crtc.get(9) as usize & 0x1F) + 1)
+            * if self.crtc.get(9) & 0x80 != 0 { 2 } else { 1 };
         // Line Compare matches one displayed scanline; the address counter
         // restarts for the following scanline. A repeated-line mode can place
         // that transition inside a logical output row, so use the next row.
@@ -2987,11 +3036,11 @@ impl LegacyVgaState {
     /// scanlines to output rows. Blanking does not change the mode geometry;
     /// it only suppresses scanout from this row through the end of the frame.
     pub fn vertical_blank_start(&self, h: usize) -> usize {
-        let start = self.crtc[0x15] as usize
-            | (((self.crtc[7] >> 3) & 1) as usize) << 8
-            | (((self.crtc[9] >> 5) & 1) as usize) << 9;
-        let scan_div = ((self.crtc[9] as usize & 0x1F) + 1)
-            * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
+        let start = self.crtc.get(0x15) as usize
+            | (((self.crtc.get(7) >> 3) & 1) as usize) << 8
+            | (((self.crtc.get(9) >> 5) & 1) as usize) << 9;
+        let scan_div = ((self.crtc.get(9) as usize & 0x1F) + 1)
+            * if self.crtc.get(9) & 0x80 != 0 { 2 } else { 1 };
         let start = start / scan_div.max(1);
         if start < h { start } else { usize::MAX }
     }

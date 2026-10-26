@@ -665,7 +665,8 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
                     // Reading 0x3DA returns Input Status #1 AND resets the
                     // attribute-controller write flip-flop.
                     state.ac_state.pending_data = false;
-                    input_status1(machine, &pc.scanout)
+                    let now = machine.now();
+                    state.beam(now).status
                 }
                 LegacyVgaIo::Native => {
                     crate::kernel::drivers::vga_hw::track_ac_reset();

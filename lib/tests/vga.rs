@@ -44,8 +44,9 @@ fn packed_rows_match_encoded_words_for_every_vga_mode() {
     for mode in modes {
         let (w, h) = vga::dimensions(mode);
         let frame = Frame {
+            memory: None,
             plane_layout: vga::VramLayout::PlaneMinor,
-            mode, vram: &memory, planes: &memory, ac: &ac, palette: &palette,
+            mode, vram: &memory, planes: &memory, ac: ac, palette: palette,
             dac_mask: 0x7F, font: &lib::vga_fonts::FONT_8X16,
             font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: true, text_cursor: None,
             cga_palette: [0, 0x123456, 0xABCDEF, 0xFFFFFF],
@@ -86,9 +87,10 @@ fn packed_rows_share_tail_storage_without_corrupting_following_rows() {
     let planes: Vec<u8> = (1..=16).collect();
     for width in [1, 2, 4] {
         let frame = Frame {
+            memory: None,
             plane_layout: vga::VramLayout::PlaneMinor,
             mode: VgaMode::ModeX { w: width, h: 4, row_bytes: 1 },
-            vram: &[], planes: &planes, ac: &ac, palette: &palette, dac_mask: 0xFF,
+            vram: &[], planes: &planes, ac: ac, palette: palette, dac_mask: 0xFF,
             font: &[], font_b: &[], font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4],
             start_offset: 0, pixel_pan: 0, split_pixel_pan: 0, line_compare: usize::MAX, blank_start: 3,
         };
@@ -129,13 +131,14 @@ fn packed_text_reads_cells_and_font_directly_from_vga_planes() {
     }
     let ac = identity_ac();
     let direct = Frame {
+            memory: None,
         plane_layout: layout,
         mode: TEXT80,
         vram: &[],
         planes: &state.planes,
-        ac: &ac,
-        palette: &state.dac,
-        dac_mask: state.dac_mask,
+        ac: ac,
+        palette: state.dac.read(),
+        dac_mask: state.dac_mask.get(),
         font: &[],
         font_b: &[],
         font_maps: Some((0, 0)),
@@ -147,6 +150,7 @@ fn packed_text_reads_cells_and_font_directly_from_vga_planes() {
         blank_start: usize::MAX,
     };
     let compact = Frame {
+            memory: None,
         vram: &text,
         planes: &[],
         font: &lib::vga_fonts::FONT_8X16,
@@ -155,7 +159,7 @@ fn packed_text_reads_cells_and_font_directly_from_vga_planes() {
         ..direct
     };
     let mut pal = vga::Pal::new();
-    pal.sync(&state.dac, state.dac_mask, PixelFormat::NATIVE, &mut [0; 768]);
+    pal.sync(&state.dac.read(), state.dac_mask.get(), PixelFormat::NATIVE, &mut [0; 768]);
     for y in 0..16 {
         let mut expected = vec![0u8; 720 * 4 + vga::PACKED_ROW_PADDING];
         let mut actual = vec![0u8; expected.len()];
@@ -183,8 +187,9 @@ fn scanout_reads_either_live_plane_layout_without_reordering() {
         VgaMode::Planar16 { w: 24, h: 4, row_bytes: 4 }]
     {
         let mut frame = Frame {
+            memory: None,
             mode, plane_layout: VramLayout::PlaneMinor, planes: &minor, vram: &[],
-            ac: &ac, palette: &palette, dac_mask: 0xFF, font: &[], font_b: &[], font_maps: None,
+            ac: ac, palette: palette, dac_mask: 0xFF, font: &[], font_b: &[], font_maps: None,
             blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 0x4000,
             pixel_pan: 3, split_pixel_pan: 0, line_compare: 2, blank_start: 3,
         };
@@ -360,18 +365,18 @@ fn trapped_addressing_is_independent_of_backing_layout() {
 
 #[test]
 fn byte_mode_odd_even_blits_preserve_full_plane_offsets() {
-    let mut state = vga::LegacyVgaState::new();
+    let state = vga::LegacyVgaState::new();
     let regs = vga::bios_mode_regs(0x13).unwrap();
-    state.seq = regs.seq;
-    state.gc = regs.gc;
-    state.crtc = regs.crtc;
+    state.seq.write(regs.seq);
+    state.gc.write(regs.gc);
+    state.crtc.write(regs.crtc);
     // Jazz combines odd/even plane selection with byte-mode scanout and a
     // 336-pixel virtual stride. A0 chooses planes without halving the offset.
-    state.seq[4] = 0x02;
-    state.gc[5] = 0x50;
-    state.crtc[0x14] = 0;
-    state.crtc[0x17] = 0xE3;
-    state.crtc[0x13] = 42;
+    state.seq.set(4, 0x02);
+    state.gc.set(5, 0x50);
+    state.crtc.set(0x14, 0);
+    state.crtc.set(0x17, 0xE3);
+    state.crtc.set(0x13, 42);
     let mut vram = vec![0u8; 4 * 0x10000];
     for (offset, pixels) in [(0x1200, [11, 12, 13, 14]), (0x1201, [21, 22, 23, 24])] {
         for (plane, pixel) in pixels.into_iter().enumerate() {
@@ -382,7 +387,7 @@ fn byte_mode_odd_even_blits_preserve_full_plane_offsets() {
         let (source, plane) = state.cpu_read_address(0x1200 + parity);
         assert_eq!((source, plane), (0x1200 + parity, parity));
         let cur = core::array::from_fn(|p| vram[state.layout().index(p, source)]);
-        let mut gc = state.gc;
+        let mut gc = state.gc.read();
         gc[4] = plane as u8;
         let (_, latches) = vga::planar_read(cur, &gc);
         gc[5] |= 1; // VRAM-to-VRAM latch copy
@@ -402,25 +407,25 @@ fn byte_mode_odd_even_cannot_use_compact_text_alias() {
     let mut state = *vga::LegacyVgaState::new_mode3_boxed();
     assert!(matches!(state.cpu_aperture(), vga::CpuAperture::Direct { .. }));
     state.port_write(0x3D4, 0x17);
-    let write = state.port_write(0x3D5, state.crtc[0x17] | 0x40);
+    let write = state.port_write(0x3D5, state.crtc.get(0x17) | 0x40);
     assert!(matches!(write.new_aperture, vga::CpuAperture::Trapped { .. }));
     // GC6 chain-odd/even pairs addresses independently of plane selection.
     assert_eq!(state.cpu_read_address(7), (6, 1));
     assert_eq!(state.cpu_write_address(7), (6, 0x02));
-    state.gc[6] &= !0x02;
+    state.gc.set(6, state.gc.get(6) & (!0x02));
     assert_eq!(state.cpu_read_address(7), (7, 1));
     assert_eq!(state.cpu_write_address(7), (7, 0x02));
 }
 
 #[test]
 fn odd_even_map_zero_exposes_the_full_128k_aperture() {
-    let mut state = vga::LegacyVgaState::new();
+    let state = vga::LegacyVgaState::new();
     let regs = vga::bios_mode_regs(3).unwrap();
-    state.seq = regs.seq;
-    state.gc = regs.gc;
+    state.seq.write(regs.seq);
+    state.gc.write(regs.gc);
     // GC6 memory map 00 decodes A0000..BFFFF. With the standard plane-0/1
     // odd/even selection, that whole 128K is one direct prefix of OddEven.
-    state.gc[6] &= !0x0C;
+    state.gc.set(6, state.gc.get(6) & (!0x0C));
     assert_eq!(state.layout(), VramLayout::OddEven);
     assert_eq!(
         state.cpu_aperture(),
@@ -433,20 +438,20 @@ fn odd_even_map_zero_exposes_the_full_128k_aperture() {
 
 #[test]
 fn unchained_single_plane_reads_still_trap() {
-    let mut state = vga::LegacyVgaState::new();
-    state.seq[4] = 0x04;
-    state.seq[2] = 0x04;
-    state.gc[4] = 2;
-    state.gc[6] = 0x04;
+    let state = vga::LegacyVgaState::new();
+    state.seq.set(4, 0x04);
+    state.seq.set(2, 0x04);
+    state.gc.set(4, 2);
+    state.gc.set(6, 0x04);
     assert!(matches!(state.cpu_aperture(), vga::CpuAperture::Trapped { .. }));
 }
 
 #[test]
 fn mode6_is_sequential_plane_zero_and_trapped() {
-    let mut state = vga::LegacyVgaState::new();
+    let state = vga::LegacyVgaState::new();
     let regs = vga::bios_mode_regs(6).unwrap();
-    state.seq = regs.seq;
-    state.gc = regs.gc;
+    state.seq.write(regs.seq);
+    state.gc.write(regs.gc);
     assert_eq!(state.classify_mode(), Some(VgaMode::Cga2));
     assert_eq!(state.layout(), VramLayout::PlaneMinor);
     assert_eq!(
@@ -460,7 +465,7 @@ fn mode6_is_sequential_plane_zero_and_trapped() {
 
     // Sequential mode obeys the sequencer map mask without hidden special
     // cases: selecting plane 2 routes the same offset only to plane 2.
-    state.seq[2] = 0x04;
+    state.seq.set(2, 0x04);
     assert_eq!(state.cpu_write_address(0x2345), (0x2345, 0x04));
 }
 
@@ -524,12 +529,13 @@ fn mode13h_maps_each_index_through_the_palette() {
     }
     let ac = identity_ac();
     let mut frame = Frame {
+            memory: None,
         plane_layout: vga::VramLayout::PlaneMinor,
         mode: VgaMode::Mode13h,
         vram: &vram,
         planes: &[],
-        ac: &ac,
-        palette: &pal,
+        ac: ac,
+        palette: pal,
         dac_mask: 0xFF,
         font: &[],
         font_b: &[],
@@ -563,12 +569,13 @@ fn mode13h_tolerates_short_vram() {
     let pal = vga_render::fallback_palette();
     let ac = identity_ac();
     let frame = Frame {
+            memory: None,
         plane_layout: vga::VramLayout::PlaneMinor,
         mode: VgaMode::Mode13h,
         vram: &vram,
         planes: &[],
-        ac: &ac,
-        palette: &pal,
+        ac: ac,
+        palette: pal,
         dac_mask: 0xFF,
         font: &[],
         font_b: &[],
@@ -599,9 +606,10 @@ fn packed_indexed_spans_preserve_short_source_and_palette_zero() {
         let (w, h) = vga::dimensions(mode);
         for len in [0, 1, 23, 350] {
             let frame = Frame {
+            memory: None,
                 mode, plane_layout: VramLayout::PlaneMinor,
                 vram: &memory[..len], planes: &memory[..len],
-                ac: &ac, palette: &palette, dac_mask: 0x7F, font: &[], font_b: &[], font_maps: None,
+                ac: ac, palette: palette, dac_mask: 0x7F, font: &[], font_b: &[], font_maps: None,
                 blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 3,
                 pixel_pan: 7, split_pixel_pan: 0, line_compare: 2, blank_start: h,
             };
@@ -653,12 +661,13 @@ fn text_renders_glyph_pixels_with_fg_bg() {
     let pal = vga_render::fallback_palette();
     let ac = identity_ac();
     let frame = Frame {
+            memory: None,
         plane_layout: vga::VramLayout::PlaneMinor,
         mode: TEXT80,
         vram: &vram,
         planes: &[],
-        ac: &ac,
-        palette: &pal,
+        ac: ac,
+        palette: pal,
         dac_mask: 0xFF,
         font: &font,
         font_b: &font,
@@ -707,12 +716,13 @@ fn text_attribute_bit_three_selects_character_map() {
     let pal = vga_render::fallback_palette();
     let ac = identity_ac();
     let frame = Frame {
+            memory: None,
         plane_layout: vga::VramLayout::PlaneMinor,
         mode: TEXT80,
         vram: &vram,
         planes: &[],
-        ac: &ac,
-        palette: &pal,
+        ac: ac,
+        palette: pal,
         dac_mask: 0xFF,
         font: &font_a,
         font_b: &font_b,
@@ -743,9 +753,10 @@ fn text40_keeps_rows_separate_and_doubles_character_dots() {
     let pal = vga_render::fallback_palette();
     let ac = identity_ac();
     let frame = Frame {
+            memory: None,
         plane_layout: vga::VramLayout::PlaneMinor,
         mode: TEXT40, vram: &vram, planes: &[],
-        ac: &ac, palette: &pal,
+        ac: ac, palette: pal,
         dac_mask: 0xFF, font: &font, font_b: &font, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4],
         start_offset: 0, pixel_pan: 0, split_pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
     };
@@ -783,8 +794,8 @@ fn initial_vga_palette_has_standard_greys_and_hue_rings() {
     }
     assert!(p[248 * 3..].iter().all(|&v| v == 0));
     assert!(p.iter().all(|&v| v <= 63));
-    assert_eq!(vga::LegacyVgaState::new().dac, p);
-    assert_eq!(vga::LegacyVgaState::new_boxed().dac, p);
+    assert_eq!(vga::LegacyVgaState::new().dac.read(), p);
+    assert_eq!(vga::LegacyVgaState::new_boxed().dac.read(), p);
 }
 
 #[test]
@@ -824,12 +835,13 @@ fn native_rows_hold_one_output_encoded_word_per_vga_pixel() {
     let vram: Vec<u8> = (0..320 * 200).map(|i| (i % 320 & 255) as u8).collect();
     let ac = identity_ac();
     let frame = Frame {
+            memory: None,
         plane_layout: vga::VramLayout::PlaneMinor,
         mode: VgaMode::Mode13h,
         vram: &vram,
         planes: &[],
-        ac: &ac,
-        palette: &palette,
+        ac: ac,
+        palette: palette,
         dac_mask: 0xFF,
         font: &[],
         font_b: &[],
@@ -930,8 +942,9 @@ fn text_cursor_tracks_page_shape_disable_and_blink_in_both_renderers() {
     crtc[0x0B] = 15;
     crtc[0x0F] = 20;
     let mut frame = Frame {
+            memory: None,
         mode, plane_layout: VramLayout::PlaneMinor, vram: &memory, planes: &[],
-        ac: &ac, palette: &palette, dac_mask: 0xFF,
+        ac: ac, palette: palette, dac_mask: 0xFF,
         font: &font, font_b: &font, font_maps: None, blink: false,
         text_cursor: vga::TextCursor::from_crtc(&crtc, true),
         cga_palette: [0; 4], start_offset: 16, pixel_pan: 0, split_pixel_pan: 0,
@@ -966,4 +979,354 @@ fn text_cursor_tracks_page_shape_disable_and_blink_in_both_renderers() {
             }
         }
     }
+}
+
+#[test]
+fn display_start_waits_for_retrace_before_fine_pan_wrap() {
+    let mut state = vga::LegacyVgaState::new();
+    state.crtc.set(0x0d, 29);
+    state.latch_display_start(10);
+    state.latch_pixel_pan(10);
+    // Prepare the next coarse scroll address during the active frame.
+    state.port_write(0x3d4, 0x0d);
+    state.port_write(0x3d5, 28);
+    assert!(!state.latch_display_start(10));
+    assert_eq!(state.display_start(), 29);
+    assert_eq!(state.crtc.get(0x0d), 28); // Register reads see programmed state.
+    // At retrace the address latches, then the guest changes pan 0 -> 7.
+    assert!(state.latch_display_start(11));
+    state.port_write(0x3c0, 0x13);
+    state.port_write(0x3c0, 7);
+    assert!(!state.latch_pixel_pan(10)); // Still inside retrace.
+    assert_eq!(state.pixel_pan(), 0);
+    assert!(state.latch_pixel_pan(11)); // Retrace ended.
+    assert_eq!(usize::from(state.display_start()) * 8 + usize::from(state.pixel_pan()), 29 * 8 - 1);
+    assert!(!state.latch_display_start(11));
+}
+
+#[test]
+fn active_frame_scroll_writes_keep_both_old_latches_until_retrace() {
+    let mut state = vga::LegacyVgaState::new_boxed();
+    state.crtc.set(0x0d, 29);
+    state.latch_display_start(10);
+    state.latch_pixel_pan(10);
+    // Keen's active-frame update prepares coarse and fine scroll together.
+    state.port_write(0x3d4, 0x0d);
+    state.port_write(0x3d5, 28);
+    state.port_write(0x3c0, 0x13);
+    state.port_write(0x3c0, 7);
+    assert!(!state.latch_display_start(10));
+    assert!(!state.latch_pixel_pan(10));
+    assert_eq!((state.display_start(), state.pixel_pan()), (29, 0));
+    assert_eq!(state.ac.get(0x13), 7); // CPU still reads the programmed value.
+    state.latch_display_start(11);
+    assert_eq!((state.display_start(), state.pixel_pan()), (28, 0));
+    state.latch_pixel_pan(11);
+    assert_eq!((state.display_start(), state.pixel_pan()), (28, 7));
+}
+
+#[test]
+fn display_start_latches_before_next_frames_write() {
+    let mut state = vga::LegacyVgaState::new_boxed();
+    state.latch_display_start(1);
+    state.crtc.set(0x0c, 0x21);
+    state.crtc.set(0x0d, 0x1d);
+    // No capture occurred in frame 2. A frame-3 write must still retain
+    // the previously programmed page for the current scanout.
+    assert!(state.latch_display_start(3));
+    state.crtc.set(0x0c, 0);
+    assert_eq!(state.display_start(), 0x211d);
+    assert!(state.latch_display_start(4));
+    assert_eq!(state.display_start(), 0x001d);
+}
+
+
+#[test]
+fn beam_status_and_scroll_latches_share_programmed_edges() {
+    let mut state = vga::LegacyVgaState::new_boxed();
+    let regs = vga::bios_mode_regs(0x0d).unwrap();
+    state.crtc.write(regs.crtc);
+    state.seq.write(regs.seq);
+    state.misc_output.set(regs.misc);
+    // Mode 0Dh: 50 character clocks * 16 dots, 449 scanlines,
+    // vertical retrace at line 412, ending at line 414.
+    let time = |line: u64, dot: u64| ((line * 800 + dot) * 1_000_000_000).div_ceil(25_175_000);
+    let before = state.beam(time(411, 799));
+    let start = state.beam(time(412, 0));
+    let during = state.beam(time(413, 799));
+    let end = state.beam(time(414, 0));
+    assert_eq!((before.address_epoch, before.panning_epoch), (0, 0));
+    assert_eq!((start.address_epoch, start.panning_epoch), (1, 0));
+    assert_eq!((end.address_epoch, end.panning_epoch), (1, 1));
+    assert_eq!(before.status & 8, 0);
+    assert_eq!(start.status & 8, 8);
+    assert_eq!(during.status & 8, 8);
+    assert_eq!(end.status & 8, 0);
+    assert_eq!(state.beam(time(100, 0)).status, 0);
+    assert_eq!(state.beam(time(100, 700)).status, 1);
+    // Repeated reads at the same instant cannot move the beam.
+    for _ in 0..32 { assert_eq!(state.beam(time(100, 0)).status, 0); }
+    state.latch_display_start(before.address_epoch);
+    state.latch_pixel_pan(before.panning_epoch);
+    state.crtc.set(0x0d, 17);
+    state.ac.set(0x13, 3);
+    state.latch_display_start(start.address_epoch);
+    state.latch_pixel_pan(start.panning_epoch);
+    assert_eq!((state.display_start(), state.pixel_pan()), (17, 0));
+    state.ac.set(0x13, 7); // Pan programmed during retrace belongs to this frame.
+    state.latch_pixel_pan(end.panning_epoch);
+    assert_eq!((state.display_start(), state.pixel_pan()), (17, 7));
+    state.crtc.set(0x0d, 18); // Active-frame programming waits for the next edge.
+    state.ac.set(0x13, 0);
+    let next = state.beam(time(449 + 411, 799));
+    state.latch_display_start(next.address_epoch);
+    state.latch_pixel_pan(next.panning_epoch);
+    assert_eq!((state.display_start(), state.pixel_pan()), (17, 7));
+}
+
+#[test]
+fn beam_uses_mode_specific_refresh_and_wrapped_retrace_end() {
+    let state = vga::LegacyVgaState::new_boxed();
+    let regs = vga::bios_mode_regs(0x12).unwrap();
+    state.crtc.write(regs.crtc);
+    state.seq.write(regs.seq);
+    state.misc_output.set(regs.misc);
+    let time = |line: u64| (line * 800 * 1_000_000_000).div_ceil(25_175_000);
+    // 640x480: 525 total lines, retrace 490..492, approximately 60 Hz.
+    assert_eq!(state.beam(time(489)).status & 8, 0);
+    assert_eq!(state.beam(time(490)).status & 8, 8);
+    assert_eq!(state.beam(time(492)).status & 8, 0);
+    assert_eq!(state.beam(time(525 + 490)).address_epoch, 2);
+    // The four-bit retrace-end comparator wraps: start 490, end 0 means
+    // line 496, not a pulse ending immediately or at the frame boundary.
+    state.crtc.set(0x11, state.crtc.get(0x11) & (0xf0));
+    assert_eq!(state.beam(time(495)).status & 8, 8);
+    assert_eq!(state.beam(time(496)).status & 8, 0);
+}
+
+fn short_beam_timing() -> vga::beam::Timing {
+    vga::beam::Timing {
+        dot_hz: 1_000_000_000, dots_per_clock: 1,
+        horizontal_total: 10, horizontal_display: 8,
+        horizontal_blank_start: 8, horizontal_blank_end: 10,
+        vertical_total: 6, vertical_display: 3,
+        blank_start: 3, blank_end: 6, retrace_start: 4, retrace_end: 5,
+    }
+}
+
+#[test]
+fn beam_phases_do_not_depend_on_polling_frequency() {
+    use vga::beam::{Phase, Sequencer};
+    let timing = short_beam_timing();
+    let mut synchronous = Sequencer::new(timing, 0);
+    let mut asynchronous = Sequencer::new(timing, 0);
+    let mut frequent = Vec::new();
+    let mut batched = Vec::new();
+    for now in 1..=180 {
+        while let Some(event) = asynchronous.next(now) { frequent.push(event); }
+    }
+    for now in [3, 19, 79, 80, 180] {
+        while let Some(event) = synchronous.next(now) { batched.push(event); }
+    }
+    assert_eq!(frequent, batched);
+    assert!(frequent.windows(2).all(|pair|
+        (pair[0].clock, pair[0].phase) < (pair[1].clock, pair[1].phase)));
+    let boundary: Vec<_> = frequent.iter().filter(|e| e.clock == 60).map(|e| e.phase).collect();
+    assert_eq!(boundary, [Phase::BlankEnd, Phase::HorizontalBlankEnd, Phase::FrameStart, Phase::RowStart]);
+    assert_eq!(synchronous.deadline_ns(), 188);
+}
+
+#[test]
+fn beam_status_and_latch_events_use_the_same_clock() {
+    use vga::beam::{Phase, Sequencer};
+    let timing = short_beam_timing();
+    let mut clock = Sequencer::new(timing, 0);
+    assert_eq!(timing.status(7), 0);
+    assert_eq!(timing.status(8), 1);
+    assert_eq!(timing.status(10), 0);
+    assert_eq!(timing.status(30), 1);
+    assert_eq!(timing.status(40), 9);
+    assert_eq!(timing.status(50), 1);
+    let mut edges = Vec::new();
+    while let Some(event) = clock.next(180) {
+        if event.phase == Phase::RetraceStart {
+            assert_eq!(timing.status(event.clock) & 8, 8);
+            assert_eq!(timing.latch_epoch(event.clock, timing.retrace_start), event.frame + 1);
+            edges.push(event.clock);
+        }
+        if event.phase == Phase::RetraceEnd {
+            assert_eq!(timing.status(event.clock) & 8, 0);
+        }
+    }
+    assert_eq!(edges, [40, 100, 160]);
+}
+
+#[test]
+fn beam_retrace_can_wrap_through_frame_start() {
+    use vga::beam::{Phase, Sequencer};
+    let mut timing = short_beam_timing();
+    timing.retrace_start = 5;
+    timing.retrace_end = 7;
+    let mut clock = Sequencer::new(timing, 49);
+    let mut edges = Vec::new();
+    while let Some(event) = clock.next(71) {
+        if matches!(event.phase, Phase::RetraceStart | Phase::RetraceEnd) {
+            edges.push((event.clock, event.phase));
+        }
+    }
+    assert_eq!(edges, [(50, Phase::RetraceStart), (70, Phase::RetraceEnd)]);
+    assert_eq!(timing.status(59) & 8, 8);
+    assert_eq!(timing.status(60) & 8, 8);
+    assert_eq!(timing.status(70) & 8, 0);
+}
+
+#[test]
+fn beam_deadline_rounding_never_fires_early() {
+    use vga::beam::Timing;
+    let state = vga::LegacyVgaState::new_mode3_boxed();
+    let timing = Timing::from_registers(state.misc_output.get(), &state.seq.read(), &state.crtc.read());
+    for clock in [1, 7, 100, 999, 45_000, 1_000_000, 9_000_000_000] {
+        let deadline = timing.time_at(clock);
+        assert_eq!(timing.clock_at(deadline), clock);
+        assert!(timing.clock_at(deadline - 1) < clock);
+    }
+}
+
+#[test]
+fn beam_reprogramming_does_not_replay_old_rows() {
+    use vga::beam::Sequencer;
+    let timing = short_beam_timing();
+    let mut clock = Sequencer::new(timing, 0);
+    while clock.next(79).is_some() {}
+    clock.reprogram(timing, 79);
+    assert_eq!(clock.deadline_ns(), 80);
+    let mut changed = timing;
+    changed.horizontal_total = 12;
+    clock.reprogram(changed, 79);
+    assert_eq!(clock.deadline_ns(), 80); // Blank at column 8 of row 6.
+    assert!(clock.next(79).is_none());
+    assert_eq!(clock.next(80).unwrap().clock, 80);
+}
+
+fn tiny_scanout_device() -> (vga::LegacyVgaState, vga::memory::Memory<'static>, vga::beam::Timing) {
+    use std::sync::atomic::AtomicU8;
+    let state = vga::LegacyVgaState::new();
+    state.seq.set(1, 1);
+    state.seq.set(4, 4);
+    state.gc.set(6, 1);
+    state.crtc.set(0, 5); // Ten character clocks per physical line.
+    state.crtc.set(1, 0); // Eight visible pixels.
+    state.crtc.set(6, 4); // Six physical lines, four visible.
+    state.crtc.set(0x12, 3);
+    state.crtc.set(0x13, 1); // Two bytes per plane per source row.
+    state.crtc.set(0x15, 4);
+    state.crtc.set(0x16, 6);
+    state.crtc.set(0x10, 4);
+    state.crtc.set(0x11, 5);
+    state.crtc.set(0x18, 255);
+    for i in 0..16 { state.ac.set(i, i as u8); }
+    state.dac.write([0; 768]);
+    state.dac.set(3, 63); // Colour 1 red; colour 2 green.
+    state.dac.set(7, 63);
+    let bytes = Box::leak((0..4 * 65536).map(|_| AtomicU8::new(0)).collect::<Vec<_>>().into_boxed_slice());
+    let memory = vga::memory::Memory::from_bytes(bytes);
+    let timing = vga::beam::Timing::from_registers(state.misc_output.get(), &state.seq.read(), &state.crtc.read());
+    (state, memory, timing)
+}
+
+fn assert_packed_colour(pixels: &[u8], start_row: usize, end_row: usize, colour: u32) {
+    for row in start_row..end_row {
+        for pixel in 0..8 {
+            let offset = (row * 8 + pixel) * 4;
+            assert_eq!(u32::from_le_bytes(pixels[offset..offset + 4].try_into().unwrap()), colour);
+        }
+    }
+}
+
+#[test]
+fn scanout_latches_active_display_flip_for_next_frame() {
+    let (device, memory, timing) = tiny_scanout_device();
+    for row in 0..4 {
+        memory.put(device.layout().index(0, row * 2), 255);
+        memory.put(device.layout().index(1, 8 + row * 2), 255);
+    }
+    let mut scanout = vga::scanout::Scanout::new(&device, memory, PixelFormat::NATIVE, 0);
+    let mut front = Vec::new();
+    scanout.reserve(32, &mut front);
+    for clock in [40, 60, 65] { scanout.advance(timing.time_at(clock), &mut front, || {}); }
+    assert!(front.is_empty()); // A partial frame must never reach presentation.
+    device.crtc.set(0x0d, 8); // Active display; the current address stays latched.
+    assert!(scanout.advance(timing.time_at(90), &mut front, || {}).is_some());
+    assert_packed_colour(&front, 0, 4, 0x00ff0000);
+    for clock in [100, 120, 150] { scanout.advance(timing.time_at(clock), &mut front, || {}); }
+    assert_packed_colour(&front, 0, 4, 0x0000ff00);
+}
+
+#[test]
+fn scanout_fetches_live_rows_without_publication_or_frame_copy() {
+    let (device, memory, timing) = tiny_scanout_device();
+    for row in 0..4 { memory.put(device.layout().index(0, row * 2), 255); }
+    let mut scanout = vga::scanout::Scanout::new(&device, memory, PixelFormat::NATIVE, 0);
+    let mut front = Vec::new();
+    scanout.reserve(32, &mut front);
+    for clock in [40, 60] { scanout.advance(timing.time_at(clock), &mut front, || {}); }
+    // Drawing after row zero was scanned affects subsequent rows only.
+    for row in 0..4 {
+        memory.put(device.layout().index(0, row * 2), 0);
+        memory.put(device.layout().index(1, row * 2), 255);
+    }
+    scanout.advance(timing.time_at(90), &mut front, || {});
+    assert_packed_colour(&front, 0, 1, 0x00ff0000);
+    assert_packed_colour(&front, 1, 4, 0x0000ff00);
+}
+
+#[test]
+fn scanout_sync_and_async_drivers_produce_identical_images() {
+    let (device, memory, timing) = tiny_scanout_device();
+    for row in 0..4 { memory.put(device.layout().index(0, row * 2), 255); }
+    let mut synchronous = vga::scanout::Scanout::new(&device, memory, PixelFormat::NATIVE, 0);
+    let mut asynchronous = vga::scanout::Scanout::new(&device, memory, PixelFormat::NATIVE, 0);
+    let (mut sync_front, mut async_front) = (Vec::new(), Vec::new());
+    synchronous.reserve(32, &mut sync_front);
+    asynchronous.reserve(32, &mut async_front);
+    for clock in 1..=150 {
+        asynchronous.advance(timing.time_at(clock), &mut async_front, || {});
+        if [30, 60, 75, 90, 120, 150].contains(&clock) {
+            synchronous.advance(timing.time_at(clock), &mut sync_front, || {});
+            assert_eq!(sync_front, async_front);
+        }
+        if clock == 75 {
+            // Both consumers reached the write time; subsequent row fetches
+            // observe the changed DAC cells, without changing the earlier rows.
+            device.dac.set(3, 0);
+            device.dac.set(4, 63);
+        }
+    }
+}
+
+#[test]
+fn scanout_shares_registers_but_process_clone_does_not() {
+    let original = vga::LegacyVgaState::new();
+    let consumer = original.scanout_view();
+    let child = original.clone();
+    original.crtc.set(0x0d, 42);
+    assert_eq!(consumer.crtc.get(0x0d), 42);
+    assert_eq!(child.crtc.get(0x0d), 0);
+    drop(original);
+    assert_eq!(consumer.crtc.get(0x0d), 42); // Consumer owns a lifetime reference.
+}
+
+#[test]
+fn stalled_scanout_discards_partial_frame_and_recovers() {
+    let (device, memory, timing) = tiny_scanout_device();
+    for row in 0..4 { memory.put(device.layout().index(0, row * 2), 255); }
+    let mut scanout = vga::scanout::Scanout::new(&device, memory, PixelFormat::NATIVE, 0);
+    let mut front = Vec::new();
+    scanout.reserve(32, &mut front);
+    scanout.advance(timing.time_at(40), &mut front, || {});
+    scanout.advance(timing.time_at(60), &mut front, || {});
+    scanout.advance(timing.time_at(600), &mut front, || {});
+    assert!(front.is_empty());
+    for clock in [630, 660, 690] { scanout.advance(timing.time_at(clock), &mut front, || {}); }
+    assert_packed_colour(&front, 0, 4, 0x00ff0000);
 }

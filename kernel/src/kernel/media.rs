@@ -430,15 +430,11 @@ impl<T: Send + 'static> VideoService<T> {
         Some(guard)
     }
     pub fn activate(&self) {
-        if !enabled() {
-            if (self.due)() && let Some(mut state) = self.state.value.try_lock() {
-                (self.poll)(&mut state);
-            }
+        let argument = &*self.state as *const VideoState<T> as usize;
+        if VIDEO_OWNER.load(Ordering::Acquire) == argument {
+            kernel_entry();
             return;
         }
-
-        let argument = &*self.state as *const VideoState<T> as usize;
-        if VIDEO_OWNER.load(Ordering::Acquire) == argument { return; }
         unsafe fn invoke<T>(argument: usize) {
             let state = unsafe { &*(argument as *const VideoState<T>) };
             if state.publication_pending.load(Ordering::Acquire) { return; }
@@ -451,6 +447,8 @@ impl<T: Send + 'static> VideoService<T> {
         VIDEO_POLL.store(self.poll as usize, Ordering::Relaxed);
         *slot = Some(VideoPoll { command: Command { run: invoke::<T>, argument }, due: self.due });
         VIDEO_OWNER.store(argument, Ordering::Release);
+        drop(slot);
+        kernel_entry();
     }
     /// Fence scanout before changing the physical mode or releasing mappings.
     pub fn pause(&self) {
@@ -467,12 +465,20 @@ static VIDEO_POLL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicU
 impl<T: Send + 'static> Drop for VideoService<T> {
     fn drop(&mut self) { self.pause(); }
 }
+/// The synchronous driver consumes precisely the same device phases as the
+/// media worker. Call before dispatching a guest event that can change VGA.
+pub(crate) fn kernel_entry() {
+    if !enabled() { video_checkpoint(); }
+}
 fn video_checkpoint() {
     if let Some(service) = VIDEO_SERVICE.try_lock()
         && let Some(service) = *service
         && (service.due)()
     {
-        unsafe { execute(service.command); }
+        unsafe {
+            if enabled() { execute(service.command); }
+            else { (service.command.run)(service.command.argument); }
+        }
     }
 }
 
@@ -637,4 +643,20 @@ mod guest_memory_tests {
         gate.enter();
         gate.leave();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn inline_video_entries_do_not_require_a_worker_refresh_callback() {
+    assert!(!enabled());
+    assert_eq!(REFRESH.load(Ordering::Relaxed), 0);
+    let service = unsafe { VideoService::new(0usize, || true, |calls| *calls += 1) };
+    service.activate();
+    kernel_entry();
+    assert_eq!(*service.try_lock().unwrap(), 2);
+    service.pause();
+    kernel_entry();
+    assert_eq!(*service.try_lock().unwrap(), 2);
+    service.activate();
+    assert_eq!(*service.try_lock().unwrap(), 3);
 }

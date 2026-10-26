@@ -435,7 +435,7 @@ pub fn is_standard_text(device: &DosVideo) -> bool {
             crate::kernel::drivers::vga_hw::is_standard_text_mode(native.cap()),
         DosVideo::Vga(dev) | DosVideo::Fullscreen(FullscreenVga::Emulated(dev, _)) =>
             dev.state.legacy().is_some_and(|state| ::vga::is_standard_text(&::vga::Regs {
-                crtc: state.crtc, seq: state.seq, gc: state.gc, misc: state.misc_output,
+                crtc: state.crtc.read(), seq: state.seq.read(), gc: state.gc.read(), misc: state.misc_output.get(),
             })),
     }
 }
@@ -470,7 +470,7 @@ fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine:
             dev.svga_pages = pages;
             if !dev.svga_vram.is_empty() {
                 let bytes = svga.config.framebuffer_bytes as usize;
-                live_vram_mut(machine)[..bytes].copy_from_slice(&dev.svga_vram[..bytes]);
+                live_vram_mut(machine).range(0, bytes).copy_from(&dev.svga_vram[..bytes]);
                 dev.svga_vram.clear();
             }
             machine.copy_page_entries(
@@ -548,6 +548,9 @@ fn initialize_live_vram<A: crate::Arch>(
 
 static REGISTER_REVISION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 static MEMORY_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+pub(crate) fn scanout_epoch() -> u32 {
+    MEMORY_EPOCH.load(core::sync::atomic::Ordering::Relaxed)
+}
 pub(crate) fn scanout_revision() -> u32 {
     REGISTER_REVISION.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -559,9 +562,8 @@ fn rebind_scanout() {
     MEMORY_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-// Scanout sampling excludes both guest execution and kernel alias accesses.
-// The guest loop holds this gate for one slice; the renderer only holds it
-// while copying into its own scratch, never while decoding or presenting.
+// Audio DMA and the linear VBE fallback still use this gate. Legacy VGA
+// scanout uses atomic memory directly and never acquires this gate.
 use crate::kernel::media::GUEST_MEMORY;
 #[thread_local]
 static mut LIVE_ACCESS_DEPTH: usize = 0;
@@ -616,7 +618,7 @@ impl LiveRegion {
 }
 pub(crate) fn try_live_access() -> Option<LiveRead> { GUEST_MEMORY.try_read() }
 pub(crate) fn sample_live(vram: LiveRegion, destination: &mut [u8],
-    planes: LiveRegion, plane_destination: &mut [u8]) -> bool {
+    planes: LiveRegion, plane_destination: &mut [u8], revision: u32) -> bool {
     let inline = !crate::kernel::media::enabled() && unsafe { LIVE_ACCESS_DEPTH != 0 };
     let _guard = if inline { None } else {
         let Some(guard) = try_live_access() else { return false };
@@ -624,6 +626,10 @@ pub(crate) fn sample_live(vram: LiveRegion, destination: &mut [u8],
     };
     let epoch = MEMORY_EPOCH.load(core::sync::atomic::Ordering::Relaxed);
     if vram.epoch != epoch || planes.epoch != epoch { return false; }
+    // The producer publishes registers separately from this VRAM copy. A
+    // guest scroll/page-flip since that publication invalidates the pair.
+    // Check while holding the guest gate, so no port write can race the copy.
+    if revision != scanout_revision() { return false; }
     vram.sample(destination);
     planes.sample(plane_destination);
     true
@@ -665,22 +671,22 @@ pub fn trapped_aperture(vga: &LegacyVgaState) -> Option<core::ops::Range<u16>> {
 /// pages; address-space teardown/fork must never free or privatize them.
 pub(crate) const VGA_VRAM_BASE: usize = 0x4100_0000;
 
-fn live_planes_mut<A>(_machine: &mut A) -> &mut [u8] {
-    // The exclusive machine borrow prevents guest entry/owner switches while
-    // this kernel view is held. IRQ handlers never access emulated VRAM.
-    unsafe { core::slice::from_raw_parts_mut(live_vram_ptr(), PLANES_LEN) }
+fn live_planes_mut<A>(_machine: &mut A) -> ::vga::memory::Memory<'static> {
+    live_memory().range(0, PLANES_LEN)
 }
 
-fn live_vram_mut<A>(_machine: &mut A) -> &mut [u8] {
-    use core::sync::atomic::Ordering;
-    let bytes = LIVE_VRAM_PAGES.load(Ordering::Relaxed) * crate::PAGE_SIZE;
-    unsafe { core::slice::from_raw_parts_mut(live_vram_ptr(), bytes) }
+pub(crate) fn live_memory() -> ::vga::memory::Memory<'static> {
+    let bytes = LIVE_VRAM_PAGES.load(core::sync::atomic::Ordering::Relaxed) * crate::PAGE_SIZE;
+    // The backing is permanent; kernel writers use this same byte-atomic view.
+    unsafe { ::vga::memory::Memory::mapped(live_vram_ptr(), bytes) }
 }
+
+fn live_vram_mut<A>(_machine: &mut A) -> ::vga::memory::Memory<'static> { live_memory() }
 
 fn write_live_planes<A: crate::Arch>(machine: &mut A, planes: &[u8]) {
     let _live_access = live_access();
     assert_eq!(planes.len(), PLANES_LEN);
-    live_planes_mut(machine).copy_from_slice(planes);
+    live_planes_mut(machine).copy_from(planes);
 }
 
 fn aperture_range(aperture: ::vga::CpuAperture) -> Option<::vga::ApertureRange> {
@@ -750,7 +756,7 @@ pub fn port_write<A: crate::Arch>(
     let write = state.port_write(port, value);
     if let Some(transition) = write.vram_transition {
         rebind_scanout();
-        transition.apply(live_planes_mut(machine));
+        live_planes_mut(machine).transition(transition);
     }
     apply_aperture_write(machine, write);
 }
@@ -769,8 +775,7 @@ pub fn bios_load_font<A: crate::Arch>(
     let _live_access = live_access();
     let Some(dev) = device.emulated_mut() else { return };
     let Some(vga) = dev.state.legacy_mut() else { return };
-    ::vga::load_font_glyphs(
-        live_planes_mut(machine),
+    live_planes_mut(machine).load_font(
         vga.layout(),
         map,
         first,
@@ -786,11 +791,11 @@ pub fn bios_set_text_height(device: &mut DosVideo, glyph_h: u8) {
     let visible = if glyph_h == 14 { 350u16 } else { 400u16 };
     let end = visible - 1;
     let Some(state) = dev.state.legacy_mut() else { return };
-    state.crtc[9] = (state.crtc[9] & 0xE0) | (glyph_h - 1);
-    state.crtc[0x12] = end as u8;
-    state.crtc[7] = (state.crtc[7] & !0x42)
+    state.crtc.set(9, (state.crtc.get(9) & 0xE0) | (glyph_h - 1));
+    state.crtc.set(0x12, end as u8);
+    state.crtc.set(7, (state.crtc.get(7) & !0x42)
         | (((end >> 8) as u8 & 1) << 1)
-        | (((end >> 9) as u8 & 1) << 6);
+        | (((end >> 9) as u8 & 1) << 6));
 }
 
 /// BIOS text services program the same registers as direct guest port I/O.
@@ -800,7 +805,7 @@ pub fn bios_write_crtc<A: crate::Arch>(
     if let Some(dev) = device.emulated_mut() {
         if let Some(state) = dev.state.legacy_mut() {
             state.crtc_index = index;
-            state.crtc[usize::from(index)] = value;
+            state.crtc.set(usize::from(index), value);
         }
     } else if device.is_native() {
         let port: u16 = bda_field!(machine, crtc_base);
@@ -813,7 +818,7 @@ pub fn bios_set_font_map_select(device: &mut DosVideo, select: u8) {
     if let Some(dev) = device.emulated_mut()
         && let Some(state) = dev.state.legacy_mut()
     {
-        state.seq[3] = select;
+        state.seq.set(3, select);
     }
 }
 
@@ -1103,7 +1108,7 @@ pub fn svga_set_curated_mode<A: crate::Arch>(
         machine.map_shared_pages(SVGA_LFB_BASE >> 12, base, pages);
     }
     if request & 0x8000 == 0 {
-        live_vram_mut(machine)[..mode.framebuffer_bytes as usize].fill(0);
+        live_vram_mut(machine).range(0, mode.framebuffer_bytes as usize).fill(0);
     }
     let access = if request & 0x4000 != 0 {
         ::vga::SvgaAccess::Linear
@@ -1183,14 +1188,14 @@ pub fn set_emulated_mode<A: crate::Arch>(
     // display-start showed the menu at the wrong offset; stale shift/chain
     // bits later misclassified the menu as the level's Mode X entirely).
     if let Some(r) = ::vga::bios_mode_regs(mode) {
-        vga.misc_output = r.misc;
-        vga.seq = r.seq;
-        vga.gc = r.gc;
-        vga.crtc = r.crtc;
+        vga.misc_output.set(r.misc);
+        vga.seq.write(r.seq);
+        vga.gc.write(r.gc);
+        vga.crtc.write(r.crtc);
     }
     let new_layout = vga.layout();
     if old_layout != new_layout {
-        ::vga::VramTransition::between(old_layout, new_layout).apply(planes);
+        planes.transition(::vga::VramTransition::between(old_layout, new_layout));
     }
     // A real VGA BIOS reloads the DAC on every clearing mode set. Which default
     // depends on the render path: text and planar 16-colour modes map
@@ -1202,24 +1207,24 @@ pub fn set_emulated_mode<A: crate::Arch>(
         // mode-13h fallback. VGA uses an RGBI-compatibility DAC for the 200-line
         // EGA modes (0Dh/0Eh) and the full 64-colour EGA DAC for 350/480-line
         // planar modes.
-        vga.dac = if matches!(mode, 0x0D | 0x0E) {
+        vga.dac.write(if matches!(mode, 0x0D | 0x0E) {
             ::vga::ega_200line_dac()
         } else {
             ::vga::ega_dac()
-        };
+        });
     } else if clear {
-        vga.dac = if matches!(mode, 0..=3 | 7) {
+        vga.dac.write(if matches!(mode, 0..=3 | 7) {
             ::vga::ega_dac()
         } else {
             ::vga::fallback_palette()
-        };
+        });
     }
     let planar = matches!(mode, 0x0D..=0x12);
     if matches!(mode, 0..=3 | 7) {
-        vga.ac[..16].copy_from_slice(&::vga::VGA_TEXT_AC_PALETTE);
-        vga.ac[0x10] &= !0x80;
-        vga.ac[0x12] = 0x0F;
-        vga.ac[0x14] = 0;
+        vga.ac.write_range(0, &::vga::VGA_TEXT_AC_PALETTE);
+        vga.ac.set(0x10, vga.ac.get(0x10) & (!0x80));
+        vga.ac.set(0x12, 0x0F);
+        vga.ac.set(0x14, 0);
     }
     if planar {
         // Standard EGA AC palettes, straight out of the BIOS video parameter
@@ -1243,11 +1248,11 @@ pub fn set_emulated_mode<A: crate::Arch>(
         } else {
             &EGA_AC_NORMAL
         };
-        vga.ac[..16].copy_from_slice(ac);
-        vga.ac[0x10] &= !0x80; // P4/P5 from palette, not colour-select
-        vga.ac[0x12] = 0x0F; // colour plane enable: all planes visible
-        vga.ac[0x13] = 0x00; // pixel pan
-        vga.ac[0x14] = 0x00; // colour select high bits
+        vga.ac.write_range(0, ac);
+        vga.ac.set(0x10, vga.ac.get(0x10) & (!0x80)); // P4/P5 from palette, not colour-select
+        vga.ac.set(0x12, 0x0F); // colour plane enable: all planes visible
+        vga.ac.set(0x13, 0x00); // pixel pan
+        vga.ac.set(0x14, 0x00); // colour select high bits
     }
     if clear { planes.fill(0); }
     // A VGA BIOS text-mode set reloads the ROM character generator even when
@@ -1255,10 +1260,9 @@ pub fn set_emulated_mode<A: crate::Arch>(
     // plane-2 font, omitting this leaves every ordinary BIOS text screen with
     // an all-zero character map after the plane clear above.
     if matches!(mode, 0..=3 | 7) {
-        ::vga::load_font_map(
-            planes,
+        planes.load_font(
             vga.layout(),
-            0,
+            0, 0,
             &lib::codepage::current_codepage().fonts().h16,
             16,
         );
@@ -1274,7 +1278,7 @@ pub fn set_emulated_mode<A: crate::Arch>(
 pub fn vram_write<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaState, off: u32, byte: u8) {
     let _live_access = live_access();
     if let Some(base) = live_vram_ptr_if_initialized() {
-        let planes = unsafe { core::slice::from_raw_parts_mut(base.as_ptr(), PLANES_LEN) };
+        let planes = unsafe { ::vga::memory::Memory::mapped(base.as_ptr(), PLANES_LEN) };
         vram_write_live(planes, vga, off, byte);
         return;
     }
@@ -1286,7 +1290,7 @@ pub fn vram_write<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaS
     let cur = core::array::from_fn(|p| {
         machine.read::<u8>(VGA_VRAM_BASE + layout.index(p, off))
     });
-    let out = ::vga::planar_write(cur, vga.latches, &vga.gc, map_mask, byte);
+    let out = ::vga::planar_write(cur, vga.latches, &vga.gc.read(), map_mask, byte);
     for p in 0..4 {
         if out[p] != cur[p] {
             machine.write::<u8>(VGA_VRAM_BASE + layout.index(p, off), out[p]);
@@ -1299,7 +1303,7 @@ pub fn flush_write_batch<A: arch_abi::GuestBytes>(machine: &mut A, state: &mut L
     writes: &mut crate::kernel::dos::planar::FastWrites) {
     let _live_access = live_access();
     if let Some(base) = live_vram_ptr_if_initialized() {
-        let planes = unsafe { core::slice::from_raw_parts_mut(base.as_ptr(), PLANES_LEN) };
+        let planes = unsafe { ::vga::memory::Memory::mapped(base.as_ptr(), PLANES_LEN) };
         for (address, value, bytes) in writes.drain() {
             for byte in 0..bytes {
                 vram_write_live(planes, state, address - A0000 as u32 + u32::from(byte),
@@ -1322,7 +1326,7 @@ pub fn flush_write_batch<A: arch_abi::GuestBytes>(machine: &mut A, state: &mut L
 /// up to four translated writes for every already-expensive #PF-emulated CPU
 /// byte.
 #[inline(always)]
-fn vram_write_live(planes: &mut [u8], vga: &mut LegacyVgaState, off: u32, byte: u8) {
+fn vram_write_live(planes: ::vga::memory::Memory<'_>, vga: &mut LegacyVgaState, off: u32, byte: u8) {
     let (off, map_mask) = vga.cpu_write_address(off as usize);
     let layout = vga.layout();
 
@@ -1330,30 +1334,30 @@ fn vram_write_live(planes: &mut [u8], vga: &mut LegacyVgaState, off: u32, byte: 
     // byte and no set/reset. In that configuration the VGA ALU reduces exactly
     // to assigning the byte to every enabled plane; avoid fetching four old
     // values and running the general ALU for the overwhelmingly common case.
-    if vga.gc[5] & 0x0B == 0
-        && vga.gc[3] & 0x1F == 0
-        && vga.gc[1] & 0x0F == 0
-        && vga.gc[8] == 0xFF
+    if vga.gc.get(5) & 0x0B == 0
+        && vga.gc.get(3) & 0x1F == 0
+        && vga.gc.get(1) & 0x0F == 0
+        && vga.gc.get(8) == 0xFF
     {
         for p in 0..4 {
             if map_mask & (1 << p) != 0 {
-                planes[layout.index(p, off)] = byte;
+                planes.put(layout.index(p, off), byte);
             }
         }
         return;
     }
 
-    let cur = core::array::from_fn(|p| planes[layout.index(p, off)]);
-    let out = ::vga::planar_write(cur, vga.latches, &vga.gc, map_mask, byte);
+    let cur = core::array::from_fn(|p| planes.get(layout.index(p, off)).unwrap());
+    let out = ::vga::planar_write(cur, vga.latches, &vga.gc.read(), map_mask, byte);
     for p in 0..4 {
         if out[p] != cur[p] {
-            planes[layout.index(p, off)] = out[p];
+            planes.put(layout.index(p, off), out[p]);
         }
     }
 }
 
-/// Copy bytes into guest memory, routing any overlap with the trap-backed VGA
-/// aperture through the VGA write path. DOS services can legally transfer
+/// Copy bytes into guest memory, routing any VGA aperture overlap through
+/// the device's atomic write path (including directly mapped text/chain-4). DOS services can legally transfer
 /// file/device data straight into video memory; on a real VGA those CPU stores
 /// still honour map mask/write-mode/latches, while the emulated path has the aperture
 /// unmapped so raw `machine.copy_to` would fault in the kernel.
@@ -1367,12 +1371,12 @@ pub fn copy_to_guest<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut DosVide
         machine.copy_to(addr, src);
         return;
     };
-    let Some(pages) = trapped_aperture(vga) else {
+    let Some(range) = aperture_range(vga.cpu_aperture()) else {
         machine.copy_to(addr, src);
         return;
     };
-    let window_base = usize::from(pages.start) << 12;
-    let window_end = usize::from(pages.end) << 12;
+    let window_base = usize::from(range.start_page) << 12;
+    let window_end = usize::from(range.end_page) << 12;
     if src.is_empty()
         || addr >= window_end
         || addr.saturating_add(src.len()) <= window_base
@@ -1396,7 +1400,7 @@ pub fn copy_to_guest<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut DosVide
         }
         let n = (window_end - cur).min(src.len() - pos);
         if let Some(base) = live_vram_ptr_if_initialized() {
-            let planes = unsafe { core::slice::from_raw_parts_mut(base.as_ptr(), PLANES_LEN) };
+            let planes = unsafe { ::vga::memory::Memory::mapped(base.as_ptr(), PLANES_LEN) };
             for (i, &byte) in src[pos..pos + n].iter().enumerate() {
                 vram_write_live(planes, vga, (cur + i - window_base) as u32, byte);
             }
@@ -1422,7 +1426,7 @@ pub fn vram_read<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaSt
             machine.read::<u8>(VGA_VRAM_BASE + layout.index(p, off))
         })
     };
-    let mut gc = vga.gc;
+    let mut gc = vga.gc.read();
     gc[4] = read_plane as u8;
     let (data, latches) = ::vga::planar_read(cur, &gc);
     vga.latches = latches;
@@ -1573,7 +1577,7 @@ pub fn bios_draw_glyph<A: arch_abi::GuestBytes>(
             let Some(dev) = device.emulated_mut() else { return false };
             let Some(vga) = dev.state.legacy_mut() else { return false };
             let width: u32 = if mode == 0x0D { 320 } else { 640 };
-            let rb = if vga.crtc[0x13] != 0 { vga.crtc[0x13] as u32 * 2 } else { width / 8 };
+            let rb = if vga.crtc.get(0x13) != 0 { vga.crtc.get(0x13) as u32 * 2 } else { width / 8 };
             for gy in 0..cell_h {
                 let bits = glyph(gy);
                 let py = py0 + gy;
@@ -1703,10 +1707,10 @@ mod bios_memory_tests {
         let mut dev = EmulatedVga::initial_mode3();
         let regs = ::vga::bios_mode_regs(mode).unwrap();
         if let Some(state) = dev.state.legacy_mut() {
-            state.seq = regs.seq;
-            state.gc = regs.gc;
-            state.crtc = regs.crtc;
-            state.misc_output = regs.misc;
+            state.seq.write(regs.seq);
+            state.gc.write(regs.gc);
+            state.crtc.write(regs.crtc);
+            state.misc_output.set(regs.misc);
         }
         let aperture = dev.state.legacy().map_or(::vga::CpuAperture::None, |state| state.cpu_aperture());
         let memory = Memory {
@@ -1726,10 +1730,10 @@ mod bios_memory_tests {
             let a = first.emulated_mut().unwrap().state.legacy_mut().unwrap();
             let b = second.emulated_mut().unwrap().state.legacy_mut().unwrap();
             for state in [&mut *a, &mut *b] {
-                state.gc[5] = mode;
-                state.gc[3] = 0x19; // XOR, rotated CPU data
-                state.gc[8] = 0x5a;
-                state.seq[2] = 9;
+                state.gc.set(5, mode);
+                state.gc.set(3, 0x19); // XOR, rotated CPU data
+                state.gc.set(8, 0x5a);
+                state.seq.set(2, 9);
                 state.latches = [0x12, 0x34, 0x56, 0x78];
             }
             let mut writes = FastWrites::new();
