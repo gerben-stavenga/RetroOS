@@ -7,8 +7,17 @@
 extern crate alloc;
 
 mod class;
+mod controls;
+mod dialog;
+mod drawing;
+mod format;
+mod input;
+mod keyboard;
+mod menu;
 mod message;
+mod paint;
 mod rect;
+mod resource;
 mod runtime;
 mod state;
 mod text;
@@ -99,7 +108,7 @@ pub unsafe extern "system" fn SendMessageW(
     wparam: u32,
     lparam: u32,
 ) -> i32 {
-    unsafe { message::send(hwnd, message, wparam, lparam) }
+    unsafe { message::send(hwnd, message, wparam, lparam, true) }
 }
 
 #[unsafe(no_mangle)]
@@ -109,11 +118,15 @@ pub unsafe extern "system" fn SendMessageA(
     wparam: u32,
     lparam: u32,
 ) -> i32 {
-    unsafe { SendMessageW(hwnd, message, wparam, lparam) }
+    unsafe { message::send(hwnd, message, wparam, lparam, false) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DispatchMessageW(message: *const Message) -> i32 {
+    unsafe { dispatch(message, true) }
+}
+
+unsafe fn dispatch(message: *const Message, wide: bool) -> i32 {
     // Copy before calling guest code: it may change or release the caller's MSG.
     let Message {
         hwnd,
@@ -130,13 +143,13 @@ pub unsafe extern "system" fn DispatchMessageW(message: *const Message) -> i32 {
         }
         0
     } else {
-        unsafe { SendMessageW(hwnd, message, wparam, lparam) }
+        unsafe { message::send(hwnd, message, wparam, lparam, wide) }
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DispatchMessageA(message: *const Message) -> i32 {
-    unsafe { DispatchMessageW(message) }
+    unsafe { dispatch(message, false) }
 }
 
 #[unsafe(no_mangle)]
@@ -147,7 +160,7 @@ pub unsafe extern "system" fn CallWindowProcW(
     wparam: u32,
     lparam: u32,
 ) -> i32 {
-    unsafe { proc(hwnd, message, wparam, lparam) }
+    unsafe { call_procedure(proc as u32, hwnd, message, wparam, lparam, true) }
 }
 
 #[unsafe(no_mangle)]
@@ -158,20 +171,115 @@ pub unsafe extern "system" fn CallWindowProcA(
     wparam: u32,
     lparam: u32,
 ) -> i32 {
-    unsafe { proc(hwnd, message, wparam, lparam) }
+    unsafe { call_procedure(proc as u32, hwnd, message, wparam, lparam, false) }
 }
 
 // Called only on the window-owning thread, with USER state unlocked.
-unsafe fn invoke(hwnd: u32, message: u32, wparam: u32, lparam: u32) -> i32 {
-    let address = state::with(|s| {
+unsafe fn invoke(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool) -> i32 {
+    let call = [lparam, wparam, message, hwnd];
+    unsafe {
+        input::hooks(4, 0, 1, call.as_ptr() as u32);
+    }
+    let result = unsafe { invoke_body(hwnd, message, wparam, lparam, wide) };
+    let returned = [result as u32, lparam, wparam, message, hwnd];
+    unsafe {
+        input::hooks(12, 0, 1, returned.as_ptr() as u32);
+    }
+    result
+}
+unsafe fn invoke_body(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool) -> i32 {
+    let target = state::with(|s| {
         s.windows
             .iter()
             .find(|w| w.hwnd == hwnd)
-            .map_or(0, |w| w.proc)
+            .map(|w| (w.proc, w.wide))
     });
-    if address == 0 {
+    let Some((address, target_wide)) = target.filter(|t| t.0 != 0) else {
         return 0;
+    };
+    let builtin = controls::builtin(address);
+    let proc: WndProc = unsafe { transmute(controls::variant(address, wide)) };
+    if builtin || wide == target_wide {
+        return unsafe { proc(hwnd, message, wparam, lparam) };
     }
+    unsafe { converted(address, target_wide, hwnd, message, wparam, lparam, wide) }
+}
+
+unsafe fn call_procedure(
+    address: u32,
+    hwnd: u32,
+    message: u32,
+    wparam: u32,
+    lparam: u32,
+    wide: bool,
+) -> i32 {
+    if address >> 16 == 0xffff {
+        let entry = state::with(|s| {
+            s.procedures
+                .get((address & 0xffff).wrapping_sub(1) as usize)
+                .copied()
+        });
+        let Some((proc, encoding)) = entry else {
+            return 0;
+        };
+        unsafe { converted(proc, encoding, hwnd, message, wparam, lparam, wide) }
+    } else if address != 0 {
+        let proc: WndProc = unsafe { transmute(address) };
+        unsafe { proc(hwnd, message, wparam, lparam) }
+    } else {
+        0
+    }
+}
+
+unsafe fn converted(
+    address: u32,
+    target_wide: bool,
+    hwnd: u32,
+    message: u32,
+    wparam: u32,
+    lparam: u32,
+    wide: bool,
+) -> i32 {
     let proc: WndProc = unsafe { transmute(address) };
-    unsafe { proc(hwnd, message, wparam, lparam) }
+    if wide == target_wide {
+        return unsafe { proc(hwnd, message, wparam, lparam) };
+    }
+    // Text messages cross the caller/window encoding boundary on the receiving
+    // thread. Temporary buffers remain live throughout reentrant callbacks.
+    match message {
+        0x000c if lparam != 0 => {
+            let mut value = unsafe { text::read(lparam, wide) };
+            if target_wide {
+                value.push(0);
+                unsafe { proc(hwnd, message, wparam, value.as_ptr() as u32) }
+            } else {
+                let mut bytes = text::ansi(&value);
+                bytes.push(0);
+                unsafe { proc(hwnd, message, wparam, bytes.as_ptr() as u32) }
+            }
+        }
+        0x000d | 0x000e => {
+            if message == 0x000d && (wparam == 0 || lparam == 0) {
+                return 0;
+            }
+            let length = unsafe { proc(hwnd, 0x000e, 0, 0) }.max(0) as usize;
+            let capacity = length.saturating_add(1);
+            // u16 backing also accommodates the ANSI result and its terminator.
+            let mut buffer = alloc::vec![0u16; capacity];
+            unsafe {
+                proc(hwnd, 0x000d, capacity as u32, buffer.as_mut_ptr() as u32);
+            }
+            let value = unsafe { text::read(buffer.as_ptr() as u32, target_wide) };
+            if message == 0x000e {
+                if wide {
+                    value.len() as i32
+                } else {
+                    text::ansi(&value).len() as i32
+                }
+            } else {
+                unsafe { text::write(lparam, wparam as i32, &value, wide) as i32 }
+            }
+        }
+        _ => unsafe { proc(hwnd, message, wparam, lparam) },
+    }
 }

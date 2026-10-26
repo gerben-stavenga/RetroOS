@@ -13,7 +13,10 @@ const EMPTY: Counter = Counter {
     kind: 0, key: 0, cs: 0, ip: 0, calls: 0, run: 0, dispatch: 0, max_dispatch: 0,
 };
 const SLOTS: usize = 256;
-static mut COUNTERS: [Counter; SLOTS] = [EMPTY; SLOTS];
+// The cooperative event loop owns this optional diagnostic storage. Allocate
+// on first use, outside the measured dispatch interval, rather than reserving
+// 12 KiB in every kernel's bootstrap footprint.
+static mut COUNTERS: alloc::vec::Vec<Counter> = alloc::vec::Vec::new();
 static mut OVERFLOW: u64 = 0;
 const RM_TARGET_SLOTS: usize = 32;
 static mut RM_TARGETS: [(u8, u16, u16, u64); RM_TARGET_SLOTS] = [(0, 0, 0, 0); RM_TARGET_SLOTS];
@@ -61,6 +64,7 @@ impl Sample {
         // Keep table lookup outside the measured dispatch interval.
         unsafe {
             let counters = &mut *core::ptr::addr_of_mut!(COUNTERS);
+            if counters.is_empty() { counters.resize(SLOTS, EMPTY); }
             let first = (key.wrapping_mul(2654435761) ^ kind) as usize % SLOTS;
             for probe in 0..SLOTS {
                 let index = (first + probe) % SLOTS;
@@ -84,7 +88,7 @@ impl Dispatch {
         let Some((index, run, start)) = self.0 else { return };
         let elapsed = machine.rdtsc().wrapping_sub(start);
         unsafe {
-            let counter = &mut (*core::ptr::addr_of_mut!(COUNTERS))[index];
+            let counter = &mut (&mut *core::ptr::addr_of_mut!(COUNTERS))[index];
             counter.calls += 1;
             counter.run += run;
             counter.dispatch += elapsed;
@@ -95,7 +99,7 @@ impl Dispatch {
 
 pub(super) fn reset() {
     unsafe {
-        core::ptr::write(core::ptr::addr_of_mut!(COUNTERS), [EMPTY; SLOTS]);
+        (&mut *core::ptr::addr_of_mut!(COUNTERS)).fill(EMPTY);
         OVERFLOW = 0;
         RM_TARGETS = [(0, 0, 0, 0); RM_TARGET_SLOTS];
         READ_DETAILS = [(0, 0, 0); READ_DETAIL_SLOTS];

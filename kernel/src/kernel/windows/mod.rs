@@ -124,9 +124,6 @@ enum Api {
     WideCharToMultiByte,
     WriteConsoleA,
     WriteFile,
-    CharUpperA,
-    LstrcpyW,
-    LstrlenW,
     UpdateWindow,
     InvalidateRect,
     TranslateMessage,
@@ -215,6 +212,7 @@ enum GdiObject {
 
 struct DeviceContext {
     handle: u32,
+    window: Option<u32>,
     bitmap: Option<u32>,
     x: i32,
     y: i32,
@@ -284,6 +282,8 @@ pub struct WindowsState {
     focus_hwnd: u32,
     gdi_objects: Vec<(u32, GdiObject)>,
     dcs: Vec<DeviceContext>,
+    gdi_rops: Vec<(u32,i32)>,
+    gdi_clips: Vec<(u32, Vec<(i32,i32,i32,i32)>)>,
     mouse_x: i32,
     mouse_y: i32,
     mouse_buttons: u8,
@@ -341,6 +341,8 @@ impl WindowsState {
             focus_hwnd: 0,
             gdi_objects: Vec::new(),
             dcs: Vec::new(),
+            gdi_rops: Vec::new(),
+            gdi_clips: Vec::new(),
             mouse_x: 0,
             mouse_y: 0,
             mouse_buttons: 0,
@@ -557,7 +559,10 @@ pub fn surface_buffer<'a>(
         window.width as usize,
         window.height as usize,
         window.width as usize * 4,
-        vga::PixelFormat::NATIVE,
+        // GDI stores COLORREF (red in the low byte). The console rasterizer
+        // writes native packed pixels instead.
+        if window.hwnd == state.console.hwnd { vga::PixelFormat::NATIVE }
+        else { vga::PixelFormat { red_pos: 0, blue_pos: 16, ..vga::PixelFormat::NATIVE } },
         &window.pixels,
     ).ok()
 }
@@ -994,9 +999,6 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
     ),
     (b"KERNEL32", b"WriteConsoleA", Api::WriteConsoleA, 20),
     (b"KERNEL32", b"WriteFile", Api::WriteFile, 20),
-    (b"KERNEL32", b"lstrcpyW", Api::LstrcpyW, 8),
-    (b"KERNEL32", b"lstrlenW", Api::LstrlenW, 4),
-    (b"USER32", b"CharUpperA", Api::CharUpperA, 4),
     (b"USER32", b"AdjustWindowRect", Api::Stub(1), 12),
     (b"USER32", b"BeginPaint", Api::BeginPaint, 8),
     (b"USER32", b"CheckMenuItem", Api::Stub(0), 12),
@@ -1617,8 +1619,8 @@ fn target_mut(
     state: &mut WindowsState,
     dc: u32,
 ) -> Option<RenderTarget<'_>> {
-    if dc == state.paint_dc {
-        let hwnd = state.paint_hwnd;
+    let window = if dc == state.paint_dc { Some(state.paint_hwnd) } else { state.dcs.iter().find(|d| d.handle == dc).and_then(|d| d.window) };
+    if let Some(hwnd) = window {
         let window = state.windows.iter().find(|window| window.hwnd == hwnd)?;
         let (clip_width, clip_height) = (window.width, window.height);
         let (mut x, mut y, mut parent) = (window.x, window.y, window.parent);
@@ -1674,6 +1676,9 @@ fn target_mut(
 }
 
 fn put_pixel(state: &mut WindowsState, dc: u32, x: i32, y: i32, color: u32) {
+    let rop = state.gdi_rops.iter().find(|(h,_)|*h==dc).map_or(13,|(_,r)|*r) - 1;
+    if state.gdi_clips.iter().find(|(h,_)| *h==dc).is_some_and(|(_,r)| !r.iter().any(|&(l,t,r,b)| l<=x && x<r && t<=y && y<b)) { return; }
+
     let Some(target) = target_mut(state, dc) else {
         return;
     };
@@ -1685,11 +1690,22 @@ fn put_pixel(state: &mut WindowsState, dc: u32, x: i32, y: i32, color: u32) {
     if x < 0 || y < 0 || x >= target.width as i32 || y >= target.height as i32 { return; }
     let at = (y as usize * target.width as usize + x as usize) * 4;
     if at + 4 <= target.pixels.len() {
-        target.pixels[at..at + 4].copy_from_slice(&color.to_le_bytes());
+        let old = u32::from_le_bytes(target.pixels[at..at+4].try_into().unwrap());
+        let mut mixed = 0;
+        if rop&1!=0 {mixed |= !color & !old;} if rop&2!=0 {mixed |= !color & old;}
+        if rop&4!=0 {mixed |= color & !old;} if rop&8!=0 {mixed |= color & old;}
+        target.pixels[at..at + 4].copy_from_slice(&(mixed & 0x00ff_ffff).to_le_bytes());
     }
 }
 
-fn fill_pixels(
+fn fill_pixels(state: &mut WindowsState, dc: u32, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
+    if let Some((_,rects)) = state.gdi_clips.iter().find(|(h,_)| *h==dc) {
+        let rects = rects.clone();
+        for (l,t,r,b) in rects { fill_pixels_unclipped(state,dc,left.max(l),top.max(t),right.min(r),bottom.min(b),color); }
+    } else { fill_pixels_unclipped(state,dc,left,top,right,bottom,color); }
+}
+
+fn fill_pixels_unclipped(
     state: &mut WindowsState,
     dc: u32,
     left: i32,
@@ -2077,23 +2093,6 @@ fn dispatch<A: crate::Arch>(
             true,
             false,
         ),
-        Api::CharUpperA => {
-            let p = arg(machine, regs, 0);
-            if p <= 0xffff {
-                u32::from(lib::codepage::encoding_page(lib::locale::current().ansi).unwrap().uppercase(p as u8))
-            } else {
-                let mut at = p as usize;
-                loop {
-                    let b = machine.read::<u8>(at);
-                    if b == 0 {
-                        break;
-                    }
-                    machine.write::<u8>(at, lib::codepage::encoding_page(lib::locale::current().ansi).unwrap().uppercase(b));
-                    at += 1;
-                }
-                p
-            }
-        }
         Api::GetStartupInfoA => {
             let out = arg(machine, regs, 0) as usize;
             machine.zero(out, 68);
@@ -2104,21 +2103,6 @@ fn dispatch<A: crate::Arch>(
             let ticks = machine.now() / 1_000_000;
             regs.rdx = ticks >> 32;
             ticks as u32
-        }
-        Api::LstrlenW => w_string(machine, arg(machine, regs, 0)).map_or(0, |s| s.len() as u32),
-        Api::LstrcpyW => {
-            let dst = arg(machine, regs, 0) as usize;
-            let src = arg(machine, regs, 1) as usize;
-            let mut n = 0;
-            loop {
-                let c = machine.read::<u16>(src + n * 2);
-                machine.write::<u16>(dst + n * 2, c);
-                n += 1;
-                if c == 0 || n == 32768 {
-                    break;
-                }
-            }
-            dst as u32
         }
         Api::UpdateWindow | Api::InvalidateRect => {
             let hwnd = arg(machine, regs, 0);
@@ -2203,6 +2187,7 @@ fn dispatch<A: crate::Arch>(
             state.next_object += 1;
             state.dcs.push(DeviceContext {
                 handle,
+                window: None,
                 bitmap: None,
                 x: 0,
                 y: 0,
@@ -2217,7 +2202,7 @@ fn dispatch<A: crate::Arch>(
         Api::SelectObject => {
             let dc = arg(machine, regs, 0);
             let object = arg(machine, regs, 1);
-            let kind = state
+            let kind = if (0x30000..0x30100).contains(&object) { Some(1) } else { state
                 .gdi_objects
                 .iter()
                 .find(|(h, _)| *h == object)
@@ -2226,7 +2211,7 @@ fn dispatch<A: crate::Arch>(
                     GdiObject::Brush(_) => 1,
                     GdiObject::Pen(_) => 2,
                     GdiObject::Font => 3,
-                });
+                }) };
             let Some(context) = state.dcs.iter_mut().find(|d| d.handle == dc) else {
                 return 0;
             };
@@ -2261,6 +2246,8 @@ fn dispatch<A: crate::Arch>(
         }
         Api::DeleteDC => {
             let dc = arg(machine, regs, 0);
+            state.gdi_clips.retain(|(h,_)| *h!=dc);
+            state.gdi_rops.retain(|(h,_)| *h!=dc);
             if let Some(index) = state.dcs.iter().position(|d| d.handle == dc) {
                 state.dcs.swap_remove(index);
                 1
@@ -2279,7 +2266,9 @@ fn dispatch<A: crate::Arch>(
         Api::FillRect => {
             let dc = arg(machine, regs, 0);
             let rect = arg(machine, regs, 1) as usize;
-            let color = object_color(state, arg(machine, regs, 2), 0x00c0_c0c0);
+            let brush = arg(machine, regs, 2);
+            let brush = if brush == 0 { state.dcs.iter().find(|d| d.handle == dc).map_or(0, |d| d.brush) } else { brush };
+            let color = object_color(state, brush, 0x00c0_c0c0);
             let (l, t, r, b) = rect_from_guest(machine, rect);
             fill_pixels(state, dc, l, t, r, b, color);
             1

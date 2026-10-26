@@ -1,3 +1,4 @@
+load("//toolchain:windows_rust.bzl", "windows_rust_library")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:windows_watcom.bzl", "windows_dll")
 
@@ -7,12 +8,64 @@ nasm_library(
     copts = ["-fwin32"],
 )
 
+windows_rust_library(
+    name = "kernel32_rust",
+    crate_root = "kernel32.rs",
+    srcs = ["resource.rs", "profile.rs", "//lib/windows/user32:runtime.rs"],
+)
+
 windows_dll(
     name = "kernel32_dll",
     obj = ":kernel32_obj",
+    libraries = [":kernel32_rust"],
+    export_aliases = {
+        "GetPrivateProfileStringW": "_GetPrivateProfileStringW@24",
+        "GetPrivateProfileIntW": "_GetPrivateProfileIntW@16",
+        "lstrlenA": "_lstrlenA@4",
+        "lstrcpyA": "_lstrcpyA@8",
+        "lstrcpynA": "_lstrcpynA@12",
+        "lstrcmpA": "_lstrcmpA@8",
+        "lstrcmpiA": "_lstrcmpiA@8",
+        "FindResourceA": "_FindResourceA@12",
+        "FindResourceExA": "_FindResourceExA@16",
+        "lstrlenW": "_lstrlenW@4",
+        "lstrcpyW": "_lstrcpyW@8",
+        "lstrcpynW": "_lstrcpynW@12",
+        "lstrcmpW": "_lstrcmpW@8",
+        "lstrcmpiW": "_lstrcmpiW@8",
+        "FindResourceW": "_FindResourceW@12",
+        "FindResourceExW": "_FindResourceExW@16",
+        "MulDiv": "_MulDiv@12",
+        "LoadResource": "_LoadResource@8",
+        "SizeofResource": "_SizeofResource@8",
+        "LockResource": "_LockResource@4",
+        "FreeResource": "_FreeResource@4",
+    },
     out = "KERNEL32.DLL",
     module_name = "KERNEL32",
     exports = [
+        "GetPrivateProfileStringW", "GetPrivateProfileIntW", "HeapAlloc", "HeapFree", "GetProcessHeap", "CreateFileW",
+        "lstrlenA",
+        "lstrcpyA",
+        "lstrcpynA",
+        "lstrcmpA",
+        "lstrcmpiA",
+        "FindResourceA",
+        "FindResourceExA",
+        "lstrcpynW",
+        "lstrcmpW",
+        "lstrcmpiW",
+        "FindResourceW",
+        "FindResourceExW",
+        "MulDiv",
+        "LoadResource",
+        "SizeofResource",
+        "LockResource",
+        "FreeResource",
+        "CompareStringA",
+        "CompareStringW",
+        "SetLastError",
+
         "CloseHandle", "CreateEventA", "CreateFileA", "ExitProcess",
         "FlushFileBuffers", "GetACP", "GetCPInfo", "GetCommandLineA",
         "GetCommandLineW", "GetConsoleMode", "GetCurrentThreadId",

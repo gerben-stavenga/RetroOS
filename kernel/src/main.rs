@@ -55,6 +55,7 @@ fn main() {
     let mut wav: Option<String> = None;
     let mut live_console = false;
     let mut suite_control = false;
+    let mut input_control = false;
     // Positional args: [0] = program/disk, [1..] = the program's own argv tail.
     let mut positional: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -79,6 +80,9 @@ fn main() {
             // ports are unpopulated and the kernel sound path is inert.
             "--wav" => wav = args.next(),
             "--suite-control" => suite_control = true,
+            // Same input protocol without the TCG retired-instruction clock;
+            // useful for KVM applications blocked in native event waits.
+            "--input-control" => input_control = true,
             "--suite-cpu" => {
                 let name = args.next().unwrap_or_default();
                 if !arch::suite_control::set_cpu_model(&name) {
@@ -195,8 +199,8 @@ fn main() {
     // stdin→keyboard pump. Keys reach the guest via the kernel's IRQ1 path and
     // the C BIOS INT 9/16h. Harmless headless (raw mode skips a non-TTY).
     arch::enter_raw_mode();
-    if suite_control {
-        arch::suite_control::enable();
+    if suite_control || input_control {
+        if suite_control { arch::suite_control::enable(); }
         spawn_suite_control();
     } else {
         spawn_keyboard();
@@ -271,7 +275,7 @@ fn install_socket_backend_hosted() {
 fn spawn_suite_control() {
     std::thread::spawn(|| {
         use std::io::{BufRead, Write};
-        arch::suite_control::wait_paused();
+        if arch::suite_control::enabled() { arch::suite_control::wait_paused(); }
         println!("READY");
         std::io::stdout().flush().unwrap();
         for line in std::io::stdin().lock().lines() {
@@ -279,7 +283,10 @@ fn spawn_suite_control() {
             let mut words = line.split_whitespace();
             match words.next() {
                 Some("run") => match words.next().and_then(|s| s.parse::<u64>().ok()) {
-                    Some(ms) => arch::suite_control::run(ms),
+                    Some(ms) => {
+                        if arch::suite_control::enabled() { arch::suite_control::run(ms); }
+                        else { std::thread::sleep(std::time::Duration::from_millis(ms.min(1000))); }
+                    },
                     None => { println!("ERROR invalid run"); continue; }
                 },
                 Some("cycles") => match words.next().and_then(|s| s.parse::<u64>().ok()) {
@@ -294,8 +301,18 @@ fn spawn_suite_control() {
                         }
                     }
                 },
+                Some("mouse") => {
+                    let values: Vec<_> = words.collect();
+                    let report = (values.len() == 3).then(|| {
+                        Some((values[0].parse::<i16>().ok()?, values[1].parse::<i16>().ok()?, values[2].parse::<u8>().ok()?))
+                    }).flatten();
+                    let Some((dx, dy, buttons)) = report else {
+                        println!("ERROR invalid mouse report"); continue;
+                    };
+                    arch::post_irq(arch::Irq::Mouse { dx, dy, buttons });
+                },
                 Some("snapshot") => {
-                    arch::suite_control::snapshot();
+                    if arch::suite_control::enabled() { arch::suite_control::snapshot(); }
                     if let Some((w, h, px)) = arch::take_frame() {
                         // The control client names its capture with `--screenshot`.
                         // Write through the same backend helper as ordinary captures.

@@ -11,6 +11,91 @@ pub(super) fn call<A: crate::Arch>(
     let args: [u32; 12] = core::array::from_fn(|n| arg(machine, regs, n));
     let a = |n: usize| args[n];
     match name {
+        b"WinHelpW" => fail(state,120,0),
+        b"SetPixel" => {
+            if super::super::target_mut(state,a(0)).is_none(){return u32::MAX;}
+            super::super::put_pixel(state,a(0),a(1) as i32,a(2) as i32,a(3));a(3)&0xffffff
+        }
+        b"OutputDebugStringA" | b"OutputDebugStringW" => {
+            let value=if name.ends_with(b"W"){w_string(machine,a(0))}else{c_string(machine,a(0))};
+            if let Ok(value)=value {crate::compact_println!("[win32-debug] {}",core::str::from_utf8(&value).unwrap_or("?"));}
+            0
+        }
+        b"RetroGdiDeleteDC" => super::super::dispatch(machine,kt,state,regs,super::super::Api::DeleteDC),
+        b"RetroSurfaceDC" => {
+            let hwnd = a(0); let old = a(1);
+            if hwnd != 0 && !state.windows.iter().any(|w|w.hwnd==hwnd) {return fail(state,1400,0);}
+            if old != 0 {
+                let Some(dc)=state.dcs.iter_mut().find(|d|d.handle==old) else{return 0;};
+                dc.window=Some(hwnd);return old;
+            }
+            let handle=state.next_object;state.next_object+=1;
+            state.dcs.push(super::super::DeviceContext {handle,window:Some(hwnd),bitmap:None,x:0,y:0,pen:0x30008,brush:0x30005,font:1,bk:0x00ff_ffff,text:0});
+            handle
+        }
+        b"RetroInvalidateWindow" => super::super::dispatch(machine,kt,state,regs,super::super::Api::InvalidateRect),
+        b"RetroValidateWindow" => {state.messages.retain(|m|m.hwnd!=a(0)||m.message!=0xf);1}
+        b"RetroEndPaint" => super::super::dispatch(machine,kt,state,regs,super::super::Api::EndPaint),
+
+        b"RetroGdiRop" => {
+            let dc=a(0);let value=a(1) as i32;
+            if dc!=state.paint_dc && !state.dcs.iter().any(|d|d.handle==dc) {return 0;}
+            if !(0..=16).contains(&value) {return 0;}
+            if let Some((_,rop))=state.gdi_rops.iter_mut().find(|(h,_)|*h==dc) {
+                let old=*rop;if value!=0{*rop=value;}old as u32
+            } else {if value!=0{state.gdi_rops.push((dc,value));}13}
+        }
+
+        b"RetroGdiDeleteObject" => super::super::dispatch(machine, kt, state, regs, super::super::Api::DeleteObject),
+        b"RetroGdiBounds" => {
+            let dc = a(0);
+            if dc != state.paint_dc && !state.dcs.iter().any(|d| d.handle == dc) { return 0; }
+            let (w,h) = super::super::target_mut(state, dc).map_or((1024,768), |t| (t.clip_width,t.clip_height));
+            let at = a(1) as usize;
+            machine.write::<u32>(at, 0); machine.write::<u32>(at+4, 0);
+            machine.write::<u32>(at+8, w); machine.write::<u32>(at+12, h);
+            1
+        }
+        b"RetroGdiClip" => {
+            let dc = a(0); let count = a(2) as i32;
+            if dc != state.paint_dc && !state.dcs.iter().any(|d| d.handle == dc) { return 0; }
+            if count < -1 || count > 65536 { return 0; }
+            state.gdi_clips.retain(|(h,_)| *h != dc);
+            if count >= 0 {
+                let mut rectangles = Vec::new();
+                for i in 0..count as usize { rectangles.push(super::super::rect_from_guest(machine, a(1) as usize + i*16)); }
+                state.gdi_clips.push((dc, rectangles));
+            }
+            1
+        }
+
+        b"RetroGdiBitmap" => {
+            let (width,height)=(a(0),a(1));
+            if width==0 || height==0 || width>2048 || height>2048 {return fail(state,87,0);}
+            let mut pixels=vec![0;width as usize*height as usize*4];
+            machine.copy_from(a(2) as usize,&mut pixels);
+            let handle=state.next_object;state.next_object+=1;
+            state.gdi_objects.push((handle,super::super::GdiObject::Bitmap{width,height,pixels}));handle
+        }
+        b"RetroGdiSelectObject" => super::super::dispatch(machine, kt, state, regs, super::super::Api::SelectObject),
+        b"RetroGdiObject" => {
+            let object=state.gdi_objects.iter().find(|(h,_)| *h==a(0));
+            if let Some((_,super::super::GdiObject::Bitmap{width,height,..}))=object {
+                if a(2)==0 {return 24;} if a(1)<24 {return 0;}
+                let values=[0,*width,*height,*width*4,0x00200001,0];
+                for (i,v) in values.iter().enumerate(){machine.write::<u32>(a(2) as usize+i*4,*v);} 24
+            } else {0}
+        }
+        b"GetPixel" => {
+            let Some(target) = super::super::target_mut(state, a(0)) else { return u32::MAX; };
+            let (x, y) = (a(1) as i32, a(2) as i32);
+            if x < 0 || y < 0 || x >= target.clip_width as i32 || y >= target.clip_height as i32 { return u32::MAX; }
+            let (x, y) = (x + target.origin_x, y + target.origin_y);
+            if x < 0 || y < 0 || x >= target.width as i32 || y >= target.height as i32 { return u32::MAX; }
+            let at = (y as usize * target.width as usize + x as usize) * 4;
+            u32::from_le_bytes(target.pixels[at..at+4].try_into().unwrap()) & 0x00ff_ffff
+        }
+
         b"RetroReadEvent" => {
             // A null output subscribes an auto-reset event without consuming input.
             if a(1) != 0 {

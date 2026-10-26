@@ -61,6 +61,9 @@ fn pump_input() {
     state::with(|s| {
         let mut message = Message::default();
         while unsafe { RetroReadEvent(&raw mut message, 0) } != 0 {
+            if message.message == 0xf {
+                crate::paint::record_native(s, message.hwnd);
+            }
             let thread = s
                 .windows
                 .iter()
@@ -131,7 +134,11 @@ fn retrieve(thread: u32, hwnd: u32, min: u32, max: u32, remove: bool) -> Option<
             .map(|(i, _)| i);
         if let Some(i) = index {
             return Some(if remove {
-                s.queues[qi].input.remove(i)
+                if s.queues[qi].input[i].message == 0xf {
+                    s.queues[qi].input[i]
+                } else {
+                    s.queues[qi].input.remove(i)
+                }
             } else {
                 s.queues[qi].input[i]
             });
@@ -405,6 +412,7 @@ pub struct Sent {
     sender: u32,
     receiver: u32,
     message: Message,
+    wide: bool,
     started: bool,
     result: Option<i32>,
 }
@@ -433,7 +441,7 @@ fn dispatch_sent(thread: u32) {
                 .iter_mut()
                 .find(|r| r.receiver == thread && !r.started)?;
             sent.started = true;
-            let next = (sent.ticket, sent.message);
+            let next = (sent.ticket, sent.message, sent.wide);
             s.queues
                 .iter_mut()
                 .find(|q| q.thread == thread)?
@@ -441,10 +449,10 @@ fn dispatch_sent(thread: u32) {
                 .push(sent.ticket);
             Some(next)
         });
-        let Some((ticket, m)) = next else {
+        let Some((ticket, m, wide)) = next else {
             return;
         };
-        let result = unsafe { crate::invoke(m.hwnd, m.message, m.wparam, m.lparam) };
+        let result = unsafe { crate::invoke(m.hwnd, m.message, m.wparam, m.lparam, wide) };
         state::with(|s| {
             s.queues
                 .iter_mut()
@@ -456,7 +464,7 @@ fn dispatch_sent(thread: u32) {
         reply(ticket, result);
     }
 }
-pub unsafe fn send(hwnd: u32, message: u32, wparam: u32, lparam: u32) -> i32 {
+pub unsafe fn send(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool) -> i32 {
     if hwnd == 0xffff {
         let handles: Vec<u32> = state::with(|s| {
             s.windows
@@ -467,7 +475,7 @@ pub unsafe fn send(hwnd: u32, message: u32, wparam: u32, lparam: u32) -> i32 {
         });
         for h in handles {
             unsafe {
-                send(h, message, wparam, lparam);
+                send(h, message, wparam, lparam, wide);
             }
         }
         return 1;
@@ -478,7 +486,7 @@ pub unsafe fn send(hwnd: u32, message: u32, wparam: u32, lparam: u32) -> i32 {
         return state::error(1400) as i32;
     };
     if sender == receiver {
-        return unsafe { crate::invoke(hwnd, message, wparam, lparam) };
+        return unsafe { crate::invoke(hwnd, message, wparam, lparam, wide) };
     }
     let event = ensure_queue();
     if event == 0 {
@@ -498,6 +506,7 @@ pub unsafe fn send(hwnd: u32, message: u32, wparam: u32, lparam: u32) -> i32 {
                 lparam,
                 ..Message::default()
             },
+            wide,
             started: false,
             result: None,
         });
@@ -544,4 +553,86 @@ pub extern "system" fn ReplyMessage(result: i32) -> i32 {
             .and_then(|q| q.active.last().copied())
     });
     ticket.map_or(0, |ticket| i32::from(reply(ticket, result)))
+}
+
+fn queue_bits(q: &Queue) -> u32 {
+    let mut bits = if q.messages.is_empty() { 0 } else { 8 | 0x100 };
+    for m in &q.input {
+        bits |= match m.message {
+            0x100..=0x109 => 1,
+            0x200 => 2,
+            0x201..=0x20e => 4,
+            0xf => 0x20,
+            _ => 8,
+        };
+    }
+    bits
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn GetQueueStatus(flags: u32) -> u32 {
+    ensure_queue();
+    pump_input();
+    let thread = current();
+    state::with(|s| {
+        s.queues.iter().find(|q| q.thread == thread).map_or(0, |q| {
+            let bits = queue_bits(q) & flags;
+            bits | (bits << 16)
+        })
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn MsgWaitForMultipleObjects(
+    count: u32,
+    handles: *const u32,
+    all: u32,
+    timeout: u32,
+    mask: u32,
+) -> u32 {
+    if count > 63 || count != 0 && handles.is_null() {
+        state::error(87);
+        return u32::MAX;
+    }
+    let event = ensure_queue();
+    if event == 0 {
+        return u32::MAX;
+    }
+    let mut waits = alloc::vec![0u32;count as usize+1];
+    for i in 0..count as usize {
+        waits[i] = unsafe { handles.add(i).read_unaligned() };
+    }
+    waits[count as usize] = event;
+    unsafe extern "system" {
+        fn WaitForMultipleObjects(n: u32, handles: *const u32, all: u32, timeout: u32) -> u32;
+    }
+    let start = now();
+    loop {
+        pump_input();
+        dispatch_sent(current());
+        if GetQueueStatus(mask) != 0 {
+            if all == 0 || count == 0 {
+                return count;
+            }
+            let r = unsafe { WaitForMultipleObjects(count, waits.as_ptr(), 1, 0) };
+            if r == 0 {
+                return count;
+            }
+            if r == u32::MAX {
+                return r;
+            }
+        }
+        let elapsed = now().wrapping_sub(start);
+        let remaining = if timeout == u32::MAX {
+            u32::MAX
+        } else {
+            timeout.saturating_sub(elapsed)
+        };
+        let r = unsafe { WaitForMultipleObjects(count + 1, waits.as_ptr(), all, remaining) };
+        if r != count {
+            return r;
+        }
+        if timeout != u32::MAX && now().wrapping_sub(start) >= timeout && GetQueueStatus(mask) == 0
+        {
+            return 258;
+        }
+    }
 }

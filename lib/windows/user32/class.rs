@@ -6,22 +6,32 @@ use crate::{
 use alloc::{vec, vec::Vec};
 
 pub unsafe fn find(classes: &[Class], name: u32, instance: u32, wide: bool) -> Option<usize> {
-    let instance = if instance == 0 {
-        unsafe { crate::runtime::GetModuleHandleA(0) }
-    } else {
-        instance
-    };
     let value = if name > 0xffff {
         unsafe { text::read(name, wide) }
     } else {
         Vec::new()
     };
-    classes.iter().position(|c| {
-        (name <= 0xffff && c.atom == name || name > 0xffff && text::same(&c.name, &value))
-            && (instance == 0 || c.instance == instance || c.style & 0x4000 != 0)
-    })
+    let matches = |c: &&Class| {
+        name <= 0xffff && c.atom == name || name > 0xffff && text::same(&c.name, &value)
+    };
+    classes
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, c)| matches(c))
+        .find(|(_, c)| !c.global && c.instance == instance && instance != 0)
+        .or_else(|| {
+            classes
+                .iter()
+                .enumerate()
+                .rev()
+                .filter(|(_, c)| matches(c))
+                .find(|(_, c)| c.global)
+        })
+        .map(|(i, _)| i)
 }
 unsafe fn register(address: u32, wide: bool, extended: bool) -> u32 {
+    crate::controls::ensure();
     if address == 0 {
         return state::error(87);
     }
@@ -44,11 +54,19 @@ unsafe fn register(address: u32, wide: bool, extended: bool) -> u32 {
     } else {
         field(4)
     };
+    if instance == unsafe { crate::runtime::GetModuleHandleA(c"USER32".as_ptr() as u32) } {
+        return state::error(87);
+    }
+    let global = field(0) & 0x4000 != 0;
     state::with(|s| {
-        if s.classes
-            .iter()
-            .any(|c| c.instance == instance && text::same(&c.name, &value))
-        {
+        if s.classes.iter().any(|c| {
+            text::same(&c.name, &value)
+                && if global {
+                    c.global
+                } else {
+                    !c.global && c.instance == instance
+                }
+        }) {
             return state::error(1410);
         }
         if s.next_atom > 0xffff {
@@ -57,6 +75,7 @@ unsafe fn register(address: u32, wide: bool, extended: bool) -> u32 {
         let atom = s.next_atom;
         s.next_atom += 1;
         s.classes.push(Class {
+            global,
             atom,
             name: value,
             style: field(0),
@@ -76,6 +95,11 @@ unsafe fn register(address: u32, wide: bool, extended: bool) -> u32 {
     })
 }
 unsafe fn unregister(name: u32, instance: u32, wide: bool) -> i32 {
+    let instance = if instance == 0 {
+        unsafe { crate::runtime::GetModuleHandleA(0) }
+    } else {
+        instance
+    };
     state::with(|s| {
         let Some(index) = (unsafe { find(&s.classes, name, instance, wide) }) else {
             return state::error(1411) as i32;
@@ -89,6 +113,7 @@ unsafe fn unregister(name: u32, instance: u32, wide: bool) -> i32 {
     })
 }
 unsafe fn info(instance: u32, name: u32, output: u32, wide: bool, extended: bool) -> i32 {
+    crate::controls::ensure();
     if output == 0 {
         return state::error(87) as i32;
     }
@@ -99,10 +124,10 @@ unsafe fn info(instance: u32, name: u32, output: u32, wide: bool, extended: bool
         let c = &s.classes[index];
         let values = [
             c.style,
-            c.proc,
+            crate::controls::variant(c.proc, wide),
             c.extra.len() as u32,
             c.window_extra as u32,
-            c.instance,
+            if c.global { instance } else { c.instance },
             c.icon,
             c.cursor,
             c.background,
@@ -122,7 +147,7 @@ unsafe fn info(instance: u32, name: u32, output: u32, wide: bool, extended: bool
                 p.add(i).write_unaligned(value);
             }
         }
-        1
+        c.atom as i32
     })
 }
 macro_rules! class_api {
@@ -166,7 +191,7 @@ class_api!(
     true
 );
 
-unsafe fn long(hwnd: u32, index: i32, value: Option<u32>) -> u32 {
+unsafe fn long(hwnd: u32, index: i32, value: Option<u32>, wide: bool) -> u32 {
     state::with(|s| {
         let Some(w) = s.windows.iter().find(|w| w.hwnd == hwnd) else {
             return state::error(1400);
@@ -199,7 +224,11 @@ unsafe fn long(hwnd: u32, index: i32, value: Option<u32>) -> u32 {
             -32 if value.is_none() => return c.atom,
             _ => return state::error(1413),
         };
-        let old = *slot;
+        let old = if index == -24 {
+            crate::controls::variant(*slot, wide)
+        } else {
+            *slot
+        };
         if let Some(v) = value {
             *slot = v;
         }
@@ -208,17 +237,17 @@ unsafe fn long(hwnd: u32, index: i32, value: Option<u32>) -> u32 {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn GetClassLongA(h: u32, i: i32) -> u32 {
-    unsafe { long(h, i, None) }
+    unsafe { long(h, i, None, false) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn GetClassLongW(h: u32, i: i32) -> u32 {
-    unsafe { long(h, i, None) }
+    unsafe { long(h, i, None, true) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn SetClassLongA(h: u32, i: i32, v: u32) -> u32 {
-    unsafe { long(h, i, Some(v)) }
+    unsafe { long(h, i, Some(v), false) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn SetClassLongW(h: u32, i: i32, v: u32) -> u32 {
-    unsafe { long(h, i, Some(v)) }
+    unsafe { long(h, i, Some(v), true) }
 }

@@ -1,0 +1,313 @@
+{
+  "class": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved KERNEL32.dll!lstrcmpW"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "KERNEL32.DLL!lstrcmpW",
+      "USER32.DLL!LoadCursorA",
+      "USER32.DLL!LoadImageA"
+    ],
+    "source_sha256": "b8917e2a52a5427625ab68acc270f9581a94e6e53aed6ca8c400e8854867d824"
+  },
+  "dce": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved GDI32.dll!CreateRectRgnIndirect"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "GDI32.DLL!CreateRectRgnIndirect",
+      "GDI32.DLL!GetClipBox",
+      "GDI32.DLL!GetROP2",
+      "GDI32.DLL!GetRgnBox",
+      "GDI32.DLL!SetROP2",
+      "USER32.DLL!GetDCEx",
+      "USER32.DLL!LoadCursorA",
+      "USER32.DLL!RedrawWindow"
+    ],
+    "source_sha256": "f46627bc8d32d96cb00b35587064131a9cf73732e22fe8d2012aabec3b297324"
+  },
+  "dialog": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved GDI32.dll!GetObjectW"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "GDI32.DLL!GetObjectW",
+      "KERNEL32.DLL!FindResourceA",
+      "KERNEL32.DLL!LoadResource",
+      "KERNEL32.DLL!LockResource",
+      "KERNEL32.DLL!lstrcmpW",
+      "USER32.DLL!CreateDialogIndirectParamA",
+      "USER32.DLL!CreateDialogIndirectParamW",
+      "USER32.DLL!DefDlgProcA",
+      "USER32.DLL!DialogBoxParamA",
+      "USER32.DLL!GetDlgItemTextA",
+      "USER32.DLL!GetFocus",
+      "USER32.DLL!GetNextDlgGroupItem",
+      "USER32.DLL!GetNextDlgTabItem",
+      "USER32.DLL!GetTopWindow",
+      "USER32.DLL!IsDialogMessageA",
+      "USER32.DLL!LoadCursorA",
+      "USER32.DLL!SendDlgItemMessageW",
+      "USER32.DLL!SetFocus",
+      "USER32.DLL!SystemParametersInfoW"
+    ],
+    "source_sha256": "1716142ebca5659edd321a38f09cb07b2dee544eb36d1d623bfbccf4bde623b7"
+  },
+  "input": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved USER32.dll!CallNextHookEx"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "USER32.DLL!CallNextHookEx",
+      "USER32.DLL!ClipCursor",
+      "USER32.DLL!GetKeyNameTextA",
+      "USER32.DLL!GetKeyboardLayout",
+      "USER32.DLL!GetKeyboardLayoutNameA",
+      "USER32.DLL!LoadCursorA",
+      "USER32.DLL!MapVirtualKeyExA",
+      "USER32.DLL!MsgWaitForMultipleObjects",
+      "USER32.DLL!SetFocus",
+      "USER32.DLL!SetWindowsHookExA",
+      "USER32.DLL!SetWindowsHookExW",
+      "USER32.DLL!ToUnicode",
+      "USER32.DLL!UnhookWindowsHookEx",
+      "USER32.DLL!mouse_event"
+    ],
+    "source_sha256": "724b00a6c9f56252977b9e29998f50efc8994507faff2a36d746755f8e14a7f0"
+  },
+  "msg": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved GDI32.dll!CombineRgn"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "GDI32.DLL!CombineRgn",
+      "GDI32.DLL!CreateRectRgn",
+      "GDI32.DLL!GetClipBox",
+      "GDI32.DLL!GetRegionData",
+      "GDI32.DLL!GetRgnBox",
+      "GDI32.DLL!SetRectRgn",
+      "KERNEL32.DLL!CreateEventW",
+      "KERNEL32.DLL!OpenEventA",
+      "KERNEL32.DLL!ResetEvent",
+      "KERNEL32.DLL!WaitForMultipleObjects",
+      "KERNEL32.DLL!lstrcmpA",
+      "KERNEL32.DLL!lstrcmpW",
+      "KERNEL32.DLL!lstrcmpiA",
+      "KERNEL32.DLL!lstrcpynW",
+      "KERNEL32.DLL!lstrlenA",
+      "USER32.DLL!CallNextHookEx",
+      "USER32.DLL!ChangeClipboardChain",
+      "USER32.DLL!DefDlgProcA",
+      "USER32.DLL!DefFrameProcA",
+      "USER32.DLL!DefMDIChildProcA",
+      "USER32.DLL!DestroyAcceleratorTable",
+      "USER32.DLL!DialogBoxParamA",
+      "USER32.DLL!DrawMenuBar",
+      "USER32.DLL!EnableMenuItem",
+      "USER32.DLL!GetActiveWindow",
+      "USER32.DLL!GetCapture",
+      "USER32.DLL!GetClipboardOwner",
+      "USER32.DLL!GetClipboardViewer",
+      "USER32.DLL!GetFocus",
+      "USER32.DLL!GetMenuItemID",
+      "USER32.DLL!GetMenuState",
+      "USER32.DLL!GetQueueStatus",
+      "USER32.DLL!GetScrollInfo",
+      "USER32.DLL!GetScrollRange",
+      "USER32.DLL!GetSubMenu",
+      "USER32.DLL!GetSystemMenu",
+      "USER32.DLL!GetUpdateRect",
+      "USER32.DLL!GetUpdateRgn",
+      "USER32.DLL!InvalidateRgn",
+      "USER32.DLL!LoadAcceleratorsA",
+      "USER32.DLL!LoadCursorA",
+      "USER32.DLL!LoadMenuA",
+      "USER32.DLL!MsgWaitForMultipleObjects",
+      "USER32.DLL!RedrawWindow",
+      "USER32.DLL!ScrollWindow",
+      "USER32.DLL!ScrollWindowEx",
+      "USER32.DLL!SendMessageCallbackA",
+      "USER32.DLL!SendMessageCallbackW",
+      "USER32.DLL!SendMessageTimeoutA",
+      "USER32.DLL!SendNotifyMessageA",
+      "USER32.DLL!SendNotifyMessageW",
+      "USER32.DLL!SetActiveWindow",
+      "USER32.DLL!SetClipboardViewer",
+      "USER32.DLL!SetFocus",
+      "USER32.DLL!SetScrollInfo",
+      "USER32.DLL!SetScrollRange",
+      "USER32.DLL!SetWindowRgn",
+      "USER32.DLL!SetWindowsHookExA",
+      "USER32.DLL!TranslateAcceleratorA",
+      "USER32.DLL!UnhookWindowsHookEx",
+      "USER32.DLL!ValidateRect",
+      "USER32.DLL!ValidateRgn",
+      "USER32.DLL!WaitForInputIdle",
+      "USER32.DLL!mouse_event"
+    ],
+    "source_sha256": "bb24ea6454b767b8bc4cebad3a405368227010aaca1d4baff395f645cae0a289"
+  },
+  "resource": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved KERNEL32.dll!FindResourceA"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "KERNEL32.DLL!FindResourceA",
+      "USER32.DLL!CopyAcceleratorTableA",
+      "USER32.DLL!CreateAcceleratorTableA",
+      "USER32.DLL!DestroyAcceleratorTable",
+      "USER32.DLL!LoadBitmapA"
+    ],
+    "source_sha256": "434669c1e6110535cc77e24c68e877f8633e94b5650e0ff26b23715d0d2769c8"
+  },
+  "static": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved GDI32.dll!CreateRectRgn"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "GDI32.DLL!CreateRectRgn",
+      "GDI32.DLL!GetClipRgn",
+      "GDI32.DLL!GetPixel",
+      "USER32.DLL!LoadCursorA"
+    ],
+    "source_sha256": "51f372c17366b361d20b73cbe250d42fe667e98e11a520bcb05f64e87a4df7f8"
+  },
+  "text": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved GDI32.dll!CreateFontIndirectA"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "GDI32.DLL!CreateFontIndirectA",
+      "GDI32.DLL!GetTextMetricsA",
+      "GDI32.DLL!SetMapMode",
+      "KERNEL32.DLL!MulDiv",
+      "KERNEL32.DLL!lstrcpyA",
+      "KERNEL32.DLL!lstrlenA",
+      "USER32.DLL!DrawStateA",
+      "USER32.DLL!DrawTextA",
+      "USER32.DLL!DrawTextExA",
+      "USER32.DLL!DrawTextExW",
+      "USER32.DLL!DrawTextW",
+      "USER32.DLL!GetTabbedTextExtentA"
+    ],
+    "source_sha256": "04b8993ff98165e96ab65db79a4fdac11953b5955b027e4e3e58e939f97ccf12"
+  },
+  "uitools": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved GDI32.dll!CreateBitmap"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "GDI32.DLL!CreateBitmap",
+      "GDI32.DLL!GetPixel"
+    ],
+    "source_sha256": "c06eee4b3ddf4a6e7c01a0901e541c36933341f44f2ad0c4ae3953e3ed00666a"
+  },
+  "win": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved GDI32.dll!CombineRgn"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "GDI32.DLL!CombineRgn",
+      "GDI32.DLL!CreateRectRgn",
+      "GDI32.DLL!CreateRectRgnIndirect",
+      "GDI32.DLL!EqualRgn",
+      "GDI32.DLL!GetClipBox",
+      "GDI32.DLL!GetPixel",
+      "GDI32.DLL!GetRandomRgn",
+      "GDI32.DLL!GetRgnBox",
+      "GDI32.DLL!SelectClipRgn",
+      "GDI32.DLL!SetRectRgn",
+      "GDI32.DLL!TextOutA",
+      "KERNEL32.DLL!lstrcmpA",
+      "KERNEL32.DLL!lstrcmpiA",
+      "USER32.DLL!AdjustWindowRectEx",
+      "USER32.DLL!CallNextHookEx",
+      "USER32.DLL!CreateMDIWindowA",
+      "USER32.DLL!CreateMDIWindowW",
+      "USER32.DLL!DefFrameProcA",
+      "USER32.DLL!DefMDIChildProcA",
+      "USER32.DLL!EnumThreadWindows",
+      "USER32.DLL!GetActiveWindow",
+      "USER32.DLL!GetCapture",
+      "USER32.DLL!GetFocus",
+      "USER32.DLL!GetMenu",
+      "USER32.DLL!GetScrollInfo",
+      "USER32.DLL!GetScrollRange",
+      "USER32.DLL!GetShellWindow",
+      "USER32.DLL!GetUpdateRect",
+      "USER32.DLL!IsMenu",
+      "USER32.DLL!LoadCursorA",
+      "USER32.DLL!LoadImageA",
+      "USER32.DLL!MsgWaitForMultipleObjects",
+      "USER32.DLL!RedrawWindow",
+      "USER32.DLL!ScrollDC",
+      "USER32.DLL!ScrollWindowEx",
+      "USER32.DLL!SetActiveWindow",
+      "USER32.DLL!SetFocus",
+      "USER32.DLL!SetWindowRgn",
+      "USER32.DLL!SetWindowsHookExA",
+      "USER32.DLL!UnhookWindowsHookEx",
+      "USER32.DLL!ValidateRect",
+      "USER32.DLL!ValidateRgn",
+      "USER32.DLL!mouse_event"
+    ],
+    "source_sha256": "c980ebc6fc9c0fa205935c92265c06f843f2fc9835ad085ced154a1fb5cb4268"
+  },
+  "wsprintf": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved KERNEL32.dll!lstrcmpA"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "KERNEL32.DLL!lstrcmpA",
+      "KERNEL32.DLL!lstrcmpW",
+      "USER32.DLL!CharLowerA",
+      "USER32.DLL!wsprintfA",
+      "USER32.DLL!wsprintfW"
+    ],
+    "source_sha256": "aa0bf9a16774bb0f56eb6da0bbaf362479401f08ac2226c583e15324e12a633e"
+  }
+}

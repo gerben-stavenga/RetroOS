@@ -1,0 +1,231 @@
+{
+  "class": {
+    "status": "passed",
+    "summaries": [
+      {
+        "unit": "class",
+        "checks": 666,
+        "todo": 0,
+        "failures": 0,
+        "skipped": 0
+      }
+    ],
+    "diagnostics": [],
+    "checks_by_location": {},
+    "guest_exit_codes": [
+      0
+    ],
+    "missing_static_imports": [],
+    "source_sha256": "b8917e2a52a5427625ab68acc270f9581a94e6e53aed6ca8c400e8854867d824"
+  },
+  "dce": {
+    "status": "passed",
+    "summaries": [
+      {
+        "unit": "dce",
+        "checks": 136,
+        "todo": 0,
+        "failures": 0,
+        "skipped": 0
+      }
+    ],
+    "diagnostics": [],
+    "checks_by_location": {},
+    "guest_exit_codes": [
+      0
+    ],
+    "missing_static_imports": [],
+    "source_sha256": "f46627bc8d32d96cb00b35587064131a9cf73732e22fe8d2012aabec3b297324"
+  },
+  "dialog": {
+    "status": "passed",
+    "summaries": [
+      {
+        "unit": "dialog",
+        "checks": 96,
+        "todo": 0,
+        "failures": 0,
+        "skipped": 1
+      }
+    ],
+    "diagnostics": [],
+    "checks_by_location": {
+      "dialog.c:1152: Tests skipped": 1
+    },
+    "guest_exit_codes": [
+      0
+    ],
+    "missing_static_imports": [],
+    "source_sha256": "1716142ebca5659edd321a38f09cb07b2dee544eb36d1d623bfbccf4bde623b7"
+  },
+  "input": {
+    "status": "passed",
+    "summaries": [
+      {
+        "unit": "input",
+        "checks": 577,
+        "todo": 0,
+        "failures": 0,
+        "skipped": 2
+      }
+    ],
+    "diagnostics": [],
+    "checks_by_location": {
+      "input.c:1585: Tests skipped": 1,
+      "input.c:1597: Tests skipped": 1
+    },
+    "guest_exit_codes": [
+      0
+    ],
+    "missing_static_imports": [],
+    "source_sha256": "724b00a6c9f56252977b9e29998f50efc8994507faff2a36d746755f8e14a7f0"
+  },
+  "msg": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved USER32.dll!ChangeClipboardChain"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "USER32.DLL!ChangeClipboardChain",
+      "USER32.DLL!DefFrameProcA",
+      "USER32.DLL!DefMDIChildProcA",
+      "USER32.DLL!GetClipboardOwner",
+      "USER32.DLL!GetClipboardViewer",
+      "USER32.DLL!GetScrollInfo",
+      "USER32.DLL!GetScrollRange",
+      "USER32.DLL!ScrollWindow",
+      "USER32.DLL!ScrollWindowEx",
+      "USER32.DLL!SendMessageCallbackA",
+      "USER32.DLL!SendMessageCallbackW",
+      "USER32.DLL!SendMessageTimeoutA",
+      "USER32.DLL!SendNotifyMessageA",
+      "USER32.DLL!SendNotifyMessageW",
+      "USER32.DLL!SetClipboardViewer",
+      "USER32.DLL!SetScrollInfo",
+      "USER32.DLL!SetScrollRange",
+      "USER32.DLL!SetWindowRgn",
+      "USER32.DLL!WaitForInputIdle"
+    ],
+    "source_sha256": "bb24ea6454b767b8bc4cebad3a405368227010aaca1d4baff395f645cae0a289"
+  },
+  "resource": {
+    "status": "passed",
+    "summaries": [
+      {
+        "unit": "resource",
+        "checks": 83,
+        "todo": 0,
+        "failures": 0,
+        "skipped": 0
+      }
+    ],
+    "diagnostics": [],
+    "checks_by_location": {},
+    "guest_exit_codes": [
+      0
+    ],
+    "missing_static_imports": [],
+    "source_sha256": "434669c1e6110535cc77e24c68e877f8633e94b5650e0ff26b23715d0d2769c8"
+  },
+  "static": {
+    "status": "passed",
+    "summaries": [
+      {
+        "unit": "static",
+        "checks": 29,
+        "todo": 0,
+        "failures": 0,
+        "skipped": 0
+      }
+    ],
+    "diagnostics": [],
+    "checks_by_location": {},
+    "guest_exit_codes": [
+      0
+    ],
+    "missing_static_imports": [],
+    "source_sha256": "51f372c17366b361d20b73cbe250d42fe667e98e11a520bcb05f64e87a4df7f8"
+  },
+  "text": {
+    "status": "passed",
+    "summaries": [
+      {
+        "unit": "text",
+        "checks": 289,
+        "todo": 0,
+        "failures": 0,
+        "skipped": 0
+      }
+    ],
+    "diagnostics": [],
+    "checks_by_location": {},
+    "guest_exit_codes": [
+      0
+    ],
+    "missing_static_imports": [],
+    "source_sha256": "04b8993ff98165e96ab65db79a4fdac11953b5955b027e4e3e58e939f97ccf12"
+  },
+  "uitools": {
+    "status": "passed",
+    "summaries": [
+      {
+        "unit": "uitools",
+        "checks": 6,
+        "todo": 0,
+        "failures": 0,
+        "skipped": 0
+      }
+    ],
+    "diagnostics": [],
+    "checks_by_location": {},
+    "guest_exit_codes": [
+      0
+    ],
+    "missing_static_imports": [],
+    "source_sha256": "c06eee4b3ddf4a6e7c01a0901e541c36933341f44f2ad0c4ae3953e3ed00666a"
+  },
+  "win": {
+    "status": "loader-blocked",
+    "summaries": [],
+    "diagnostics": [
+      "Windows: unresolved USER32.dll!AdjustWindowRectEx"
+    ],
+    "checks_by_location": {},
+    "guest_exit_codes": [],
+    "missing_static_imports": [
+      "USER32.DLL!AdjustWindowRectEx",
+      "USER32.DLL!CreateMDIWindowA",
+      "USER32.DLL!CreateMDIWindowW",
+      "USER32.DLL!DefFrameProcA",
+      "USER32.DLL!DefMDIChildProcA",
+      "USER32.DLL!GetScrollInfo",
+      "USER32.DLL!GetScrollRange",
+      "USER32.DLL!ScrollDC",
+      "USER32.DLL!ScrollWindowEx",
+      "USER32.DLL!SetWindowRgn"
+    ],
+    "source_sha256": "c980ebc6fc9c0fa205935c92265c06f843f2fc9835ad085ced154a1fb5cb4268"
+  },
+  "wsprintf": {
+    "status": "passed",
+    "summaries": [
+      {
+        "unit": "wsprintf",
+        "checks": 6,
+        "todo": 0,
+        "failures": 0,
+        "skipped": 0
+      }
+    ],
+    "diagnostics": [],
+    "checks_by_location": {},
+    "guest_exit_codes": [
+      0
+    ],
+    "missing_static_imports": [],
+    "source_sha256": "aa0bf9a16774bb0f56eb6da0bbaf362479401f08ac2226c583e15324e12a633e"
+  }
+}

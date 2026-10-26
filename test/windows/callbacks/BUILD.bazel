@@ -23,3 +23,21 @@ windows_watcom_binary(
     src = "messages.c",
     visibility = ["//visibility:public"],
 )
+
+windows_watcom_binary(
+    name = "events",
+    src = "events.c",
+    visibility = ["//visibility:public"],
+)
+
+windows_watcom_binary(
+    name = "regions",
+    src = "regions.c",
+    visibility = ["//visibility:public"],
+)
+
+windows_watcom_binary(
+    name = "bitmap_profile",
+    src = "bitmap_profile.c",
+    visibility = ["//visibility:public"],
+)

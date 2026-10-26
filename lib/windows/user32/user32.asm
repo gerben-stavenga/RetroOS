@@ -8,38 +8,18 @@ global %1
 %endmacro
 
 gate AdjustWindowRect
-gate BeginPaint
-gate CharUpperA
-gate CheckMenuItem
-gate DestroyIcon
-gate DialogBoxParamW
 gate DrawEdge
-gate EndDialog
-gate EndPaint
+global _FillRect@12
+_FillRect@12:
 gate FillRect
-gate GetDC
 gate GetDlgItemInt
-gate GetDlgItemTextW
 gate GetMenuItemRect
 gate GetSysColorBrush
 gate GetSystemMetrics
-gate InvalidateRect
-gate LoadAcceleratorsW
-gate LoadCursorW
-gate LoadIconW
-gate LoadMenuW
-gate LoadStringW
 gate MessageBoxW
 gate RetroWndProcReturn
-gate ReleaseCapture
-gate ReleaseDC
-gate SetCapture
 gate SetDlgItemInt
-gate SetDlgItemTextW
-gate SetMenu
-gate TranslateAcceleratorW
 gate TranslateMessage
-gate UpdateWindow
 
 ; Private kernel operations return normally to this guest DLL. All suspended
 ; window-procedure calls live on the guest stack, including nested creation.
@@ -57,3 +37,43 @@ gate RetroSurfaceUpdate
 global _RetroReadEvent@8
 _RetroReadEvent@8:
 gate RetroReadEvent
+
+extern _wvsprintfA@12
+global wsprintfA
+wsprintfA:
+    lea eax, [esp+12]
+    push eax
+    push dword [esp+12]
+    push dword [esp+12]
+    call _wvsprintfA@12
+    ret
+
+extern _wvsprintfW@12
+global wsprintfW
+wsprintfW:
+    lea eax, [esp+12]
+    push eax
+    push dword [esp+12]
+    push dword [esp+12]
+    call _wvsprintfW@12
+    ret
+
+global _GetKeyState@4
+_GetKeyState@4:
+gate GetKeyState
+
+global _RetroSurfaceDC@8
+_RetroSurfaceDC@8:
+gate RetroSurfaceDC
+
+global _RetroInvalidateWindow@12
+_RetroInvalidateWindow@12:
+gate RetroInvalidateWindow
+
+global _RetroValidateWindow@4
+_RetroValidateWindow@4:
+gate RetroValidateWindow
+
+global _RetroEndPaint@8
+_RetroEndPaint@8:
+gate RetroEndPaint

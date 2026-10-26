@@ -110,3 +110,56 @@ pub unsafe fn write(address: u32, capacity: i32, text: &[u16], wide: bool) -> u3
         n as u32
     }
 }
+
+unsafe fn case(value: u32, wide: bool, upper: bool) -> u32 {
+    if value == 0 {
+        return 0;
+    }
+    let scalar = value <= 0xffff;
+    let bytes = [value as u8, 0];
+    let mut chars = if scalar {
+        if wide {
+            vec![value as u16]
+        } else {
+            unsafe { read(bytes.as_ptr() as u32, false) }
+        }
+    } else {
+        unsafe { read(value, wide) }
+    };
+    for c in &mut chars {
+        if let Some(ch) = char::from_u32(*c as u32) {
+            let mapped = if upper {
+                ch.to_uppercase().next().unwrap()
+            } else {
+                ch.to_lowercase().next().unwrap()
+            };
+            if mapped as u32 <= 0xffff {
+                *c = mapped as u16;
+            }
+        }
+    }
+    if scalar {
+        if wide {
+            chars.first().copied().unwrap_or(0) as u32
+        } else {
+            ansi(&chars).first().copied().unwrap_or(0) as u32
+        }
+    } else {
+        unsafe {
+            write(value, (chars.len() + 1) as i32, &chars, wide);
+        }
+        value
+    }
+}
+macro_rules! case_api {
+    ($name:ident, $wide:expr, $upper:expr) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "system" fn $name(value: u32) -> u32 {
+            unsafe { case(value, $wide, $upper) }
+        }
+    };
+}
+case_api!(CharUpperA, false, true);
+case_api!(CharUpperW, true, true);
+case_api!(CharLowerA, false, false);
+case_api!(CharLowerW, true, false);

@@ -11,6 +11,7 @@ enum Status {
     Suspended,
     Sleeping(u64),
     Waiting(u32, u64),
+    WaitingMany(u64),
     Critical(u32),
     Exited(u32),
 }
@@ -20,6 +21,8 @@ struct Context {
     id: u32,
     handle: u32,
     status: Status,
+    wait_handles: Vec<u32>,
+    wait_all: bool,
     tls: [u32; 64],
     teb: [u8; 4096],
     error: u32,
@@ -39,6 +42,8 @@ struct Mutex {
 }
 struct Event {
     handle: u32,
+    name: Vec<u8>,
+    references: u32,
     manual: bool,
     signaled: bool,
 }
@@ -60,6 +65,7 @@ fn ensure<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, t: &mut Sta
     machine.copy_from(TEB_BASE as usize, &mut teb);
     let id = machine.read::<u32>((TEB_BASE + 0x24) as usize);
     t.contexts.push(Context {
+        wait_handles: Vec::new(), wait_all: false,
         regs: *regs,
         fx: Box::new(machine.clean_fx_template()),
         id,
@@ -127,6 +133,32 @@ fn signaled(t: &mut State, handle: u32, id: u32) -> Option<bool> {
     None
 }
 
+// Test readiness without consuming auto-reset events or acquiring mutexes.
+fn ready(t: &State, handle: u32, id: u32) -> Option<bool> {
+    if let Some(c) = t.contexts.iter().find(|c| c.handle == handle && handle != 0) {
+        return Some(matches!(c.status, Status::Exited(_)));
+    }
+    if let Some(e) = t.events.iter().find(|e| e.handle == handle) { return Some(e.signaled); }
+    t.mutexes.iter().find(|m| m.handle == handle).map(|m| m.owner == 0 || m.owner == id)
+}
+fn multiple(t: &mut State, handles: &[u32], all: bool, id: u32) -> Result<Option<u32>, ()> {
+    let mut first = None;
+    let mut every = true;
+    for (i, &h) in handles.iter().enumerate() {
+        let value = ready(t, h, id).ok_or(())?;
+        every &= value;
+        if value && first.is_none() { first = Some(i); }
+    }
+    if all {
+        if !every { return Ok(None); }
+        for &h in handles { signaled(t, h, id); }
+        Ok(Some(0))
+    } else if let Some(i) = first {
+        signaled(t, handles[i], id);
+        Ok(Some(i as u32))
+    } else { Ok(None) }
+}
+
 pub(super) fn call<A: crate::Arch>(
     machine: &mut A,
     state: &mut WindowsState,
@@ -134,6 +166,16 @@ pub(super) fn call<A: crate::Arch>(
     gate: Gate,
 ) -> Option<thread::KernelAction> {
     let name = gate.name;
+    if name == b"CloseHandle" {
+        let handle = arg(machine, regs, 0);
+        if let Some(i) = state.threads.events.iter().position(|e| e.handle == handle) {
+            state.threads.events[i].references -= 1;
+            if state.threads.events[i].references == 0 { state.threads.events.remove(i); }
+            finish(machine, regs, gate, 1);
+            return Some(thread::KernelAction::Done);
+        }
+        return None;
+    }
     if !matches!(
         name,
         b"InitializeCriticalSection"
@@ -150,7 +192,8 @@ pub(super) fn call<A: crate::Arch>(
             | b"GetExitCodeThread"
             | b"ResumeThread"
             | b"TerminateThread"
-            | b"CreateEventA"
+            | b"CreateEventA" | b"CreateEventW" | b"OpenEventA" | b"OpenEventW"
+            | b"ResetEvent" | b"WaitForMultipleObjects" | b"WaitForMultipleObjectsEx"
             | b"SetEvent"
             | b"Sleep"
             | b"WaitForSingleObject"
@@ -303,6 +346,7 @@ pub(super) fn call<A: crate::Arch>(
                     teb[off..off + 4].copy_from_slice(&v.to_le_bytes());
                 }
                 t.contexts.push(Context {
+        wait_handles: Vec::new(), wait_all: false,
                     regs: child,
                     fx: Box::new(machine.clean_fx_template()),
                     id,
@@ -380,26 +424,58 @@ pub(super) fn call<A: crate::Arch>(
                 fail(state, ERROR_INVALID_HANDLE, 0)
             }
         }
-        b"CreateEventA" => {
-            let handle = state.next_object;
-            state.next_object += 1;
-            t.events.push(Event {
-                handle,
-                manual: arg(machine, regs, 1) != 0,
-                signaled: arg(machine, regs, 2) != 0,
-            });
-            handle
+        b"CreateEventA" | b"CreateEventW" | b"OpenEventA" | b"OpenEventW" => {
+            let create = name.starts_with(b"Create");
+            let address = arg(machine, regs, if create { 3 } else { 2 });
+            let event_name: Vec<u8> = if address == 0 { Vec::new() }
+                else if name.ends_with(b"W") { w_string(machine, address).unwrap_or_default() }
+                else { c_string(machine, address).unwrap_or_default() };
+            if let Some(e) = t.events.iter_mut().find(|e| !event_name.is_empty() && e.name == event_name) {
+                e.references += 1;
+                state.last_error = if create { 183 } else { 0 };
+                e.handle
+            } else if !create { fail(state, 2, 0) }
+            else {
+                let handle = state.next_object;
+                state.next_object += 1;
+                t.events.push(Event { handle, name: event_name, references: 1,
+                    manual: arg(machine, regs, 1) != 0, signaled: arg(machine, regs, 2) != 0 });
+                state.last_error = 0;
+                handle
+            }
         }
-        b"SetEvent" => {
-            if let Some(e) = t
-                .events
-                .iter_mut()
-                .find(|e| e.handle == arg(machine, regs, 0))
-            {
-                e.signaled = true;
+        b"SetEvent" | b"ResetEvent" => {
+            if let Some(e) = t.events.iter_mut().find(|e| e.handle == arg(machine, regs, 0)) {
+                e.signaled = name == b"SetEvent";
                 1
+            } else { fail(state, ERROR_INVALID_HANDLE, 0) }
+        }
+        b"WaitForMultipleObjects" | b"WaitForMultipleObjectsEx" => {
+            let count = arg(machine, regs, 0) as usize;
+            let array = arg(machine, regs, 1) as usize;
+            let all = arg(machine, regs, 2) != 0;
+            let timeout = arg(machine, regs, 3);
+            let mut handles = [0u32; 64];
+            if count == 0 || count > handles.len() || array == 0 {
+                fail(state, ERROR_INVALID_PARAMETER, u32::MAX)
             } else {
-                fail(state, ERROR_INVALID_HANDLE, 0)
+                for (i, h) in handles[..count].iter_mut().enumerate() { *h = machine.read::<u32>(array + i * 4); }
+                let duplicate = handles[..count].iter().enumerate().any(|(i,h)| handles[..i].contains(h));
+                let id = t.contexts[t.active].id;
+                if duplicate { fail(state, ERROR_INVALID_PARAMETER, u32::MAX) }
+                else { match multiple(&mut t, &handles[..count], all, id) {
+                    Ok(Some(result)) => result,
+                    Ok(None) => {
+                        if timeout != 0 {
+                            let deadline = if timeout == u32::MAX { u64::MAX } else { machine.now().saturating_add(u64::from(timeout)*1_000_000) };
+                            t.contexts[t.active].wait_handles = handles[..count].to_vec();
+                            t.contexts[t.active].wait_all = all;
+                            t.contexts[t.active].status = Status::WaitingMany(deadline);
+                        }
+                        258
+                    }
+                    Err(()) => fail(state, ERROR_INVALID_HANDLE, u32::MAX),
+                } }
             }
         }
         b"Sleep" => {
@@ -467,6 +543,16 @@ pub(super) fn schedule<A: crate::Arch>(machine: &mut A, state: &mut WindowsState
                     t.contexts[i].status = Status::Ready;
                     t.contexts[i].regs.rax = if ready { 0 } else { 258 };
                 }
+            }
+            Status::WaitingMany(deadline) => {
+                let id = t.contexts[i].id;
+                let handles = core::mem::take(&mut t.contexts[i].wait_handles);
+                let all = t.contexts[i].wait_all;
+                let result = multiple(&mut t, &handles, all, id);
+                t.contexts[i].wait_handles = handles;
+                let result = match result { Ok(Some(r)) => Some(r), Err(()) => Some(u32::MAX),
+                    Ok(None) if now >= deadline => Some(258), _ => None };
+                if let Some(result) = result { t.contexts[i].status = Status::Ready; t.contexts[i].regs.rax = u64::from(result); }
             }
             Status::Critical(address) => {
                 if let Some(c) = t

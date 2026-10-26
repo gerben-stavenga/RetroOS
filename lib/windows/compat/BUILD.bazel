@@ -1,3 +1,6 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:windows_watcom.bzl", "windows_dll")
+load("//toolchain:windows_rust.bzl", "windows_rust_library")
 load(":compat.bzl", "compat_dll")
 
 compat_dll("advapi32", "ADVAPI32", [
@@ -6,13 +9,109 @@ compat_dll("advapi32", "ADVAPI32", [
 ])
 compat_dll("comctl32", "COMCTL32", ["InitCommonControlsEx"])
 compat_dll("dwmapi", "DWMAPI", ["DwmSetWindowAttribute"])
-compat_dll("gdi32", "GDI32", [
-    "Arc", "BitBlt", "CreateCompatibleBitmap", "CreateCompatibleDC",
-    "CreateFontW", "CreatePen", "CreateSolidBrush", "DeleteDC", "DeleteObject",
-    "Ellipse", "GetLayout", "GetStockObject", "GetTextExtentPoint32W", "LineTo",
-    "MoveToEx", "Polygon", "SelectObject", "SetBkColor", "SetBkMode", "SetLayout",
-    "SetTextColor", "TextOutW",
-])
+nasm_library(name = "gdi32_obj", srcs = ["gdi32.asm"], copts = ["-fwin32"])
+windows_rust_library(name = "gdi32_rust", crate_root = "gdi32.rs", srcs = ["font.rs", "//lib/windows/user32:runtime.rs"])
+windows_dll(
+    name = "gdi32_dll", obj = ":gdi32_obj", libraries = [":gdi32_rust"],
+    out = "GDI32.DLL", module_name = "GDI32",
+    imports = {
+        "_MultiByteToWideChar@24": "KERNEL32.MultiByteToWideChar",
+        "_HeapAlloc@12": "KERNEL32.HeapAlloc", "_HeapFree@12": "KERNEL32.HeapFree",
+        "_GetProcessHeap@0": "KERNEL32.GetProcessHeap", "_ExitProcess@4": "KERNEL32.ExitProcess",
+        "_Sleep@4": "KERNEL32.Sleep",
+    },
+    export_aliases = {
+        "SetDIBitsToDevice": "_SetDIBitsToDevice@48",
+        "GetMapMode": "_GetMapMode@4",
+        "CreateBitmap": "_CreateBitmap@20",
+        "CreateFontIndirectW": "_CreateFontIndirectW@4",
+        "CreateFontIndirectA": "_CreateFontIndirectA@4",
+        "CreateFontW": "_CreateFontW@56",
+        "SelectObject": "_SelectObject@8",
+        "GetObjectW": "_GetObjectW@12",
+        "TextOutA": "_TextOutA@20",
+        "GetTextMetricsA": "_GetTextMetricsA@8",
+        "SetMapMode": "_SetMapMode@8",
+
+        "DeleteDC": "_DeleteDC@4",
+        "CreateRectRgn": "_CreateRectRgn@16",
+        "CreateRectRgnIndirect": "_CreateRectRgnIndirect@4",
+        "SetRectRgn": "_SetRectRgn@20",
+        "CombineRgn": "_CombineRgn@16",
+        "EqualRgn": "_EqualRgn@8",
+        "GetRgnBox": "_GetRgnBox@8",
+        "OffsetRgn": "_OffsetRgn@12",
+        "PtInRegion": "_PtInRegion@12",
+        "RectInRegion": "_RectInRegion@8",
+        "GetRegionData": "_GetRegionData@12",
+        "DeleteObject": "_DeleteObject@4",
+        "SelectClipRgn": "_SelectClipRgn@8",
+        "GetClipRgn": "_GetClipRgn@8",
+        "GetClipBox": "_GetClipBox@8",
+        "GetRandomRgn": "_GetRandomRgn@12",
+        "GetROP2": "_GetROP2@4",
+        "SetROP2": "_SetROP2@8",
+    },
+    exports = [
+        "SetDIBitsToDevice",
+        "GetMapMode",
+        "RetroGdiSelectObject", "RetroGdiObject", "RetroGdiBitmap",
+        "CreateFontIndirectW",
+        "CreateFontIndirectA",
+        "GetObjectW",
+        "TextOutA",
+        "GetTextMetricsA",
+        "SetMapMode",
+
+        "Arc",
+        "BitBlt",
+        "CreateCompatibleBitmap",
+        "CreateCompatibleDC",
+        "CreateFontW",
+        "CreatePen",
+        "CreateSolidBrush",
+        "DeleteDC",
+        "DeleteObject",
+        "Ellipse",
+        "GetLayout",
+        "GetStockObject",
+        "GetTextExtentPoint32W",
+        "LineTo",
+        "MoveToEx",
+        "Polygon",
+        "SelectObject",
+        "SetBkColor",
+        "SetBkMode",
+        "SetLayout",
+        "SetTextColor",
+        "TextOutW",
+        "CreateRectRgn",
+        "CreateRectRgnIndirect",
+        "SetRectRgn",
+        "CombineRgn",
+        "EqualRgn",
+        "GetRgnBox",
+        "OffsetRgn",
+        "PtInRegion",
+        "RectInRegion",
+        "GetRegionData",
+        "SelectClipRgn",
+        "GetClipRgn",
+        "GetClipBox",
+        "GetRandomRgn",
+        "GetROP2",
+        "SetROP2",
+        "CreateBitmap",
+        "GetPixel",
+        "RetroGdiDeleteObject",
+        "RetroGdiClip",
+        "RetroGdiBounds",
+        "RetroGdiDeleteDC",
+        "RetroGdiRop",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 compat_dll("shell32", "SHELL32", ["ExtractIconA", "ShellAboutW"])
 compat_dll("winmm", "WINMM", ["PlaySoundW"])
 
