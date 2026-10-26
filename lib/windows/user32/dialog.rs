@@ -223,10 +223,9 @@ unsafe fn template(
         return None;
     }
     if proc != 0 {
-        let callback: crate::WndProc = unsafe { core::mem::transmute(proc) };
         unsafe {
             let focus = crate::input::GetNextDlgTabItem(hwnd, 0, 0);
-            if callback(hwnd, 0x110, focus, parameter) != 0
+            if crate::call_dialog_procedure(proc, hwnd, 0x110, focus, parameter, wide) != 0
                 && window::IsWindow(hwnd) != 0
                 && style & 0x400 == 0
             {
@@ -247,6 +246,22 @@ unsafe fn create(
     parameter: u32,
     wide: bool,
 ) -> u32 {
+    if crate::win16_resource::instance(instance) {
+        return unsafe { crate::win16_resource::bytes(5, name, wide) }
+            .and_then(crate::win16_resource::dialog)
+            .and_then(|data| unsafe {
+                template(
+                    instance,
+                    data.as_ptr() as u32,
+                    data.len(),
+                    parent,
+                    proc,
+                    parameter,
+                    wide,
+                )
+            })
+            .unwrap_or(0);
+    }
     let Some(data) = (unsafe { crate::resource::bytes(instance, name, 5, wide) }) else {
         return 0;
     };
@@ -396,9 +411,8 @@ unsafe fn default(hwnd: u32, m: u32, w: u32, l: u32, wide: bool) -> i32 {
             .find(|d| d.hwnd == hwnd)
             .map(|d| (d.proc, d.wide))
     });
-    if let Some((proc, _)) = callback.filter(|p| p.0 != 0) {
-        let callback: crate::WndProc = unsafe { core::mem::transmute(proc) };
-        let result = unsafe { callback(hwnd, m, w, l) };
+    if let Some((proc, encoding)) = callback.filter(|p| p.0 != 0) {
+        let result = unsafe { crate::call_dialog_procedure(proc, hwnd, m, w, l, encoding) };
         if result != 0 {
             return result;
         }

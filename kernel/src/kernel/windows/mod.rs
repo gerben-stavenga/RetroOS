@@ -171,13 +171,6 @@ struct Module {
     base: u32,
 }
 
-#[derive(Clone)]
-struct WindowClass {
-    name: Vec<u8>,
-    wndproc: u32,
-    background: u32,
-}
-
 #[derive(Clone, Copy)]
 struct Message {
     hwnd: u32,
@@ -189,7 +182,6 @@ struct Message {
 pub(super) struct Window {
     hwnd: u32,
     parent: u32,
-    wndproc: u32,
     x: i32,
     y: i32,
     width: u32,
@@ -264,7 +256,6 @@ pub struct WindowsState {
     process_exit_code: Option<u32>,
     stack_base: u32,
     stack_size: u32,
-    classes: Vec<WindowClass>,
     windows: Vec<Window>,
     messages: Vec<Message>,
     user_events: Vec<u32>,
@@ -274,7 +265,6 @@ pub struct WindowsState {
     callback: Option<Callback>,
     callback_stack: Vec<Callback>,
     callback_return: u32,
-    quit: bool,
     paint_dc: u32,
     dirty: bool,
     cursor_dirty: bool,
@@ -324,7 +314,6 @@ impl WindowsState {
             process_exit_code: None,
             stack_base: 0,
             stack_size: 0,
-            classes: Vec::new(),
             windows: Vec::new(),
             messages: Vec::new(),
             user_events: Vec::new(),
@@ -333,7 +322,6 @@ impl WindowsState {
             callback: None,
             callback_stack: Vec::new(),
             callback_return: 0,
-            quit: false,
             paint_dc: 0x20000,
             dirty: true,
             cursor_dirty: true,
@@ -2478,7 +2466,7 @@ pub fn handle_event<A: crate::Arch>(
     regs: &mut Regs,
     event: crate::KernelEvent,
 ) -> thread::KernelAction {
-    if let Some(mut win16) = state.win16.take() {
+    if !A::seg_is_32(regs.code_seg()) && let Some(mut win16) = state.win16.take() {
         let action = win16::handle_event(machine, kt, state, &mut win16, regs, event);
         state.win16 = Some(win16);
         return action;
@@ -2620,7 +2608,6 @@ mod damage_tests {
         state.windows.push(Window {
             hwnd: 7,
             parent: 0,
-            wndproc: 0,
             x: 0,
             y: 0,
             width: 8,

@@ -1,8 +1,8 @@
-//! Built-in Win16 ABI hosted by the native Windows personality.
+//! NE loading and the remaining native Win16 services.
 //!
-//! Imported NE entry points are rebound to two-byte `INT 83h` stubs in a
-//! synthetic 16-bit code segment.  This mirrors the replacement-PE DLL path,
-//! while keeping the historical segmented ABI out of the compositor.
+//! USER and core GDI exports run in guest DLLs through a segmented ABI adapter
+//! to the shared Rust implementation. Only remaining INT 83h exports enter here;
+//! application callbacks and their continuations stay on guest stacks.
 
 extern crate alloc;
 
@@ -55,18 +55,6 @@ struct Gate {
     name: &'static str,
 }
 
-#[derive(Clone, Copy)]
-struct Callback {
-    dispatch_gate: Gate,
-    result: CallbackResult,
-}
-
-#[derive(Clone, Copy)]
-enum CallbackResult {
-    WndProc,
-    CreateWindow { hwnd: u32 },
-}
-
 struct Resource {
     handle: u16,
     offset: u16,
@@ -75,15 +63,12 @@ struct Resource {
 pub(super) struct State {
     image: Vec<u8>,
     gates: Vec<Gate>,
-    callback: Option<Callback>,
-    callback_gate: Gate,
     instance: u16,
     auto_data: u16,
     local_next: u16,
     local_end: u16,
     psp_selector: u16,
     env_selector: u16,
-    timer: u16,
     resource_selector: u16,
     resource_next: u16,
     resources: Vec<Resource>,
@@ -551,7 +536,9 @@ fn imported_target<A: crate::Arch>(
         if machine.read::<u8>((base + u32::from(offset)) as usize) != 0xcd
             || machine.read::<u8>((base + u32::from(offset) + 1) as usize) != GATE_VECTOR
         {
-            return Err(-8);
+            // Guest implementations (including mixed-bitness thunks) execute
+            // normally. Only actual INT exports belong in the native gate map.
+            return Ok((offset, selector));
         }
         let gate = register_gate(gates, kind, ordinal, selector, offset)?;
         return Ok((gate.offset, gate.selector));
@@ -682,22 +669,6 @@ pub(super) fn exec<A: crate::Arch>(
             |number| module_segment_base(module_index, number),
         )?;
     }
-    let user = modules.iter().find(|loaded| loaded.kind == Some(Module::User)).ok_or(-2)?;
-    let user_image = ne::Image::parse(&user.data).map_err(|_| -8)?;
-    let (callback_segment, callback_offset) = user_image.entry(421).map_err(|_| -127)?;
-    let callback_selector = *user.selectors
-        .get(callback_segment.wrapping_sub(1) as usize).ok_or(-8)?;
-    let callback_gate = Gate {
-        module: Module::User,
-        ordinal: 0xffff,
-        selector: callback_selector,
-        offset: callback_offset,
-        arg_bytes: 0,
-        long_result: true,
-        name: "WndProcReturn",
-    };
-    gates.push(callback_gate);
-
     for number in 1..=header.segment_count {
         let segment = image.segment(number).map_err(|_| -8)?;
         let extra = if number == header.auto_data {
@@ -730,20 +701,9 @@ pub(super) fn exec<A: crate::Arch>(
     let current = thread::get_thread(threads, tid).ok_or(-8)?;
     let mut windows = WindowsState::new();
     windows.next_object = 0x0100;
-    windows.paint_dc = 0x0200;
-    windows.dcs.push(super::DeviceContext {
-                viewport: None,
-        handle: windows.paint_dc,
-        window: None,
-        bitmap: None,
-        x: 0,
-        y: 0,
-        pen: 0,
-        brush: 0,
-        font: 1,
-        bk: 0x00ff_ffff,
-        text: 0,
-    });
+    // Window DCs now belong to guest USER. Do not reserve a numeric DC that
+    // could collide with a subsequently allocated real bitmap/window context.
+    windows.paint_dc = 0;
     windows.ldt = ldt;
     windows.exec_path_len = main_path.len().min(windows.exec_path.len());
     windows.exec_path[..windows.exec_path_len]
@@ -767,6 +727,7 @@ pub(super) fn exec<A: crate::Arch>(
     let code_selector = *selectors.get(header.entry_segment.wrapping_sub(1) as usize).ok_or(-8)?;
 
     current.kernel.vcpu.regs.init_user_process(0, 0);
+    init_bridge(machine, &mut windows, &modules, &current.kernel.vcpu.regs, tid, &data, data_selector)?;
     let regs = &mut current.kernel.vcpu.regs;
     regs.frame.rip = u64::from(header.entry_offset);
     regs.frame.cs = u64::from(code_selector);
@@ -787,21 +748,131 @@ pub(super) fn exec<A: crate::Arch>(
     windows.win16 = Some(State {
         image: data,
         gates,
-        callback: None,
-        callback_gate,
         instance: data_selector,
         auto_data: data_selector,
         local_next,
         local_end,
         psp_selector,
         env_selector,
-        timer: 0,
         resource_selector,
         resource_next: 0,
         resources: Vec::new(),
     });
     windows.on_resume(machine);
     current.personality = thread::Personality::Windows(windows);
+    Ok(())
+}
+
+/// Bind guest thunk entry points. There is no per-call kernel continuation.
+fn init_bridge<A: crate::Arch>(
+    machine: &mut A,
+    windows: &mut WindowsState,
+    modules: &[LoadedModule],
+    flat: &Regs,
+    tid: usize,
+    image_data: &[u8],
+    instance: u16,
+) -> Result<(), i32> {
+    let user = modules
+        .iter()
+        .find(|m| m.kind == Some(Module::User))
+        .ok_or(-2)?;
+    let image = ne::Image::parse(&user.data).map_err(|_| -8)?;
+    let _binding = match image.entry(423) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    let (ret_segment, ret_offset) = image.entry(424).map_err(|_| -8)?;
+    let return16 =
+        (u32::from(user.selectors[ret_segment as usize - 1]) << 16) | u32::from(ret_offset);
+    // The first module represents the NE executable for filename/instance
+    // lookup; PE dependency mapping starts at the ordinary first DLL slot.
+    windows.modules.push(super::Module {
+        name: super::module_name(windows.exec_path_str()),
+        path: windows.exec_path_str().to_vec(),
+        data: Vec::new(),
+        base: SEGMENT_BASE,
+    });
+    let (_, initializers) = super::load_library(machine, windows, b"USER32.DLL").map_err(|_| -8)?;
+    // Our replacement DLLs have no DllMain. Do not silently skip a real DLL's.
+    if !initializers.is_empty() {
+        return Err(-8);
+    }
+    let entry = super::export_address(&windows.modules, b"USER32", b"Retro16Enter")?;
+    let back = super::export_address(&windows.modules, b"USER32", b"Retro16Return")?;
+    let config = super::export_address(&windows.modules, b"USER32", b"Retro16Config")?;
+    let teb = super::TEB_BASE;
+    machine.zero(teb as usize, 4096);
+    machine.write::<u32>((teb + 0x18) as usize, teb);
+    machine.write::<u32>((teb + 0x24) as usize, tid as u32 + 1);
+    machine.set_page_flags(teb as usize / 4096, 1, true, false);
+    let teb_selector = selector(&mut windows.ldt, teb, 4096, false)?;
+    const TABLE: u32 = 0x7ff8_0000;
+    let table_size = (windows.ldt.len() * 8).next_multiple_of(4096);
+    machine.zero(TABLE as usize, table_size);
+    for (i, &desc) in windows.ldt.iter().enumerate().skip(1) {
+        let selector = (i as u16) * 8 + 7;
+        let base = selector_base(windows, selector).ok_or(-8)?;
+        let limit = ((desc & 0xffff) | ((desc >> 32) & 0xf0000)) as u32;
+        machine.write::<u32>(TABLE as usize + i * 8, base);
+        machine.write::<u32>(TABLE as usize + i * 8 + 4, limit);
+    }
+    machine.set_page_flags(TABLE as usize / 4096, table_size / 4096, false, false);
+    windows.stack_size = 256 * 1024;
+    windows.stack_base = super::STACK_TOP - windows.stack_size;
+    // A read-only guard catches downward stack writes beyond the guest reserve.
+    let guard = windows.stack_base as usize - 4096;
+    machine.zero(guard, 4096);
+    machine.set_page_flags(guard / 4096, 1, false, false);
+    machine.zero(windows.stack_base as usize, windows.stack_size as usize);
+    machine.set_page_flags(
+        windows.stack_base as usize / 4096,
+        windows.stack_size as usize / 4096,
+        true,
+        false,
+    );
+    const RESOURCE_IMAGE: u32 = 0x7000_0000;
+    let image_pages = image_data.len().div_ceil(4096);
+    machine.zero(RESOURCE_IMAGE as usize, image_pages * 4096);
+    machine.copy_to(RESOURCE_IMAGE as usize, image_data);
+    machine.set_page_flags(RESOURCE_IMAGE as usize / 4096, image_pages, false, false);
+    for (i, value) in [
+        flat.ds as u32,
+        u32::from(teb_selector),
+        super::STACK_TOP,
+        0,
+        TABLE,
+        return16,
+        windows.ldt.len() as u32,
+        windows.stack_base,
+        RESOURCE_IMAGE,
+        image_data.len() as u32,
+        u32::from(instance),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        machine.write::<u32>(config as usize + i * 4, value);
+    }
+    for loaded in modules {
+        let image = ne::Image::parse(&loaded.data).map_err(|_| -8)?;
+        let Ok((segment, offset)) = image.entry_by_name(b"RetroBridgeConfig") else {
+            continue;
+        };
+        let code_selector = loaded.selectors[segment as usize - 1];
+        let base = selector_base(windows, code_selector).ok_or(-8)?;
+        let pages = image
+            .segment(u16::from(segment))
+            .map_err(|_| -8)?
+            .alloc_size
+            .div_ceil(4096);
+        machine.set_page_flags(base as usize / 4096, pages, true, false);
+        machine.write::<u32>((base + u32::from(offset)) as usize, entry);
+        machine.write::<u16>((base + u32::from(offset) + 4) as usize, flat.code_seg());
+        machine.write::<u32>((base + u32::from(offset) + 6) as usize, back);
+        machine.write::<u16>((base + u32::from(offset) + 10) as usize, flat.code_seg());
+        machine.set_page_flags(base as usize / 4096, pages, false, true);
+    }
     Ok(())
 }
 
@@ -859,53 +930,6 @@ fn dos_path(path: &[u8]) -> Vec<u8> {
     result
 }
 
-fn write_message16<A: crate::Arch>(machine: &mut A, out: usize, message: super::Message) {
-    machine.write::<u16>(out, message.hwnd as u16);
-    machine.write::<u16>(out + 2, message.message as u16);
-    machine.write::<u16>(out + 4, message.wparam as u16);
-    machine.write::<u32>(out + 6, message.lparam);
-    machine.write::<u32>(out + 10, (machine.now() / 1_000_000) as u32);
-    machine.write::<u16>(out + 14, 0);
-    machine.write::<u16>(out + 16, 0);
-}
-
-fn message16<A: crate::Arch>(machine: &A, at: usize) -> super::Message {
-    super::Message {
-        hwnd: u32::from(machine.read::<u16>(at)),
-        message: u32::from(machine.read::<u16>(at + 2)),
-        wparam: u32::from(machine.read::<u16>(at + 4)),
-        lparam: machine.read::<u32>(at + 6),
-    }
-}
-
-fn begin_wndproc<A: crate::Arch>(
-    machine: &mut A,
-    windows: &WindowsState,
-    state: &mut State,
-    regs: &mut Regs,
-    dispatch_gate: Gate,
-    callback_result: CallbackResult,
-    message: super::Message,
-) -> bool {
-    let Some(window) = windows.windows.iter().find(|window| window.hwnd == message.hwnd) else {
-        return false;
-    };
-    if window.wndproc == 0 || state.callback.is_some() { return false; }
-    let new_sp = (regs.sp32() as u16).wrapping_sub(14);
-    let Some(stack) = linear(windows, regs.stack_seg(), new_sp) else { return false; };
-    machine.write::<u16>(stack, state.callback_gate.offset);
-    machine.write::<u16>(stack + 2, state.callback_gate.selector);
-    machine.write::<u32>(stack + 4, message.lparam);
-    machine.write::<u16>(stack + 8, message.wparam as u16);
-    machine.write::<u16>(stack + 10, message.message as u16);
-    machine.write::<u16>(stack + 12, message.hwnd as u16);
-    state.callback = Some(Callback { dispatch_gate, result: callback_result });
-    regs.frame.rsp = u64::from(new_sp);
-    regs.frame.rip = u64::from(window.wndproc as u16);
-    regs.frame.cs = u64::from((window.wndproc >> 16) as u16);
-    true
-}
-
 fn dib_header<A: crate::Arch>(machine: &A, header: usize) -> Option<(usize, usize, u16, usize)> {
     match machine.read::<u32>(header) {
         12 => {
@@ -960,9 +984,12 @@ fn decode_dib<A: crate::Arch>(
                     let b = machine.read::<u8>(at) as u32;
                     let g = machine.read::<u8>(at + 1) as u32;
                     let r = machine.read::<u8>(at + 2) as u32;
-                    b | (g << 8) | (r << 16)
+                    r | (g << 8) | (b << 16)
                 }
-                32 => machine.read::<u32>(source_row + x * 4) & 0x00ff_ffff,
+                32 => {
+                    let v = machine.read::<u32>(source_row + x * 4);
+                    ((v & 0xff) << 16) | (v & 0xff00) | ((v >> 16) & 0xff)
+                },
                 _ => 0,
             };
             let at = (y * width + x) * 4;
@@ -980,7 +1007,7 @@ fn palette_color<A: crate::Arch>(
     let b = machine.read::<u8>(at) as u32;
     let g = machine.read::<u8>(at + 1) as u32;
     let r = machine.read::<u8>(at + 2) as u32;
-    b | (g << 8) | (r << 16)
+    r | (g << 8) | (b << 16)
 }
 
 fn finish<A: crate::Arch>(
@@ -1012,6 +1039,13 @@ fn dispatch<A: crate::Arch>(
     gate: Gate,
 ) -> u32 {
     match (gate.module, gate.ordinal) {
+        (Module::Kernel, 115) => {
+            if let Some(text) = stack_u32(machine, windows, regs, 4)
+                .and_then(|p| far_string(machine, windows, p)) {
+                crate::compact_println!("{}", core::str::from_utf8(&text).unwrap_or("?"));
+            }
+            0
+        }
         (Module::Kernel, 3) => 0x0000_0a03, // Windows 3.10
         (Module::Kernel, 4) => 1,
         (Module::Kernel, 91) => {
@@ -1125,7 +1159,6 @@ fn dispatch<A: crate::Arch>(
                     | (u32::from(state.resource_selector) << 16))
                 .unwrap_or(0)
         }
-        (Module::Kernel, 115) => 0,
         (Module::Kernel, 127) => {
             u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(0))
         }
@@ -1154,259 +1187,8 @@ fn dispatch<A: crate::Arch>(
                 core::str::from_utf8(&text).unwrap_or("?"));
             1 // IDOK
         }
-        (Module::User, 5) => 1,
-        (Module::User, 6) => {
-            windows.quit = true;
-            0
-        }
-        (Module::User, 10) => {
-            let requested = stack_u16(machine, windows, regs, 8).unwrap_or(0);
-            state.timer = if requested == 0 { 1 } else { requested };
-            u32::from(state.timer)
-        }
-        (Module::User, 12) => {
-            state.timer = 0;
-            1
-        }
-        (Module::User, 15) => (machine.now() / 1_000_000) as u32,
-        (Module::User, 18) => stack_u16(machine, windows, regs, 4).unwrap_or(0) as u32,
-        (Module::User, 19) => 1,
-        (Module::User, 22) => {
-            let hwnd = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
-            let previous = windows.focus_hwnd;
-            if hwnd == 0 || windows.windows.iter().any(|window| window.hwnd == hwnd) {
-                windows.focus_hwnd = hwnd;
-            }
-            previous
-        }
-        (Module::User, 23) => windows.focus_hwnd,
-        (Module::User, 33) => {
-            let Some(rect) = stack_u32(machine, windows, regs, 4)
-                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
-            let hwnd = u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(0));
-            let Some(window) = windows.windows.iter().find(|window| window.hwnd == hwnd) else {
-                return 0;
-            };
-            machine.write::<i16>(rect, 0);
-            machine.write::<i16>(rect + 2, 0);
-            machine.write::<i16>(rect + 4, window.width as i16);
-            machine.write::<i16>(rect + 6, window.height as i16);
-            1
-        }
-        (Module::User, 39) => {
-            let Some(out) = stack_u32(machine, windows, regs, 4)
-                .and_then(|p| far_linear(windows, p)) else { return 0 };
-            let hwnd = u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(0));
-            let Some(window) = windows.windows.iter().find(|window| window.hwnd == hwnd) else {
-                return 0;
-            };
-            machine.zero(out, 30);
-            machine.write::<u16>(out, windows.paint_dc as u16);
-            machine.write::<u16>(out + 2, 1);
-            machine.write::<i16>(out + 4, 0);
-            machine.write::<i16>(out + 6, 0);
-            machine.write::<i16>(out + 8, window.width as i16);
-            machine.write::<i16>(out + 10, window.height as i16);
-            windows.paint_hwnd = hwnd;
-            windows.paint_dc
-        }
-        (Module::User, 40) => {
-            windows.dirty = true;
-            1
-        }
-        (Module::User, 57) => {
-            let Some(wc) = stack_u32(machine, windows, regs, 4)
-                .and_then(|p| far_linear(windows, p)) else { return 0 };
-            let wndproc = machine.read::<u32>(wc + 2);
-            let background = u32::from(machine.read::<u16>(wc + 16));
-            let name_pointer = machine.read::<u32>(wc + 22);
-            let Some(name) = far_string(machine, windows, name_pointer) else { return 0 };
-            if let Some(class) = windows.classes.iter_mut()
-                .find(|class| class.name.eq_ignore_ascii_case(&name)) {
-                class.wndproc = wndproc;
-                class.background = background;
-            } else {
-                windows.classes.push(super::WindowClass { name, wndproc, background });
-            }
-            windows.classes.len() as u32
-        }
-        (Module::User, 41) => {
-            let class_pointer = stack_u32(machine, windows, regs, 30).unwrap_or(0);
-            let class = if class_pointer >> 16 == 0 {
-                windows.classes.first().map(|class| (class.wndproc, class.background))
-            } else {
-                let Some(name) = far_string(machine, windows, class_pointer) else {
-                    crate::compact_dbg_println!("[win16] invalid window class pointer {:08x}", class_pointer);
-                    return 0;
-                };
-                windows.classes.iter().find(|class| class.name.eq_ignore_ascii_case(&name))
-                    .map(|class| (class.wndproc, class.background))
-                    .or_else(|| [b"BUTTON".as_slice(), b"EDIT", b"STATIC", b"LISTBOX",
-                        b"SCROLLBAR", b"COMBOBOX", b"MDICLIENT"]
-                        .iter().any(|class| name.eq_ignore_ascii_case(class))
-                        .then_some((0, 0x30005)))
-                    .or_else(|| {
-                        crate::compact_dbg_println!("[win16] window class '{}' not found",
-                            core::str::from_utf8(&name).unwrap_or("?"));
-                        None
-                    })
-            };
-            let Some((wndproc, _background)) = class else { return 0 };
-            let parent = u32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0));
-            let raw_width = stack_u16(machine, windows, regs, 16).unwrap_or(1);
-            let raw_height = stack_u16(machine, windows, regs, 14).unwrap_or(1);
-            let raw_x = stack_u16(machine, windows, regs, 20).unwrap_or(0);
-            let raw_y = stack_u16(machine, windows, regs, 18).unwrap_or(0);
-            let (width, height) = if parent == 0 && raw_width == 0x8000 {
-                // CW_USEDEFAULT on a top-level window delegates both dimensions
-                // to the window manager; the supplied height is ignored.
-                (640, 480)
-            } else {
-                (u32::from(raw_width).clamp(1, 2048),
-                    u32::from(raw_height).clamp(1, 2048))
-            };
-            let hwnd = windows.next_object;
-            windows.next_object = windows.next_object.wrapping_add(1);
-            windows.windows.push(super::Window {
-                hwnd,
-                parent,
-                wndproc,
-                x: if parent == 0 && raw_x == 0x8000 { 0 } else { i32::from(raw_x as i16) },
-                y: if parent == 0 && raw_x == 0x8000 { 0 } else { i32::from(raw_y as i16) },
-                width,
-                height,
-                visible: false,
-                pixels: vec![0xc0; width as usize * height as usize * 4],
-            });
-            hwnd
-        }
-        (Module::User, 42) => {
-            let show = stack_u16(machine, windows, regs, 4).unwrap_or(0) != 0;
-            let hwnd = u32::from(stack_u16(machine, windows, regs, 6).unwrap_or(0));
-            if let Some(window) = windows.windows.iter_mut().find(|window| window.hwnd == hwnd) {
-                let was = window.visible;
-                window.visible = show;
-                let top_level = window.parent == 0;
-                let size = window.width | (window.height << 16);
-                if show && top_level {
-                    windows.messages.push(super::Message {
-                        hwnd,
-                        message: 0x0005,
-                        wparam: 0,
-                        lparam: size,
-                    });
-                }
-                if show { super::queue_paint(windows, hwnd); }
-                was as u32
-            } else { 0 }
-        }
-        (Module::User, 53) => {
-            let hwnd = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
-            if let Some(index) = windows.windows.iter().position(|window| window.hwnd == hwnd) {
-                windows.windows.remove(index);
-                1
-            } else { 0 }
-        }
-        (Module::User, 56) => {
-            let repaint = stack_u16(machine, windows, regs, 4).unwrap_or(0) != 0;
-            let height = u32::from(stack_u16(machine, windows, regs, 6).unwrap_or(1)).clamp(1, 2048);
-            let width = u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(1)).clamp(1, 2048);
-            let y = i32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0) as i16);
-            let x = i32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0) as i16);
-            let hwnd = u32::from(stack_u16(machine, windows, regs, 14).unwrap_or(0));
-            if let Some(window) = windows.windows.iter_mut().find(|window| window.hwnd == hwnd) {
-                window.x = x;
-                window.y = y;
-                window.width = width;
-                window.height = height;
-                window.pixels.resize(width as usize * height as usize * 4, 0xc0);
-                if repaint { super::queue_paint(windows, hwnd); }
-                1
-            } else { 0 }
-        }
-        (Module::User, 66) => {
-            windows.paint_hwnd = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
-            windows.paint_dc
-        }
-        (Module::User, 68) => 1,
-        (Module::User, 72) => {
-            let Some(rect) = stack_u32(machine, windows, regs, 12)
-                .and_then(|p| far_linear(windows, p)) else { return 0 };
-            machine.write::<i16>(rect, stack_u16(machine, windows, regs, 10).unwrap_or(0) as i16);
-            machine.write::<i16>(rect + 2, stack_u16(machine, windows, regs, 8).unwrap_or(0) as i16);
-            machine.write::<i16>(rect + 4, stack_u16(machine, windows, regs, 6).unwrap_or(0) as i16);
-            machine.write::<i16>(rect + 6, stack_u16(machine, windows, regs, 4).unwrap_or(0) as i16);
-            1
-        }
-        (Module::User, 76) => {
-            let point = stack_u32(machine, windows, regs, 4).unwrap_or(0);
-            let Some(rect) = stack_u32(machine, windows, regs, 8)
-                .and_then(|p| far_linear(windows, p)) else { return 0 };
-            let x = point as u16 as i16;
-            let y = (point >> 16) as u16 as i16;
-            let left = machine.read::<i16>(rect);
-            let top = machine.read::<i16>(rect + 2);
-            let right = machine.read::<i16>(rect + 4);
-            let bottom = machine.read::<i16>(rect + 6);
-            (x >= left && x < right && y >= top && y < bottom) as u32
-        }
-        (Module::User, 81) => {
-            let brush = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
-            let Some(rect) = stack_u32(machine, windows, regs, 6)
-                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
-            let dc = u32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0));
-            let left = i32::from(machine.read::<i16>(rect));
-            let top = i32::from(machine.read::<i16>(rect + 2));
-            let right = i32::from(machine.read::<i16>(rect + 4));
-            let bottom = i32::from(machine.read::<i16>(rect + 6));
-            let color = super::object_color(windows, brush, 0x00c0_c0c0);
-            super::fill_pixels(windows, dc, left, top, right, bottom, color);
-            windows.dirty = true;
-            1
-        }
-        (Module::User, 108 | 109) => {
-            if windows.quit { return 0; }
-            if windows.messages.is_empty() {
-                if state.timer != 0
-                    && let Some(window) = windows.windows.iter().find(|window| window.visible)
-                {
-                    windows.messages.push(super::Message {
-                        hwnd: window.hwnd, message: 0x0113,
-                        wparam: u32::from(state.timer), lparam: 0,
-                    });
-                }
-                if windows.messages.is_empty() { return 0; }
-            }
-            let message = windows.messages[0];
-            let Some(out) = stack_u32(machine, windows, regs,
-                    if gate.ordinal == 108 { 10 } else { 12 })
-                .and_then(|p| far_linear(windows, p)) else { return 0 };
-            write_message16(machine, out, message);
-            let remove = gate.ordinal == 108
-                || stack_u16(machine, windows, regs, 4).unwrap_or(0) & 1 != 0;
-            if remove { windows.messages.remove(0); }
-            1
-        }
-        (Module::User, 110) => {
-            windows.messages.push(super::Message {
-                hwnd: u32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0)),
-                message: u32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0)),
-                wparam: u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(0)),
-                lparam: stack_u32(machine, windows, regs, 4).unwrap_or(0),
-            });
-            1
-        }
-        (Module::User, 107 | 111 | 113 | 114) => 0,
-        (Module::User, 124 | 125) => {
-            let hwnd_displacement = if gate.ordinal == 124 { 4 } else { 10 };
-            let hwnd = u32::from(stack_u16(machine, windows, regs, hwnd_displacement).unwrap_or(0));
-            if windows.windows.iter().any(|window| window.hwnd == hwnd) {
-                super::queue_paint(windows, hwnd);
-                1
-            } else { 0 }
-        }
-        (Module::User, 150 | 173 | 174 | 177) => 1,
-        (Module::User, 154 | 155 | 158 | 171) => 1,
+        (Module::User, 173 | 174 | 177) => 1,
+        (Module::User, 171) => 1,
         (Module::User, 175) => {
             let name = stack_u32(machine, windows, regs, 4).unwrap_or(0);
             if name >> 16 != 0 {
@@ -1466,10 +1248,6 @@ fn dispatch<A: crate::Arch>(
             machine.write::<u8>(out + len, 0);
             len as u32
         }
-        (Module::User, 179) => {
-            let metric = stack_at(windows, regs, 4).map(|p| machine.read::<u16>(p)).unwrap_or(0);
-            match metric { 0 => 640, 1 => 480, 2 | 3 => 16, 4 => 16, 15 => 16, _ => 0 }
-        }
         (Module::User, 180) => {
             match stack_u16(machine, windows, regs, 4).unwrap_or(0) {
                 0 | 4 | 15 => 0x00c0_c0c0,
@@ -1484,147 +1262,6 @@ fn dispatch<A: crate::Arch>(
         (Module::User, 286) => 1,
         (Module::User, 287) => stack_u16(machine, windows, regs, 4).unwrap_or(0) as u32,
 
-        (Module::Gdi, 4) => 1,
-        (Module::Gdi, 19) => {
-            let y = stack_u16(machine, windows, regs, 4).unwrap_or(0) as i16 as i32;
-            let x = stack_u16(machine, windows, regs, 6).unwrap_or(0) as i16 as i32;
-            let dc = u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(0));
-            let (old_x, old_y, pen) = windows.dcs.iter().find(|item| item.handle == dc)
-                .map(|item| (item.x, item.y, item.pen)).unwrap_or((0, 0, 0));
-            let color = super::object_color(windows, pen, 0);
-            super::line(windows, dc, old_x, old_y, x, y, color);
-            if let Some(item) = windows.dcs.iter_mut().find(|item| item.handle == dc) {
-                item.x = x; item.y = y;
-            }
-            1
-        }
-        (Module::Gdi, 20) => {
-            let y = stack_u16(machine, windows, regs, 4).unwrap_or(0) as i16 as i32;
-            let x = stack_u16(machine, windows, regs, 6).unwrap_or(0) as i16 as i32;
-            let dc = u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(0));
-            let mut old = 0;
-            if let Some(item) = windows.dcs.iter_mut().find(|item| item.handle == dc) {
-                old = (item.x as u16 as u32) | ((item.y as u16 as u32) << 16);
-                item.x = x; item.y = y;
-            }
-            old
-        }
-        (Module::Gdi, 31) => {
-            let color = stack_u32(machine, windows, regs, 4).unwrap_or(0);
-            let y = stack_u16(machine, windows, regs, 8).unwrap_or(0) as i16 as i32;
-            let x = stack_u16(machine, windows, regs, 10).unwrap_or(0) as i16 as i32;
-            let dc = u32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0));
-            super::put_pixel(windows, dc, x, y, color);
-            color
-        }
-        (Module::Gdi, 33) => {
-            let count = usize::from(stack_u16(machine, windows, regs, 4).unwrap_or(0)).min(4096);
-            let Some(text) = stack_u32(machine, windows, regs, 6)
-                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
-            let y = i32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0) as i16);
-            let x = i32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0) as i16);
-            let dc = u32::from(stack_u16(machine, windows, regs, 14).unwrap_or(0));
-            let color = windows.dcs.iter().find(|context| context.handle == dc)
-                .map_or(0, |context| context.text);
-            for n in 0..count {
-                let ch = super::encoding::ansi().decode(&[machine.read::<u8>(text + n)], false).unwrap();
-                let glyph = crate::kernel::text::glyph16(ch.chars().next().unwrap());
-                for (gy, &bits) in glyph.iter().enumerate() {
-                    for gx in 0..8 {
-                        if bits & (0x80 >> gx) != 0 {
-                            super::put_pixel(windows, dc,
-                                x + (n * 8 + gx) as i32, y + gy as i32, color);
-                        }
-                    }
-                }
-            }
-            windows.dirty = true;
-            1
-        }
-        (Module::Gdi, 34) => {
-            let sy = stack_u16(machine, windows, regs, 8).unwrap_or(0) as i16 as i32;
-            let sx = stack_u16(machine, windows, regs, 10).unwrap_or(0) as i16 as i32;
-            let src = u32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0));
-            let height = stack_u16(machine, windows, regs, 14).unwrap_or(0) as usize;
-            let width = stack_u16(machine, windows, regs, 16).unwrap_or(0) as usize;
-            let dy = stack_u16(machine, windows, regs, 18).unwrap_or(0) as i16 as i32;
-            let dx = stack_u16(machine, windows, regs, 20).unwrap_or(0) as i16 as i32;
-            let dst = u32::from(stack_u16(machine, windows, regs, 22).unwrap_or(0));
-            let Some(source_bitmap) = super::dc_bitmap(windows, src) else { return 0 };
-            let Some((sw, sh, source)) = windows.gdi_objects.iter().find_map(|(handle, object)| {
-                match object {
-                    super::GdiObject::Bitmap { width, height, pixels }
-                        if *handle == source_bitmap => Some((*width, *height, pixels.clone())),
-                    _ => None,
-                }
-            }) else { return 0 };
-            for y in 0..height {
-                for x in 0..width {
-                    let px = sx + x as i32;
-                    let py = sy + y as i32;
-                    if px < 0 || py < 0 || px >= sw as i32 || py >= sh as i32 { continue; }
-                    let at = (py as usize * sw as usize + px as usize) * 4;
-                    let color = u32::from_le_bytes(source[at..at + 4].try_into().unwrap());
-                    super::put_pixel(windows, dst, dx + x as i32, dy + y as i32, color);
-                }
-            }
-            windows.dirty = true;
-            1
-        }
-        (Module::Gdi, 45) => {
-            let object = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
-            let dc = u32::from(stack_u16(machine, windows, regs, 6).unwrap_or(0));
-            if let Some(item) = windows.dcs.iter_mut().find(|item| item.handle == dc) {
-                if windows.gdi_objects.iter().any(|(h, o)| *h == object
-                    && matches!(o, super::GdiObject::Bitmap { .. })) {
-                    item.bitmap.replace(object).unwrap_or(0)
-                } else if windows.gdi_objects.iter().any(|(h, o)| *h == object
-                    && matches!(o, super::GdiObject::Pen(_))) {
-                    core::mem::replace(&mut item.pen, object)
-                } else if windows.gdi_objects.iter().any(|(h, o)| *h == object
-                    && matches!(o, super::GdiObject::Font)) {
-                    core::mem::replace(&mut item.font, object)
-                } else {
-                    core::mem::replace(&mut item.brush, object)
-                }
-            } else { 0 }
-        }
-        (Module::Gdi, 51) => {
-            let height = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
-            let width = u32::from(stack_u16(machine, windows, regs, 6).unwrap_or(0));
-            let Some(size) = usize::try_from(width).ok()
-                .and_then(|width| usize::try_from(height).ok()
-                    .and_then(|height| width.checked_mul(height)))
-                .and_then(|pixels| pixels.checked_mul(4)) else { return 0 };
-            if width == 0 || height == 0 || width > 2048 || height > 2048 { return 0; }
-            let handle = windows.next_object;
-            windows.next_object = windows.next_object.wrapping_add(1);
-            windows.gdi_objects.push((handle, super::GdiObject::Bitmap {
-                width,
-                height,
-                pixels: vec![0; size],
-            }));
-            handle
-        }
-        (Module::Gdi, 52) => {
-            // A memory DC always owns a default 1x1 monochrome bitmap.  The
-            // first SelectObject must return that non-null previous object.
-            let bitmap = windows.next_object;
-            windows.next_object = windows.next_object.wrapping_add(1);
-            windows.gdi_objects.push((bitmap, super::GdiObject::Bitmap {
-                width: 1,
-                height: 1,
-                pixels: vec![0; 4],
-            }));
-            let handle = windows.next_object;
-            windows.next_object = windows.next_object.wrapping_add(1);
-            windows.dcs.push(super::DeviceContext {
-                viewport: None,
-                handle, window: None, bitmap: Some(bitmap), x: 0, y: 0, pen: 0, brush: 0, font: 1,
-                bk: 0x00ff_ffff, text: 0,
-            });
-            handle
-        }
         (Module::Gdi, 57) => {
             if stack_u32(machine, windows, regs, 4)
                 .and_then(|pointer| far_linear(windows, pointer)).is_none()
@@ -1649,32 +1286,6 @@ fn dispatch<A: crate::Arch>(
             windows.next_object = windows.next_object.wrapping_add(1);
             windows.gdi_objects.push((handle, super::GdiObject::Brush(color)));
             handle
-        }
-        (Module::Gdi, 61) => {
-            let color = stack_u32(machine, windows, regs, 4).unwrap_or(0);
-            let handle = windows.next_object;
-            windows.next_object = windows.next_object.wrapping_add(1);
-            windows.gdi_objects.push((handle, super::GdiObject::Pen(color)));
-            handle
-        }
-        (Module::Gdi, 66) => {
-            let color = stack_u32(machine, windows, regs, 4).unwrap_or(0);
-            let handle = windows.next_object;
-            windows.next_object = windows.next_object.wrapping_add(1);
-            windows.gdi_objects.push((handle, super::GdiObject::Brush(color)));
-            handle
-        }
-        (Module::Gdi, 68) => {
-            let handle = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
-            if let Some(index) = windows.dcs.iter().position(|item| item.handle == handle) {
-                windows.dcs.remove(index); 1
-            } else { 0 }
-        }
-        (Module::Gdi, 69) => {
-            let handle = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
-            if let Some(index) = windows.gdi_objects.iter().position(|(h, _)| *h == handle) {
-                windows.gdi_objects.remove(index); 1
-            } else { 0 }
         }
         (Module::Gdi, 80) => {
             let index = stack_u16(machine, windows, regs, 4).unwrap_or(0);
@@ -1710,18 +1321,6 @@ fn dispatch<A: crate::Arch>(
                     capacity as u32
                 }
             }
-        }
-        (Module::Gdi, 87) => {
-            let index = stack_u16(machine, windows, regs, 4).unwrap_or(0);
-            let color = match index { 0 | 6 => 0x00ff_ffff, 1 => 0x00c0_c0c0,
-                2 => 0x0080_8080, 3 => 0x0040_4040, _ => 0 };
-            let handle = windows.next_object;
-            windows.next_object = windows.next_object.wrapping_add(1);
-            let object = if matches!(index, 6..=8) {
-                super::GdiObject::Pen(color)
-            } else { super::GdiObject::Brush(color) };
-            windows.gdi_objects.push((handle, object));
-            handle
         }
         (Module::Gdi, 91) => {
             let count = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
@@ -1831,67 +1430,16 @@ pub(super) fn handle_event<A: crate::Arch>(
                 crate::compact_dbg_println!("[win16] invalid DLL gate {:04x}:{:04x}", regs.code_seg(), ip);
                 return thread::KernelAction::Exit(-1);
             };
-            if gate.ordinal == 0xffff {
-                let Some(callback) = state.callback.take() else {
-                    return thread::KernelAction::Exit(-1);
-                };
-                let wndproc_result = (regs.rax as u16 as u32) | ((regs.rdx as u16 as u32) << 16);
-                let result = match callback.result {
-                    CallbackResult::WndProc => wndproc_result,
-                    CallbackResult::CreateWindow { hwnd } => {
-                        if wndproc_result as u16 == 0xffff {
-                            if let Some(index) = windows.windows.iter()
-                                .position(|window| window.hwnd == hwnd)
-                            {
-                                windows.windows.remove(index);
-                            }
-                            0
-                        } else {
-                            hwnd
-                        }
-                    }
-                };
-                if finish(machine, windows, regs, callback.dispatch_gate, result).is_err() {
-                    return thread::KernelAction::Exit(-1);
-                }
-                return thread::KernelAction::Done;
+            if gate.module == Module::Kernel && gate.ordinal == 102 && (regs.rax as u16 >> 8) == 0x4c {
+                return thread::KernelAction::Exit(regs.rax as u8 as i32);
+            }
+            if gate.module == Module::Kernel && gate.ordinal == 1 {
+                return thread::KernelAction::Exit(stack_u16(machine, windows, regs, 4).unwrap_or(1) as i32);
             }
             if crate::kernel::startup::trace_enabled() {
                 crate::compact_dbg_println!("[win16] {:?}.{} {}", gate.module, gate.ordinal, gate.name);
             }
-            if gate.module == Module::User && gate.ordinal == 114 {
-                let Some(message_at) = stack_u32(machine, windows, regs, 4)
-                    .and_then(|p| far_linear(windows, p)) else {
-                    return thread::KernelAction::Exit(-1);
-                };
-                let message = message16(machine, message_at);
-                if begin_wndproc(machine, windows, state, regs, gate,
-                    CallbackResult::WndProc, message) {
-                    return thread::KernelAction::Done;
-                }
-            }
-            if gate.module == Module::User && gate.ordinal == 108
-                && !windows.quit && windows.messages.is_empty() && state.timer == 0
-            {
-                // GetMessage blocks until input or another producer queues a
-                // message.  Re-enter the INT gate when this thread is next
-                // scheduled instead of returning the WM_QUIT value zero.
-                regs.frame.rip = u64::from(gate.offset);
-                return thread::KernelAction::Yield;
-            }
             let result = dispatch(machine, kt, windows, state, regs, gate);
-            if gate.module == Module::User && gate.ordinal == 41 && result != 0 {
-                let message = super::Message {
-                    hwnd: result,
-                    message: 1,
-                    wparam: 0,
-                    lparam: stack_u32(machine, windows, regs, 4).unwrap_or(0),
-                };
-                if begin_wndproc(machine, windows, state, regs, gate,
-                    CallbackResult::CreateWindow { hwnd: result }, message) {
-                    return thread::KernelAction::Done;
-                }
-            }
             if finish(machine, windows, regs, gate, result).is_err() {
                 return thread::KernelAction::Exit(-1);
             }

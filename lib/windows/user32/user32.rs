@@ -22,6 +22,8 @@ mod resource;
 mod runtime;
 mod state;
 mod text;
+mod win16;
+mod win16_resource;
 mod window;
 
 use core::mem::transmute;
@@ -138,6 +140,9 @@ unsafe fn dispatch(message: *const Message, wide: bool) -> i32 {
         ..
     } = unsafe { message.read() };
     if message == 0x113 && lparam != 0 {
+        if let Some(result) = unsafe { win16::invoke(lparam, hwnd, message, wparam, time, false) } {
+            return result;
+        }
         let proc: TimerProc = unsafe { transmute(lparam) };
         unsafe {
             proc(hwnd, message, wparam, time);
@@ -198,6 +203,9 @@ unsafe fn invoke_body(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: b
     let Some((address, target_wide)) = target.filter(|t| t.0 != 0) else {
         return 0;
     };
+    if let Some(result) = unsafe { win16::invoke(address, hwnd, message, wparam, lparam, wide) } {
+        return result;
+    }
     let builtin = controls::builtin(address);
     let proc: WndProc = unsafe { transmute(controls::variant(address, wide)) };
     if builtin || wide == target_wide {
@@ -214,6 +222,9 @@ unsafe fn call_procedure(
     lparam: u32,
     wide: bool,
 ) -> i32 {
+    if let Some(result) = unsafe { win16::invoke(address, hwnd, message, wparam, lparam, wide) } {
+        return result;
+    }
     if address >> 16 == 0xffff {
         let entry = state::with(|s| {
             s.procedures
@@ -230,6 +241,21 @@ unsafe fn call_procedure(
     } else {
         0
     }
+}
+
+// Win16 DLGPROC returns a 16-bit BOOL; DX is not part of its result.
+unsafe fn call_dialog_procedure(
+    address: u32,
+    hwnd: u32,
+    message: u32,
+    wparam: u32,
+    lparam: u32,
+    wide: bool,
+) -> i32 {
+    if let Some(result) = unsafe { win16::invoke(address, hwnd, message, wparam, lparam, wide) } {
+        return result as u16 as i16 as i32;
+    }
+    unsafe { call_procedure(address, hwnd, message, wparam, lparam, wide) }
 }
 
 unsafe fn converted(

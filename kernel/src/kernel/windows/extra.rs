@@ -1372,7 +1372,6 @@ fn ensure_window(state: &mut WindowsState) {
     state.windows.push(Window {
         hwnd,
         parent: 0,
-        wndproc: 0,
         x: 0,
         y: 0,
         width,

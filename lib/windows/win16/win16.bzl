@@ -5,6 +5,7 @@ def win16_dll(name, module, exports):
     nasm_library(
         name = name + "_obj",
         srcs = [name + ".asm"],
+        hdrs = ["bridge.inc"],
         copts = ["-fobj"],
     )
     windows16_dll(

@@ -51,6 +51,8 @@ pub struct Window {
 }
 
 pub struct State {
+    pub win16_handles: Vec<u32>,
+    pub win16_procs: Vec<u32>,
     pub keyboard: [u8; 256],
     pub menu_popup: Option<crate::menu::Popup>,
     pub menus: Vec<crate::menu::Menu>,
@@ -85,6 +87,8 @@ unsafe impl Sync for Global {}
 static GLOBAL: Global = Global {
     locked: AtomicBool::new(false),
     state: UnsafeCell::new(State {
+        win16_handles: Vec::new(),
+        win16_procs: Vec::new(),
         keyboard: [0; 256],
         menu_popup: None,
         menus: Vec::new(),

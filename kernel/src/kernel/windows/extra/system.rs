@@ -223,7 +223,7 @@ pub(super) fn call<A: crate::Arch>(
             let height = a(3).clamp(1, 2048);
             let hwnd = state.next_object;
             state.next_object = state.next_object.wrapping_add(1);
-            state.windows.push(Window { hwnd, parent: a(4), wndproc: 0,
+            state.windows.push(Window { hwnd, parent: a(4),
                 x: a(0) as i32, y: a(1) as i32, width, height, visible: false,
                 pixels: vec![0xc0; width as usize * height as usize * 4] });
             hwnd

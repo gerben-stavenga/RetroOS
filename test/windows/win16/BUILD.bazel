@@ -1,0 +1,20 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:windows_watcom.bzl", "windows16_binary")
+nasm_library(name="bridge_obj", srcs=["bridge.asm"], copts=["-fobj"])
+windows16_binary(name="bridge", obj=":bridge_obj", imports={
+    "Exit": "KERNEL.1", "CallWindowProc": "USER.122", "Debug": "KERNEL.115",
+}, visibility=["//visibility:public"])
+nasm_library(name="window_obj", srcs=["window.asm"], copts=["-fobj"])
+windows16_binary(name="window", obj=":window_obj", imports={
+    "Exit": "KERNEL.1", "Debug": "KERNEL.115",
+    "RegisterClass": "USER.57", "CreateWindow": "USER.41", "DestroyWindow": "USER.53",
+    "DefWindowProc": "USER.107", "SendMessage": "USER.111", "UpdateWindow": "USER.124",
+    "BeginPaint": "USER.39", "EndPaint": "USER.40", "GetClientRect": "USER.33",
+    "PostMessage": "USER.110", "GetMessage": "USER.108", "DispatchMessage": "USER.114",
+    "DOSExit": "KERNEL.102",
+    "CreateDC": "GDI.52", "CreateBitmap": "GDI.51", "SelectObject": "GDI.45",
+    "DeleteDC": "GDI.68", "DeleteObject": "GDI.69", "SetPixel": "GDI.31",
+    "CreateDialog": "USER.242", "SetDlgItemInt": "USER.94", "GetDlgItemInt": "USER.95",
+    "FillRect": "USER.81", "CreateSolidBrush": "GDI.66", "GetPixel": "GDI.83",
+    "GetDC": "USER.66", "ReleaseDC": "USER.68",
+}, visibility=["//visibility:public"])

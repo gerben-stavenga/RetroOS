@@ -340,9 +340,17 @@ pub extern "system" fn GetSystemMenu(h: u32, reset: u32) -> u32 {
     menu
 }
 unsafe fn load(instance: u32, name: u32, wide: bool) -> u32 {
+    if crate::win16_resource::instance(instance) {
+        return unsafe { crate::win16_resource::bytes(4, name, wide) }
+            .and_then(crate::win16_resource::menu)
+            .map_or(0, |data| template(&data));
+    }
     let Some(data) = (unsafe { crate::resource::bytes(instance, name, 4, wide) }) else {
         return 0;
     };
+    template(data)
+}
+fn template(data: &[u8]) -> u32 {
     fn word(data: &[u8], p: &mut usize) -> Option<u16> {
         let b = data.get(*p..*p + 2)?;
         *p += 2;

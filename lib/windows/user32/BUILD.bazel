@@ -11,7 +11,7 @@ nasm_library(
 windows_rust_library(
     name = "user32_rust",
     crate_root = "user32.rs",
-    srcs = ["frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
+    srcs = ["win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
 )
 
 windows_dll(
@@ -19,6 +19,14 @@ windows_dll(
     obj = ":user32_obj",
     libraries = [":user32_rust"],
     imports = {
+        "_CreatePen@12": "GDI32.CreatePen",
+        "_TextOutA@20": "GDI32.TextOutA",
+        "_LineTo@12": "GDI32.LineTo",
+        "_MoveToEx@16": "GDI32.MoveToEx",
+        "_SetMapMode@8": "GDI32.SetMapMode",
+        "_SetBkColor@8": "GDI32.SetBkColor",
+        "_SetPixel@16": "GDI32.SetPixel",
+        "_GetPixel@12": "GDI32.GetPixel",
         "_CreateCompatibleDC@4": "GDI32.CreateCompatibleDC",
         "_CreateCompatibleBitmap@12": "GDI32.CreateCompatibleBitmap",
         "_SelectObject@8": "GDI32.SelectObject",
@@ -473,6 +481,7 @@ windows_dll(
         "SendMessageA", "SendMessageW", "SetCapture", "SetDlgItemInt", "SetDlgItemTextW",
         "SetMenu", "SetRect", "SetTimer", "ShowWindow", "TranslateAcceleratorW",
         "TranslateMessage", "UpdateWindow",
+        "Retro16Enter", "Retro16Return", "Retro16Config",
         "RetroSurfaceCreate", "RetroSurfaceUpdate", "RetroReleaseWindow", "RetroReadEvent",
     ],
     visibility = ["//visibility:public"],

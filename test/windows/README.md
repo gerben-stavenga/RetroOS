@@ -1,4 +1,4 @@
-# Win32 personality tests
+# Windows personality tests
 
 These are normal 32-bit Windows console programs compiled and linked with the
 Open Watcom C runtime. `HELLO.EXE` covers PE loading, Watcom startup and stdout.
@@ -15,11 +15,16 @@ The Win32 `GetEnvironmentStrings` API now exposes values parsed from
 `C:\RETROOS\RETROOS.INI`, including optional `HOME` and `MCHOME` settings.
 `GetTempPathA` uses `TEMP` from that environment (default `C:\TEMP`).
 
-The Win16 side follows the same boundary with real 16-bit NE facade modules
-from `C:\RETROOS\WINDOWS\SYSTEM`. The NE loader resolves ordinal imports through those
-modules' entry tables and patches 16:16 call sites to their `INT 83h` exports.
-The original Windows 3.1 `WINMINE.EXE` is a local proprietary acceptance test
-and is therefore not part of this repository.
+The Win16 NE facades at `C:\RETROOS\WINDOWS\SYSTEM` now bridge into the
+same guest Rust USER32/GDI32 implementation. Window procedures and nested calls
+stay on guest stacks, including the reverse transition to 16-bit protected mode.
+Unmigrated services retain native INT gates. See
+[the bridge ABI and limitations](../../lib/windows/win16/README.md).
+
+Run `ENGINE=kvm python3 test/windows_win16.py` and
+`ENGINE=tcg python3 test/windows_win16.py` for source-built NE callback, window,
+painting and dialog tests. The original Windows 3.1 Minesweeper remains a local
+proprietary acceptance test rather than a repository fixture.
 
 ```sh
 bazelisk build \

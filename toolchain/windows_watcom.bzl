@@ -138,3 +138,25 @@ windows16_dll = rule(
         "_runtime": attr.label(default = "@open_watcom//:c_runtime"),
     },
 )
+
+# Small mixed-bitness ABI tests deliberately have no C startup runtime.
+def _windows16_binary_impl(ctx):
+    response = ctx.actions.declare_file(ctx.label.name + ".lnk")
+    ctx.actions.write(response, "\n".join([
+        "format windows", "option quiet", "option start=_start",
+        "option stack=8192", "option heapsize=4096",
+        "name " + ctx.outputs.exe.path, "file " + ctx.file.obj.path,
+    ] + ["import %s %s" % (symbol, target) for symbol, target in ctx.attr.imports.items()]) + "\n")
+    ctx.actions.run(executable=ctx.executable._linker, arguments=["@" + response.path],
+        inputs=[response, ctx.file.obj], outputs=[ctx.outputs.exe])
+    return [DefaultInfo(files=depset([ctx.outputs.exe]))]
+
+windows16_binary = rule(
+    implementation=_windows16_binary_impl,
+    outputs={"exe": "%{name}.exe"},
+    attrs={
+        "obj": attr.label(allow_single_file=True, mandatory=True),
+        "imports": attr.string_dict(),
+        "_linker": attr.label(default="@open_watcom//:binl64/wlink", allow_single_file=True, executable=True, cfg="exec"),
+    },
+)
