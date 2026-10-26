@@ -240,14 +240,16 @@ const SPECS: &[Spec] = &[
     spec(b"USER32", b"CreateDialogParamA", 20),
     spec(b"USER32", b"CreateMenu", 0),
     spec(b"USER32", b"CreatePopupMenu", 0),
-    spec(b"USER32", b"CreateWindowExA", 48),
+    spec(b"USER32", b"RetroReadEvent", 8),
+    spec(b"USER32", b"RetroSurfaceCreate", 20),
+    spec(b"USER32", b"RetroSurfaceUpdate", 28),
+    spec(b"USER32", b"RetroReleaseWindow", 4),
     spec(b"USER32", b"ChangeDisplaySettingsA", 8),
     spec(b"USER32", b"EnumDisplaySettingsA", 12),
     spec(b"USER32", b"DefWindowProcA", 16),
     spec(b"USER32", b"DeleteMenu", 12),
     spec(b"USER32", b"DestroyMenu", 4),
     spec(b"USER32", b"DestroyWindow", 4),
-    spec(b"USER32", b"DispatchMessageA", 4),
     spec(b"USER32", b"DrawAnimatedRects", 16),
     spec(b"USER32", b"EmptyClipboard", 0),
     spec(b"USER32", b"IsClipboardFormatAvailable", 4),
@@ -266,7 +268,6 @@ const SPECS: &[Spec] = &[
     spec(b"USER32", b"GetLastActivePopup", 4),
     spec(b"USER32", b"GetMenuItemCount", 4),
     spec(b"USER32", b"GetMenuItemInfoA", 16),
-    spec(b"USER32", b"GetMessageA", 16),
     spec(b"USER32", b"GetParent", 4),
     spec(b"USER32", b"GetWindow", 8),
     spec(b"USER32", b"GetWindowDC", 4),
@@ -287,12 +288,8 @@ const SPECS: &[Spec] = &[
     spec(b"USER32", b"OemToCharBuffA", 12),
     spec(b"USER32", b"OpenClipboard", 4),
     spec(b"USER32", b"OpenIcon", 4),
-    spec(b"USER32", b"PeekMessageA", 20),
-    spec(b"USER32", b"PostMessageA", 16),
-    spec(b"USER32", b"PostThreadMessageA", 16),
     spec(b"USER32", b"RegisterClassExA", 4),
     spec(b"USER32", b"RegisterWindowMessageA", 4),
-    spec(b"USER32", b"SendMessageA", 16),
     spec(b"USER32", b"SetClipboardData", 8),
     spec(b"USER32", b"SetCursorPos", 8),
     spec(b"USER32", b"SetForegroundWindow", 4),
@@ -420,6 +417,7 @@ const SPECS: &[Spec] = &[
     spec(b"KERNEL32", b"GetSystemDefaultLangID", 0),
     spec(b"KERNEL32", b"GetVersionExA", 4),
     spec(b"KERNEL32", b"GetVolumeInformationA", 32),
+    spec(b"KERNEL32", b"GetProcessHeap", 0),
     spec(b"KERNEL32", b"HeapAlloc", 12),
     spec(b"KERNEL32", b"HeapCompact", 8),
     spec(b"KERNEL32", b"HeapCreate", 12),
@@ -831,7 +829,7 @@ pub(super) fn call<A: crate::Arch>(
         state.last_error = arg(machine, regs, 0);
         return 0;
     }
-    if name.eq_ignore_ascii_case(b"HeapCreate") {
+    if name.eq_ignore_ascii_case(b"HeapCreate") || name.eq_ignore_ascii_case(b"GetProcessHeap") {
         return 1;
     }
     if name.eq_ignore_ascii_case(b"HeapAlloc") {

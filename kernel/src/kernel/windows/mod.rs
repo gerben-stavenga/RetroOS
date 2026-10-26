@@ -1,8 +1,8 @@
-//! Native 32-bit Windows console personality.
+//! Native Windows personality.
 //!
-//! PE imports resolve against ordinary replacement DLLs. Their exported
-//! functions are consecutive `INT 83h` gates; the personality implements the
-//! Win32 calls and completes their stdcall returns.
+//! PE imports resolve against ordinary replacement DLLs. INT 83h exports
+//! enter kernel services and complete their stdcall returns. DLL guest code
+//! handles window callbacks with ordinary calls and returns on the guest stack.
 
 extern crate alloc;
 
@@ -86,7 +86,6 @@ const ERROR_INVALID_PARAMETER: u32 = 87;
 enum Api {
     CloseHandle,
     CreateEventA,
-    CreateWindowExA,
     CreateFileA,
     ExitProcess,
     FlushFileBuffers,
@@ -128,20 +127,10 @@ enum Api {
     CharUpperA,
     LstrcpyW,
     LstrlenW,
-    RegisterClassW,
-    CreateWindowExW,
-    ShowWindow,
     UpdateWindow,
     InvalidateRect,
-    GetMessageW,
-    PeekMessageW,
     TranslateMessage,
-    DispatchMessageW,
-    PostMessageW,
-    PostQuitMessage,
-    DefWindowProcW,
     RetroWndProcReturn,
-    GetClientRect,
     BeginPaint,
     EndPaint,
     GetDC,
@@ -150,11 +139,6 @@ enum Api {
     DrawEdge,
     GetSysColorBrush,
     GetSystemMetrics,
-    SetRect,
-    InflateRect,
-    OffsetRect,
-    PtInRect,
-    MoveWindow,
     CreateCompatibleDC,
     CreateCompatibleBitmap,
     SelectObject,
@@ -285,9 +269,10 @@ pub struct WindowsState {
     classes: Vec<WindowClass>,
     windows: Vec<Window>,
     messages: Vec<Message>,
-    thread_messages: Vec<(u32,Message)>,
+    user_events: Vec<u32>,
     registered_messages: Vec<(Vec<u8>,u32)>,
     trampolines: Vec<extra::Bound>,
+    // DLL initialization only; USER32 window callbacks use ordinary guest calls.
     callback: Option<Callback>,
     callback_stack: Vec<Callback>,
     callback_return: u32,
@@ -342,7 +327,7 @@ impl WindowsState {
             classes: Vec::new(),
             windows: Vec::new(),
             messages: Vec::new(),
-            thread_messages: Vec::new(),
+            user_events: Vec::new(),
             registered_messages: Vec::new(),
             trampolines: Vec::new(),
             callback: None,
@@ -402,6 +387,11 @@ impl WindowsState {
     pub fn repaint_osd(&mut self) {
         self.cursor_dirty = true;
     }
+    fn wake_user(&mut self) {
+        for &event in &self.user_events {
+            threads::signal(&mut self.threads, event);
+        }
+    }
     pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8) {
         let pressed = crate::kernel::keyboard::update_console(&mut self.console.keyboard,scancode);
         if crate::kernel::keyboard::event().scan == 0 { return; }
@@ -416,6 +406,7 @@ impl WindowsState {
             wparam: u32::from(scancode & 0x7f),
             lparam: 0,
         });
+        self.wake_user();
         extra::push_key(&mut self.console, scancode, crate::kernel::keyboard::event(), crate::kernel::keyboard::control_state());
         if !pressed {
             return;
@@ -477,6 +468,7 @@ impl WindowsState {
                 lparam,
             });
         }
+        self.wake_user();
         self.mouse_buttons = buttons;
         self.cursor_dirty = true;
     }
@@ -863,12 +855,7 @@ fn load_library<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, name:
         for module in &state.modules[start..] {
             protect_module(machine,module).map_err(|_|8u32)?;
             let image=pe::Image::parse(&module.data).map_err(|_|193u32)?;
-            for export in image.exports().map_err(|_|193u32)? {
-                if let Some(spec) = extra::lookup(&module.name, &export.name) {
-                    state.gates.push(Gate { return_ip: module.base + export.rva + 2,
-                        api: Api::Extension, arg_bytes: spec.arg_bytes, name: spec.name });
-                }
-            }
+            register_module_gates(machine, module, &mut state.gates).map_err(|e| e as u32)?;
             if image.header.entry_rva!=0 {dlls.push((module.base,module.base+image.header.entry_rva));}
         }
         Ok((base,dlls))
@@ -914,6 +901,195 @@ fn dll_startup_stub_at<A: crate::Arch>(machine: &mut A, dlls: &[(u32,u32)], exe_
     machine.copy_to(stub as usize, &code);
     machine.set_page_flags(stub as usize / 4096, 1, false, true);
     Ok(stub)
+}
+
+const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
+    (b"KERNEL32", b"CloseHandle", Api::CloseHandle, 4),
+    (b"KERNEL32", b"CreateEventA", Api::CreateEventA, 16),
+    (b"KERNEL32", b"CreateFileA", Api::CreateFileA, 28),
+    (b"KERNEL32", b"ExitProcess", Api::ExitProcess, 4),
+    (b"KERNEL32", b"FlushFileBuffers", Api::FlushFileBuffers, 4),
+    (b"KERNEL32", b"GetACP", Api::GetACP, 0),
+    (b"KERNEL32", b"GetCPInfo", Api::GetCPInfo, 8),
+    (b"KERNEL32", b"GetCommandLineA", Api::GetCommandLineA, 0),
+    (b"KERNEL32", b"GetCommandLineW", Api::GetCommandLineW, 0),
+    (b"KERNEL32", b"GetConsoleMode", Api::GetConsoleMode, 8),
+    (
+        b"KERNEL32",
+        b"GetCurrentThreadId",
+        Api::GetCurrentThreadId,
+        0,
+    ),
+    (b"KERNEL32", b"GetFileType", Api::GetFileType, 4),
+    (b"KERNEL32", b"GetLastError", Api::GetLastError, 0),
+    (
+        b"KERNEL32",
+        b"GetModuleFileNameA",
+        Api::GetModuleFileNameA,
+        12,
+    ),
+    (
+        b"KERNEL32",
+        b"GetModuleFileNameW",
+        Api::GetModuleFileNameW,
+        12,
+    ),
+    (b"KERNEL32", b"GetModuleHandleA", Api::GetModuleHandleA, 4),
+    (b"KERNEL32", b"GetModuleHandleW", Api::GetModuleHandleW, 4),
+    (b"KERNEL32", b"GetOEMCP", Api::GetOEMCP, 0),
+    (b"KERNEL32", b"GetProcAddress", Api::GetProcAddress, 8),
+    (b"KERNEL32", b"GetStdHandle", Api::GetStdHandle, 4),
+    (b"KERNEL32", b"GetStartupInfoA", Api::GetStartupInfoA, 4),
+    (b"KERNEL32", b"GetTickCount64", Api::GetTickCount64, 0),
+    (b"KERNEL32", b"GetVersion", Api::GetVersion, 0),
+    (b"KERNEL32", b"LoadLibraryA", Api::LoadLibraryA, 4),
+    (
+        b"KERNEL32",
+        b"MultiByteToWideChar",
+        Api::MultiByteToWideChar,
+        24,
+    ),
+    (
+        b"KERNEL32",
+        b"ReadConsoleInputA",
+        Api::ReadConsoleInputA,
+        16,
+    ),
+    (b"KERNEL32", b"ReadFile", Api::ReadFile, 20),
+    (
+        b"KERNEL32",
+        b"SetConsoleCtrlHandler",
+        Api::SetConsoleCtrlHandler,
+        8,
+    ),
+    (b"KERNEL32", b"SetConsoleMode", Api::SetConsoleMode, 8),
+    (
+        b"KERNEL32",
+        b"SetEnvironmentVariableA",
+        Api::SetEnvironmentVariableA,
+        8,
+    ),
+    (b"KERNEL32", b"SetFilePointer", Api::SetFilePointer, 16),
+    (b"KERNEL32", b"SetStdHandle", Api::SetStdHandle, 8),
+    (
+        b"KERNEL32",
+        b"SetUnhandledExceptionFilter",
+        Api::SetUnhandledExceptionFilter,
+        4,
+    ),
+    (
+        b"KERNEL32",
+        b"UnhandledExceptionFilter",
+        Api::UnhandledExceptionFilter,
+        4,
+    ),
+    (b"KERNEL32", b"VirtualAlloc", Api::VirtualAlloc, 16),
+    (b"KERNEL32", b"VirtualFree", Api::VirtualFree, 12),
+    (b"KERNEL32", b"VirtualQuery", Api::VirtualQuery, 12),
+    (
+        b"KERNEL32",
+        b"WideCharToMultiByte",
+        Api::WideCharToMultiByte,
+        32,
+    ),
+    (b"KERNEL32", b"WriteConsoleA", Api::WriteConsoleA, 20),
+    (b"KERNEL32", b"WriteFile", Api::WriteFile, 20),
+    (b"KERNEL32", b"lstrcpyW", Api::LstrcpyW, 8),
+    (b"KERNEL32", b"lstrlenW", Api::LstrlenW, 4),
+    (b"USER32", b"CharUpperA", Api::CharUpperA, 4),
+    (b"USER32", b"AdjustWindowRect", Api::Stub(1), 12),
+    (b"USER32", b"BeginPaint", Api::BeginPaint, 8),
+    (b"USER32", b"CheckMenuItem", Api::Stub(0), 12),
+    (b"USER32", b"DestroyIcon", Api::Stub(1), 4),
+    (b"USER32", b"DialogBoxParamW", Api::Stub(0), 20),
+    (b"USER32", b"DrawEdge", Api::DrawEdge, 16),
+    (b"USER32", b"EndDialog", Api::Stub(1), 8),
+    (b"USER32", b"EndPaint", Api::EndPaint, 8),
+    (b"USER32", b"FillRect", Api::FillRect, 12),
+    (b"USER32", b"GetDC", Api::GetDC, 4),
+    (b"USER32", b"GetDlgItemInt", Api::Stub(0), 16),
+    (b"USER32", b"GetDlgItemTextW", Api::Stub(0), 16),
+    (b"USER32", b"GetMenuItemRect", Api::Stub(0), 16),
+    (b"USER32", b"GetSysColorBrush", Api::GetSysColorBrush, 4),
+    (b"USER32", b"GetSystemMetrics", Api::GetSystemMetrics, 4),
+    (b"USER32", b"InvalidateRect", Api::InvalidateRect, 12),
+    (b"USER32", b"LoadAcceleratorsW", Api::Stub(0), 8),
+    (b"USER32", b"LoadCursorW", Api::Stub(1), 8),
+    (b"USER32", b"LoadIconW", Api::Stub(1), 8),
+    (b"USER32", b"LoadMenuW", Api::Stub(0), 8),
+    (b"USER32", b"LoadStringW", Api::Stub(0), 16),
+    (b"USER32", b"MessageBoxW", Api::Stub(1), 16),
+    (b"USER32", b"RetroWndProcReturn", Api::RetroWndProcReturn, 0),
+    (b"USER32", b"ReleaseCapture", Api::Stub(1), 0),
+    (b"USER32", b"ReleaseDC", Api::ReleaseDC, 8),
+    (b"USER32", b"SetCapture", Api::Stub(1), 4),
+    (b"USER32", b"SetDlgItemInt", Api::Stub(1), 16),
+    (b"USER32", b"SetDlgItemTextW", Api::Stub(1), 12),
+    (b"USER32", b"SetMenu", Api::Stub(1), 8),
+    (b"USER32", b"TranslateAcceleratorW", Api::Stub(0), 12),
+    (b"USER32", b"TranslateMessage", Api::TranslateMessage, 4),
+    (b"USER32", b"UpdateWindow", Api::UpdateWindow, 4),
+    (b"GDI32", b"Arc", Api::Stub(1), 36),
+    (b"GDI32", b"BitBlt", Api::BitBlt, 36),
+    (
+        b"GDI32",
+        b"CreateCompatibleBitmap",
+        Api::CreateCompatibleBitmap,
+        12,
+    ),
+    (b"GDI32", b"CreateCompatibleDC", Api::CreateCompatibleDC, 4),
+    (b"GDI32", b"CreateFontW", Api::Stub(1), 56),
+    (b"GDI32", b"CreatePen", Api::CreatePen, 12),
+    (b"GDI32", b"CreateSolidBrush", Api::CreateSolidBrush, 4),
+    (b"GDI32", b"DeleteDC", Api::DeleteDC, 4),
+    (b"GDI32", b"DeleteObject", Api::DeleteObject, 4),
+    (b"GDI32", b"Ellipse", Api::Ellipse, 20),
+    (b"GDI32", b"GetLayout", Api::Stub(0), 4),
+    (b"GDI32", b"GetStockObject", Api::GetStockObject, 4),
+    (
+        b"GDI32",
+        b"GetTextExtentPoint32W",
+        Api::GetTextExtentPoint32W,
+        16,
+    ),
+    (b"GDI32", b"LineTo", Api::LineTo, 12),
+    (b"GDI32", b"MoveToEx", Api::MoveToEx, 16),
+    (b"GDI32", b"Polygon", Api::Polygon, 12),
+    (b"GDI32", b"SelectObject", Api::SelectObject, 8),
+    (b"GDI32", b"SetBkColor", Api::SetBkColor, 8),
+    (b"GDI32", b"SetBkMode", Api::Stub(1), 8),
+    (b"GDI32", b"SetLayout", Api::Stub(0), 8),
+    (b"GDI32", b"SetTextColor", Api::SetTextColor, 8),
+    (b"GDI32", b"TextOutW", Api::TextOutW, 20),
+    (b"ADVAPI32", b"RegCloseKey", Api::Stub(0), 4),
+    (b"ADVAPI32", b"RegCreateKeyExW", Api::Stub(1), 36),
+    (b"ADVAPI32", b"RegQueryValueExW", Api::Stub(2), 24),
+    (b"ADVAPI32", b"RegSetValueExW", Api::Stub(0), 24),
+    (b"COMCTL32", b"InitCommonControlsEx", Api::Stub(1), 4),
+    (b"DWMAPI", b"DwmSetWindowAttribute", Api::Stub(0), 16),
+    (b"SHELL32", b"ExtractIconA", Api::Stub(0), 12),
+    (b"SHELL32", b"ShellAboutW", Api::Stub(1), 16),
+    (b"WINMM", b"PlaySoundW", Api::Stub(1), 12),
+];
+
+/// Real DLL functions execute as guest code. Only explicit INT 83h exports
+/// register kernel gates, identically for startup imports and LoadLibrary.
+fn register_module_gates<A: crate::Arch>(machine: &A, module: &Module, gates: &mut Vec<Gate>) -> Result<(), i32> {
+    let image = pe::Image::parse(&module.data).map_err(|_| 8)?;
+    let dll_name = module.name.strip_suffix(b".DLL").unwrap_or(&module.name);
+    for export in image.exports().map_err(|_| 8)? {
+        let address = module.base + export.rva;
+        if machine.read::<u16>(address as usize) != 0x83cd { continue; }
+        let core = API_SPECS.iter().find(|(dll, name, _, _)|
+            dll_name.eq_ignore_ascii_case(dll) && export.name == *name);
+        let spec = core.map(|(_, name, api, bytes)| (*name, *api, *bytes))
+            .or_else(|| extra::lookup(&module.name, &export.name)
+                .map(|spec| (spec.name, Api::Extension, spec.arg_bytes)));
+        if let Some((name, api, arg_bytes)) = spec {
+            gates.push(Gate { return_ip: address + 2, api, arg_bytes, name });
+        }
+    }
+    Ok(())
 }
 
 fn export_address(modules: &[Module], module: &[u8], name: &[u8]) -> Result<u32, i32> {
@@ -1150,219 +1326,8 @@ pub fn exec_pe_into<A: crate::Arch>(
     state.cwd_len = cwd.len().min(state.cwd.len());
     state.cwd[..state.cwd_len].copy_from_slice(&cwd[..state.cwd_len]);
 
-    let specs: &[(&[u8], &[u8], Api, u32)] = &[
-        (b"KERNEL32", b"CloseHandle", Api::CloseHandle, 4),
-        (b"KERNEL32", b"CreateEventA", Api::CreateEventA, 16),
-        (b"KERNEL32", b"CreateFileA", Api::CreateFileA, 28),
-        (b"KERNEL32", b"ExitProcess", Api::ExitProcess, 4),
-        (b"KERNEL32", b"FlushFileBuffers", Api::FlushFileBuffers, 4),
-        (b"KERNEL32", b"GetACP", Api::GetACP, 0),
-        (b"KERNEL32", b"GetCPInfo", Api::GetCPInfo, 8),
-        (b"KERNEL32", b"GetCommandLineA", Api::GetCommandLineA, 0),
-        (b"KERNEL32", b"GetCommandLineW", Api::GetCommandLineW, 0),
-        (b"KERNEL32", b"GetConsoleMode", Api::GetConsoleMode, 8),
-        (
-            b"KERNEL32",
-            b"GetCurrentThreadId",
-            Api::GetCurrentThreadId,
-            0,
-        ),
-        (b"KERNEL32", b"GetFileType", Api::GetFileType, 4),
-        (b"KERNEL32", b"GetLastError", Api::GetLastError, 0),
-        (
-            b"KERNEL32",
-            b"GetModuleFileNameA",
-            Api::GetModuleFileNameA,
-            12,
-        ),
-        (
-            b"KERNEL32",
-            b"GetModuleFileNameW",
-            Api::GetModuleFileNameW,
-            12,
-        ),
-        (b"KERNEL32", b"GetModuleHandleA", Api::GetModuleHandleA, 4),
-        (b"KERNEL32", b"GetModuleHandleW", Api::GetModuleHandleW, 4),
-        (b"KERNEL32", b"GetOEMCP", Api::GetOEMCP, 0),
-        (b"KERNEL32", b"GetProcAddress", Api::GetProcAddress, 8),
-        (b"KERNEL32", b"GetStdHandle", Api::GetStdHandle, 4),
-        (b"KERNEL32", b"GetStartupInfoA", Api::GetStartupInfoA, 4),
-        (b"KERNEL32", b"GetTickCount64", Api::GetTickCount64, 0),
-        (b"KERNEL32", b"GetVersion", Api::GetVersion, 0),
-        (b"KERNEL32", b"LoadLibraryA", Api::LoadLibraryA, 4),
-        (
-            b"KERNEL32",
-            b"MultiByteToWideChar",
-            Api::MultiByteToWideChar,
-            24,
-        ),
-        (
-            b"KERNEL32",
-            b"ReadConsoleInputA",
-            Api::ReadConsoleInputA,
-            16,
-        ),
-        (b"KERNEL32", b"ReadFile", Api::ReadFile, 20),
-        (
-            b"KERNEL32",
-            b"SetConsoleCtrlHandler",
-            Api::SetConsoleCtrlHandler,
-            8,
-        ),
-        (b"KERNEL32", b"SetConsoleMode", Api::SetConsoleMode, 8),
-        (
-            b"KERNEL32",
-            b"SetEnvironmentVariableA",
-            Api::SetEnvironmentVariableA,
-            8,
-        ),
-        (b"KERNEL32", b"SetFilePointer", Api::SetFilePointer, 16),
-        (b"KERNEL32", b"SetStdHandle", Api::SetStdHandle, 8),
-        (
-            b"KERNEL32",
-            b"SetUnhandledExceptionFilter",
-            Api::SetUnhandledExceptionFilter,
-            4,
-        ),
-        (
-            b"KERNEL32",
-            b"UnhandledExceptionFilter",
-            Api::UnhandledExceptionFilter,
-            4,
-        ),
-        (b"KERNEL32", b"VirtualAlloc", Api::VirtualAlloc, 16),
-        (b"KERNEL32", b"VirtualFree", Api::VirtualFree, 12),
-        (b"KERNEL32", b"VirtualQuery", Api::VirtualQuery, 12),
-        (
-            b"KERNEL32",
-            b"WideCharToMultiByte",
-            Api::WideCharToMultiByte,
-            32,
-        ),
-        (b"KERNEL32", b"WriteConsoleA", Api::WriteConsoleA, 20),
-        (b"KERNEL32", b"WriteFile", Api::WriteFile, 20),
-        (b"KERNEL32", b"lstrcpyW", Api::LstrcpyW, 8),
-        (b"KERNEL32", b"lstrlenW", Api::LstrlenW, 4),
-        (b"USER32", b"CharUpperA", Api::CharUpperA, 4),
-        (b"USER32", b"AdjustWindowRect", Api::Stub(1), 12),
-        (b"USER32", b"BeginPaint", Api::BeginPaint, 8),
-        (b"USER32", b"CheckMenuItem", Api::Stub(0), 12),
-        (b"USER32", b"CreateWindowExW", Api::CreateWindowExW, 48),
-        (b"USER32", b"DefWindowProcW", Api::DefWindowProcW, 16),
-        (b"USER32", b"DestroyIcon", Api::Stub(1), 4),
-        (b"USER32", b"DialogBoxParamW", Api::Stub(0), 20),
-        (b"USER32", b"DispatchMessageW", Api::DispatchMessageW, 4),
-        (b"USER32", b"DrawEdge", Api::DrawEdge, 16),
-        (b"USER32", b"EndDialog", Api::Stub(1), 8),
-        (b"USER32", b"EndPaint", Api::EndPaint, 8),
-        (b"USER32", b"FillRect", Api::FillRect, 12),
-        (b"USER32", b"GetClientRect", Api::GetClientRect, 8),
-        (b"USER32", b"GetDC", Api::GetDC, 4),
-        (b"USER32", b"GetDlgItem", Api::Stub(0), 8),
-        (b"USER32", b"GetDlgItemInt", Api::Stub(0), 16),
-        (b"USER32", b"GetDlgItemTextW", Api::Stub(0), 16),
-        (b"USER32", b"GetMenuItemRect", Api::Stub(0), 16),
-        (b"USER32", b"GetMessageW", Api::GetMessageW, 16),
-        (b"USER32", b"GetSysColorBrush", Api::GetSysColorBrush, 4),
-        (b"USER32", b"GetSystemMetrics", Api::GetSystemMetrics, 4),
-        (b"USER32", b"InflateRect", Api::InflateRect, 12),
-        (b"USER32", b"InvalidateRect", Api::InvalidateRect, 12),
-        (b"USER32", b"KillTimer", Api::Stub(1), 8),
-        (b"USER32", b"LoadAcceleratorsW", Api::Stub(0), 8),
-        (b"USER32", b"LoadCursorW", Api::Stub(1), 8),
-        (b"USER32", b"LoadIconW", Api::Stub(1), 8),
-        (b"USER32", b"LoadMenuW", Api::Stub(0), 8),
-        (b"USER32", b"LoadStringW", Api::Stub(0), 16),
-        (b"USER32", b"MapWindowPoints", Api::Stub(0), 16),
-        (b"USER32", b"MessageBoxW", Api::Stub(1), 16),
-        (b"USER32", b"MoveWindow", Api::MoveWindow, 24),
-        (b"USER32", b"OffsetRect", Api::OffsetRect, 12),
-        (b"USER32", b"PeekMessageW", Api::PeekMessageW, 20),
-        (b"USER32", b"PostMessageW", Api::PostMessageW, 16),
-        (b"USER32", b"PostQuitMessage", Api::PostQuitMessage, 4),
-        (b"USER32", b"PtInRect", Api::PtInRect, 12),
-        (b"USER32", b"RegisterClassW", Api::RegisterClassW, 4),
-        (b"USER32", b"RetroWndProcReturn", Api::RetroWndProcReturn, 0),
-        (b"USER32", b"ReleaseCapture", Api::Stub(1), 0),
-        (b"USER32", b"ReleaseDC", Api::ReleaseDC, 8),
-        (b"USER32", b"SendMessageW", Api::Stub(0), 16),
-        (b"USER32", b"SetCapture", Api::Stub(1), 4),
-        (b"USER32", b"SetDlgItemInt", Api::Stub(1), 16),
-        (b"USER32", b"SetDlgItemTextW", Api::Stub(1), 12),
-        (b"USER32", b"SetMenu", Api::Stub(1), 8),
-        (b"USER32", b"SetRect", Api::SetRect, 20),
-        (b"USER32", b"SetTimer", Api::Stub(1), 16),
-        (b"USER32", b"ShowWindow", Api::ShowWindow, 8),
-        (b"USER32", b"TranslateAcceleratorW", Api::Stub(0), 12),
-        (b"USER32", b"TranslateMessage", Api::TranslateMessage, 4),
-        (b"USER32", b"UpdateWindow", Api::UpdateWindow, 4),
-        (b"GDI32", b"Arc", Api::Stub(1), 36),
-        (b"GDI32", b"BitBlt", Api::BitBlt, 36),
-        (
-            b"GDI32",
-            b"CreateCompatibleBitmap",
-            Api::CreateCompatibleBitmap,
-            12,
-        ),
-        (b"GDI32", b"CreateCompatibleDC", Api::CreateCompatibleDC, 4),
-        (b"GDI32", b"CreateFontW", Api::Stub(1), 56),
-        (b"GDI32", b"CreatePen", Api::CreatePen, 12),
-        (b"GDI32", b"CreateSolidBrush", Api::CreateSolidBrush, 4),
-        (b"GDI32", b"DeleteDC", Api::DeleteDC, 4),
-        (b"GDI32", b"DeleteObject", Api::DeleteObject, 4),
-        (b"GDI32", b"Ellipse", Api::Ellipse, 20),
-        (b"GDI32", b"GetLayout", Api::Stub(0), 4),
-        (b"GDI32", b"GetStockObject", Api::GetStockObject, 4),
-        (
-            b"GDI32",
-            b"GetTextExtentPoint32W",
-            Api::GetTextExtentPoint32W,
-            16,
-        ),
-        (b"GDI32", b"LineTo", Api::LineTo, 12),
-        (b"GDI32", b"MoveToEx", Api::MoveToEx, 16),
-        (b"GDI32", b"Polygon", Api::Polygon, 12),
-        (b"GDI32", b"SelectObject", Api::SelectObject, 8),
-        (b"GDI32", b"SetBkColor", Api::SetBkColor, 8),
-        (b"GDI32", b"SetBkMode", Api::Stub(1), 8),
-        (b"GDI32", b"SetLayout", Api::Stub(0), 8),
-        (b"GDI32", b"SetTextColor", Api::SetTextColor, 8),
-        (b"GDI32", b"TextOutW", Api::TextOutW, 20),
-        (b"ADVAPI32", b"RegCloseKey", Api::Stub(0), 4),
-        (b"ADVAPI32", b"RegCreateKeyExW", Api::Stub(1), 36),
-        (b"ADVAPI32", b"RegQueryValueExW", Api::Stub(2), 24),
-        (b"ADVAPI32", b"RegSetValueExW", Api::Stub(0), 24),
-        (b"COMCTL32", b"InitCommonControlsEx", Api::Stub(1), 4),
-        (b"DWMAPI", b"DwmSetWindowAttribute", Api::Stub(0), 16),
-        (b"SHELL32", b"ExtractIconA", Api::Stub(0), 12),
-        (b"SHELL32", b"ShellAboutW", Api::Stub(1), 16),
-        (b"WINMM", b"PlaySoundW", Api::Stub(1), 12),
-    ];
-    for &(module, name, api, arg_bytes) in specs {
-        let Some(_) = find_module(&modules, module) else {
-            continue;
-        };
-        let address = export_address(&modules, module, name)?;
-        state.gates.push(Gate {
-            return_ip: address + 2,
-            api,
-            arg_bytes,
-            name,
-        });
-    }
-    // Extension APIs can be ordinary facade exports or import trampolines.
-    // Register facade gates too, so GetProcAddress returns callable exports.
     for module in &modules {
-        for export in pe::Image::parse(&module.data).map_err(|_| 8)?.exports().map_err(|_| 8)? {
-            if let Some(spec) = extra::lookup(&module.name, &export.name) {
-                state.gates.push(Gate {
-                    return_ip: module.base + export.rva + 2,
-                    api: Api::Extension,
-                    arg_bytes: spec.arg_bytes,
-                    name: spec.name,
-                });
-            }
-        }
+        register_module_gates(machine, module, &mut state.gates)?;
     }
     for bound in &trampolines {
         state.gates.push(Gate {
@@ -1599,32 +1564,8 @@ fn queue_paint(state: &mut WindowsState, hwnd: u32) {
             lparam: 0,
         });
     }
+    state.wake_user();
     state.dirty = true;
-}
-
-fn begin_wndproc<A: crate::Arch>(
-    machine: &mut A,
-    regs: &mut Regs,
-    state: &mut WindowsState,
-    gate: Gate,
-    message: Message,
-) -> bool {
-    let Some(window) = state.windows.iter().find(|w| w.hwnd == message.hwnd) else {
-        return false;
-    };
-    if window.wndproc == 0 || state.callback.is_some() {
-        return false;
-    }
-    let sp = regs.sp().wrapping_sub(20);
-    machine.write::<u32>(sp as usize, state.callback_return);
-    machine.write::<u32>(sp as usize + 4, message.hwnd);
-    machine.write::<u32>(sp as usize + 8, message.message);
-    machine.write::<u32>(sp as usize + 12, message.wparam);
-    machine.write::<u32>(sp as usize + 16, message.lparam);
-    state.callback = Some(Callback { gate, module_result: None });
-    regs.frame.rsp = sp;
-    regs.frame.rip = window.wndproc as u64;
-    true
 }
 
 fn system_color(index: u32) -> u32 {
@@ -2179,85 +2120,6 @@ fn dispatch<A: crate::Arch>(
             }
             dst as u32
         }
-        Api::RegisterClassW => {
-            let wc = arg(machine, regs, 0) as usize;
-            let wndproc = machine.read::<u32>(wc + 4);
-            let background = machine.read::<u32>(wc + 28);
-            let name_ptr = machine.read::<u32>(wc + 36);
-            let name = match w_string(machine, name_ptr) {
-                Ok(name) => name,
-                Err(e) => return fail(state, e, 0),
-            };
-            if let Some(class) = state
-                .classes
-                .iter_mut()
-                .find(|c| c.name.eq_ignore_ascii_case(&name))
-            {
-                class.wndproc = wndproc;
-                class.background = background;
-            } else {
-                state.classes.push(WindowClass {
-                    name,
-                    wndproc,
-                    background,
-                });
-            }
-            state.classes.len() as u32
-        }
-        Api::CreateWindowExW | Api::CreateWindowExA => {
-            let class_ptr = arg(machine, regs, 1);
-            let class = if class_ptr <= 0xffff {
-                state.classes.first()
-            } else {
-                let name = match if api==Api::CreateWindowExA {c_string(machine,class_ptr)} else {w_string(machine, class_ptr)} {
-                    Ok(v) => v,
-                    Err(_) => return 0,
-                };
-                state
-                    .classes
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(&name))
-            };
-            let Some(class) = class else {
-                return fail(state, 1411, 0);
-            };
-            let width = arg(machine, regs, 6).clamp(1, 2048);
-            let height = arg(machine, regs, 7).clamp(1, 2048);
-            let hwnd = state.next_object;
-            state.next_object = state.next_object.wrapping_add(1);
-            let pixels = vec![0xc0; width as usize * height as usize * 4];
-            state.windows.push(Window {
-                hwnd,
-                parent: arg(machine, regs, 8),
-                wndproc: class.wndproc,
-                x: arg(machine, regs, 4) as i32,
-                y: arg(machine, regs, 5) as i32,
-                width,
-                height,
-                visible: false,
-                pixels,
-            });
-            state.messages.push(Message {
-                hwnd,
-                message: 0x0001,
-                wparam: 0,
-                lparam: arg(machine, regs, 11),
-            });
-            hwnd
-        }
-        Api::ShowWindow => {
-            let hwnd = arg(machine, regs, 0);
-            if let Some(window) = state.windows.iter_mut().find(|w| w.hwnd == hwnd) {
-                let was = window.visible;
-                window.visible = arg(machine, regs, 1) != 0;
-                if window.visible {
-                    queue_paint(state, hwnd);
-                }
-                was as u32
-            } else {
-                0
-            }
-        }
         Api::UpdateWindow | Api::InvalidateRect => {
             let hwnd = arg(machine, regs, 0);
             if state.windows.iter().any(|w| w.hwnd == hwnd) {
@@ -2267,59 +2129,8 @@ fn dispatch<A: crate::Arch>(
                 0
             }
         }
-        Api::GetMessageW | Api::PeekMessageW => {
-            let out = arg(machine, regs, 0) as usize;
-            if state.quit {
-                return 0;
-            }
-            if state.messages.is_empty() {
-                if let Some(window) = state.windows.iter().find(|w| w.visible) {
-                    state.messages.push(Message {
-                        hwnd: window.hwnd,
-                        message: 0x0113,
-                        wparam: 1,
-                        lparam: 0,
-                    });
-                } else {
-                    return 0;
-                }
-            }
-            let message = state.messages[0];
-            write_message(machine, out, message);
-            let remove = api == Api::GetMessageW || arg(machine, regs, 4) & 1 != 0;
-            if remove {
-                state.messages.remove(0);
-            }
-            1
-        }
         Api::TranslateMessage => 1,
-        Api::DispatchMessageW | Api::RetroWndProcReturn => 0,
-        Api::PostMessageW => {
-            state.messages.push(Message {
-                hwnd: arg(machine, regs, 0),
-                message: arg(machine, regs, 1),
-                wparam: arg(machine, regs, 2),
-                lparam: arg(machine, regs, 3),
-            });
-            1
-        }
-        Api::PostQuitMessage => {
-            state.quit = true;
-            0
-        }
-        Api::DefWindowProcW => 0,
-        Api::GetClientRect => {
-            let hwnd = arg(machine, regs, 0);
-            let out = arg(machine, regs, 1) as usize;
-            let Some(window) = state.windows.iter().find(|w| w.hwnd == hwnd) else {
-                return 0;
-            };
-            machine.write::<u32>(out, 0);
-            machine.write::<u32>(out + 4, 0);
-            machine.write::<u32>(out + 8, window.width);
-            machine.write::<u32>(out + 12, window.height);
-            1
-        }
+        Api::RetroWndProcReturn => 0,
         Api::GetSystemMetrics => match arg(machine, regs, 0) {
             0 => 1024,
             1 => 768,
@@ -2331,45 +2142,6 @@ fn dispatch<A: crate::Arch>(
             32 | 33 => 4,
             _ => 0,
         },
-        Api::SetRect => {
-            let out = arg(machine, regs, 0) as usize;
-            for n in 0..4 { machine.write::<u32>(out + n * 4, arg(machine, regs, n + 1)); }
-            1
-        }
-        Api::InflateRect => {
-            let out = arg(machine, regs, 0) as usize;
-            let dx = arg(machine, regs, 1); let dy = arg(machine, regs, 2);
-            machine.write::<u32>(out, machine.read::<u32>(out).wrapping_sub(dx));
-            machine.write::<u32>(out + 4, machine.read::<u32>(out + 4).wrapping_sub(dy));
-            machine.write::<u32>(out + 8, machine.read::<u32>(out + 8).wrapping_add(dx));
-            machine.write::<u32>(out + 12, machine.read::<u32>(out + 12).wrapping_add(dy));
-            1
-        }
-        Api::OffsetRect => {
-            let out = arg(machine, regs, 0) as usize;
-            let dx = arg(machine, regs, 1); let dy = arg(machine, regs, 2);
-            machine.write::<u32>(out, machine.read::<u32>(out).wrapping_add(dx));
-            machine.write::<u32>(out + 4, machine.read::<u32>(out + 4).wrapping_add(dy));
-            machine.write::<u32>(out + 8, machine.read::<u32>(out + 8).wrapping_add(dx));
-            machine.write::<u32>(out + 12, machine.read::<u32>(out + 12).wrapping_add(dy));
-            1
-        }
-        Api::PtInRect => {
-            let (l, t, r, b) = rect_from_guest(machine, arg(machine, regs, 0) as usize);
-            let x = arg(machine, regs, 1) as i32; let y = arg(machine, regs, 2) as i32;
-            (x >= l && x < r && y >= t && y < b) as u32
-        }
-        Api::MoveWindow => {
-            let hwnd = arg(machine, regs, 0);
-            let width = arg(machine, regs, 3).clamp(1, 2048);
-            let height = arg(machine, regs, 4).clamp(1, 2048);
-            if let Some(window) = state.windows.iter_mut().find(|w| w.hwnd == hwnd) {
-                window.width = width; window.height = height;
-                window.pixels.resize(width as usize * height as usize * 4, 0xc0);
-                if arg(machine, regs, 5) != 0 { queue_paint(state, hwnd); }
-                1
-            } else { 0 }
-        }
         Api::BeginPaint => {
             let hwnd = arg(machine, regs, 0);
             let out = arg(machine, regs, 1) as usize;
@@ -2766,18 +2538,6 @@ pub fn handle_event<A: crate::Arch>(
                 state.callback=state.callback_stack.pop();
                 finish(machine, regs, callback.gate, result);
                 return thread::KernelAction::Done;
-            }
-            if gate.api == Api::DispatchMessageW || gate.name==b"DispatchMessageA" {
-                let msg = arg(machine, regs, 0) as usize;
-                let message = Message {
-                    hwnd: machine.read::<u32>(msg),
-                    message: machine.read::<u32>(msg + 4),
-                    wparam: machine.read::<u32>(msg + 8),
-                    lparam: machine.read::<u32>(msg + 12),
-                };
-                if begin_wndproc(machine, regs, state, gate, message) {
-                    return thread::KernelAction::Done;
-                }
             }
             if gate.api == Api::Extension
                 && (gate.name.eq_ignore_ascii_case(b"CreateProcessA")

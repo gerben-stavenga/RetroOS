@@ -11,6 +11,27 @@ pub(super) fn call<A: crate::Arch>(
     let args: [u32; 12] = core::array::from_fn(|n| arg(machine, regs, n));
     let a = |n: usize| args[n];
     match name {
+        b"RetroReadEvent" => {
+            // A null output subscribes an auto-reset event without consuming input.
+            if a(1) != 0 {
+                if !super::super::threads::signal(&mut state.threads, a(1)) {
+                    return fail(state, ERROR_INVALID_HANDLE, 0);
+                }
+                if !state.user_events.contains(&a(1)) {
+                    state.user_events.push(a(1));
+                }
+            }
+            if a(0) == 0 {
+                return 1;
+            }
+            if state.messages.is_empty() {
+                return 0;
+            }
+            let message = state.messages.remove(0);
+            super::super::write_message(machine, a(0) as usize, message);
+            1
+        }
+
         b"ChangeDisplaySettingsA" => u32::MAX, // DISP_CHANGE_FAILED
         b"EnumDisplaySettingsA" => fail(state,120,0),
         b"OpenFileMappingA" => {
@@ -111,65 +132,43 @@ pub(super) fn call<A: crate::Arch>(
             state.registered_messages.push((name, id));
             id
         }
-        b"RegisterClassExA" => {
-            let wc = a(0) as usize;
-            let Ok(name) = c_string(machine, machine.read::<u32>(wc + 40)) else {
-                return fail(state, ERROR_INVALID_PARAMETER, 0);
-            };
-            let wndproc = machine.read::<u32>(wc + 8);
-            let background = machine.read::<u32>(wc + 32);
-            state.classes.push(super::super::WindowClass {
-                name,
-                wndproc,
-                background,
-            });
-            state.classes.len() as u32
+        b"RetroSurfaceCreate" => {
+            let width = a(2).clamp(1, 2048);
+            let height = a(3).clamp(1, 2048);
+            let hwnd = state.next_object;
+            state.next_object = state.next_object.wrapping_add(1);
+            state.windows.push(Window { hwnd, parent: a(4), wndproc: 0,
+                x: a(0) as i32, y: a(1) as i32, width, height, visible: false,
+                pixels: vec![0xc0; width as usize * height as usize * 4] });
+            hwnd
         }
-        b"CreateWindowExA" => {
-            super::super::dispatch(machine, kt, state, regs, super::super::Api::CreateWindowExA)
-        }
-        b"GetMessageA" | b"PeekMessageA" => {
-            let id = machine.read::<u32>((super::super::TEB_BASE + 0x24) as usize);
-            let found = state
-                .thread_messages
-                .iter()
-                .position(|(owner, _)| *owner == id);
-            let message = found
-                .map(|i| state.thread_messages[i].1)
-                .or_else(|| state.messages.first().copied());
-            let Some(message) = message else {
-                if name == b"GetMessageA" {
-                    state.console.hold = true;
-                }
-                return 0;
-            };
-            super::super::write_message(machine, a(0) as usize, message);
-            if name == b"GetMessageA" || a(4) & 1 != 0 {
-                if let Some(i) = found {
-                    state.thread_messages.remove(i);
-                } else {
-                    state.messages.remove(0);
-                }
+        b"RetroSurfaceUpdate" => {
+            let hwnd = a(0);
+            let Some(window) = state.windows.iter_mut().find(|w| w.hwnd == hwnd) else {return fail(state,1400,0)};
+            let width = a(3).clamp(1,2048);
+            let height = a(4).clamp(1,2048);
+            if window.width != width || window.height != height {
+                window.pixels.resize(width as usize * height as usize * 4, 0xc0);
+                window.width = width; window.height = height;
             }
-            u32::from(message.message != 0x12)
-        }
-        b"PostThreadMessageA" => {
-            state.thread_messages.push((
-                a(0),
-                super::super::Message {
-                    hwnd: 0,
-                    message: a(1),
-                    wparam: a(2),
-                    lparam: a(3),
-                },
-            ));
+            window.x = a(1) as i32; window.y = a(2) as i32;
+            window.parent = a(5); window.visible = a(6) != 0;
+            if window.visible {state.focus_hwnd = hwnd; super::super::queue_paint(state,hwnd);}
+            state.dirty = true;
             1
         }
-        b"PostMessageA" => {
-            super::super::dispatch(machine, kt, state, regs, super::super::Api::PostMessageW)
+        b"RetroReleaseWindow" => {
+            let hwnd = a(0);
+            state.windows.retain(|w| w.hwnd != hwnd);
+            state.messages.retain(|m| m.hwnd != hwnd);
+            if state.focus_hwnd == hwnd { state.focus_hwnd = 0; }
+            if state.paint_hwnd == hwnd { state.paint_hwnd = 0; }
+            state.dirty = true;
+            1
         }
-        b"DispatchMessageA" | b"DefWindowProcA" => 0,
-        b"IsWindow" | b"IsWindowVisible" => u32::from(state.windows.iter().any(|w| w.hwnd == a(0))),
+        b"DefWindowProcA" => u32::from(a(1) == 0x81),
+        b"IsWindow" => u32::from(state.windows.iter().any(|w| w.hwnd == a(0))),
+        b"IsWindowVisible" => u32::from(state.windows.iter().any(|w| w.hwnd == a(0) && w.visible)),
         b"LoadStringA" => {
             if a(3) as i32 <= 0 || a(2) == 0 {
                 return fail(state, ERROR_INVALID_PARAMETER, 0);

@@ -6,9 +6,11 @@ Open Watcom C runtime. `HELLO.EXE` covers PE loading, Watcom startup and stdout.
 `C:\WINDOWS\APPS\WATCOM.TXT` before printing the verified contents.
 
 RetroOS ships the PE replacement DLLs at `C:\RETROOS\WINDOWS\SYSTEM32` with the
-matched boot runtime, even when C: is a separate data disk. Their exports are
-two-byte `INT 83h` gates; Win32 API
-semantics live in the Rust Windows personality.
+matched boot runtime, even when C: is a separate data disk. Most exports are
+two-byte `INT 83h` gates into the Rust Windows personality. USER32 also contains guest Rust code: `CreateWindowExA/W`,
+`SendMessageA/W`, and `DispatchMessageA/W` call application window procedures
+using the guest stack. Window allocation, procedure lookup and release remain
+private kernel gates.
 The Win32 `GetEnvironmentStrings` API now exposes values parsed from
 `C:\RETROOS\RETROOS.INI`, including optional `HOME` and `MCHOME` settings.
 `GetTempPathA` uses `TEMP` from that environment (default `C:\TEMP`).
@@ -68,3 +70,52 @@ NDN_DIR=/path/to/NDN-W32 ENGINE=kvm python3 test/windows_threads.py
 The proprietary DLLs are copied into a temporary test drive and are not
 included in the repository. The fixture skips their application-specific
 DLL startup, which needs NDN's Virtual Pascal shared heap callbacks.
+
+## Guest-stack window callbacks
+
+`CreateWindowExA/W` builds a `CREATESTRUCT` on its guest stack, calls
+`WM_NCCREATE` and `WM_CREATE` synchronously, and handles rejected creation
+before returning. Nested creation and message dispatch use ordinary guest
+calls and returns, so no Rust continuation or kernel window-callback record
+survives a call into application code. This does not implement a save-state
+format; it keeps the pending call state in guest memory and CPU registers.
+
+Run the callback regression with either hosted engine:
+
+```sh
+ENGINE=kvm python3 test/windows_callbacks.py
+ENGINE=tcg python3 test/windows_callbacks.py
+```
+
+It checks ANSI and Unicode creation, `CREATESTRUCT` contents, class atoms,
+creation rejection and cleanup, nested window creation and synchronous
+messages, timer dispatch, and a thread blocking inside a callback while
+another thread creates a window. A separate program loads USER32 at runtime
+and checks its exported guest functions and private gates.
+
+This is the basic creation/message path, not complete USER32 compatibility:
+creation's full nonclient/positioning notifications, cross-process messaging,
+and ANSI/Unicode message conversion remain unimplemented.
+
+The Rust implementation is in `lib/windows/user32/user32.rs`, with pure
+rectangle operations in `rect.rs`. A pinned Windows Rust core is used only
+for `no_std` compilation; the DLL does not import the Windows Rust standard
+library or a C runtime. `extern "system"` supplies the Win32 calling
+convention, and the existing PE linker exports the normal undecorated API
+names. NASM contains only kernel-entry gates. The same test also exercises
+rectangle boundaries, aliasing, intersections, unions and subtraction, plus
+`CallWindowProcA/W`.
+
+The message fixture checks per-thread posted queues, window/child and message
+filters, `PM_NOREMOVE`, `WM_QUIT`, deadline-based timers, timer replacement and
+cancellation, and pending timer messages surviving cancellation. Cross-thread
+`SendMessage` runs callbacks on their owning thread; a blocked sender services
+incoming sends, including a nested call back from its receiver. `ReplyMessage`
+can unblock the sender before the receiver returns. No USER state lock is held
+across application callbacks.
+
+The guest DLL owns queues and timers. `RetroReadEvent` transfers kernel input
+and paint notifications, and subscribes existing KERNEL32 events for wakeups.
+Waiting uses `WaitForSingleObject`, with the next matching timer as its timeout.
+There is no fabricated timer on an empty queue or busy-polling message loop.
+The kernel retains its separate Win16 message handling.

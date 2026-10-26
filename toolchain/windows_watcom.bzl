@@ -55,13 +55,19 @@ def _windows_dll_impl(ctx):
             "option modname=%s" % ctx.attr.module_name,
             "name %s" % output.path,
             "file %s" % obj.path,
-        ] + (["option start=%s" % ctx.attr.entry] if ctx.attr.entry else []) + ["export %s" % symbol for symbol in ctx.attr.exports]) + "\n",
+        ] + ["file %s" % extra.path for extra in ctx.files.extra_objs]
+        + ["library %s" % library.path for library in ctx.files.libraries]
+        + ["import '%s' %s" % (symbol, target) for symbol, target in ctx.attr.imports.items()]
+        + (["option start=%s" % ctx.attr.entry] if ctx.attr.entry else [])
+        + [("export %s='%s'" % (symbol, ctx.attr.export_aliases[symbol]))
+           if symbol in ctx.attr.export_aliases else "export %s" % symbol
+           for symbol in ctx.attr.exports]) + "\n",
     )
     ctx.actions.run(
         executable = ctx.executable._linker,
         arguments = ["@" + response.path],
         env = {"WATCOM": watcom_root},
-        inputs = depset([obj, response], transitive = [ctx.attr._runtime[DefaultInfo].files]),
+        inputs = depset([obj, response] + ctx.files.extra_objs + ctx.files.libraries, transitive = [ctx.attr._runtime[DefaultInfo].files]),
         outputs = [output],
         mnemonic = "WindowsWatcomDllLink",
         progress_message = "Linking Win32 DLL %{label}",
@@ -73,6 +79,10 @@ windows_dll = rule(
     attrs = {
         "obj": attr.label(allow_single_file = True, mandatory = True),
         "out": attr.output(mandatory = True),
+        "extra_objs": attr.label_list(allow_files = True),
+        "export_aliases": attr.string_dict(),
+        "libraries": attr.label_list(allow_files = True),
+        "imports": attr.string_dict(),
         "module_name": attr.string(mandatory = True),
         "exports": attr.string_list(mandatory = True),
         "entry": attr.string(),

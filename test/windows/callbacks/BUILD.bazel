@@ -1,0 +1,25 @@
+load("//toolchain:windows_watcom.bzl", "windows_watcom_binary")
+
+windows_watcom_binary(
+    name = "callbacks",
+    src = "callbacks.c",
+    visibility = ["//visibility:public"],
+)
+
+windows_watcom_binary(
+    name = "dynamic",
+    src = "dynamic.c",
+    visibility = ["//visibility:public"],
+)
+
+windows_watcom_binary(
+    name = "lifecycle",
+    src = "lifecycle.c",
+    visibility = ["//visibility:public"],
+)
+
+windows_watcom_binary(
+    name = "messages",
+    src = "messages.c",
+    visibility = ["//visibility:public"],
+)

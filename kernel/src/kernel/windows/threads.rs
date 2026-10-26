@@ -91,6 +91,16 @@ fn ensure<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, t: &mut Sta
     }
 }
 
+// USER32 subscribes existing KERNEL32 events; queue policy stays in the DLL.
+pub(super) fn signal(t: &mut State, handle: u32) -> bool {
+    if let Some(event) = t.events.iter_mut().find(|e| e.handle == handle) {
+        event.signaled = true;
+        true
+    } else {
+        false
+    }
+}
+
 fn signaled(t: &mut State, handle: u32, id: u32) -> Option<bool> {
     if let Some(c) = t
         .contexts
