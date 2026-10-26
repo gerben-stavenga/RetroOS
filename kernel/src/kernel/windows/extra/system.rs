@@ -24,13 +24,14 @@ pub(super) fn call<A: crate::Arch>(
         b"RetroGdiDeleteDC" => super::super::dispatch(machine,kt,state,regs,super::super::Api::DeleteDC),
         b"RetroSurfaceDC" => {
             let hwnd = a(0); let old = a(1);
+            let viewport=Some((a(2) as i32,a(3) as i32,a(4).min(2048),a(5).min(2048)));
             if hwnd != 0 && !state.windows.iter().any(|w|w.hwnd==hwnd) {return fail(state,1400,0);}
             if old != 0 {
                 let Some(dc)=state.dcs.iter_mut().find(|d|d.handle==old) else{return 0;};
-                dc.window=Some(hwnd);return old;
+                dc.window=Some(hwnd);dc.viewport=viewport;return old;
             }
             let handle=state.next_object;state.next_object+=1;
-            state.dcs.push(super::super::DeviceContext {handle,window:Some(hwnd),bitmap:None,x:0,y:0,pen:0x30008,brush:0x30005,font:1,bk:0x00ff_ffff,text:0});
+            state.dcs.push(super::super::DeviceContext {viewport,handle,window:Some(hwnd),bitmap:None,x:0,y:0,pen:0x30008,brush:0x30005,font:1,bk:0x00ff_ffff,text:0});
             handle
         }
         b"RetroInvalidateWindow" => super::super::dispatch(machine,kt,state,regs,super::super::Api::InvalidateRect),

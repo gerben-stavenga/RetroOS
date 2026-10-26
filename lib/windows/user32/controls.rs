@@ -122,8 +122,8 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
         s.windows.iter().find(|w| w.hwnd == hwnd).map(|w| {
             (
                 w.parent,
-                w.width,
-                w.height,
+                crate::frame::client(s, w)[2] - crate::frame::client(s, w)[0],
+                crate::frame::client(s, w)[3] - crate::frame::client(s, w)[1],
                 w.title.clone(),
                 w.control.image,
             )
@@ -131,6 +131,8 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
     });
     if let Some((parent, width, height, title, image)) = info {
         let static_control = kind == [83, 116, 97, 116, 105, 99];
+        let button = kind == [66, 117, 116, 116, 111, 110];
+        let edit = kind == [69, 100, 105, 116];
         let bitmap = static_control && matches!(style & 0x1f, 3 | 14);
         let etched = static_control && matches!(style & 0x1f, 16 | 17);
         if (!bitmap || image != 0) && (!etched || ps[1] != 0) {
@@ -138,7 +140,13 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
                 unsafe {
                     crate::SendMessageW(
                         parent,
-                        if static_control { 0x138 } else { 0x135 },
+                        if static_control {
+                            0x138
+                        } else if edit {
+                            0x133
+                        } else {
+                            0x135
+                        },
                         dc,
                         hwnd,
                     ) as u32
@@ -156,9 +164,32 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
                 FillRect(dc, &rect, brush);
                 SetBkMode(dc, 1);
             }
+            if button && style & 15 <= 1 {
+                crate::frame::bevel(dc, [0, 0, width, height]);
+            }
             if !bitmap && !etched && !title.is_empty() {
+                let mut label = Vec::new();
+                let mut i = 0;
+                while i < title.len() {
+                    if (button || static_control && style & 0x80 == 0) && title[i] == 38 {
+                        i += 1;
+                        if i == title.len() {
+                            break;
+                        }
+                    }
+                    label.push(title[i]);
+                    i += 1;
+                }
+                let (x, y) = if button && style & 15 <= 1 {
+                    (
+                        (width - label.len() as i32 * 8).max(0) / 2,
+                        (height - 16).max(0) / 2,
+                    )
+                } else {
+                    (0, 0)
+                };
                 unsafe {
-                    TextOutW(dc, 0, 0, title.as_ptr(), title.len() as i32);
+                    TextOutW(dc, x, y, label.as_ptr(), label.len() as i32);
                 }
             }
         }
@@ -213,6 +244,21 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                 crate::dialog::DefDlgProcA(hwnd, message, wparam, lparam)
             }
         };
+    }
+    if (edit || button) && message == 0x201 {
+        unsafe {
+            crate::input::SetFocus(hwnd);
+        }
+    }
+    if edit && message == 0x201 {
+        let x = (lparam as u16 as i16) as i32;
+        state::with(|s| {
+            if let Some(w) = s.windows.iter_mut().find(|w| w.hwnd == hwnd) {
+                let at = (x.max(0) as usize / 8).min(w.title.len());
+                w.control.start = at;
+                w.control.end = at;
+            }
+        });
     }
     if edit && matches!(message, 7 | 8) {
         unsafe {

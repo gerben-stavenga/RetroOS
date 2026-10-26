@@ -22,12 +22,17 @@ unsafe extern "system" {
     ) -> u32;
     fn RetroReleaseWindow(hwnd: u32) -> u32;
 }
-fn update(hwnd: u32) {
+pub(crate) fn update(hwnd: u32) {
     let info = state::with(|s| {
         s.windows.iter().find(|w| w.hwnd == hwnd).map(|w| {
+            let r = s
+                .windows
+                .iter()
+                .find(|p| p.hwnd == w.parent)
+                .map_or([0; 4], |p| crate::frame::client(s, p));
             (
-                w.x,
-                w.y,
+                w.x + r[0],
+                w.y + r[1],
                 w.width,
                 w.height,
                 w.parent,
@@ -124,6 +129,23 @@ pub unsafe fn create(mut cs: CreateStruct, wide: bool) -> u32 {
             control: crate::controls::Control::default(),
         })
     });
+    if parent == 0 {
+        let menu = if cs.menu != 0 {
+            cs.menu
+        } else if class.menu != 0 {
+            if class.wide {
+                unsafe { crate::menu::LoadMenuW(class.instance, class.menu) }
+            } else {
+                unsafe { crate::menu::LoadMenuA(class.instance, class.menu) }
+            }
+        } else {
+            0
+        };
+        if menu != 0 {
+            crate::menu::SetMenu(hwnd, menu);
+        }
+    }
+    update(hwnd);
     let address = (&raw mut cs) as u32;
     let nc = unsafe { SendMessageW(hwnd, 0x81, 0, address) } != 0;
     if IsWindow(hwnd) == 0 {
@@ -177,6 +199,9 @@ fn remove(hwnd: u32) {
     crate::paint::destroy(hwnd);
     state::with(|s| {
         s.timers.retain(|t| t.hwnd != hwnd);
+        if s.menu_popup.as_ref().is_some_and(|p| p.hwnd == hwnd) {
+            s.menu_popup = None;
+        }
         for q in &mut s.queues {
             q.messages.retain(|m| m.hwnd != hwnd);
             q.input.retain(|m| m.hwnd != hwnd);
@@ -411,13 +436,14 @@ pub extern "system" fn SetWindowPos(
         });
     }
     update(hwnd);
+    crate::frame::paint(hwnd);
     let visible = state::with(|s| {
         s.windows
             .iter()
             .find(|w| w.hwnd == hwnd)
             .is_some_and(|w| w.style & VISIBLE != 0)
     });
-    if visible && old.4 & VISIBLE == 0 {
+    if visible && (old.4 & VISIBLE == 0 || pos.flags & (1 | 8) == 0) {
         unsafe {
             crate::paint::InvalidateRect(hwnd, 0, 1);
         }
@@ -742,6 +768,9 @@ pub unsafe extern "system" fn DefWindowProcA(h: u32, m: u32, w: u32, l: u32) -> 
     unsafe { default_proc(h, m, w, l, false) }
 }
 unsafe fn default_proc(h: u32, m: u32, w: u32, l: u32, wide: bool) -> i32 {
+    if let Some(result) = crate::frame::message(h, m, w, l) {
+        return result;
+    }
     match m {
         0x14 => {
             let brush = state::with(|s| {
@@ -784,7 +813,9 @@ unsafe fn default_proc(h: u32, m: u32, w: u32, l: u32, wide: bool) -> i32 {
                 };
                 w.title = title;
                 1
-            })
+            });
+            crate::frame::paint(h);
+            1
         }
         0x0d | 0x0e => {
             let title = state::with(|s| {
@@ -820,7 +851,12 @@ unsafe fn default_proc(h: u32, m: u32, w: u32, l: u32, wide: bool) -> i32 {
                         h,
                         5,
                         0,
-                        (pos.width as u32 & 0xffff) | ((pos.height as u32 & 0xffff) << 16),
+                        state::with(|s| {
+                            s.windows.iter().find(|w| w.hwnd == h).map_or(0, |w| {
+                                let r = crate::frame::client(s, w);
+                                crate::frame::pack(r[2] - r[0], r[3] - r[1])
+                            })
+                        }),
                     );
                 }
             }
@@ -859,22 +895,7 @@ text_api!(
 );
 
 fn origin(hwnd: u32) -> Option<(i32, i32)> {
-    if hwnd == 0 {
-        return Some((0, 0));
-    }
-    state::with(|s| {
-        let (mut h, mut x, mut y) = (hwnd, 0i32, 0i32);
-        for _ in 0..=s.windows.len() {
-            if h == 0 {
-                return Some((x, y));
-            }
-            let w = s.windows.iter().find(|w| w.hwnd == h)?;
-            x = x.wrapping_add(w.x);
-            y = y.wrapping_add(w.y);
-            h = w.parent;
-        }
-        None
-    })
+    state::with(|s| crate::frame::origin(s, hwnd, true))
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn GetClientRect(hwnd: u32, out: *mut crate::rect::Rect) -> i32 {
@@ -882,10 +903,10 @@ pub unsafe extern "system" fn GetClientRect(hwnd: u32, out: *mut crate::rect::Re
         return state::error(87) as i32;
     }
     let size = state::with(|s| {
-        s.windows
-            .iter()
-            .find(|w| w.hwnd == hwnd)
-            .map(|w| (w.width, w.height))
+        s.windows.iter().find(|w| w.hwnd == hwnd).map(|w| {
+            let r = crate::frame::client(s, w);
+            (r[2] - r[0], r[3] - r[1])
+        })
     });
     let Some((width, height)) = size else {
         return state::error(1400) as i32;
@@ -894,13 +915,18 @@ pub unsafe extern "system" fn GetClientRect(hwnd: u32, out: *mut crate::rect::Re
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn GetWindowRect(hwnd: u32, out: *mut crate::rect::Rect) -> i32 {
-    let Some((x, y)) = origin(hwnd) else {
-        return state::error(1400) as i32;
-    };
-    if unsafe { GetClientRect(hwnd, out) } == 0 {
+    if out.is_null() {
         return 0;
     }
-    unsafe { crate::rect::OffsetRect(out, x, y) }
+    let rect = state::with(|s| {
+        let w = s.windows.iter().find(|w| w.hwnd == hwnd)?;
+        let (x, y) = crate::frame::origin(s, hwnd, false)?;
+        Some((x, y, w.width, w.height))
+    });
+    let Some((x, y, width, height)) = rect else {
+        return state::error(1400) as i32;
+    };
+    unsafe { crate::rect::SetRect(out, x, y, x + width, y + height) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn MapWindowPoints(

@@ -11,7 +11,7 @@ nasm_library(
 windows_rust_library(
     name = "user32_rust",
     crate_root = "user32.rs",
-    srcs = ["menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
+    srcs = ["frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
 )
 
 windows_dll(
@@ -19,6 +19,12 @@ windows_dll(
     obj = ":user32_obj",
     libraries = [":user32_rust"],
     imports = {
+        "_CreateCompatibleDC@4": "GDI32.CreateCompatibleDC",
+        "_CreateCompatibleBitmap@12": "GDI32.CreateCompatibleBitmap",
+        "_SelectObject@8": "GDI32.SelectObject",
+        "_BitBlt@36": "GDI32.BitBlt",
+        "_CreateSolidBrush@4": "GDI32.CreateSolidBrush",
+        "_SetTextColor@8": "GDI32.SetTextColor",
         "_GetMapMode@4": "GDI32.GetMapMode",
         "_GetTextExtentPoint32W@16": "GDI32.GetTextExtentPoint32W",
         "_WaitForMultipleObjects@16": "KERNEL32.WaitForMultipleObjects",
@@ -60,6 +66,12 @@ windows_dll(
         "_WideCharToMultiByte@32": "KERNEL32.WideCharToMultiByte",
     },
     export_aliases = {
+        "TranslateMessage": "_TranslateMessage@4",
+        "SetDlgItemInt": "_SetDlgItemInt@16",
+        "GetDlgItemInt": "_GetDlgItemInt@16",
+        "AdjustWindowRect": "_AdjustWindowRect@12",
+        "AdjustWindowRectEx": "_AdjustWindowRectEx@16",
+        "GetMenuItemRect": "_GetMenuItemRect@16",
         "CreateMenu": "_CreateMenu@0",
         "CreatePopupMenu": "_CreatePopupMenu@0",
         "IsMenu": "_IsMenu@4",
@@ -448,7 +460,7 @@ windows_dll(
         "CallWindowProcA",
         "CallWindowProcW",
 
-        "AdjustWindowRect", "BeginPaint", "CharUpperA", "CheckMenuItem",
+        "AdjustWindowRect", "AdjustWindowRectEx", "BeginPaint", "CharUpperA", "CheckMenuItem",
         "CreateWindowExA", "CreateWindowExW", "DefWindowProcW", "DestroyIcon", "DialogBoxParamW",
         "DispatchMessageA", "DispatchMessageW", "DrawEdge", "EndDialog", "EndPaint", "FillRect",
         "GetClientRect", "GetDC", "GetDlgItem", "GetDlgItemInt",

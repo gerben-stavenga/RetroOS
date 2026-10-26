@@ -31,7 +31,7 @@ use unicorn_engine::{RegisterX86, Unicorn};
 
 /// Instructions between forced returns to the kernel — the timer-IRQ delivery
 /// grid. A trap returns before this is spent and the *remainder* carries over
-/// ([`BUDGET`]); only a clean run to the boundary resets it. So IRQ0 lands on a
+/// ([`BUDGET`]); delivering the timer wakeup resets it. So IRQ0 lands on a
 /// fixed cumulative-instruction grid regardless of how the guest's I/O chopped
 /// the run up — like real hardware where `IN`/`INT` don't restart the PIT. Must
 /// be <= the shortest timer period a guest programs (Doom's 140 Hz ~= 14k instr).
@@ -39,8 +39,8 @@ const IRQ_PERIOD: usize = 2_000;
 
 thread_local! {
     /// Instructions left until the next forced kernel return (IRQ0 grid point):
-    /// decremented by every run, carried across traps, reset at the loop top once
-    /// a run reaches the boundary with no trap pending.
+    /// decremented by every run, carried across traps, reset only when the
+    /// elapsed boundary is delivered as an IRQ exit.
     static BUDGET: Cell<usize> = const { Cell::new(IRQ_PERIOD) };
 }
 
@@ -413,11 +413,12 @@ pub fn execute() -> KernelEvent {
         // The projected TF in `regs` requests one hardware step. The resulting
         // `#DB` is reflected below as `KernelEvent::DebugTrap`; DOS owns source
         // attribution, so the interpreter only needs to let it run.
-        // Roll to the next IRQ0 grid period once the last was fully spent; a trap
-        // carries the remainder over so the grid stays fixed in cumulative
-        // instructions (the kernel pumps the PIT on every return regardless).
+        // A trap can consume the last instructions of a timer period. Deliver
+        // that trap first, then its timer wakeup on this entry. Silently resetting
+        // the budget here starves the event-loop clock in tight INT loops.
         if budget_spent() {
             BUDGET.with(|b| b.set(IRQ_PERIOD));
+            return KernelEvent::Irq;
         }
         let begin = configure(uc, vcpu, mode);
         {
@@ -576,7 +577,11 @@ pub fn execute() -> KernelEvent {
             // Virtual time is charged per basic block in the block hook (above),
             // so nothing to add here. A bare `Ok` is either a full-slice retire
             // or a block-hook IRQ stop — both just hand control to the kernel.
-            Ok(()) => KernelEvent::Irq,
+            Ok(()) => {
+                // This return already delivers the elapsed timer boundary.
+                if budget_spent() { BUDGET.with(|b| b.set(IRQ_PERIOD)); }
+                KernelEvent::Irq
+            },
             // Unicorn can reject an invalid encoding before the interrupt
             // hook runs. It is still a CPU #UD, including for real-mode
             // VM-detection routines that recover through their INT 6 hook.

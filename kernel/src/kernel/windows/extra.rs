@@ -118,7 +118,7 @@ impl Console {
 
 const SPECS: &[Spec] = &[
     spec(b"GDI32", b"RetroGdiDeleteDC", 4),
-    spec(b"USER32", b"RetroSurfaceDC", 8),
+    spec(b"USER32", b"RetroSurfaceDC", 24),
     spec(b"USER32", b"RetroInvalidateWindow", 12),
     spec(b"USER32", b"RetroValidateWindow", 4),
     spec(b"USER32", b"RetroEndPaint", 8),

@@ -41,3 +41,15 @@ windows_watcom_binary(
     src = "bitmap_profile.c",
     visibility = ["//visibility:public"],
 )
+
+windows_watcom_binary(
+    name = "frame",
+    src = "frame.c",
+    visibility = ["//visibility:public"],
+)
+
+windows_watcom_binary(
+    name = "repaint",
+    src = "repaint.c",
+    visibility = ["//visibility:public"],
+)

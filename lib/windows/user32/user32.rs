@@ -11,6 +11,7 @@ mod controls;
 mod dialog;
 mod drawing;
 mod format;
+mod frame;
 mod input;
 mod keyboard;
 mod menu;

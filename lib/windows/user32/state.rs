@@ -51,6 +51,8 @@ pub struct Window {
 }
 
 pub struct State {
+    pub keyboard: [u8; 256],
+    pub menu_popup: Option<crate::menu::Popup>,
     pub menus: Vec<crate::menu::Menu>,
     pub attached_menus: Vec<crate::menu::Attached>,
     pub cursor: [i32; 2],
@@ -83,6 +85,8 @@ unsafe impl Sync for Global {}
 static GLOBAL: Global = Global {
     locked: AtomicBool::new(false),
     state: UnsafeCell::new(State {
+        keyboard: [0; 256],
+        menu_popup: None,
         menus: Vec::new(),
         attached_menus: Vec::new(),
         cursor: [0; 2],

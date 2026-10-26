@@ -732,6 +732,7 @@ pub(super) fn exec<A: crate::Arch>(
     windows.next_object = 0x0100;
     windows.paint_dc = 0x0200;
     windows.dcs.push(super::DeviceContext {
+                viewport: None,
         handle: windows.paint_dc,
         window: None,
         bitmap: None,
@@ -1618,6 +1619,7 @@ fn dispatch<A: crate::Arch>(
             let handle = windows.next_object;
             windows.next_object = windows.next_object.wrapping_add(1);
             windows.dcs.push(super::DeviceContext {
+                viewport: None,
                 handle, window: None, bitmap: Some(bitmap), x: 0, y: 0, pen: 0, brush: 0, font: 1,
                 bk: 0x00ff_ffff, text: 0,
             });

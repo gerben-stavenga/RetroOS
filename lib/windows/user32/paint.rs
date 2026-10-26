@@ -3,7 +3,7 @@
 use crate::{state, window};
 use alloc::vec::Vec;
 unsafe extern "system" {
-    fn RetroSurfaceDC(hwnd: u32, old: u32) -> u32;
+    fn RetroSurfaceDC(hwnd: u32, old: u32, x: i32, y: i32, width: u32, height: u32) -> u32;
     fn RetroInvalidateWindow(hwnd: u32, rect: u32, erase: u32) -> i32;
     fn RetroValidateWindow(hwnd: u32) -> i32;
     fn RetroEndPaint(hwnd: u32, paint: u32) -> i32;
@@ -39,7 +39,10 @@ fn full(s: &state::State, hwnd: u32) -> u32 {
         .windows
         .iter()
         .find(|w| w.hwnd == hwnd)
-        .map_or((1024, 768), |w| (w.width, w.height));
+        .map_or((1024, 768), |w| {
+            let r = crate::frame::client(s, w);
+            (r[2] - r[0], r[3] - r[1])
+        });
     unsafe { CreateRectRgn(0, 0, w, h) }
 }
 pub fn record_native(s: &mut state::State, hwnd: u32) {
@@ -52,14 +55,8 @@ pub fn record_native(s: &mut state::State, hwnd: u32) {
         });
     }
 }
-fn origin(s: &state::State, mut hwnd: u32) -> (i32, i32) {
-    let (mut x, mut y) = (0i32, 0i32);
-    while let Some(w) = s.windows.iter().find(|w| w.hwnd == hwnd) {
-        x = x.wrapping_add(w.x);
-        y = y.wrapping_add(w.y);
-        hwnd = w.parent;
-    }
-    (x, y)
+fn origin(s: &state::State, hwnd: u32) -> (i32, i32) {
+    crate::frame::origin(s, hwnd, true).unwrap_or((0, 0))
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn GetDCEx(hwnd: u32, region: u32, flags: u32) -> u32 {
@@ -73,13 +70,24 @@ pub unsafe extern "system" fn GetDCEx(hwnd: u32, region: u32, flags: u32) -> u32
                 return state::error(6);
             }
         }
+        let view = s
+            .windows
+            .iter()
+            .find(|w| w.hwnd == hwnd)
+            .map_or([0, 0, 1024, 768], |w| {
+                if flags & 1 != 0 {
+                    [0, 0, w.width, w.height]
+                } else {
+                    crate::frame::client(s, w)
+                }
+            });
         let (class, style) = s
             .windows
             .iter()
             .find(|w| w.hwnd == hwnd)
             .and_then(|w| s.classes.iter().find(|c| c.atom == w.class))
             .map_or((0, 0), |c| (c.atom, c.style));
-        let persistent = flags & 2 == 0 && style & 0x60 != 0;
+        let persistent = flags & 3 == 0 && style & 0x60 != 0;
         let key_class = if persistent && style & 0x40 != 0 {
             class
         } else {
@@ -100,7 +108,16 @@ pub unsafe extern "system" fn GetDCEx(hwnd: u32, region: u32, flags: u32) -> u32
         let i = if let Some(i) = existing {
             i
         } else {
-            let handle = unsafe { RetroSurfaceDC(hwnd, 0) };
+            let handle = unsafe {
+                RetroSurfaceDC(
+                    hwnd,
+                    0,
+                    view[0],
+                    view[1],
+                    (view[2] - view[0]) as u32,
+                    (view[3] - view[1]) as u32,
+                )
+            };
             if handle == 0 {
                 return 0;
             }
@@ -118,7 +135,14 @@ pub unsafe extern "system" fn GetDCEx(hwnd: u32, region: u32, flags: u32) -> u32
         let changed = s.dcs[i].hwnd != hwnd;
         let dc = s.dcs[i].handle;
         unsafe {
-            RetroSurfaceDC(hwnd, dc);
+            RetroSurfaceDC(
+                hwnd,
+                dc,
+                view[0],
+                view[1],
+                (view[2] - view[0]) as u32,
+                (view[3] - view[1]) as u32,
+            );
         }
         if !persistent {
             unsafe {
@@ -411,7 +435,9 @@ pub unsafe extern "system" fn EndPaint(hwnd: u32, out: u32) -> i32 {
             d.painting = false;
         }
     });
-    ReleaseDC(hwnd, dc)
+    let result = ReleaseDC(hwnd, dc);
+    crate::frame::paint(hwnd);
+    result
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn UpdateWindow(hwnd: u32) -> i32 {

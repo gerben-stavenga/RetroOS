@@ -2,6 +2,7 @@
 //! Traversal checks all directory offsets before reading them.
 use crate::{GetModuleHandleA, SetLastError};
 unsafe extern "system" {
+    fn GetModuleFileNameA(module: u32, out: *mut u8, size: u32) -> u32;
     fn MultiByteToWideChar(cp: u32, flags: u32, src: u32, len: i32, dst: *mut u16, cap: i32)
     -> i32;
 }
@@ -24,7 +25,11 @@ impl Tree {
         } else {
             module
         };
-        if base == 0 || unsafe { word(base) } != 0x5a4d {
+        let mut path = [0u8; 2];
+        if base == 0
+            || unsafe { GetModuleFileNameA(base, path.as_mut_ptr(), 2) } == 0
+            || unsafe { word(base) } != 0x5a4d
+        {
             return None;
         }
         let pe = base.checked_add(unsafe { dword(base + 0x3c) })?;

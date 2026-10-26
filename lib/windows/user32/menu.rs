@@ -13,7 +13,7 @@ pub struct Menu {
 }
 pub struct Attached {
     pub hwnd: u32,
-    menu: u32,
+    pub menu: u32,
     system: u32,
 }
 fn create() -> u32 {
@@ -123,6 +123,11 @@ unsafe fn insert(h: u32, at: u32, flags: u32, id: u32, p: u32, wide: bool, repla
         };
         let target = locate(s, h, at, flags, 0);
         let (m, i) = target.unwrap_or((m, s.menus[m].items.len()));
+        let flags = if flags & 0x14 == 0 && id == 0 && label.is_empty() {
+            flags | 0x800
+        } else {
+            flags
+        };
         let item = Item { flags, id, label };
         if replace {
             if i >= s.menus[m].items.len() {
@@ -410,34 +415,258 @@ pub unsafe extern "system" fn DrawMenuBar(h: u32) -> i32 {
     if window::IsWindow(h) == 0 {
         return 0;
     }
-    let items = state::with(|s| {
-        let menu = s.attached_menus.iter().find(|m| m.hwnd == h)?.menu;
-        s.menus
-            .iter()
-            .find(|m| m.handle == menu)
-            .map(|m| m.items.clone())
-    });
-    let Some(items) = items else {
-        return 1;
+    crate::frame::paint(h);
+    1
+}
+#[derive(Clone)]
+pub struct Popup {
+    pub hwnd: u32,
+    menu: u32,
+    rect: [i32; 4],
+    hot: Option<usize>,
+    opening: bool,
+}
+fn display_label(text: &[u16]) -> Vec<u16> {
+    text.iter().copied().filter(|&c| c != 38).collect()
+}
+fn bar_rects(s: &state::State, h: u32) -> Vec<(Item, [i32; 4])> {
+    let Some(w) = s.windows.iter().find(|w| w.hwnd == h) else {
+        return Vec::new();
     };
-    unsafe extern "system" {
-        fn TextOutW(dc: u32, x: i32, y: i32, text: *const u16, count: i32) -> i32;
-        fn FillRect(dc: u32, r: *const [i32; 4], brush: u32) -> i32;
-        fn GetStockObject(i: u32) -> u32;
+    let Some(a) = s.attached_menus.iter().find(|a| a.hwnd == h) else {
+        return Vec::new();
+    };
+    let Some(menu) = s.menus.iter().find(|m| m.handle == a.menu) else {
+        return Vec::new();
+    };
+    let r = crate::frame::client(s, w);
+    let mut x = r[0];
+    menu.items
+        .iter()
+        .map(|i| {
+            let width = display_label(&i.label).len() as i32 * 8 + 16;
+            let rect = [x, r[1] - crate::frame::MENU_HEIGHT, x + width, r[1]];
+            x += width;
+            (i.clone(), rect)
+        })
+        .collect()
+}
+fn rows(s: &state::State, p: &Popup) -> Vec<(Item, [i32; 4])> {
+    let Some(menu) = s.menus.iter().find(|m| m.handle == p.menu) else {
+        return Vec::new();
+    };
+    let mut y = p.rect[1] + 2;
+    menu.items
+        .iter()
+        .map(|i| {
+            let height = if i.flags & 0x800 != 0 { 7 } else { 20 };
+            let r = [p.rect[0] + 2, y, p.rect[2] - 2, y + height];
+            y += height;
+            (i.clone(), r)
+        })
+        .collect()
+}
+fn inside(r: [i32; 4], x: i32, y: i32) -> bool {
+    x >= r[0] && y >= r[1] && x < r[2] && y < r[3]
+}
+pub fn draw(h: u32, dc: u32) {
+    let (bar, popup) = state::with(|s| {
+        (
+            bar_rects(s, h),
+            s.menu_popup
+                .as_ref()
+                .filter(|p| p.hwnd == h)
+                .map(|p| (p.clone(), rows(s, p))),
+        )
+    });
+    for (item, r) in bar {
+        crate::frame::fill(dc, r, 0xc0c0c0);
+        crate::frame::label(dc, r[0] + 8, r[1] + 1, &display_label(&item.label), 0);
     }
-    let dc = unsafe { crate::paint::GetWindowDC(h) };
-    if dc == 0 {
+    if let Some((p, items)) = popup {
+        crate::frame::bevel(dc, p.rect);
+        for (index, (i, r)) in items.iter().enumerate() {
+            if i.flags & 0x800 != 0 {
+                crate::frame::fill(dc, [r[0] + 2, r[1] + 3, r[2] - 2, r[1] + 4], 0x808080);
+                continue;
+            }
+            let hot = p.hot == Some(index) && i.flags & 3 == 0;
+            crate::frame::fill(dc, *r, if hot { 0x800000 } else { 0xc0c0c0 });
+            let color = if i.flags & 3 != 0 {
+                0x808080
+            } else if hot {
+                0xffffff
+            } else {
+                0
+            };
+            let label = display_label(&i.label);
+            let mut parts = label.split(|&c| c == 9);
+            crate::frame::label(dc, r[0] + 18, r[1] + 2, parts.next().unwrap_or(&[]), color);
+            if let Some(accel) = parts.next() {
+                crate::frame::label(
+                    dc,
+                    r[2] - 4 - accel.len() as i32 * 8,
+                    r[1] + 2,
+                    accel,
+                    color,
+                );
+            }
+            if i.flags & 8 != 0 {
+                crate::frame::label(dc, r[0] + 3, r[1] + 2, &[42], color);
+            }
+        }
+    }
+}
+pub fn pointer(h: u32, message: u32, x: i32, y: i32) {
+    let opening = state::with(|s| {
+        if let Some(p) = s.menu_popup.as_mut().filter(|p| p.hwnd == h) {
+            if p.opening && message == 0xa2 {
+                p.opening = false;
+                return true;
+            }
+        }
+        false
+    });
+    if opening {
+        return;
+    }
+    let open = state::with(|s| {
+        if s.menu_popup
+            .as_ref()
+            .is_some_and(|p| p.hwnd == h && inside(p.rect, x, y))
+        {
+            return None;
+        }
+        bar_rects(s, h).into_iter().find(|(_, r)| inside(*r, x, y))
+    });
+    if let Some((item, rect)) = open {
+        if message == 0xa1 && item.flags & 0x10 != 0 && item.flags & 3 == 0 {
+            unsafe {
+                crate::SendMessageW(h, 0x116, GetMenu(h), 0);
+                crate::SendMessageW(h, 0x117, item.id, 0);
+            }
+            state::with(|s| {
+                let Some(menu) = s.menus.iter().find(|m| m.handle == item.id) else {
+                    return;
+                };
+                let width = menu
+                    .items
+                    .iter()
+                    .map(|i| display_label(&i.label).len() as i32 * 8 + 32)
+                    .max()
+                    .unwrap_or(80);
+                let height = 4 + menu
+                    .items
+                    .iter()
+                    .map(|i| if i.flags & 0x800 != 0 { 7 } else { 20 })
+                    .sum::<i32>();
+                let Some(w) = s.windows.iter().find(|w| w.hwnd == h) else {
+                    return;
+                };
+                let left = rect[0].min((w.width - width).max(0));
+                let top = rect[3].min((w.height - height).max(0));
+                s.menu_popup = Some(Popup {
+                    hwnd: h,
+                    menu: item.id,
+                    rect: [left, top, (left + width).min(w.width), top + height],
+                    hot: None,
+                    opening: true,
+                });
+            });
+            crate::frame::paint(h);
+        }
+        return;
+    }
+    let mut command = None;
+    let mut close = false;
+    let mut changed = false;
+    state::with(|s| {
+        let Some(p) = s.menu_popup.as_ref().filter(|p| p.hwnd == h).cloned() else {
+            return;
+        };
+        let hit = rows(s, &p)
+            .into_iter()
+            .enumerate()
+            .find(|(_, (_, r))| inside(*r, x, y));
+        if let Some(p) = s.menu_popup.as_mut() {
+            let hot = hit.as_ref().map(|(i, _)| *i);
+            changed = p.hot != hot;
+            p.hot = hot;
+        }
+        if message == 0xa2 {
+            close = true;
+            if let Some((_, (i, _))) = hit {
+                if i.flags & (3 | 0x800 | 0x10) == 0 {
+                    command = Some(i.id);
+                }
+            }
+        } else if message == 0xa1 && hit.is_none() {
+            close = true;
+        }
+        if close {
+            s.menu_popup = None;
+        }
+    });
+    if close {
+        unsafe {
+            crate::paint::InvalidateRect(h, 0, 1);
+            crate::paint::UpdateWindow(h);
+        }
+    } else if changed {
+        crate::frame::paint(h);
+    }
+    if let Some(id) = command {
+        unsafe {
+            crate::SendMessageW(h, 0x111, id, 0);
+        }
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn GetMenuItemRect(
+    h: u32,
+    menu: u32,
+    index: u32,
+    out: *mut [i32; 4],
+) -> i32 {
+    if out.is_null() {
         return 0;
     }
-    let mut x = 8;
-    for item in items {
-        let width = item.label.len() as i32 * 8 + 16;
-        unsafe {
-            FillRect(dc, &[x - 8, 0, x + width, 20], GetStockObject(1));
-            TextOutW(dc, x, 2, item.label.as_ptr(), item.label.len() as i32);
-        }
-        x += width;
+    let rect = state::with(|s| {
+        let h = if h == 0 {
+            s.attached_menus.iter().find(|a| a.menu == menu)?.hwnd
+        } else {
+            h
+        };
+        let rect = if s
+            .attached_menus
+            .iter()
+            .any(|a| a.hwnd == h && a.menu == menu)
+        {
+            bar_rects(s, h).get(index as usize)?.1
+        } else {
+            let p = s
+                .menu_popup
+                .as_ref()
+                .filter(|p| p.hwnd == h && p.menu == menu)?;
+            rows(s, p).get(index as usize)?.1
+        };
+        let (x, y) = crate::frame::origin(s, h, false)?;
+        Some([rect[0] + x, rect[1] + y, rect[2] + x, rect[3] + y])
+    });
+    let Some(r) = rect else {
+        return 0;
+    };
+    unsafe {
+        out.write_unaligned(r);
     }
-    crate::paint::ReleaseDC(h, dc);
     1
+}
+
+pub fn popup_rect(h: u32) -> Option<[i32; 4]> {
+    state::with(|s| {
+        s.menu_popup
+            .as_ref()
+            .filter(|p| p.hwnd == h)
+            .map(|p| p.rect)
+    })
 }

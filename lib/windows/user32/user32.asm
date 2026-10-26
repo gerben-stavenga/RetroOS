@@ -7,19 +7,14 @@ global %1
 %1: int 0x83
 %endmacro
 
-gate AdjustWindowRect
 gate DrawEdge
 global _FillRect@12
 _FillRect@12:
 gate FillRect
-gate GetDlgItemInt
-gate GetMenuItemRect
 gate GetSysColorBrush
 gate GetSystemMetrics
 gate MessageBoxW
 gate RetroWndProcReturn
-gate SetDlgItemInt
-gate TranslateMessage
 
 ; Private kernel operations return normally to this guest DLL. All suspended
 ; window-procedure calls live on the guest stack, including nested creation.
@@ -62,8 +57,8 @@ global _GetKeyState@4
 _GetKeyState@4:
 gate GetKeyState
 
-global _RetroSurfaceDC@8
-_RetroSurfaceDC@8:
+global _RetroSurfaceDC@24
+_RetroSurfaceDC@24:
 gate RetroSurfaceDC
 
 global _RetroInvalidateWindow@12

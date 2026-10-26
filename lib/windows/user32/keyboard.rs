@@ -334,3 +334,77 @@ pub unsafe extern "system" fn ToUnicode(
     }
     1
 }
+
+/// The transport supplies make/break scancodes, not Windows virtual keys.
+pub fn input(s: &mut state::State, m: &mut crate::Message) {
+    if m.message != 0x100 && m.message != 0x101 {
+        return;
+    }
+    let scan = m.wparam;
+    let key = MapVirtualKeyExA(scan, 1, 0);
+    if key >= 256 {
+        return;
+    }
+    let down = m.message == 0x100;
+    let old = s.keyboard[key as usize];
+    let toggle = if down && old & 0x80 == 0 && matches!(key, 20 | 144 | 145) {
+        old ^ 1
+    } else {
+        old
+    };
+    s.keyboard[key as usize] = (toggle & 1) | if down { 0x80 } else { 0 };
+    m.wparam = key;
+    m.lparam = 1
+        | ((scan & 255) << 16)
+        | if down {
+            if old & 0x80 != 0 { 1 << 30 } else { 0 }
+        } else {
+            3 << 30
+        };
+    let thread = s
+        .windows
+        .iter()
+        .find(|w| w.hwnd == m.hwnd)
+        .map(|w| w.thread);
+    if let Some(focus) = s
+        .inputs
+        .iter()
+        .find(|i| Some(i.thread) == thread && i.focus != 0)
+        .map(|i| i.focus)
+    {
+        m.hwnd = focus;
+    }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn TranslateMessage(message: *const crate::Message) -> i32 {
+    if message.is_null() {
+        return 0;
+    }
+    let m = unsafe { message.read_unaligned() };
+    if !matches!(m.message, 0x100 | 0x101 | 0x104 | 0x105) {
+        return 0;
+    }
+    if m.message == 0x100 || m.message == 0x104 {
+        let keys = state::with(|s| s.keyboard);
+        let mut text = [0u16; 4];
+        let n = unsafe {
+            ToUnicode(
+                m.wparam,
+                (m.lparam >> 16) & 255,
+                keys.as_ptr(),
+                text.as_mut_ptr(),
+                4,
+                0,
+            )
+        };
+        for &c in text.iter().take(n.max(0) as usize) {
+            crate::message::PostMessageW(
+                m.hwnd,
+                if m.message == 0x104 { 0x106 } else { 0x102 },
+                u32::from(c),
+                m.lparam,
+            );
+        }
+    }
+    1
+}

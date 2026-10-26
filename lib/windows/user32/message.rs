@@ -61,6 +61,8 @@ fn pump_input() {
     state::with(|s| {
         let mut message = Message::default();
         while unsafe { RetroReadEvent(&raw mut message, 0) } != 0 {
+            crate::keyboard::input(s, &mut message);
+            crate::frame::input(s, &mut message);
             if message.message == 0xf {
                 crate::paint::record_native(s, message.hwnd);
             }

@@ -4,9 +4,9 @@ use alloc::vec::Vec;
 #[derive(Default)]
 pub struct Input {
     pub thread: u32,
-    focus: u32,
+    pub focus: u32,
     active: u32,
-    capture: u32,
+    pub capture: u32,
 }
 pub struct Hook {
     handle: u32,
@@ -319,7 +319,7 @@ pub unsafe extern "system" fn IsDialogMessageW(h: u32, msg: *const crate::Messag
     }
     if m.message == 0x100 && m.wparam == 9 {
         unsafe {
-            SetFocus(GetNextDlgTabItem(h, GetFocus(), 0));
+            crate::dialog::focus_control(GetNextDlgTabItem(h, GetFocus(), 0));
         }
         return 1;
     }

@@ -107,6 +107,8 @@ unsafe fn template(
             r.name()?;
         }
     }
+    // Dialog template dimensions describe the client area.
+    let margins = crate::frame::margins(style, ex, false);
     // Default dialog units: the stock 8 by 16 system font.
     let hwnd = unsafe {
         window::create(
@@ -117,8 +119,8 @@ unsafe fn template(
                 menu: 0,
                 x: x * 2,
                 y: y * 2,
-                width: width * 2,
-                height: height * 2,
+                width: width * 2 + margins[0] + margins[2],
+                height: height * 2 + margins[1] + margins[3],
                 style: style & !0x10000000,
                 ex_style: ex,
                 class: pointer(&class),
@@ -228,7 +230,7 @@ unsafe fn template(
                 && window::IsWindow(hwnd) != 0
                 && style & 0x400 == 0
             {
-                crate::input::SetFocus(crate::input::GetNextDlgTabItem(hwnd, 0, 0));
+                focus_control(crate::input::GetNextDlgTabItem(hwnd, 0, 0));
             }
         }
     }
@@ -333,6 +335,7 @@ unsafe fn modal(hwnd: u32) -> i32 {
         }
         unsafe {
             if crate::input::IsDialogMessageW(hwnd, &msg) == 0 {
+                crate::keyboard::TranslateMessage(&msg);
                 crate::DispatchMessageW(&msg);
             }
             if !shown && msg.message == 0x113 {
@@ -403,7 +406,7 @@ unsafe fn default(hwnd: u32, m: u32, w: u32, l: u32, wide: bool) -> i32 {
     match m {
         7 => {
             unsafe {
-                crate::input::SetFocus(crate::input::GetNextDlgTabItem(hwnd, 0, 0));
+                focus_control(crate::input::GetNextDlgTabItem(hwnd, 0, 0));
             }
             0
         }
@@ -521,4 +524,98 @@ pub unsafe extern "system" fn MapDialogRect(h: u32, r: *mut [i32; 4]) -> i32 {
         r.write_unaligned(rect);
     }
     1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn SetDlgItemInt(h: u32, id: u32, value: u32, signed: i32) -> i32 {
+    let negative = signed != 0 && (value as i32) < 0;
+    let mut number = if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    };
+    let mut text = [0u16; 12];
+    let mut at = 11;
+    loop {
+        at -= 1;
+        text[at] = 48 + (number % 10) as u16;
+        number /= 10;
+        if number == 0 {
+            break;
+        }
+    }
+    if negative {
+        at -= 1;
+        text[at] = 45;
+    }
+    unsafe { SetDlgItemTextW(h, id, text.as_ptr().add(at) as u32) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn GetDlgItemInt(
+    h: u32,
+    id: u32,
+    translated: *mut i32,
+    signed: i32,
+) -> u32 {
+    if !translated.is_null() {
+        unsafe {
+            translated.write_unaligned(0);
+        }
+    }
+    let mut text = [0u16; 64];
+    let n = unsafe { GetDlgItemTextW(h, id, text.as_mut_ptr() as u32, text.len() as u32) };
+    if n <= 0 {
+        return 0;
+    }
+    let mut p = 0;
+    while p < n as usize && (text[p] == 32 || text[p] == 9) {
+        p += 1;
+    }
+    let negative = p < n as usize && text[p] == 45 && signed != 0;
+    if negative || p < n as usize && text[p] == 43 {
+        p += 1;
+    }
+    let begin = p;
+    let mut value = 0u32;
+    let limit = if signed == 0 {
+        u32::MAX
+    } else if negative {
+        0x80000000
+    } else {
+        0x7fffffff
+    };
+    while p < n as usize && (48..=57).contains(&text[p]) {
+        let Some(next) = value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u32::from(text[p] - 48)))
+            .filter(|v| *v <= limit)
+        else {
+            return 0;
+        };
+        value = next;
+        p += 1;
+    }
+    if p == begin {
+        return 0;
+    }
+    if !translated.is_null() {
+        unsafe {
+            translated.write_unaligned(1);
+        }
+    }
+    if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    }
+}
+
+/// Dialog keyboard navigation selects edit contents for immediate replacement.
+pub unsafe fn focus_control(h: u32) {
+    unsafe {
+        crate::input::SetFocus(h);
+        if crate::SendMessageW(h, 0x87, 0, 0) & 8 != 0 {
+            crate::SendMessageW(h, 0xb1, 0, u32::MAX);
+        }
+    }
 }

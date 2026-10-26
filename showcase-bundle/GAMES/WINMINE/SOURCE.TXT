@@ -1,0 +1,11 @@
+Minesweeper (Win32)
+Entry point: C:\GAMES\WINMINE\WINMINE.EXE
+
+Installed from the user-provided Minesweeper_Win_EN.zip.
+Archive SHA256: ea5692037273e2dcff1b2d0beb86f18d0c8e011ded7256a177413607ab5a6ea4
+EXE SHA256: bcff89311d792f6428468e813ac6929a346a979f907071c302f418d128eaaf41
+
+Original executable and help files are unchanged.
+MSVCRT.DLL is the runtime already included in COMMANDER/MC, placed
+next to the game to use the same runtime as the tested configuration.
+Help viewing is not yet implemented.

@@ -26,6 +26,8 @@ gate GetEnvironmentVariableW
 gate GetCurrentThreadId
 gate GetFileType
 gate GetLastError
+global _GetModuleFileNameA@12
+_GetModuleFileNameA@12:
 gate GetModuleFileNameA
 gate GetModuleFileNameW
 global _GetModuleHandleA@4

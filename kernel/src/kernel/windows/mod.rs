@@ -126,7 +126,6 @@ enum Api {
     WriteFile,
     UpdateWindow,
     InvalidateRect,
-    TranslateMessage,
     RetroWndProcReturn,
     BeginPaint,
     EndPaint,
@@ -211,6 +210,7 @@ enum GdiObject {
 }
 
 struct DeviceContext {
+    viewport: Option<(i32, i32, u32, u32)>,
     handle: u32,
     window: Option<u32>,
     bitmap: Option<u32>,
@@ -999,7 +999,6 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
     ),
     (b"KERNEL32", b"WriteConsoleA", Api::WriteConsoleA, 20),
     (b"KERNEL32", b"WriteFile", Api::WriteFile, 20),
-    (b"USER32", b"AdjustWindowRect", Api::Stub(1), 12),
     (b"USER32", b"BeginPaint", Api::BeginPaint, 8),
     (b"USER32", b"CheckMenuItem", Api::Stub(0), 12),
     (b"USER32", b"DestroyIcon", Api::Stub(1), 4),
@@ -1009,9 +1008,7 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
     (b"USER32", b"EndPaint", Api::EndPaint, 8),
     (b"USER32", b"FillRect", Api::FillRect, 12),
     (b"USER32", b"GetDC", Api::GetDC, 4),
-    (b"USER32", b"GetDlgItemInt", Api::Stub(0), 16),
     (b"USER32", b"GetDlgItemTextW", Api::Stub(0), 16),
-    (b"USER32", b"GetMenuItemRect", Api::Stub(0), 16),
     (b"USER32", b"GetSysColorBrush", Api::GetSysColorBrush, 4),
     (b"USER32", b"GetSystemMetrics", Api::GetSystemMetrics, 4),
     (b"USER32", b"InvalidateRect", Api::InvalidateRect, 12),
@@ -1025,11 +1022,9 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
     (b"USER32", b"ReleaseCapture", Api::Stub(1), 0),
     (b"USER32", b"ReleaseDC", Api::ReleaseDC, 8),
     (b"USER32", b"SetCapture", Api::Stub(1), 4),
-    (b"USER32", b"SetDlgItemInt", Api::Stub(1), 16),
     (b"USER32", b"SetDlgItemTextW", Api::Stub(1), 12),
     (b"USER32", b"SetMenu", Api::Stub(1), 8),
     (b"USER32", b"TranslateAcceleratorW", Api::Stub(0), 12),
-    (b"USER32", b"TranslateMessage", Api::TranslateMessage, 4),
     (b"USER32", b"UpdateWindow", Api::UpdateWindow, 4),
     (b"GDI32", b"Arc", Api::Stub(1), 36),
     (b"GDI32", b"BitBlt", Api::BitBlt, 36),
@@ -1606,6 +1601,7 @@ fn dc_bitmap(state: &WindowsState, dc: u32) -> Option<u32> {
 }
 
 struct RenderTarget<'a> {
+    dirty: Option<&'a mut bool>,
     width: u32,
     height: u32,
     origin_x: i32,
@@ -1619,10 +1615,11 @@ fn target_mut(
     state: &mut WindowsState,
     dc: u32,
 ) -> Option<RenderTarget<'_>> {
+    let viewport = state.dcs.iter().find(|d| d.handle == dc).and_then(|d| d.viewport);
     let window = if dc == state.paint_dc { Some(state.paint_hwnd) } else { state.dcs.iter().find(|d| d.handle == dc).and_then(|d| d.window) };
     if let Some(hwnd) = window {
         let window = state.windows.iter().find(|window| window.hwnd == hwnd)?;
-        let (clip_width, clip_height) = (window.width, window.height);
+        let (vx, vy, clip_width, clip_height) = viewport.unwrap_or((0, 0, window.width, window.height));
         let (mut x, mut y, mut parent) = (window.x, window.y, window.parent);
         let mut root = hwnd;
         while parent != 0 {
@@ -1635,16 +1632,18 @@ fn target_mut(
             parent = window.parent;
         }
         if root == hwnd { x = 0; y = 0; }
+        let dirty = &mut state.dirty;
         return state.windows.iter_mut().find(|window| window.hwnd == root).map(|window| {
             let need = window.width as usize * window.height as usize * 4;
             if window.pixels.len() != need {
                 window.pixels.resize(need, 0xc0);
             }
             RenderTarget {
+                dirty: Some(dirty),
                 width: window.width,
                 height: window.height,
-                origin_x: x,
-                origin_y: y,
+                origin_x: x.saturating_add(vx),
+                origin_y: y.saturating_add(vy),
                 clip_width,
                 clip_height,
                 pixels: &mut window.pixels,
@@ -1662,6 +1661,7 @@ fn target_mut(
                 height,
                 pixels,
             } => Some(RenderTarget {
+                dirty: None,
                 width: *width,
                 height: *height,
                 origin_x: 0,
@@ -1695,6 +1695,7 @@ fn put_pixel(state: &mut WindowsState, dc: u32, x: i32, y: i32, color: u32) {
         if rop&1!=0 {mixed |= !color & !old;} if rop&2!=0 {mixed |= !color & old;}
         if rop&4!=0 {mixed |= color & !old;} if rop&8!=0 {mixed |= color & old;}
         target.pixels[at..at + 4].copy_from_slice(&(mixed & 0x00ff_ffff).to_le_bytes());
+        if let Some(dirty) = target.dirty { *dirty = true; }
     }
 }
 
@@ -1725,6 +1726,8 @@ fn fill_pixels_unclipped(
         .clamp(0, target.height as i32) as usize;
     let bottom = bottom.clamp(0, target.clip_height as i32).saturating_add(target.origin_y)
         .clamp(0, target.height as i32) as usize;
+    if left >= right || top >= bottom { return; }
+    if let Some(dirty) = target.dirty { *dirty = true; }
     let bytes = color.to_le_bytes();
     for y in top..bottom {
         for x in left..right {
@@ -2113,7 +2116,6 @@ fn dispatch<A: crate::Arch>(
                 0
             }
         }
-        Api::TranslateMessage => 1,
         Api::RetroWndProcReturn => 0,
         Api::GetSystemMetrics => match arg(machine, regs, 0) {
             0 => 1024,
@@ -2186,6 +2188,7 @@ fn dispatch<A: crate::Arch>(
             let handle = state.next_object;
             state.next_object += 1;
             state.dcs.push(DeviceContext {
+                viewport: None,
                 handle,
                 window: None,
                 bitmap: None,
@@ -2460,7 +2463,6 @@ fn dispatch<A: crate::Arch>(
                     }
                 }
             }
-            state.dirty = true;
             1
         }
         Api::Extension => 0,
@@ -2605,5 +2607,73 @@ mod path_tests {
         assert_eq!(guest_windows_path(b"cdrom/GAMES"), b"D:\\GAMES");
         assert_eq!(guest_windows_path(b"host"), b"H:\\");
         assert_eq!(guest_windows_path(b"disk1/TOOLS"), b"E:\\TOOLS");
+    }
+}
+
+#[cfg(test)]
+mod damage_tests {
+    use super::*;
+
+    #[test]
+    fn window_writes_damage_scanout_but_offscreen_work_and_reads_do_not() {
+        let mut state = WindowsState::new();
+        state.windows.push(Window {
+            hwnd: 7,
+            parent: 0,
+            wndproc: 0,
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+            visible: true,
+            pixels: vec![0; 8 * 8 * 4],
+        });
+        state.paint_hwnd = 7;
+        let dc = state.paint_dc;
+        state.dirty = false;
+        assert!(target_mut(&mut state, dc).is_some());
+        assert!(!state.dirty, "querying a target must not damage it");
+        fill_pixels(&mut state, dc, 0, 0, 4, 4, 0xff);
+        assert!(
+            state.dirty,
+            "GetDC fills must present without EndPaint/input"
+        );
+        state.dirty = false;
+        put_pixel(&mut state, dc, 5, 5, 0xff00);
+        assert!(
+            state.dirty,
+            "text/line/pixel writes must damage their surface"
+        );
+        state.dirty = false;
+        put_pixel(&mut state, dc, 99, 99, 0);
+        fill_pixels(&mut state, dc, 99, 99, 100, 100, 0);
+        assert!(!state.dirty, "clipped writes must not damage a surface");
+        state.gdi_objects.push((
+            9,
+            GdiObject::Bitmap {
+                width: 8,
+                height: 8,
+                pixels: vec![0; 8 * 8 * 4],
+            },
+        ));
+        state.dcs.push(DeviceContext {
+            viewport: None,
+            handle: 8,
+            window: None,
+            bitmap: Some(9),
+            x: 0,
+            y: 0,
+            pen: 0,
+            brush: 0,
+            font: 0,
+            bk: 0,
+            text: 0,
+        });
+        fill_pixels(&mut state, 8, 0, 0, 8, 8, 0xff);
+        put_pixel(&mut state, 8, 0, 0, 0xff00);
+        assert!(
+            !state.dirty,
+            "offscreen menu composition must stay invisible"
+        );
     }
 }
