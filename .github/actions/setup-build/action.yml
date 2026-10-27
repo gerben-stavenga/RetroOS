@@ -12,7 +12,8 @@ runs:
   - name: Install test tools
     run: |
       # Some runner-local Azure mirrors throttle large firmware/tool downloads.
-      for sources in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+      for sources in /etc/apt/sources.list /etc/apt/sources.list.d/*.list \
+        /etc/apt/sources.list.d/*.sources /etc/apt/apt-mirrors.txt; do
         if [ -f "$sources" ]; then
           sudo sed -i 's/azure.archive.ubuntu.com/archive.ubuntu.com/g' "$sources"
         fi
