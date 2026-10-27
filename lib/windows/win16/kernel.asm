@@ -50,7 +50,7 @@ gate lstrlen
 gate InitTask
 gate LoadLibrary
 gate FreeLibrary
-gate GetTempFileName
+bridge GetTempFileName, 2097, 12
 gate DOS3Call
 gate SetErrorMode
 gate OutputDebugString
@@ -66,3 +66,5 @@ gate FatalAppExit
 gate IsDBCSLeadByte
 
 bridge WinExec, 2166, 6
+
+bridge GetWindowsDirectory, 2134, 6

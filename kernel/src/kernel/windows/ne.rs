@@ -178,15 +178,19 @@ impl<'a> Image<'a> {
     /// Resolve an exported name through the resident and non-resident name
     /// tables, then decode its ordinary NE entry-table target.
     pub fn entry_by_name(&self, wanted: &[u8]) -> Result<(u8, u16), Error> {
+        self.entry(self.ordinal_by_name(wanted)?)
+    }
+
+    pub fn ordinal_by_name(&self, wanted: &[u8]) -> Result<u16, Error> {
         let resident = self.ne + u16_at(self.data, self.ne + 0x26)? as usize;
         if let Some(ordinal) = self.named_ordinal(resident, self.data.len(), wanted)? {
-            return self.entry(ordinal);
+            return Ok(ordinal);
         }
         let nonresident = u32_at(self.data, self.ne + 0x2c)? as usize;
         let length = u16_at(self.data, self.ne + 0x20)? as usize;
         let end = nonresident.checked_add(length).ok_or(Error::Overflow)?;
         if let Some(ordinal) = self.named_ordinal(nonresident, end, wanted)? {
-            return self.entry(ordinal);
+            return Ok(ordinal);
         }
         Err(Error::BadImage)
     }

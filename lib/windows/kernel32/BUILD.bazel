@@ -1,3 +1,4 @@
+load("@rules_rust//rust:defs.bzl", "rust_test")
 load("//toolchain:windows_rust.bzl", "windows_rust_library")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:windows_watcom.bzl", "windows_dll")
@@ -11,7 +12,7 @@ nasm_library(
 windows_rust_library(
     name = "kernel32_rust",
     crate_root = "kernel32.rs",
-    srcs = ["resource.rs", "profile.rs", "//lib/windows/user32:runtime.rs"],
+    srcs = ["szdd.rs", "installer.rs", "resource.rs", "profile.rs", "//lib/windows/user32:runtime.rs"],
 )
 
 windows_dll(
@@ -19,6 +20,9 @@ windows_dll(
     obj = ":kernel32_obj",
     libraries = [":kernel32_rust"],
     export_aliases = {
+        "GetWindowsDirectoryA": "_GetWindowsDirectoryA@8",
+        "GetTempFileNameA": "_GetTempFileNameA@16",
+        "LZCopy": "_LZCopy@8",
         "WinExec": "_WinExec@8",
         "GetPrivateProfileStringW": "_GetPrivateProfileStringW@24",
         "GetPrivateProfileIntW": "_GetPrivateProfileIntW@16",
@@ -45,6 +49,8 @@ windows_dll(
     out = "KERNEL32.DLL",
     module_name = "KERNEL32",
     exports = [
+        "GetWindowsDirectoryA",
+        "GetTempFileNameA", "LZCopy", "GetTempPathA", "GetCurrentDirectoryA", "GetFileAttributesA",
         "WinExec", "CreateProcessA",
         "GetPrivateProfileStringW", "GetPrivateProfileIntW", "HeapAlloc", "HeapFree", "GetProcessHeap", "CreateFileW",
         "lstrlenA",
@@ -96,4 +102,13 @@ windows_dll(
 
     ],
     visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "szdd_test",
+    size = "small",
+    srcs = ["szdd.rs"],
+    crate_root = "szdd.rs",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
 )

@@ -11,6 +11,8 @@ global _CloseHandle@4
 _CloseHandle@4:
 gate CloseHandle
 gate CreateEventA
+global _CreateFileA@28
+_CreateFileA@28:
 gate CreateFileA
 global _ExitProcess@4
 _ExitProcess@4:
@@ -63,6 +65,8 @@ gate VirtualFree
 gate VirtualQuery
 gate WideCharToMultiByte
 gate WriteConsoleA
+global _WriteFile@20
+_WriteFile@20:
 gate WriteFile
 gate GetLocaleInfoA
 gate GetLocaleInfoW
@@ -107,3 +111,7 @@ gate CreateFileW
 global _CreateProcessA@40
 _CreateProcessA@40:
 gate CreateProcessA
+
+gate GetTempPathA
+gate GetCurrentDirectoryA
+gate GetFileAttributesA

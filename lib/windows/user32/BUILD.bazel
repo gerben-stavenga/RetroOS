@@ -20,6 +20,13 @@ windows_dll(
     obj = ":user32_obj",
     libraries = [":user32_rust"],
     imports = {
+        "_GetWindowsDirectoryA@8": "KERNEL32.GetWindowsDirectoryA",
+        "_GetTempFileNameA@16": "KERNEL32.GetTempFileNameA",
+        "_GetTempPathA@8": "KERNEL32.GetTempPathA",
+        "_GetCurrentDirectoryA@8": "KERNEL32.GetCurrentDirectoryA",
+        "_GetFileAttributesA@4": "KERNEL32.GetFileAttributesA",
+        "_LZCopy@8": "KERNEL32.LZCopy",
+
         "_WinExec@8": "KERNEL32.WinExec",
         "_CreateFileA@28": "KERNEL32.CreateFileA",
         "_CloseHandle@4": "KERNEL32.CloseHandle",

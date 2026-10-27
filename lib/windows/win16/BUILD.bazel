@@ -16,7 +16,7 @@ win16_dll("kernel", "KERNEL", [
     "SetErrorMode.107", "OutputDebugString.115", "LocalShrink.121",
     "GetPrivateProfileInt.127",
     "GetPrivateProfileString.128", "WritePrivateProfileString.129",
-    "GetDOSEnvironment.131", "GetWinFlags.132", "GetSystemDirectory.135",
+    "GetWindowsDirectory.134", "GetDOSEnvironment.131", "GetWinFlags.132", "GetSystemDirectory.135",
     "GetDriveType.136", "FatalAppExit.137", "IsDBCSLeadByte.207",
 ])
 
@@ -94,3 +94,5 @@ win16_dll("sound", "SOUND", [
 win16_dll("shell", "SHELL", ["ShellAbout.22"])
 
 win16_dll("keyboard", "KEYBOARD", ["AnsiToOem.5", "OemToAnsi.6"])
+
+win16_dll("lzexpand", "LZEXPAND", ["LZCopy.1", "RetroBridgeConfig.423"])

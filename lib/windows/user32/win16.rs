@@ -3,6 +3,13 @@
 use crate::{Message, class, input, keyboard, menu, message, paint, rect, state, window};
 
 unsafe extern "system" {
+    fn GetWindowsDirectoryA(out: u32, capacity: u32) -> u32;
+    fn GetTempFileNameA(path: u32, prefix: u32, unique: u32, out: u32) -> u32;
+    fn GetTempPathA(n: u32, p: u32) -> u32;
+    fn GetCurrentDirectoryA(n: u32, p: u32) -> u32;
+    fn GetFileAttributesA(p: u32) -> u32;
+    fn LZCopy(source: u32, dest: u32) -> i32;
+
     fn WinExec(command: u32, show: u32) -> u32;
     fn CreateFileA(
         path: u32,
@@ -415,6 +422,59 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
         let i = |at| word(a, at) as i16 as i32;
         let h = |at| decode(word(a, at));
         Some(match o {
+            2134 => GetWindowsDirectoryA(pointer(d(2), w(0) as usize)?, w(0)),
+            3001 => LZCopy(w(2), w(0)) as u32,
+            2097 => {
+                let mut path = [0u8; 260];
+                let drive = w(10) as u8;
+                if drive & 0x80 != 0 {
+                    let letter = drive & 0x7f;
+                    if letter == 0 {
+                        GetCurrentDirectoryA(260, path.as_mut_ptr() as u32);
+                    } else {
+                        path[0] = letter;
+                    }
+                    path[1] = b':';
+                    path[2] = b'\\';
+                    path[3] = 0;
+                } else {
+                    GetTempPathA(260, path.as_mut_ptr() as u32);
+                    let attr = GetFileAttributesA(path.as_ptr() as u32);
+                    if attr == u32::MAX || attr & 16 == 0 {
+                        GetCurrentDirectoryA(260, path.as_mut_ptr() as u32);
+                        path[1] = b':';
+                        path[2] = b'\\';
+                        path[3] = 0;
+                    }
+                }
+                let mut prefix = [b'~', 0, 0, 0];
+                if d(6) != 0 {
+                    let p = string(d(6))? as *const u8;
+                    for j in 0..2 {
+                        let c = p.add(j).read();
+                        if c == 0 {
+                            break;
+                        }
+                        prefix[j + 1] = c;
+                    }
+                }
+                let mut out = [0u8; 260];
+                let result = GetTempFileNameA(
+                    path.as_ptr() as u32,
+                    prefix.as_ptr() as u32,
+                    w(4),
+                    out.as_mut_ptr() as u32,
+                );
+                if result == 0 {
+                    0
+                } else {
+                    let n = out.iter().position(|&c| c == 0)? + 1;
+                    let dst = pointer(d(0), n)?;
+                    core::ptr::copy_nonoverlapping(out.as_ptr(), dst as *mut u8, n);
+                    result
+                }
+            }
+
             421 => {
                 let out = pointer(d(8), 1)?;
                 let fmt = string(d(4))?;

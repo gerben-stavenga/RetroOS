@@ -4,6 +4,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 extern crate alloc;
 mod profile;
+mod installer;
+mod szdd;
 mod resource;
 #[allow(dead_code)]
 #[path = "../user32/runtime.rs"]

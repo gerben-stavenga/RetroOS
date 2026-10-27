@@ -47,6 +47,7 @@ BOOT_FILES = {
     "//lib/windows/win16:gdi_dll":        "RETROOS/WINDOWS/SYSTEM/GDI.DLL",
     "//lib/windows/win16:shell_dll":      "RETROOS/WINDOWS/SYSTEM/SHELL.DLL",
     "//lib/windows/win16:sound_dll":      "RETROOS/WINDOWS/SYSTEM/SOUND.DLL",
+    "//lib/windows/win16:lzexpand_dll": "RETROOS/WINDOWS/SYSTEM/LZEXPAND.DLL",
     "//lib/windows/win16:keyboard_dll":   "RETROOS/WINDOWS/SYSTEM/KEYBOARD.DLL",
     "//lib/os2/doscalls:doscalls_dll":     "RETROOS/OS2/DLL/DOSCALLS.DLL",
     "//lib/os2/kbdcalls:kbdcalls_dll":     "RETROOS/OS2/DLL/KBDCALLS.DLL",

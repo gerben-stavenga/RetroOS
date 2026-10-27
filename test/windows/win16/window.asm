@@ -13,9 +13,139 @@ extern DOSExit, CreateDialog, SetDlgItemInt, GetDlgItemInt
 extern GetCursorPos, SetCursorPos, ClientToScreen, ScreenToClient
 extern wvsprintf, WinExec
 extern _lopen, _lclose, _lread, _lcreat, _llseek, _lwrite
+extern GetTempFileName, LoadLibrary, FreeLibrary, GetModuleHandle, GetProcAddress, GetModuleUsage
 global _start
 _start:
     mov [initial_sp], sp
+    push ds
+    push word kernel_name
+    call far GetModuleHandle
+    test ax,ax
+    jz installer_fail
+    push ax
+    push ds
+    push word version_name
+    call far GetProcAddress
+    mov [installer_proc],ax
+    mov [installer_proc+2],dx
+    or ax,dx
+    jz installer_fail
+    call far [installer_proc]
+    cmp ax,0x0a03
+    jne installer_fail
+    push ds
+    push word lz_name
+    call far LoadLibrary
+    cmp ax,32
+    jb installer_fail
+    mov [lz_module],ax
+    push ax
+    push ds
+    push word lz_copy_name
+    call far GetProcAddress
+    mov [installer_proc],ax
+    mov [installer_proc+2],dx
+    or ax,dx
+    jz installer_fail
+    push word [lz_module]
+    push dword 1
+    call far GetProcAddress
+    cmp ax,[installer_proc]
+    jne installer_fail
+    cmp dx,[installer_proc+2]
+    jne installer_fail
+    push word 0xc3
+    push ds
+    push word temp_prefix
+    push word 0
+    push ds
+    push word temp_one
+    call far GetTempFileName
+    test ax,ax
+    jz installer_fail
+    mov [temp_unique],ax
+    push word 0xc3
+    push ds
+    push word temp_prefix
+    push word 0
+    push ds
+    push word temp_two
+    call far GetTempFileName
+    test ax,ax
+    jz installer_fail
+    cmp ax,[temp_unique]
+    je installer_fail
+    push ds
+    push word temp_one
+    push word 2
+    call far _lopen
+    cmp ax,0xffff
+    je installer_fail
+    mov [lz_source],ax
+    push ax
+    push ds
+    push word compressed
+    push word compressed_end-compressed
+    call far _lwrite
+    cmp ax,compressed_end-compressed
+    jne installer_fail
+    push word [lz_source]
+    push dword 0
+    push word 0
+    call far _llseek
+    push ds
+    push word temp_two
+    push word 2
+    call far _lopen
+    cmp ax,0xffff
+    je installer_fail
+    mov [lz_dest],ax
+    push word [lz_source]
+    push ax
+    call far [installer_proc]
+    cmp ax,9
+    jne installer_fail
+    test dx,dx
+    jnz installer_fail
+    push word [lz_dest]
+    push dword 0
+    push word 0
+    call far _llseek
+    push word [lz_dest]
+    push ds
+    push word expanded
+    push word 9
+    call far _lread
+    cmp ax,9
+    jne installer_fail
+    cmp word [expanded],0x6261
+    jne installer_fail
+    cmp word [expanded+6],0x6261
+    jne installer_fail
+    cmp byte [expanded+8],'c'
+    jne installer_fail
+    push word [lz_source]
+    call far _lclose
+    push word [lz_dest]
+    call far _lclose
+    push ds
+    push word lz_name
+    call far LoadLibrary
+    cmp ax,[lz_module]
+    jne installer_fail
+    push ax
+    call far GetModuleUsage
+    cmp ax,2
+    jne installer_fail
+    push word [lz_module]
+    call far FreeLibrary
+    push word [lz_module]
+    call far GetModuleUsage
+    cmp ax,1
+    jne installer_fail
+    cmp sp,[initial_sp]
+    jne installer_fail
+
     push ds
     push word file_missing
     push word 1
@@ -815,6 +945,11 @@ file_fail_15:
     push word file_error_15
     call far Debug
     jmp fail
+installer_fail:
+    push ds
+    push word installer_error
+    call far Debug
+    jmp fail
 pmdos_fail:
     push ds
     push word pm_error
@@ -1091,6 +1226,24 @@ file_missing: db "C:\ABSENT.DAT",0
 file_payload: db "hello",0
 file_buffer: times 8 db 0
 file_handle: dw 0
+kernel_name: db "KERNEL",0
+version_name: db "GetVersion",0
+lz_name: db "LZEXPAND.DLL",0
+lz_copy_name: db "LZCopy",0
+lz_module: dw 0
+installer_proc: dd 0
+lz_source: dw 0
+lz_dest: dw 0
+temp_unique: dw 0
+temp_prefix: db "TEST",0
+temp_one: times 144 db 0
+temp_two: times 144 db 0
+compressed: db "SZDD",0x88,0xf0,0x27,0x33,'A',0
+    dd 9
+    db 7,'a','b','c',0xf0,0xf3
+compressed_end:
+expanded: times 16 db 0
+installer_error: db "Installer services failed",0
 pm_directory: db "PMTEST",0
 pm_relative_file: db "ROUND.DAT",0
 pm_absolute_file: db "C:\PMTEST\ROUND.DAT",0

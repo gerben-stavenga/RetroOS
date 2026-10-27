@@ -17,7 +17,7 @@ def main():
     targets = [f'//kernel:{host}', '//test/windows/win16:bridge', '//test/windows/win16:window', '//test/windows/win16:legacy_user',
                '//lib/windows/user32:user32_dll', '//lib/windows/kernel32:kernel32_dll',
                '//lib/windows/compat:gdi32_dll']
-    targets += [f'//lib/windows/win16:{name}_dll' for name in ('user','kernel','gdi','sound','shell','keyboard')]
+    targets += [f'//lib/windows/win16:{name}_dll' for name in ('user','kernel','gdi','sound','shell','keyboard','lzexpand')]
     subprocess.run(['bazelisk', 'build', *targets, '--platforms=@platforms//host'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-win16-') as directory:
         root = Path(directory)
@@ -25,7 +25,7 @@ def main():
         system.mkdir(parents=True)
         system32 = root / 'RETROOS/WINDOWS/SYSTEM32'
         system32.mkdir()
-        for name in ('USER','KERNEL','GDI','SOUND','SHELL','KEYBOARD'):
+        for name in ('USER','KERNEL','GDI','SOUND','SHELL','KEYBOARD','LZEXPAND'):
             shutil.copyfile(ROOT / f'bazel-bin/lib/windows/win16/{name}.DLL', system / f'{name}.DLL')
         for name, folder in [('USER32','user32'), ('KERNEL32','kernel32'), ('GDI32','compat')]:
             shutil.copyfile(ROOT / f'bazel-bin/lib/windows/{folder}/{name}.DLL', system32 / f'{name}.DLL')

@@ -71,6 +71,8 @@ struct LocalBlock {
 
 pub(super) struct State {
     image: Vec<u8>,
+    modules: Vec<LoadedModule>,
+    bridge_cs: u16,
     gates: Vec<Gate>,
     instance: u16,
     auto_data: u16,
@@ -417,6 +419,7 @@ struct LoadedModule {
     kind: Option<Module>,
     data: Vec<u8>,
     selectors: Vec<u16>,
+    references: u16,
 }
 
 fn module_file(name: &[u8]) -> Vec<u8> {
@@ -523,6 +526,7 @@ fn imported_target<A: crate::Arch>(
     let kind = module(&canonical);
     if kind == Some(Module::Kernel) {
         match ordinal {
+            Some(113) => return Ok((3, 0)),
             Some(114) => return Ok((8, 0)),
             Some(178) => return Ok((0x0413, 0)),
             _ => {}
@@ -534,8 +538,9 @@ fn imported_target<A: crate::Arch>(
         return Err(-2);
     };
     let image = ne::Image::parse(&loaded.data).map_err(|_| -8)?;
+    let ordinal = ordinal.or_else(|| symbol.and_then(|name| image.ordinal_by_name(name).ok()));
     let entry = match (ordinal, symbol) {
-        (Some(ordinal), None) => image.entry(ordinal),
+        (Some(ordinal), _) => image.entry(ordinal),
         (None, Some(symbol)) => image.entry_by_name(symbol),
         _ => return Err(-8),
     };
@@ -664,6 +669,7 @@ pub(super) fn exec<A: crate::Arch>(
             kind: module(&canonical),
             data: module_data,
             selectors: module_selectors,
+            references: 1,
         });
         pending.extend(dependencies.into_iter().map(|dependency| {
             (dependency, module_path.clone())
@@ -748,6 +754,7 @@ pub(super) fn exec<A: crate::Arch>(
 
     current.kernel.vcpu.regs.init_user_process(0, 0);
     init_bridge(machine, &mut windows, &modules, &current.kernel.vcpu.regs, tid, &data, data_selector)?;
+    let bridge_cs = current.kernel.vcpu.regs.code_seg();
     let regs = &mut current.kernel.vcpu.regs;
     regs.frame.rip = u64::from(header.entry_offset);
     regs.frame.cs = u64::from(code_selector);
@@ -767,6 +774,8 @@ pub(super) fn exec<A: crate::Arch>(
 
     windows.win16 = Some(State {
         image: data,
+        modules,
+        bridge_cs,
         gates,
         instance: data_selector,
         auto_data: data_selector,
@@ -1172,7 +1181,52 @@ fn dispatch<A: crate::Arch>(
         }
         (Module::Kernel, 25) => machine.free_page_count().saturating_mul(4096).min(u32::MAX as usize) as u32,
         (Module::Kernel, 23 | 24 | 30 | 52) => 1,
-        (Module::Kernel, 47) => u32::from(state.instance),
+        (Module::Kernel, 47) => {
+            let p = stack_u32(machine, windows, regs, 4).unwrap_or(0);
+            if p == 0 { u32::from(state.instance) } else {
+                far_string(machine, windows, p).and_then(|name| {
+                    let name = canonical_module_name(&name);
+                    state.modules.iter().find(|m| m.name == name).map(|m| u32::from(m.selectors[0]))
+                }).unwrap_or(0)
+            }
+        }
+        (Module::Kernel, 48) => {
+            let h = stack_u16(machine, windows, regs, 4).unwrap_or(0);
+            if h == state.instance { 1 } else {
+                state.modules.iter().find(|m| m.selectors.first() == Some(&h)).map_or(0, |m| u32::from(m.references))
+            }
+        }
+        (Module::Kernel, 50) => {
+            let p = stack_u32(machine, windows, regs, 4).unwrap_or(0);
+            let h = stack_u16(machine, windows, regs, 8).unwrap_or(0);
+            let name = if p >> 16 == 0 { None } else { far_string(machine, windows, p) };
+            let ordinal = if p >> 16 == 0 { Some(p as u16) } else { None };
+            if h == state.instance {
+                let Ok(image) = ne::Image::parse(&state.image) else { return 0 };
+                let target = ordinal.map_or_else(|| image.entry_by_name(name.as_deref().unwrap_or(b"")), |o| image.entry(o));
+                return target.ok().and_then(|(segment, offset)| {
+                    let base = segment_base(u16::from(segment)).ok()?;
+                    let index = (1..windows.ldt.len()).find(|&i|
+                        selector_base_from_ldt(&windows.ldt, i as u16 * 8 + 7) == Some(base))?;
+                    Some((((index as u32)*8+7)<<16) | u32::from(offset))
+                }).unwrap_or(0);
+            }
+            let Some(module) = state.modules.iter().find(|m| m.selectors.first() == Some(&h)) else { return 0 };
+            let module_name = module.name.clone();
+            imported_target(machine, &windows.ldt, &state.modules, &mut state.gates, &module_name, ordinal, name.as_deref())
+                .map_or(0, |(offset, selector)| (u32::from(selector)<<16)|u32::from(offset))
+        }
+        (Module::Kernel, 95) => {
+            let Some(name) = stack_u32(machine, windows, regs, 4).and_then(|p| far_string(machine, windows, p)) else { return 2 };
+            load_dynamic(machine, windows, state, &name).map_or_else(|e| if e == -2 {2} else {11}, u32::from)
+        }
+        (Module::Kernel, 96) => {
+            let h = stack_u16(machine, windows, regs, 4).unwrap_or(0);
+            if let Some(m) = state.modules.iter_mut().find(|m| m.selectors.first() == Some(&h)) {
+                m.references = m.references.saturating_sub(1);
+            }
+            0
+        }
         (Module::Kernel, 49) => {
             let capacity = stack_u16(machine, windows, regs, 4).unwrap_or(0) as usize;
             let Some(out) = stack_u32(machine, windows, regs, 6)
@@ -1472,6 +1526,11 @@ pub(super) fn handle_event<A: crate::Arch>(
                 crate::compact_dbg_println!("[win16] {:?}.{} {}", gate.module, gate.ordinal, gate.name);
             }
             let result = dispatch(machine, kt, windows, state, regs, gate);
+            if gate.module == Module::Kernel && gate.ordinal == 95 {
+                dos.ldt[..windows.ldt.len()].copy_from_slice(&windows.ldt);
+                for i in 0..windows.ldt.len() { dos.ldt_alloc[i / 32] |= 1 << (i % 32); }
+                machine.load_ldt(&dos.ldt[..]);
+            }
             if finish(machine, windows, regs, gate, result).is_err() {
                 return thread::KernelAction::Exit(-1);
             }
@@ -1504,4 +1563,82 @@ fn dos_call<A: crate::Arch>(
         windows.cwd[..windows.cwd_len].copy_from_slice(&cwd[..windows.cwd_len]);
     }
     action
+}
+
+fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, state: &mut State, name: &[u8]) -> Result<u16, i32> {
+    let name = canonical_module_name(name);
+    if let Some(m) = state.modules.iter_mut().find(|m| m.name == name) {
+        m.references = m.references.saturating_add(1);
+        return Ok(m.selectors[0]);
+    }
+    let start = state.modules.len();
+    let old_ldt = windows.ldt.len();
+    let old_gates = state.gates.len();
+    let result = (|| {
+        let mut pending = vec![(name.clone(), windows.exec_path_str().to_vec())];
+        let mut next = 0;
+        while next < pending.len() {
+            let (name, importer) = pending[next].clone(); next += 1;
+            let name = canonical_module_name(&name);
+            if state.modules.iter().any(|m| m.name == name) { continue; }
+            let (path, data) = load_module_file(&name, &importer)?;
+            let image = ne::Image::parse(&data).map_err(|_| -8)?;
+            // Guest facades have no LibMain. Do not silently skip a DLL initializer.
+            if image.header.entry_segment != 0 || image.header.segment_count > 16 { return Err(-8); }
+            let mut selectors = Vec::new();
+            let index = state.modules.len();
+            if index >= ((RESOURCE_BASE - MODULE_BASE) / MODULE_STRIDE) as usize { return Err(-8); }
+            for n in 1..=image.header.segment_count {
+                let segment = image.segment(n).map_err(|_| -8)?;
+                let base = module_segment_base(index, n)?;
+                machine.set_page_flags(base as usize/4096, segment.alloc_size.div_ceil(4096), true, false);
+                machine.zero(base as usize, segment.alloc_size);
+                machine.copy_to(base as usize, image.segment_bytes(segment).map_err(|_| -8)?);
+                selectors.push(selector(&mut windows.ldt, base, segment.alloc_size, segment.is_code())?);
+            }
+            let dependencies = image.modules().map_err(|_| -8)?;
+            state.modules.push(LoadedModule { kind: module(&name), name, data, selectors, references: 1 });
+            pending.extend(dependencies.into_iter().map(|dep| (dep, path.clone())));
+        }
+        let entry = super::export_address(&windows.modules, b"USER32", b"Retro16Enter")?;
+        let back = super::export_address(&windows.modules, b"USER32", b"Retro16Return")?;
+        for index in start..state.modules.len() {
+            let m = &state.modules[index];
+            let image = ne::Image::parse(&m.data).map_err(|_| -8)?;
+            relocate_image(machine, &image, &m.selectors, &state.modules, &windows.ldt, &mut state.gates, |n| module_segment_base(index, n))?;
+            if let Ok((segment, offset)) = image.entry_by_name(b"RetroBridgeConfig") {
+                let base = selector_base(windows, m.selectors[segment as usize-1]).ok_or(-8)?;
+                machine.write::<u32>((base+u32::from(offset)) as usize, entry);
+                machine.write::<u16>((base+u32::from(offset)+4) as usize, state.bridge_cs);
+                machine.write::<u32>((base+u32::from(offset)+6) as usize, back);
+                machine.write::<u16>((base+u32::from(offset)+10) as usize, state.bridge_cs);
+            }
+            for n in 1..=image.header.segment_count {
+                let seg = image.segment(n).map_err(|_| -8)?;
+                machine.set_page_flags(module_segment_base(index,n)? as usize/4096, seg.alloc_size.div_ceil(4096), !seg.is_code(), seg.is_code());
+            }
+        }
+        // Extend the guest selector translation table without reinitializing USER state.
+        const TABLE: usize = 0x7ff8_0000;
+        let pages = (windows.ldt.len()*8).div_ceil(4096);
+        let old_pages = (old_ldt*8).div_ceil(4096);
+        if pages > old_pages { machine.zero(TABLE+old_pages*4096, (pages-old_pages)*4096); }
+        machine.set_page_flags(TABLE/4096, pages, true, false);
+        for i in old_ldt..windows.ldt.len() {
+            let desc = windows.ldt[i];
+            let base = selector_base(windows, i as u16*8+7).ok_or(-8)?;
+            machine.write::<u32>(TABLE+i*8, base);
+            machine.write::<u32>(TABLE+i*8+4, ((desc&0xffff)|((desc>>32)&0xf0000)) as u32);
+        }
+        machine.set_page_flags(TABLE/4096, pages, false, false);
+        let config = super::export_address(&windows.modules, b"USER32", b"Retro16Config")?;
+        machine.write::<u32>(config as usize+24, windows.ldt.len() as u32);
+        Ok(state.modules[start].selectors[0])
+    })();
+    if result.is_err() {
+        state.modules.truncate(start);
+        state.gates.truncate(old_gates);
+        windows.ldt.truncate(old_ldt);
+    }
+    result
 }
