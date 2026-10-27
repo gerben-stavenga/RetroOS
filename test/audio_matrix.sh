@@ -29,6 +29,9 @@ source test/lib/qemu_common.sh
 qemu_bazel build //:data_disk || exit 1
 LOG_DIR=$(mktemp -d -t retroos-audio-matrix.XXXXXX)
 python3 test/private_data_disk.py bazel-bin/data_disk.bin "$LOG_DIR/data.bin" || exit 1
+# TCG on shared runners can spend over a refresh period in presentation.
+# Keep all protocol verdicts mandatory while allowing that execution overhead.
+PROBE_TIMEOUT=180
 ACCEL=(); [ "${1:-}" = "--kvm" ] && ACCEL=(--kvm)
 pid=""
 trap 'qemu_stop_and_reap "$pid"' EXIT
@@ -48,12 +51,12 @@ for sink in "${SINKS[@]}"; do
   for entry in "${PROBES[@]}"; do
     prog="${entry%%:*}"; expect="${entry#*:}"
     log="$LOG_DIR/$sink-$(basename "$prog").log"
-    AUDIO_BACKEND=none QEMU_DISPLAY=none timeout --kill-after=5 90 \
+    AUDIO_BACKEND=none QEMU_DISPLAY=none timeout --kill-after=5 "$PROBE_TIMEOUT" \
         ./run.sh qemu "${ACCEL[@]}" --arch x64 --firmware uefi --data-image "$LOG_DIR/data.bin" \
         --sound "$sink" --cmd "$prog" > "$log" 2>&1 &
     pid=$!
     # Both probes wait for a key after their last verdict.
-    qemu_wait_for_log "$log" "${expect##* }\|FATAL\|KERNEL PANIC\|panicked\|-FAIL\|FAIL-" 90 "$pid" || true
+    qemu_wait_for_log "$log" "${expect##* }\|FATAL\|KERNEL PANIC\|panicked\|-FAIL\|FAIL-" "$PROBE_TIMEOUT" "$pid" || true
     qemu_stop_and_reap "$pid"
     pid=""
     qemu_guest_log "$log" > "$log.guest"
@@ -67,6 +70,8 @@ for sink in "${SINKS[@]}"; do
     else
         fail=$((fail+1))
         # Show why here: the log lives in a temp dir that CI throws away.
+        printf '=== %s %s first 80 lines ===\n' "$sink" "$(basename "$prog")" >&2
+        head -80 "$log" >&2
         printf '=== %s %s last 40 lines ===\n' "$sink" "$(basename "$prog")" >&2
         tail -40 "$log" >&2
         printf '%-10s %-22s FAIL missing:%s (%s)\n' "$sink" "$(basename "$prog")" \
