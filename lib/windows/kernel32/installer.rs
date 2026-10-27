@@ -140,3 +140,12 @@ pub unsafe extern "system" fn GetWindowsDirectoryA(out: u32, capacity: u32) -> u
     }
     path.len() as u32 - 1
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn GetSystemDirectoryA(out: u32, capacity: u32) -> u32 {
+    let path = b"C:\\RETROOS\\WINDOWS\\SYSTEM\0";
+    if capacity < path.len() as u32 { return path.len() as u32; }
+    if out == 0 { return 0; }
+    unsafe { core::ptr::copy_nonoverlapping(path.as_ptr(), out as *mut u8, path.len()); }
+    path.len() as u32 - 1
+}

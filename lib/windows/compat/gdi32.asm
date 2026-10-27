@@ -21,7 +21,11 @@ gate SetBkColor
 gate SetBkMode
 gate SetLayout
 gate SetTextColor
-gate TextOutW
+gate GetBkColor
+gate GetTextColor
+global _RetroGdiTextOutW@20
+_RetroGdiTextOutW@20:
+gate RetroGdiTextOutW
 
 global _RetroGdiBitmap@12
 _RetroGdiBitmap@12:
@@ -49,8 +53,15 @@ global _RetroGdiDeleteDC@4
 _RetroGdiDeleteDC@4:
 gate RetroGdiDeleteDC
 
-global _TextOutW@20
-_TextOutW@20: jmp TextOutW
+global _GetCurrentPositionEx@8
+_GetCurrentPositionEx@8:
+gate GetCurrentPositionEx
+global _MoveToEx@16
+_MoveToEx@16: jmp MoveToEx
+global _GetTextExtentPoint32W@16
+_GetTextExtentPoint32W@16: jmp GetTextExtentPoint32W
+global _GetPixel@12
+_GetPixel@12: jmp GetPixel
 
 global _RetroGdiSelectObject@8
 _RetroGdiSelectObject@8:
@@ -78,3 +89,8 @@ _Polygon@12: jmp Polygon
 global _GetObjectType@4
 _GetObjectType@4:
 gate GetObjectType
+
+global _GetBkColor@4
+_GetBkColor@4: jmp GetBkColor
+global _CreateSolidBrush@4
+_CreateSolidBrush@4: jmp CreateSolidBrush

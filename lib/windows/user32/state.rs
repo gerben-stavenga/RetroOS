@@ -28,6 +28,7 @@ pub struct Class {
 }
 
 pub struct Window {
+    pub properties: Vec<(Vec<u16>, u32)>,
     pub hwnd: u32,
     pub class: u32,
     pub thread: u32,

@@ -12,7 +12,7 @@ nasm_library(
 windows_rust_library(
     name = "user32_rust",
     crate_root = "user32.rs",
-    srcs = ["messagebox.rs", "scrollbar.rs", "bitmap.rs", "win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
+    srcs = ["mdi.rs", "messagebox.rs", "scrollbar.rs", "bitmap.rs", "win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
 )
 
 windows_dll(
@@ -20,6 +20,19 @@ windows_dll(
     obj = ":user32_obj",
     libraries = [":user32_rust"],
     imports = {
+        "_GetPrivateProfileStringW@24": "KERNEL32.GetPrivateProfileStringW",
+        "_GetPrivateProfileIntW@16": "KERNEL32.GetPrivateProfileIntW",
+        "_GetBkColor@4": "GDI32.GetBkColor",
+        "_GetTextColor@4": "GDI32.GetTextColor",
+        "_SetTextAlign@8": "GDI32.SetTextAlign",
+        "_ExtFloodFill@20": "GDI32.ExtFloodFill",
+        "_GlobalAddAtomA@4": "KERNEL32.GlobalAddAtomA",
+        "_GlobalFindAtomA@4": "KERNEL32.GlobalFindAtomA",
+        "_GlobalDeleteAtom@4": "KERNEL32.GlobalDeleteAtom",
+        "_GlobalGetAtomNameA@12": "KERNEL32.GlobalGetAtomNameA",
+
+        "_GetSystemDirectoryA@8": "KERNEL32.GetSystemDirectoryA",
+        "_MulDiv@12": "KERNEL32.MulDiv",
         "_GetWindowsDirectoryA@8": "KERNEL32.GetWindowsDirectoryA",
         "_GetTempFileNameA@16": "KERNEL32.GetTempFileNameA",
         "_GetTempPathA@8": "KERNEL32.GetTempPathA",
@@ -37,6 +50,8 @@ windows_dll(
 
         "_Rectangle@20": "GDI32.Rectangle",
         "_CreatePen@12": "GDI32.CreatePen",
+        "_PatBlt@24": "GDI32.PatBlt",
+        "_ExtTextOutA@32": "GDI32.ExtTextOutA",
         "_TextOutA@20": "GDI32.TextOutA",
         "_LineTo@12": "GDI32.LineTo",
         "_MoveToEx@16": "GDI32.MoveToEx",
@@ -93,6 +108,11 @@ windows_dll(
         "_WideCharToMultiByte@32": "KERNEL32.WideCharToMultiByte",
     },
     export_aliases = {
+        "DefMDIChildProcA": "_DefMDIChildProcA@16",
+        "DefMDIChildProcW": "_DefMDIChildProcW@16",
+        "TranslateMDISysAccel": "_TranslateMDISysAccel@8",
+        "WaitMessage": "_WaitMessage@0",
+        "IsZoomed": "_IsZoomed@4",
         "MessageBoxA": "_MessageBoxA@16", "MessageBoxW": "_MessageBoxW@16",
         "SetScrollPos": "_SetScrollPos@16", "GetScrollPos": "_GetScrollPos@8",
         "SetScrollRange": "_SetScrollRange@20", "GetScrollRange": "_GetScrollRange@16",
@@ -266,6 +286,12 @@ windows_dll(
         "SetWindowLongA": "_SetWindowLongA@12",
         "GetClassNameA": "_GetClassNameA@12",
         "GetWindowTextA": "_GetWindowTextA@12",
+        "GetPropA": "_GetPropA@8",
+        "GetPropW": "_GetPropW@8",
+        "SetPropA": "_SetPropA@12",
+        "SetPropW": "_SetPropW@12",
+        "RemovePropA": "_RemovePropA@8",
+        "RemovePropW": "_RemovePropW@8",
         "GetWindowTextLengthA": "_GetWindowTextLengthA@4",
         "SetWindowTextA": "_SetWindowTextA@8",
         "DefWindowProcA": "_DefWindowProcA@16",
@@ -322,6 +348,12 @@ windows_dll(
     out = "USER32.DLL",
     module_name = "USER32",
     exports = [
+        "WaitMessage",
+        "IsZoomed",
+        "DefMDIChildProcA",
+        "DefMDIChildProcW",
+        "TranslateMDISysAccel",
+
         "MessageBoxA",
         "SetScrollPos", "GetScrollPos", "SetScrollRange", "GetScrollRange",
         "CreateMenu",
@@ -459,6 +491,12 @@ windows_dll(
         "SetWindowLongA",
         "GetClassNameA",
         "GetWindowTextA",
+        "GetPropA",
+        "GetPropW",
+        "SetPropA",
+        "SetPropW",
+        "RemovePropA",
+        "RemovePropW",
         "GetWindowTextLengthA",
         "SetWindowTextA",
         "DefWindowProcA",

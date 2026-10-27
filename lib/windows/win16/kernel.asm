@@ -32,7 +32,7 @@ gate GetModuleFileName
 gate GetProcAddress
 gate MakeProcInstance
 gate FreeProcInstance
-gate GetProfileString
+bridge GetProfileString, 2058, 18
 gate FindResource
 gate LoadResource
 gate LockResource
@@ -55,12 +55,12 @@ gate DOS3Call
 gate SetErrorMode
 gate OutputDebugString
 gate LocalShrink
-gate GetPrivateProfileInt
-gate GetPrivateProfileString
+bridge GetPrivateProfileInt, 2127, 14
+bridge GetPrivateProfileString, 2128, 22
 gate WritePrivateProfileString
 gate GetDOSEnvironment
 gate GetWinFlags
-gate GetSystemDirectory
+bridge GetSystemDirectory, 2135, 6
 gate GetDriveType
 gate FatalAppExit
 gate IsDBCSLeadByte
@@ -68,3 +68,13 @@ gate IsDBCSLeadByte
 bridge WinExec, 2166, 6
 
 bridge GetWindowsDirectory, 2134, 6
+
+gate GlobalHandle
+gate GetFreeSpace
+gate AllocCStoDSAlias
+gate AllocSelector
+gate FreeSelector
+gate PrestoChangoSelector
+
+bridge GetProfileInt, 2057, 10
+gate GetHeapSpaces

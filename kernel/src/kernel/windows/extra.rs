@@ -130,6 +130,10 @@ const SPECS: &[Spec] = &[
     spec(b"GDI32", b"RetroGdiCurrentObject", 8),
     spec(b"GDI32", b"RetroGdiClip", 12),
     spec(b"GDI32", b"RetroGdiBounds", 8),
+    spec(b"GDI32", b"GetBkColor", 4),
+    spec(b"GDI32", b"GetTextColor", 4),
+    spec(b"GDI32", b"RetroGdiTextOutW", 20),
+    spec(b"GDI32", b"GetCurrentPositionEx", 8),
     spec(b"GDI32", b"RetroGdiBitmap", 12),
     spec(b"GDI32", b"GetPixel", 12),
     spec(b"GDI32", b"SetPixel", 16),
@@ -197,6 +201,13 @@ const SPECS: &[Spec] = &[
     spec(b"KERNEL32", b"GetShortPathNameA", 12),
     spec(b"KERNEL32", b"GetSystemTimeAsFileTime", 4),
     spec(b"KERNEL32", b"GetThreadLocale", 0),
+    spec(b"KERNEL32", b"GlobalAddAtomA", 4),
+    spec(b"KERNEL32", b"GlobalAddAtomW", 4),
+    spec(b"KERNEL32", b"GlobalFindAtomA", 4),
+    spec(b"KERNEL32", b"GlobalFindAtomW", 4),
+    spec(b"KERNEL32", b"GlobalDeleteAtom", 4),
+    spec(b"KERNEL32", b"GlobalGetAtomNameA", 12),
+    spec(b"KERNEL32", b"GlobalGetAtomNameW", 12),
     spec(b"KERNEL32", b"GlobalAlloc", 8),
     spec(b"KERNEL32", b"GlobalLock", 4),
     spec(b"KERNEL32", b"GlobalMemoryStatus", 4),
@@ -910,7 +921,6 @@ pub(super) fn call<A: crate::Arch>(
         || name.eq_ignore_ascii_case(b"SetFileTime")
         || name.eq_ignore_ascii_case(b"SetFileAttributesA")
         || name.eq_ignore_ascii_case(b"SetFileAttributesW")
-        || name.eq_ignore_ascii_case(b"SetErrorMode")
         || name.eq_ignore_ascii_case(b"SetConsoleTitleA")
         || name.eq_ignore_ascii_case(b"SetConsoleActiveScreenBuffer")
         || name.eq_ignore_ascii_case(b"Sleep")
@@ -1318,7 +1328,7 @@ fn tls_alloc(state: &mut WindowsState) -> u32 {
     0xffff_ffff
 }
 
-fn heap_alloc<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, flags: u32, bytes: u32) -> u32 {
+pub(super) fn heap_alloc<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, flags: u32, bytes: u32) -> u32 {
     let size = bytes.max(1).next_multiple_of(8);
     if let Some(block) = state.blocks.iter_mut().find(|block| !block.used && block.size >= size) {
         block.used = true;
@@ -1341,7 +1351,7 @@ fn heap_alloc<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, flags: 
     addr
 }
 
-fn heap_free(state: &mut WindowsState, addr: u32) {
+pub(super) fn heap_free(state: &mut WindowsState, addr: u32) {
     if let Some(block) = state.blocks.iter_mut().find(|block| block.addr == addr) {
         block.used = false;
     }

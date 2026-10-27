@@ -3,6 +3,20 @@
 use crate::{Message, class, input, keyboard, menu, message, paint, rect, state, window};
 
 unsafe extern "system" {
+    fn GetPrivateProfileStringW(section:*const u16,key:*const u16,default:*const u16,out:*mut u16,capacity:u32,path:*const u16)->u32;
+    fn PatBlt(dc:u32,x:i32,y:i32,width:i32,height:i32,rop:u32)->i32;
+    fn ExtTextOutA(dc:u32,x:i32,y:i32,options:u32,rect:*const rect::Rect,text:u32,count:u32,dx:*const i32)->i32;
+    fn GetSystemDirectoryA(out:u32,capacity:u32)->u32;
+    fn MulDiv(number:i32,numerator:i32,denominator:i32)->i32;
+    fn GetPrivateProfileIntW(section:*const u16,key:*const u16,default:i32,path:*const u16)->u32;
+    fn GetBkColor(dc:u32)->u32;
+    fn GetTextColor(dc:u32)->u32;
+    fn SetTextAlign(dc:u32,align:u32)->u32;
+    fn ExtFloodFill(dc:u32,x:i32,y:i32,color:u32,kind:u32)->i32;
+    fn GlobalAddAtomA(name: u32) -> u32;
+    fn GlobalFindAtomA(name: u32) -> u32;
+    fn GlobalDeleteAtom(atom: u32) -> u32;
+    fn GlobalGetAtomNameA(atom: u32, out: u32, capacity: u32) -> u32;
     fn GetWindowsDirectoryA(out: u32, capacity: u32) -> u32;
     fn GetTempFileNameA(path: u32, prefix: u32, unique: u32, out: u32) -> u32;
     fn GetTempPathA(n: u32, p: u32) -> u32;
@@ -66,7 +80,7 @@ unsafe extern "system" {
     fn FillRect(dc: u32, rect: *const [i32; 4], brush: u32) -> i32;
 }
 unsafe extern "C" {
-    pub(super) static Retro16Config: [u32; 11];
+    pub(super) static Retro16Config: [u32; 12];
 }
 const PROC: u32 = 0xfffd_0000;
 
@@ -97,12 +111,11 @@ fn encode(h: u32) -> u32 {
         0x7fff + s.win16_handles.len() as u32
     })
 }
-const NATIVE_PROC: u32 = 0xfffc_0000;
 fn native_procedure(p: u32) -> Option<u32> {
-    if p & 0xffff_0000 != NATIVE_PROC {
-        return None;
-    }
-    state::with(|s| s.win16_native_procs.get((p & 0xffff) as usize).copied())
+    let base = unsafe { Retro16Config[11] };
+    let offset = p.checked_sub(base)?;
+    if offset >= 256 * 16 || offset % 16 != 0 { return None; }
+    state::with(|s| s.win16_native_procs.get((offset / 16) as usize).copied())
 }
 fn procedure(p: u32) -> u32 {
     if let Some(native) = native_procedure(p) {
@@ -130,12 +143,12 @@ fn original(p: u32) -> u32 {
     if p & 0xffff_0000 != PROC {
         return state::with(|s| {
             if let Some(i) = s.win16_native_procs.iter().position(|&v| v == p) {
-                return NATIVE_PROC + i as u32;
+                return unsafe { Retro16Config[11] } + i as u32 * 16;
             }
-            if s.win16_native_procs.len() >= 0x10000 {
+            if s.win16_native_procs.len() >= 256 {
                 return 0;
             }
-            let id = NATIVE_PROC + s.win16_native_procs.len() as u32;
+            let id = unsafe { Retro16Config[11] } + s.win16_native_procs.len() as u32 * 16;
             s.win16_native_procs.push(p);
             id
         });
@@ -165,6 +178,18 @@ unsafe fn pointer(p: u32, bytes: usize) -> Option<u32> {
         }
         base.checked_add(offset)
     }
+}
+unsafe fn far_pointer(p: u32) -> Option<u32> {
+    if p <= 0xffff { return Some(p); }
+    unsafe {
+        for index in 1..Retro16Config[6] {
+            let sel = index * 8 + 7;
+            let (base, limit) = segment(sel)?;
+            if let Some(offset) = p.checked_sub(base)
+                && offset <= limit.min(0xffff) { return Some((sel << 16) | offset); }
+        }
+    }
+    None
 }
 unsafe fn string(p: u32) -> Option<u32> {
     if p <= 0xffff {
@@ -422,6 +447,82 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
         let i = |at| word(a, at) as i16 as i32;
         let h = |at| decode(word(a, at));
         Some(match o {
+            20000..=20255 => {
+                let native = state::with(|s| s.win16_native_procs.get((o - 20000) as usize).copied())?;
+                return translated_message(h(8), w(6), w(4), d(0), |m, wp, lp| {
+                    crate::call_procedure(native, h(8), m, wp, lp, false) as u32
+                });
+            }
+            24 => window::RemovePropA(h(4), string(d(0))?),
+            25 => window::GetPropA(h(4), string(d(0))?),
+            26 => window::SetPropA(h(6), string(d(2))?, w(0)),
+            431 | 432 => {
+                let p = d(0);
+                let value = if p >> 16 == 0 { p } else { string(p)? };
+                let result = if o == 431 { crate::text::CharUpperA(value) } else { crate::text::CharLowerA(value) };
+                if p >> 16 == 0 { result } else { p }
+            }
+            2058 | 2128 => {
+                let off=if o==2128 {4}else{0};
+                let wide=|p|->Option<Option<alloc::vec::Vec<u16>>> {
+                    if p==0 {return Some(None);}
+                    let mut v=crate::text::read(string(p)?,false);v.push(0);Some(Some(v))
+                };
+                let section=wide(d(14+off))?;
+                let key=wide(d(10+off))?;
+                let default=wide(d(6+off))?;
+                let path=wide(if o==2128 {d(0)}else{0})?;
+                let ptr=|s:&Option<alloc::vec::Vec<u16>>|s.as_ref().map_or(core::ptr::null(),|v|v.as_ptr());
+                let cap=w(off) as usize;
+                if cap==0 {return Some(0);}
+                let out=pointer(d(2+off),cap)? as *mut u8;
+                let mut buffer=alloc::vec![0u16;cap];
+                let n=GetPrivateProfileStringW(ptr(&section),ptr(&key),ptr(&default),buffer.as_mut_ptr(),cap as u32,ptr(&path)) as usize;
+                let bytes=crate::text::ansi(&buffer[..n]);
+                let list=section.is_none()||key.is_none();
+                let reserve=if list && bytes.len()>=cap {2}else{1};
+                let n=bytes.len().min(cap.saturating_sub(reserve));
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(),out,n);out.add(n).write(0);
+                if list && n+1<cap {out.add(n+1).write(0);}
+                n as u32
+            }
+            2127 => {
+                let mut section=crate::text::read(string(d(10))?,false);section.push(0);
+                let mut key=crate::text::read(string(d(6))?,false);key.push(0);
+                let mut path=crate::text::read(string(d(0))?,false);path.push(0);
+                GetPrivateProfileIntW(section.as_ptr(),key.as_ptr(),i(4),path.as_ptr())
+            }
+            2057 => {
+                let mut section=crate::text::read(string(d(6))?,false); section.push(0);
+                let mut key=crate::text::read(string(d(2))?,false); key.push(0);
+                GetPrivateProfileIntW(section.as_ptr(),key.as_ptr(),i(0),core::ptr::null())
+            }
+            447 => {
+                let (wp,lp)=to32(w(4),w(2),d(0));
+                crate::mdi::DefMDIChildProcA(h(8),w(4),wp,lp) as u32
+            }
+            451 => crate::mdi::TranslateMDISysAccel(h(4),&read_message(d(0))?) as u32,
+
+            1075 => GetBkColor(h(0)),
+            1090 => GetTextColor(h(0)),
+            1346 => SetTextAlign(h(2),w(0)),
+            1372 => ExtFloodFill(h(10),i(8),i(6),d(2),w(0)) as u32,
+            268 => GlobalAddAtomA(string(d(0))?),
+            269 => GlobalDeleteAtom(w(0)),
+            270 => GlobalFindAtomA(string(d(0))?),
+            271 => GlobalGetAtomNameA(w(6), pointer(d(2), w(0) as usize)?, i(0) as u32),
+            1029 => PatBlt(h(12),i(10),i(8),i(6),i(4),d(0)) as u32,
+            1351 => {
+                let rect=if d(10)!=0 {Some(rectangle(d(10))?)} else {None};
+                let count=w(4);
+                let advances=if d(0)!=0 {
+                    let p=pointer(d(0),count as usize*2)?;
+                    Some((0..count as usize).map(|n|(p as *const i16).add(n).read_unaligned() as i32).collect::<alloc::vec::Vec<_>>())
+                } else {None};
+                ExtTextOutA(h(20),i(18),i(16),w(14),rect.as_ref().map_or(core::ptr::null(),|r|r),if count==0 {0} else {pointer(d(6),count as usize)?},count,advances.as_ref().map_or(core::ptr::null(),|v|v.as_ptr())) as u32
+            }
+            1128 => MulDiv(i(4),i(2),i(0)) as u32,
+            2135 => GetSystemDirectoryA(pointer(d(2), w(0) as usize)?, w(0)),
             2134 => GetWindowsDirectoryA(pointer(d(2), w(0) as usize)?, w(0)),
             3001 => LZCopy(w(2), w(0)) as u32,
             2097 => {
@@ -612,7 +713,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             }
             10 => message::SetTimer(h(8), w(6), w(4), procedure(d(0))),
             12 => message::KillTimer(h(2), w(0)) as u32,
-            15 => crate::runtime::GetTickCount(),
+            13 | 15 => crate::runtime::GetTickCount(),
             18 => encode(input::SetCapture(h(0))),
             19 => input::ReleaseCapture() as u32,
             22 => encode(input::SetFocus(h(0))),
@@ -714,6 +815,35 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             35 => window::IsWindowEnabled(h(0)) as u32,
             36 => window::GetWindowTextA(h(6), pointer(d(2), w(0) as usize)?, i(0)) as u32,
             37 => window::SetWindowTextA(h(4), string(d(0))?) as u32,
+            38 => window::GetWindowTextLengthA(h(0)) as u32,
+            48 => window::IsChild(h(2), h(0)) as u32,
+            49 => window::IsWindowVisible(h(0)) as u32,
+            90 => input::IsDialogMessageA(h(4), &read_message(d(0))?) as u32,
+            112 => message::WaitMessage() as u32,
+            228 => encode(input::GetNextDlgTabItem(h(4), h(2), w(0))),
+            239 => crate::dialog::DialogBoxParamA(w(14), string(d(10))?, h(8), procedure(d(4)), d(0)) as u32,
+            241 => encode(crate::dialog::CreateDialogParamA(w(14), string(d(10))?, h(8), procedure(d(4)), d(0))),
+            250 => menu::GetMenuState(h(4), w(2), w(0)),
+            272 => window::IsZoomed(h(0)) as u32,
+            284 => state::with(|s| (0x8000usize.saturating_sub(s.win16_handles.len()) * 100 / 0x8000) as u32),
+            308 => {
+                let (wp, lp) = to32(w(4), w(2), d(0));
+                crate::dialog::DefDlgProcA(h(8), w(4), wp, lp) as u32
+            }
+            404 => {
+                let out = pointer(d(0), 26)?;
+                let mut wc = [0u32; 10];
+                let result = class::GetClassInfoA(w(8), string(d(4))?, wc.as_mut_ptr() as u32);
+                if result == 0 { return Some(0); }
+                putw(out,0,wc[0]); putl(out,2,original(wc[1]));
+                for (at, value) in [(6,wc[2]),(8,wc[3]),(10,wc[4]),(12,encode(wc[5])),(14,encode(wc[6])),(16,encode(wc[7]))] {
+                    putw(out,at,value);
+                }
+                putl(out,18,far_pointer(wc[8])?);
+                putl(out,22,d(4));
+                result as u32
+            }
+
             39 => {
                 let out = pointer(d(0), 32)?;
                 let mut ps = [0u32; 16];
@@ -733,10 +863,10 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 ps[0] = decode(ps[0]);
                 paint::EndPaint(h(4), ps.as_ptr() as u32) as u32
             }
-            41 => {
+            41 | 452 => {
                 let size = |v: i32| if v == i16::MIN as i32 { i32::MIN } else { v };
                 encode(crate::CreateWindowExA(
-                    0,
+                    if o == 452 { d(30) } else { 0 },
                     string(d(26))?,
                     string(d(22))?,
                     d(18),
@@ -957,8 +1087,8 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             113 => keyboard::TranslateMessage(&read_message(d(0))?) as u32,
             114 => crate::DispatchMessageA(&read_message(d(0))?) as u32,
             122 => {
-                // Native control procedures are exposed as opaque Win16
-                // tokens; translate at that boundary, never far-call them.
+                // Native control procedures have real Win16 entry thunks.
+                // Forward directly when called through CallWindowProc.
                 let proc = d(10);
                 if let Some(native) = native_procedure(proc) {
                     return translated_message(h(8), w(6), w(4), d(0), |m, wp, lp| {

@@ -34,6 +34,7 @@ struct State {
     selected_fonts: Vec<(u32, u32)>,
     map_modes: Vec<(u32, i32)>,
     brush_origins: Vec<(u32, [i32; 2])>,
+    text_align: Vec<(u32,u32)>,
     next: u32,
     regions: Vec<(u32, Vec<Rect>)>,
     clips: Vec<(u32, Vec<Rect>)>,
@@ -50,6 +51,7 @@ static GLOBAL: Global = Global {
         selected_fonts: Vec::new(),
         map_modes: Vec::new(),
         brush_origins: Vec::new(),
+        text_align: Vec::new(),
         next: 0x5000_0000,
         regions: Vec::new(),
         clips: Vec::new(),
@@ -436,6 +438,7 @@ pub extern "system" fn DeleteDC(dc: u32) -> i32 {
             s.selected_fonts.retain(|(h, _)| *h != dc);
             s.map_modes.retain(|(h, _)| *h != dc);
             s.brush_origins.retain(|(h, _)| *h != dc);
+            s.text_align.retain(|(h, _)| *h != dc);
         });
     }
     result
@@ -685,4 +688,56 @@ pub unsafe extern "system" fn SetBrushOrgEx(dc: u32, x: i32, y: i32, old: *mut [
 pub extern "system" fn UnrealizeObject(object: u32) -> i32 {
     // Solid brushes are used directly; there is no device realization to drop.
     i32::from(unsafe { GetObjectType(object) } == 2)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn SetTextAlign(dc: u32, align: u32) -> u32 {
+    let mut bounds=Rect::default();
+    if unsafe { RetroGdiBounds(dc,&mut bounds) }==0 || align & !0x11f != 0 { return u32::MAX; }
+    with(|s| {
+        if let Some((_,old))=s.text_align.iter_mut().find(|(h,_)|*h==dc) {
+            let previous=*old;*old=align;previous
+        } else {s.text_align.push((dc,align));0}
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn GetTextAlign(dc: u32) -> u32 {
+    with(|s|s.text_align.iter().find(|(h,_)|*h==dc).map_or(0,|(_,a)|*a))
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ExtFloodFill(dc: u32, x: i32, y: i32, color: u32, kind: u32) -> i32 {
+    unsafe extern "system" {fn GetPixel(dc:u32,x:i32,y:i32)->u32;}
+    let mut bounds=Rect::default();
+    if kind>1 || unsafe {RetroGdiBounds(dc,&mut bounds)}==0 || !bounds.contains(x,y) {return 0;}
+    let brush=unsafe {RetroGdiCurrentObject(dc,2)};
+    if brush==0 {return 0;}
+    let clips=with(|s|s.clips.iter().find(|(h,_)|*h==dc).map(|(_,r)|r.clone()));
+    let allowed=|x,y|bounds.contains(x,y) && clips.as_ref().is_none_or(|r|r.iter().any(|r|r.contains(x,y)));
+    let matches=|pixel| pixel!=u32::MAX && if kind==1 {pixel==color} else {pixel!=color};
+    if !allowed(x,y) || !matches(unsafe {GetPixel(dc,x,y)}) {return 0;}
+    let width=(bounds.right-bounds.left) as usize;
+    let height=(bounds.bottom-bounds.top) as usize;
+    let mut visited=vec![false;width*height];
+    let mut pending=vec![(x,y)];
+    visited[(y-bounds.top) as usize*width+(x-bounds.left) as usize]=true;
+    while let Some((x,y))=pending.pop() {
+        if !matches(unsafe {GetPixel(dc,x,y)}) {continue;}
+        unsafe {RetroGdiFillRect(dc,&[x,y,x+1,y+1],brush);}
+        for (nx,ny) in [(x-1,y),(x+1,y),(x,y-1),(x,y+1)] {
+            if allowed(nx,ny) {
+                let at=(ny-bounds.top) as usize*width+(nx-bounds.left) as usize;
+                if !visited[at] {visited[at]=true;pending.push((nx,ny));}
+            }
+        }
+    }
+    1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn PatBlt(dc:u32,x:i32,y:i32,width:i32,height:i32,rop:u32)->i32 {
+    let truth=(rop>>16) as u8;
+    // A pattern operation cannot depend on the source operand. Reuse the
+    // shared raster operation and clipping with an identical source view.
+    if ((truth >> 2) ^ truth) & 0x33 != 0 {return 0;}
+    unsafe {BitBlt(dc,x,y,width,height,dc,x,y,rop)}
 }

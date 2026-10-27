@@ -657,3 +657,9 @@ pub unsafe extern "system" fn MsgWaitForMultipleObjects(
         }
     }
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn WaitMessage() -> i32 {
+    let mut message = Message::default();
+    i32::from(unsafe { get(&mut message, 0, 0, 0, false, true) } >= 0)
+}

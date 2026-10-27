@@ -20,6 +20,7 @@ windows_dll(
     obj = ":kernel32_obj",
     libraries = [":kernel32_rust"],
     export_aliases = {
+        "GetSystemDirectoryA": "_GetSystemDirectoryA@8",
         "GetWindowsDirectoryA": "_GetWindowsDirectoryA@8",
         "GetTempFileNameA": "_GetTempFileNameA@16",
         "LZCopy": "_LZCopy@8",
@@ -49,6 +50,15 @@ windows_dll(
     out = "KERNEL32.DLL",
     module_name = "KERNEL32",
     exports = [
+        "GlobalAddAtomA",
+        "GlobalAddAtomW",
+        "GlobalFindAtomA",
+        "GlobalFindAtomW",
+        "GlobalDeleteAtom",
+        "GlobalGetAtomNameA",
+        "GlobalGetAtomNameW",
+
+        "GetSystemDirectoryA",
         "GetWindowsDirectoryA",
         "GetTempFileNameA", "LZCopy", "GetTempPathA", "GetCurrentDirectoryA", "GetFileAttributesA",
         "WinExec", "CreateProcessA",

@@ -44,7 +44,7 @@ fn stock() -> LogFont {
 unsafe extern "system" {
     fn RetroGdiSelectObject(dc: u32, object: u32) -> u32;
     fn RetroGdiObject(object: u32, size: u32, out: u32) -> i32;
-    fn TextOutW(dc: u32, x: i32, y: i32, text: *const u16, count: i32) -> i32;
+    fn RetroGdiTextOutW(dc: u32, x: i32, y: i32, text: *const u16, count: i32) -> i32;
     fn MultiByteToWideChar(
         cp: u32,
         flags: u32,
@@ -230,4 +230,84 @@ pub extern "system" fn GetMapMode(dc: u32) -> i32 {
             .find(|(h, _)| *h == dc)
             .map_or(1, |(_, m)| *m)
     })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn TextOutW(dc:u32, mut x:i32, mut y:i32, text:*const u16, count:i32)->i32 {
+    unsafe extern "system" {
+        fn GetCurrentPositionEx(dc:u32,out:*mut [i32;2])->i32;
+        fn MoveToEx(dc:u32,x:i32,y:i32,old:*mut [i32;2])->i32;
+        fn GetTextExtentPoint32W(dc:u32,text:*const u16,count:i32,size:*mut [i32;2])->i32;
+    }
+    if count<0 || text.is_null() && count!=0 {return 0;}
+    let align=crate::GetTextAlign(dc);
+    let mut size=[0,16];
+    if unsafe {GetTextExtentPoint32W(dc,text,count,&mut size)}==0 {return 0;}
+    if align&1!=0 {
+        let mut position=[0;2];
+        if unsafe {GetCurrentPositionEx(dc,&mut position)}==0 {return 0;}
+        x=position[0];y=position[1];
+    }
+    let (origin_x,origin_y)=(x,y);
+    x-=match align&6 {2=>size[0],6=>size[0]/2,_=>0};
+    y-=match align&24 {8=>size[1],24=>12,_=>0};
+    let result=unsafe {RetroGdiTextOutW(dc,x,y,text,count)};
+    if result!=0 && align&1!=0 {
+        unsafe {MoveToEx(dc,origin_x+size[0],origin_y,core::ptr::null_mut());}
+    }
+    result
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ExtTextOutA(dc:u32,x:i32,y:i32,options:u32,rect:*const Rect,text:*const u8,count:u32,dx:*const i32)->i32 {
+    if count > 65535 || (count != 0 && text.is_null()) { return 0; }
+    let mut units = alloc::vec![0u16; count as usize];
+    let n = if count == 0 { 0 } else { unsafe { MultiByteToWideChar(0,0,text,count as i32,units.as_mut_ptr(),count as i32) } };
+    if count != 0 && n == 0 { return 0; }
+    // The supported ANSI code pages are single-byte, so advances correspond
+    // one-to-one with the decoded UTF-16 units.
+    unsafe { ExtTextOutW(dc,x,y,options,rect,units.as_ptr(),n as u32,dx) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ExtTextOutW(dc:u32,mut x:i32,mut y:i32,options:u32,rect:*const Rect,text:*const u16,count:u32,dx:*const i32)->i32 {
+    unsafe extern "system" {
+        fn GetBkColor(dc:u32)->u32;
+        fn CreateSolidBrush(color:u32)->u32;
+        fn GetCurrentPositionEx(dc:u32,out:*mut [i32;2])->i32;
+        fn MoveToEx(dc:u32,x:i32,y:i32,old:*mut [i32;2])->i32;
+    }
+    if count > 65535 || (count != 0 && text.is_null()) || options & !6 != 0 || (options & 6 != 0 && rect.is_null()) { return 0; }
+    let mut bounds=Rect::default();
+    if unsafe {crate::RetroGdiBounds(dc,&mut bounds)}==0 {return 0;}
+    let saved=with(|s|s.clips.iter().find(|(h,_)|*h==dc).map(|(_,r)|r.clone()));
+    if options & 4 != 0 {
+        let r=unsafe {rect.read_unaligned()};
+        let clipped=crate::combine(saved.as_deref().unwrap_or(&[bounds]),&[r],1);
+        unsafe {crate::RetroGdiClip(dc,clipped.as_ptr(),clipped.len() as i32);}
+    }
+    if options & 2 != 0 {
+        let r=unsafe {rect.read_unaligned()};
+        let brush=unsafe {CreateSolidBrush(GetBkColor(dc))};
+        unsafe {crate::RetroGdiFillRect(dc,&[r.left,r.top,r.right,r.bottom],brush);}
+        crate::DeleteObject(brush);
+    }
+    let result=if count==0 {1} else if dx.is_null() {
+        unsafe {TextOutW(dc,x,y,text,count as i32)}
+    } else {
+        let align=crate::GetTextAlign(dc);
+        if align&1!=0 {let mut p=[0;2];unsafe {GetCurrentPositionEx(dc,&mut p);} x=p[0];y=p[1];}
+        let origin=[x,y];
+        let width=(0..count as usize).fold(0i32,|v,i|v.saturating_add(unsafe {dx.add(i).read_unaligned()}));
+        x=x.saturating_sub(match align&6 {2=>width,6=>width/2,_=>0});
+        y-=match align&24 {8=>16,24=>12,_=>0};
+        let mut ok=1;
+        for i in 0..count as usize {
+            if unsafe {RetroGdiTextOutW(dc,x,y,text.add(i),1)}==0 {ok=0;break;}
+            x=x.saturating_add(unsafe {dx.add(i).read_unaligned()});
+        }
+        if ok!=0 && align&1!=0 {unsafe {MoveToEx(dc,origin[0].saturating_add(width),origin[1],core::ptr::null_mut());}}
+        ok
+    };
+    if options&4!=0 {unsafe {crate::RetroGdiClip(dc,saved.as_ref().map_or(core::ptr::null(),|r|r.as_ptr()),saved.as_ref().map_or(-1,|r|r.len() as i32));}}
+    result
 }

@@ -116,6 +116,7 @@ pub unsafe fn create(mut cs: CreateStruct, wide: bool) -> u32 {
             ex_style: cs.ex_style,
             user: 0,
             extra: vec![0; class.window_extra],
+            properties: Vec::new(),
             title,
             x: cs.x,
             y: cs.y,
@@ -1082,3 +1083,50 @@ pub extern "system" fn IsIconic(hwnd: u32) -> i32 {
         )
     })
 }
+
+#[unsafe(no_mangle)]
+pub extern "system" fn IsZoomed(hwnd: u32) -> i32 {
+    state::with(|s| i32::from(s.windows.iter().any(|w| w.hwnd == hwnd && w.style & 0x01000000 != 0)))
+}
+
+unsafe extern "system" {
+    fn GlobalGetAtomNameA(atom: u32, out: u32, capacity: u32) -> u32;
+}
+unsafe fn property_key(name: u32, wide: bool) -> Vec<u16> {
+    if name <= 0xffff {
+        let mut buffer = [0u8; 256];
+        if unsafe { GlobalGetAtomNameA(name, buffer.as_mut_ptr() as u32, 256) } == 0 {
+            return Vec::new();
+        }
+        unsafe { text::read(buffer.as_ptr() as u32, false) }
+    } else {
+        unsafe { text::read(name, wide) }
+    }
+}
+unsafe fn property(hwnd: u32, name: u32, wide: bool, op: u32, data: u32) -> u32 {
+    let key = unsafe { property_key(name, wide) };
+    if key.is_empty() { return state::error(87); }
+    state::with(|s| {
+        let Some(window) = s.windows.iter_mut().find(|w| w.hwnd == hwnd) else { return 0; };
+        let index = window.properties.iter().position(|(k, _)| text::same(k, &key));
+        match (op, index) {
+            (0, Some(i)) => window.properties[i].1,
+            (1, Some(i)) => { window.properties[i].1 = data; 1 }
+            (1, None) => { window.properties.push((key, data)); 1 }
+            (2, Some(i)) => window.properties.remove(i).1,
+            _ => 0,
+        }
+    })
+}
+macro_rules! property_api {
+    ($get:ident, $set:ident, $remove:ident, $wide:expr) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "system" fn $get(hwnd:u32,name:u32)->u32 { unsafe { property(hwnd,name,$wide,0,0) } }
+        #[unsafe(no_mangle)]
+        pub unsafe extern "system" fn $set(hwnd:u32,name:u32,data:u32)->u32 { unsafe { property(hwnd,name,$wide,1,data) } }
+        #[unsafe(no_mangle)]
+        pub unsafe extern "system" fn $remove(hwnd:u32,name:u32)->u32 { unsafe { property(hwnd,name,$wide,2,0) } }
+    };
+}
+property_api!(GetPropA, SetPropA, RemovePropA, false);
+property_api!(GetPropW, SetPropW, RemovePropW, true);

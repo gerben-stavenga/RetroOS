@@ -22,9 +22,9 @@ bridge SetCapture, 18, 2
 bridge ReleaseCapture, 19, 0
 bridge SetFocus, 22, 2
 bridge GetFocus, 23, 0
-gate RemoveProp
-gate GetProp
-gate SetProp
+bridge RemoveProp, 24, 6
+bridge GetProp, 25, 6
+bridge SetProp, 26, 8
 bridge ClientToScreen, 28, 6
 bridge ScreenToClient, 29, 6
 bridge IsIconic, 31, 2
@@ -139,8 +139,8 @@ bridge DeleteMenu, 413, 6
 bridge ModifyMenu, 414, 12
 gate wsprintf
 gate lstrcmp
-gate AnsiUpper
-gate AnsiLower
+bridge AnsiUpper, 431, 4
+bridge AnsiLower, 432, 4
 bridge DestroyIcon, 457, 2
 gate DrawFocusRect
 gate lstrcmpi
@@ -148,3 +148,42 @@ gate AnsiNext
 gate WNetGetConnection
 
 bridge wvsprintf, 421, 12
+
+bridge GlobalAddAtom, 268, 4
+bridge GlobalDeleteAtom, 269, 2
+bridge GlobalFindAtom, 270, 4
+bridge GlobalGetAtomName, 271, 8
+
+bridge GetTickCount, 13, 0
+bridge GetWindowTextLength, 38, 2
+bridge IsChild, 48, 4
+bridge IsWindowVisible, 49, 2
+bridge IsDialogMessage, 90, 6
+bridge WaitMessage, 112, 0
+bridge GetNextDlgTabItem, 228, 6
+bridge DialogBoxParam, 239, 16
+bridge CreateDialogParam, 241, 16
+bridge GetMenuState, 250, 6
+bridge IsZoomed, 272, 2
+bridge GetFreeSystemResources, 284, 2
+bridge DefDlgProc, 308, 10
+bridge GetClassInfo, 404, 10
+bridge CreateWindowEx, 452, 34
+
+bridge DefMDIChildProc, 447, 10
+bridge TranslateMDISysAccel, 451, 6
+
+; Real callable/readable far procedures for shared 32-bit control classes.
+; Win16 frameworks may inspect a WNDPROC before forwarding through it.
+align 16
+global RetroNativeProcedures
+RetroNativeProcedures:
+%assign native_index 0
+%rep 256
+    push word (20000 + native_index)
+    call bridge_enter
+    add sp, 2
+    retf 10
+    align 16
+%assign native_index native_index + 1
+%endrep

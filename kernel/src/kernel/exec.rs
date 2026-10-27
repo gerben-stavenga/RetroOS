@@ -353,7 +353,7 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
         BinaryFormat::Lx => Err(-8),
         BinaryFormat::Ne if matches!(exec_vga, ExecVga::None) => {
             crate::kernel::windows::exec_ne_into(
-                machine, threads, tid, data.bytes, path, &parent_cwd, personality_name)
+                machine, threads, tid, data.bytes, path, &parent_cwd, personality_name, &cmdtail)
         }
         BinaryFormat::Ne => Err(-8),
         BinaryFormat::Pe if matches!(exec_vga, ExecVga::None) => {

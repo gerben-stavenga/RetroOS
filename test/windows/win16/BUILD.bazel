@@ -6,6 +6,17 @@ windows16_binary(name="bridge", obj=":bridge_obj", imports={
 }, visibility=["//visibility:public"])
 nasm_library(name="window_obj", srcs=["window.asm"], copts=["-fobj"])
 windows16_binary(name="window", obj=":window_obj", imports={
+    "GetPrivateProfileString": "KERNEL.128",
+    "PatBlt": "GDI.29",
+    "ExtTextOut": "GDI.351", "SetBkColor": "GDI.1",
+    "SetTextAlign": "GDI.346", "ExtFloodFill": "GDI.372",
+    "SetProp": "USER.26", "GetProp": "USER.25", "RemoveProp": "USER.24",
+    "InitTask": "KERNEL.91",
+    "GlobalAlloc": "KERNEL.15", "GlobalReAlloc": "KERNEL.16", "GlobalFree": "KERNEL.17",
+    "GlobalLock": "KERNEL.18", "GlobalUnlock": "KERNEL.19", "GlobalSize": "KERNEL.20", "GlobalHandle": "KERNEL.21",
+    "AllocCStoDSAlias": "KERNEL.170", "FreeSelector": "KERNEL.176",
+    "GlobalAddAtom": "USER.268", "GlobalDeleteAtom": "USER.269",
+    "GlobalFindAtom": "USER.270", "GlobalGetAtomName": "USER.271",
     "GetTempFileName": "KERNEL.97", "LoadLibrary": "KERNEL.95", "FreeLibrary": "KERNEL.96",
     "GetModuleHandle": "KERNEL.47", "GetProcAddress": "KERNEL.50", "GetModuleUsage": "KERNEL.48",
     "wvsprintf": "USER.421", "WinExec": "KERNEL.166",

@@ -21,6 +21,7 @@ def main():
     subprocess.run(['bazelisk', 'build', *targets, '--platforms=@platforms//host'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-win16-') as directory:
         root = Path(directory)
+        (root / "INSTALL.INI").write_text("[Installer]\nTarget=C:\\CIV\n", encoding="ascii")
         system = root / 'RETROOS/WINDOWS/SYSTEM'
         system.mkdir(parents=True)
         system32 = root / 'RETROOS/WINDOWS/SYSTEM32'
@@ -33,7 +34,7 @@ def main():
         for program in ('bridge', 'window'):
             shutil.copyfile(ROOT / f'bazel-bin/test/windows/win16/{program}.exe', root / 'BRIDGE.EXE')
             result = subprocess.run(['python3', str(ROOT/'test/disk_fixture.py'), '--root', directory, '--',
-                str(ROOT/f'bazel-bin/kernel/{host}'), '--c-root', '/', '--cmd', '/BRIDGE.EXE'],
+                str(ROOT/f'bazel-bin/kernel/{host}'), '--c-root', '/', '--cmd', '/BRIDGE.EXE probe' if program == 'window' else '/BRIDGE.EXE'],
                 cwd=ROOT, capture_output=True, text=True, timeout=40)
             log = result.stdout + result.stderr
             if result.returncode or f'WIN16 {program.upper()} PASS' not in log or any(x in log for x in ('PANIC', 'SEGV', ' FAIL')):

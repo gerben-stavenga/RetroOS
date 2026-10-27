@@ -21,7 +21,7 @@ bridge LineTo, 1019, 6
 bridge MoveTo, 1020, 6
 gate Arc
 bridge Rectangle, 1027, 10
-gate PatBlt
+bridge PatBlt, 1029, 14
 bridge SetPixel, 1031, 10
 bridge TextOut, 1033, 12
 bridge BitBlt, 1034, 20
@@ -54,15 +54,20 @@ gate GetWindowExt
 gate LPtoDP
 gate PlayMetaFile
 gate DeleteMetaFile
-gate MulDiv
+bridge MulDiv, 1128, 6
 bridge SetBrushOrg, 1148, 6
 bridge UnrealizeObject, 1150, 2
 gate CreateIC
 gate GetNearestColor
 gate CreateDiscardableBitmap
 gate SetMetaFileBits
-gate ExtTextOut
+bridge ExtTextOut, 1351, 22
 gate CreatePalette
 gate AnimatePalette
 gate CreateDIBitmap
 gate SetDIBitsToDevice
+
+bridge GetBkColor, 1075, 2
+bridge GetTextColor, 1090, 2
+bridge SetTextAlign, 1346, 4
+bridge ExtFloodFill, 1372, 12

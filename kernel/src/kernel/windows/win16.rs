@@ -69,6 +69,8 @@ struct LocalBlock {
     locks: u8,
 }
 
+struct GlobalBlock { handle: u16, selector: u16, count: usize, address: u32, size: u32, flags: u16, locks: u16 }
+
 pub(super) struct State {
     image: Vec<u8>,
     modules: Vec<LoadedModule>,
@@ -79,6 +81,9 @@ pub(super) struct State {
     local_next: u16,
     local_start: u16,
     local_blocks: Vec<LocalBlock>,
+    global_blocks: Vec<GlobalBlock>,
+    selector_floor: usize,
+    selector_reservations: Vec<u16>,
     local_end: u16,
     psp_selector: u16,
     env_selector: u16,
@@ -117,6 +122,13 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::Kernel, 18) => (2, true, "GlobalLock"),
         (Module::Kernel, 19) => (2, false, "GlobalUnlock"),
         (Module::Kernel, 20) => (2, true, "GlobalSize"),
+        (Module::Kernel, 21) => (2, true, "GlobalHandle"),
+        (Module::Kernel, 138) => (2, true, "GetHeapSpaces"),
+        (Module::Kernel, 169) => (2, true, "GetFreeSpace"),
+        (Module::Kernel, 170) => (2, false, "AllocCStoDSAlias"),
+        (Module::Kernel, 175) => (2, false, "AllocSelector"),
+        (Module::Kernel, 176) => (2, false, "FreeSelector"),
+        (Module::Kernel, 177) => (4, false, "PrestoChangoSelector"),
         (Module::Kernel, 23) => (2, false, "LockSegment"),
         (Module::Kernel, 24) => (2, false, "UnlockSegment"),
         (Module::Kernel, 25) => (4, true, "GlobalCompact"),
@@ -127,74 +139,45 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::Kernel, 50) => (6, true, "GetProcAddress"),
         (Module::Kernel, 51) => (6, true, "MakeProcInstance"),
         (Module::Kernel, 52) => (4, false, "FreeProcInstance"),
-        (Module::Kernel, 58) => (18, false, "GetProfileString"),
         (Module::Kernel, 60) => (10, false, "FindResource"),
         (Module::Kernel, 61) => (4, false, "LoadResource"),
         (Module::Kernel, 62) => (2, true, "LockResource"),
         (Module::Kernel, 63) => (2, false, "FreeResource"),
         (Module::Kernel, 74) => (10, false, "OpenFile"),
-        (Module::Kernel, 81) => (2, false, "_lclose"),
         (Module::Kernel, 88) => (8, true, "lstrcpy"),
         (Module::Kernel, 89) => (8, true, "lstrcat"),
         (Module::Kernel, 90) => (4, false, "lstrlen"),
         (Module::Kernel, 91) => (0, false, "InitTask"),
         (Module::Kernel, 95) => (4, false, "LoadLibrary"),
         (Module::Kernel, 96) => (2, false, "FreeLibrary"),
-        (Module::Kernel, 97) => (12, false, "GetTempFileName"),
         (Module::Kernel, 102) => (0, false, "DOS3Call"),
         (Module::Kernel, 107) => (2, false, "SetErrorMode"),
         (Module::Kernel, 115) => (4, false, "OutputDebugString"),
         (Module::Kernel, 121) => (4, false, "LocalShrink"),
-        (Module::Kernel, 127) => (14, false, "GetPrivateProfileInt"),
-        (Module::Kernel, 128) => (22, false, "GetPrivateProfileString"),
         (Module::Kernel, 129) => (16, false, "WritePrivateProfileString"),
         (Module::Kernel, 131) => (0, true, "GetDOSEnvironment"),
         (Module::Kernel, 132) => (0, true, "GetWinFlags"),
-        (Module::Kernel, 135) => (6, false, "GetSystemDirectory"),
         (Module::Kernel, 136) => (2, false, "GetDriveType"),
         (Module::Kernel, 137) => (6, false, "FatalAppExit"),
         (Module::Kernel, 207) => (2, false, "IsDBCSLeadByte"),
 
-        (Module::Gdi, 1) => (6, true, "SetBkColor"),
-        (Module::Gdi, 2) => (4, false, "SetBkMode"),
-        (Module::Gdi, 3) => (4, false, "SetMapMode"),
-        (Module::Gdi, 4) => (4, false, "SetROP2"),
         (Module::Gdi, 7) => (4, false, "SetStretchBltMode"),
-        (Module::Gdi, 9) => (6, true, "SetTextColor"),
         (Module::Gdi, 11) => (6, true, "SetWindowOrg"),
         (Module::Gdi, 12) => (6, true, "SetWindowExt"),
         (Module::Gdi, 13) => (6, true, "SetViewportOrg"),
         (Module::Gdi, 14) => (6, true, "SetViewportExt"),
-        (Module::Gdi, 19) => (6, false, "LineTo"),
-        (Module::Gdi, 20) => (6, true, "MoveTo"),
         (Module::Gdi, 23) => (18, false, "Arc"),
-        (Module::Gdi, 27) => (10, false, "Rectangle"),
-        (Module::Gdi, 29) => (14, false, "PatBlt"),
-        (Module::Gdi, 31) => (10, true, "SetPixel"),
-        (Module::Gdi, 33) => (12, false, "TextOut"),
-        (Module::Gdi, 34) => (20, false, "BitBlt"),
         (Module::Gdi, 35) => (24, false, "StretchBlt"),
         (Module::Gdi, 36) => (8, false, "Polygon"),
         (Module::Gdi, 38) => (14, true, "Escape"),
-        (Module::Gdi, 44) => (4, false, "SelectClipRgn"),
-        (Module::Gdi, 45) => (4, false, "SelectObject"),
-        (Module::Gdi, 51) => (6, false, "CreateCompatibleBitmap"),
-        (Module::Gdi, 52) => (2, false, "CreateCompatibleDC"),
         (Module::Gdi, 53) => (16, false, "CreateDC"),
         (Module::Gdi, 54) => (8, false, "CreateEllipticRgn"),
         (Module::Gdi, 57) => (4, false, "CreateFontIndirect"),
         (Module::Gdi, 60) => (2, false, "CreatePatternBrush"),
-        (Module::Gdi, 61) => (8, false, "CreatePen"),
-        (Module::Gdi, 66) => (4, false, "CreateSolidBrush"),
         (Module::Gdi, 67) => (8, false, "DPtoLP"),
-        (Module::Gdi, 68) => (2, false, "DeleteDC"),
-        (Module::Gdi, 69) => (2, false, "DeleteObject"),
         (Module::Gdi, 74) => (10, true, "GetBitmapBits"),
         (Module::Gdi, 80) => (4, false, "GetDeviceCaps"),
-        (Module::Gdi, 81) => (2, false, "GetMapMode"),
         (Module::Gdi, 82) => (8, false, "GetObject"),
-        (Module::Gdi, 83) => (6, true, "GetPixel"),
-        (Module::Gdi, 87) => (2, false, "GetStockObject"),
         (Module::Gdi, 91) => (8, true, "GetTextExtent"),
         (Module::Gdi, 93) => (6, false, "GetTextMetrics"),
         (Module::Gdi, 94) => (2, true, "GetViewportExt"),
@@ -202,152 +185,42 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::Gdi, 99) => (8, false, "LPtoDP"),
         (Module::Gdi, 123) => (4, false, "PlayMetaFile"),
         (Module::Gdi, 127) => (2, false, "DeleteMetaFile"),
-        (Module::Gdi, 128) => (6, false, "MulDiv"),
-        (Module::Gdi, 148) => (6, true, "SetBrushOrg"),
-        (Module::Gdi, 150) => (2, false, "UnrealizeObject"),
         (Module::Gdi, 153) => (16, false, "CreateIC"),
         (Module::Gdi, 154) => (6, true, "GetNearestColor"),
         (Module::Gdi, 156) => (6, false, "CreateDiscardableBitmap"),
         (Module::Gdi, 160) => (2, false, "SetMetaFileBits"),
-        (Module::Gdi, 351) => (22, false, "ExtTextOut"),
         (Module::Gdi, 360) => (4, false, "CreatePalette"),
         (Module::Gdi, 367) => (10, false, "AnimatePalette"),
         (Module::Gdi, 442) => (20, false, "CreateDIBitmap"),
         (Module::Gdi, 443) => (30, false, "SetDIBitsToDevice"),
 
-        (Module::User, 1) => (12, false, "MessageBox"),
-        (Module::User, 5) => (2, false, "InitApp"),
-        (Module::User, 6) => (2, false, "PostQuitMessage"),
-        (Module::User, 10) => (10, false, "SetTimer"),
-        (Module::User, 12) => (4, false, "KillTimer"),
-        (Module::User, 15) => (0, true, "GetCurrentTime"),
-        (Module::User, 18) => (2, false, "SetCapture"),
-        (Module::User, 19) => (0, false, "ReleaseCapture"),
-        (Module::User, 28) => (6, false, "ClientToScreen"),
-        (Module::User, 31) => (2, false, "IsIconic"),
-        (Module::User, 39) => (6, false, "BeginPaint"),
-        (Module::User, 40) => (6, false, "EndPaint"),
-        (Module::User, 41) => (30, false, "CreateWindow"),
-        (Module::User, 42) => (4, false, "ShowWindow"),
         (Module::User, 45) => (2, false, "BringWindowToTop"),
         (Module::User, 50) => (8, false, "FindWindow"),
-        (Module::User, 53) => (2, false, "DestroyWindow"),
-        (Module::User, 56) => (12, false, "MoveWindow"),
-        (Module::User, 57) => (4, false, "RegisterClass"),
-        (Module::User, 66) => (2, false, "GetDC"),
-        (Module::User, 68) => (4, false, "ReleaseDC"),
-        (Module::User, 72) => (12, false, "SetRect"),
-        (Module::User, 76) => (8, false, "PtInRect"),
-        (Module::User, 87) => (12, false, "DialogBox"),
-        (Module::User, 88) => (4, false, "EndDialog"),
-        (Module::User, 92) => (8, false, "SetDlgItemText"),
-        (Module::User, 93) => (10, false, "GetDlgItemText"),
-        (Module::User, 94) => (8, false, "SetDlgItemInt"),
-        (Module::User, 95) => (10, false, "GetDlgItemInt"),
-        (Module::User, 107) => (10, true, "DefWindowProc"),
-        (Module::User, 108) => (10, false, "GetMessage"),
-        (Module::User, 109) => (12, false, "PeekMessage"),
-        (Module::User, 110) => (10, false, "PostMessage"),
-        (Module::User, 111) => (10, true, "SendMessage"),
-        (Module::User, 113) => (4, false, "TranslateMessage"),
-        (Module::User, 114) => (4, true, "DispatchMessage"),
-        (Module::User, 124) => (2, false, "UpdateWindow"),
-        (Module::User, 125) => (8, false, "InvalidateRect"),
-        (Module::User, 150) => (6, false, "LoadMenu"),
-        (Module::User, 154) => (6, false, "CheckMenuItem"),
-        (Module::User, 155) => (6, false, "EnableMenuItem"),
-        (Module::User, 158) => (4, false, "SetMenu"),
         (Module::User, 171) => (12, false, "WinHelp"),
-        (Module::User, 173) => (6, false, "LoadCursor"),
-        (Module::User, 174) => (6, false, "LoadIcon"),
         (Module::User, 176) => (10, false, "LoadString"),
         (Module::User, 177) => (6, false, "LoadAccelerators"),
         (Module::User, 178) => (8, false, "TranslateAccelerator"),
-        (Module::User, 179) => (2, false, "GetSystemMetrics"),
         (Module::User, 286) => (0, false, "GetDesktopWindow"),
         (Module::User, 287) => (2, false, "GetLastActivePopup"),
         (Module::User, 420) => (0, false, "wsprintf"),
 
         (Module::User, 16) => (4, false, "ClipCursor"),
-        (Module::User, 17) => (4, false, "GetCursorPos"),
-        (Module::User, 22) => (2, false, "SetFocus"),
-        (Module::User, 23) => (0, false, "GetFocus"),
-        (Module::User, 24) => (6, false, "RemoveProp"),
-        (Module::User, 25) => (6, false, "GetProp"),
-        (Module::User, 26) => (8, false, "SetProp"),
-        (Module::User, 29) => (6, false, "ScreenToClient"),
-        (Module::User, 32) => (6, false, "GetWindowRect"),
-        (Module::User, 33) => (6, false, "GetClientRect"),
-        (Module::User, 34) => (4, false, "EnableWindow"),
-        (Module::User, 35) => (2, false, "IsWindowEnabled"),
-        (Module::User, 36) => (8, false, "GetWindowText"),
-        (Module::User, 37) => (6, false, "SetWindowText"),
-        (Module::User, 46) => (2, false, "GetParent"),
-        (Module::User, 47) => (2, false, "IsWindow"),
-        (Module::User, 60) => (0, false, "GetActiveWindow"),
-        (Module::User, 61) => (14, false, "ScrollWindow"),
-        (Module::User, 62) => (8, false, "SetScrollPos"),
-        (Module::User, 64) => (10, false, "SetScrollRange"),
-        (Module::User, 69) => (2, false, "SetCursor"),
-        (Module::User, 70) => (4, false, "SetCursorPos"),
-        (Module::User, 71) => (2, false, "ShowCursor"),
-        (Module::User, 74) => (8, false, "CopyRect"),
-        (Module::User, 77) => (8, false, "OffsetRect"),
-        (Module::User, 78) => (8, false, "InflateRect"),
-        (Module::User, 79) => (12, false, "IntersectRect"),
-        (Module::User, 81) => (8, false, "FillRect"),
         (Module::User, 83) => (8, false, "FrameRect"),
-        (Module::User, 84) => (8, false, "DrawIcon"),
-        (Module::User, 85) => (14, false, "DrawText"),
-        (Module::User, 91) => (4, false, "GetDlgItem"),
-        (Module::User, 96) => (8, false, "CheckRadioButton"),
-        (Module::User, 97) => (6, false, "CheckDlgButton"),
-        (Module::User, 98) => (4, false, "IsDlgButtonChecked"),
         (Module::User, 100) => (12, false, "DlgDirList"),
-        (Module::User, 101) => (12, true, "SendDlgItemMessage"),
         (Module::User, 104) => (2, false, "MessageBeep"),
-        (Module::User, 106) => (2, false, "GetKeyState"),
         (Module::User, 118) => (4, false, "RegisterWindowMessage"),
-        (Module::User, 122) => (14, true, "CallWindowProc"),
-        (Module::User, 127) => (6, false, "ValidateRect"),
         (Module::User, 131) => (4, true, "GetClassLong"),
-        (Module::User, 133) => (4, false, "GetWindowWord"),
-        (Module::User, 134) => (6, false, "SetWindowWord"),
-        (Module::User, 135) => (4, true, "GetWindowLong"),
-        (Module::User, 136) => (8, true, "SetWindowLong"),
-        (Module::User, 151) => (0, false, "CreateMenu"),
-        (Module::User, 152) => (2, false, "DestroyMenu"),
-        (Module::User, 153) => (12, false, "ChangeMenu"),
-        (Module::User, 156) => (4, false, "GetSystemMenu"),
-        (Module::User, 157) => (2, false, "GetMenu"),
-        (Module::User, 159) => (4, false, "GetSubMenu"),
-        (Module::User, 160) => (2, false, "DrawMenuBar"),
-        (Module::User, 175) => (6, false, "LoadBitmap"),
         (Module::User, 180) => (2, true, "GetSysColor"),
         (Module::User, 185) => (22, false, "GrayString"),
         (Module::User, 189) => (0, false, "GetSysModalWindow"),
         (Module::User, 191) => (6, false, "ChildWindowFromPoint"),
-        (Module::User, 196) => (20, true, "TabbedTextOut"),
         (Module::User, 229) => (2, false, "GetTopWindow"),
-        (Module::User, 232) => (14, false, "SetWindowPos"),
-        (Module::User, 236) => (0, false, "GetCapture"),
         (Module::User, 240) => (14, false, "DialogBoxIndirectParam"),
-        (Module::User, 242) => (16, false, "CreateDialogIndirectParam"),
-        (Module::User, 244) => (8, false, "EqualRect"),
         (Module::User, 249) => (2, false, "GetAsyncKeyState"),
-        (Module::User, 277) => (2, false, "GetDlgCtrlID"),
         (Module::User, 282) => (6, false, "SelectPalette"),
         (Module::User, 283) => (2, false, "RealizePalette"),
         (Module::User, 407) => (18, false, "CreateIcon"),
-        (Module::User, 410) => (12, false, "InsertMenu"),
-        (Module::User, 411) => (10, false, "AppendMenu"),
-        (Module::User, 412) => (6, false, "RemoveMenu"),
-        (Module::User, 413) => (6, false, "DeleteMenu"),
-        (Module::User, 414) => (12, false, "ModifyMenu"),
         (Module::User, 430) => (8, false, "lstrcmp"),
-        (Module::User, 431) => (4, true, "AnsiUpper"),
-        (Module::User, 432) => (4, true, "AnsiLower"),
-        (Module::User, 457) => (2, false, "DestroyIcon"),
         (Module::User, 466) => (6, false, "DrawFocusRect"),
         (Module::User, 471) => (8, false, "lstrcmpi"),
         (Module::User, 472) => (4, true, "AnsiNext"),
@@ -381,6 +254,54 @@ fn selector(ldt: &mut Vec<u64>, base: u32, size: usize, code: bool) -> Result<u1
     let sel = ((ldt.len() as u16) << 3) | 7;
     ldt.push(descriptor(base, size as u32 - 1, code));
     Ok(sel)
+}
+
+fn selector_slots(windows: &mut WindowsState, state: &State, count: usize) -> Option<usize> {
+    if count==0 || count>8192 {return None;}
+    for start in state.selector_floor..=8192-count {
+        if (start..start+count).all(|i| windows.ldt.get(i).copied().unwrap_or(0)==0
+            && !state.selector_reservations.contains(&(i as u16*8+7))) {
+            if windows.ldt.len()<start+count {windows.ldt.resize(start+count,0);}
+            return Some(start);
+        }
+    }
+    None
+}
+fn global_alloc<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, state: &mut State, size: u32, flags: u16) -> u32 {
+    let count = size.max(1).div_ceil(65536) as usize;
+    let Some(index) = selector_slots(windows,state,count) else { return 0 };
+    let address = super::extra::heap_alloc(machine,windows,if flags & 0x40 != 0 {8} else {0},size);
+    if address == 0 { return 0; }
+    let first = index as u16 * 8 + 7;
+    for i in 0..count {
+        let left = size.max(1).saturating_sub(i as u32 * 65536);
+        windows.ldt[index+i]=descriptor(address+i as u32*65536,left.min(65536)-1,false);
+    }
+    let handle = if flags & 2 != 0 { first - 1 } else { first };
+    state.global_blocks.push(GlobalBlock {handle,selector:first,count,address,size,flags,locks:0});
+    u32::from(handle)
+}
+fn global_free(windows: &mut WindowsState, state: &mut State, index: usize) {
+    let block = state.global_blocks.remove(index);
+    for i in 0..block.count { windows.ldt[usize::from(block.selector>>3)+i] = 0; }
+    super::extra::heap_free(windows,block.address);
+}
+fn sync_selectors<A: crate::Arch>(machine: &mut A, windows: &WindowsState, old_len: usize) {
+    const TABLE: usize = 0x7ff8_0000;
+    let pages = (windows.ldt.len()*8).div_ceil(4096);
+    let old_pages = (old_len*8).div_ceil(4096);
+    if pages > old_pages { machine.zero(TABLE+old_pages*4096,(pages-old_pages)*4096); }
+    machine.set_page_flags(TABLE/4096,pages,true,false);
+    for (i,&desc) in windows.ldt.iter().enumerate() {
+        let base = selector_base_from_ldt(&windows.ldt,i as u16*8+7).unwrap_or(0);
+        let limit = ((desc&0xffff)|((desc>>32)&0xf0000)) as u32;
+        machine.write::<u32>(TABLE+i*8,base);
+        machine.write::<u32>(TABLE+i*8+4,limit);
+    }
+    machine.set_page_flags(TABLE/4096,pages,false,false);
+    if let Ok(config) = super::export_address(&windows.modules,b"USER32",b"Retro16Config") {
+        machine.write::<u32>(config as usize+24,windows.ldt.len() as u32);
+    }
 }
 
 fn selector_base_from_ldt(ldt: &[u64], selector: u16) -> Option<u32> {
@@ -513,6 +434,12 @@ fn patch_chain<A: crate::Arch>(
     Ok(())
 }
 
+const LOW_EXPORTS: &[(u16,&[u8],u32)] = &[
+    (183,b"__0000H",0),(193,b"__0040H",0x400),
+    (174,b"__A000H",0xa0000),(181,b"__B000H",0xb0000),(182,b"__B800H",0xb8000),
+    (195,b"__C000H",0xc0000),(179,b"__D000H",0xd0000),
+    (190,b"__E000H",0xe0000),(194,b"__F000H",0xf0000),
+];
 fn imported_target<A: crate::Arch>(
     machine: &A,
     ldt: &[u64],
@@ -525,6 +452,13 @@ fn imported_target<A: crate::Arch>(
     let canonical = canonical_module_name(name);
     let kind = module(&canonical);
     if kind == Some(Module::Kernel) {
+        if let Some((_,_,base))=LOW_EXPORTS.iter().find(|(o,n,_)|ordinal==Some(*o) || symbol.is_some_and(|s|s.eq_ignore_ascii_case(n))) {
+            let index=ldt.iter().enumerate().find(|(i,desc)| **desc & (1<<47)!=0 && **desc & (1<<43)==0
+                && selector_base_from_ldt(ldt,*i as u16*8+7)==Some(*base)).map(|(i,_)|i).ok_or(-8)?;
+            return Ok((index as u16*8+7,0));
+        }
+        if symbol.is_some_and(|s|s.eq_ignore_ascii_case(b"__AHSHIFT")) {return Ok((3,0));}
+        if symbol.is_some_and(|s|s.eq_ignore_ascii_case(b"__AHINCR")) {return Ok((8,0));}
         match ordinal {
             Some(113) => return Ok((3, 0)),
             Some(114) => return Ok((8, 0)),
@@ -601,19 +535,22 @@ fn relocate_image<A: crate::Arch>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Shared executable launch context.
 pub(super) fn exec<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
     tid: usize,
     data: Vec<u8>,
     path: &[u8],
-    _parent_cwd: &[u8],
+    parent_cwd: &[u8],
     launcher: Option<thread::PersonalityName>,
+    cmdtail: &[u8],
 ) -> Result<(), i32> {
     let image = ne::Image::parse(&data).map_err(|_| -8)?;
     let header = image.header;
     let mut dos = crate::kernel::dos::new_win16(machine, (PSP_BASE >> 4) as u16);
     let mut ldt = dos.ldt[..32].to_vec();
+    for &(_,_,base) in LOW_EXPORTS { selector(&mut ldt,base,65536,false)?; }
     let mut selectors = Vec::with_capacity(header.segment_count as usize);
 
     for number in 1..=header.segment_count {
@@ -676,6 +613,11 @@ pub(super) fn exec<A: crate::Arch>(
         }));
     }
 
+    // Preserve the launcher's command tail in the shared PMDOS PSP.
+    let tail = &cmdtail[..cmdtail.len().min(126)];
+    machine.write::<u8>((PSP_BASE + 0x80) as usize, tail.len() as u8);
+    machine.copy_to((PSP_BASE + 0x81) as usize, tail);
+    machine.write::<u8>((PSP_BASE + 0x81) as usize + tail.len(), 0);
     // PMDOS initialized the shared PSP/JFT before NE image loading.
     machine.zero(ENV_BASE as usize, 4096);
     let psp_selector = selector(&mut ldt, PSP_BASE, 256, false)?;
@@ -734,7 +676,13 @@ pub(super) fn exec<A: crate::Arch>(
     windows.exec_path_len = main_path.len().min(windows.exec_path.len());
     windows.exec_path[..windows.exec_path_len]
         .copy_from_slice(&main_path[..windows.exec_path_len]);
-    let cwd = super::dirname(&main_path);
+    let cwd = if parent_cwd.is_empty() {
+        super::dirname(&main_path).to_vec()
+    } else if parent_cwd.get(1) == Some(&b':') {
+        crate::kernel::dos::dos_abs_to_vfs(parent_cwd).ok_or(-2)?
+    } else {
+        parent_cwd.to_vec()
+    };
     windows.cwd_len = cwd.len().min(windows.cwd.len());
     windows.cwd[..windows.cwd_len].copy_from_slice(&cwd[..windows.cwd_len]);
 
@@ -782,6 +730,9 @@ pub(super) fn exec<A: crate::Arch>(
         local_next,
         local_start: local_next,
         local_blocks: Vec::new(),
+        global_blocks: Vec::new(),
+        selector_floor: windows.ldt.len(),
+        selector_reservations: Vec::new(),
         local_end,
         psp_selector,
         env_selector,
@@ -819,6 +770,8 @@ fn init_bridge<A: crate::Arch>(
     let (ret_segment, ret_offset) = image.entry(424).map_err(|_| -8)?;
     let return16 =
         (u32::from(user.selectors[ret_segment as usize - 1]) << 16) | u32::from(ret_offset);
+    let (native_segment, native_offset) = image.entry(425).map_err(|_| -8)?;
+    let native16 = (u32::from(user.selectors[native_segment as usize - 1]) << 16) | u32::from(native_offset);
     // The first module represents the NE executable for filename/instance
     // lookup; PE dependency mapping starts at the ordinary first DLL slot.
     windows.modules.push(super::Module {
@@ -882,6 +835,7 @@ fn init_bridge<A: crate::Arch>(
         RESOURCE_IMAGE,
         image_data.len() as u32,
         u32::from(instance),
+        native16,
     ]
     .into_iter()
     .enumerate()
@@ -1104,13 +1058,24 @@ fn dispatch<A: crate::Arch>(
             }
             0
         }
+        (Module::Kernel, 107) => {
+            let mode = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
+            core::mem::replace(&mut windows.error_mode, mode)
+        }
         (Module::Kernel, 3) => 0x0000_0a03, // Windows 3.10
         (Module::Kernel, 4) => 1,
         (Module::Kernel, 91) => {
             // The Microsoft C startup consumes these register results before
             // it calls WinMain.
             regs.rax = u64::from(state.instance);
-            regs.rbx = u64::from(state.local_end.wrapping_sub(state.local_next));
+            // InitTask returns ES:BX pointing into the PSP command tail.
+            // Returning heap capacity here makes C runtimes dereference past
+            // the 256-byte PSP selector limit.
+            let length = machine.read::<u8>((PSP_BASE + 0x80) as usize).min(126) as u32;
+            let mut offset = if length == 0 { 0x80 } else { 0x81 };
+            while offset < 0x81 + length && matches!(machine.read::<u8>((PSP_BASE + offset) as usize), b' ' | b'\t') { offset += 1; }
+            machine.write::<u8>((PSP_BASE + 0x81 + length.min(126)) as usize, 0);
+            regs.rbx = u64::from(offset);
             regs.rcx = 0;
             regs.rdx = 1; // SW_SHOWNORMAL, passed by the C runtime to WinMain.
             regs.rsi = 0;
@@ -1179,7 +1144,73 @@ fn dispatch<A: crate::Arch>(
             let handle = stack_u16(machine, windows, regs, 4).unwrap_or(0);
             state.local_blocks.iter().find(|b| b.handle == handle).map_or(0, |b| u32::from(b.size))
         }
-        (Module::Kernel, 25) => machine.free_page_count().saturating_mul(4096).min(u32::MAX as usize) as u32,
+        (Module::Kernel, 138) => {
+            let total=u32::from(state.local_end-state.local_start);
+            let used=state.local_blocks.iter().map(|b|u32::from(b.size)+if b.movable {4}else{0}).sum::<u32>();
+            (total<<16)|total.saturating_sub(used)
+        }
+        (Module::Kernel, 15) => {
+            let size = stack_u32(machine,windows,regs,4).unwrap_or(0);
+            let flags = stack_u16(machine,windows,regs,8).unwrap_or(0);
+            global_alloc(machine,windows,state,size,flags)
+        }
+        (Module::Kernel, 16) => {
+            let flags = stack_u16(machine,windows,regs,4).unwrap_or(0);
+            let size = stack_u32(machine,windows,regs,6).unwrap_or(0);
+            let handle = stack_u16(machine,windows,regs,10).unwrap_or(0);
+            let Some(index) = state.global_blocks.iter().position(|b| b.handle == handle) else { return 0 };
+            if flags & 0x80 != 0 { state.global_blocks[index].flags = flags; return u32::from(handle); }
+            let old = &state.global_blocks[index];
+            if size <= old.size { state.global_blocks[index].size = size; return u32::from(handle); }
+            if old.locks != 0 || old.flags & 2 == 0 { return 0; }
+            let (address, length, original_flags) = (old.address, old.size, old.flags);
+            let next = global_alloc(machine,windows,state,size,original_flags | (flags & 0x40));
+            if next == 0 { return 0; }
+            let new_address = state.global_blocks.last().unwrap().address;
+            for i in 0..length as usize {
+                let byte = machine.read::<u8>(address as usize+i);
+                machine.write::<u8>(new_address as usize+i,byte);
+            }
+            global_free(windows,state,index);
+            next
+        }
+        (Module::Kernel, 17..=21) => {
+            let handle = stack_u16(machine,windows,regs,4).unwrap_or(0);
+            let Some(index) = state.global_blocks.iter().position(|b| b.handle == handle || b.selector == handle) else { return 0 };
+            let block = &mut state.global_blocks[index];
+            match gate.ordinal {
+                17 => { if block.locks != 0 { u32::from(handle) } else { global_free(windows,state,index); 0 } }
+                18 => { if block.flags & 2 != 0 { block.locks = block.locks.saturating_add(1); } u32::from(block.selector)<<16 }
+                19 => { block.locks = block.locks.saturating_sub(1); u32::from(block.locks != 0) }
+                20 => block.size,
+                _ => (u32::from(block.selector)<<16)|u32::from(block.handle),
+            }
+        }
+        (Module::Kernel, 170 | 175 | 176 | 177) => {
+            let src = stack_u16(machine,windows,regs,if gate.ordinal == 177 {6} else {4}).unwrap_or(0);
+            let index = usize::from(src >> 3);
+            if src != 0 && (src & 7 != 7 || index >= windows.ldt.len()) { return 0; }
+            let mut desc = if src == 0 { 0 } else { windows.ldt[index] };
+            match gate.ordinal {
+                176 => { if src == 0 || index < state.selector_floor { return u32::from(src); } windows.ldt[index] = 0; state.selector_reservations.retain(|&s|s!=src); 0 }
+                177 => {
+                    let dest = stack_u16(machine,windows,regs,4).unwrap_or(0);
+                    if src == 0 || dest & 7 != 7 || usize::from(dest>>3) >= windows.ldt.len() { return 0; }
+                    desc ^= 1 << 43;
+                    windows.ldt[usize::from(dest>>3)] = desc;
+                    u32::from(dest)
+                }
+                _ => {
+                    if gate.ordinal == 170 { desc &= !(1 << 43); }
+                    let Some(index)=selector_slots(windows,state,1) else{return 0;};
+                    let sel=index as u16*8+7;
+                    windows.ldt[index]=desc;
+                    state.selector_reservations.push(sel);
+                    u32::from(sel)
+                }
+            }
+        }
+        (Module::Kernel, 25 | 169) => machine.free_page_count().saturating_mul(4096).min(u32::MAX as usize) as u32,
         (Module::Kernel, 23 | 24 | 30 | 52) => 1,
         (Module::Kernel, 47) => {
             let p = stack_u32(machine, windows, regs, 4).unwrap_or(0);
@@ -1288,21 +1319,6 @@ fn dispatch<A: crate::Arch>(
                 .map(|resource| u32::from(resource.offset)
                     | (u32::from(state.resource_selector) << 16))
                 .unwrap_or(0)
-        }
-        (Module::Kernel, 127) => {
-            u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(0))
-        }
-        (Module::Kernel, 128) => {
-            let capacity = stack_u16(machine, windows, regs, 8).unwrap_or(0) as usize;
-            let Some(out) = stack_u32(machine, windows, regs, 10)
-                .and_then(|p| far_linear(windows, p)) else { return 0 };
-            let default_pointer = stack_u32(machine, windows, regs, 14).unwrap_or(0);
-            let default = far_string(machine, windows, default_pointer).unwrap_or_default();
-            if capacity == 0 { return 0; }
-            let len = default.len().min(capacity - 1);
-            machine.copy_to(out, &default[..len]);
-            machine.write::<u8>(out + len, 0);
-            len as u32
         }
         (Module::Kernel, 129) => 1,
         (Module::Kernel, 131) => u32::from(state.env_selector) << 16,
@@ -1526,8 +1542,10 @@ pub(super) fn handle_event<A: crate::Arch>(
             if crate::kernel::startup::trace_enabled() {
                 crate::compact_dbg_println!("[win16] {:?}.{} {}", gate.module, gate.ordinal, gate.name);
             }
+            let old_ldt = windows.ldt.len();
             let result = dispatch(machine, kt, windows, state, regs, gate);
-            if gate.module == Module::Kernel && gate.ordinal == 95 {
+            if gate.module == Module::Kernel && matches!(gate.ordinal,15..=21|95|170|175..=177) {
+                sync_selectors(machine,windows,old_ldt);
                 dos.ldt[..windows.ldt.len()].copy_from_slice(&windows.ldt);
                 for i in 0..windows.ldt.len() { dos.ldt_alloc[i / 32] |= 1 << (i % 32); }
                 machine.load_ldt(&dos.ldt[..]);
@@ -1541,6 +1559,7 @@ pub(super) fn handle_event<A: crate::Arch>(
         _ => {
             crate::compact_dbg_println!("[win16] unhandled {:?} at {:04x}:{:04x}",
                 event, regs.code_seg(), regs.ip32() as u16);
+            crate::compact_dbg_println!("[win16] ax={:04x} bx={:04x} cx={:04x} dx={:04x} ds={:04x} es={:04x} di={:04x}", regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.ds, regs.es, regs.rdi);
             thread::KernelAction::Exit(-1)
         }
     }

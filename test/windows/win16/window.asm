@@ -1,5 +1,10 @@
 bits 16
 segment _TEXT public class=CODE use16
+extern GetPrivateProfileString
+extern PatBlt
+extern SetTextAlign, ExtFloodFill, ExtTextOut, SetBkColor
+extern SetProp, GetProp, RemoveProp
+extern InitTask
 extern Exit, Debug, RegisterClass, CreateWindow, DestroyWindow, DefWindowProc
 extern SendMessage, UpdateWindow, BeginPaint, EndPaint, GetClientRect
 extern PostMessage, GetMessage, DispatchMessage, FillRect, CreateSolidBrush, GetPixel, GetDC, ReleaseDC
@@ -14,9 +19,135 @@ extern GetCursorPos, SetCursorPos, ClientToScreen, ScreenToClient
 extern wvsprintf, WinExec
 extern _lopen, _lclose, _lread, _lcreat, _llseek, _lwrite
 extern GetTempFileName, LoadLibrary, FreeLibrary, GetModuleHandle, GetProcAddress, GetModuleUsage
+extern GlobalAlloc, GlobalLock, GlobalUnlock, GlobalFree, GlobalSize, GlobalReAlloc, GlobalHandle
+extern AllocCStoDSAlias, FreeSelector
+extern GlobalAddAtom, GlobalFindAtom, GlobalDeleteAtom, GlobalGetAtomName
 global _start
 _start:
+    call far InitTask
+    test ax, ax
+    jz installer_fail
+    cmp bx, 0x100
+    jae installer_fail
+    cmp dword [es:bx], 'prob'
+    jne installer_fail
+    cmp word [es:bx+4], 'e'
+    jne installer_fail
+    push ds
+    pop es
     mov [initial_sp], sp
+    push ds
+    push word ini_section
+    push ds
+    push word ini_key
+    push ds
+    push word ini_default
+    push ds
+    push word ini_result
+    push word 32
+    push ds
+    push word ini_path
+    call far GetPrivateProfileString
+    cmp ax, 6
+    jne installer_fail
+    cmp dword [ini_result], 'C:\C'
+    jne installer_fail
+    cmp word [ini_result+4], 'IV'
+    jne installer_fail
+    push word 0x42
+    push dword 16
+    call far GlobalAlloc
+    test ax,ax
+    jz installer_fail
+    mov [test_global],ax
+    push ax
+    call far GlobalLock
+    test dx,dx
+    jz installer_fail
+    mov es,dx
+    mov bx,ax
+    cmp byte [es:bx],0
+    jne installer_fail
+    mov byte [es:bx],0x5a
+    push ds
+    pop es
+    push word [test_global]
+    call far GlobalUnlock
+    push word [test_global]
+    push dword 32
+    push word 2
+    call far GlobalReAlloc
+    test ax,ax
+    jz installer_fail
+    mov [test_global],ax
+    push ax
+    call far GlobalSize
+    cmp ax,32
+    jne installer_fail
+    test dx,dx
+    jnz installer_fail
+    push word [test_global]
+    call far GlobalLock
+    mov es,dx
+    mov bx,ax
+    cmp byte [es:bx],0x5a
+    jne installer_fail
+    push dx
+    call far GlobalHandle
+    cmp ax,[test_global]
+    jne installer_fail
+    push ds
+    pop es
+    push word [test_global]
+    call far GlobalUnlock
+    push word [test_global]
+    call far GlobalFree
+    test ax,ax
+    jnz installer_fail
+    push cs
+    call far AllocCStoDSAlias
+    test ax,ax
+    jz installer_fail
+    push ax
+    call far FreeSelector
+    test ax,ax
+    jnz installer_fail
+
+    push ds
+    push word atom_name
+    call far GlobalAddAtom
+    cmp ax,0xc000
+    jb installer_fail
+    mov [test_atom],ax
+    push ds
+    push word atom_lower
+    call far GlobalAddAtom
+    cmp ax,[test_atom]
+    jne installer_fail
+    push word [test_atom]
+    push ds
+    push word atom_buffer
+    push word 32
+    call far GlobalGetAtomName
+    cmp ax,9
+    jne installer_fail
+    cmp word [atom_buffer],0x6e49
+    jne installer_fail
+    push word [test_atom]
+    call far GlobalDeleteAtom
+    push ds
+    push word atom_lower
+    call far GlobalFindAtom
+    cmp ax,[test_atom]
+    jne installer_fail
+    push word [test_atom]
+    call far GlobalDeleteAtom
+    push ds
+    push word atom_name
+    call far GlobalFindAtom
+    test ax,ax
+    jnz installer_fail
+
     push ds
     push word kernel_name
     call far GetModuleHandle
@@ -464,6 +595,72 @@ _start:
     cmp dx, 0x0011
     jne fail
     push word [dc]
+    push word 6 ; TA_CENTER
+    call far SetTextAlign
+    test ax, ax
+    jnz fail
+    push word [dc]
+    push word 0
+    call far SetTextAlign
+    cmp ax, 6
+    jne fail
+    push word [dc]
+    push word 0
+    push word 0
+    push dword 0x00113322
+    push word 1 ; FLOODFILLSURFACE, default white brush
+    call far ExtFloodFill
+    test ax, ax
+    jz fail
+    push word [dc]
+    push word 0
+    push word 0
+    call far GetPixel
+    cmp ax, 0xffff
+    jne fail
+    cmp dx, 0x00ff
+    jne fail
+    push word [dc]
+    push dword 0x00112233
+    call far SetBkColor
+    push word [dc]
+    push word 0
+    push word 0
+    push word 6 ; ETO_OPAQUE | ETO_CLIPPED
+    push ds
+    push word tiny_rect
+    push dword 0
+    push word 0
+    push dword 0
+    call far ExtTextOut
+    test ax, ax
+    jz fail
+    push word [dc]
+    push word 0
+    push word 0
+    call far GetPixel
+    cmp ax, 0x2233
+    jne fail
+    cmp dx, 0x11
+    jne fail
+    push word [dc]
+    push word 0
+    push word 0
+    push word 1
+    push word 1
+    push dword 0x00550009 ; DSTINVERT
+    call far PatBlt
+    test ax, ax
+    jz fail
+    push word [dc]
+    push word 0
+    push word 0
+    call far GetPixel
+    cmp ax, 0xddcc
+    jne fail
+    cmp dx, 0xee
+    jne fail
+    push word [dc]
     push word [old_bitmap]
     call far SelectObject
     push word [bitmap]
@@ -621,6 +818,31 @@ _start:
     jz fail
     mov [button], ax
     push ax
+    push ds
+    push word button_title
+    push word 0x4321
+    call far SetProp
+    test ax, ax
+    jz fail
+    push word [button]
+    push ds
+    push word button_title
+    call far GetProp
+    cmp ax, 0x4321
+    jne fail
+    push word [button]
+    push ds
+    push word button_title
+    call far RemoveProp
+    cmp ax, 0x4321
+    jne fail
+    push word [button]
+    push ds
+    push word button_title
+    call far GetProp
+    test ax, ax
+    jnz fail
+    push word [button]
     push word -12
     call far GetWindowWord
     cmp ax, 77
@@ -636,6 +858,20 @@ _start:
     call far GetWindowLong
     mov [button_proc], ax
     mov [button_proc+2], dx
+    ; Native class procedures must be readable and directly far-callable.
+    mov es, dx
+    mov bx, ax
+    cmp byte [es:bx], 0x68
+    jne fail
+    push ds
+    pop es
+    push word [button]
+    push word 0x000e ; WM_GETTEXTLENGTH
+    push word 0
+    push dword 0
+    call far [button_proc]
+    cmp ax, 6
+    jne fail
     push word [button]
     push word -4
     push cs
@@ -1235,6 +1471,17 @@ installer_proc: dd 0
 lz_source: dw 0
 lz_dest: dw 0
 temp_unique: dw 0
+ini_section: db "Installer",0
+ini_key: db "Target",0
+ini_default: db "WRONG",0
+ini_path: db "C:\INSTALL.INI",0
+ini_result: times 32 db 0
+tiny_rect: dw 0,0,1,1
+test_global: dw 0
+test_atom: dw 0
+atom_name: db "Installer",0
+atom_lower: db "installer",0
+atom_buffer: times 32 db 0
 temp_prefix: db "TEST",0
 temp_one: times 144 db 0
 temp_two: times 144 db 0

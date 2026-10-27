@@ -115,3 +115,11 @@ gate CreateProcessA
 gate GetTempPathA
 gate GetCurrentDirectoryA
 gate GetFileAttributesA
+
+gate GlobalAddAtomA
+gate GlobalAddAtomW
+gate GlobalFindAtomA
+gate GlobalFindAtomW
+gate GlobalDeleteAtom
+gate GlobalGetAtomNameA
+gate GlobalGetAtomNameW

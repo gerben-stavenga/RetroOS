@@ -17,6 +17,7 @@ mod input;
 mod keyboard;
 mod menu;
 mod message;
+mod mdi;
 mod messagebox;
 mod paint;
 mod rect;

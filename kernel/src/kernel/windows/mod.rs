@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod pe;
 pub mod ne;
+mod atoms;
 mod extra;
 mod encoding;
 mod threads;
@@ -270,6 +271,7 @@ pub struct WindowsState {
     /// mode (bit 0) set, which is what a constant mode of 3 reported.
     std_mode: [u32; 3],
     last_error: u32,
+    error_mode: u32,
     pub cwd: [u8; 128],
     pub cwd_len: usize,
     exec_path: [u8; 164],
@@ -329,6 +331,7 @@ impl WindowsState {
             console: extra::Console::new(),
             std_mode: [0; 3],
             last_error: 0,
+            error_mode: 0,
             cwd: [0; 128],
             cwd_len: 0,
             exec_path: [0; 164],
@@ -493,6 +496,7 @@ impl WindowsState {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Shared executable launch context.
 pub fn exec_ne_into<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
@@ -501,8 +505,9 @@ pub fn exec_ne_into<A: crate::Arch>(
     path: &[u8],
     parent_cwd: &[u8],
     launcher: Option<thread::PersonalityName>,
+    cmdtail: &[u8],
 ) -> Result<(), i32> {
-    win16::exec(machine, threads, tid, data, path, parent_cwd, launcher)
+    win16::exec(machine, threads, tid, data, path, parent_cwd, launcher, cmdtail)
 }
 
 /// Publish the foremost native Win32 top-level window into the shared desktop.

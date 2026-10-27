@@ -1166,7 +1166,7 @@ fn prepare_program<A: crate::Arch>(
     let tid = match exec::detect_format(&buf, &launch_path) {
         exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, &launch_path, args, &cwd),
         exec::BinaryFormat::Lx => launch_os2(machine, threads, buf.into_bytes(), &launch_path, &cwd, &env, &cmdline_tail),
-        exec::BinaryFormat::Ne => launch_win16(machine, threads, buf.into_bytes(), &launch_path),
+        exec::BinaryFormat::Ne => launch_win16(machine, threads, buf.into_bytes(), &launch_path, &cwd, &cmdline_tail),
         exec::BinaryFormat::Pe => launch_windows(machine, threads, buf.into_bytes(), &loaded_path, &env),
         _ => dos::run_init_program(
             machine,
@@ -1317,6 +1317,8 @@ fn launch_win16<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     buf: alloc::vec::Vec<u8>,
     path: &[u8],
+    cwd: &[u8],
+    cmdtail: &[u8],
 ) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
@@ -1328,7 +1330,7 @@ fn launch_win16<A: crate::Arch>(
         t.kernel.tid as usize
     };
     crate::kernel::kpipe::add_reader(cpipe);
-    crate::kernel::windows::exec_ne_into(machine, threads, tid, buf, path, b"", None)
+    crate::kernel::windows::exec_ne_into(machine, threads, tid, buf, path, cwd, None, cmdtail)
         .unwrap_or_else(|e| {
             lib::compact_panic!(
                 "Windows NE exec failed ({}): errno {}",

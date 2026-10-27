@@ -83,7 +83,7 @@ section .data align=4
 global Retro16Config, _Retro16Config
 _Retro16Config:
 Retro16Config:
-    times 11 dd 0
+    times 12 dd 0
 retro16_jump: dd 0
     dw 0
 retro16_stack: dd 0

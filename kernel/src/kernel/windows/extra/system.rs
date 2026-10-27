@@ -11,10 +11,43 @@ pub(super) fn call<A: crate::Arch>(
     let args: [u32; 12] = core::array::from_fn(|n| arg(machine, regs, n));
     let a = |n: usize| args[n];
     match name {
+        b"SetErrorMode" => core::mem::replace(&mut state.error_mode, a(0)),
         b"WinHelpW" => fail(state,120,0),
         b"SetPixel" => {
             if super::super::target_mut(state,a(0)).is_none(){return u32::MAX;}
             super::super::put_pixel(state,a(0),a(1) as i32,a(2) as i32,a(3));a(3)&0xffffff
+        }
+        b"GlobalAddAtomA" | b"GlobalAddAtomW" | b"GlobalFindAtomA" | b"GlobalFindAtomW" => {
+            let pointer = a(0);
+            if pointer <= 0xffff {
+                return if (1..0xc000).contains(&pointer) { pointer } else { fail(state,87,0) };
+            }
+            let text = if name.ends_with(b"W") { w_string(machine,pointer) } else { c_string(machine,pointer) };
+            let Ok(text) = text else { return fail(state,87,0); };
+            let Ok(text) = core::str::from_utf8(&text) else { return fail(state,87,0); };
+            match super::super::atoms::GLOBAL.lock().lookup(text, name.starts_with(b"GlobalAdd")) {
+                Ok(atom) => u32::from(atom), Err(error) => fail(state,error,0),
+            }
+        }
+        b"GlobalDeleteAtom" => {
+            if let Err(error) = super::super::atoms::GLOBAL.lock().delete(a(0) as u16) {
+                state.last_error = error;
+            }
+            0
+        }
+        b"GlobalGetAtomNameA" | b"GlobalGetAtomNameW" => {
+            let out = a(1) as usize; let cap = a(2) as i32;
+            if out == 0 || cap <= 0 { return fail(state,87,0); }
+            let text = match super::super::atoms::GLOBAL.lock().name(a(0) as u16) {
+                Ok(text) => text, Err(error) => return fail(state,error,0),
+            };
+            if name.ends_with(b"A") { return copy_ascii(machine,out,cap as usize,text.as_bytes()); }
+            let mut n = 0;
+            for unit in text.encode_utf16().take(cap as usize - 1) {
+                machine.write::<u16>(out + n * 2, unit); n += 1;
+            }
+            machine.write::<u16>(out + n * 2, 0);
+            n as u32
         }
         b"OutputDebugStringA" | b"OutputDebugStringW" => {
             let value=if name.ends_with(b"W"){w_string(machine,a(0))}else{c_string(machine,a(0))};
@@ -48,6 +81,15 @@ pub(super) fn call<A: crate::Arch>(
         }
 
         b"RetroGdiDeleteObject" => super::super::dispatch(machine, kt, state, regs, super::super::Api::DeleteObject),
+        b"RetroGdiTextOutW" => super::super::dispatch(machine,kt,state,regs,super::super::Api::TextOutW),
+        b"GetBkColor" | b"GetTextColor" => state.dcs.iter().find(|d|d.handle==a(0))
+            .map_or(u32::MAX,|d|if name==b"GetBkColor"{d.bk}else{d.text}),
+        b"GetCurrentPositionEx" => {
+            let Some(dc)=state.dcs.iter().find(|d|d.handle==a(0)) else{return 0;};
+            if a(1)==0 {return 0;}
+            machine.write::<i32>(a(1) as usize,dc.x);
+            machine.write::<i32>(a(1) as usize+4,dc.y);1
+        }
         b"RetroGdiBounds" => {
             let dc = a(0);
             if dc != state.paint_dc && !state.dcs.iter().any(|d| d.handle == dc) { return 0; }
