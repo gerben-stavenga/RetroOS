@@ -29,10 +29,14 @@ source test/lib/qemu_common.sh
 qemu_bazel build //:data_disk || exit 1
 LOG_DIR=$(mktemp -d -t retroos-audio-matrix.XXXXXX)
 python3 test/private_data_disk.py bazel-bin/data_disk.bin "$LOG_DIR/data.bin" || exit 1
-# TCG on shared runners can spend over a refresh period in presentation.
-# Keep all protocol verdicts mandatory while allowing that execution overhead.
-PROBE_TIMEOUT=180
-ACCEL=(); [ "${1:-}" = "--kvm" ] && ACCEL=(--kvm)
+# Advance TCG device time with guest instructions, not host scheduling delays.
+# Otherwise a slow framebuffer copy can consume the single-cycle DMA window
+# before SBTEST observes its busy/idle edge. KVM keeps its real-time clock.
+# Instruction-count timing may run slower than wall time on shared runners.
+PROBE_TIMEOUT=300
+ACCEL=()
+TIMING=(-icount shift=0,sleep=off)
+if [ "${1:-}" = "--kvm" ]; then ACCEL=(--kvm); TIMING=(); PROBE_TIMEOUT=180; fi
 pid=""
 trap 'qemu_stop_and_reap "$pid"' EXIT
 trap 'exit 130' INT
@@ -53,7 +57,7 @@ for sink in "${SINKS[@]}"; do
     log="$LOG_DIR/$sink-$(basename "$prog").log"
     AUDIO_BACKEND=none QEMU_DISPLAY=none timeout --kill-after=5 "$PROBE_TIMEOUT" \
         ./run.sh qemu "${ACCEL[@]}" --arch x64 --firmware uefi --data-image "$LOG_DIR/data.bin" \
-        --sound "$sink" --cmd "$prog" > "$log" 2>&1 &
+        --sound "$sink" --cmd "$prog" -- "${TIMING[@]}" > "$log" 2>&1 &
     pid=$!
     # Both probes wait for a key after their last verdict.
     qemu_wait_for_log "$log" "${expect##* }\|FATAL\|KERNEL PANIC\|panicked\|-FAIL\|FAIL-" "$PROBE_TIMEOUT" "$pid" || true
@@ -70,8 +74,8 @@ for sink in "${SINKS[@]}"; do
     else
         fail=$((fail+1))
         # Show why here: the log lives in a temp dir that CI throws away.
-        printf '=== %s %s first 80 lines ===\n' "$sink" "$(basename "$prog")" >&2
-        head -80 "$log" >&2
+        printf '=== %s %s guest startup and verdicts ===\n' "$sink" "$(basename "$prog")" >&2
+        sed '/\[stall\]/d' "$log" | tail -120 >&2
         printf '=== %s %s last 40 lines ===\n' "$sink" "$(basename "$prog")" >&2
         tail -40 "$log" >&2
         printf '%-10s %-22s FAIL missing:%s (%s)\n' "$sink" "$(basename "$prog")" \
