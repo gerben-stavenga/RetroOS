@@ -1197,51 +1197,6 @@ fn dispatch<A: crate::Arch>(
         }
         (Module::User, 173 | 174 | 177) => 1,
         (Module::User, 171) => 1,
-        (Module::User, 175) => {
-            let name = stack_u32(machine, windows, regs, 4).unwrap_or(0);
-            if name >> 16 != 0 {
-                crate::compact_dbg_println!("[win16] named bitmap resources unsupported");
-                return 0;
-            }
-            let Ok(image) = ne::Image::parse(&state.image) else { return 0 };
-            let Ok(bytes) = image.resource(2, name as u16) else {
-                crate::compact_dbg_println!("[win16] bitmap resource {} not found", name as u16);
-                return 0;
-            };
-            let offset = (usize::from(state.resource_next) + 3) & !3;
-            let Some(end) = offset.checked_add(bytes.len()) else { return 0 };
-            if end >= 0x10000 { return 0; }
-            let header = RESOURCE_BASE as usize + offset;
-            machine.copy_to(header, bytes);
-            let Some((width, height, bpp, palette)) = dib_header(machine, header) else {
-                return 0;
-            };
-            let header_size = machine.read::<u32>(header) as usize;
-            let palette_entries = match bpp {
-                1..=8 if header_size >= 40 => {
-                    let used = machine.read::<u32>(header + 32) as usize;
-                    if used == 0 { 1usize << bpp } else { used }
-                }
-                1..=8 => 1usize << bpp,
-                _ => 0,
-            };
-            let palette_stride = if header_size == 12 { 3 } else { 4 };
-            let bits = palette.saturating_add(palette_entries.saturating_mul(palette_stride));
-            let Some(pixel_bytes) = width.checked_mul(height).and_then(|n| n.checked_mul(4)) else {
-                return 0;
-            };
-            let mut pixels = vec![0u8; pixel_bytes];
-            decode_dib(machine, bits, palette, width, height, bpp, &mut pixels);
-            state.resource_next = end as u16;
-            let handle = windows.next_object;
-            windows.next_object = windows.next_object.wrapping_add(1);
-            windows.gdi_objects.push((handle, super::GdiObject::Bitmap {
-                width: width as u32,
-                height: height as u32,
-                pixels,
-            }));
-            handle
-        }
         (Module::User, 178) => 0,
         (Module::User, 176) => {
             let capacity = stack_u16(machine, windows, regs, 4).unwrap_or(0) as usize;

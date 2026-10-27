@@ -109,7 +109,7 @@ bridge DrawMenuBar, 160, 2
 gate WinHelp
 gate LoadCursor
 gate LoadIcon
-gate LoadBitmap
+bridge LoadBitmap, 175, 6
 gate LoadString
 gate LoadAccelerators
 gate TranslateAccelerator

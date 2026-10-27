@@ -4,6 +4,7 @@ extern Exit, Debug, RegisterClass, CreateWindow, DestroyWindow, DefWindowProc
 extern SendMessage, UpdateWindow, BeginPaint, EndPaint, GetClientRect
 extern PostMessage, GetMessage, DispatchMessage, FillRect, CreateSolidBrush, GetPixel, GetDC, ReleaseDC
 extern CreateDC, CreateBitmap, SelectObject, DeleteDC, DeleteObject, SetPixel
+extern ShowWindow, GetWindowRect
 extern DOSExit, CreateDialog, SetDlgItemInt, GetDlgItemInt
 global _start
 _start:
@@ -70,6 +71,8 @@ _start:
     test ax, ax
     jz fail
     mov [hwnd], ax
+    cmp word [size_kind], 0
+    jne fail
     cmp word [created], 1
     jne fail
     cmp word [nested], 1
@@ -112,6 +115,54 @@ _start:
     push word [hwnd]
     push word [dc]
     call far ReleaseDC
+    ; Maximize must change geometry and notify the Win16 procedure. Repeating
+    ; it must not overwrite the normal placement needed by SW_RESTORE.
+    push word [hwnd]
+    push word 3
+    call far ShowWindow
+    cmp word [size_kind], 2
+    jne fail
+    push word [hwnd]
+    push word 3
+    call far ShowWindow
+    push word [hwnd]
+    push ds
+    push word rect
+    call far GetWindowRect
+    cmp word [rect+4], 1024
+    jne fail
+    cmp word [rect+6], 768
+    jne fail
+    push word [hwnd]
+    push word 9
+    call far ShowWindow
+    cmp word [size_kind], 0
+    jne fail
+    push word [hwnd]
+    push ds
+    push word rect
+    call far GetWindowRect
+    cmp word [rect], 10
+    jne fail
+    cmp word [rect+2], 10
+    jne fail
+    cmp word [rect+4], 170
+    jne fail
+    cmp word [rect+6], 130
+    jne fail
+    ; A segmented WINDOWPOS with NOMOVE|NOSIZE must not emit WM_SIZE
+    ; when forwarded through shared DefWindowProc.
+    mov ax, [hwnd]
+    mov [position], ax
+    mov word [size_kind], 0xffff
+    push ax
+    push word 0x47
+    push word 0
+    push ds
+    push word position
+    call far DefWindowProc
+    cmp word [size_kind], 0xffff
+    jne fail
     push ds
     push ds
     push word dlg_template
@@ -155,6 +206,8 @@ fail:
 wndproc:
     push bp
     mov bp, sp
+    cmp word [bp+12], 5
+    je .size
     cmp word [bp+12], 0x81
     je .nc
     cmp word [bp+12], 1
@@ -172,6 +225,12 @@ wndproc:
     push word [bp+10]
     push dword [bp+6]
     call far DefWindowProc
+    jmp .return
+.size:
+    mov ax, [bp+10]
+    mov [size_kind], ax
+    xor ax, ax
+    xor dx, dx
     jmp .return
 .nc:
     les bx, [bp+6]
@@ -277,6 +336,8 @@ dlg_template:
     dw 10,10,50,10,100
     dd 0x50810000
     db 0x81,0,0
+position: dw 0,0,0,0,0,0,3
+size_kind: dw 0xffff
 translated: dw 0
 dialog: dw 0
 remaining: dw 0

@@ -10,6 +10,7 @@ use alloc::{vec, vec::Vec};
 const CHILD: u32 = 0x4000_0000;
 const VISIBLE: u32 = 0x1000_0000;
 unsafe extern "system" {
+    fn GetSystemMetrics(index: u32) -> u32;
     fn RetroSurfaceCreate(x: i32, y: i32, width: i32, height: i32, parent: u32) -> u32;
     fn RetroSurfaceUpdate(
         hwnd: u32,
@@ -120,6 +121,8 @@ pub unsafe fn create(mut cs: CreateStruct, wide: bool) -> u32 {
             y: cs.y,
             width: cs.width,
             height: cs.height,
+            normal_rect: None,
+            needs_size: true,
             destroying: false,
             wide: if crate::controls::builtin(class.proc) {
                 wide
@@ -165,6 +168,32 @@ pub unsafe fn create(mut cs: CreateStruct, wide: bool) -> u32 {
             remove(hwnd);
         }
         return 0;
+    }
+    // Child and popup windows receive their initial size at creation;
+    // overlapped windows receive it when first shown.
+    if cs.style & (CHILD | 0x8000_0000) != 0 {
+        let initial = state::with(|s| {
+            let w = s.windows.iter().find(|w| w.hwnd == hwnd)?;
+            let r = crate::frame::client(s, w);
+            Some((
+                crate::frame::pack(r[2] - r[0], r[3] - r[1]),
+                crate::frame::pack(w.x + r[0], w.y + r[1]),
+            ))
+        });
+        if let Some((size, position)) = initial {
+            state::with(|s| {
+                if let Some(w) = s.windows.iter_mut().find(|w| w.hwnd == hwnd) {
+                    w.needs_size = false;
+                }
+            });
+            unsafe {
+                SendMessageW(hwnd, 5, 0, size);
+                SendMessageW(hwnd, 3, 0, position);
+            }
+        }
+        if IsWindow(hwnd) == 0 {
+            return 0;
+        }
     }
     if show {
         ShowWindow(hwnd, 5);
@@ -390,6 +419,7 @@ pub extern "system" fn SetWindowPos(
             pos.y = w.y;
         }
         if pos.flags & 1 == 0 {
+            w.needs_size = false;
             w.width = pos.width.clamp(0, 2048);
             w.height = pos.height.clamp(0, 2048);
         }
@@ -472,33 +502,62 @@ pub extern "system" fn MoveWindow(h: u32, x: i32, y: i32, w: i32, t: i32, repain
 }
 #[unsafe(no_mangle)]
 pub extern "system" fn ShowWindow(hwnd: u32, command: u32) -> i32 {
-    let old = state::with(|s| {
-        let Some(w) = s.windows.iter_mut().find(|w| w.hwnd == hwnd) else {
-            return None;
+    let screen = unsafe { [GetSystemMetrics(0) as i32, GetSystemMetrics(1) as i32] };
+    let placement = state::with(|s| {
+        let index = s.windows.iter().position(|w| w.hwnd == hwnd)?;
+        let parent = s.windows[index].parent;
+        let extent = if s.windows[index].style & CHILD != 0 {
+            s.windows
+                .iter()
+                .find(|w| w.hwnd == parent)
+                .map(|w| {
+                    let r = crate::frame::client(s, w);
+                    [r[2] - r[0], r[3] - r[1]]
+                })
+                .unwrap_or(screen)
+        } else {
+            screen
         };
+        let w = &mut s.windows[index];
         let visible = w.style & VISIBLE != 0;
+        let mut rect = [w.x, w.y, w.width, w.height];
+        let mut resize = w.needs_size && command != 0;
         match command {
             2 | 6 | 7 | 11 => w.style = (w.style & !0x0100_0000) | 0x2000_0000,
-            3 => w.style = (w.style & !0x2000_0000) | 0x0100_0000,
-            1 | 9 => w.style &= !0x2100_0000,
+            3 => {
+                if w.normal_rect.is_none() {
+                    w.normal_rect = Some(rect);
+                }
+                w.style = (w.style & !0x2000_0000) | 0x0100_0000;
+                rect = [0, 0, extent[0], extent[1]];
+                resize = true;
+            }
+            1 | 9 => {
+                w.style &= !0x2100_0000;
+                if let Some(normal) = w.normal_rect.take() {
+                    rect = normal;
+                    resize = true;
+                }
+            }
             _ => {}
         }
-        Some(visible)
+        Some((visible, rect, resize))
     });
-    let Some(old) = old else {
+    let Some((old, rect, resize)) = placement else {
         return state::error(1400) as i32;
     };
     SetWindowPos(
         hwnd,
         0,
-        0,
-        0,
-        0,
-        0,
-        7 | if command == 0 { 0x80 } else { 0x40 },
+        rect[0],
+        rect[1],
+        rect[2],
+        rect[3],
+        (if resize { 4 } else { 7 }) | if command == 0 { 0x80 } else { 0x40 },
     );
     i32::from(old)
 }
+
 #[unsafe(no_mangle)]
 pub extern "system" fn GetParent(hwnd: u32) -> u32 {
     state::with(|s| {
@@ -850,7 +909,17 @@ unsafe fn default_proc(h: u32, m: u32, w: u32, l: u32, wide: bool) -> i32 {
                     SendMessageW(
                         h,
                         5,
-                        0,
+                        state::with(|s| {
+                            s.windows.iter().find(|w| w.hwnd == h).map_or(0, |w| {
+                                if w.style & 0x2000_0000 != 0 {
+                                    1
+                                } else if w.style & 0x0100_0000 != 0 {
+                                    2
+                                } else {
+                                    0
+                                }
+                            })
+                        }),
                         state::with(|s| {
                             s.windows.iter().find(|w| w.hwnd == h).map_or(0, |w| {
                                 let r = crate::frame::client(s, w);

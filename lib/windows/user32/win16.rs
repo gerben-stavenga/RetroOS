@@ -300,7 +300,16 @@ unsafe fn callback(proc: u32, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool)
         } else if matches!(msg, 0x46 | 0x47) && lp != 0 {
             let p = lp as *const u32;
             putw(scratch, 0, encode(p.read()));
-            putw(scratch, 2, encode(p.add(1).read()));
+            let after = p.add(1).read();
+            putw(
+                scratch,
+                2,
+                if after >= 0xffff_fffe {
+                    after
+                } else {
+                    encode(after)
+                },
+            );
             for i in 2..7 {
                 putw(scratch, i * 2, p.add(i).read());
             }
@@ -322,7 +331,12 @@ unsafe fn callback(proc: u32, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool)
         if msg == 0x46 && lp != 0 {
             let p = lp as *mut u32;
             p.write(decode(word(scratch, 0)));
-            p.add(1).write(decode(word(scratch, 2)));
+            let after = word(scratch, 2);
+            p.add(1).write(if after >= 0xfffe {
+                after as i16 as i32 as u32
+            } else {
+                decode(after)
+            });
             for i in 2..6 {
                 p.add(i).write(word(scratch, i * 2) as i16 as i32 as u32);
             }
@@ -528,18 +542,59 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             107 | 111 | 110 => {
                 let m = w(6);
                 let (wp, lp) = to32(m, w(4), d(0));
-                let lp = if matches!(m, 0xc | 0xd) {
+                // Win16 forwards a segmented, WORD-sized WINDOWPOS back to
+                // USER. Keep the translated storage alive through nested calls.
+                let position = if o != 110 && lp != 0 && matches!(m, 0x46 | 0x47) {
+                    Some(pointer(lp, 14)?)
+                } else {
+                    None
+                };
+                let mut pos = [0u32; 7];
+                if let Some(p) = position {
+                    pos[0] = decode(word(p, 0));
+                    let after = word(p, 2);
+                    pos[1] = if after >= 0xfffe {
+                        after as i16 as i32 as u32
+                    } else {
+                        decode(after)
+                    };
+                    for n in 2..6 {
+                        pos[n] = word(p, n * 2) as i16 as i32 as u32;
+                    }
+                    pos[6] = word(p, 12);
+                }
+                let lp = if position.is_some() {
+                    pos.as_mut_ptr() as u32
+                } else if matches!(m, 0xc | 0xd) {
                     pointer(lp, if m == 0xd { wp as usize } else { 1 })?
                 } else {
                     lp
                 };
-                if o == 107 {
+                let result = if o == 107 {
                     window::DefWindowProcA(h(8), m, wp, lp) as u32
                 } else if o == 111 {
                     crate::SendMessageA(h(8), m, wp, lp) as u32
                 } else {
                     message::PostMessageA(h(8), m, wp, lp) as u32
+                };
+                if m == 0x46 {
+                    if let Some(p) = position {
+                        putw(p, 0, encode(pos[0]));
+                        putw(
+                            p,
+                            2,
+                            if pos[1] >= 0xffff_fffe {
+                                pos[1]
+                            } else {
+                                encode(pos[1])
+                            },
+                        );
+                        for n in 2..7 {
+                            putw(p, n * 2, pos[n]);
+                        }
+                    }
                 }
+                result
             }
             108 | 109 => {
                 let off = if o == 109 { 2 } else { 0 };
@@ -604,6 +659,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             158 => menu::SetMenu(h(2), h(0)) as u32,
             159 => encode(menu::GetSubMenu(h(2), i(0))),
             160 => menu::DrawMenuBar(h(0)) as u32,
+            175 => encode(crate::resource::LoadBitmapA(w(4), string(d(0))?)),
             179 => GetSystemMetrics(w(0)),
             236 => encode(input::GetCapture()),
             242 => {

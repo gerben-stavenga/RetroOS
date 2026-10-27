@@ -45,6 +45,8 @@ pub struct Window {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+    pub normal_rect: Option<[i32; 4]>,
+    pub needs_size: bool,
     pub destroying: bool,
     pub wide: bool,
     pub control: crate::controls::Control,

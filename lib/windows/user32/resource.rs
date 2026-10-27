@@ -29,6 +29,9 @@ pub enum Resource {
     },
 }
 pub(crate) unsafe fn bytes(module: u32, name: u32, kind: u32, wide: bool) -> Option<&'static [u8]> {
+    if crate::win16_resource::instance(module) {
+        return unsafe { crate::win16_resource::bytes(kind as u16, name, wide) };
+    }
     let info = unsafe {
         if wide {
             FindResourceW(module, name, kind)
@@ -215,88 +218,11 @@ fn word(data: &[u8], at: usize) -> Option<u16> {
     let b = data.get(at..at + 2)?;
     Some(u16::from_le_bytes([b[0], b[1]]))
 }
-fn dword(data: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?))
+unsafe fn bitmap(data: &[u8], width: i32, height: i32) -> Option<u32> {
+    let (width, height, bits) = crate::bitmap::decode(data, width, height)?;
+    Some(unsafe { CreateBitmap(width, height, 1, 32, bits.as_ptr()) })
 }
-unsafe fn bitmap(data: &[u8], wanted_width: i32, wanted_height: i32) -> Option<u32> {
-    let header = dword(data, 0)? as usize;
-    let (width, height, depth, palette_stride) = if header == 12 {
-        (
-            word(data, 4)? as i32,
-            word(data, 6)? as i32,
-            word(data, 10)?,
-            3,
-        )
-    } else if header >= 40 && dword(data, 16)? == 0 {
-        (
-            dword(data, 4)? as i32,
-            dword(data, 8)? as i32,
-            word(data, 14)?,
-            4,
-        )
-    } else {
-        return None;
-    };
-    if width <= 0
-        || width > 2048
-        || height == 0
-        || height.unsigned_abs() > 2048
-        || !matches!(depth, 1 | 4 | 8 | 24 | 32)
-    {
-        return None;
-    }
-    let colors = if depth <= 8 {
-        if header >= 40 && dword(data, 32)? != 0 {
-            dword(data, 32)? as usize
-        } else {
-            1usize << depth
-        }
-    } else {
-        0
-    };
-    let offset = header.checked_add(colors.checked_mul(palette_stride)?)?;
-    let stride = (width as usize * depth as usize).div_ceil(32) * 4;
-    let source = data.get(offset..offset.checked_add(stride * height.unsigned_abs() as usize)?)?;
-    let out_width = if wanted_width > 0 {
-        wanted_width
-    } else {
-        width
-    };
-    let out_height = if wanted_height > 0 {
-        wanted_height
-    } else {
-        height.abs()
-    };
-    if out_width > 2048 || out_height > 2048 {
-        return None;
-    }
-    let mut bits = vec![0u8; out_width as usize * out_height as usize * 4];
-    for y in 0..out_height as usize {
-        let sy = y * height.unsigned_abs() as usize / out_height as usize;
-        let row = if height > 0 {
-            height as usize - 1 - sy
-        } else {
-            sy
-        } * stride;
-        for x in 0..out_width as usize {
-            let sx = x * width as usize / out_width as usize;
-            let pixel = if depth <= 8 {
-                let bit = sx * depth as usize;
-                let index = ((source[row + bit / 8] >> (8 - depth as usize - bit % 8))
-                    & ((1u16 << depth) - 1) as u8) as usize;
-                if index >= colors {
-                    return None;
-                }
-                data.get(header + index * palette_stride..header + index * palette_stride + 3)?
-            } else {
-                &source[row + sx * (depth as usize / 8)..][..3]
-            };
-            let at = (y * out_width as usize + x) * 4;
-            bits[at..at + 3].copy_from_slice(pixel);
-        }
-    }
-    Some(unsafe { CreateBitmap(out_width, out_height, 1, 32, bits.as_ptr()) })
-}
+
 unsafe fn load_image(
     module: u32,
     name: u32,

@@ -54,7 +54,8 @@ image size, and instance selector. The binding belongs to the matched boot runti
 The adapter covers window/class creation, dispatch and nested sends, queues,
 timers, focus/capture, client DCs and painting, rectangles, menus, dialogs, and
 core GDI drawing. NE menu/dialog resources are converted into the shared resource
-formats in the DLL. Segmented allocation, file/resource loading and remaining
+formats in the DLL. NE LoadBitmap uses the same bounded DIB decoder as PE, including
+RLE4/RLE8 resources; bitmap decompression stays outside the kernel. Segmented allocation, file/resource loading and remaining
 unmigrated GDI/services still use native INT 83h gates. This is not complete
 Win16 API or message-marshalling coverage; resources from additional NE modules,
 multiple NE tasks, and unsupported controls/messages need further work.
@@ -67,7 +68,8 @@ ENGINE=tcg python3 test/windows_win16.py
 ```
 
 They check recursive far callbacks, register/stack preservation, CREATESTRUCT
-conversion, nested SendMessage, queued dispatch, client dimensions, painting and
+conversion, nested SendMessage, queued dispatch, initial size notifications,
+maximize/restore geometry, WINDOWPOS forwarding, client dimensions, painting and
 pixel readback, dialog-template conversion and numeric controls, the 16-bit
 DLGPROC return convention, and process termination. No proprietary game is needed.
 Windows 3.1 Minesweeper is also a local acceptance test for its resource menus,
@@ -76,3 +78,14 @@ Custom Field dialog, board resizing, flagging, revealing cells and closing.
 The legacy dialog-template layout was checked against
 [Wine's Win16 dialog parser](https://github.com/wine-mirror/wine/blob/master/dlls/user.exe16/dialog.c);
 the resource adapters here convert formats and reuse RetroOS's existing policy.
+
+The shared bitmap decoder has host tests for encoded runs, absolute packets and
+padding, delta moves, row orientation, scaling, and malformed input:
+
+```
+bazelisk test //lib/windows/user32:bitmap_test --platforms=@platforms//host
+```
+
+Castle of the Winds is a local acceptance test for maximizing its initially
+zero-width Startup window and displaying its RLE4 title banners. This does not
+assert complete gameplay compatibility.

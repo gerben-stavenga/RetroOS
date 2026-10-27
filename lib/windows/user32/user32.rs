@@ -6,6 +6,7 @@
 
 extern crate alloc;
 
+mod bitmap;
 mod class;
 mod controls;
 mod dialog;

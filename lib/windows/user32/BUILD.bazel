@@ -1,3 +1,4 @@
+load("@rules_rust//rust:defs.bzl", "rust_test")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:windows_watcom.bzl", "windows_dll")
 load("//toolchain:windows_rust.bzl", "windows_rust_library")
@@ -11,7 +12,7 @@ nasm_library(
 windows_rust_library(
     name = "user32_rust",
     crate_root = "user32.rs",
-    srcs = ["win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
+    srcs = ["bitmap.rs", "win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
 )
 
 windows_dll(
@@ -488,3 +489,13 @@ windows_dll(
 )
 
 exports_files(["runtime.rs"])
+
+# Pure resource decoding runs on the host; it needs no Windows guest services.
+rust_test(
+    name = "bitmap_test",
+    size = "small",
+    srcs = ["bitmap.rs"],
+    crate_root = "bitmap.rs",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
+)
