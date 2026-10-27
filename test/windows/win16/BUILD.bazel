@@ -1,5 +1,5 @@
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
-load("//toolchain:windows_watcom.bzl", "windows16_binary")
+load("//toolchain:windows_watcom.bzl", "windows16_binary", "windows16_dll")
 nasm_library(name="bridge_obj", srcs=["bridge.asm"], copts=["-fobj"])
 windows16_binary(name="bridge", obj=":bridge_obj", imports={
     "Exit": "KERNEL.1", "CallWindowProc": "USER.122", "Debug": "KERNEL.115",
@@ -18,3 +18,8 @@ windows16_binary(name="window", obj=":window_obj", imports={
     "FillRect": "USER.81", "CreateSolidBrush": "GDI.66", "GetPixel": "GDI.83",
     "GetDC": "USER.66", "ReleaseDC": "USER.68",
 }, visibility=["//visibility:public"])
+
+# An obsolete kernel-gate facade must never shadow the matched guest runtime.
+nasm_library(name="legacy_user_obj", srcs=["legacy_user.asm"], copts=["-fobj"])
+windows16_dll(name="legacy_user", obj=":legacy_user_obj", out="LEGACYUSER.DLL",
+    module_name="USER", exports=["CallWindowProc.122"], visibility=["//visibility:public"])

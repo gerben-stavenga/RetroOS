@@ -3,8 +3,11 @@
 The NE USER and GDI facades contain ordinary 16-bit protected-mode code for
 migrated exports. They enter the same guest Rust USER32 and GDI32 libraries used
 by PE programs. The facades are linked as NE DLLs by Open Watcom and contain no
-Microsoft code. The kernel maps the DLLs, establishes descriptors and binds two
-far pointers per facade; it does not suspend a kernel continuation for callbacks.
+Microsoft code. Core NE facades load exclusively from
+`C:\RETROOS\WINDOWS\SYSTEM`; application-local copies cannot override them, and
+a missing runtime is an error. Other dependencies retain application-local
+lookup (for example, a game-supplied COMMDLG.DLL). The kernel maps the DLLs,
+establishes descriptors and binds two far pointers per facade; it does not suspend a kernel continuation for callbacks.
 
 ```
 NE caller -> USER.DLL / GDI.DLL -> USER32 Rust adapter -> shared USER32 / GDI32

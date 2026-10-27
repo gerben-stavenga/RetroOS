@@ -437,15 +437,23 @@ fn canonical_module_name(name: &[u8]) -> Vec<u8> {
 fn load_module_file(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
     let file = module_file(name);
     let system = join(crate::kernel::dos::c_root(), b"RETROOS/WINDOWS/SYSTEM");
-    for path in [join(dirname(importer), &file), join(&system, &file)] {
+    // Core facades form a private ABI with the kernel and shared PE DLLs.
+    // Load them exclusively from the matched runtime, never from an app.
+    // Ordinary application dependencies (e.g. COMMDLG) keep local precedence.
+    let local = join(dirname(importer), &file);
+    let runtime = join(&system, &file);
+    let candidates = [local, runtime];
+    let paths = if module(name).is_some() { &candidates[1..] } else { &candidates[..] };
+    for path in paths {
         if let Ok(data) = crate::kernel::exec::load_file_resolved(&path) {
-            return Ok((path, data));
+            return Ok((path.clone(), data));
         }
         let rooted = [crate::kernel::dos::c_root(), path.as_slice()].concat();
         if let Ok(data) = crate::kernel::exec::load_file_resolved(&rooted) {
             return Ok((rooted, data));
         }
     }
+    crate::compact_println!("Windows: missing Win16 {}", core::str::from_utf8(&file).unwrap_or("dll"));
     Err(-2)
 }
 
