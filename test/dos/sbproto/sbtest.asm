@@ -95,14 +95,15 @@ edge_seen:
         ; a real SB16 keeps honouring that pause across the next start command:
         ; the 0x14 below arms the 8237, one already-in-flight byte moves, and
         ; the card then stops asking. Observed on 86Box as cnt=00FE against a
-        ; programmed 0x00FF, with the TC bit never latching. Resume first.
-        ; (QEMU's sb16 does not model the pause holding across a new start,
-        ; which is why this only ever failed on the faithful card.)
-        mov dx, 0x22C
-        mov al, 0xD4           ; continue 8-bit DMA
-        out dx, al
+        ; programmed 0x00FF, with the TC bit never latching.
+        ; Keep the old transfer paused while replacing its DMA programming.
+        ; Resuming first lets it finish after startblk clears TC but before
+        ; the new DSP command, leaving a stale TC bit with a live new count.
         mov ax, 255            ; short block (256 bytes, ~23 ms at 11 kHz)
         call startblk
+        mov dx, 0x22C
+        mov al, 0xD4           ; now resume the newly armed transfer
+        out dx, al
         ; Bound the poll in TIME, not iterations. Port 0x08 is trapped by the
         ; kernel (the 8237 windows are never granted to a guest, because the
         ; addresses it programs are COW-relocated), so every read here is a VM
