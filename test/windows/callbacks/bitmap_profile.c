@@ -217,6 +217,14 @@ int main(void)
         CHECK(SendMessageA(combo,CB_SETCURSEL,0,0)==0);
         CHECK(GetWindowTextA(edit,value,sizeof(value))==8);
         CHECK(strcmp(value,"selected")==0);
+        CHECK(SendMessageA(combo,CB_SELECTSTRING,(WPARAM)-1,(LPARAM)"missing")==CB_ERR);
+        CHECK(SendMessageA(combo,CB_GETCURSEL,0,0)==0);
+        CHECK(SendMessageA(combo,CB_ADDSTRING,0,(LPARAM)"Second")==1);
+        CHECK(SendMessageA(combo,CB_SELECTSTRING,(WPARAM)-1,(LPARAM)"sec")==1);
+        CHECK(GetWindowTextA(edit,value,sizeof(value))==6);
+        CHECK(strcmp(value,"Second")==0);
+        CHECK(SendMessageA(combo,CB_FINDSTRINGEXACT,(WPARAM)-1,(LPARAM)"second")==1);
+        CHECK(SendMessageA(combo,CB_FINDSTRINGEXACT,(WPARAM)-1,(LPARAM)"sec")==CB_ERR);
         CHECK(SendMessageA(combo,CB_SETCURSEL,(WPARAM)-1,0)==CB_ERR);
         CHECK(GetWindowTextA(combo,value,sizeof(value))==0);
         CHECK(DestroyWindow(parent));

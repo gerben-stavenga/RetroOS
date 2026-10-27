@@ -322,7 +322,7 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
                     (0, 0)
                 };
                 unsafe {
-                    if static_control && matches!(style & 0x1f,0..=2|11|12) {
+                    if static_control && matches!(style & 0x1f,0..=2|12) {
                         let alignment=match style & 0x1f {1=>1,2=>2,_=>0};
                         let flags=0x800|alignment|if style & 0x1f==12 {0}else{0x10};
                         crate::drawing::DrawTextW(dc,label.as_ptr() as u32,label.len() as i32,&mut [0,0,width,height],flags);
@@ -703,6 +703,9 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                 0x14e => 0x186,
                 0x148 => 0x189,
                 0x149 => 0x18a,
+                0x14c => 0x18f,
+                0x14d => 0x18c,
+                0x158 => 0x1a2,
                 _ => 0,
             }
         } else {
@@ -710,9 +713,9 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
         };
         if matches!(
             normalized,
-            0x180 | 0x181 | 0x182 | 0x184 | 0x186 | 0x187 | 0x188 | 0x18b | 0x189 | 0x18a
+            0x180 | 0x181 | 0x182 | 0x184 | 0x186 | 0x187 | 0x188 | 0x18b | 0x189 | 0x18a | 0x18c | 0x18f | 0x1a2
         ) {
-            let string = if normalized == 0x180 || normalized == 0x181 {
+            let string = if matches!(normalized,0x180|0x181|0x18c|0x18f|0x1a2) {
                 unsafe { text::read(lparam, wide) }
             } else {
                 Vec::new()
@@ -750,6 +753,18 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                         };
                         c.selected.map_or(-1, |i| i as i32)
                     }
+                    0x18c | 0x18f | 0x1a2 => {
+                        let count=c.items.len();
+                        if count==0 {return -1;}
+                        let start=if wparam==u32::MAX {0}else{(wparam as usize+1)%count};
+                        let found=(0..count).map(|step|(start+step)%count).find(|&i| {
+                            let item=&c.items[i];
+                            if normalized==0x1a2 {text::same(item,&string)}
+                            else {item.len()>=string.len() && text::same(&item[..string.len()],&string)}
+                        });
+                        if normalized==0x18c && found.is_some() {c.selected=found;}
+                        found.map_or(-1,|i|i as i32)
+                    }
                     0x187 => i32::from(c.selected == Some(wparam as usize)),
                     0x188 => c.selected.map_or(-1, |i| i as i32),
                     0x18b => c.items.len() as i32,
@@ -770,7 +785,7 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                     _ => -1,
                 }
             });
-            if combo && matches!(normalized,0x184|0x186) {
+            if combo && (matches!(normalized,0x184|0x186) || normalized==0x18c && result>=0) {
                 let (child,mut value)=state::with(|s| {
                     let w=s.windows.iter_mut().find(|w|w.hwnd==hwnd).unwrap();
                     let value=w.control.selected.and_then(|i|w.control.items.get(i)).cloned().unwrap_or_default();
@@ -782,7 +797,7 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                     unsafe {crate::SendMessageW(child,0xc,0,value.as_ptr() as u32);}
                 }
             }
-            if matches!(normalized, 0x180 | 0x181 | 0x182 | 0x184 | 0x186) {
+            if matches!(normalized, 0x180 | 0x181 | 0x182 | 0x184 | 0x186 | 0x18c) {
                 unsafe {
                     crate::paint::InvalidateRect(hwnd, 0, 0);
                 }

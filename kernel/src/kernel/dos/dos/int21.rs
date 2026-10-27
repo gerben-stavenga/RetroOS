@@ -1189,6 +1189,13 @@ pub(super) fn int_21h<A: crate::Arch>(
             }
             DosExit::Ok
         }
+        // VFS volumes do not expose a FAT drive-parameter block. This API
+        // reports failure in AL, rather than the generic CF/AX convention.
+        // Returning AX=1 leaves callers treating stale DS:BX as a valid DPB.
+        0x32 => {
+            regs.rax=(regs.rax & !0xff)|0xff;
+            DosExit::Ok
+        }
         // Allocation information shares the same geometry as free-space queries.
         // Unlike AH=36h, DS:BX points at DOS's resident media descriptor byte.
         0x1b | 0x1c => {

@@ -320,7 +320,22 @@ unsafe fn callback(proc: u32, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool)
         let saved = frame.add(1).read();
         let ss = frame.add(2).read();
         let (base, _) = segment(ss)?;
-        let reserve: u32 = if lp != 0 && matches!(msg, 1 | 0x81 | 0xc | 0xd | 0x46 | 0x47) {
+        // A subclass still receives the Win16 control message numbers and
+        // segmented string pointers, even though USER dispatches Win32 messages.
+        let class=state::with(|s|s.windows.iter().find(|v|v.hwnd==hwnd).map_or(0,|v|v.class));
+        let control_msg=if class==0xc004 && (0x140..=0x158).contains(&msg) {
+            msg-0x140+0x400
+        } else if class==0xc003 || class==0xc005 {
+            match msg {
+                0x180..=0x186=>msg-0x180+0x401,
+                0x187..=0x18b=>msg-0x187+0x408,
+                0x18c..=0x1a2=>msg-0x18c+0x40d,
+                _=>msg,
+            }
+        } else {msg};
+        let control_string=control_msg!=msg && matches!(msg,
+            0x180|0x181|0x18c|0x18f|0x1a2|0x143|0x14a|0x14c|0x14d|0x158);
+        let reserve: u32 = if lp != 0 && (control_string || matches!(msg, 1 | 0x81 | 0xc | 0xd | 0x46 | 0x47)) {
             1024
         } else {
             0
@@ -362,8 +377,8 @@ unsafe fn callback(proc: u32, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool)
                 cursor += text.len();
             }
             l = far;
-        } else if matches!(msg, 0xc | 0xd) && lp != 0 {
-            if msg == 0xc {
+        } else if (control_string || matches!(msg, 0xc | 0xd)) && lp != 0 {
+            if control_string || msg == 0xc {
                 let mut text = crate::text::ansi(&crate::text::read(lp, wide));
                 text.push(0);
                 if text.len() > reserve as usize {
@@ -398,7 +413,7 @@ unsafe fn callback(proc: u32, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool)
         let message16 = if (0x132..=0x138).contains(&msg) {
             0x19
         } else {
-            msg
+            control_msg
         };
         args[6..8].copy_from_slice(&(message16 as u16).to_le_bytes());
         args[8..10].copy_from_slice(&(encode(hwnd) as u16).to_le_bytes());
@@ -1274,7 +1289,7 @@ unsafe fn translated_message(
             m
         };
         let (wp, lp) = to32(m, w, l);
-        let wp = if matches!(m, 0x181 | 0x186 | 0x14a | 0x14e) {
+        let wp = if matches!(m, 0x181 | 0x186 | 0x18c | 0x18f | 0x1a2 | 0x14a | 0x14c | 0x14d | 0x14e | 0x158) {
             wp as u16 as i16 as i32 as u32
         } else {
             wp
@@ -1309,7 +1324,7 @@ unsafe fn translated_message(
             pos.as_mut_ptr() as u32
         } else if matches!(
             m,
-            0x180 | 0x181 | 0x18c | 0x18f | 0x1a2 | 0x143 | 0x14a | 0x14c | 0x14d
+            0x180 | 0x181 | 0x18c | 0x18f | 0x1a2 | 0x143 | 0x14a | 0x14c | 0x14d | 0x158
         ) {
             string(lp)?
         } else if matches!(m, 0x189 | 0x148) {

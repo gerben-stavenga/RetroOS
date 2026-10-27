@@ -403,6 +403,11 @@ _start:
     jz pmdos_fail
     cmp bx,0xadad
     jne pmdos_fail
+    mov ax,0x3200
+    mov dx,3
+    int 0x21
+    cmp al,0xff
+    jne pmdos_fail
     push ds
     mov ax,0x1c00
     mov dx,3
@@ -952,6 +957,61 @@ _start:
     jne fail
     push word [button]
     call far DestroyWindow
+    ; Control subclasses must receive Win16 message IDs and far strings.
+    push ds
+    push word combo_class
+    push dword 0
+    push dword 0x50000202
+    push word 2
+    push word 2
+    push word 120
+    push word 80
+    push word [hwnd]
+    push word 79
+    push ds
+    push dword 0
+    call far CreateWindow
+    test ax,ax
+    jz fail
+    mov [combo],ax
+    push ax
+    push word -4
+    push cs
+    push word combo_subclass
+    call far SetWindowLong
+    mov [combo_proc],ax
+    mov [combo_proc+2],dx
+    push word [combo]
+    push word 0x40a ; CB_INSERTSTRING
+    push word -1
+    push ds
+    push word combo_path
+    call far SendMessage
+    test ax,ax
+    jnz fail
+    cmp word [combo_seen],1
+    jne fail
+    push word [combo]
+    push word 0x40e ; CB_SETCURSEL
+    push word 0
+    push dword 0
+    call far SendMessage
+    test ax,ax
+    jnz fail
+    push word [combo]
+    push word 0xd
+    push word 16
+    push ds
+    push word button_text
+    call far SendMessage
+    cmp ax,13
+    jne fail
+    cmp word [button_text],'C:'
+    jne fail
+    cmp byte [button_text+13],0
+    jne fail
+    push word [combo]
+    call far DestroyWindow
     ; Two-byte access to the last extra-byte slot must not require four bytes.
     push word [hwnd]
     push word 0
@@ -1439,7 +1499,34 @@ button_subclass:
     call far CallWindowProc
     pop bp
     retf 10
+combo_subclass:
+    push bp
+    mov bp,sp
+    cmp word [bp+12],0x40a
+    jne .forward
+    push es
+    les bx,[bp+6]
+    cmp word [es:bx],'C:'
+    jne .bad
+    inc word [combo_seen]
+.bad:
+    pop es
+.forward:
+    push dword [combo_proc]
+    push word [bp+14]
+    push word [bp+12]
+    push word [bp+10]
+    push dword [bp+6]
+    call far CallWindowProc
+    pop bp
+    retf 10
 segment _DATA public class=DATA use16
+combo: dw 0
+combo_proc: dd 0
+combo_seen: dw 0
+combo_class: db 'COMBOBOX',0
+combo_path: db 'C:\MPS\CIVWIN',0
+
 wc: dw 3
     dw wndproc, 0
     dw 0,2,0,0,0,16
