@@ -78,12 +78,13 @@ pub(super) struct Video {
     canvas: (usize, usize),
     last_output: Option<(usize, usize)>,
     announced: bool,
+    next_present_ns: u64,
 }
 impl Video {
     fn new(fb: Framebuffer, format: PixelFormat) -> Self {
         Self { fb, format, source: None, legacy: None, legacy_epoch: 0, legacy_ready: None, presented: Vec::new(), source_revision: None, owner: None, voodoo: None, scanout: Scanout::new_boxed(),
             scene: None, composed: Vec::new(), row: alloc::vec![0; fb.width * usize::from(format.bytes_per_pixel)],
-            canvas: (fb.width, fb.height), last_output: None, announced: false }
+            canvas: (fb.width, fb.height), last_output: None, announced: false, next_present_ns: 0 }
     }
     pub(super) fn invalidate(&mut self) {
         self.source_revision = None;
@@ -104,6 +105,11 @@ impl Video {
             self.scanout.mode = Some(mode);
             self.scanout.pal.fmt = self.format;
         }
+        // Scanout phases above remain current even when the physical sink is
+        // slow. A completed copy must leave time before presenting again:
+        // checkpoints can finish another VGA frame during that same copy.
+        let present_started = crate::kernel::portio::now_ns();
+        if present_started < self.next_present_ns { return; }
         let _stall = crate::kernel::portio::StallWatch::new("video render/present");
         if let Some(voodoo) = &self.voodoo {
             let w = self.scanout.geo.0;
@@ -159,6 +165,11 @@ impl Video {
         // A slow frame drops missed refreshes rather than immediately doing
         // another full frame. Leave a publication window for the guest core.
         LAST_FRAME.store(frame_period(), Ordering::Relaxed);
+        let finished = crate::kernel::portio::now_ns();
+        let interval = 1_000_000_000 / u64::from(REFRESH_HZ.load(Ordering::Relaxed).max(1));
+        self.next_present_ns = if finished.saturating_sub(present_started) >= interval {
+            finished.saturating_add(interval)
+        } else { 0 };
 
     }
 }

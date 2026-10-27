@@ -12,7 +12,7 @@ def main():
     targets = [
         "//kernel:retroos-host-kvm", "//test/dos/locale:locale",
         "//test/windows/locale:locale", "//test/os2/locale:locale",
-        "//test/linux/runtime:runtime", "//lib/windows/kernel32:kernel32_dll", "//lib/windows/user32:user32_dll",
+        "//test/linux/runtime:runtime", "//lib/windows/kernel32:kernel32_dll", "//lib/windows/user32:user32_dll", "//lib/windows/compat:gdi32_dll",
         "//lib/os2/doscalls:doscalls_dll", "//lib/os2/nls:nls_dll",
         "//lib/os2/kbdcalls:kbdcalls_dll", "//lib/os2/viocalls:viocalls_dll",
     ]
@@ -30,6 +30,7 @@ def main():
             ("test/os2/locale/locale.exe", "OS2.EXE"),
             ("lib/windows/kernel32/KERNEL32.DLL", "RETROOS/WINDOWS/SYSTEM32/KERNEL32.DLL"),
             ("lib/windows/user32/USER32.DLL", "RETROOS/WINDOWS/SYSTEM32/USER32.DLL"),
+            ("lib/windows/compat/GDI32.DLL", "RETROOS/WINDOWS/SYSTEM32/GDI32.DLL"),
             ("lib/os2/doscalls/DOSCALLS.DLL", "RETROOS/OS2/DLL/DOSCALLS.DLL"),
             ("lib/os2/nls/NLS.DLL", "RETROOS/OS2/DLL/NLS.DLL"),
             ("lib/os2/kbdcalls/KBDCALLS.DLL", "RETROOS/OS2/DLL/KBDCALLS.DLL"),
