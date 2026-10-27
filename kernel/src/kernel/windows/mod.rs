@@ -2427,34 +2427,61 @@ fn dispatch<A: crate::Arch>(
             let dy = arg(machine, regs, 2) as i32;
             let width = arg(machine, regs, 3) as usize;
             let height = arg(machine, regs, 4) as usize;
+            if width == 0 || height == 0 || width > i32::MAX as usize || height > i32::MAX as usize { return 0; }
             let src = arg(machine, regs, 5);
             let sx = arg(machine, regs, 6) as i32;
             let sy = arg(machine, regs, 7) as i32;
             let Some(source_bitmap) = dc_bitmap(state, src) else {
                 return 0;
             };
-            let Some((sw, sh, source)) = state.gdi_objects.iter().find_map(|(h, o)| match o {
-                GdiObject::Bitmap {
-                    width,
-                    height,
-                    pixels,
-                } if *h == source_bitmap => Some((*width, *height, pixels.clone())),
+            let Some((left, top, copy_width, copy_height, source)) = state.gdi_objects.iter().find_map(|(h, o)| match o {
+                GdiObject::Bitmap { width: sw, height: sh, pixels } if *h == source_bitmap => {
+                    let left = i64::from(sx).clamp(0, i64::from(*sw));
+                    let top = i64::from(sy).clamp(0, i64::from(*sh));
+                    let right = (i64::from(sx) + width as i64).clamp(left, i64::from(*sw));
+                    let bottom = (i64::from(sy) + height as i64).clamp(top, i64::from(*sh));
+                    let (cw, ch) = ((right-left) as usize, (bottom-top) as usize);
+                    let mut copy = Vec::with_capacity(cw * ch * 4);
+                    for y in top as usize..bottom as usize {
+                        let start = (y * *sw as usize + left as usize) * 4;
+                        copy.extend_from_slice(&pixels[start..start + cw * 4]);
+                    }
+                    Some((left as i32, top as i32, cw, ch, copy))
+                }
                 _ => None,
-            }) else {
-                return 0;
-            };
-            for y in 0..height {
-                for x in 0..width {
-                    let px = sx + x as i32;
-                    let py = sy + y as i32;
-                    if px >= 0 && py >= 0 && px < sw as i32 && py < sh as i32 {
-                        let at = (py as usize * sw as usize + px as usize) * 4;
-                        let color = u32::from_le_bytes([
-                            source[at],
-                            source[at + 1],
-                            source[at + 2],
-                            source[at + 3],
-                        ]);
+            }) else { return 0; };
+            let dx = dx.saturating_add(left.saturating_sub(sx));
+            let dy = dy.saturating_add(top.saturating_sub(sy));
+            if arg(machine, regs, 8) == 0x00cc0020 {
+                // Resolve the destination and its clip once, then copy rows.
+                // SRCCOPY is independent of the pen's ROP2 setting.
+                let clips = state.gdi_clips.iter().find(|(h,_)| *h == dst).map(|(_,r)| r.clone());
+                let Some(target) = target_mut(state, dst) else { return 0; };
+                let bounds = [(0, 0, target.clip_width as i32, target.clip_height as i32)];
+                let mut changed = false;
+                for &(cl, ct, cr, cb) in clips.as_deref().unwrap_or(&bounds) {
+                    let l = i64::from(dx).max(i64::from(cl)).max(0).max(-i64::from(target.origin_x));
+                    let t = i64::from(dy).max(i64::from(ct)).max(0).max(-i64::from(target.origin_y));
+                    let r = (i64::from(dx) + copy_width as i64).min(i64::from(cr))
+                        .min(i64::from(target.clip_width)).min(i64::from(target.width) - i64::from(target.origin_x));
+                    let b = (i64::from(dy) + copy_height as i64).min(i64::from(cb))
+                        .min(i64::from(target.clip_height)).min(i64::from(target.height) - i64::from(target.origin_y));
+                    if l >= r || t >= b { continue; }
+                    let count = (r-l) as usize * 4;
+                    for y in t..b {
+                        let from = ((y - i64::from(dy)) as usize * copy_width + (l - i64::from(dx)) as usize) * 4;
+                        let to = ((y + i64::from(target.origin_y)) as usize * target.width as usize
+                            + (l + i64::from(target.origin_x)) as usize) * 4;
+                        target.pixels[to..to+count].copy_from_slice(&source[from..from+count]);
+                    }
+                    changed = true;
+                }
+                if changed && let Some(dirty) = target.dirty { *dirty = true; }
+            } else {
+                for y in 0..copy_height {
+                    for x in 0..copy_width {
+                        let at = (y * copy_width + x) * 4;
+                        let color = u32::from_le_bytes(source[at..at+4].try_into().unwrap());
                         put_pixel(state, dst, dx + x as i32, dy + y as i32, color);
                     }
                 }

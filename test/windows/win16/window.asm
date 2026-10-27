@@ -8,11 +8,30 @@ extern GetWindowWord, SetWindowWord, GetWindowLong, SetWindowLong, CallWindowPro
 extern LocalAlloc, LocalLock, LocalUnlock, LocalFree, LocalReAlloc
 extern MessageBox, SetTimer, KillTimer, GetFocus, GetParent, IsWindowEnabled
 extern SetScrollRange, SetScrollPos
-extern ShowWindow, GetWindowRect
+extern ShowWindow, GetWindowRect, GetTickCount
 extern DOSExit, CreateDialog, SetDlgItemInt, GetDlgItemInt
 global _start
 _start:
     mov [initial_sp], sp
+    mov ah, 0x2c
+    call far DOSExit
+    mov [clock_sample], dx
+    call far GetTickCount
+    mov [clock_start], ax
+.clock_wait:
+    call far GetTickCount
+    sub ax, [clock_start]
+    cmp ax, 30
+    jb .clock_wait
+    mov ah, 0x2c
+    call far DOSExit
+    cmp dx, [clock_sample]
+    je fail
+    cmp dl, 100
+    jae fail
+    cmp dh, 60
+    jae fail
+
     push word 0x42
     push word 32
     call far LocalAlloc
@@ -394,6 +413,74 @@ _start:
     call far IsWindowEnabled
     cmp ax, 1
     jne fail
+    ; Win16 LB_* numbers and far strings reach the shared list control.
+    push ds
+    push word list_class
+    push ds
+    push word list_empty
+    push dword 0x50000001
+    push word 10
+    push word 10
+    push word 100
+    push word 40
+    push word [hwnd]
+    push word 77
+    push ds
+    push dword 0
+    call far CreateWindow
+    mov [list_hwnd], ax
+    test ax, ax
+    jz fail
+    push ax
+    push word 0x401
+    push word 0
+    push ds
+    push word list_text
+    call far SendMessage
+    test ax, ax
+    jnz fail
+    push word [list_hwnd]
+    push word 0x40c
+    push word 0
+    push dword 0
+    call far SendMessage
+    cmp ax, 1
+    jne fail
+    push word [list_hwnd]
+    push word 0x40a
+    push word 0
+    push ds
+    push word list_buffer
+    call far SendMessage
+    cmp ax, 5
+    jne fail
+    cmp word [list_buffer], 0x7041
+    jne fail
+    push word [list_hwnd]
+    push word 0x407
+    push word 0
+    push dword 0
+    call far SendMessage
+    test ax, ax
+    jnz fail
+    push word [list_hwnd]
+    call far UpdateWindow
+    push word [list_hwnd]
+    call far GetDC
+    mov [dc], ax
+    push ax
+    push word 90
+    push word 5
+    call far GetPixel
+    test ax, ax
+    jnz fail
+    cmp dx, 0x80
+    jne fail
+    push word [list_hwnd]
+    push word [dc]
+    call far ReleaseDC
+    push word [list_hwnd]
+    call far DestroyWindow
     push ds
     push ds
     push word dlg_template
@@ -687,6 +774,15 @@ classname: db 'Win16Shared',0
 title: db 'Shared guest window',0
 passed: db 'WIN16 WINDOW PASS',0
 failed: db 'WIN16 WINDOW FAIL',0
+
+list_class: db "ListBox",0
+list_empty: db 0
+list_text: db "Apple",0
+list_buffer: times 8 db 0
+list_hwnd: dw 0
+clock_sample: dw 0
+clock_start: dw 0
+
 segment STACK stack class=STACK use16
     resb 8192
 group DGROUP _DATA STACK

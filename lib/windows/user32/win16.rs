@@ -595,8 +595,10 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             97 => crate::dialog::SendDlgItemMessageA(h(4), w(2), 0xf1, w(0), 0) as u32,
             98 => crate::dialog::SendDlgItemMessageA(h(2), w(0), 0xf0, 0, 0) as u32,
             101 => {
-                let (wp, lp) = to32(w(6), w(4), d(0));
-                crate::dialog::SendDlgItemMessageA(h(10), w(8), w(6), wp, lp) as u32
+                let child = window::GetDlgItem(h(10), w(8) as i32);
+                translated_message(child, w(6), w(4), d(0), |m, wp, lp| {
+                    crate::SendMessageA(child, m, wp, lp) as u32
+                })?
             }
             107 | 111 | 110 => {
                 let m = w(6);
@@ -609,7 +611,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                     };
                     message::PostMessageA(h(8), m, wp, lp) as u32
                 } else {
-                    translated_message(m, w(4), d(0), |m, wp, lp| {
+                    translated_message(h(8), m, w(4), d(0), |m, wp, lp| {
                         if o == 107 {
                             window::DefWindowProcA(h(8), m, wp, lp) as u32
                         } else {
@@ -638,7 +640,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 // tokens; translate at that boundary, never far-call them.
                 let proc = d(10);
                 if let Some(native) = native_procedure(proc) {
-                    return translated_message(w(6), w(4), d(0), |m, wp, lp| {
+                    return translated_message(h(8), w(6), w(4), d(0), |m, wp, lp| {
                         crate::call_procedure(native, h(8), m, wp, lp, false) as u32
                     });
                 }
@@ -772,13 +774,43 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
 }
 
 unsafe fn translated_message(
+    hwnd: u32,
     m: u32,
     w: u32,
     l: u32,
     call: impl FnOnce(u32, u32, u32) -> u32,
 ) -> Option<u32> {
     unsafe {
+        // Win16 control messages occupy WM_USER, so translation depends on
+        // the target class; application-defined WM_USER messages stay intact.
+        let class = state::with(|s| {
+            s.windows
+                .iter()
+                .find(|v| v.hwnd == hwnd)
+                .map_or(0, |v| v.class)
+        });
+        let m = if class == 0xc003 || class == 0xc005 {
+            match m {
+                0x401..=0x407 => m - 0x401 + 0x180,
+                0x408 => 0x187,
+                0x409 => 0x188,
+                0x40a => 0x189,
+                0x40b => 0x18a,
+                0x40c => 0x18b,
+                0x40d..=0x423 => m - 0x40d + 0x18c,
+                _ => m,
+            }
+        } else if class == 0xc004 && (0x400..=0x418).contains(&m) {
+            m - 0x400 + 0x140
+        } else {
+            m
+        };
         let (wp, lp) = to32(m, w, l);
+        let wp = if matches!(m, 0x181 | 0x186 | 0x14a | 0x14e) {
+            wp as u16 as i16 as i32 as u32
+        } else {
+            wp
+        };
         let m = if m == 0x19 {
             0x132 + (l >> 16).min(6)
         } else {
@@ -807,6 +839,18 @@ unsafe fn translated_message(
         }
         let lp = if position.is_some() {
             pos.as_mut_ptr() as u32
+        } else if matches!(
+            m,
+            0x180 | 0x181 | 0x18c | 0x18f | 0x1a2 | 0x143 | 0x14a | 0x14c | 0x14d
+        ) {
+            string(lp)?
+        } else if matches!(m, 0x189 | 0x148) {
+            let count_msg = if m == 0x189 { 0x18a } else { 0x149 };
+            let count = crate::SendMessageA(hwnd, count_msg, wp, 0);
+            if count < 0 {
+                return Some(u32::MAX);
+            }
+            pointer(lp, count as usize + 1)?
         } else if matches!(m, 0xc | 0xd) {
             pointer(lp, if m == 0xd { wp as usize } else { 1 })?
         } else {

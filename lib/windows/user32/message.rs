@@ -132,7 +132,26 @@ fn retrieve(thread: u32, hwnd: u32, min: u32, max: u32, remove: bool) -> Option<
             .iter()
             .enumerate()
             .filter(|(_, m)| matches(s, m, hwnd, min, max))
-            .min_by_key(|(_, m)| u8::from(m.message == 0xf))
+            .min_by_key(|(_, m)| {
+                if m.message != 0xf {
+                    return (0, 0);
+                }
+                let mut depth = 0;
+                let mut parent = m.hwnd;
+                while let Some(w) = s.windows.iter().find(|w| w.hwnd == parent) {
+                    if w.parent == 0 {
+                        break;
+                    }
+                    depth += 1;
+                    parent = w.parent;
+                    if depth >= s.windows.len() {
+                        break;
+                    }
+                }
+                // A parent's background can cover its children. Deliver its
+                // pending paint before theirs, even when they queued first.
+                (1, depth)
+            })
             .map(|(i, _)| i);
         if let Some(i) = index {
             return Some(if remove {

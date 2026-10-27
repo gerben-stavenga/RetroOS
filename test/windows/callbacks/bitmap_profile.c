@@ -13,6 +13,19 @@ static void CALLBACK close_message(HWND window, UINT msg, UINT_PTR id, DWORD tic
     CHECK(GetDlgItem(dialog,IDCANCEL)!=0);
     SendMessageW(dialog,WM_COMMAND,IDCANCEL,0);
 }
+static LRESULT CALLBACK paint_order_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
+{
+    if(m==WM_PAINT) {
+        PAINTSTRUCT ps;
+        RECT r;
+        HDC dc=BeginPaint(w,&ps);
+        GetClientRect(w,&r);
+        FillRect(dc,&r,GetStockObject(GetParent(w)?BLACK_BRUSH:WHITE_BRUSH));
+        EndPaint(w,&ps);
+        return 0;
+    }
+    return DefWindowProcA(w,m,wp,lp);
+}
 int main(void)
 {
     HDC dc=CreateCompatibleDC(0);
@@ -37,6 +50,29 @@ int main(void)
     CHECK(GetPixel(dc,0,0)==RGB(0,0,255));CHECK(GetPixel(dc,0,1)==RGB(255,0,0));
     CHECK(SetPixel(dc,1,1,RGB(22,33,44))==RGB(22,33,44));
     CHECK(GetPixel(dc,1,1)==RGB(22,33,44));
+    /* SRCCOPY respects source bounds and destination clips, ignores ROP2,
+       and snapshots overlapping copies within the same bitmap. */
+    {
+        HDC dst=CreateCompatibleDC(0);
+        HBITMAP db=CreateCompatibleBitmap(dst,4,4);
+        HRGN clip=CreateRectRgn(1,1,3,3);
+        int x,y;
+        SelectObject(dst,db);
+        for(y=0;y<4;++y) for(x=0;x<4;++x) SetPixel(dst,x,y,RGB(9,8,7));
+        SelectClipRgn(dst,clip);
+        SetROP2(dst,R2_BLACK);
+        CHECK(BitBlt(dst,0,0,4,4,dc,-1,-1,SRCCOPY));
+        CHECK(GetPixel(dst,1,1)==RGB(0,0,255));
+        CHECK(GetPixel(dst,2,1)==RGB(255,255,255));
+        CHECK(GetPixel(dst,2,2)==RGB(22,33,44));
+        SelectClipRgn(dst,0);
+        CHECK(GetPixel(dst,0,0)==RGB(9,8,7));
+        CHECK(GetPixel(dst,3,3)==RGB(9,8,7));
+        CHECK(BitBlt(dst,2,2,2,2,dst,1,1,SRCCOPY));
+        CHECK(GetPixel(dst,2,2)==RGB(0,0,255));
+        CHECK(GetPixel(dst,3,3)==RGB(22,33,44));
+        DeleteObject(clip);DeleteDC(dst);DeleteObject(db);
+    }
     CHECK(DeleteDC(dc));CHECK(DeleteObject(bitmap));
     /* Rectangle honors selected brush/pen and excludes right/bottom edges. */
     {
@@ -60,6 +96,29 @@ int main(void)
         CHECK(GetPixel(rd,2,2)==RGB(255,0,0));
         SelectObject(rd,oldb);SelectObject(rd,oldp);
         DeleteDC(rd);DeleteObject(rb);DeleteObject(red);DeleteObject(black);
+    }
+    /* Pending parent paint must precede child paint, even if the child
+       was invalidated first, or the parent wipes out its finished pixels. */
+    {
+        WNDCLASSA wc={0};
+        MSG msg;
+        HWND parent,child;
+        HDC pdc;
+        wc.lpfnWndProc=paint_order_proc;wc.lpszClassName="PaintOrder";
+        wc.hInstance=GetModuleHandleA(0);
+        CHECK(RegisterClassA(&wc)!=0);
+        parent=CreateWindowA("PaintOrder","",WS_POPUP|WS_VISIBLE,0,0,100,80,0,0,wc.hInstance,0);
+        child=CreateWindowA("PaintOrder","",WS_CHILD|WS_VISIBLE,10,10,30,30,parent,0,wc.hInstance,0);
+        UpdateWindow(parent);
+        InvalidateRect(child,0,TRUE);
+        InvalidateRect(parent,0,TRUE);
+        CHECK(PeekMessageA(&msg,0,WM_PAINT,WM_PAINT,PM_REMOVE));
+        CHECK(msg.hwnd==parent);DispatchMessageA(&msg);
+        CHECK(PeekMessageA(&msg,0,WM_PAINT,WM_PAINT,PM_REMOVE));
+        CHECK(msg.hwnd==child);DispatchMessageA(&msg);
+        pdc=GetDC(parent);CHECK(GetPixel(pdc,15,15)==RGB(0,0,0));ReleaseDC(parent,pdc);
+        DestroyWindow(parent);
+        UnregisterClassA("PaintOrder",wc.hInstance);
     }
     /* Group frames must not erase sibling controls; auto-radio buttons share
        state and painting regardless of whether the caller is PE or NE. */

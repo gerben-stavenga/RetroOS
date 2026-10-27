@@ -98,7 +98,10 @@ unsafe extern "system" {
     fn FillRect(dc: u32, rect: *const [i32; 4], brush: u32) -> i32;
     fn TextOutW(dc: u32, x: i32, y: i32, text: *const u16, count: i32) -> i32;
     fn GetStockObject(index: u32) -> u32;
+    fn GetSysColorBrush(index: u32) -> u32;
     fn SetBkMode(dc: u32, mode: u32) -> i32;
+    fn SetTextColor(dc: u32, color: u32) -> u32;
+    fn SetBkColor(dc: u32, color: u32) -> u32;
 }
 unsafe fn notify(hwnd: u32, code: u32) {
     let target = state::with(|s| {
@@ -125,10 +128,14 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
                 w.title.clone(),
                 w.control.image,
                 w.control.check,
+                w.control.items.clone(),
+                w.control.selected,
             )
         })
     });
-    if let Some((parent, width, height, title, image, check)) = info {
+    if let Some((parent, width, height, title, image, check, items, selected)) = info {
+        let list = kind == [76, 105, 115, 116, 66, 111, 120]
+            || kind == [67, 111, 109, 98, 111, 76, 66, 111, 120];
         let static_control = kind == [83, 116, 97, 116, 105, 99];
         let button = kind == [66, 117, 116, 116, 111, 110];
         let edit = kind == [69, 100, 105, 116];
@@ -141,6 +148,8 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
                         parent,
                         if static_control {
                             0x138
+                        } else if list {
+                            0x134
                         } else if edit {
                             0x133
                         } else {
@@ -255,7 +264,33 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
                     }
                 }
             }
-            if !bitmap && !etched && !title.is_empty() {
+            if list {
+                for (i, item) in items
+                    .iter()
+                    .enumerate()
+                    .take(((height + 15) / 16).max(0) as usize)
+                {
+                    let y = i as i32 * 16;
+                    let active = selected == Some(i);
+                    unsafe {
+                        FillRect(
+                            dc,
+                            &[0, y, width, (y + 16).min(height)],
+                            if active {
+                                GetSysColorBrush(13)
+                            } else {
+                                GetStockObject(0)
+                            },
+                        );
+                        let old_text = SetTextColor(dc, if active { 0xffffff } else { 0 });
+                        let old_back = SetBkColor(dc, if active { 0x800000 } else { 0xffffff });
+                        TextOutW(dc, 2, y, item.as_ptr(), item.len() as i32);
+                        SetTextColor(dc, old_text);
+                        SetBkColor(dc, old_back);
+                    }
+                }
+            }
+            if !list && !bitmap && !etched && !title.is_empty() {
                 let mut label = Vec::new();
                 let mut i = 0;
                 while i < title.len() {
@@ -336,6 +371,39 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                 crate::dialog::DefDlgProcA(hwnd, message, wparam, lparam)
             }
         };
+    }
+    if list && matches!(message, 0x201 | 0x100) {
+        let changed = state::with(|s| {
+            let w = s.windows.iter_mut().find(|w| w.hwnd == hwnd).unwrap();
+            let c = &mut w.control;
+            let index = if message == 0x201 {
+                ((lparam >> 16) as u16 as i16 as i32 / 16).max(0) as usize
+            } else {
+                match wparam {
+                    0x26 => c.selected.unwrap_or(0).saturating_sub(1),
+                    0x28 => c
+                        .selected
+                        .map_or(0, |v| v + 1)
+                        .min(c.items.len().saturating_sub(1)),
+                    _ => return false,
+                }
+            };
+            if index >= c.items.len() || c.selected == Some(index) {
+                return false;
+            }
+            c.selected = Some(index);
+            true
+        });
+        unsafe {
+            crate::input::SetFocus(hwnd);
+            if changed {
+                crate::paint::InvalidateRect(hwnd, 0, 0);
+                if style & 1 != 0 {
+                    notify(hwnd, 1);
+                }
+            }
+        }
+        return 0;
     }
     if (edit || button) && message == 0x201 {
         unsafe {
@@ -551,8 +619,8 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                 0x14a => 0x181,
                 0x144 => 0x182,
                 0x14b => 0x184,
-                0x146 => 0x188,
-                0x147 => 0x187,
+                0x146 => 0x18b,
+                0x147 => 0x188,
                 0x14e => 0x186,
                 0x148 => 0x189,
                 0x149 => 0x18a,
@@ -563,14 +631,14 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
         };
         if matches!(
             normalized,
-            0x180 | 0x181 | 0x182 | 0x184 | 0x186 | 0x187 | 0x188 | 0x189 | 0x18a
+            0x180 | 0x181 | 0x182 | 0x184 | 0x186 | 0x187 | 0x188 | 0x18b | 0x189 | 0x18a
         ) {
             let string = if normalized == 0x180 || normalized == 0x181 {
                 unsafe { text::read(lparam, wide) }
             } else {
                 Vec::new()
             };
-            return state::with(|s| {
+            let result = state::with(|s| {
                 let w = s.windows.iter_mut().find(|w| w.hwnd == hwnd).unwrap();
                 let c = &mut w.control;
                 match normalized {
@@ -603,8 +671,9 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                         };
                         c.selected.map_or(-1, |i| i as i32)
                     }
-                    0x187 => c.selected.map_or(-1, |i| i as i32),
-                    0x188 => c.items.len() as i32,
+                    0x187 => i32::from(c.selected == Some(wparam as usize)),
+                    0x188 => c.selected.map_or(-1, |i| i as i32),
+                    0x18b => c.items.len() as i32,
                     0x189 | 0x18a => {
                         let Some(value) = c.items.get(wparam as usize) else {
                             return -1;
@@ -622,6 +691,12 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                     _ => -1,
                 }
             });
+            if matches!(normalized, 0x180 | 0x181 | 0x182 | 0x184 | 0x186) {
+                unsafe {
+                    crate::paint::InvalidateRect(hwnd, 0, 0);
+                }
+            }
+            return result;
         }
     }
     if scroll {

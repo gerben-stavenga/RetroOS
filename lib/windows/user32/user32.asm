@@ -11,6 +11,8 @@ gate DrawEdge
 global _FillRect@12
 _FillRect@12:
 gate FillRect
+global _GetSysColorBrush@4
+_GetSysColorBrush@4:
 gate GetSysColorBrush
 global _GetSystemMetrics@4
 _GetSystemMetrics@4:

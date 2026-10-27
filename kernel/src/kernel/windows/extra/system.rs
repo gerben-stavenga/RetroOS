@@ -245,7 +245,8 @@ pub(super) fn call<A: crate::Arch>(
             }
             window.x = a(1) as i32; window.y = a(2) as i32;
             window.parent = a(5); window.visible = a(6) != 0;
-            if window.visible {state.focus_hwnd = hwnd; super::super::queue_paint(state,hwnd);}
+            // Placement alone does not invalidate pixels. Guest USER owns update
+            // regions and queues WM_PAINT explicitly when showing/resizing.
             state.dirty = true;
             1
         }

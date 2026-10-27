@@ -83,6 +83,7 @@ pub(super) struct State {
     resource_selector: u16,
     resource_next: u16,
     resources: Vec<Resource>,
+    clock_anchor: Option<(u64, u64)>,
 }
 
 fn module(name: &[u8]) -> Option<Module> {
@@ -778,6 +779,7 @@ pub(super) fn exec<A: crate::Arch>(
         resource_selector,
         resource_next: 0,
         resources: Vec::new(),
+        clock_anchor: None,
     });
     windows.on_resume(machine);
     current.personality = thread::Personality::Windows(windows);
@@ -1108,6 +1110,27 @@ fn dispatch<A: crate::Arch>(
         }
         (Module::Kernel, 102) => {
             match (regs.rax as u16 >> 8) as u8 {
+                0x2a | 0x2c => {
+                    // Win16 C runtimes use DOS3Call for _getdate/_gettime,
+                    // including animation waits. Advance from one RTC sample
+                    // with the monotonic clock, without polling CMOS per call.
+                    let now = machine.now();
+                    let (epoch, start) = *state.clock_anchor.get_or_insert_with(|| {
+                        let unix = crate::kernel::clock::rtc_unix_timestamp().unwrap_or(315532800);
+                        (u64::from(crate::kernel::clock::unix_to_local(unix)), now)
+                    });
+                    let centis = epoch * 100 + now.saturating_sub(start) / 10_000_000;
+                    let fields = crate::kernel::clock::calendar_from_unix((centis / 100) as i64);
+                    if (regs.rax as u16 >> 8) as u8 == 0x2a {
+                        regs.rcx = (regs.rcx & !0xffff) | u64::from(fields[0]);
+                        regs.rdx = (regs.rdx & !0xffff) | u64::from((fields[1] << 8) | fields[3]);
+                        (regs.rax as u32 & !0xff) | u32::from(fields[2])
+                    } else {
+                        regs.rcx = (regs.rcx & !0xffff) | u64::from((fields[4] << 8) | fields[5]);
+                        regs.rdx = (regs.rdx & !0xffff) | (u64::from(fields[6]) << 8) | (centis % 100);
+                        regs.rax as u32 & !0xff
+                    }
+                }
                 0x25 => 0, // Set interrupt vector; Win16 owns the virtual vector.
                 0x30 => {
                     regs.rax = (regs.rax & !0xffff) | 0x0005;
