@@ -12,7 +12,7 @@ nasm_library(
 windows_rust_library(
     name = "user32_rust",
     crate_root = "user32.rs",
-    srcs = ["bitmap.rs", "win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
+    srcs = ["scrollbar.rs", "bitmap.rs", "win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
 )
 
 windows_dll(
@@ -20,6 +20,7 @@ windows_dll(
     obj = ":user32_obj",
     libraries = [":user32_rust"],
     imports = {
+        "_Rectangle@20": "GDI32.Rectangle",
         "_CreatePen@12": "GDI32.CreatePen",
         "_TextOutA@20": "GDI32.TextOutA",
         "_LineTo@12": "GDI32.LineTo",
@@ -75,6 +76,8 @@ windows_dll(
         "_WideCharToMultiByte@32": "KERNEL32.WideCharToMultiByte",
     },
     export_aliases = {
+        "SetScrollPos": "_SetScrollPos@16", "GetScrollPos": "_GetScrollPos@8",
+        "SetScrollRange": "_SetScrollRange@20", "GetScrollRange": "_GetScrollRange@16",
         "TranslateMessage": "_TranslateMessage@4",
         "SetDlgItemInt": "_SetDlgItemInt@16",
         "GetDlgItemInt": "_GetDlgItemInt@16",
@@ -293,6 +296,7 @@ windows_dll(
     out = "USER32.DLL",
     module_name = "USER32",
     exports = [
+        "SetScrollPos", "GetScrollPos", "SetScrollRange", "GetScrollRange",
         "CreateMenu",
         "CreatePopupMenu",
         "IsMenu",

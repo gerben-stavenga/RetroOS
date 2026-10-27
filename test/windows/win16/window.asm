@@ -5,6 +5,7 @@ extern SendMessage, UpdateWindow, BeginPaint, EndPaint, GetClientRect
 extern PostMessage, GetMessage, DispatchMessage, FillRect, CreateSolidBrush, GetPixel, GetDC, ReleaseDC
 extern CreateDC, CreateBitmap, SelectObject, DeleteDC, DeleteObject, SetPixel
 extern GetWindowWord, SetWindowWord, GetWindowLong, SetWindowLong, CallWindowProc
+extern SetScrollRange, SetScrollPos
 extern ShowWindow, GetWindowRect
 extern DOSExit, CreateDialog, SetDlgItemInt, GetDlgItemInt
 global _start
@@ -252,6 +253,63 @@ _start:
     call far GetWindowWord
     cmp ax, 0xbeef
     jne fail
+    ; Shared vertical scrollbar: drag through its thumb and let the NE
+    ; parent update position in response to WM_VSCROLL.
+    push ds
+    push word scroll_class
+    push dword 0
+    push dword 0x50000001
+    push word 2
+    push word 2
+    push word 16
+    push word 128
+    push word [hwnd]
+    push word 79
+    push ds
+    push dword 0
+    call far CreateWindow
+    mov [scroll], ax
+    test ax, ax
+    jz fail
+    push ax
+    push word 2
+    push word -10
+    push word 30
+    push word 1
+    call far SetScrollRange
+    cmp ax, 1
+    jne fail
+    push word [scroll]
+    push word 2
+    push word 10
+    push word 1
+    call far SetScrollPos
+    push word [scroll]
+    push word 0x201
+    push word 1
+    push dword 0x00400008
+    call far SendMessage
+    push word [scroll]
+    push word 0x200
+    push word 1
+    push dword 0x00680008
+    call far SendMessage
+    push word [scroll]
+    push word 0x202
+    push word 0
+    push dword 0x00680008
+    call far SendMessage
+    cmp word [scroll_events], 7
+    jne fail
+    push word [scroll]
+    push word 0xe1
+    push word 0
+    push dword 0
+    call far SendMessage
+    cmp ax, 30
+    jne fail
+    push word [scroll]
+    call far DestroyWindow
     push ds
     push ds
     push word dlg_template
@@ -295,6 +353,8 @@ fail:
 wndproc:
     push bp
     mov bp, sp
+    cmp word [bp+12], 0x115
+    je .scroll
     cmp word [bp+12], 0x111
     je .command
     cmp word [bp+12], 5
@@ -316,6 +376,36 @@ wndproc:
     push word [bp+10]
     push dword [bp+6]
     call far DefWindowProc
+    jmp .return
+.scroll:
+    mov ax, [scroll]
+    cmp [bp+8], ax
+    jne fail
+    mov ax, [bp+10]
+    cmp ax, 8
+    je .scroll_end
+    cmp word [bp+6], 30
+    jne fail
+    cmp ax, 5
+    je .scroll_track
+    cmp ax, 4
+    jne fail
+    or word [scroll_events], 2
+    jmp .scroll_position
+.scroll_track:
+    or word [scroll_events], 1
+.scroll_position:
+    push word [scroll]
+    push word 2
+    push word [bp+6]
+    push word 1
+    call far SetScrollPos
+    jmp .scroll_return
+.scroll_end:
+    or word [scroll_events], 4
+.scroll_return:
+    xor ax, ax
+    xor dx, dx
     jmp .return
 .command:
     cmp word [bp+10], 78
@@ -452,6 +542,9 @@ dlg_template:
     db 0x81,0,0
 position: dw 0,0,0,0,0,0,3
 size_kind: dw 0xffff
+scroll: dw 0
+scroll_events: dw 0
+scroll_class: db "ScrollBar",0
 button: dw 0
 button_proc: dd 0
 button_text: times 16 db 0

@@ -126,6 +126,8 @@ const SPECS: &[Spec] = &[
     spec(b"GDI32", b"RetroGdiDeleteObject", 4),
     spec(b"GDI32", b"RetroGdiSelectObject", 8),
     spec(b"GDI32", b"RetroGdiObject", 12),
+    spec(b"GDI32", b"RetroGdiFillRect", 12),
+    spec(b"GDI32", b"RetroGdiCurrentObject", 8),
     spec(b"GDI32", b"RetroGdiClip", 12),
     spec(b"GDI32", b"RetroGdiBounds", 8),
     spec(b"GDI32", b"RetroGdiBitmap", 12),

@@ -617,3 +617,35 @@ pub unsafe extern "system" fn SetDIBitsToDevice(
     DeleteObject(bitmap);
     if result != 0 { lines as i32 } else { 0 }
 }
+
+unsafe extern "system" {
+    fn RetroGdiCurrentObject(dc: u32, kind: u32) -> u32;
+    fn RetroGdiFillRect(dc: u32, rect: *const [i32; 4], brush: u32) -> i32;
+    fn Polygon(dc: u32, points: *const [i32; 2], count: i32) -> i32;
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Rectangle(
+    dc: u32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) -> i32 {
+    let (l, r) = (left.min(right), left.max(right));
+    let (t, b) = (top.min(bottom), top.max(bottom));
+    let brush = unsafe { RetroGdiCurrentObject(dc, 2) };
+    if brush == 0 {
+        return 0;
+    }
+    if l == r || t == b {
+        return 1;
+    }
+    unsafe {
+        RetroGdiFillRect(dc, &[l, t, r, b], brush);
+        Polygon(
+            dc,
+            [[l, t], [r - 1, t], [r - 1, b - 1], [l, b - 1]].as_ptr(),
+            4,
+        )
+    }
+}

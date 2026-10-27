@@ -1566,6 +1566,12 @@ fn system_color(index: u32) -> u32 {
 }
 
 fn object_color(state: &WindowsState, handle: u32, default: u32) -> u32 {
+    if (0x40000..=0x40008).contains(&handle) {
+        return match handle - 0x40000 {
+            0 | 6 => 0x00ff_ffff, 1 => 0x00c0_c0c0, 2 => 0x0080_8080,
+            3 => 0x0040_4040, 4 | 7 => 0, _ => default,
+        };
+    }
     if (0x30000..0x30100).contains(&handle) {
         return system_color(handle - 0x30000);
     }
@@ -2182,8 +2188,8 @@ fn dispatch<A: crate::Arch>(
                 bitmap: None,
                 x: 0,
                 y: 0,
-                pen: 0x30008,
-                brush: 0x30005,
+                pen: 0x40007,
+                brush: 0x40000,
                 font: 1,
                 bk: 0x00ff_ffff,
                 text: 0,
@@ -2193,7 +2199,8 @@ fn dispatch<A: crate::Arch>(
         Api::SelectObject => {
             let dc = arg(machine, regs, 0);
             let object = arg(machine, regs, 1);
-            let kind = if (0x30000..0x30100).contains(&object) { Some(1) } else { state
+            let kind = if (0x40006..=0x40008).contains(&object) { Some(2) }
+            else if (0x40000..=0x40005).contains(&object) || (0x30000..0x30100).contains(&object) { Some(1) } else { state
                 .gdi_objects
                 .iter()
                 .find(|(h, _)| *h == object)
@@ -2247,18 +2254,18 @@ fn dispatch<A: crate::Arch>(
             }
         }
         Api::GetStockObject => {
-            0x30000
-                + match arg(machine, regs, 0) {
-                    4 => 8,
-                    5 => 5,
-                    _ => 5,
-                }
+            match arg(machine, regs, 0) {
+                index @ 0..=8 => 0x40000 + index,
+                index @ 10..=17 => 0x30000 + index,
+                _ => 0,
+            }
         }
         Api::FillRect => {
             let dc = arg(machine, regs, 0);
             let rect = arg(machine, regs, 1) as usize;
             let brush = arg(machine, regs, 2);
             let brush = if brush == 0 { state.dcs.iter().find(|d| d.handle == dc).map_or(0, |d| d.brush) } else { brush };
+            if brush == 0x40005 { return 1; }
             let color = object_color(state, brush, 0x00c0_c0c0);
             let (l, t, r, b) = rect_from_guest(machine, rect);
             fill_pixels(state, dc, l, t, r, b, color);
@@ -2303,7 +2310,7 @@ fn dispatch<A: crate::Arch>(
                 return 0;
             };
             let color = object_color(state, pen, 0);
-            line(state, dc, x0, y0, x, y, color);
+            if pen != 0x40008 { line(state, dc, x0, y0, x, y, color); }
             if let Some(context) = state.dcs.iter_mut().find(|d| d.handle == dc) {
                 context.x = x;
                 context.y = y;
@@ -2346,6 +2353,7 @@ fn dispatch<A: crate::Arch>(
                 .iter()
                 .find(|d| d.handle == dc)
                 .map_or(0x30008, |d| d.pen);
+            if pen == 0x40008 { return 1; }
             let color = object_color(state, pen, 0);
             if count > 1 && count < 1024 {
                 for i in 0..count {

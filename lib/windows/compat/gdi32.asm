@@ -65,3 +65,12 @@ _CreateCompatibleDC@4: jmp CreateCompatibleDC
 
 global _BitBlt@36
 _BitBlt@36: jmp BitBlt
+
+global _RetroGdiFillRect@12
+_RetroGdiFillRect@12:
+gate RetroGdiFillRect
+global _RetroGdiCurrentObject@8
+_RetroGdiCurrentObject@8:
+gate RetroGdiCurrentObject
+global _Polygon@12
+_Polygon@12: jmp Polygon

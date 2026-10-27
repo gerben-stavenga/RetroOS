@@ -12,9 +12,7 @@ pub struct Control {
     selected: Option<usize>,
     image: u32,
     font: u32,
-    minimum: i32,
-    maximum: i32,
-    position: i32,
+    pub(crate) scroll: [crate::scrollbar::Info; 3],
 }
 pub fn ensure() {
     state::with(|s| {
@@ -126,10 +124,11 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
                 crate::frame::client(s, w)[3] - crate::frame::client(s, w)[1],
                 w.title.clone(),
                 w.control.image,
+                w.control.check,
             )
         })
     });
-    if let Some((parent, width, height, title, image)) = info {
+    if let Some((parent, width, height, title, image, check)) = info {
         let static_control = kind == [83, 116, 97, 116, 105, 99];
         let button = kind == [66, 117, 116, 116, 111, 110];
         let edit = kind == [69, 100, 105, 116];
@@ -155,17 +154,106 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
                 0
             };
             let brush = if brush == 0 {
-                unsafe { GetStockObject(0) }
+                unsafe { GetStockObject(if edit { 0 } else { 1 }) }
             } else {
                 brush
             };
+            if kind == [83, 99, 114, 111, 108, 108, 66, 97, 114] {
+                crate::scrollbar::draw(dc, hwnd, width, height, style);
+                unsafe {
+                    crate::paint::EndPaint(hwnd, ps.as_ptr() as u32);
+                }
+                return 0;
+            }
+            let group = button && style & 15 == 7;
             let rect = [0, 0, width, height];
             unsafe {
-                FillRect(dc, &rect, brush);
+                if group {
+                    // A group box is a frame, not an opaque panel. Its interior
+                    // can contain sibling controls painted before it.
+                    for edge in [
+                        [0, 8, width, 9],
+                        [0, 8, 1, height],
+                        [0, height - 1, width, height],
+                        [width - 1, 8, width, height],
+                    ] {
+                        FillRect(dc, &edge, GetStockObject(3));
+                    }
+                    FillRect(
+                        dc,
+                        &[
+                            6,
+                            0,
+                            (title.len() as i32 * 8 + 10).min(width),
+                            16.min(height),
+                        ],
+                        brush,
+                    );
+                } else {
+                    FillRect(dc, &rect, brush);
+                }
                 SetBkMode(dc, 1);
             }
             if button && style & 15 <= 1 {
                 crate::frame::bevel(dc, [0, 0, width, height]);
+            }
+            let choice = button && matches!(style & 15, 2..=6 | 9);
+            if choice {
+                let top = ((height - 13) / 2).max(0);
+                let radio = matches!(style & 15, 4 | 9);
+                // Scanline drawing uses the shared fill primitive, so clipping
+                // and both Win16/Win32 device contexts remain identical.
+                for y in 0i32..13 {
+                    let inset = if radio {
+                        match y {
+                            0 | 12 => 4,
+                            1 | 11 => 2,
+                            2 | 10 => 1,
+                            _ => 0,
+                        }
+                    } else {
+                        0
+                    };
+                    unsafe {
+                        FillRect(
+                            dc,
+                            &[inset, top + y, 13 - inset, top + y + 1],
+                            GetStockObject(4),
+                        );
+                        if y > 0 && y < 12 {
+                            FillRect(
+                                dc,
+                                &[inset + 1, top + y, 12 - inset, top + y + 1],
+                                GetStockObject(0),
+                            );
+                        }
+                    }
+                }
+                if check != 0 {
+                    if radio {
+                        for y in 4i32..9 {
+                            let inset = if y == 4 || y == 8 { 5 } else { 4 };
+                            unsafe {
+                                FillRect(
+                                    dc,
+                                    &[inset, top + y, 13 - inset, top + y + 1],
+                                    GetStockObject(4),
+                                );
+                            }
+                        }
+                    } else {
+                        for y in 3i32..10 {
+                            unsafe {
+                                FillRect(dc, &[y, top + y, y + 1, top + y + 1], GetStockObject(4));
+                                FillRect(
+                                    dc,
+                                    &[12 - y, top + y, 13 - y, top + y + 1],
+                                    GetStockObject(4),
+                                );
+                            }
+                        }
+                    }
+                }
             }
             if !bitmap && !etched && !title.is_empty() {
                 let mut label = Vec::new();
@@ -180,7 +268,11 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
                     label.push(title[i]);
                     i += 1;
                 }
-                let (x, y) = if button && style & 15 <= 1 {
+                let (x, y) = if group {
+                    (8, 0)
+                } else if choice {
+                    (17, (height - 16).max(0) / 2)
+                } else if button && style & 15 <= 1 {
                     (
                         (width - label.len() as i32 * 8).max(0) / 2,
                         (height - 16).max(0) / 2,
@@ -280,6 +372,44 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                 w.control.pressed = false;
             }
         });
+        if style & 15 == 9 {
+            let changed = state::with(|s| {
+                let Some(parent) = s.windows.iter().find(|w| w.hwnd == hwnd).map(|w| w.parent)
+                else {
+                    return Vec::new();
+                };
+                let siblings: Vec<_> = s
+                    .windows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, w)| w.parent == parent)
+                    .map(|(i, w)| (i, w.hwnd, w.style))
+                    .collect();
+                let Some(at) = siblings.iter().position(|v| v.1 == hwnd) else {
+                    return Vec::new();
+                };
+                let first = (0..=at)
+                    .rev()
+                    .find(|&i| siblings[i].2 & 0x20000 != 0)
+                    .unwrap_or(0);
+                let end = (at + 1..siblings.len())
+                    .find(|&i| siblings[i].2 & 0x20000 != 0)
+                    .unwrap_or(siblings.len());
+                let mut changed = Vec::new();
+                for &(i, h, style) in &siblings[first..end] {
+                    if matches!(style & 15, 4 | 9) {
+                        s.windows[i].control.check = u32::from(h == hwnd);
+                        changed.push(h);
+                    }
+                }
+                changed
+            });
+            for h in changed {
+                unsafe {
+                    crate::paint::InvalidateRect(h, 0, 0);
+                }
+            }
+        }
         unsafe {
             notify(hwnd, 0);
             crate::paint::InvalidateRect(hwnd, 0, 0);
@@ -324,7 +454,7 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
         });
     }
     if button && (0xf0..=0xf4).contains(&message) {
-        return state::with(|s| {
+        let result = state::with(|s| {
             let w = s.windows.iter_mut().find(|w| w.hwnd == hwnd).unwrap();
             match message {
                 0xf0 => w.control.check as i32,
@@ -351,6 +481,12 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                 _ => 0,
             }
         });
+        if matches!(message, 0xf1 | 0xf3 | 0xf4) {
+            unsafe {
+                crate::paint::InvalidateRect(hwnd, 0, 0);
+            }
+        }
+        return result;
     }
     if edit && matches!(message, 0xb0 | 0xb1 | 0xc2 | 0x102) {
         let insertion = if message == 0xc2 {
@@ -488,35 +624,10 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
             });
         }
     }
-    if scroll && matches!(message, 0xe0..=0xe3) {
-        return state::with(|s| {
-            let w = s.windows.iter_mut().find(|w| w.hwnd == hwnd).unwrap();
-            let c = &mut w.control;
-            match message {
-                0xe0 => {
-                    let old = c.position;
-                    c.position = (wparam as i32).clamp(c.minimum, c.maximum.max(c.minimum));
-                    old
-                }
-                0xe1 => c.position,
-                0xe2 => {
-                    c.minimum = wparam as i32;
-                    c.maximum = lparam as i32;
-                    0
-                }
-                _ => {
-                    unsafe {
-                        if wparam != 0 {
-                            (wparam as *mut i32).write_unaligned(c.minimum);
-                        }
-                        if lparam != 0 {
-                            (lparam as *mut i32).write_unaligned(c.maximum);
-                        }
-                    }
-                    0
-                }
-            }
-        });
+    if scroll {
+        if let Some(result) = unsafe { crate::scrollbar::message(hwnd, message, wparam, lparam) } {
+            return result;
+        }
     }
     if message == 0x87 {
         return if edit {

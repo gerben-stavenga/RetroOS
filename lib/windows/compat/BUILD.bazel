@@ -21,6 +21,7 @@ windows_dll(
         "_Sleep@4": "KERNEL32.Sleep",
     },
     export_aliases = {
+        "Rectangle": "_Rectangle@20",
         "SetDIBitsToDevice": "_SetDIBitsToDevice@48",
         "GetMapMode": "_GetMapMode@4",
         "CreateBitmap": "_CreateBitmap@20",
@@ -53,6 +54,7 @@ windows_dll(
         "SetROP2": "_SetROP2@8",
     },
     exports = [
+        "Rectangle", "RetroGdiCurrentObject", "RetroGdiFillRect",
         "SetDIBitsToDevice",
         "GetMapMode",
         "RetroGdiSelectObject", "RetroGdiObject", "RetroGdiBitmap",

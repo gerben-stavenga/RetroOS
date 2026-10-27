@@ -4,6 +4,7 @@ use crate::{Message, class, input, keyboard, menu, message, paint, rect, state, 
 
 unsafe extern "system" {
     fn Retro16Call(proc: u32, args: *const u8, bytes: u32, reserve: u32) -> u32;
+    fn Rectangle(dc: u32, l: i32, t: i32, r: i32, b: i32) -> i32;
     fn GetSystemMetrics(index: u32) -> u32;
     fn GetPixel(dc: u32, x: i32, y: i32) -> u32;
     fn SetPixel(dc: u32, x: i32, y: i32, color: u32) -> u32;
@@ -195,6 +196,7 @@ unsafe fn write_rect(p: u32, r: &rect::Rect) -> Option<()> {
 }
 fn to32(m: u32, w: u32, l: u32) -> (u32, u32) {
     match m {
+        0x19 => (decode(w), decode(l & 0xffff)),
         0x111 => (w | (l & 0xffff_0000), decode(l & 0xffff)),
         0x114 | 0x115 => (w | (l << 16), decode(l >> 16)),
         0x14 | 7 | 8 => (decode(w), l),
@@ -204,6 +206,7 @@ fn to32(m: u32, w: u32, l: u32) -> (u32, u32) {
 }
 fn to16(m: u32, w: u32, l: u32) -> (u32, u32) {
     match m {
+        0x132..=0x138 => (encode(w), encode(l) | ((m - 0x132) << 16)),
         0x111 => (w & 0xffff, encode(l) | (w & 0xffff_0000)),
         0x114 | 0x115 => (w & 0xffff, (w >> 16) | (encode(l) << 16)),
         0x14 | 7 | 8 => (encode(w), l),
@@ -341,7 +344,12 @@ unsafe fn callback(proc: u32, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool)
         let mut args = [0u8; 10];
         args[0..4].copy_from_slice(&l.to_le_bytes());
         args[4..6].copy_from_slice(&(w as u16).to_le_bytes());
-        args[6..8].copy_from_slice(&(msg as u16).to_le_bytes());
+        let message16 = if (0x132..=0x138).contains(&msg) {
+            0x19
+        } else {
+            msg
+        };
+        args[6..8].copy_from_slice(&(message16 as u16).to_le_bytes());
         args[8..10].copy_from_slice(&(encode(hwnd) as u16).to_le_bytes());
         if msg == 0xd {
             args[4..6].copy_from_slice(&(wp.min(reserve) as u16).to_le_bytes());
@@ -365,7 +373,11 @@ unsafe fn callback(proc: u32, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool)
             }
             p.add(6).write(word(scratch, 12));
         }
-        Some(result)
+        Some(if (0x132..=0x138).contains(&msg) {
+            decode(result & 0xffff)
+        } else {
+            result
+        })
     }
 }
 
@@ -473,6 +485,8 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 class::RegisterClassA(wc.as_ptr() as u32)
             }
             60 => encode(input::GetActiveWindow()),
+            62 => crate::scrollbar::SetScrollPos(h(6), i(4), i(2), i(0)) as u32,
+            64 => crate::scrollbar::SetScrollRange(h(8), i(6), i(4), i(2), i(0)) as u32,
             66 => encode(paint::GetDC(h(0))),
             68 => paint::ReleaseDC(h(2), h(0)) as u32,
             72 => {
@@ -573,7 +587,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                     };
                     message::PostMessageA(h(8), m, wp, lp) as u32
                 } else {
-                    translated_message(m, w(4), d(0), |wp, lp| {
+                    translated_message(m, w(4), d(0), |m, wp, lp| {
                         if o == 107 {
                             window::DefWindowProcA(h(8), m, wp, lp) as u32
                         } else {
@@ -602,8 +616,8 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 // tokens; translate at that boundary, never far-call them.
                 let proc = d(10);
                 if let Some(native) = native_procedure(proc) {
-                    return translated_message(w(6), w(4), d(0), |wp, lp| {
-                        crate::call_procedure(native, h(8), w(6), wp, lp, false) as u32
+                    return translated_message(w(6), w(4), d(0), |m, wp, lp| {
+                        crate::call_procedure(native, h(8), m, wp, lp, false) as u32
                     });
                 }
                 // NE-to-NE forwarding preserves segmented LPARAM buffers.
@@ -715,6 +729,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 MoveToEx(h(4), i(2), i(0), &mut old);
                 old[0] as u16 as u32 | ((old[1] as u16 as u32) << 16)
             }
+            1027 => Rectangle(h(8), i(6), i(4), i(2), i(0)) as u32,
             1031 => SetPixel(h(8), i(6), i(4), d(0)),
             1033 => TextOutA(h(10), i(8), i(6), pointer(d(2), w(0) as usize)?, i(0)) as u32,
             1034 => BitBlt(h(18), i(16), i(14), i(12), i(10), h(8), i(6), i(4), d(0)) as u32,
@@ -738,10 +753,15 @@ unsafe fn translated_message(
     m: u32,
     w: u32,
     l: u32,
-    call: impl FnOnce(u32, u32) -> u32,
+    call: impl FnOnce(u32, u32, u32) -> u32,
 ) -> Option<u32> {
     unsafe {
         let (wp, lp) = to32(m, w, l);
+        let m = if m == 0x19 {
+            0x132 + (l >> 16).min(6)
+        } else {
+            m
+        };
         // Win16 forwards a segmented, WORD-sized WINDOWPOS back to
         // USER. Keep the translated storage alive through nested calls.
         let position = if lp != 0 && matches!(m, 0x46 | 0x47) {
@@ -770,7 +790,7 @@ unsafe fn translated_message(
         } else {
             lp
         };
-        let result = call(wp, lp);
+        let result = call(m, wp, lp);
         if m == 0x46 {
             if let Some(p) = position {
                 putw(p, 0, encode(pos[0]));
@@ -788,6 +808,10 @@ unsafe fn translated_message(
                 }
             }
         }
-        Some(result)
+        Some(if (0x132..=0x138).contains(&m) {
+            encode(result)
+        } else {
+            result
+        })
     }
 }

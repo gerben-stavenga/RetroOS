@@ -21,6 +21,7 @@ mod paint;
 mod rect;
 mod resource;
 mod runtime;
+mod scrollbar;
 mod state;
 mod text;
 mod win16;

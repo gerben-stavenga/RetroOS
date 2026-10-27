@@ -73,7 +73,7 @@ ENGINE=tcg python3 test/windows_win16.py
 They check recursive far callbacks, register/stack preservation, CREATESTRUCT
 conversion, nested SendMessage, queued dispatch, initial size notifications,
 maximize/restore geometry, WINDOWPOS forwarding, shared control subclassing,
-window words, client dimensions, painting and
+window words, scrollbar range/position and drag notifications, client dimensions, painting and
 pixel readback, dialog-template conversion and numeric controls, the 16-bit
 DLGPROC return convention, and process termination. No proprietary game is needed.
 Windows 3.1 Minesweeper is also a local acceptance test for its resource menus,
@@ -93,3 +93,10 @@ bazelisk test //lib/windows/user32:bitmap_test --platforms=@platforms//host
 Castle of the Winds is a local acceptance test for maximizing its initially
 zero-width Startup window and displaying its RLE4 title banners. This does not
 assert complete gameplay compatibility.
+
+Shared USER draws checkbox/radio indicators, group-box frames and scrollbar
+controls. Shared GDI implements Rectangle using the kernel's existing pixel-fill
+and polygon primitives; stock brushes/pens preserve their types and null behavior.
+Win16 WM_CTLCOLOR is translated to the corresponding Win32 control-color message.
+The Win32 callback suite checks radio grouping, transparent group-box interiors,
+and rectangle brush/pen behavior.

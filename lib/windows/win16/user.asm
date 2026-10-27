@@ -47,8 +47,8 @@ bridge MoveWindow, 56, 12
 bridge RegisterClass, 57, 4
 bridge GetActiveWindow, 60, 0
 gate ScrollWindow
-gate SetScrollPos
-gate SetScrollRange
+bridge SetScrollPos, 62, 8
+bridge SetScrollRange, 64, 10
 bridge GetDC, 66, 2
 bridge ReleaseDC, 68, 4
 gate SetCursor

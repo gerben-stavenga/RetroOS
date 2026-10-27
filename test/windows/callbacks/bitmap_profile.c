@@ -28,6 +28,50 @@ int main(void)
     CHECK(SetPixel(dc,1,1,RGB(22,33,44))==RGB(22,33,44));
     CHECK(GetPixel(dc,1,1)==RGB(22,33,44));
     CHECK(DeleteDC(dc));CHECK(DeleteObject(bitmap));
+    /* Rectangle honors selected brush/pen and excludes right/bottom edges. */
+    {
+        HDC rd=CreateCompatibleDC(0);
+        HBITMAP rb=CreateCompatibleBitmap(rd,16,16);
+        HBRUSH red=CreateSolidBrush(RGB(255,0,0));
+        HPEN black=CreatePen(PS_SOLID,1,RGB(0,0,0));
+        HGDIOBJ oldb,oldp;
+        SelectObject(rd,rb);
+        oldb=SelectObject(rd,red);oldp=SelectObject(rd,black);
+        CHECK(Rectangle(rd,2,2,10,10));
+        CHECK(GetPixel(rd,3,3)==RGB(255,0,0));
+        CHECK(GetPixel(rd,2,2)==RGB(0,0,0));
+        CHECK(GetPixel(rd,10,10)!=RGB(255,0,0));
+        SetPixel(rd,4,4,RGB(0,0,255));
+        SelectObject(rd,GetStockObject(NULL_BRUSH));
+        CHECK(Rectangle(rd,2,2,10,10));
+        CHECK(GetPixel(rd,4,4)==RGB(0,0,255));
+        SelectObject(rd,red);SelectObject(rd,GetStockObject(NULL_PEN));
+        CHECK(Rectangle(rd,2,2,10,10));
+        CHECK(GetPixel(rd,2,2)==RGB(255,0,0));
+        SelectObject(rd,oldb);SelectObject(rd,oldp);
+        DeleteDC(rd);DeleteObject(rb);DeleteObject(red);DeleteObject(black);
+    }
+    /* Group frames must not erase sibling controls; auto-radio buttons share
+       state and painting regardless of whether the caller is PE or NE. */
+    {
+        HWND parent=CreateWindowA("STATIC","",WS_POPUP|WS_VISIBLE,0,0,250,80,0,0,0,0);
+        HWND first=CreateWindowA("BUTTON","first",WS_CHILD|WS_VISIBLE|WS_GROUP|BS_AUTORADIOBUTTON,10,20,100,20,parent,(HMENU)1,0,0);
+        HWND second=CreateWindowA("BUTTON","second",WS_CHILD|WS_VISIBLE|BS_AUTORADIOBUTTON,120,20,100,20,parent,(HMENU)2,0,0);
+        HWND group=CreateWindowA("BUTTON","Choices",WS_CHILD|WS_VISIBLE|BS_GROUPBOX,0,0,240,60,parent,(HMENU)3,0,0);
+        HDC cd;
+        CHECK(parent&&first&&second&&group);
+        SendMessageA(first,BM_CLICK,0,0);
+        CHECK(SendMessageA(first,BM_GETCHECK,0,0)==BST_CHECKED);
+        SendMessageA(second,BM_CLICK,0,0);
+        CHECK(SendMessageA(first,BM_GETCHECK,0,0)==BST_UNCHECKED);
+        CHECK(SendMessageA(second,BM_GETCHECK,0,0)==BST_CHECKED);
+        UpdateWindow(parent);UpdateWindow(first);UpdateWindow(second);
+        cd=GetDC(first);
+        CHECK(GetPixel(cd,0,9)==RGB(0,0,0));
+        UpdateWindow(group);
+        CHECK(GetPixel(cd,0,9)==RGB(0,0,0));
+        ReleaseDC(first,cd);DestroyWindow(parent);
+    }
     file=CreateFileA("C:\\PROFILE.INI",GENERIC_WRITE,0,0,CREATE_ALWAYS,0,0);
     CHECK(file!=INVALID_HANDLE_VALUE);
     CHECK(WriteFile(file,ini,sizeof(ini)-1,&written,0));CHECK(CloseHandle(file));

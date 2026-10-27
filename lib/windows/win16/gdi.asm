@@ -20,7 +20,7 @@ gate SetViewportExt
 bridge LineTo, 1019, 6
 bridge MoveTo, 1020, 6
 gate Arc
-gate Rectangle
+bridge Rectangle, 1027, 10
 gate PatBlt
 bridge SetPixel, 1031, 10
 bridge TextOut, 1033, 12

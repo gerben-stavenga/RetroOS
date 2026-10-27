@@ -31,7 +31,7 @@ pub(super) fn call<A: crate::Arch>(
                 dc.window=Some(hwnd);dc.viewport=viewport;return old;
             }
             let handle=state.next_object;state.next_object+=1;
-            state.dcs.push(super::super::DeviceContext {viewport,handle,window:Some(hwnd),bitmap:None,x:0,y:0,pen:0x30008,brush:0x30005,font:1,bk:0x00ff_ffff,text:0});
+            state.dcs.push(super::super::DeviceContext {viewport,handle,window:Some(hwnd),bitmap:None,x:0,y:0,pen:0x40007,brush:0x40000,font:1,bk:0x00ff_ffff,text:0});
             handle
         }
         b"RetroInvalidateWindow" => super::super::dispatch(machine,kt,state,regs,super::super::Api::InvalidateRect),
@@ -77,6 +77,12 @@ pub(super) fn call<A: crate::Arch>(
             machine.copy_from(a(2) as usize,&mut pixels);
             let handle=state.next_object;state.next_object+=1;
             state.gdi_objects.push((handle,super::super::GdiObject::Bitmap{width,height,pixels}));handle
+        }
+        b"RetroGdiFillRect" => super::super::dispatch(machine, kt, state, regs, super::super::Api::FillRect),
+        b"RetroGdiCurrentObject" => {
+            state.dcs.iter().find(|d| d.handle == a(0)).map_or(0, |d| match a(1) {
+                1 => d.pen, 2 => d.brush, 6 => d.font, 7 => d.bitmap.unwrap_or(1), _ => 0,
+            })
         }
         b"RetroGdiSelectObject" => super::super::dispatch(machine, kt, state, regs, super::super::Api::SelectObject),
         b"RetroGdiObject" => {
