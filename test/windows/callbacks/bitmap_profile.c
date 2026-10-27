@@ -87,6 +87,17 @@ int main(void)
         CHECK(GetPixel(dst,0,1)==0);CHECK(GetPixel(dst,1,1)==RGB(255,255,255));
         DeleteObject(clip);DeleteDC(dst);DeleteObject(db);
     }
+    {
+        POINT previous;
+        HBRUSH brush=CreateSolidBrush(RGB(1,2,3));
+        CHECK(SetBrushOrgEx(dc,7,-3,&previous));
+        CHECK(previous.x==0&&previous.y==0);
+        CHECK(SetBrushOrgEx(dc,-2,9,&previous));
+        CHECK(previous.x==7&&previous.y==-3);
+        CHECK(UnrealizeObject(brush));
+        CHECK(!UnrealizeObject((HGDIOBJ)0));
+        DeleteObject(brush);
+    }
     CHECK(DeleteDC(dc));CHECK(DeleteObject(bitmap));
     /* Rectangle honors selected brush/pen and excludes right/bottom edges. */
     {
@@ -133,6 +144,38 @@ int main(void)
         pdc=GetDC(parent);CHECK(GetPixel(pdc,15,15)==RGB(0,0,0));ReleaseDC(parent,pdc);
         DestroyWindow(parent);
         UnregisterClassA("PaintOrder",wc.hInstance);
+    }
+    /* Window DC copies must snapshot overlapping pixels, and scrolling must
+       expose the vacated strip while preserving the copied content. */
+    {
+        HWND window=CreateWindowA("STATIC","",WS_POPUP|WS_VISIBLE,30,40,100,80,0,0,0,0);
+        HDC wd;
+        RECT area={0,0,8,8},update;
+        POINT point={5,6};
+        HCURSOR arrow=LoadCursorA(0,IDC_ARROW),old;
+        int x,y,tab=24;
+        DWORD extent;
+        UpdateWindow(window);
+        CHECK(ClientToScreen(window,&point));
+        CHECK(point.x==35&&point.y==46);
+        CHECK(ScreenToClient(window,&point));
+        CHECK(point.x==5&&point.y==6);
+        old=SetCursor(arrow);
+        CHECK(GetCursor()==arrow);
+        CHECK(ShowCursor(FALSE)==-1);
+        CHECK(ShowCursor(TRUE)==0);
+        CHECK(SetCursor(old)==arrow);
+        wd=GetDC(window);
+        for(y=0;y<8;++y) for(x=0;x<8;++x) SetPixel(wd,x,y,RGB(x+1,y+1,7));
+        CHECK(ScrollWindow(window,2,0,&area,&area));
+        CHECK(GetPixel(wd,2,3)==RGB(1,4,7));
+        CHECK(GetPixel(wd,7,3)==RGB(6,4,7));
+        CHECK(GetUpdateRect(window,&update,FALSE));
+        CHECK(update.left==0&&update.top==0&&update.right==2&&update.bottom==8);
+        extent=GetTabbedTextExtentA(wd,"A\tB",3,1,&tab);
+        CHECK(TabbedTextOutA(wd,10,20,"A\tB",3,1,&tab,10)==extent);
+        ReleaseDC(window,wd);
+        DestroyWindow(window);
     }
     /* Group frames must not erase sibling controls; auto-radio buttons share
        state and painting regardless of whether the caller is PE or NE. */

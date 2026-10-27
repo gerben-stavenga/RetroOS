@@ -74,3 +74,7 @@ _RetroGdiCurrentObject@8:
 gate RetroGdiCurrentObject
 global _Polygon@12
 _Polygon@12: jmp Polygon
+
+global _GetObjectType@4
+_GetObjectType@4:
+gate GetObjectType

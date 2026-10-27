@@ -6,6 +6,9 @@ unsafe extern "system" {
     fn Retro16Call(proc: u32, args: *const u8, bytes: u32, reserve: u32) -> u32;
     fn Rectangle(dc: u32, l: i32, t: i32, r: i32, b: i32) -> i32;
     fn GetSystemMetrics(index: u32) -> u32;
+    fn GetKeyState(key: u32) -> i32;
+    fn SetBrushOrgEx(dc: u32, x: i32, y: i32, old: *mut [i32; 2]) -> i32;
+    fn UnrealizeObject(object: u32) -> i32;
     fn GetPixel(dc: u32, x: i32, y: i32) -> u32;
     fn SetPixel(dc: u32, x: i32, y: i32, color: u32) -> u32;
     fn SetBkColor(dc: u32, color: u32) -> u32;
@@ -424,6 +427,84 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 write_rect(d(0), &r)?;
                 result as u32
             }
+            17 => {
+                let out = pointer(d(0), 4)?;
+                let mut point = [0; 2];
+                let result = input::GetCursorPos(&mut point);
+                putw(out, 0, point[0] as u32);
+                putw(out, 2, point[1] as u32);
+                result as u32
+            }
+            28 | 29 => {
+                let p = pointer(d(0), 4)?;
+                let mut point = rect::Point {
+                    x: word(p, 0) as i16 as i32,
+                    y: word(p, 2) as i16 as i32,
+                };
+                let result = if o == 28 {
+                    window::ClientToScreen(h(4), &mut point)
+                } else {
+                    window::ScreenToClient(h(4), &mut point)
+                };
+                putw(p, 0, point.x as u32);
+                putw(p, 2, point.y as u32);
+                result as u32
+            }
+            31 => window::IsIconic(h(0)) as u32,
+            69 => encode(input::SetCursor(h(0))),
+            71 => input::ShowCursor(i(0)) as u32,
+            173 => encode(crate::resource::LoadCursorA(w(4), string(d(0))?)),
+            70 => input::SetCursorPos(i(2), i(0)) as u32,
+            106 => GetKeyState(w(0)) as u32,
+            232 => {
+                let after = w(10);
+                window::SetWindowPos(
+                    h(12),
+                    if after >= 0xfffe {
+                        after as i16 as i32 as u32
+                    } else {
+                        decode(after)
+                    },
+                    i(8),
+                    i(6),
+                    i(4),
+                    i(2),
+                    w(0),
+                ) as u32
+            }
+            196 => {
+                let count = i(6);
+                if count < 0 {
+                    return Some(0);
+                }
+                let p = if count == 0 {
+                    0
+                } else {
+                    pointer(d(2), count as usize * 2)?
+                };
+                let tabs: alloc::vec::Vec<i32> = (0..count as usize)
+                    .map(|j| word(p, j * 2) as i16 as i32)
+                    .collect();
+                crate::drawing::TabbedTextOutA(
+                    h(18),
+                    i(16),
+                    i(14),
+                    pointer(d(10), w(8) as usize)?,
+                    i(8),
+                    count,
+                    tabs.as_ptr(),
+                    i(0),
+                )
+            }
+            1148 => {
+                let mut old = [0; 2];
+                if SetBrushOrgEx(h(4), i(2), i(0), &mut old) == 0 {
+                    0
+                } else {
+                    (old[0] as u32 & 0xffff) | ((old[1] as u32 & 0xffff) << 16)
+                }
+            }
+            1150 => UnrealizeObject(h(0)) as u32,
             34 => window::EnableWindow(h(2), i(0)) as u32,
             35 => window::IsWindowEnabled(h(0)) as u32,
             36 => window::GetWindowTextA(h(6), pointer(d(2), w(0) as usize)?, i(0)) as u32,
@@ -486,6 +567,27 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 class::RegisterClassA(wc.as_ptr() as u32)
             }
             60 => encode(input::GetActiveWindow()),
+            61 => {
+                let area = if d(4) == 0 {
+                    None
+                } else {
+                    let r = rectangle(d(4))?;
+                    Some([r.left, r.top, r.right, r.bottom])
+                };
+                let clip = if d(0) == 0 {
+                    None
+                } else {
+                    let r = rectangle(d(0))?;
+                    Some([r.left, r.top, r.right, r.bottom])
+                };
+                paint::ScrollWindow(
+                    h(12),
+                    i(10),
+                    i(8),
+                    area.as_ref().map_or(core::ptr::null(), |r| r),
+                    clip.as_ref().map_or(core::ptr::null(), |r| r),
+                ) as u32
+            }
             62 => crate::scrollbar::SetScrollPos(h(6), i(4), i(2), i(0)) as u32,
             64 => crate::scrollbar::SetScrollRange(h(8), i(6), i(4), i(2), i(0)) as u32,
             66 => encode(paint::GetDC(h(0))),
@@ -721,6 +823,21 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             159 => encode(menu::GetSubMenu(h(2), i(0))),
             160 => menu::DrawMenuBar(h(0)) as u32,
             175 => encode(crate::resource::LoadBitmapA(w(4), string(d(0))?)),
+            153 => {
+                let flags = w(0);
+                let id = if flags & 0x10 != 0 { h(2) } else { w(2) };
+                if flags & 0x100 != 0 {
+                    menu::AppendMenuA(h(10), flags & !0x100, id, string(d(4))?) as u32
+                } else if flags & 0x200 != 0 {
+                    menu::DeleteMenu(h(10), w(8), flags & !0x200) as u32
+                } else if flags & 0x1000 != 0 {
+                    menu::RemoveMenu(h(10), w(8), flags & !0x1000) as u32
+                } else if flags & 0x80 != 0 {
+                    menu::ModifyMenuA(h(10), w(8), flags & !0x80, id, string(d(4))?) as u32
+                } else {
+                    menu::InsertMenuA(h(10), w(8), flags, id, string(d(4))?) as u32
+                }
+            }
             174 => encode(crate::resource::LoadIconA(w(4), string(d(0))?)),
             457 => crate::resource::DestroyIcon(h(0)) as u32,
             179 => GetSystemMetrics(w(0)),

@@ -17,7 +17,7 @@ bridge SetTimer, 10, 10
 bridge KillTimer, 12, 4
 bridge GetCurrentTime, 15, 0
 gate ClipCursor
-gate GetCursorPos
+bridge GetCursorPos, 17, 4
 bridge SetCapture, 18, 2
 bridge ReleaseCapture, 19, 0
 bridge SetFocus, 22, 2
@@ -25,9 +25,9 @@ bridge GetFocus, 23, 0
 gate RemoveProp
 gate GetProp
 gate SetProp
-gate ClientToScreen
-gate ScreenToClient
-gate IsIconic
+bridge ClientToScreen, 28, 6
+bridge ScreenToClient, 29, 6
+bridge IsIconic, 31, 2
 bridge GetWindowRect, 32, 6
 bridge GetClientRect, 33, 6
 bridge EnableWindow, 34, 4
@@ -46,14 +46,14 @@ bridge DestroyWindow, 53, 2
 bridge MoveWindow, 56, 12
 bridge RegisterClass, 57, 4
 bridge GetActiveWindow, 60, 0
-gate ScrollWindow
+bridge ScrollWindow, 61, 14
 bridge SetScrollPos, 62, 8
 bridge SetScrollRange, 64, 10
 bridge GetDC, 66, 2
 bridge ReleaseDC, 68, 4
-gate SetCursor
-gate SetCursorPos
-gate ShowCursor
+bridge SetCursor, 69, 2
+bridge SetCursorPos, 70, 4
+bridge ShowCursor, 71, 2
 bridge SetRect, 72, 12
 bridge CopyRect, 74, 8
 bridge PtInRect, 76, 8
@@ -77,7 +77,7 @@ bridge IsDlgButtonChecked, 98, 4
 gate DlgDirList
 bridge SendDlgItemMessage, 101, 12
 gate MessageBeep
-gate GetKeyState
+bridge GetKeyState, 106, 2
 bridge DefWindowProc, 107, 10
 bridge GetMessage, 108, 10
 bridge PeekMessage, 109, 12
@@ -98,7 +98,7 @@ bridge SetWindowLong, 136, 8
 bridge LoadMenu, 150, 6
 bridge CreateMenu, 151, 0
 bridge DestroyMenu, 152, 2
-gate ChangeMenu
+bridge ChangeMenu, 153, 12
 bridge CheckMenuItem, 154, 6
 bridge EnableMenuItem, 155, 6
 bridge GetSystemMenu, 156, 4
@@ -107,7 +107,7 @@ bridge SetMenu, 158, 4
 bridge GetSubMenu, 159, 4
 bridge DrawMenuBar, 160, 2
 gate WinHelp
-gate LoadCursor
+bridge LoadCursor, 173, 6
 bridge LoadIcon, 174, 6
 bridge LoadBitmap, 175, 6
 gate LoadString
@@ -118,9 +118,9 @@ gate GetSysColor
 gate GrayString
 gate GetSysModalWindow
 gate ChildWindowFromPoint
-gate TabbedTextOut
+bridge TabbedTextOut, 196, 20
 gate GetTopWindow
-gate SetWindowPos
+bridge SetWindowPos, 232, 14
 bridge GetCapture, 236, 0
 gate DialogBoxIndirectParam
 bridge CreateDialogIndirectParam, 242, 16

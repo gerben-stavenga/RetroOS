@@ -231,14 +231,29 @@ pub unsafe extern "system" fn DrawTextA(dc: u32, p: u32, n: i32, r: *mut [i32; 4
 pub unsafe extern "system" fn DrawTextW(dc: u32, p: u32, n: i32, r: *mut [i32; 4], f: u32) -> i32 {
     unsafe { draw(dc, p, n, r, f, core::ptr::null_mut(), true) }
 }
-unsafe fn tabbed(dc: u32, p: u32, n: i32, count: i32, tabs: *const i32, wide: bool) -> u32 {
+unsafe fn tabbed(
+    dc: u32,
+    p: u32,
+    n: i32,
+    count: i32,
+    tabs: *const i32,
+    wide: bool,
+    paint: Option<(i32, i32, i32)>,
+) -> u32 {
     if n < 0 || count < 0 || count != 0 && tabs.is_null() {
         return 0;
     }
     let input = unsafe { units(p, n, wide) };
     let unit = extent(dc, &[32])[0];
     let mut parts = input.split(|&c| c == 9);
-    let mut x = extent(dc, parts.next().unwrap_or(&[]))[0];
+    let first = parts.next().unwrap_or(&[]);
+    let initial = paint.map_or(0, |(x, _, origin)| x - origin);
+    let mut x = initial + extent(dc, first)[0];
+    if let Some((px, py, _)) = paint {
+        unsafe {
+            TextOutW(dc, px, py, first.as_ptr(), first.len() as i32);
+        }
+    }
     let stops = if count == 0 {
         &[][..]
     } else {
@@ -267,9 +282,15 @@ unsafe fn tabbed(dc: u32, p: u32, n: i32, count: i32, tabs: *const i32, wide: bo
             };
             if step < 0 { -next } else { next }
         });
-        x = if stop < 0 { -stop } else { stop + width };
+        let start = if stop < 0 { -stop - width } else { stop };
+        if let Some((_, py, origin)) = paint {
+            unsafe {
+                TextOutW(dc, origin + start, py, part.as_ptr(), part.len() as i32);
+            }
+        }
+        x = start + width;
     }
-    (x as u32 & 0xffff) | ((extent(dc, &[32])[1] as u32 & 0xffff) << 16)
+    ((x - initial) as u32 & 0xffff) | ((extent(dc, &[32])[1] as u32 & 0xffff) << 16)
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn GetTabbedTextExtentA(
@@ -279,7 +300,7 @@ pub unsafe extern "system" fn GetTabbedTextExtentA(
     c: i32,
     t: *const i32,
 ) -> u32 {
-    unsafe { tabbed(dc, p, n, c, t, false) }
+    unsafe { tabbed(dc, p, n, c, t, false, None) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn GetTabbedTextExtentW(
@@ -289,7 +310,7 @@ pub unsafe extern "system" fn GetTabbedTextExtentW(
     c: i32,
     t: *const i32,
 ) -> u32 {
-    unsafe { tabbed(dc, p, n, c, t, true) }
+    unsafe { tabbed(dc, p, n, c, t, true, None) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DrawStateA(
@@ -319,4 +340,31 @@ pub unsafe extern "system" fn DrawStateA(
         }
         _ => 0,
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn TabbedTextOutA(
+    dc: u32,
+    x: i32,
+    y: i32,
+    p: u32,
+    n: i32,
+    c: i32,
+    t: *const i32,
+    origin: i32,
+) -> u32 {
+    unsafe { tabbed(dc, p, n, c, t, false, Some((x, y, origin))) }
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn TabbedTextOutW(
+    dc: u32,
+    x: i32,
+    y: i32,
+    p: u32,
+    n: i32,
+    c: i32,
+    t: *const i32,
+    origin: i32,
+) -> u32 {
+    unsafe { tabbed(dc, p, n, c, t, true, Some((x, y, origin))) }
 }

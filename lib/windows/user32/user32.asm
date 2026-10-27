@@ -212,3 +212,10 @@ Retro16Return:
     pop ebx
     pop ebp
     ret 16
+
+global _RetroPointerVisible@4
+_RetroPointerVisible@4:
+gate RetroPointerVisible
+global _RetroPointerPosition@8
+_RetroPointerPosition@8:
+gate RetroPointerPosition

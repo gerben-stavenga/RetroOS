@@ -55,8 +55,8 @@ gate LPtoDP
 gate PlayMetaFile
 gate DeleteMetaFile
 gate MulDiv
-gate SetBrushOrg
-gate UnrealizeObject
+bridge SetBrushOrg, 1148, 6
+bridge UnrealizeObject, 1150, 2
 gate CreateIC
 gate GetNearestColor
 gate CreateDiscardableBitmap

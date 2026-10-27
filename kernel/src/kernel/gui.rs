@@ -341,6 +341,13 @@ impl Desktop {
         changed
     }
 
+    /// Hide the compositor pointer while preserving the application's position.
+    pub fn clear_pointer(&mut self) -> bool {
+        let changed = self.pointer.take().is_some();
+        if changed { self.damage_scene(); }
+        changed
+    }
+
     /// Return the retained node for `(endpoint, key)`, creating it invisible
     /// on first use. Node identity survives focus changes.
     pub fn ensure_node(

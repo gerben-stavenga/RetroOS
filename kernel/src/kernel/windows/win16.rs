@@ -1290,7 +1290,7 @@ fn dispatch<A: crate::Arch>(
         (Module::Kernel, 129) => 1,
         (Module::Kernel, 131) => u32::from(state.env_selector) << 16,
         (Module::Kernel, 132) => 0x0025, // protected mode, 386, enhanced mode
-        (Module::User, 173 | 177) => 1,
+        (Module::User, 177) => 1,
         (Module::User, 171) => 1,
         (Module::User, 178) => 0,
         (Module::User, 176) => {

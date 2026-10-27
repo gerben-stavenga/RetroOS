@@ -33,6 +33,7 @@ struct State {
     fonts: Vec<(u32, font::LogFont)>,
     selected_fonts: Vec<(u32, u32)>,
     map_modes: Vec<(u32, i32)>,
+    brush_origins: Vec<(u32, [i32; 2])>,
     next: u32,
     regions: Vec<(u32, Vec<Rect>)>,
     clips: Vec<(u32, Vec<Rect>)>,
@@ -48,6 +49,7 @@ static GLOBAL: Global = Global {
         fonts: Vec::new(),
         selected_fonts: Vec::new(),
         map_modes: Vec::new(),
+        brush_origins: Vec::new(),
         next: 0x5000_0000,
         regions: Vec::new(),
         clips: Vec::new(),
@@ -433,6 +435,7 @@ pub extern "system" fn DeleteDC(dc: u32) -> i32 {
             s.clips.retain(|(h, _)| *h != dc);
             s.selected_fonts.retain(|(h, _)| *h != dc);
             s.map_modes.retain(|(h, _)| *h != dc);
+            s.brush_origins.retain(|(h, _)| *h != dc);
         });
     }
     result
@@ -648,4 +651,38 @@ pub unsafe extern "system" fn Rectangle(
             4,
         )
     }
+}
+
+unsafe extern "system" {
+    fn GetObjectType(object: u32) -> u32;
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn SetBrushOrgEx(dc: u32, x: i32, y: i32, old: *mut [i32; 2]) -> i32 {
+    let mut bounds = Rect::default();
+    if unsafe { RetroGdiBounds(dc, &mut bounds) } == 0 {
+        return 0;
+    }
+    with(|s| {
+        let prev = s
+            .brush_origins
+            .iter()
+            .find(|(h, _)| *h == dc)
+            .map_or([0; 2], |(_, p)| *p);
+        if !old.is_null() {
+            unsafe {
+                old.write_unaligned(prev);
+            }
+        }
+        if let Some((_, p)) = s.brush_origins.iter_mut().find(|(h, _)| *h == dc) {
+            *p = [x, y];
+        } else {
+            s.brush_origins.push((dc, [x, y]));
+        }
+    });
+    1
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn UnrealizeObject(object: u32) -> i32 {
+    // Solid brushes are used directly; there is no device realization to drop.
+    i32::from(unsafe { GetObjectType(object) } == 2)
 }

@@ -10,9 +10,20 @@ extern MessageBox, SetTimer, KillTimer, GetFocus, GetParent, IsWindowEnabled
 extern SetScrollRange, SetScrollPos
 extern ShowWindow, GetWindowRect, GetTickCount
 extern DOSExit, CreateDialog, SetDlgItemInt, GetDlgItemInt
+extern GetCursorPos, SetCursorPos, ClientToScreen, ScreenToClient
 global _start
 _start:
     mov [initial_sp], sp
+    push word 123
+    push word 234
+    call far SetCursorPos
+    push ds
+    push word cursor_point
+    call far GetCursorPos
+    cmp word [cursor_point],123
+    jne fail
+    cmp word [cursor_point+2],234
+    jne fail
     mov ah, 0x2c
     call far DOSExit
     mov [clock_sample], dx
@@ -154,13 +165,25 @@ _start:
     test ax, ax
     jz fail
     mov [hwnd], ax
+    push ax
+    push ds
+    push word cursor_point
+    call far ClientToScreen
+    push word [hwnd]
+    push ds
+    push word cursor_point
+    call far ScreenToClient
+    cmp word [cursor_point],123
+    jne fail
+    cmp word [cursor_point+2],234
+    jne fail
     cmp word [size_kind], 0
     jne fail
     cmp word [created], 1
     jne fail
     cmp word [nested], 1
     jne fail
-    push ax
+    push word [hwnd]
     call far UpdateWindow
     cmp word [painted], 1
     jb fail
@@ -782,6 +805,7 @@ list_buffer: times 8 db 0
 list_hwnd: dw 0
 clock_sample: dw 0
 clock_start: dw 0
+cursor_point: dw 0,0
 
 segment STACK stack class=STACK use16
     resb 8192

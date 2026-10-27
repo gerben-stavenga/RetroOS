@@ -1071,3 +1071,14 @@ pub unsafe extern "system" fn ScreenToClient(hwnd: u32, point: *mut crate::rect:
     }
     1
 }
+
+#[unsafe(no_mangle)]
+pub extern "system" fn IsIconic(hwnd: u32) -> i32 {
+    state::with(|s| {
+        i32::from(
+            s.windows
+                .iter()
+                .any(|w| w.hwnd == hwnd && w.style & 0x20000000 != 0),
+        )
+    })
+}

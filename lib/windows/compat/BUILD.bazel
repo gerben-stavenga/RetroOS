@@ -21,6 +21,8 @@ windows_dll(
         "_Sleep@4": "KERNEL32.Sleep",
     },
     export_aliases = {
+        "SetBrushOrgEx": "_SetBrushOrgEx@16",
+        "UnrealizeObject": "_UnrealizeObject@4",
         "Rectangle": "_Rectangle@20",
         "SetDIBitsToDevice": "_SetDIBitsToDevice@48",
         "GetMapMode": "_GetMapMode@4",
@@ -54,6 +56,7 @@ windows_dll(
         "SetROP2": "_SetROP2@8",
     },
     exports = [
+        "SetBrushOrgEx", "UnrealizeObject", "GetObjectType",
         "Rectangle", "RetroGdiCurrentObject", "RetroGdiFillRect",
         "SetDIBitsToDevice",
         "GetMapMode",

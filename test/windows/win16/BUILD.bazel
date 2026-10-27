@@ -6,6 +6,8 @@ windows16_binary(name="bridge", obj=":bridge_obj", imports={
 }, visibility=["//visibility:public"])
 nasm_library(name="window_obj", srcs=["window.asm"], copts=["-fobj"])
 windows16_binary(name="window", obj=":window_obj", imports={
+    "GetCursorPos": "USER.17", "SetCursorPos": "USER.70",
+    "ClientToScreen": "USER.28", "ScreenToClient": "USER.29",
     "Exit": "KERNEL.1", "Debug": "KERNEL.115",
     "RegisterClass": "USER.57", "CreateWindow": "USER.41", "DestroyWindow": "USER.53",
     "DefWindowProc": "USER.107", "SendMessage": "USER.111", "UpdateWindow": "USER.124",

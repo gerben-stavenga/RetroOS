@@ -558,3 +558,126 @@ pub fn destroy(hwnd: u32) {
         }
     }
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn ScrollWindow(
+    hwnd: u32,
+    dx: i32,
+    dy: i32,
+    scroll: *const [i32; 4],
+    clip: *const [i32; 4],
+) -> i32 {
+    unsafe extern "system" {
+        fn BitBlt(
+            dst: u32,
+            x: i32,
+            y: i32,
+            w: i32,
+            h: i32,
+            src: u32,
+            sx: i32,
+            sy: i32,
+            rop: u32,
+        ) -> i32;
+    }
+    if window::IsWindow(hwnd) == 0 {
+        return 0;
+    }
+    let mut client = [0; 4];
+    unsafe {
+        window::GetClientRect(hwnd, client.as_mut_ptr().cast());
+    }
+    let area = if scroll.is_null() {
+        client
+    } else {
+        unsafe { scroll.read_unaligned() }
+    };
+    let limit = if clip.is_null() {
+        client
+    } else {
+        unsafe { clip.read_unaligned() }
+    };
+    let bounds = [
+        area[0].max(limit[0]).max(client[0]),
+        area[1].max(limit[1]).max(client[1]),
+        area[2].min(limit[2]).min(client[2]),
+        area[3].min(limit[3]).min(client[3]),
+    ];
+    if bounds[0] >= bounds[2] || bounds[1] >= bounds[3] {
+        return 1;
+    }
+    let dc = unsafe { GetDC(hwnd) };
+    if dc == 0 {
+        return 0;
+    }
+    let region = unsafe { CreateRectRgn(bounds[0], bounds[1], bounds[2], bounds[3]) };
+    if region == 0 {
+        ReleaseDC(hwnd, dc);
+        return 0;
+    }
+    let result = unsafe {
+        SelectClipRgn(dc, region);
+        let result = BitBlt(
+            dc,
+            area[0].saturating_add(dx),
+            area[1].saturating_add(dy),
+            area[2] - area[0],
+            area[3] - area[1],
+            dc,
+            area[0],
+            area[1],
+            0x00cc0020,
+        );
+        SelectClipRgn(dc, 0);
+        DeleteObject(region);
+        result
+    };
+    ReleaseDC(hwnd, dc);
+    if result == 0 {
+        return 0;
+    }
+    let kept = [
+        bounds[0].max(area[0].saturating_add(dx)),
+        bounds[1].max(area[1].saturating_add(dy)),
+        bounds[2].min(area[2].saturating_add(dx)),
+        bounds[3].min(area[3].saturating_add(dy)),
+    ];
+    let exposed = if kept[0] >= kept[2] || kept[1] >= kept[3] {
+        alloc::vec![bounds]
+    } else {
+        alloc::vec![
+            [bounds[0], bounds[1], bounds[2], kept[1]],
+            [bounds[0], kept[3], bounds[2], bounds[3]],
+            [bounds[0], kept[1], kept[0], kept[3]],
+            [kept[2], kept[1], bounds[2], kept[3]],
+        ]
+    };
+    for rect in exposed {
+        if rect[0] < rect[2] && rect[1] < rect[3] {
+            unsafe {
+                InvalidateRect(hwnd, rect.as_ptr() as u32, 1);
+            }
+        }
+    }
+    if scroll.is_null() {
+        let children = state::with(|s| {
+            s.windows
+                .iter()
+                .filter(|w| w.parent == hwnd)
+                .map(|w| (w.hwnd, w.x, w.y))
+                .collect::<Vec<_>>()
+        });
+        for (child, x, y) in children {
+            window::SetWindowPos(
+                child,
+                0,
+                x.saturating_add(dx),
+                y.saturating_add(dy),
+                0,
+                0,
+                1 | 4 | 8 | 16,
+            );
+        }
+    }
+    1
+}

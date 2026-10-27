@@ -422,10 +422,14 @@ pub unsafe extern "system" fn GetCursorPos(out: *mut [i32; 2]) -> i32 {
 }
 #[unsafe(no_mangle)]
 pub extern "system" fn SetCursorPos(x: i32, y: i32) -> i32 {
-    state::with(|s| {
+    let point = state::with(|s| {
         let r = s.cursor_clip.unwrap_or([0, 0, 1024, 768]);
         s.cursor = [x.clamp(r[0], r[2] - 1), y.clamp(r[1], r[3] - 1)];
+        s.cursor
     });
+    unsafe {
+        RetroPointerPosition(point[0], point[1]);
+    }
     1
 }
 #[unsafe(no_mangle)]
@@ -508,4 +512,38 @@ pub unsafe extern "system" fn mouse_event(flags: u32, dx: u32, dy: u32, data: u3
             );
         }
     }
+}
+
+unsafe extern "system" {
+    fn RetroPointerVisible(visible: u32) -> i32;
+    fn RetroPointerPosition(x: i32, y: i32) -> i32;
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn SetCursor(cursor: u32) -> u32 {
+    let (old, visible) = state::with(|s| {
+        let old = s.cursor_handle;
+        s.cursor_handle = cursor;
+        (old, cursor != 0 && s.cursor_count >= 0)
+    });
+    unsafe {
+        RetroPointerVisible(u32::from(visible));
+    }
+    old
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn GetCursor() -> u32 {
+    state::with(|s| s.cursor_handle)
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn ShowCursor(show: i32) -> i32 {
+    let (count, visible) = state::with(|s| {
+        s.cursor_count = s
+            .cursor_count
+            .saturating_add(if show != 0 { 1 } else { -1 });
+        (s.cursor_count, s.cursor_count >= 0 && s.cursor_handle != 0)
+    });
+    unsafe {
+        RetroPointerVisible(u32::from(visible));
+    }
+    count
 }

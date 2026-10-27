@@ -85,6 +85,15 @@ pub(super) fn call<A: crate::Arch>(
             })
         }
         b"RetroGdiSelectObject" => super::super::dispatch(machine, kt, state, regs, super::super::Api::SelectObject),
+        b"GetObjectType" => {
+            let h=a(0);
+            if (0x40000..=0x40005).contains(&h) || (0x30000..0x30100).contains(&h) { return 2; }
+            if (0x40006..=0x40008).contains(&h) { return 1; }
+            state.gdi_objects.iter().find_map(|(id,o)| if *id!=h {None} else {Some(match o {
+                super::super::GdiObject::Brush(_)=>2, super::super::GdiObject::Pen(_)=>1,
+                super::super::GdiObject::Font=>6, super::super::GdiObject::Bitmap{..}=>7,
+            })}).unwrap_or(0)
+        }
         b"RetroGdiObject" => {
             let object=state.gdi_objects.iter().find(|(h,_)| *h==a(0));
             if let Some((_,super::super::GdiObject::Bitmap{width,height,..}))=object {
@@ -103,6 +112,12 @@ pub(super) fn call<A: crate::Arch>(
             u32::from_le_bytes(target.pixels[at..at+4].try_into().unwrap()) & 0x00ff_ffff
         }
 
+        b"RetroPointerVisible" => { state.cursor_visible = a(0) != 0; state.cursor_dirty = true; 1 }
+        b"RetroPointerPosition" => {
+            let (x,y)=state.windows.iter().rfind(|w|w.parent==0 && w.visible).map_or((0,0),|w|(w.x,w.y));
+            state.mouse_x=(a(0) as i32).saturating_sub(x);state.mouse_y=(a(1) as i32).saturating_sub(y);
+            state.cursor_dirty=true;1
+        }
         b"RetroReadEvent" => {
             // A null output subscribes an auto-reset event without consuming input.
             if a(1) != 0 {

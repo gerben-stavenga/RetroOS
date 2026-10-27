@@ -268,6 +268,7 @@ pub struct WindowsState {
     paint_dc: u32,
     dirty: bool,
     cursor_dirty: bool,
+    cursor_visible: bool,
     paint_hwnd: u32,
     focus_hwnd: u32,
     gdi_objects: Vec<(u32, GdiObject)>,
@@ -325,6 +326,7 @@ impl WindowsState {
             paint_dc: 0x20000,
             dirty: true,
             cursor_dirty: true,
+            cursor_visible: true,
             paint_hwnd: 0,
             focus_hwnd: 0,
             gdi_objects: Vec::new(),
@@ -510,10 +512,10 @@ pub fn render<A: crate::Arch>(
     let placement = desktop
         .geometry(node)
         .expect("live Win32 presentation node");
-    let pointer_changed = desktop.set_pointer(crate::kernel::gui::Point {
+    let pointer_changed = if state.cursor_visible { desktop.set_pointer(crate::kernel::gui::Point {
         x: placement.x + state.mouse_x,
         y: placement.y + state.mouse_y,
-    });
+    }) } else { desktop.clear_pointer() };
     if !state.dirty && !state.cursor_dirty && !focus_changed && !pointer_changed {
         return;
     }
@@ -2431,25 +2433,21 @@ fn dispatch<A: crate::Arch>(
             let src = arg(machine, regs, 5);
             let sx = arg(machine, regs, 6) as i32;
             let sy = arg(machine, regs, 7) as i32;
-            let Some(source_bitmap) = dc_bitmap(state, src) else {
-                return 0;
-            };
-            let Some((left, top, copy_width, copy_height, source)) = state.gdi_objects.iter().find_map(|(h, o)| match o {
-                GdiObject::Bitmap { width: sw, height: sh, pixels } if *h == source_bitmap => {
-                    let left = i64::from(sx).clamp(0, i64::from(*sw));
-                    let top = i64::from(sy).clamp(0, i64::from(*sh));
-                    let right = (i64::from(sx) + width as i64).clamp(left, i64::from(*sw));
-                    let bottom = (i64::from(sy) + height as i64).clamp(top, i64::from(*sh));
-                    let (cw, ch) = ((right-left) as usize, (bottom-top) as usize);
-                    let mut copy = Vec::with_capacity(cw * ch * 4);
-                    for y in top as usize..bottom as usize {
-                        let start = (y * *sw as usize + left as usize) * 4;
-                        copy.extend_from_slice(&pixels[start..start + cw * 4]);
-                    }
-                    Some((left as i32, top as i32, cw, ch, copy))
-                }
-                _ => None,
-            }) else { return 0; };
+            // Snapshot the requested source view, including window DCs, so
+            // overlapping scroll/copy operations do not consume changed pixels.
+            let Some(source) = target_mut(state, src) else { return 0; };
+            let left = i64::from(sx).max(0).max(-i64::from(source.origin_x));
+            let top = i64::from(sy).max(0).max(-i64::from(source.origin_y));
+            let right = (i64::from(sx)+width as i64).min(i64::from(source.clip_width)).min(i64::from(source.width)-i64::from(source.origin_x));
+            let bottom = (i64::from(sy)+height as i64).min(i64::from(source.clip_height)).min(i64::from(source.height)-i64::from(source.origin_y));
+            if right <= left || bottom <= top { return 1; }
+            let (copy_width,copy_height)=((right-left) as usize,(bottom-top) as usize);
+            let mut pixels=Vec::with_capacity(copy_width*copy_height*4);
+            for y in top..bottom {
+                let start=((y+i64::from(source.origin_y)) as usize*source.width as usize+(left+i64::from(source.origin_x)) as usize)*4;
+                pixels.extend_from_slice(&source.pixels[start..start+copy_width*4]);
+            }
+            let (left,top,source)=(left as i32,top as i32,pixels);
             let dx = dx.saturating_add(left.saturating_sub(sx));
             let dy = dy.saturating_add(top.saturating_sub(sy));
             {
