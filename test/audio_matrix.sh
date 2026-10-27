@@ -56,8 +56,9 @@ for sink in "${SINKS[@]}"; do
     qemu_wait_for_log "$log" "${expect##* }\|FATAL\|KERNEL PANIC\|panicked\|-FAIL\|FAIL-" 90 "$pid" || true
     qemu_stop_and_reap "$pid"
     pid=""
+    qemu_guest_log "$log" > "$log.guest"
     missing=()
-    for e in $expect; do grep -aq "$e" "$log" || missing+=("$e"); done
+    for e in $expect; do grep -aq "$e" "$log.guest" || missing+=("$e"); done
     if grep -aqE 'FATAL|KERNEL PANIC|panicked|SEGV|-FAIL|FAIL-' "$log"; then
         missing+=("no-crash-or-failure")
     fi

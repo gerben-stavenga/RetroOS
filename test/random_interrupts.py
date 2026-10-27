@@ -74,13 +74,20 @@ def session(work, uefi=False):
                 control.connect(str(monitor))
                 control.settimeout(.001)
                 for i in range(900):
-                    control.sendall(b'sendkey a 1\n')
+                    if SEEDED in log.read_text(errors='replace'):
+                        break
+                    try:
+                        control.sendall(b'sendkey a 1\n')
+                    except BrokenPipeError:
+                        # A successful guest can shut QEMU down between the
+                        # log check and send. Verify its verdict below.
+                        break
                     time.sleep(.01 + (i % 7) * .001)
                     try:
                         control.recv(65536)
                     except TimeoutError:
                         pass
-                    if i % 20 == 0 and SEEDED in log.read_text(errors='replace'):
+                    except ConnectionResetError:
                         break
                 else:
                     raise AssertionError(log.read_text(errors='replace')[-5000:])

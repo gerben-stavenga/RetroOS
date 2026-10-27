@@ -12,12 +12,21 @@ qemu_bazel() {
     fi
 }
 
+# Guest DOS output may arrive one character at a time. A rate-limited
+# kernel stall diagnostic can split a verdict; keep the raw log for errors.
+qemu_guest_log() {
+    python3 -c 'import re, sys
+text = open(sys.argv[1], errors="replace").read()
+print(re.sub(r"\[stall\] [^\r\n]* took [0-9]+ ms at [0-9]+ ms\r?\n(?:core [0-9]+: )?", "", text), end="")' "$1"
+}
+
 qemu_wait_for_log() {
     local log="$1" needle="$2" timeout_seconds="${3:-30}"
     local deadline=$((SECONDS + timeout_seconds))
     shift 3
     while (( SECONDS < deadline )); do
-        if grep -q "$needle" "$log" 2>/dev/null; then
+        if grep -q "$needle" "$log" 2>/dev/null ||
+            qemu_guest_log "$log" 2>/dev/null | grep "$needle" >/dev/null; then
             return 0
         fi
         local pid
