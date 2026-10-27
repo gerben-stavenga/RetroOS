@@ -25,7 +25,9 @@ def session(work, disk, name, cpu, machine, accel):
         '-debugcon', f'file:{log}'],
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
-        deadline = time.monotonic() + 90
+        # Each mode touches and verifies 300 MiB twice under TCG. Shared
+        # CI runners can spend nearly 90 seconds on a successful variant.
+        deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
             text = log.read_text(errors='replace') if log.exists() else ''
             assert not any(x in text for x in ('PHYSICAL-MEMORY-FAIL', 'PANIC', 'SEGV', '[mem] exit tid=1 code=1')), text
