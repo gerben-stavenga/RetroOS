@@ -234,3 +234,10 @@ mod tests {
         assert_eq!(dos_to_unix_datetime(0, (44 << 9) | (2 << 5) | 30), None);
     }
 }
+
+/// A Windows PMDOS client has no BIOS IRQ0 handler advancing the BDA clock.
+pub(super) fn host_time<A: crate::Arch>(machine: &A, dos: &crate::kernel::dos::DosState<A>) -> Option<([u16; 8], u8)> {
+    let (epoch, start) = dos.host_clock?;
+    let centis = epoch * 100 + machine.now().saturating_sub(start) / 10_000_000;
+    Some((crate::kernel::clock::calendar_from_unix((centis / 100) as i64), (centis % 100) as u8))
+}

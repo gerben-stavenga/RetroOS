@@ -17,8 +17,8 @@ const SEGMENT_BASE: u32 = 0x0100_0000;
 const SEGMENT_STRIDE: u32 = 0x0001_0000;
 const MODULE_BASE: u32 = 0x0200_0000;
 const MODULE_STRIDE: u32 = 0x0010_0000;
-const PSP_BASE: u32 = 0x0300_0000;
-const ENV_BASE: u32 = 0x0301_0000;
+const PSP_BASE: u32 = 0x0008_0000;
+const ENV_BASE: u32 = 0x0008_1000;
 const RESOURCE_BASE: u32 = 0x0302_0000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,7 +83,6 @@ pub(super) struct State {
     resource_selector: u16,
     resource_next: u16,
     resources: Vec<Resource>,
-    clock_anchor: Option<(u64, u64)>,
 }
 
 fn module(name: &[u8]) -> Option<Module> {
@@ -608,7 +607,8 @@ pub(super) fn exec<A: crate::Arch>(
 ) -> Result<(), i32> {
     let image = ne::Image::parse(&data).map_err(|_| -8)?;
     let header = image.header;
-    let mut ldt = vec![0];
+    let mut dos = crate::kernel::dos::new_win16(machine, (PSP_BASE >> 4) as u16);
+    let mut ldt = dos.ldt[..32].to_vec();
     let mut selectors = Vec::with_capacity(header.segment_count as usize);
 
     for number in 1..=header.segment_count {
@@ -670,7 +670,7 @@ pub(super) fn exec<A: crate::Arch>(
         }));
     }
 
-    machine.zero(PSP_BASE as usize, 4096);
+    // PMDOS initialized the shared PSP/JFT before NE image loading.
     machine.zero(ENV_BASE as usize, 4096);
     let psp_selector = selector(&mut ldt, PSP_BASE, 256, false)?;
     let env_selector = selector(&mut ldt, ENV_BASE, 4096, false)?;
@@ -779,10 +779,12 @@ pub(super) fn exec<A: crate::Arch>(
         resource_selector,
         resource_next: 0,
         resources: Vec::new(),
-        clock_anchor: None,
     });
     windows.on_resume(machine);
-    current.personality = thread::Personality::Windows(windows);
+    dos.ldt[..windows.ldt.len()].copy_from_slice(&windows.ldt);
+    for i in 0..windows.ldt.len() { dos.ldt_alloc[i / 32] |= 1 << (i % 32); }
+    dos.dfs.init_from_vfs(&super::guest_windows_path(windows.cwd_str()));
+    current.personality = thread::Personality::Windows(super::WindowsProcess { state: windows, dos: Some(dos) });
     Ok(())
 }
 
@@ -1107,45 +1109,6 @@ fn dispatch<A: crate::Arch>(
             regs.ds = u64::from(state.auto_data);
             regs.es = u64::from(state.psp_selector);
             1
-        }
-        (Module::Kernel, 102) => {
-            match (regs.rax as u16 >> 8) as u8 {
-                0x2a | 0x2c => {
-                    // Win16 C runtimes use DOS3Call for _getdate/_gettime,
-                    // including animation waits. Advance from one RTC sample
-                    // with the monotonic clock, without polling CMOS per call.
-                    let now = machine.now();
-                    let (epoch, start) = *state.clock_anchor.get_or_insert_with(|| {
-                        let unix = crate::kernel::clock::rtc_unix_timestamp().unwrap_or(315532800);
-                        (u64::from(crate::kernel::clock::unix_to_local(unix)), now)
-                    });
-                    let centis = epoch * 100 + now.saturating_sub(start) / 10_000_000;
-                    let fields = crate::kernel::clock::calendar_from_unix((centis / 100) as i64);
-                    if (regs.rax as u16 >> 8) as u8 == 0x2a {
-                        regs.rcx = (regs.rcx & !0xffff) | u64::from(fields[0]);
-                        regs.rdx = (regs.rdx & !0xffff) | u64::from((fields[1] << 8) | fields[3]);
-                        (regs.rax as u32 & !0xff) | u32::from(fields[2])
-                    } else {
-                        regs.rcx = (regs.rcx & !0xffff) | u64::from((fields[4] << 8) | fields[5]);
-                        regs.rdx = (regs.rdx & !0xffff) | (u64::from(fields[6]) << 8) | (centis % 100);
-                        regs.rax as u32 & !0xff
-                    }
-                }
-                0x25 => 0, // Set interrupt vector; Win16 owns the virtual vector.
-                0x30 => {
-                    regs.rax = (regs.rax & !0xffff) | 0x0005;
-                    5
-                }
-                0x35 => {
-                    regs.es = u64::from(state.psp_selector);
-                    regs.rbx &= !0xffff;
-                    regs.rax as u32
-                }
-                ah => {
-                    crate::compact_dbg_println!("[win16] DOS3Call AH={:02x} stub", ah);
-                    regs.rax as u32
-                }
-            }
         }
         (Module::Kernel, 5) => {
             let size = usize::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
@@ -1472,14 +1435,19 @@ fn dispatch<A: crate::Arch>(
 
 pub(super) fn handle_event<A: crate::Arch>(
     machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
     windows: &mut WindowsState,
     state: &mut State,
+    dos: &mut crate::kernel::dos::DosState<A>,
     regs: &mut Regs,
     event: crate::KernelEvent,
 ) -> thread::KernelAction {
     match event {
         crate::KernelEvent::Irq => thread::KernelAction::Done,
+        crate::KernelEvent::Hlt => crate::kernel::dos::win16_resume(machine, kt, dos, regs)
+            .unwrap_or(thread::KernelAction::Done),
+        crate::KernelEvent::SoftInt(0x21) => dos_call(machine, bios, kt, windows, dos, regs),
         crate::KernelEvent::SoftInt(GATE_VECTOR) => {
             let ip = regs.ip32() as u16;
             let Some(gate) = state.gates.iter().copied()
@@ -1488,8 +1456,14 @@ pub(super) fn handle_event<A: crate::Arch>(
                 crate::compact_dbg_println!("[win16] invalid DLL gate {:04x}:{:04x}", regs.code_seg(), ip);
                 return thread::KernelAction::Exit(-1);
             };
-            if gate.module == Module::Kernel && gate.ordinal == 102 && (regs.rax as u16 >> 8) == 0x4c {
-                return thread::KernelAction::Exit(regs.rax as u8 as i32);
+            if gate.module == Module::Kernel && gate.ordinal == 102 {
+                // Complete the FAR CALL first. PMDOS can now return or suspend
+                // using the same continuation as a direct software interrupt.
+                let ax = regs.rax as u32;
+                if finish(machine, windows, regs, gate, ax).is_err() {
+                    return thread::KernelAction::Exit(-1);
+                }
+                return dos_call(machine, bios, kt, windows, dos, regs);
             }
             if gate.module == Module::Kernel && gate.ordinal == 1 {
                 return thread::KernelAction::Exit(stack_u16(machine, windows, regs, 4).unwrap_or(1) as i32);
@@ -1510,4 +1484,24 @@ pub(super) fn handle_event<A: crate::Arch>(
             thread::KernelAction::Exit(-1)
         }
     }
+}
+
+fn dos_call<A: crate::Arch>(
+    machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    kt: &mut thread::KernelThread<A>, windows: &mut WindowsState,
+    dos: &mut crate::kernel::dos::DosState<A>, regs: &mut Regs,
+) -> thread::KernelAction {
+    let previous_cwd = super::guest_windows_path(windows.cwd_str());
+    dos.dfs.init_from_vfs(&previous_cwd);
+    let action = crate::kernel::dos::win16_int21(machine, bios, kt, dos, regs);
+    machine.load_ldt(&dos.ldt[..]);
+    let mut path = alloc::vec![b'A' + dos.dfs.current_drive_number(), b':', b'\\'];
+    path.extend_from_slice(dos.dfs.get_cwd());
+    if !path.eq_ignore_ascii_case(&previous_cwd)
+        && let Some(cwd) = crate::kernel::dos::windows_abs_to_vfs(&path, false)
+    {
+        windows.cwd_len = cwd.len().min(windows.cwd.len());
+        windows.cwd[..windows.cwd_len].copy_from_slice(&cwd[..windows.cwd_len]);
+    }
+    action
 }

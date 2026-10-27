@@ -119,6 +119,103 @@ _start:
     jne file_fail_14
     cmp sp,[initial_sp]
     jne file_fail_15
+    push es
+    mov ah,0x62
+    int 0x21
+    mov es,bx
+    cmp word [es:0],0x20cd
+    pop es
+    jne pmdos_fail
+    mov ah,0x50
+    call far DOSExit
+    jc pmdos_fail
+    ; Direct PMDOS and DOS3Call use selectors and the same file/directory
+    ; state as KERNEL's Windows APIs. Poison high halves like a 16-bit client.
+    mov edx,0xabcd0002
+    mov ax,0x0e00
+    int 0x21
+    mov ah,0x19
+    call far DOSExit
+    cmp al,2
+    jne pmdos_fail
+    mov dx,pm_directory
+    mov ah,0x39
+    int 0x21
+    jc pmdos_fail
+    mov dx,pm_directory
+    mov ah,0x3b
+    call far DOSExit
+    jc pmdos_fail
+    push ds
+    push word pm_relative_file
+    push word 0
+    call far _lcreat
+    cmp ax,0xffff
+    je pmdos_fail
+    mov [file_handle],ax
+    mov bx,ax
+    mov edx,0xabcd0000
+    mov dx,file_payload
+    mov ecx,0x12340005
+    mov ax,0x4000
+    int 0x21
+    jc pmdos_fail
+    cmp ax,5
+    jne pmdos_fail
+    cmp ecx,0x12340005
+    jne pmdos_fail
+    shr edx,16
+    cmp dx,0xabcd
+    jne pmdos_fail
+    mov bx,[file_handle]
+    xor cx,cx
+    xor dx,dx
+    mov ax,0x4200
+    call far DOSExit
+    jc pmdos_fail
+    mov dx,file_buffer
+    mov cx,5
+    mov ah,0x3f
+    int 0x21
+    jc pmdos_fail
+    cmp ax,5
+    jne pmdos_fail
+    cmp word [file_buffer],0x6568
+    jne pmdos_fail
+    push word [file_handle]
+    call far _lclose
+    test ax,ax
+    jnz pmdos_fail
+    mov dx,pm_root
+    mov ah,0x3b
+    int 0x21
+    jc pmdos_fail
+    push ds
+    push word pm_absolute_file
+    push word 0
+    call far _lopen
+    cmp ax,0xffff
+    je pmdos_fail
+    mov bx,ax
+    mov ah,0x3e
+    call far DOSExit
+    jc pmdos_fail
+    mov dx,pm_absolute_file
+    mov ax,0x3d00
+    int 0x21
+    jc pmdos_fail
+    push ax
+    call far _lclose
+    test ax,ax
+    jnz pmdos_fail
+    mov bx,0xffff
+    mov ah,0x3e
+    int 0x21
+    jnc pmdos_fail
+    cmp ax,6
+    jne pmdos_fail
+    cmp sp,[initial_sp]
+    jne pmdos_fail
     push word 123
     push word 234
     call far SetCursorPos
@@ -718,6 +815,10 @@ file_fail_15:
     push word file_error_15
     call far Debug
     jmp fail
+pmdos_fail:
+    push ds
+    push word pm_error
+    call far Debug
 fail:
     push ds
     push word failed
@@ -990,6 +1091,11 @@ file_missing: db "C:\ABSENT.DAT",0
 file_payload: db "hello",0
 file_buffer: times 8 db 0
 file_handle: dw 0
+pm_directory: db "PMTEST",0
+pm_relative_file: db "ROUND.DAT",0
+pm_absolute_file: db "C:\PMTEST\ROUND.DAT",0
+pm_root: db "C:\",0
+pm_error: db "PMDOS interoperability failed",0
 format_text: db "%d %s %04X %ld",0
 format_args: dw -2,file_payload,0,0x2a
     dd 70

@@ -467,7 +467,7 @@ pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, bios_display:
     // afterward would write into the wrong context.
     let ah = (regs.rax >> 8) as u8;
     let proc_ctrl = matches!(ah, 0x00 | 0x31 | 0x4B | 0x4C);
-    let mask16 = !proc_ctrl && dos.dpmi.as_ref().is_some_and(|d| !d.client_use32);
+    let mask16 = !proc_ctrl && dos.dpmi.as_ref().map_or(dos.pm_dos, |d| !d.client_use32);
     const HI: u64 = 0xFFFF_0000;
     let saved_hi = if mask16 {
         let s = [
@@ -832,4 +832,36 @@ mod continuation_tests {
         assert_eq!(merged & 1, 0);
         assert_eq!(merged & !super::DOS_STATUS_MASK, saved & !super::DOS_STATUS_MASK);
     }
+}
+
+pub(super) fn init_win16_psp<A: crate::Arch>(machine: &mut A, psp: u16) {
+    let mut value = lowmem::Psp::default();
+    value.int_20 = [0xcd, 0x20];
+    value.top_of_mem = 0xa000;
+    value.parent_psp = psp;
+    value.jft = [0xff; 20];
+    value.jft[..3].copy_from_slice(&[0, 1, 2]);
+    value.max_files = thread::MAX_FDS as u16;
+    value.jft_far_off = 0x100;
+    value.jft_far_seg = psp;
+    value.cmdline[0] = 0x0d;
+    lowmem::Psp::store(machine, psp, value);
+    for i in 0..thread::MAX_FDS {
+        machine.write::<u8>((usize::from(psp) << 4) + 0x100 + i, if i < 3 { i as u8 } else { 0xff });
+    }
+}
+
+/// Windows file APIs and INT 21h share KernelThread::fds. Refresh DOS's
+/// guest-visible handle metadata before servicing a call, including handles
+/// opened or closed through KERNEL32 since the previous DOS entry.
+pub(super) fn sync_win16_handles<A: crate::Arch>(
+    machine: &mut A, kt: &thread::KernelThread<A>, dos: &thread::DosState<A>,
+) {
+    let count = usize::from(lowmem::Psp::max_files(machine, dos.current_psp)).min(thread::MAX_FDS);
+    let address = lowmem::Psp::jft_addr(machine, dos.current_psp);
+    let mut entries = [0xff; thread::MAX_FDS];
+    for (i, fd) in kt.fds.iter().enumerate().take(count) {
+        if !fd.is_none() { entries[i] = i as u8; }
+    }
+    machine.copy_to(address, &entries[..count]);
 }

@@ -59,6 +59,17 @@ pub(in crate::kernel::dos) fn get_or_alloc_psp_sel<A: crate::Arch>(
             }
         }
     }
+    // PMDOS also serves NE clients without a DPMI layer. Their loader already
+    // installed the PSP descriptor; reuse it rather than allocating an alias
+    // on every AH=51h/62h call.
+    if dos.dpmi.is_none() {
+        if let Some(index) = dos.ldt.iter().position(|&d|
+            d & (1 << 47) != 0 && d & (1 << 43) == 0
+            && desc_base(d) == u32::from(segment) * 16 && desc_limit(d) >= 0xff)
+        {
+            return idx_to_sel(index);
+        }
+    }
     let idx = match alloc_ldt(&mut dos.ldt_alloc) {
         Some(i) => i,
         None => return 0,
@@ -87,6 +98,14 @@ pub(in crate::kernel::dos) fn psp_sel_to_segment<A: crate::Arch>(
     dos: &thread::DosState<A>,
     selector: u16,
 ) -> Option<u16> {
+    if dos.dpmi.is_none() {
+        if selector & 7 != 7 { return None; }
+        let desc = *dos.ldt.get(usize::from(selector >> 3))?;
+        let base = desc_base(desc);
+        return (desc & (1 << 47) != 0 && desc & (1 << 43) == 0
+            && base & 15 == 0 && base < 0x100000 && desc_limit(desc) >= 0xff)
+            .then_some((base >> 4) as u16);
+    }
     let dpmi = dos.dpmi.as_ref()?;
     for entry in &dpmi.psp_cache {
         if entry.selector != 0 && entry.selector == selector {

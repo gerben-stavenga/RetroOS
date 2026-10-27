@@ -221,6 +221,31 @@ struct Callback {
     module_result: Option<u32>,
 }
 
+/// Windows API state plus optional protected-mode DOS services for NE programs.
+pub struct WindowsProcess<A: crate::Arch> {
+    state: WindowsState,
+    dos: Option<alloc::boxed::Box<crate::kernel::dos::DosState<A>>>,
+}
+impl<A: crate::Arch> WindowsProcess<A> {
+    pub fn on_resume(&mut self, machine: &mut A) {
+        self.state.on_resume(machine);
+        if let Some(dos) = &self.dos { machine.load_ldt(&dos.ldt[..]); }
+    }
+    pub fn on_exit(&mut self, machine: &mut A, regs: &mut Regs) {
+        if let Some(dos) = &mut self.dos { dos.on_exit(machine, regs, false); }
+    }
+}
+impl<A: crate::Arch> From<WindowsState> for WindowsProcess<A> {
+    fn from(state: WindowsState) -> Self { Self { state, dos: None } }
+}
+impl<A: crate::Arch> core::ops::Deref for WindowsProcess<A> {
+    type Target = WindowsState;
+    fn deref(&self) -> &WindowsState { &self.state }
+}
+impl<A: crate::Arch> core::ops::DerefMut for WindowsProcess<A> {
+    fn deref_mut(&mut self) -> &mut WindowsState { &mut self.state }
+}
+
 pub struct WindowsState {
     pub(crate) environment: Vec<u8>,
     file_oem: bool,
@@ -1338,7 +1363,7 @@ pub fn exec_pe_into<A: crate::Arch>(
     state.trampolines = trampolines;
     state.modules = modules;
     state.on_resume(machine);
-    current.personality = thread::Personality::Windows(state);
+    current.personality = thread::Personality::Windows(state.into());
     Ok(())
 }
 
@@ -2505,13 +2530,15 @@ fn dispatch<A: crate::Arch>(
 
 pub fn handle_event<A: crate::Arch>(
     machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
-    state: &mut WindowsState,
+    process: &mut WindowsProcess<A>,
     regs: &mut Regs,
     event: crate::KernelEvent,
 ) -> thread::KernelAction {
+    let state = &mut process.state;
     if !A::seg_is_32(regs.code_seg()) && let Some(mut win16) = state.win16.take() {
-        let action = win16::handle_event(machine, kt, state, &mut win16, regs, event);
+        let action = win16::handle_event(machine, bios, kt, state, &mut win16, process.dos.as_mut().expect("NE DOS services"), regs, event);
         state.win16 = Some(win16);
         return action;
     }

@@ -239,6 +239,8 @@ pub struct DosState<A: crate::Arch> {
     /// 0300 and don't need this — leaving it off for them keeps spec-strict
     /// reflect-to-RM behaviour for INT 21 hooks installed in the IVT.
     pub pm_dos: bool,
+    /// Clock for clients without a guest BIOS timer ISR (Win16).
+    pub host_clock: Option<(u64, u64)>,
 
     /// LIFO stack of suspended DOS continuations. A syscall that cannot finish
     /// synchronously moves its original return frame here with its callback,
@@ -348,6 +350,7 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::addr_of_mut!((*p).dpmi).write(None);
             core::ptr::addr_of_mut!((*p).tf_sources).write(0);
             core::ptr::addr_of_mut!((*p).pm_dos).write(false);
+            core::ptr::addr_of_mut!((*p).host_clock).write(None);
             core::ptr::addr_of_mut!((*p).suspended_calls).write(alloc::vec::Vec::new());
             state.assume_init()
         }
@@ -2253,3 +2256,44 @@ fn log_pm_ud<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
 }
 
 pub use dfs::{configure_drive, reset_configured_drives};
+
+// Win16 shares the same PM DOS state, selector decoder, handle table, and
+// interrupt continuations as a 16-bit DOS extender.
+pub(crate) fn new_win16<A: crate::Arch>(machine: &mut A, psp: u16) -> alloc::boxed::Box<DosState<A>> {
+    initialize_dos_template(machine, &mut Regs::empty());
+    let mut dos = DosState::new_boxed(machine, DosVideo::Vga(EmulatedVga::initial_mode3()));
+    dpmi::install_kernel_ldt_slots(&mut dos);
+    dos.pm_dos = true;
+    let unix = crate::kernel::clock::rtc_unix_timestamp().unwrap_or(315532800);
+    dos.host_clock = Some((u64::from(crate::kernel::clock::unix_to_local(unix)), machine.now()));
+    dos.current_psp = psp;
+    dos.dta = (u32::from(psp) << 4) + 0x80;
+    dos::init_win16_psp(machine, psp);
+    dos
+}
+pub(crate) fn win16_int21<A: crate::Arch>(
+    machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    kt: &mut thread::KernelThread<A>, dos: &mut DosState<A>, regs: &mut Regs,
+) -> thread::KernelAction {
+    let ah = (regs.rax >> 8) as u8;
+    if matches!(ah, 0x00 | 0x4c) {
+        return thread::KernelAction::Exit(if ah == 0 { 0 } else { regs.rax as u8 as i32 });
+    }
+    // DOS EXEC/TSR replace the real-mode process context. Windows process
+    // creation uses WinExec/CreateProcess instead; never corrupt the NE image.
+    if matches!(ah, 0x31 | 0x4b) {
+        regs.rax = (regs.rax & !0xffff) | 1;
+        regs.set_flag32(1);
+        return thread::KernelAction::Done;
+    }
+    dos::sync_win16_handles(machine, kt, dos);
+    mode_transitions::push_iret_frame(machine, &dos.ldt[..], regs, false,
+        regs.ip32(), regs.code_seg(), machine::guest_flags(regs));
+    dos::pmdos_int21_handler(machine, bios, kt, dos, regs)
+}
+pub(crate) fn win16_resume<A: crate::Arch>(
+    machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut DosState<A>, regs: &mut Regs,
+) -> Option<thread::KernelAction> {
+    if dos.suspended_calls.is_empty() { return None; }
+    Some(dos::poll_suspended_call(machine, kt, dos, regs))
+}

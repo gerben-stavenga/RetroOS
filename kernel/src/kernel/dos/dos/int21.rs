@@ -1064,7 +1064,9 @@ pub(super) fn int_21h<A: crate::Arch>(
         }
         // AH=2Ah — Get System Date
         0x2A => {
-            let (year, month, day, dow) = cmos_date(machine);
+            let (year, month, day, dow) = super::clock::host_time(machine, dos)
+                .map(|(f, _)| (f[0], f[1] as u8, f[3] as u8, f[2] as u8))
+                .unwrap_or_else(|| cmos_date(machine));
             regs.rcx = (regs.rcx & !0xFFFF) | year as u64; // CX = year
             regs.rdx = (regs.rdx & !0xFFFF) | ((month as u64) << 8) | day as u64; // DH = month, DL = day
             regs.rax = (regs.rax & !0xFF) | dow as u64; // AL = day of week (0=Sun, 6=Sat)
@@ -1080,7 +1082,9 @@ pub(super) fn int_21h<A: crate::Arch>(
         }
         // AH=2Ch — Get System Time
         0x2C => {
-            let (hours, mins, secs, centisecs) = bios_time_of_day(machine);
+            let (hours, mins, secs, centisecs) = super::clock::host_time(machine, dos)
+                .map(|(f, cs)| (f[4] as u8, f[5] as u8, f[6] as u8, cs))
+                .unwrap_or_else(|| bios_time_of_day(machine));
             regs.rcx = (regs.rcx & !0xFFFF) | ((hours as u64) << 8) | mins as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | ((secs as u64) << 8) | centisecs as u64;
             return thread::KernelAction::Done;

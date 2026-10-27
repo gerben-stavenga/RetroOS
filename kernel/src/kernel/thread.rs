@@ -245,7 +245,7 @@ pub enum Personality<A: crate::Arch> {
     /// Native 32-bit OS/2 LX userspace.
     Os2(Os2State),
     /// Native 32-bit Windows PE userspace.
-    Windows(WindowsState),
+    Windows(crate::kernel::windows::WindowsProcess<A>),
 }
 
 impl<A: crate::Arch> Personality<A> {
@@ -515,7 +515,7 @@ impl<A: crate::Arch> Personality<A> {
             Self::Dos(dos) => crate::kernel::dos::handle_event(machine, bios_display, kt, dos, regs, kevent),
             Self::Linux(linux) => crate::kernel::linux::handle_event(machine, kt, linux, regs, kevent),
             Self::Os2(os2) => crate::kernel::os2::handle_event(machine, kt, os2, regs, kevent),
-            Self::Windows(windows) => crate::kernel::windows::handle_event(machine, kt, windows, regs, kevent),
+            Self::Windows(windows) => crate::kernel::windows::handle_event(machine, bios_display, kt, windows, regs, kevent),
         }
     }
 
@@ -1039,7 +1039,8 @@ pub fn exit_thread<A: crate::Arch>(
             Personality::Dos(dos) => dos.on_exit(
                 machine, &mut thread.kernel.vcpu, !return_dos_vga),
             Personality::Linux(linux) => linux.close_virtual_fds(),
-            Personality::Os2(_) | Personality::Windows(_) => {}
+            Personality::Windows(windows) => windows.on_exit(machine, &mut thread.kernel.vcpu),
+            Personality::Os2(_) => {}
         }
         thread.kernel.close_all_fds();
         thread.kernel.exit_code = exit_code;
