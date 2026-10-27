@@ -12,6 +12,8 @@ windows16_binary(name="window", obj=":window_obj", imports={
     "BeginPaint": "USER.39", "EndPaint": "USER.40", "GetClientRect": "USER.33",
     "PostMessage": "USER.110", "GetMessage": "USER.108", "DispatchMessage": "USER.114",
     "DOSExit": "KERNEL.102",
+    "GetWindowWord": "USER.133", "SetWindowWord": "USER.134",
+    "GetWindowLong": "USER.135", "SetWindowLong": "USER.136", "CallWindowProc": "USER.122",
     "ShowWindow": "USER.42", "GetWindowRect": "USER.32",
     "CreateDC": "GDI.52", "CreateBitmap": "GDI.51", "SelectObject": "GDI.45",
     "DeleteDC": "GDI.68", "DeleteObject": "GDI.69", "SetPixel": "GDI.31",

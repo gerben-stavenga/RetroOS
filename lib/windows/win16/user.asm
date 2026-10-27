@@ -91,8 +91,8 @@ bridge UpdateWindow, 124, 2
 bridge InvalidateRect, 125, 8
 bridge ValidateRect, 127, 6
 gate GetClassLong
-gate GetWindowWord
-gate SetWindowWord
+bridge GetWindowWord, 133, 4
+bridge SetWindowWord, 134, 6
 bridge GetWindowLong, 135, 4
 bridge SetWindowLong, 136, 8
 bridge LoadMenu, 150, 6

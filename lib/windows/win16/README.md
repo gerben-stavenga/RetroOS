@@ -45,6 +45,9 @@ Native handles below 0x8000 retain their values. Larger shared handles (notably
 menus and stock objects) have process-local 16-bit aliases. Registered NE
 procedures use a separate token table; those tokens are recognized at the shared
 USER callback boundary and are never invoked as flat function addresses.
+Conversely, shared control procedures returned to Win16 use opaque tokens;
+CallWindowProc translates messages back to the shared procedure, and SetWindowLong
+can restore it. Native procedures are never interpreted as segmented addresses.
 
 `Retro16Config` is the private loader/assembly/Rust binding, in DWORDs:
 flat data selector, TEB selector, stack cursor, active frame, descriptor table,
@@ -69,7 +72,8 @@ ENGINE=tcg python3 test/windows_win16.py
 
 They check recursive far callbacks, register/stack preservation, CREATESTRUCT
 conversion, nested SendMessage, queued dispatch, initial size notifications,
-maximize/restore geometry, WINDOWPOS forwarding, client dimensions, painting and
+maximize/restore geometry, WINDOWPOS forwarding, shared control subclassing,
+window words, client dimensions, painting and
 pixel readback, dialog-template conversion and numeric controls, the 16-bit
 DLGPROC return convention, and process termination. No proprietary game is needed.
 Windows 3.1 Minesweeper is also a local acceptance test for its resource menus,

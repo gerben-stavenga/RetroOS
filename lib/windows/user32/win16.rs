@@ -70,7 +70,17 @@ fn encode(h: u32) -> u32 {
         0x7fff + s.win16_handles.len() as u32
     })
 }
+const NATIVE_PROC: u32 = 0xfffc_0000;
+fn native_procedure(p: u32) -> Option<u32> {
+    if p & 0xffff_0000 != NATIVE_PROC {
+        return None;
+    }
+    state::with(|s| s.win16_native_procs.get((p & 0xffff) as usize).copied())
+}
 fn procedure(p: u32) -> u32 {
+    if let Some(native) = native_procedure(p) {
+        return native;
+    }
     if p == 0 {
         return 0;
     }
@@ -87,8 +97,21 @@ fn procedure(p: u32) -> u32 {
     })
 }
 fn original(p: u32) -> u32 {
+    if p == 0 {
+        return 0;
+    }
     if p & 0xffff_0000 != PROC {
-        return p;
+        return state::with(|s| {
+            if let Some(i) = s.win16_native_procs.iter().position(|&v| v == p) {
+                return NATIVE_PROC + i as u32;
+            }
+            if s.win16_native_procs.len() >= 0x10000 {
+                return 0;
+            }
+            let id = NATIVE_PROC + s.win16_native_procs.len() as u32;
+            s.win16_native_procs.push(p);
+            id
+        });
     }
     state::with(|s| {
         s.win16_procs
@@ -541,60 +564,23 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             }
             107 | 111 | 110 => {
                 let m = w(6);
-                let (wp, lp) = to32(m, w(4), d(0));
-                // Win16 forwards a segmented, WORD-sized WINDOWPOS back to
-                // USER. Keep the translated storage alive through nested calls.
-                let position = if o != 110 && lp != 0 && matches!(m, 0x46 | 0x47) {
-                    Some(pointer(lp, 14)?)
-                } else {
-                    None
-                };
-                let mut pos = [0u32; 7];
-                if let Some(p) = position {
-                    pos[0] = decode(word(p, 0));
-                    let after = word(p, 2);
-                    pos[1] = if after >= 0xfffe {
-                        after as i16 as i32 as u32
+                if o == 110 {
+                    let (wp, lp) = to32(m, w(4), d(0));
+                    let lp = if matches!(m, 0xc | 0xd) {
+                        pointer(lp, if m == 0xd { wp as usize } else { 1 })?
                     } else {
-                        decode(after)
+                        lp
                     };
-                    for n in 2..6 {
-                        pos[n] = word(p, n * 2) as i16 as i32 as u32;
-                    }
-                    pos[6] = word(p, 12);
-                }
-                let lp = if position.is_some() {
-                    pos.as_mut_ptr() as u32
-                } else if matches!(m, 0xc | 0xd) {
-                    pointer(lp, if m == 0xd { wp as usize } else { 1 })?
-                } else {
-                    lp
-                };
-                let result = if o == 107 {
-                    window::DefWindowProcA(h(8), m, wp, lp) as u32
-                } else if o == 111 {
-                    crate::SendMessageA(h(8), m, wp, lp) as u32
-                } else {
                     message::PostMessageA(h(8), m, wp, lp) as u32
-                };
-                if m == 0x46 {
-                    if let Some(p) = position {
-                        putw(p, 0, encode(pos[0]));
-                        putw(
-                            p,
-                            2,
-                            if pos[1] >= 0xffff_fffe {
-                                pos[1]
-                            } else {
-                                encode(pos[1])
-                            },
-                        );
-                        for n in 2..7 {
-                            putw(p, n * 2, pos[n]);
+                } else {
+                    translated_message(m, w(4), d(0), |wp, lp| {
+                        if o == 107 {
+                            window::DefWindowProcA(h(8), m, wp, lp) as u32
+                        } else {
+                            crate::SendMessageA(h(8), m, wp, lp) as u32
                         }
-                    }
+                    })?
                 }
-                result
             }
             108 | 109 => {
                 let off = if o == 109 { 2 } else { 0 };
@@ -612,9 +598,15 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             113 => keyboard::TranslateMessage(&read_message(d(0))?) as u32,
             114 => crate::DispatchMessageA(&read_message(d(0))?) as u32,
             122 => {
-                // Both endpoints already use Win16 layouts. In particular,
-                // subclass forwarding must preserve segmented LPARAM buffers.
+                // Native control procedures are exposed as opaque Win16
+                // tokens; translate at that boundary, never far-call them.
                 let proc = d(10);
+                if let Some(native) = native_procedure(proc) {
+                    return translated_message(w(6), w(4), d(0), |wp, lp| {
+                        crate::call_procedure(native, h(8), w(6), wp, lp, false) as u32
+                    });
+                }
+                // NE-to-NE forwarding preserves segmented LPARAM buffers.
                 pointer(proc, 1)?;
                 let active = Retro16Config[3] as *const u32;
                 let saved = active.add(1).read();
@@ -637,6 +629,23 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                     paint::InvalidateRect(h(6), p, w(0)) as u32
                 } else {
                     paint::ValidateRect(h(4), p) as u32
+                }
+            }
+            133 => {
+                let value = window::word(h(2), i(0), None);
+                if matches!(i(0), -6 | -8) {
+                    encode(value)
+                } else {
+                    value
+                }
+            }
+            134 => {
+                let value = if matches!(i(2), -6 | -8) { h(0) } else { w(0) };
+                let old = window::word(h(4), i(2), Some(value));
+                if matches!(i(2), -6 | -8) {
+                    encode(old)
+                } else {
+                    old
                 }
             }
             135 => {
@@ -722,5 +731,63 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             1087 => encode(GetStockObject(w(0))),
             _ => return None,
         })
+    }
+}
+
+unsafe fn translated_message(
+    m: u32,
+    w: u32,
+    l: u32,
+    call: impl FnOnce(u32, u32) -> u32,
+) -> Option<u32> {
+    unsafe {
+        let (wp, lp) = to32(m, w, l);
+        // Win16 forwards a segmented, WORD-sized WINDOWPOS back to
+        // USER. Keep the translated storage alive through nested calls.
+        let position = if lp != 0 && matches!(m, 0x46 | 0x47) {
+            Some(pointer(lp, 14)?)
+        } else {
+            None
+        };
+        let mut pos = [0u32; 7];
+        if let Some(p) = position {
+            pos[0] = decode(word(p, 0));
+            let after = word(p, 2);
+            pos[1] = if after >= 0xfffe {
+                after as i16 as i32 as u32
+            } else {
+                decode(after)
+            };
+            for n in 2..6 {
+                pos[n] = word(p, n * 2) as i16 as i32 as u32;
+            }
+            pos[6] = word(p, 12);
+        }
+        let lp = if position.is_some() {
+            pos.as_mut_ptr() as u32
+        } else if matches!(m, 0xc | 0xd) {
+            pointer(lp, if m == 0xd { wp as usize } else { 1 })?
+        } else {
+            lp
+        };
+        let result = call(wp, lp);
+        if m == 0x46 {
+            if let Some(p) = position {
+                putw(p, 0, encode(pos[0]));
+                putw(
+                    p,
+                    2,
+                    if pos[1] >= 0xffff_fffe {
+                        pos[1]
+                    } else {
+                        encode(pos[1])
+                    },
+                );
+                for n in 2..7 {
+                    putw(p, n * 2, pos[n]);
+                }
+            }
+        }
+        Some(result)
     }
 }

@@ -621,6 +621,29 @@ pub unsafe extern "system" fn GetWindowThreadProcessId(hwnd: u32, pid: *mut u32)
     }
     thread
 }
+// Win16 window words occupy two bytes, including the last extra-byte slot.
+pub unsafe fn word(hwnd: u32, index: i32, value: Option<u32>) -> u32 {
+    if index < 0 {
+        return if matches!(index, -6 | -8 | -12) {
+            unsafe { long(hwnd, index, value, false) }
+        } else {
+            state::error(1413)
+        };
+    }
+    state::with(|s| {
+        let Some(w) = s.windows.iter_mut().find(|w| w.hwnd == hwnd) else {
+            return state::error(1400);
+        };
+        let Some(slot) = w.extra.get_mut(index as usize..index as usize + 2) else {
+            return state::error(1413);
+        };
+        let old = u16::from_le_bytes([slot[0], slot[1]]) as u32;
+        if let Some(v) = value {
+            slot.copy_from_slice(&(v as u16).to_le_bytes());
+        }
+        old
+    })
+}
 unsafe fn long(hwnd: u32, index: i32, value: Option<u32>, wide: bool) -> u32 {
     state::with(|s| {
         let Some(w) = s.windows.iter_mut().find(|w| w.hwnd == hwnd) else {

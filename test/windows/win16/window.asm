@@ -4,6 +4,7 @@ extern Exit, Debug, RegisterClass, CreateWindow, DestroyWindow, DefWindowProc
 extern SendMessage, UpdateWindow, BeginPaint, EndPaint, GetClientRect
 extern PostMessage, GetMessage, DispatchMessage, FillRect, CreateSolidBrush, GetPixel, GetDC, ReleaseDC
 extern CreateDC, CreateBitmap, SelectObject, DeleteDC, DeleteObject, SetPixel
+extern GetWindowWord, SetWindowWord, GetWindowLong, SetWindowLong, CallWindowProc
 extern ShowWindow, GetWindowRect
 extern DOSExit, CreateDialog, SetDlgItemInt, GetDlgItemInt
 global _start
@@ -163,6 +164,94 @@ _start:
     call far DefWindowProc
     cmp word [size_kind], 0xffff
     jne fail
+    ; A Win16 subclass must be able to call and restore a shared 32-bit
+    ; control procedure, including segmented text buffers and command packing.
+    push ds
+    push word button_class
+    push ds
+    push word button_title
+    push dword 0x50000000
+    push word 2
+    push word 2
+    push word 80
+    push word 24
+    push word [hwnd]
+    push word 77
+    push ds
+    push dword 0
+    call far CreateWindow
+    test ax, ax
+    jz fail
+    mov [button], ax
+    push ax
+    push word -12
+    call far GetWindowWord
+    cmp ax, 77
+    jne fail
+    push word [button]
+    push word -12
+    push word 78
+    call far SetWindowWord
+    cmp ax, 77
+    jne fail
+    push word [button]
+    push word -4
+    call far GetWindowLong
+    mov [button_proc], ax
+    mov [button_proc+2], dx
+    push word [button]
+    push word -4
+    push cs
+    push word button_subclass
+    call far SetWindowLong
+    cmp ax, [button_proc]
+    jne fail
+    cmp dx, [button_proc+2]
+    jne fail
+    push word [button]
+    call far UpdateWindow
+    push word [button]
+    push word 0xd
+    push word 16
+    push ds
+    push word button_text
+    call far SendMessage
+    cmp ax, 6
+    jne fail
+    cmp dword [button_text], 'butt'
+    jne fail
+    cmp word [button_text+4], 'on'
+    jne fail
+    push word [button]
+    push word 0xf5
+    push word 0
+    push dword 0
+    call far SendMessage
+    cmp word [clicked], 1
+    jne fail
+    push word [button]
+    push word -4
+    push dword [button_proc]
+    call far SetWindowLong
+    cmp ax, button_subclass
+    jne fail
+    mov bx, cs
+    cmp dx, bx
+    jne fail
+    push word [button]
+    call far DestroyWindow
+    ; Two-byte access to the last extra-byte slot must not require four bytes.
+    push word [hwnd]
+    push word 0
+    push word 0xbeef
+    call far SetWindowWord
+    test ax, ax
+    jnz fail
+    push word [hwnd]
+    push word 0
+    call far GetWindowWord
+    cmp ax, 0xbeef
+    jne fail
     push ds
     push ds
     push word dlg_template
@@ -206,6 +295,8 @@ fail:
 wndproc:
     push bp
     mov bp, sp
+    cmp word [bp+12], 0x111
+    je .command
     cmp word [bp+12], 5
     je .size
     cmp word [bp+12], 0x81
@@ -225,6 +316,18 @@ wndproc:
     push word [bp+10]
     push dword [bp+6]
     call far DefWindowProc
+    jmp .return
+.command:
+    cmp word [bp+10], 78
+    jne fail
+    mov ax, [button]
+    cmp word [bp+6], ax
+    jne fail
+    cmp word [bp+8], 0
+    jne fail
+    inc word [clicked]
+    xor ax, ax
+    xor dx, dx
     jmp .return
 .size:
     mov ax, [bp+10]
@@ -322,10 +425,21 @@ dlgproc:
     mov dx, 0x7bad ; DLGPROC returns BOOL in AX only
     pop bp
     retf 10
+button_subclass:
+    push bp
+    mov bp, sp
+    push dword [button_proc]
+    push word [bp+14]
+    push word [bp+12]
+    push word [bp+10]
+    push dword [bp+6]
+    call far CallWindowProc
+    pop bp
+    retf 10
 segment _DATA public class=DATA use16
 wc: dw 3
     dw wndproc, 0
-    dw 0,0,0,0,0,16
+    dw 0,2,0,0,0,16
     dd 0
     dw classname,0
 dlg_template:
@@ -338,6 +452,12 @@ dlg_template:
     db 0x81,0,0
 position: dw 0,0,0,0,0,0,3
 size_kind: dw 0xffff
+button: dw 0
+button_proc: dd 0
+button_text: times 16 db 0
+clicked: dw 0
+button_class: db "Button",0
+button_title: db "button",0
 translated: dw 0
 dialog: dw 0
 remaining: dw 0
