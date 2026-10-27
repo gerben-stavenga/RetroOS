@@ -448,17 +448,16 @@ pub fn display_tick<A: crate::Arch>(
     if display.is_headless() { return; }
     if display.resident_video() {
         let owner = presentation.as_ref().map(|(_, endpoint)| *endpoint);
-        if let Some(state) = vga.legacy() {
-            if display.bind_legacy(state, super::machine::vga::live_memory(),
+        if let Some(state) = vga.legacy()
+            && display.bind_legacy(state, super::machine::vga::live_memory(),
                 super::machine::vga::scanout_epoch(), owner) {
-                if let Some(mode) = state.classify_mode() {
-                    let (w, h) = ::vga::dimensions(mode);
-                    if let Some((desktop, endpoint)) = presentation.as_mut() {
-                        publish_vga_surface(w, h, desktop, *endpoint);
-                    }
+            if let Some(mode) = state.classify_mode() {
+                let (w, h) = ::vga::dimensions(mode);
+                if let Some((desktop, endpoint)) = presentation.as_mut() {
+                    publish_vga_surface(w, h, desktop, *endpoint);
                 }
-                return;
             }
+            return;
         }
         if !display.linear_needs_publication(super::machine::vga::scanout_revision(), owner) {
             display.poll_video();

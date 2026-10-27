@@ -60,7 +60,7 @@ pub(super) fn call<A: crate::Arch>(
         b"RetroGdiClip" => {
             let dc = a(0); let count = a(2) as i32;
             if dc != state.paint_dc && !state.dcs.iter().any(|d| d.handle == dc) { return 0; }
-            if count < -1 || count > 65536 { return 0; }
+            if !(-1..=65536).contains(&count) { return 0; }
             state.gdi_clips.retain(|(h,_)| *h != dc);
             if count >= 0 {
                 let mut rectangles = Vec::new();
@@ -97,7 +97,8 @@ pub(super) fn call<A: crate::Arch>(
         b"RetroGdiObject" => {
             let object=state.gdi_objects.iter().find(|(h,_)| *h==a(0));
             if let Some((_,super::super::GdiObject::Bitmap{width,height,..}))=object {
-                if a(2)==0 {return 24;} if a(1)<24 {return 0;}
+                if a(2)==0 {return 24;}
+                if a(1)<24 {return 0;}
                 let values=[0,*width,*height,*width*4,0x00200001,0];
                 for (i,v) in values.iter().enumerate(){machine.write::<u32>(a(2) as usize+i*4,*v);} 24
             } else {0}

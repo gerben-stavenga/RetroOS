@@ -33,7 +33,7 @@ jobs:
         gh release upload retroos \
           release/retroos-vm.tar.gz \
           release/retroos-machine.tar.gz \
-          release/retroos_grub_module_usb.img \
+          release/retroos_grub_module_usb.zip \
           release/retroos_grub_module.iso \
           release/retroos-usb-diagnostic.zip \
           release/SHA256SUMS --clobber

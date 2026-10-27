@@ -16,7 +16,8 @@ defaults:
 jobs:
   quality:
     name: Lint and unit tests
-    runs-on: ubuntu-latest
+    # Pin the build image: the legacy pkg-config bootstrap requires pre-C23 defaults.
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
     - uses: actions/checkout@v4
@@ -61,7 +62,7 @@ jobs:
       fail-fast: false
       matrix:
         suite: [boot, dos, personalities, devices]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
     - uses: actions/checkout@v4
@@ -129,7 +130,7 @@ jobs:
   package:
     name: Release images and boot checks
     if: inputs.package_release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
     - uses: actions/checkout@v4
@@ -145,7 +146,7 @@ jobs:
         python3 test/release.py
         # Later host-platform builds change the bazel-bin symlink.
         mkdir -p build/release
-        cp bazel-bin/retroos-vm.tar.gz bazel-bin/retroos-machine.tar.gz bazel-bin/retroos_grub_module_usb.img bazel-bin/retroos_grub_module.iso bazel-bin/retroos-usb-diagnostic.zip bazel-bin/SHA256SUMS build/release/
+        cp bazel-bin/retroos-vm.tar.gz bazel-bin/retroos-machine.tar.gz bazel-bin/retroos_grub_module_usb.zip bazel-bin/retroos_grub_module.iso bazel-bin/retroos-usb-diagnostic.zip bazel-bin/SHA256SUMS build/release/
     - name: Upload tested public releases
       uses: actions/upload-artifact@v4
       with:
@@ -154,7 +155,7 @@ jobs:
         path: |
           build/release/retroos-vm.tar.gz
           build/release/retroos-machine.tar.gz
-          build/release/retroos_grub_module_usb.img
+          build/release/retroos_grub_module_usb.zip
           build/release/retroos_grub_module.iso
           build/release/retroos-usb-diagnostic.zip
           build/release/SHA256SUMS
@@ -171,7 +172,7 @@ jobs:
     - quality
     - runtime
     - package
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
     - name: Check all results
       env:

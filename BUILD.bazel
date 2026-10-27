@@ -512,6 +512,15 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
+# Compress the expandable USB image for public downloads.
+genrule(
+    name = "grub_module_usb_zip",
+    srcs = [":grub_module_usb"],
+    outs = ["retroos_grub_module_usb.zip"],
+    cmd = "python3 -c 'import zipfile; z = zipfile.ZipFile(\"$@\", \"w\", compression=zipfile.ZIP_DEFLATED, compresslevel=9); z.write(\"$(location :grub_module_usb)\", \"retroos_grub_module_usb.img\"); z.close()'",
+    visibility = ["//visibility:public"],
+)
+
 # Optical-disc counterpart of the public USB module image. UniPCemu can boot
 # this through its CD-ROM drive; the same kernel, modules, and GRUB menu are
 # used so the runtime is identical regardless of boot medium.
@@ -871,13 +880,13 @@ pkg_tar(
 
 genrule(
     name = "release_checksums",
-    srcs = [":release_vm", ":release_machine", ":grub_module_usb", ":grub_module_iso", ":usb_diagnostic_zip"],
+    srcs = [":release_vm", ":release_machine", ":grub_module_usb_zip", ":grub_module_iso", ":usb_diagnostic_zip"],
     outs = ["SHA256SUMS"],
-    cmd = "sha256sum $(locations :release_vm) $(locations :release_machine) $(locations :grub_module_usb) $(locations :grub_module_iso) $(locations :usb_diagnostic_zip) | sed 's|  .*/|  |' > $@",
+    cmd = "sha256sum $(locations :release_vm) $(locations :release_machine) $(locations :grub_module_usb_zip) $(locations :grub_module_iso) $(locations :usb_diagnostic_zip) | sed 's|  .*/|  |' > $@",
 )
 
 filegroup(
     name = "release",
-    srcs = [":release_vm", ":release_machine", ":grub_module_usb", ":grub_module_iso", ":usb_diagnostic_zip", ":release_checksums"],
+    srcs = [":release_vm", ":release_machine", ":grub_module_usb_zip", ":grub_module_iso", ":usb_diagnostic_zip", ":release_checksums"],
     visibility = ["//visibility:public"],
 )

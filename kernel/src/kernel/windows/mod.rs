@@ -246,6 +246,8 @@ impl<A: crate::Arch> core::ops::DerefMut for WindowsProcess<A> {
     fn deref_mut(&mut self) -> &mut WindowsState { &mut self.state }
 }
 
+type GdiClipRect = (i32, i32, i32, i32);
+
 pub struct WindowsState {
     pub(crate) environment: Vec<u8>,
     file_oem: bool,
@@ -299,7 +301,7 @@ pub struct WindowsState {
     gdi_objects: Vec<(u32, GdiObject)>,
     dcs: Vec<DeviceContext>,
     gdi_rops: Vec<(u32,i32)>,
-    gdi_clips: Vec<(u32, Vec<(i32,i32,i32,i32)>)>,
+    gdi_clips: Vec<(u32, Vec<GdiClipRect>)>,
     mouse_x: i32,
     mouse_y: i32,
     mouse_buttons: u8,
@@ -1713,8 +1715,10 @@ fn put_pixel(state: &mut WindowsState, dc: u32, x: i32, y: i32, color: u32) {
     if at + 4 <= target.pixels.len() {
         let old = u32::from_le_bytes(target.pixels[at..at+4].try_into().unwrap());
         let mut mixed = 0;
-        if rop&1!=0 {mixed |= !color & !old;} if rop&2!=0 {mixed |= !color & old;}
-        if rop&4!=0 {mixed |= color & !old;} if rop&8!=0 {mixed |= color & old;}
+        if rop&1!=0 {mixed |= !color & !old;}
+        if rop&2!=0 {mixed |= !color & old;}
+        if rop&4!=0 {mixed |= color & !old;}
+        if rop&8!=0 {mixed |= color & old;}
         target.pixels[at..at + 4].copy_from_slice(&(mixed & 0x00ff_ffff).to_le_bytes());
         if let Some(dirty) = target.dirty { *dirty = true; }
     }

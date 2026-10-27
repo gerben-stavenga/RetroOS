@@ -835,11 +835,13 @@ mod continuation_tests {
 }
 
 pub(super) fn init_win16_psp<A: crate::Arch>(machine: &mut A, psp: u16) {
-    let mut value = lowmem::Psp::default();
-    value.int_20 = [0xcd, 0x20];
-    value.top_of_mem = 0xa000;
-    value.parent_psp = psp;
-    value.jft = [0xff; 20];
+    let mut value = lowmem::Psp {
+        int_20: [0xcd, 0x20],
+        top_of_mem: 0xa000,
+        parent_psp: psp,
+        jft: [0xff; 20],
+        ..Default::default()
+    };
     value.jft[..3].copy_from_slice(&[0, 1, 2]);
     value.max_files = thread::MAX_FDS as u16;
     value.jft_far_off = 0x100;

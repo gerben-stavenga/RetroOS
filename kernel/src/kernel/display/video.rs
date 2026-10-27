@@ -165,6 +165,7 @@ impl Video {
 
 /// Presentation reads a stable completed image. Its checkpoints keep beam
 /// fetches moving even while a slow physical framebuffer is being copied.
+#[allow(clippy::too_many_arguments)] // Borrows disjoint renderer fields while scanout advances.
 fn present_image(fb: &Framebuffer, format: PixelFormat, canvas: (usize, usize),
     last_output: &mut Option<(usize, usize)>, scene: &mut Option<gui::ResidentScene>,
     composed: &mut Vec<u8>, row: &mut Vec<u8>,

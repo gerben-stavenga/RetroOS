@@ -95,7 +95,7 @@ jobs:
           PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
         run: |
           gh release upload "$TAG" release/retroos-vm.tar.gz release/retroos-machine.tar.gz \
-            release/retroos_grub_module_usb.img release/retroos_grub_module.iso \
+            release/retroos_grub_module_usb.zip release/retroos_grub_module.iso \
             release/retroos-usb-diagnostic.zip release/SHA256SUMS --clobber
           flags=(--draft=false --title "RetroOS $VERSION" --notes-file release-notes.md)
           if [ "$PRERELEASE" = true ]; then

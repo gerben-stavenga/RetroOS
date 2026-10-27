@@ -459,7 +459,7 @@ fn load_module_file(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), 
     let candidates = [local, runtime];
     let paths = if module(name).is_some() { &candidates[1..] } else { &candidates[..] };
     for path in paths {
-        if let Ok(data) = crate::kernel::exec::load_file_resolved(&path) {
+        if let Ok(data) = crate::kernel::exec::load_file_resolved(path) {
             return Ok((path.clone(), data));
         }
         let rooted = [crate::kernel::dos::c_root(), path.as_slice()].concat();
@@ -1487,6 +1487,7 @@ fn dispatch<A: crate::Arch>(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Shared personality dispatch context.
 pub(super) fn handle_event<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,

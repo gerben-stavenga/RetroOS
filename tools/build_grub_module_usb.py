@@ -22,7 +22,7 @@ from build_boot_disk import (GAP_SECTORS, SECTOR,
 DISK_SIGNATURE = 0x5E77_0006
 BOOT_VOLUME_SERIAL = 0x5E77_0001
 PART_TYPE_FAT32_LBA = 0x0C
-BOOT_MIB = 128
+BOOT_MIB = 512
 DIAGNOSTIC_GRUB_MODULES = (
     "all_video", "fat", "gzio",
     "multiboot2", "normal", "part_msdos", "search_fs_file", "videoinfo",

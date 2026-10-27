@@ -39,3 +39,8 @@ version numbers are recorded by tags, release titles and the kernel build ID.
 `Publish rolling release` retains the legacy `retroos` download link. It now
 requires a successful CI run and matching commit; it cannot build and publish
 unchecked binaries. Numbered releases are the normal release history.
+
+Validation uses Ubuntu 24.04 explicitly: newer C23 compiler defaults break the
+legacy GLib bundled in the pkg-config bootstrap. The public USB download is
+`retroos_grub_module_usb.zip`, containing a disk with a 512 MiB FAT32 partition.
+Release checks extract and boot this archive under BIOS and UEFI.

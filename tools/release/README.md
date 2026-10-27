@@ -3,7 +3,7 @@
 Release builds retain panic diagnostics. Kernel panics display the message,
 source location, and stack trace on the console and mirror them to the log.
 
-For USB testing, use **`retroos_grub_module_usb.img`**. Its partition
+For USB testing, download **`retroos_grub_module_usb.zip`** and extract `retroos_grub_module_usb.img`. Its partition
 table is conventional and its GRUB configuration can be edited on the stick.
 For CD-ROM boot, including UniPCemu setups that cannot boot the USB image,
 use **`retroos_grub_module.iso`**. It contains the same kernel, RAM modules,
@@ -12,7 +12,7 @@ and GRUB menu as the USB image.
 ## Editable USB boot: retroos_grub_module_usb.img
 
 Use this image when you need to edit GRUB settings on a USB stick. It has a
-fixed MBR with one 128 MiB FAT32 partition (type `0x0C`, so Windows can assign
+fixed MBR with one 512 MiB FAT32 partition (type `0x0C`, so Windows can assign
 it a drive letter). The menu is
 `/boot/grub/grub.cfg`; the matching kernel and RAM modules are under
 `/boot/retroos/releases/<version>/` on the same partition.

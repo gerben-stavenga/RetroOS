@@ -17,12 +17,13 @@ OUTPUT = Path(os.environ.get('RETROOS_RELEASE_DIR', ROOT / 'bazel-bin')).resolve
 
 
 def check_usb(work):
-    image = OUTPUT / 'retroos_grub_module_usb.img'
+    image = work / 'retroos_grub_module_usb.img'
     assert image.is_file()
     with image.open('rb') as disk:
         mbr = disk.read(512)
     assert mbr[510:512] == b'\x55\xaa'
     assert struct.unpack_from('<I', mbr, 0x1B8)[0] != 0
+    assert struct.unpack_from('<I', mbr, 458)[0] == 512 * 1024 * 1024 // 512
     assert mbr[450] == 0x0C
     assert mbr[462:510] == bytes(48)
     assert struct.unpack_from('<I', mbr, 454)[0] == 2048
@@ -127,6 +128,10 @@ def main():
         (work / 'lightweight-grub.cfg').write_text(menu)
         subprocess.run(['grub-script-check', str(work / 'lightweight-grub.cfg')], check=True)
         print('PASS: lightweight USB ZIP below 5 MB, dISAppointment and photo entries')
+        with zipfile.ZipFile(OUTPUT / 'retroos_grub_module_usb.zip') as archive:
+            assert archive.namelist() == ['retroos_grub_module_usb.img']
+            assert archive.testzip() is None
+            archive.extract('retroos_grub_module_usb.img', work)
         check_usb(work)
         check_iso(work)
         vm, machine = work / 'vm', work / 'machine'
@@ -141,7 +146,7 @@ def main():
         spec = importlib.util.spec_from_file_location('module_install', module_installer)
         module_install = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module_install)
-        usb_image = OUTPUT / 'retroos_grub_module_usb.img'
+        usb_image = work / 'retroos_grub_module_usb.img'
         module_install.extract_boot_file(usb_image, 'kernel.elf', work / 'usb-kernel.elf')
         module_install.extract_boot_file(usb_image, 'retroos-base.img.gz', work / 'usb-base.img.gz')
         assert (work / 'usb-kernel.elf').read_bytes()[:4] == b'\x7fELF'
