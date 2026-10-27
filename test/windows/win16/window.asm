@@ -19,6 +19,7 @@ extern GetCursorPos, SetCursorPos, ClientToScreen, ScreenToClient
 extern wvsprintf, WinExec
 extern _lopen, _lclose, _lread, _lcreat, _llseek, _lwrite
 extern GetTempFileName, LoadLibrary, FreeLibrary, GetModuleHandle, GetProcAddress, GetModuleUsage
+extern GetDriveType
 extern GlobalAlloc, GlobalLock, GlobalUnlock, GlobalFree, GlobalSize, GlobalReAlloc, GlobalHandle
 extern AllocCStoDSAlias, FreeSelector
 extern GlobalAddAtom, GlobalFindAtom, GlobalDeleteAtom, GlobalGetAtomName
@@ -380,6 +381,44 @@ _start:
     jne file_fail_14
     cmp sp,[initial_sp]
     jne file_fail_15
+    push word 2
+    call far GetDriveType
+    cmp ax,3
+    jne pmdos_fail
+    push word 26
+    call far GetDriveType
+    test ax,ax
+    jnz pmdos_fail
+    mov ax,0x150b
+    mov cx,2
+    int 0x2f
+    test ax,ax
+    jnz pmdos_fail
+    cmp bx,0xadad
+    jne pmdos_fail
+    mov ax,0x150b
+    mov cx,3
+    int 0x2f
+    test ax,ax
+    jz pmdos_fail
+    cmp bx,0xadad
+    jne pmdos_fail
+    push ds
+    mov ax,0x1c00
+    mov dx,3
+    int 0x21
+    cmp al,8
+    jne .allocation_fail
+    cmp cx,512
+    jne .allocation_fail
+    cmp byte [bx],0xf8
+    jne .allocation_fail
+    pop ds
+    jmp .allocation_done
+.allocation_fail:
+    pop ds
+    jmp pmdos_fail
+.allocation_done:
     push es
     mov ah,0x62
     int 0x21

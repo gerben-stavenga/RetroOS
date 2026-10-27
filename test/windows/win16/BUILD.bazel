@@ -6,6 +6,7 @@ windows16_binary(name="bridge", obj=":bridge_obj", imports={
 }, visibility=["//visibility:public"])
 nasm_library(name="window_obj", srcs=["window.asm"], copts=["-fobj"])
 windows16_binary(name="window", obj=":window_obj", imports={
+    "GetDriveType": "KERNEL.136",
     "GetPrivateProfileString": "KERNEL.128",
     "PatBlt": "GDI.29",
     "ExtTextOut": "GDI.351", "SetBkColor": "GDI.1",

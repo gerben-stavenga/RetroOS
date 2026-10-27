@@ -1189,6 +1189,34 @@ pub(super) fn int_21h<A: crate::Arch>(
             }
             DosExit::Ok
         }
+        // Allocation information shares the same geometry as free-space queries.
+        // Unlike AH=36h, DS:BX points at DOS's resident media descriptor byte.
+        0x1b | 0x1c => {
+            let saved_ax=regs.rax;
+            let saved_dx=regs.rdx;
+            let drive=if ah==0x1b || regs.rdx as u8==0 {
+                dos.dfs.current_drive_number()+1
+            } else {regs.rdx as u8};
+            regs.rax=(regs.rax & !0xffff)|0x3600;
+            regs.rdx=(regs.rdx & !0xff)|u64::from(drive);
+            let _=int_21h(machine,bios_display,kt,dos,regs,suspension);
+            if regs.rax as u16==0xffff || !(1..=26).contains(&drive) {
+                regs.rax=(saved_ax & !0xff)|0xff;
+                regs.rdx=saved_dx;
+            } else {
+                regs.rax=(saved_ax & !0xff)|(regs.rax & 0xff);
+                let address=LOW_MEM_BASE+core::mem::offset_of!(LowMem,allocation_media) as u32+u32::from(drive-1);
+                machine.write::<u8>(address as usize,if drive<=2 {0xf0}else{0xf8});
+                if regs.mode()!=crate::UserMode::VM86 {
+                    regs.ds=u64::from(dpmi::LOW_MEM_SEL);
+                    regs.rbx=u64::from(address);
+                } else {
+                    regs.ds=u64::from(address>>4);
+                    regs.rbx=(regs.rbx & !0xffff)|u64::from(address & 15);
+                }
+            }
+            DosExit::Ok
+        }
         // AH=0x36: Get Disk Free Space (DL=drive, 0=default,1=A,2=B,3=C...)
         // Returns: AX=sectors/cluster, BX=free clusters, CX=bytes/sector, DX=total clusters
         // On error: AX=0xFFFF

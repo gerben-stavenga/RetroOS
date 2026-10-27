@@ -265,6 +265,7 @@ pub(super) struct LowMem {
     sft:       Sft,
     cds:       [CdsEntry; NUM_DRIVES as usize],
     pub(super) cdrom_header: CdromDeviceHeader,
+    pub(super) allocation_media: [u8; 26],
     cdrom_retf: u8,
     /// Diskette drive parameter table. IVT vector 1Eh points here (a real
     /// BIOS convention DOS-era code follows to tune step/settle times), and

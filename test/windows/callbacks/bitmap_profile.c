@@ -198,6 +198,30 @@ int main(void)
         CHECK(GetPixel(cd,0,9)==RGB(0,0,0));
         ReleaseDC(first,cd);DestroyWindow(parent);
     }
+    /* Win16 installers reach the real combo edit by child ID 1001. Text
+       entered there must also be returned through the combo itself. */
+    {
+        char value[64];
+        HWND parent=CreateWindowA("STATIC","",WS_POPUP,0,0,300,200,0,0,0,0);
+        HWND combo=CreateWindowA("COMBOBOX","",WS_CHILD|CBS_DROPDOWN,0,0,200,100,parent,(HMENU)100,0,0);
+        HWND edit=GetDlgItem(combo,1001);
+        CHECK(combo&&edit);
+        CHECK(GetParent(edit)==combo);
+        CHECK(SetWindowTextA(edit,"C:\\MPS\\CIVWIN"));
+        CHECK(GetWindowTextA(combo,value,sizeof(value))==13);
+        CHECK(strcmp(value,"C:\\MPS\\CIVWIN")==0);
+        CHECK(SetWindowTextA(combo,"replacement"));
+        CHECK(GetWindowTextA(edit,value,sizeof(value))==11);
+        CHECK(strcmp(value,"replacement")==0);
+        CHECK(SendMessageA(combo,CB_ADDSTRING,0,(LPARAM)"selected")==0);
+        CHECK(SendMessageA(combo,CB_SETCURSEL,0,0)==0);
+        CHECK(GetWindowTextA(edit,value,sizeof(value))==8);
+        CHECK(strcmp(value,"selected")==0);
+        CHECK(SendMessageA(combo,CB_SETCURSEL,(WPARAM)-1,0)==CB_ERR);
+        CHECK(GetWindowTextA(combo,value,sizeof(value))==0);
+        CHECK(DestroyWindow(parent));
+        CHECK(!IsWindow(edit));
+    }
     CHECK(SetTimer(0,0,20,close_message)!=0);
     CHECK(MessageBoxW(0,L"Choose Cancel.",L"Shared modal message",MB_OKCANCEL|MB_DEFBUTTON2)==IDCANCEL);
     file=CreateFileA("C:\\PROFILE.INI",GENERIC_WRITE,0,0,CREATE_ALWAYS,0,0);

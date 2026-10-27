@@ -12,6 +12,7 @@ pub struct Control {
     selected: Option<usize>,
     image: u32,
     font: u32,
+    edit_child: u32,
     pub(crate) scroll: [crate::scrollbar::Info; 3],
 }
 pub fn ensure() {
@@ -321,7 +322,13 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
                     (0, 0)
                 };
                 unsafe {
-                    TextOutW(dc, x, y, label.as_ptr(), label.len() as i32);
+                    if static_control && matches!(style & 0x1f,0..=2|11|12) {
+                        let alignment=match style & 0x1f {1=>1,2=>2,_=>0};
+                        let flags=0x800|alignment|if style & 0x1f==12 {0}else{0x10};
+                        crate::drawing::DrawTextW(dc,label.as_ptr() as u32,label.len() as i32,&mut [0,0,width,height],flags);
+                    } else {
+                        TextOutW(dc, x, y, label.as_ptr(), label.len() as i32);
+                    }
                 }
             }
         }
@@ -367,6 +374,36 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
     let list = kind == [76, 105, 115, 116, 66, 111, 120]
         || kind == [67, 111, 109, 98, 111, 76, 66, 111, 120];
     let combo = kind == [67, 111, 109, 98, 111, 66, 111, 120];
+    if combo {
+        if message == 1 && matches!(style & 3, 1 | 2) {
+            let cs = unsafe { &*(lparam as *const crate::CreateStruct) };
+            let child = unsafe {
+                crate::CreateWindowExW(
+                    0, [69u16,100,105,116,0].as_ptr() as u32, 0,
+                    0x50000080, 2, 2, (cs.width-22).max(1), 18,
+                    hwnd, 1001, cs.instance, 0,
+                )
+            };
+            if child == 0 { return -1; }
+            state::with(|s| {
+                if let Some(w)=s.windows.iter_mut().find(|w|w.hwnd==hwnd) {
+                    w.control.edit_child=child;
+                }
+            });
+        }
+        let child=state::with(|s|s.windows.iter().find(|w|w.hwnd==hwnd).map_or(0,|w|w.control.edit_child));
+        if child != 0 {
+            if matches!(message,0xc|0xd|0xe|0x30|0x31) {
+                return unsafe { if wide {crate::SendMessageW(child,message,wparam,lparam)} else {crate::SendMessageA(child,message,wparam,lparam)} };
+            }
+            if message==7 { unsafe {crate::input::SetFocus(child);} return 0; }
+            if message==0x111 && lparam==child {
+                let code=match wparam>>16 {0x300=>5,0x400=>6,0x100=>3,0x200=>4,_=>0};
+                if code!=0 {unsafe {notify(hwnd,code);}}
+                return 0;
+            }
+        }
+    }
     let scroll = kind == [83, 99, 114, 111, 108, 108, 66, 97, 114];
     let icon_control = kind == [83, 116, 97, 116, 105, 99] && style & 0x1f == 3;
     if icon_control && (message == 0x81 || message == 0xc) {
@@ -733,6 +770,18 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
                     _ => -1,
                 }
             });
+            if combo && matches!(normalized,0x184|0x186) {
+                let (child,mut value)=state::with(|s| {
+                    let w=s.windows.iter_mut().find(|w|w.hwnd==hwnd).unwrap();
+                    let value=w.control.selected.and_then(|i|w.control.items.get(i)).cloned().unwrap_or_default();
+                    w.title=value.clone();
+                    (w.control.edit_child,value)
+                });
+                if child!=0 {
+                    value.push(0);
+                    unsafe {crate::SendMessageW(child,0xc,0,value.as_ptr() as u32);}
+                }
+            }
             if matches!(normalized, 0x180 | 0x181 | 0x182 | 0x184 | 0x186) {
                 unsafe {
                     crate::paint::InvalidateRect(hwnd, 0, 0);

@@ -67,7 +67,8 @@ pub(crate) use dos::dos_to_unix_datetime;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.
 pub use dfs::{c_root, set_c_root};
-pub(crate) use dfs::{DFS_PATH_MAX, vfs_to_dos, extra_drive_prefix};
+pub(crate) use dfs::{DFS_PATH_MAX, vfs_to_dos, extra_drive_prefix, drive_available};
+pub(crate) use dos::win16_multiplex;
 
 /// Look up `KEY` in a DOS environment block (the RETROOS.INI master
 /// env). Startup reads boot policy out of it — `SB_AUDIO=` — before any

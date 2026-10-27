@@ -208,6 +208,17 @@ pub(super) fn poll_suspended_call<A: crate::Arch>(
     thread::KernelAction::Done
 }
 
+/// Win16 uses the same multiplex services as PMDOS. Buffer offsets are WORDs.
+pub(crate) fn win16_multiplex<A: crate::Arch>(
+    machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs,
+) -> thread::KernelAction {
+    let high_bx = regs.rbx & !0xffff;
+    regs.rbx &= 0xffff;
+    let action = int_2fh(machine, dos, regs);
+    regs.rbx = high_bx | (regs.rbx & 0xffff);
+    action
+}
+
 // ============================================================================
 // RM INT 31h dispatch — routes from the unified CD 31 array by slot number
 // ============================================================================
@@ -489,7 +500,7 @@ pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, bios_display:
         // restoring the client's stale half would corrupt the pointer —
         // DOS/16M's DPMILOAD stores the whole DS:ESI from AH=5D06 (LDS ESI)
         // and dereferenced a stale-half kernel address (DUKE3D music SEGV).
-        let keep_ebx = matches!(ah, 0x2F | 0x34 | 0x52);
+        let keep_ebx = matches!(ah, 0x1B | 0x1C | 0x2F | 0x34 | 0x52);
         let keep_esi = ah == 0x5D && al_in == 0x06;
         regs.rax = (regs.rax & !HI) | saved_hi[0];
         if !keep_ebx {

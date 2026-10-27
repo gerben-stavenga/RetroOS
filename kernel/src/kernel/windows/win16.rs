@@ -1210,6 +1210,11 @@ fn dispatch<A: crate::Arch>(
                 }
             }
         }
+        (Module::Kernel, 136) => {
+            let drive=stack_u16(machine,windows,regs,4).unwrap_or(u16::MAX);
+            if drive>=26 || !crate::kernel::dos::drive_available(b'A'+drive as u8) {0}
+            else {match drive {0|1=>2,3|8=>4,_=>3}}
+        }
         (Module::Kernel, 25 | 169) => machine.free_page_count().saturating_mul(4096).min(u32::MAX as usize) as u32,
         (Module::Kernel, 23 | 24 | 30 | 52) => 1,
         (Module::Kernel, 47) => {
@@ -1518,6 +1523,7 @@ pub(super) fn handle_event<A: crate::Arch>(
         crate::KernelEvent::Irq => thread::KernelAction::Done,
         crate::KernelEvent::Hlt => crate::kernel::dos::win16_resume(machine, kt, dos, regs)
             .unwrap_or(thread::KernelAction::Done),
+        crate::KernelEvent::SoftInt(0x2f) => crate::kernel::dos::win16_multiplex(machine, dos, regs),
         crate::KernelEvent::SoftInt(0x21) => dos_call(machine, bios, kt, windows, dos, regs),
         crate::KernelEvent::SoftInt(GATE_VECTOR) => {
             let ip = regs.ip32() as u16;
