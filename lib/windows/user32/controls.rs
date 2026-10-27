@@ -203,6 +203,11 @@ unsafe fn paint(hwnd: u32, kind: &[u16], style: u32) -> i32 {
                 }
                 SetBkMode(dc, 1);
             }
+            if static_control && style & 0x1f == 3 && image != 0 {
+                unsafe {
+                    crate::resource::DrawIcon(dc, 0, 0, image);
+                }
+            }
             if button && style & 15 <= 1 {
                 crate::frame::bevel(dc, [0, 0, width, height]);
             }
@@ -363,6 +368,37 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
         || kind == [67, 111, 109, 98, 111, 76, 66, 111, 120];
     let combo = kind == [67, 111, 109, 98, 111, 66, 111, 120];
     let scroll = kind == [83, 99, 114, 111, 108, 108, 66, 97, 114];
+    let icon_control = kind == [83, 116, 97, 116, 105, 99] && style & 0x1f == 3;
+    if icon_control && (message == 0x81 || message == 0xc) {
+        let (instance, name) = if message == 0x81 {
+            let cs = unsafe { &*(lparam as *const crate::CreateStruct) };
+            (cs.instance, cs.title)
+        } else {
+            (unsafe { window::GetWindowLongA(hwnd, -6) }, lparam)
+        };
+        let image = if name == 0 {
+            0
+        } else {
+            unsafe {
+                if wide {
+                    crate::resource::LoadIconW(instance, name)
+                } else {
+                    crate::resource::LoadIconA(instance, name)
+                }
+            }
+        };
+        state::with(|s| {
+            if let Some(w) = s.windows.iter_mut().find(|w| w.hwnd == hwnd) {
+                w.control.image = image;
+            }
+        });
+        if message == 0xc {
+            unsafe {
+                crate::paint::InvalidateRect(hwnd, 0, 1);
+            }
+        }
+        return 1;
+    }
     if kind == [35, 51, 50, 55, 55, 48] {
         return unsafe {
             if wide {
@@ -509,7 +545,7 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
         });
     }
     if message == 0x170 || message == 0x172 || message == 0x171 || message == 0x173 {
-        return state::with(|s| {
+        let old = state::with(|s| {
             let w = s.windows.iter_mut().find(|w| w.hwnd == hwnd).unwrap();
             let old = w.control.image;
             if message == 0x170 {
@@ -520,6 +556,12 @@ unsafe fn control(hwnd: u32, message: u32, wparam: u32, lparam: u32, wide: bool)
             }
             old as i32
         });
+        if matches!(message, 0x170 | 0x172) {
+            unsafe {
+                crate::paint::InvalidateRect(hwnd, 0, 1);
+            }
+        }
+        return old;
     }
     if button && (0xf0..=0xf4).contains(&message) {
         let result = state::with(|s| {

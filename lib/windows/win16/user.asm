@@ -62,7 +62,7 @@ bridge InflateRect, 78, 8
 bridge IntersectRect, 79, 12
 bridge FillRect, 81, 8
 gate FrameRect
-gate DrawIcon
+bridge DrawIcon, 84, 8
 bridge DrawText, 85, 14
 bridge DialogBox, 87, 12
 bridge EndDialog, 88, 4
@@ -108,7 +108,7 @@ bridge GetSubMenu, 159, 4
 bridge DrawMenuBar, 160, 2
 gate WinHelp
 gate LoadCursor
-gate LoadIcon
+bridge LoadIcon, 174, 6
 bridge LoadBitmap, 175, 6
 gate LoadString
 gate LoadAccelerators
@@ -141,7 +141,7 @@ gate wsprintf
 gate lstrcmp
 gate AnsiUpper
 gate AnsiLower
-gate DestroyIcon
+bridge DestroyIcon, 457, 2
 gate DrawFocusRect
 gate lstrcmpi
 gate AnsiNext

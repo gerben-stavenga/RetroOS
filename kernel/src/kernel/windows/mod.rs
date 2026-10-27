@@ -2452,9 +2452,12 @@ fn dispatch<A: crate::Arch>(
             }) else { return 0; };
             let dx = dx.saturating_add(left.saturating_sub(sx));
             let dy = dy.saturating_add(top.saturating_sub(sy));
-            if arg(machine, regs, 8) == 0x00cc0020 {
-                // Resolve the destination and its clip once, then copy rows.
-                // SRCCOPY is independent of the pen's ROP2 setting.
+            {
+                // BitBlt uses the ternary raster operation, never the pen ROP2.
+                let rop = (arg(machine, regs, 8) >> 16) as u8;
+                let brush = state.dcs.iter().find(|d| d.handle == dst).map_or(0, |d| d.brush);
+                let pattern = object_color(state, brush, 0xffffff);
+                // Resolve destination and clip once; SRCCOPY still copies rows.
                 let clips = state.gdi_clips.iter().find(|(h,_)| *h == dst).map(|(_,r)| r.clone());
                 let Some(target) = target_mut(state, dst) else { return 0; };
                 let bounds = [(0, 0, target.clip_width as i32, target.clip_height as i32)];
@@ -2472,19 +2475,27 @@ fn dispatch<A: crate::Arch>(
                         let from = ((y - i64::from(dy)) as usize * copy_width + (l - i64::from(dx)) as usize) * 4;
                         let to = ((y + i64::from(target.origin_y)) as usize * target.width as usize
                             + (l + i64::from(target.origin_x)) as usize) * 4;
-                        target.pixels[to..to+count].copy_from_slice(&source[from..from+count]);
+                        if rop == 0xcc {
+                            target.pixels[to..to+count].copy_from_slice(&source[from..from+count]);
+                        } else {
+                            for x in (0..count).step_by(4) {
+                                let src = u32::from_le_bytes(source[from+x..from+x+4].try_into().unwrap());
+                                let dst = u32::from_le_bytes(target.pixels[to+x..to+x+4].try_into().unwrap());
+                                let mut color = 0;
+                                for term in 0..8 {
+                                    if rop & (1 << term) != 0 {
+                                        color |= (if term & 4 != 0 { pattern } else { !pattern })
+                                            & (if term & 2 != 0 { src } else { !src })
+                                            & (if term & 1 != 0 { dst } else { !dst });
+                                    }
+                                }
+                                target.pixels[to+x..to+x+4].copy_from_slice(&(color & 0xffffff).to_le_bytes());
+                            }
+                        }
                     }
                     changed = true;
                 }
                 if changed && let Some(dirty) = target.dirty { *dirty = true; }
-            } else {
-                for y in 0..copy_height {
-                    for x in 0..copy_width {
-                        let at = (y * copy_width + x) * 4;
-                        let color = u32::from_le_bytes(source[at..at+4].try_into().unwrap());
-                        put_pixel(state, dst, dx + x as i32, dy + y as i32, color);
-                    }
-                }
             }
             1
         }

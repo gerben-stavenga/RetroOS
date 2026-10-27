@@ -205,6 +205,7 @@ windows_dll(
         "LoadCursorW": "_LoadCursorW@8",
         "LoadBitmapW": "_LoadBitmapW@8",
         "DestroyAcceleratorTable": "_DestroyAcceleratorTable@4",
+        "DrawIcon": "_DrawIcon@16",
         "DestroyIcon": "_DestroyIcon@4",
         "wvsprintfA": "_wvsprintfA@12",
         "wvsprintfW": "_wvsprintfW@12",
@@ -476,7 +477,7 @@ windows_dll(
         "CallWindowProcW",
 
         "AdjustWindowRect", "AdjustWindowRectEx", "BeginPaint", "CharUpperA", "CheckMenuItem",
-        "CreateWindowExA", "CreateWindowExW", "DefWindowProcW", "DestroyIcon", "DialogBoxParamW",
+        "CreateWindowExA", "CreateWindowExW", "DefWindowProcW", "DrawIcon", "DestroyIcon", "DialogBoxParamW",
         "DispatchMessageA", "DispatchMessageW", "DrawEdge", "EndDialog", "EndPaint", "FillRect",
         "GetClientRect", "GetDC", "GetDlgItem", "GetDlgItemInt",
         "GetDlgItemTextW", "GetMenuItemRect", "GetMessageW", "GetSysColorBrush",

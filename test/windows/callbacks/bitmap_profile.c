@@ -71,6 +71,20 @@ int main(void)
         CHECK(BitBlt(dst,2,2,2,2,dst,1,1,SRCCOPY));
         CHECK(GetPixel(dst,2,2)==RGB(0,0,255));
         CHECK(GetPixel(dst,3,3)==RGB(22,33,44));
+        /* Classic icon masks: preserve, invert, black and white. */
+        SelectClipRgn(dst,0);SetROP2(dst,R2_COPYPEN);
+        SetPixel(dst,0,0,RGB(10,20,30));SetPixel(dst,1,0,RGB(10,20,30));
+        SetPixel(dst,0,1,RGB(10,20,30));SetPixel(dst,1,1,RGB(10,20,30));
+        SetPixel(dc,0,0,RGB(255,255,255));SetPixel(dc,1,0,RGB(255,255,255));
+        SetPixel(dc,0,1,0);SetPixel(dc,1,1,0);
+        SetROP2(dst,R2_BLACK); /* BitBlt must ignore this. */
+        CHECK(BitBlt(dst,0,0,2,2,dc,0,0,SRCAND));
+        SetPixel(dc,0,0,0);SetPixel(dc,1,0,RGB(255,255,255));
+        SetPixel(dc,0,1,0);SetPixel(dc,1,1,RGB(255,255,255));
+        CHECK(BitBlt(dst,0,0,2,2,dc,0,0,SRCINVERT));
+        CHECK(GetPixel(dst,0,0)==RGB(10,20,30));
+        CHECK(GetPixel(dst,1,0)==RGB(245,235,225));
+        CHECK(GetPixel(dst,0,1)==0);CHECK(GetPixel(dst,1,1)==RGB(255,255,255));
         DeleteObject(clip);DeleteDC(dst);DeleteObject(db);
     }
     CHECK(DeleteDC(dc));CHECK(DeleteObject(bitmap));

@@ -246,3 +246,82 @@ mod tests {
         );
     }
 }
+
+/// Decode a classic RT_ICON DIB: color/XOR rows followed by a 1-bit AND mask.
+/// The header height includes both planes; each plane is stored bottom-up.
+pub fn decode_icon(data: &[u8]) -> Option<(i32, i32, Vec<u8>, Vec<u8>)> {
+    let header = dword(data, 0)? as usize;
+    if header != 40 || dword(data, 16)? != 0 {
+        return None;
+    }
+    let width = dword(data, 4)? as i32;
+    let doubled = dword(data, 8)? as i32;
+    let depth = word(data, 14)? as usize;
+    if width <= 0
+        || width > 256
+        || doubled <= 0
+        || doubled > 512
+        || doubled % 2 != 0
+        || !matches!(depth, 1 | 4 | 8 | 24)
+        || word(data, 12)? != 1
+    {
+        return None;
+    }
+    let height = doubled / 2;
+    let colors = if depth <= 8 {
+        let count = dword(data, 32)? as usize;
+        if count == 0 { 1 << depth } else { count }
+    } else {
+        0
+    };
+    if colors > 256 {
+        return None;
+    }
+    let stride = (width as usize * depth).div_ceil(32) * 4;
+    let mask_at = header + colors * 4 + stride * height as usize;
+    let mask_stride = (width as usize).div_ceil(32) * 4;
+    let mask = data.get(mask_at..mask_at + mask_stride * height as usize)?;
+    let mut dib = data.get(..mask_at)?.to_vec();
+    dib[8..12].copy_from_slice(&height.to_le_bytes());
+    let (_, _, color) = decode(&dib, 0, 0)?;
+    let mut and = vec![0u8; width as usize * height as usize * 4];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let bit = mask[(height as usize - y - 1) * mask_stride + x / 8] & (0x80 >> (x % 8));
+            let value: u32 = if bit != 0 { 0xffffff } else { 0 };
+            let at = (y * width as usize + x) * 4;
+            and[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    Some((width, height, color, and))
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+    #[test]
+    fn monochrome_masks_and_bounds() {
+        let mut data = vec![0u8; 64];
+        data[0..4].copy_from_slice(&40u32.to_le_bytes());
+        data[4..8].copy_from_slice(&2u32.to_le_bytes());
+        data[8..12].copy_from_slice(&4u32.to_le_bytes());
+        data[12..14].copy_from_slice(&1u16.to_le_bytes());
+        data[14..16].copy_from_slice(&1u16.to_le_bytes());
+        data[44..47].fill(255);
+        data[48] = 0x40;
+        data[52] = 0x40;
+        data[56] = 0xc0; // Bottom AND row preserves/inverts the destination.
+        let (w, h, color, mask) = decode_icon(&data).unwrap();
+        assert_eq!((w, h), (2, 2));
+        let pixels = |v: &[u8]| {
+            v.chunks_exact(4)
+                .map(|p| u32::from_le_bytes(p.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pixels(&color), vec![0, 0xffffff, 0, 0xffffff]);
+        assert_eq!(pixels(&mask), vec![0, 0, 0xffffff, 0xffffff]);
+        assert!(decode_icon(&data[..63]).is_none());
+        data[8] = 3;
+        assert!(decode_icon(&data).is_none());
+    }
+}

@@ -9,6 +9,21 @@ unsafe extern "system" {
     fn SizeofResource(module: u32, info: u32) -> u32;
     fn CreateBitmap(width: i32, height: i32, planes: u32, depth: u32, bits: *const u8) -> u32;
     fn GetKeyState(key: u32) -> i32;
+    fn CreateCompatibleDC(dc: u32) -> u32;
+    fn SelectObject(dc: u32, object: u32) -> u32;
+    fn DeleteObject(object: u32) -> i32;
+    fn DeleteDC(dc: u32) -> i32;
+    fn BitBlt(
+        dst: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        src: u32,
+        sx: i32,
+        sy: i32,
+        rop: u32,
+    ) -> i32;
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -26,6 +41,7 @@ pub enum Resource {
         kind: u32,
         shared: bool,
         _bytes: Vec<u8>,
+        icon: Option<(i32, i32, Vec<u8>, Vec<u8>)>,
     },
 }
 pub(crate) unsafe fn bytes(module: u32, name: u32, kind: u32, wide: bool) -> Option<&'static [u8]> {
@@ -232,6 +248,26 @@ unsafe fn load_image(
     flags: u32,
     wide: bool,
 ) -> u32 {
+    let name = if name > 0xffff {
+        let text = unsafe { text::read(name, wide) };
+        if text.first() == Some(&(b'#' as u16)) && text.len() > 1 {
+            text[1..]
+                .iter()
+                .try_fold(0u32, |id, &c| {
+                    if !(48..=57).contains(&c) {
+                        return None;
+                    }
+                    id.checked_mul(10)?
+                        .checked_add(u32::from(c - 48))
+                        .filter(|&id| id <= 0xffff)
+                })
+                .unwrap_or(name)
+        } else {
+            name
+        }
+    } else {
+        name
+    };
     if kind > 2 || width < 0 || height < 0 || flags & 0x10 != 0 {
         return state::error(87);
     }
@@ -274,14 +310,45 @@ unsafe fn load_image(
         if word(group, 4).unwrap_or(0) == 0 {
             return state::error(13);
         }
-        let Some(id) = word(group, 18) else {
+        let count = word(group, 4).unwrap_or(0) as usize;
+        if group.get(6..6 + count * 14).is_none() {
             return state::error(13);
-        };
+        }
+        // Prefer the requested/default dimensions, then the richest palette.
+        let best = (0..if kind == 1 { count } else { 1 })
+            .min_by_key(|&i| {
+                let at = 6 + i * 14;
+                let w = if group[at] == 0 {
+                    256
+                } else {
+                    group[at] as i32
+                };
+                let h = if group[at + 1] == 0 {
+                    256
+                } else {
+                    group[at + 1] as i32
+                };
+                (
+                    (w - if width == 0 { 32 } else { width }).abs()
+                        + (h - if height == 0 { 32 } else { height }).abs(),
+                    u16::MAX - word(group, at + 6).unwrap_or(0),
+                )
+            })
+            .unwrap();
+        let id = word(group, 6 + best * 14 + 12).unwrap();
         let Some(data) = (unsafe { bytes(module, id as u32, if kind == 1 { 3 } else { 1 }, true) })
         else {
             return 0;
         };
         data.to_vec()
+    };
+    let icon = if kind == 1 && !data.is_empty() {
+        let Some(decoded) = crate::bitmap::decode_icon(&data) else {
+            return state::error(13);
+        };
+        Some(decoded)
+    } else {
+        None
     };
     add(Resource::Image {
         module,
@@ -289,7 +356,46 @@ unsafe fn load_image(
         kind,
         shared,
         _bytes: data,
+        icon,
     })
+}
+/// Classic masked icon drawing is shared by NE and PE callers.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn DrawIcon(dc: u32, x: i32, y: i32, handle: u32) -> i32 {
+    let icon = state::with(|s| {
+        s.resources.iter().find_map(|(h, r)| match r {
+            Resource::Image {
+                icon: Some(icon), ..
+            } if *h == handle => Some(icon.clone()),
+            _ => None,
+        })
+    });
+    let Some((width, height, color, mask)) = icon else {
+        return state::error(6) as i32;
+    };
+    unsafe {
+        let source = CreateCompatibleDC(dc);
+        if source == 0 {
+            return 0;
+        }
+        let mut result = 1;
+        for (pixels, rop) in [(&mask, 0x008800c6), (&color, 0x00660046)] {
+            let bitmap = CreateBitmap(width, height, 1, 32, pixels.as_ptr());
+            if bitmap == 0 {
+                result = 0;
+                break;
+            }
+            let old = SelectObject(source, bitmap);
+            result = BitBlt(dc, x, y, width, height, source, 0, 0, rop);
+            SelectObject(source, old);
+            DeleteObject(bitmap);
+            if result == 0 {
+                break;
+            }
+        }
+        DeleteDC(source);
+        result
+    }
 }
 #[unsafe(no_mangle)]
 pub extern "system" fn DestroyIcon(handle: u32) -> i32 {

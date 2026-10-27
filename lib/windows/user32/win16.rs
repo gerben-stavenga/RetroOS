@@ -536,6 +536,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 let r = rectangle(d(2))?;
                 FillRect(h(6), &[r.left, r.top, r.right, r.bottom], h(0)) as u32
             }
+            84 => crate::resource::DrawIcon(h(6), i(4), i(2), h(0)) as u32,
             85 => {
                 let r = rectangle(d(2))?;
                 let mut r32 = [r.left, r.top, r.right, r.bottom];
@@ -561,7 +562,20 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 as u32,
             88 => crate::dialog::EndDialog(h(2), i(0)) as u32,
             91 => encode(window::GetDlgItem(h(2), i(0))),
-            92 => crate::dialog::SetDlgItemTextA(h(6), w(4), string(d(0))?) as u32,
+            92 => {
+                let child = window::GetDlgItem(h(6), w(4) as i32);
+                let icon = state::with(|s| {
+                    s.windows
+                        .iter()
+                        .any(|v| v.hwnd == child && v.class == 0xc002 && v.style & 0x1f == 3)
+                });
+                if icon && d(0) <= 0xffff {
+                    crate::SendMessageA(child, 0x170, decode(d(0)), 0);
+                    1
+                } else {
+                    crate::dialog::SetDlgItemTextA(h(6), w(4), string(d(0))?) as u32
+                }
+            }
             93 => crate::dialog::GetDlgItemTextA(h(8), w(6), pointer(d(2), w(0) as usize)?, w(0))
                 as u32,
             94 => crate::dialog::SetDlgItemInt(
@@ -707,6 +721,8 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             159 => encode(menu::GetSubMenu(h(2), i(0))),
             160 => menu::DrawMenuBar(h(0)) as u32,
             175 => encode(crate::resource::LoadBitmapA(w(4), string(d(0))?)),
+            174 => encode(crate::resource::LoadIconA(w(4), string(d(0))?)),
+            457 => crate::resource::DestroyIcon(h(0)) as u32,
             179 => GetSystemMetrics(w(0)),
             236 => encode(input::GetCapture()),
             242 => {
