@@ -17,6 +17,7 @@ mod input;
 mod keyboard;
 mod menu;
 mod message;
+mod messagebox;
 mod paint;
 mod rect;
 mod resource;

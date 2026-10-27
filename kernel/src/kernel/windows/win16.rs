@@ -60,12 +60,23 @@ struct Resource {
     offset: u16,
 }
 
+struct LocalBlock {
+    start: u16,
+    data: u16,
+    handle: u16,
+    size: u16,
+    movable: bool,
+    locks: u8,
+}
+
 pub(super) struct State {
     image: Vec<u8>,
     gates: Vec<Gate>,
     instance: u16,
     auto_data: u16,
     local_next: u16,
+    local_start: u16,
+    local_blocks: Vec<LocalBlock>,
     local_end: u16,
     psp_selector: u16,
     env_selector: u16,
@@ -759,6 +770,8 @@ pub(super) fn exec<A: crate::Arch>(
         instance: data_selector,
         auto_data: data_selector,
         local_next,
+        local_start: local_next,
+        local_blocks: Vec::new(),
         local_end,
         psp_selector,
         env_selector,
@@ -1038,6 +1051,30 @@ fn finish<A: crate::Arch>(
     Ok(())
 }
 
+fn local_alloc<A: crate::Arch>(machine: &mut A, windows: &WindowsState, state: &mut State, size: usize, flags: u16) -> u32 {
+    let aligned = (size.max(1) + 3) & !3;
+    let movable = flags & 2 != 0;
+    let overhead = if movable { 4 } else { 0 };
+    let mut at = (usize::from(state.local_start).max(4) + 3) & !3;
+    let mut slot = 0;
+    for block in &state.local_blocks {
+        if at + overhead + aligned <= usize::from(block.start) { break; }
+        at = usize::from(block.data) + usize::from(block.size);
+        slot += 1;
+    }
+    if at + overhead + aligned > usize::from(state.local_end) { return 0; }
+    // Movable HLOCAL values identify a handle cell (low bits 10),
+    // whose word points to the four-byte-aligned data in DGROUP.
+    let data = (at + overhead) as u16;
+    let handle = (at + if movable { 2 } else { 0 }) as u16;
+    let Some(pointer) = far_linear(windows, (u32::from(state.auto_data) << 16) | u32::from(data)) else { return 0 };
+    if movable { machine.write::<u16>(pointer - 2, data); }
+    if flags & 0x40 != 0 { machine.zero(pointer, aligned); }
+    state.local_blocks.insert(slot, LocalBlock { start: at as u16, data, handle, size: aligned as u16, movable, locks: 0 });
+    state.local_next = state.local_next.max((at + overhead + aligned) as u16);
+    u32::from(handle)
+}
+
 fn dispatch<A: crate::Arch>(
     machine: &mut A,
     _kt: &mut thread::KernelThread<A>,
@@ -1088,21 +1125,66 @@ fn dispatch<A: crate::Arch>(
             }
         }
         (Module::Kernel, 5) => {
-            let size = stack_at(windows, regs, 4)
-                .map(|p| machine.read::<u16>(p) as usize).unwrap_or(0);
-            let aligned = (size.max(2) + 1) & !1;
-            let next = usize::from(state.local_next).saturating_add(aligned);
-            if next > usize::from(state.local_end) {
-                crate::compact_dbg_println!("[win16] LocalAlloc {} failed ({:04x}..{:04x})",
-                    size, state.local_next, state.local_end);
-                0
-            } else {
-                let handle = state.local_next;
-                state.local_next = next as u16;
-                u32::from(handle)
-            }
+            let size = usize::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
+            let flags = stack_u16(machine, windows, regs, 6).unwrap_or(0);
+            local_alloc(machine, windows, state, size, flags)
         }
-        (Module::Kernel, 7) => 0,
+        (Module::Kernel, 6) => {
+            let handle = stack_u16(machine, windows, regs, 8).unwrap_or(0);
+            let size = usize::from(stack_u16(machine, windows, regs, 6).unwrap_or(0));
+            let flags = stack_u16(machine, windows, regs, 4).unwrap_or(0);
+            let Some(index) = state.local_blocks.iter().position(|b| b.handle == handle) else { return 0 };
+            if flags & 0x80 != 0 { return u32::from(handle); }
+            let aligned = (size.max(1) + 3) & !3;
+            let block = &state.local_blocks[index];
+            let data = block.data;
+            let old_size = usize::from(block.size);
+            let movable = block.movable;
+            let limit = state.local_blocks.get(index + 1).map_or(state.local_end, |b| b.start);
+            let Some(pointer) = far_linear(windows, (u32::from(state.auto_data) << 16) | u32::from(data)) else { return 0 };
+            if usize::from(data) + aligned <= usize::from(limit) {
+                if flags & 0x40 != 0 && aligned > old_size { machine.zero(pointer + old_size, aligned - old_size); }
+                state.local_blocks[index].size = aligned as u16;
+                state.local_next = state.local_blocks.last().map_or(state.local_start, |b| b.data + b.size);
+                return u32::from(handle);
+            }
+            if block.locks != 0 || flags & 2 == 0 { return 0; }
+            let mut bytes = vec![0; old_size.min(size)];
+            for (i, byte) in bytes.iter_mut().enumerate() { *byte = machine.read::<u8>(pointer + i); }
+            let replacement = local_alloc(machine, windows, state, size, (flags & !2) | if movable { 2 } else { 0 });
+            if replacement == 0 { return 0; }
+            let new = state.local_blocks.iter().find(|b| u32::from(b.handle) == replacement).unwrap();
+            let dest = far_linear(windows, (u32::from(state.auto_data) << 16) | u32::from(new.data)).unwrap();
+            machine.copy_to(dest, &bytes);
+            state.local_blocks.retain(|b| b.handle != handle);
+            replacement
+        }
+        (Module::Kernel, 7) => {
+            let handle = stack_u16(machine, windows, regs, 4).unwrap_or(0);
+            if handle == 0 { return 0; }
+            let Some(index) = state.local_blocks.iter().position(|b| b.handle == handle) else { return u32::from(handle) };
+            if state.local_blocks[index].locks != 0 { return u32::from(handle); }
+            state.local_blocks.remove(index);
+            state.local_next = state.local_blocks.last().map_or(state.local_start, |b| b.data + b.size);
+            0
+        }
+        (Module::Kernel, 8) => {
+            let handle = stack_u16(machine, windows, regs, 4).unwrap_or(0);
+            let Some(block) = state.local_blocks.iter_mut().find(|b| b.handle == handle) else { return 0 };
+            if block.movable { block.locks = block.locks.saturating_add(1); }
+            (u32::from(state.auto_data) << 16) | u32::from(block.data)
+        }
+        (Module::Kernel, 9) => {
+            let handle = stack_u16(machine, windows, regs, 4).unwrap_or(0);
+            let Some(block) = state.local_blocks.iter_mut().find(|b| b.handle == handle) else { return 0 };
+            block.locks = block.locks.saturating_sub(1);
+            u32::from(block.locks != 0)
+        }
+        (Module::Kernel, 10) => {
+            let handle = stack_u16(machine, windows, regs, 4).unwrap_or(0);
+            state.local_blocks.iter().find(|b| b.handle == handle).map_or(0, |b| u32::from(b.size))
+        }
+        (Module::Kernel, 25) => machine.free_page_count().saturating_mul(4096).min(u32::MAX as usize) as u32,
         (Module::Kernel, 23 | 24 | 30 | 52) => 1,
         (Module::Kernel, 47) => u32::from(state.instance),
         (Module::Kernel, 49) => {
@@ -1185,16 +1267,6 @@ fn dispatch<A: crate::Arch>(
         (Module::Kernel, 129) => 1,
         (Module::Kernel, 131) => u32::from(state.env_selector) << 16,
         (Module::Kernel, 132) => 0x0025, // protected mode, 386, enhanced mode
-        (Module::User, 1) => {
-            let text = stack_u32(machine, windows, regs, 10).unwrap_or(0);
-            let caption = stack_u32(machine, windows, regs, 6).unwrap_or(0);
-            let text = far_string(machine, windows, text).unwrap_or_default();
-            let caption = far_string(machine, windows, caption).unwrap_or_default();
-            crate::compact_dbg_println!("[win16] MessageBox '{}': '{}'",
-                core::str::from_utf8(&caption).unwrap_or("?"),
-                core::str::from_utf8(&text).unwrap_or("?"));
-            1 // IDOK
-        }
         (Module::User, 173 | 174 | 177) => 1,
         (Module::User, 171) => 1,
         (Module::User, 178) => 0,

@@ -10,7 +10,7 @@ global %1
 
 
 
-gate MessageBox
+bridge MessageBox, 1, 12
 bridge InitApp, 5, 2
 bridge PostQuitMessage, 6, 2
 bridge SetTimer, 10, 10
@@ -63,7 +63,7 @@ bridge IntersectRect, 79, 12
 bridge FillRect, 81, 8
 gate FrameRect
 gate DrawIcon
-gate DrawText
+bridge DrawText, 85, 14
 bridge DialogBox, 87, 12
 bridge EndDialog, 88, 4
 bridge GetDlgItem, 91, 4

@@ -15,7 +15,6 @@ gate GetSysColorBrush
 global _GetSystemMetrics@4
 _GetSystemMetrics@4:
 gate GetSystemMetrics
-gate MessageBoxW
 gate RetroWndProcReturn
 
 ; Private kernel operations return normally to this guest DLL. All suspended

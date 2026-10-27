@@ -396,6 +396,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
         let i = |at| word(a, at) as i16 as i32;
         let h = |at| decode(word(a, at));
         Some(match o {
+            1 => crate::messagebox::MessageBoxA(h(10), string(d(6))?, string(d(2))?, w(0)) as u32,
             5 => 1,
             6 => {
                 message::PostQuitMessage(w(0));
@@ -534,6 +535,27 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             81 => {
                 let r = rectangle(d(2))?;
                 FillRect(h(6), &[r.left, r.top, r.right, r.bottom], h(0)) as u32
+            }
+            85 => {
+                let r = rectangle(d(2))?;
+                let mut r32 = [r.left, r.top, r.right, r.bottom];
+                let count = i(6);
+                let text = if count < 0 {
+                    string(d(8))?
+                } else {
+                    pointer(d(8), count as usize)?
+                };
+                let result = crate::drawing::DrawTextA(h(12), text, count, &mut r32, w(0));
+                write_rect(
+                    d(2),
+                    &rect::Rect {
+                        left: r32[0],
+                        top: r32[1],
+                        right: r32[2],
+                        bottom: r32[3],
+                    },
+                )?;
+                result as u32
             }
             87 => crate::dialog::DialogBoxParamA(w(10), string(d(6))?, h(4), procedure(d(0)), 0)
                 as u32,

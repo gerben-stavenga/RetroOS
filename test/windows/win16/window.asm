@@ -5,12 +5,74 @@ extern SendMessage, UpdateWindow, BeginPaint, EndPaint, GetClientRect
 extern PostMessage, GetMessage, DispatchMessage, FillRect, CreateSolidBrush, GetPixel, GetDC, ReleaseDC
 extern CreateDC, CreateBitmap, SelectObject, DeleteDC, DeleteObject, SetPixel
 extern GetWindowWord, SetWindowWord, GetWindowLong, SetWindowLong, CallWindowProc
+extern LocalAlloc, LocalLock, LocalUnlock, LocalFree, LocalReAlloc
+extern MessageBox, SetTimer, KillTimer, GetFocus, GetParent, IsWindowEnabled
 extern SetScrollRange, SetScrollPos
 extern ShowWindow, GetWindowRect
 extern DOSExit, CreateDialog, SetDlgItemInt, GetDlgItemInt
 global _start
 _start:
     mov [initial_sp], sp
+    push word 0x42
+    push word 32
+    call far LocalAlloc
+    test ax, ax
+    jz fail
+    mov [local_block], ax
+    push ax
+    call far LocalLock
+    mov bx, [local_block]
+    cmp ax, [bx]
+    jne fail
+    test ax, ax
+    jz fail
+    mov bx, ds
+    cmp dx, bx
+    jne fail
+    mov bx, ax
+    cmp word [bx], 0
+    jne fail
+    cmp word [bx+30], 0
+    jne fail
+    mov word [bx], 0xbeef
+    push word [local_block]
+    push word 64
+    push word 0x42
+    call far LocalReAlloc
+    cmp ax, [local_block]
+    jne fail
+    mov bx, ax
+    mov bx, [bx]
+    cmp word [bx], 0xbeef
+    jne fail
+    cmp word [bx+62], 0
+    jne fail
+    push word [local_block]
+    call far LocalUnlock
+    test ax, ax
+    jnz fail
+    push word [local_block]
+    call far LocalFree
+    test ax, ax
+    jnz fail
+    push word [local_block]
+    call far LocalLock
+    or ax, dx
+    jnz fail
+    push word 0x42
+    push word 32
+    call far LocalAlloc
+    cmp ax, [local_block]
+    jne fail
+    push ax
+    call far LocalLock
+    mov bx, ax
+    cmp word [bx], 0
+    jne fail
+    push word [local_block]
+    call far LocalUnlock
+    push word [local_block]
+    call far LocalFree
     ; Cross the old synthetic DC value (0x200); real contexts must keep working.
     mov word [remaining], 260
 .gdi:
@@ -310,6 +372,28 @@ _start:
     jne fail
     push word [scroll]
     call far DestroyWindow
+    ; The modal box must display actual buttons and return the selected IDNO,
+    ; not the old unconditional IDOK kernel result.
+    push word 0
+    push word 0
+    push word 20
+    push cs
+    push word messagebox_timer
+    call far SetTimer
+    mov [timer_id], ax
+    push word [hwnd]
+    push ds
+    push word question
+    push ds
+    push word question_title
+    push word 0x104
+    call far MessageBox
+    cmp ax, 7
+    jne fail
+    push word [hwnd]
+    call far IsWindowEnabled
+    cmp ax, 1
+    jne fail
     push ds
     push ds
     push word dlg_template
@@ -515,6 +599,34 @@ dlgproc:
     mov dx, 0x7bad ; DLGPROC returns BOOL in AX only
     pop bp
     retf 10
+messagebox_timer:
+    push bp
+    mov bp, sp
+    push word 0
+    push word [timer_id]
+    call far KillTimer
+    push word [hwnd]
+    call far IsWindowEnabled
+    test ax, ax
+    jnz fail
+    call far GetFocus
+    mov [message_button], ax
+    push ax
+    push word -12
+    call far GetWindowWord
+    cmp ax, 7
+    jne fail
+    push word [message_button]
+    call far GetParent
+    push ax
+    push word 0x111
+    push word 7
+    push dword 0
+    call far SendMessage
+    xor ax, ax
+    xor dx, dx
+    pop bp
+    retf 10
 button_subclass:
     push bp
     mov bp, sp
@@ -542,6 +654,11 @@ dlg_template:
     db 0x81,0,0
 position: dw 0,0,0,0,0,0,3
 size_kind: dw 0xffff
+local_block: dw 0
+timer_id: dw 0
+message_button: dw 0
+question: db "Choose No to continue the test.",0
+question_title: db "Shared modal message",0
 scroll: dw 0
 scroll_events: dw 0
 scroll_class: db "ScrollBar",0

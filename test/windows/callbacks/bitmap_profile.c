@@ -3,6 +3,16 @@
 #include <string.h>
 static unsigned errors;
 #define CHECK(x) do {if(!(x)){++errors;printf("bitmap/profile check failed line %u\n",__LINE__);}}while(0)
+static void CALLBACK close_message(HWND window, UINT msg, UINT_PTR id, DWORD ticks)
+{
+    HWND button=GetFocus();
+    HWND dialog=GetParent(button);
+    KillTimer(0,id);
+    CHECK(GetDlgCtrlID(button)==IDCANCEL);
+    CHECK(GetDlgItem(dialog,IDOK)!=0);
+    CHECK(GetDlgItem(dialog,IDCANCEL)!=0);
+    SendMessageW(dialog,WM_COMMAND,IDCANCEL,0);
+}
 int main(void)
 {
     HDC dc=CreateCompatibleDC(0);
@@ -72,6 +82,8 @@ int main(void)
         CHECK(GetPixel(cd,0,9)==RGB(0,0,0));
         ReleaseDC(first,cd);DestroyWindow(parent);
     }
+    CHECK(SetTimer(0,0,20,close_message)!=0);
+    CHECK(MessageBoxW(0,L"Choose Cancel.",L"Shared modal message",MB_OKCANCEL|MB_DEFBUTTON2)==IDCANCEL);
     file=CreateFileA("C:\\PROFILE.INI",GENERIC_WRITE,0,0,CREATE_ALWAYS,0,0);
     CHECK(file!=INVALID_HANDLE_VALUE);
     CHECK(WriteFile(file,ini,sizeof(ini)-1,&written,0));CHECK(CloseHandle(file));
