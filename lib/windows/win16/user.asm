@@ -146,3 +146,5 @@ gate DrawFocusRect
 gate lstrcmpi
 gate AnsiNext
 gate WNetGetConnection
+
+bridge wvsprintf, 421, 12

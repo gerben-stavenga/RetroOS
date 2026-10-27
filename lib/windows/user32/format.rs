@@ -8,7 +8,12 @@ unsafe fn next(args: &mut *const u32) -> u32 {
     *args = unsafe { args.add(1) };
     value
 }
-unsafe fn format(out: u32, fmt: u32, mut args: *const u32, wide: bool) -> i32 {
+pub(crate) unsafe fn format_with(
+    out: u32,
+    fmt: u32,
+    wide: bool,
+    mut argument: impl FnMut(u16, u16, bool) -> u64,
+) -> i32 {
     let format = unsafe { text::read(fmt, wide) };
     let mut result: Vec<u16> = Vec::new();
     let mut i = 0;
@@ -66,7 +71,7 @@ unsafe fn format(out: u32, fmt: u32, mut args: *const u32, wide: bool) -> i32 {
         let mut value = Vec::new();
         match kind as u8 {
             b's' | b'S' | b'c' | b'C' => {
-                let pointer = unsafe { next(&mut args) };
+                let pointer = argument(kind, length, false) as u32;
                 let input_wide = match length {
                     104 => false,
                     108 | 119 => true,
@@ -90,12 +95,8 @@ unsafe fn format(out: u32, fmt: u32, mut args: *const u32, wide: bool) -> i32 {
                 zero = false;
             }
             b'd' | b'i' | b'u' | b'x' | b'X' | b'p' => {
-                let low = unsafe { next(&mut args) };
-                let mut number = if int64 {
-                    u64::from(low) | (u64::from(unsafe { next(&mut args) }) << 32)
-                } else {
-                    u64::from(low)
-                };
+                let mut number = argument(kind, length, int64);
+                let low = number as u32;
                 let signed = kind == 100 || kind == 105;
                 if signed {
                     let n = if int64 {
@@ -164,6 +165,18 @@ unsafe fn format(out: u32, fmt: u32, mut args: *const u32, wide: bool) -> i32 {
         }
     }
     unsafe { text::write(out, 1024, &result, wide) as i32 }
+}
+unsafe fn format(out: u32, fmt: u32, mut args: *const u32, wide: bool) -> i32 {
+    unsafe {
+        format_with(out, fmt, wide, |_, _, int64| {
+            let low = u64::from(next(&mut args));
+            if int64 {
+                low | (u64::from(next(&mut args)) << 32)
+            } else {
+                low
+            }
+        })
+    }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn wvsprintfA(out: u32, fmt: u32, args: *const u32) -> i32 {

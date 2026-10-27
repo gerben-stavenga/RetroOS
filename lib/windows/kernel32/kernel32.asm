@@ -25,6 +25,8 @@ gate GetEnvironmentVariableA
 gate GetEnvironmentVariableW
 gate GetCurrentThreadId
 gate GetFileType
+global _GetLastError@0
+_GetLastError@0:
 gate GetLastError
 global _GetModuleFileNameA@12
 _GetModuleFileNameA@12:
@@ -51,6 +53,7 @@ gate ReadFile
 gate SetConsoleCtrlHandler
 gate SetConsoleMode
 gate SetEnvironmentVariableA
+gate SetEndOfFile
 gate SetFilePointer
 gate SetStdHandle
 gate SetUnhandledExceptionFilter
@@ -100,3 +103,7 @@ gate GetProcessHeap
 global _CreateFileW@28
 _CreateFileW@28:
 gate CreateFileW
+
+global _CreateProcessA@40
+_CreateProcessA@40:
+gate CreateProcessA

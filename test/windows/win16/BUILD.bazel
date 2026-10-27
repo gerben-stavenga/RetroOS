@@ -6,6 +6,9 @@ windows16_binary(name="bridge", obj=":bridge_obj", imports={
 }, visibility=["//visibility:public"])
 nasm_library(name="window_obj", srcs=["window.asm"], copts=["-fobj"])
 windows16_binary(name="window", obj=":window_obj", imports={
+    "wvsprintf": "USER.421", "WinExec": "KERNEL.166",
+    "_lopen": "KERNEL.85", "_lclose": "KERNEL.81", "_lread": "KERNEL.82",
+    "_lcreat": "KERNEL.83", "_llseek": "KERNEL.84", "_lwrite": "KERNEL.86",
     "GetCursorPos": "USER.17", "SetCursorPos": "USER.70",
     "ClientToScreen": "USER.28", "ScreenToClient": "USER.29",
     "Exit": "KERNEL.1", "Debug": "KERNEL.115",

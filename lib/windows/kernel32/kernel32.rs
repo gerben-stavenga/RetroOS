@@ -126,3 +126,56 @@ pub unsafe extern "C" fn strlen(s: *const u8) -> usize {
     }
     n
 }
+
+unsafe extern "system" {
+    fn CreateProcessA(
+        app: u32,
+        command: u32,
+        process_security: u32,
+        thread_security: u32,
+        inherit: u32,
+        flags: u32,
+        environment: u32,
+        directory: u32,
+        startup: *const u32,
+        info: *mut u32,
+    ) -> i32;
+    fn CloseHandle(handle: u32) -> i32;
+    fn GetLastError() -> u32;
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn WinExec(command: u32, show: u32) -> u32 {
+    let mut startup = [0u32; 17];
+    startup[0] = 68;
+    startup[11] = 1; // STARTF_USESHOWWINDOW
+    startup[12] = show & 0xffff;
+    let mut info = [0u32; 4];
+    if unsafe {
+        CreateProcessA(
+            0,
+            command,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            startup.as_ptr(),
+            info.as_mut_ptr(),
+        )
+    } == 0
+    {
+        return match unsafe { GetLastError() } {
+            2 => 2,
+            3 => 3,
+            8 | 14 => 8,
+            193 => 11,
+            _ => 0,
+        };
+    }
+    unsafe {
+        CloseHandle(info[0]);
+        CloseHandle(info[1]);
+    }
+    33
+}

@@ -19,6 +19,7 @@ windows_dll(
     obj = ":kernel32_obj",
     libraries = [":kernel32_rust"],
     export_aliases = {
+        "WinExec": "_WinExec@8",
         "GetPrivateProfileStringW": "_GetPrivateProfileStringW@24",
         "GetPrivateProfileIntW": "_GetPrivateProfileIntW@16",
         "lstrlenA": "_lstrlenA@4",
@@ -44,6 +45,7 @@ windows_dll(
     out = "KERNEL32.DLL",
     module_name = "KERNEL32",
     exports = [
+        "WinExec", "CreateProcessA",
         "GetPrivateProfileStringW", "GetPrivateProfileIntW", "HeapAlloc", "HeapFree", "GetProcessHeap", "CreateFileW",
         "lstrlenA",
         "lstrcpyA",
@@ -76,7 +78,7 @@ windows_dll(
         "GetVersion", "LoadLibraryA",
         "MultiByteToWideChar", "ReadConsoleInputA", "ReadFile",
         "SetConsoleCtrlHandler", "SetConsoleMode", "SetEnvironmentVariableA",
-        "SetFilePointer", "SetStdHandle", "SetUnhandledExceptionFilter",
+        "SetEndOfFile", "SetFilePointer", "SetStdHandle", "SetUnhandledExceptionFilter",
         "UnhandledExceptionFilter", "VirtualAlloc", "VirtualFree",
         "VirtualQuery", "WideCharToMultiByte", "WriteConsoleA", "WriteFile",
         "lstrcpyW", "lstrlenW",

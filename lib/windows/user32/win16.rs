@@ -3,6 +3,22 @@
 use crate::{Message, class, input, keyboard, menu, message, paint, rect, state, window};
 
 unsafe extern "system" {
+    fn WinExec(command: u32, show: u32) -> u32;
+    fn CreateFileA(
+        path: u32,
+        access: u32,
+        share: u32,
+        security: u32,
+        disposition: u32,
+        flags: u32,
+        template: u32,
+    ) -> u32;
+    fn CloseHandle(handle: u32) -> i32;
+    fn ReadFile(handle: u32, buffer: u32, count: u32, done: *mut u32, overlapped: u32) -> i32;
+    fn WriteFile(handle: u32, buffer: u32, count: u32, done: *mut u32, overlapped: u32) -> i32;
+    fn SetFilePointer(handle: u32, offset: i32, high: u32, origin: u32) -> u32;
+    fn SetEndOfFile(handle: u32) -> i32;
+
     fn Retro16Call(proc: u32, args: *const u8, bytes: u32, reserve: u32) -> u32;
     fn Rectangle(dc: u32, l: i32, t: i32, r: i32, b: i32) -> i32;
     fn GetSystemMetrics(index: u32) -> u32;
@@ -399,6 +415,135 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
         let i = |at| word(a, at) as i16 as i32;
         let h = |at| decode(word(a, at));
         Some(match o {
+            421 => {
+                let out = pointer(d(8), 1)?;
+                let fmt = string(d(4))?;
+                let mut args = d(0);
+                let mut valid = true;
+                let mut output = [0u8; 1024];
+                let result = crate::format::format_with(
+                    output.as_mut_ptr() as u32,
+                    fmt,
+                    false,
+                    |kind, length, _| {
+                        let far = matches!(kind as u8, b's' | b'S' | b'p');
+                        let bytes = if far || length == b'l' as u16 { 4 } else { 2 };
+                        let Some(p) = pointer(args, bytes) else {
+                            valid = false;
+                            return 0;
+                        };
+                        let raw = if bytes == 4 { long(p, 0) } else { word(p, 0) };
+                        args = args.wrapping_add(bytes as u32);
+                        if matches!(kind as u8, b's' | b'S') {
+                            if raw == 0 {
+                                0
+                            } else {
+                                match string(raw) {
+                                    Some(p) => u64::from(p),
+                                    None => {
+                                        valid = false;
+                                        0
+                                    }
+                                }
+                            }
+                        } else if bytes == 2 && matches!(kind as u8, b'd' | b'i') {
+                            u64::from(raw as i16 as i32 as u32)
+                        } else {
+                            u64::from(raw)
+                        }
+                    },
+                );
+                if !valid || pointer(d(8), result.max(0) as usize + 1).is_none() {
+                    0
+                } else {
+                    core::ptr::copy_nonoverlapping(
+                        output.as_ptr(),
+                        out as *mut u8,
+                        result as usize + 1,
+                    );
+                    result as u32
+                }
+            }
+
+            2166 => WinExec(string(d(2))?, w(0)),
+            // KERNEL's legacy file calls use DOS-sized handles, not USER/GDI aliases.
+            2081 => {
+                if CloseHandle(w(0)) != 0 {
+                    0
+                } else {
+                    u32::MAX
+                }
+            }
+            2083 | 2085 => {
+                let mode = w(0);
+                let access = if o == 2083 {
+                    0xc0000000
+                } else {
+                    match mode & 3 {
+                        0 => 0x80000000,
+                        1 => 0x40000000,
+                        2 => 0xc0000000,
+                        _ => return Some(u32::MAX),
+                    }
+                };
+                let share = if o == 2083 {
+                    3
+                } else {
+                    match mode & 0x70 {
+                        0 | 0x40 => 3,
+                        0x10 => 0,
+                        0x20 => 1,
+                        0x30 => 2,
+                        _ => return Some(u32::MAX),
+                    }
+                };
+                let Some(path) = string(d(2)) else {
+                    return Some(u32::MAX);
+                };
+                let file = CreateFileA(
+                    path,
+                    access,
+                    share,
+                    0,
+                    if o == 2083 { 2 } else { 3 },
+                    if o == 2083 { mode } else { 0 },
+                    0,
+                );
+                if file != u32::MAX && file >= 0x8000 {
+                    CloseHandle(file);
+                    u32::MAX
+                } else {
+                    file
+                }
+            }
+            2084 => SetFilePointer(w(6), d(2) as i32, 0, w(0)),
+            2082 | 2086 => {
+                let count = w(0);
+                let handle = w(6);
+                if o == 2086 && count == 0 {
+                    if SetEndOfFile(handle) != 0 {
+                        0
+                    } else {
+                        u32::MAX
+                    }
+                } else {
+                    let Some(buffer) = (if count == 0 {
+                        Some(0)
+                    } else {
+                        pointer(d(2), count as usize)
+                    }) else {
+                        return Some(u32::MAX);
+                    };
+                    let mut done = 0;
+                    let ok = if o == 2082 {
+                        ReadFile(handle, buffer, count, &mut done, 0)
+                    } else {
+                        WriteFile(handle, buffer, count, &mut done, 0)
+                    };
+                    if ok != 0 { done } else { u32::MAX }
+                }
+            }
+
             1 => crate::messagebox::MessageBoxA(h(10), string(d(6))?, string(d(2))?, w(0)) as u32,
             5 => 1,
             6 => {

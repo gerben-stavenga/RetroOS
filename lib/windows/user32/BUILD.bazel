@@ -20,6 +20,14 @@ windows_dll(
     obj = ":user32_obj",
     libraries = [":user32_rust"],
     imports = {
+        "_WinExec@8": "KERNEL32.WinExec",
+        "_CreateFileA@28": "KERNEL32.CreateFileA",
+        "_CloseHandle@4": "KERNEL32.CloseHandle",
+        "_ReadFile@20": "KERNEL32.ReadFile",
+        "_WriteFile@20": "KERNEL32.WriteFile",
+        "_SetFilePointer@16": "KERNEL32.SetFilePointer",
+        "_SetEndOfFile@4": "KERNEL32.SetEndOfFile",
+
         "_Rectangle@20": "GDI32.Rectangle",
         "_CreatePen@12": "GDI32.CreatePen",
         "_TextOutA@20": "GDI32.TextOutA",

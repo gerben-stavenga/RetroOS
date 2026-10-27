@@ -1,5 +1,6 @@
 bits 16
 segment _TEXT public class=CODE use16
+%include "lib/windows/win16/bridge.inc"
 
 %macro gate 1
 global %1
@@ -37,7 +38,12 @@ gate LoadResource
 gate LockResource
 gate FreeResource
 gate OpenFile
-gate _lclose
+bridge _lclose, 2081, 2
+bridge _lread, 2082, 8
+bridge _lcreat, 2083, 6
+bridge _llseek, 2084, 8
+bridge _lopen, 2085, 6
+bridge _lwrite, 2086, 8
 gate lstrcpy
 gate lstrcat
 gate lstrlen
@@ -58,3 +64,5 @@ gate GetSystemDirectory
 gate GetDriveType
 gate FatalAppExit
 gate IsDBCSLeadByte
+
+bridge WinExec, 2166, 6

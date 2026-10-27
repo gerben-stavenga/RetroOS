@@ -11,9 +11,114 @@ extern SetScrollRange, SetScrollPos
 extern ShowWindow, GetWindowRect, GetTickCount
 extern DOSExit, CreateDialog, SetDlgItemInt, GetDlgItemInt
 extern GetCursorPos, SetCursorPos, ClientToScreen, ScreenToClient
+extern wvsprintf, WinExec
+extern _lopen, _lclose, _lread, _lcreat, _llseek, _lwrite
 global _start
 _start:
     mov [initial_sp], sp
+    push ds
+    push word file_missing
+    push word 1
+    call far WinExec
+    cmp ax,2
+    jne fail
+    mov word [format_args+4],ds
+    push ds
+    push word format_buffer
+    push ds
+    push word format_text
+    push ds
+    push word format_args
+    call far wvsprintf
+    cmp ax,16
+    jne fail
+    cmp word [format_buffer],0x322d
+    jne fail
+    cmp word [format_buffer+3],0x6568
+    jne fail
+    cmp word [format_buffer+9],0x3030
+    jne fail
+    cmp word [format_buffer+11],0x4132
+    jne fail
+    cmp word [format_buffer+14],0x3037
+    jne fail
+
+    push ds
+    push word file_missing
+    push word 0
+    call far _lopen
+    cmp ax,0xffff
+    jne file_fail_1
+    push ds
+    push word file_path
+    push word 0
+    call far _lcreat
+    cmp ax,0xffff
+    je file_fail_2
+    mov [file_handle],ax
+    push ax
+    push ds
+    push word file_payload
+    push word 5
+    call far _lwrite
+    cmp ax,5
+    jne file_fail_3
+    push word [file_handle]
+    call far _lclose
+    test ax,ax
+    jnz file_fail_4
+    push ds
+    push word file_path
+    push word 2
+    call far _lopen
+    cmp ax,0xffff
+    je file_fail_5
+    mov [file_handle],ax
+    push ax
+    push dword -2
+    push word 2
+    call far _llseek
+    cmp ax,3
+    jne file_fail_6
+    test dx,dx
+    jnz file_fail_7
+    push word [file_handle]
+    push ds
+    push word file_buffer
+    push word 5
+    call far _lread
+    cmp ax,2
+    jne file_fail_8
+    cmp word [file_buffer],0x6f6c
+    jne file_fail_9
+    push word [file_handle]
+    push dword 2
+    push word 0
+    call far _llseek
+    cmp ax,2
+    jne file_fail_10
+    push word [file_handle]
+    push dword 0
+    push word 0
+    call far _lwrite
+    test ax,ax
+    jnz file_fail_11
+    push word [file_handle]
+    push dword 0
+    push word 2
+    call far _llseek
+    cmp ax,2
+    jne file_fail_12
+    push word [file_handle]
+    call far _lclose
+    test ax,ax
+    jnz file_fail_13
+    push word [file_handle]
+    call far _lclose
+    cmp ax,0xffff
+    jne file_fail_14
+    cmp sp,[initial_sp]
+    jne file_fail_15
     push word 123
     push word 234
     call far SetCursorPos
@@ -538,6 +643,81 @@ _start:
     call far Debug
     mov ax, 0x4c00
     call far DOSExit
+file_fail_1:
+    push ds
+    push word file_error_1
+    call far Debug
+    jmp fail
+file_fail_2:
+    push ds
+    push word file_error_2
+    call far Debug
+    jmp fail
+file_fail_3:
+    push ds
+    push word file_error_3
+    call far Debug
+    jmp fail
+file_fail_4:
+    push ds
+    push word file_error_4
+    call far Debug
+    jmp fail
+file_fail_5:
+    push ds
+    push word file_error_5
+    call far Debug
+    jmp fail
+file_fail_6:
+    push ds
+    push word file_error_6
+    call far Debug
+    jmp fail
+file_fail_7:
+    push ds
+    push word file_error_7
+    call far Debug
+    jmp fail
+file_fail_8:
+    push ds
+    push word file_error_8
+    call far Debug
+    jmp fail
+file_fail_9:
+    push ds
+    push word file_error_9
+    call far Debug
+    jmp fail
+file_fail_10:
+    push ds
+    push word file_error_10
+    call far Debug
+    jmp fail
+file_fail_11:
+    push ds
+    push word file_error_11
+    call far Debug
+    jmp fail
+file_fail_12:
+    push ds
+    push word file_error_12
+    call far Debug
+    jmp fail
+file_fail_13:
+    push ds
+    push word file_error_13
+    call far Debug
+    jmp fail
+file_fail_14:
+    push ds
+    push word file_error_14
+    call far Debug
+    jmp fail
+file_fail_15:
+    push ds
+    push word file_error_15
+    call far Debug
+    jmp fail
 fail:
     push ds
     push word failed
@@ -805,6 +985,31 @@ list_buffer: times 8 db 0
 list_hwnd: dw 0
 clock_sample: dw 0
 clock_start: dw 0
+file_path: db "C:\FILETEST.DAT",0
+file_missing: db "C:\ABSENT.DAT",0
+file_payload: db "hello",0
+file_buffer: times 8 db 0
+file_handle: dw 0
+format_text: db "%d %s %04X %ld",0
+format_args: dw -2,file_payload,0,0x2a
+    dd 70
+format_buffer: times 64 db 0
+file_error_1: db "file step 1",0
+file_error_2: db "file step 2",0
+file_error_3: db "file step 3",0
+file_error_4: db "file step 4",0
+file_error_5: db "file step 5",0
+file_error_6: db "file step 6",0
+file_error_7: db "file step 7",0
+file_error_8: db "file step 8",0
+file_error_9: db "file step 9",0
+file_error_10: db "file step 10",0
+file_error_11: db "file step 11",0
+file_error_12: db "file step 12",0
+file_error_13: db "file step 13",0
+file_error_14: db "file step 14",0
+file_error_15: db "file step 15",0
+
 cursor_point: dw 0,0
 
 segment STACK stack class=STACK use16

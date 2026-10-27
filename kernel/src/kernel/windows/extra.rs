@@ -884,6 +884,19 @@ pub(super) fn call<A: crate::Arch>(
             .find(|block| block.addr == addr && block.used)
             .map_or(0xffff_ffff, |block| block.size);
     }
+    if name.eq_ignore_ascii_case(b"SetEndOfFile") {
+        let h = arg(machine, regs, 0) as usize;
+        let Some(thread::FdKind::Vfs(vh)) = kt.fds.get(h).copied() else {
+            state.last_error = ERROR_INVALID_HANDLE;
+            return 0;
+        };
+        let pos = crate::kernel::vfs::seek_by_handle(vh, 0, 1);
+        if pos < 0 || crate::kernel::vfs::resize_by_handle(vh, pos as u32) < 0 {
+            state.last_error = 5; // ERROR_ACCESS_DENIED
+            return 0;
+        }
+        return 1;
+    }
     if name.eq_ignore_ascii_case(b"HeapDestroy")
         || name.eq_ignore_ascii_case(b"HeapValidate")
         || name.eq_ignore_ascii_case(b"InitializeCriticalSection")
@@ -892,7 +905,6 @@ pub(super) fn call<A: crate::Arch>(
         || name.eq_ignore_ascii_case(b"DeleteCriticalSection")
         || name.eq_ignore_ascii_case(b"FreeLibrary")
         || name.eq_ignore_ascii_case(b"ReleaseMutex")
-        || name.eq_ignore_ascii_case(b"SetEndOfFile")
         || name.eq_ignore_ascii_case(b"LockFile")
         || name.eq_ignore_ascii_case(b"UnlockFile")
         || name.eq_ignore_ascii_case(b"SetFileTime")
