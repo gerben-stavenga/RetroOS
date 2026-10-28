@@ -163,7 +163,11 @@ The runtime bundle and DN have writable RAM views, including shipped files;
 changes disappear on reboot. Persistent settings can use explicit writable
 mounts at the appropriate application directory.
 
-`RETROOS.INI` contains system, locale, sound, environment and launch sections.
+`RETROOS.INI` contains system, locale, display, sound, environment and launch sections.
+Set `[display]` `scaling=fill_screen` to stretch DOS output to the whole framebuffer
+on each boot. Other modes are `original_aspect` (default), `sharp_pixels`, and
+`square_pixels`. The OSD display setting still changes the mode for the current
+session; it does not rewrite the INI file.
 `[system] start=C:\DN\DN.COM` selects the startup program; `[locale]
 language=it-IT` selects shared regional settings. `keyboard=us` and
 `codepage=850` override the locale defaults. Regional policy is shared by DOS,

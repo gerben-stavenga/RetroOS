@@ -60,6 +60,7 @@ impl core::fmt::Debug for SmbMount {
 #[derive(Clone, Default, Debug)]
 pub struct Config {
     pub home: Option<String>,
+    pub dos_scaling: Option<crate::kernel::display::DosScaling>,
     pub wifi: Option<crate::kernel::wifi::config::Profile>,
     pub smb: Vec<SmbMount>,
     pub bundle: Option<Bundle>,
@@ -213,6 +214,16 @@ impl Config {
                     "subdir" => mount.subdir = value.into(),
                     "domain" => mount.domain = value.into(), _ => return Err("unknown SMB key"),
                 }
+            } else if section == "display" {
+                if key != "scaling" { return Err("unknown display setting"); }
+                use crate::kernel::display::DosScaling;
+                config.dos_scaling = Some(match value {
+                    "original_aspect" => DosScaling::OriginalAspect,
+                    "fill_screen" => DosScaling::FillScreen,
+                    "sharp_pixels" => DosScaling::SharpPixels,
+                    "square_pixels" => DosScaling::SquarePixels,
+                    _ => return Err("invalid display scaling mode"),
+                });
             } else if section == "bundle" {
                 let bundle = config.bundle.as_mut().ok_or("missing bundle section")?;
                 match key {
@@ -368,7 +379,7 @@ impl Config {
     pub fn parse_boot(bytes: &[u8]) -> Result<Self, &'static str> {
         let config = Self::parse(bytes)?;
         if config.bundle.is_none() { return Err("BOOT.INI requires [bundle]"); }
-        if config.environment.iter().chain(config.linux_environment.iter()).any(|b| *b != 0) || !config.launch.is_empty() || !config.smb.is_empty() || config.wifi.is_some() {
+        if config.dos_scaling.is_some() || config.environment.iter().chain(config.linux_environment.iter()).any(|b| *b != 0) || !config.launch.is_empty() || !config.smb.is_empty() || config.wifi.is_some() {
             return Err("user settings belong in RETROOS.INI");
         }
         Ok(config)
