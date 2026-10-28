@@ -53,7 +53,7 @@ impl Route {
 }
 
 pub(super) struct Inventory {
-    pub keyboards: [Option<(u32, PortDevice, EpInfo)>; 2],
+    pub keyboards: [Option<(u32, PortDevice, EpInfo)>; DEVICE_LANES],
     pub mouse: Option<(u32, PortDevice, EpInfo)>,
     pub devices: [Option<(u32, PortDevice)>; DEVICE_LANES],
     pub used: usize,
@@ -61,7 +61,7 @@ pub(super) struct Inventory {
 impl Inventory {
     pub fn new() -> Self {
         Self {
-            keyboards: [None; 2],
+            keyboards: [None; DEVICE_LANES],
             mouse: None,
             devices: [None; DEVICE_LANES],
             used: 0,

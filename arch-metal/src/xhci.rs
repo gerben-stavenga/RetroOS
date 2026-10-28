@@ -1,6 +1,6 @@
 //! Compact xHCI USB host-controller driver for USB-HID keyboard and mouse input.
-//! Each controller retains up to eight devices (including USB 1/2 hubs) and three
-//! interrupt-IN endpoints: two keyboards and a mouse. Reports feed the same
+//! Each controller retains up to eight devices (including USB 1/2 hubs),
+//! a keyboard endpoint for every retained device, and a mouse. Reports feed the same
 //! `irq::QUEUE` as i8042 input, so nothing above the arch boundary depends on
 //! the physical input bus.
 
@@ -77,6 +77,12 @@ use dma::*;
 use hub::Route;
 const RING_TRBS: usize = 256;
 const DEVICE_LANES: usize = 8;
+const KEYBOARD_PIPES: usize = DEVICE_LANES;
+const MOUSE_PIPE: usize = KEYBOARD_PIPES;
+const HID_PIPES: usize = KEYBOARD_PIPES + 1;
+// Only one report is outstanding per HID pipe. Pack a 1 KiB transfer ring
+// and report buffer into each 2 KiB slice of the existing HID DMA windows.
+const HID_RING_TRBS: usize = 64;
 
 fn device_context_off(lane: usize) -> usize {
     match lane {
@@ -97,21 +103,13 @@ fn ep0_off(lane: usize) -> usize {
 }
 
 fn interrupt_off(pipe: usize) -> usize {
-    match pipe {
-        0 => INT0_OFF,
-        1 => INT1_OFF,
-        2 => INT2_OFF,
-        _ => unreachable!(),
-    }
+    assert!(pipe < HID_PIPES);
+    if pipe < 4 { INT0_OFF + pipe * 0x800 }
+    else { INT1_OFF + (pipe - 4) * 0x800 }
 }
 
 fn report_off(pipe: usize) -> usize {
-    match pipe {
-        0 => REPORT0_OFF,
-        1 => REPORT1_OFF,
-        2 => REPORT2_OFF,
-        _ => unreachable!(),
-    }
+    interrupt_off(pipe) + HID_RING_TRBS * 16
 }
 
 // Operational/runtime register offsets, relative to their region base.
@@ -289,7 +287,7 @@ struct Controller {
     evt_cycle: u32,
     ep0_enq: [usize; DEVICE_LANES],
     ep0_cycle: [u32; DEVICE_LANES],
-    pipes: [HidPipe; 3],
+    pipes: [HidPipe; HID_PIPES],
 }
 
 impl Controller {
@@ -307,7 +305,7 @@ impl Controller {
             evt_cycle: 1,
             ep0_enq: [0; DEVICE_LANES],
             ep0_cycle: [1; DEVICE_LANES],
-            pipes: [HidPipe::empty(0), HidPipe::empty(1), HidPipe::empty(2)],
+            pipes: [HidPipe::empty(0); HID_PIPES],
         }
     }
     fn map_mmio(&self, phys: u64, pages: usize) {
@@ -688,8 +686,8 @@ impl Controller {
     fn init_int_ring(&mut self, pipe: usize) {
         unsafe {
             let ring = interrupt_off(pipe);
-            core::ptr::write_bytes((self.dma_va + ring) as *mut u8, 0, 0x1000);
-            let link = (self.dma_va + ring + (RING_TRBS - 1) * 16) as *mut u32;
+            core::ptr::write_bytes((self.dma_va + ring) as *mut u8, 0, HID_RING_TRBS * 16);
+            let link = (self.dma_va + ring + (HID_RING_TRBS - 1) * 16) as *mut u32;
             core::ptr::write_volatile(link as *mut u64, self.dma_phys + ring as u64);
             core::ptr::write_volatile(link.add(3), (6 << 10) | (1 << 1));
         }
@@ -816,8 +814,8 @@ impl Controller {
             core::ptr::write_volatile(trb.add(2), pipe.report_len as u32);
             core::ptr::write_volatile(trb.add(3), (1 << 5) | (1 << 10) | pipe.cycle); // IOC, Normal
             pipe.enq += 1;
-            if pipe.enq == RING_TRBS - 1 {
-                let link = (self.dma_va + ring + (RING_TRBS - 1) * 16) as *mut u32;
+            if pipe.enq == HID_RING_TRBS - 1 {
+                let link = (self.dma_va + ring + (HID_RING_TRBS - 1) * 16) as *mut u32;
                 let c = core::ptr::read_volatile(link.add(3)) & !1;
                 core::ptr::write_volatile(link.add(3), c | pipe.cycle);
                 pipe.enq = 0;
@@ -917,7 +915,7 @@ impl Controller {
                         self.arm_report(index);
                         break;
                     };
-                    if index < 2 {
+                    if index < KEYBOARD_PIPES {
                         let id_prefixed = self.pipes[index].keyboard_report_id;
                         Self::process_keyboard_report(
                             &mut self.pipes[index].prev,
@@ -1166,7 +1164,7 @@ impl Controller {
         }
     }
 
-    /// Probe for an xHCI controller, retain at most two keyboards and one mouse,
+    /// Probe for an xHCI controller, retain a keyboard per device and one mouse,
     /// configure their interrupt endpoints, and arm their first reports. `self.poll()`
     /// (driven by the timer IRQ) then streams input into the shared IRQ queue.
     fn init(&mut self) {
@@ -1337,9 +1335,9 @@ impl Controller {
         }
         if let Some((slot, dev, ep)) = mouse
             && configured[dev.lane]
-            && self.configure_hid(slot, &dev, ep, HidRole::Mouse, 2, stride)
+            && self.configure_hid(slot, &dev, ep, HidRole::Mouse, MOUSE_PIPE, stride)
         {
-            self.pipes[2].ready = true;
+            self.pipes[MOUSE_PIPE].ready = true;
             let _ = compact_fmt::writeln!(
                 &mut lib::log::DebugCon,
                 "xHCI: mouse ready (slot {} port {} ep {} mps {}) at {:02x}:{:02x}.{}",

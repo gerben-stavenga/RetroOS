@@ -8,14 +8,10 @@ pub(super) const INCTX_OFF: usize = 0x4000; // input context (Address Device / C
 pub(super) const DEVCTX0_OFF: usize = 0x5000; // retained device lane 0: output context
 pub(super) const EP0_0_OFF: usize = 0x6000; // retained device lane 0: control transfer ring
 pub(super) const XFER_OFF: usize = 0x7000; // control-transfer data buffer (descriptors)
-pub(super) const INT0_OFF: usize = 0x8000; // HID interrupt pipe 0 transfer ring
-pub(super) const REPORT0_OFF: usize = 0x9000; // HID interrupt pipe 0 report buffer
+pub(super) const INT0_OFF: usize = 0x8000; // packed HID pipes 0..4 (8 KiB)
 pub(super) const DEVCTX1_OFF: usize = 0xA000;
 pub(super) const EP0_1_OFF: usize = 0xB000;
-pub(super) const INT1_OFF: usize = 0xC000;
-pub(super) const REPORT1_OFF: usize = 0xD000;
-pub(super) const INT2_OFF: usize = 0xE000;
-pub(super) const REPORT2_OFF: usize = 0xF000;
+pub(super) const INT1_OFF: usize = 0xC000; // packed HID pipes 4..9 (within 16 KiB)
 // The ten-bit scratchpad count can require 1023 pointers (two pages).
 // Six additional context/control-ring pairs for hubs and downstream devices.
 pub(super) const EXTRA_DEVICES_OFF: usize = 0x10000;
@@ -78,13 +74,9 @@ mod tests {
             EP0_0_OFF,
             XFER_OFF,
             INT0_OFF,
-            REPORT0_OFF,
             DEVCTX1_OFF,
             EP0_1_OFF,
             INT1_OFF,
-            REPORT1_OFF,
-            INT2_OFF,
-            REPORT2_OFF,
         ];
         for (i, offset) in regions.iter().enumerate() {
             assert!(offset + 4096 <= SCRATCH_OFF);
@@ -103,6 +95,28 @@ mod tests {
             assert!(ep0 + 4096 <= SCRATCH_OFF);
         }
         assert!(0x10000 + (DMA_PAGES + 1) * 4096 <= super::super::CONTROLLER_STRIDE);
+    }
+
+    #[test]
+    fn hid_rings_and_reports_fit_without_overlapping_device_contexts() {
+        use super::super::{HID_PIPES, HID_RING_TRBS, interrupt_off, report_off};
+        let mut ranges = alloc::vec::Vec::new();
+        for lane in 0..super::super::DEVICE_LANES {
+            ranges.push((super::super::device_context_off(lane), 4096));
+            ranges.push((super::super::ep0_off(lane), 4096));
+        }
+        for pipe in 0..HID_PIPES {
+            let ring = interrupt_off(pipe);
+            let report = report_off(pipe);
+            assert_eq!(ring % 64, 0);
+            assert_eq!(ring / 65536, (ring + HID_RING_TRBS * 16 - 1) / 65536);
+            ranges.push((ring, HID_RING_TRBS * 16));
+            ranges.push((report, 16));
+        }
+        for (i, &(start, len)) in ranges.iter().enumerate() {
+            assert!(start >= INCTX_OFF + 4096 && start + len <= SCRATCH_OFF);
+            assert!(ranges[..i].iter().all(|&(other, size)| start + len <= other || other + size <= start));
+        }
     }
 
     #[test]

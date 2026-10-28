@@ -26,6 +26,7 @@ impl Fixture {
     fn pipe(&mut self, index: usize, slot: u32, dci: u32, len: usize) {
         let c = &mut self.controller;
         c.init_int_ring(index);
+        c.pipes[index].pipe = index;
         c.pipes[index].ready = true;
         c.pipes[index].slot = slot;
         c.pipes[index].dci = dci;
@@ -66,33 +67,36 @@ fn setup_finishes_before_any_keyboard_or_mouse_transfer_is_published() {
     let mut f = Fixture::new();
     // A composite KVM uses one slot and separate keyboard/mouse endpoints.
     f.pipe(0, 1, 3, 8);
-    f.pipe(2, 1, 5, 8);
+    f.pipe(MOUSE_PIPE, 1, 5, 8);
     // Setup can consume command completions, but no report has been submitted.
     f.event(0, 33, 1, 0, 1, 0);
     assert_eq!(f.controller.wait_event(33), Some((1, 1)));
     assert!(f.controller.pipes.iter().all(|p| p.enq == 0));
     f.controller.start_pipes();
-    assert_eq!(f.controller.pipes.map(|p| p.enq), [1, 0, 1]);
+    assert_eq!(f.controller.pipes[0].enq, 1);
+    assert_eq!(f.controller.pipes[MOUSE_PIPE].enq, 1);
+    assert!(f.controller.pipes[1..MOUSE_PIPE].iter().all(|p| p.enq == 0));
     f.report(0, &[0, 0, 4, 0, 0, 0, 0, 0]);
-    f.report(2, &[1, 2, 3]);
+    f.report(MOUSE_PIPE, &[1, 2, 3]);
     f.event(1, 32, 1, 3, 1, 0);
     f.event(2, 32, 1, 5, 13, 5);
     f.controller.poll();
     crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e]));
     crate::irq::MOUSE.with(|events| assert_eq!(*events.borrow(), [(2, 3, 1)]));
-    assert_eq!(f.controller.pipes.map(|p| p.enq), [2, 0, 2]);
+    assert_eq!(f.controller.pipes[0].enq, 2);
+    assert_eq!(f.controller.pipes[MOUSE_PIPE].enq, 2);
 }
 
 #[test]
 fn short_mouse_report_does_not_invent_motion_or_release_buttons() {
     let mut f = Fixture::new();
-    f.pipe(2, 1, 5, 8);
+    f.pipe(MOUSE_PIPE, 1, 5, 8);
     f.controller.start_pipes();
-    f.report(2, &[1, 20]);
+    f.report(MOUSE_PIPE, &[1, 20]);
     f.event(0, 32, 1, 5, 13, 6); // only two bytes actually received
     f.controller.poll();
     crate::irq::MOUSE.with(|events| assert!(events.borrow().is_empty()));
-    assert_eq!(f.controller.pipes[2].enq, 2);
+    assert_eq!(f.controller.pipes[MOUSE_PIPE].enq, 2);
 }
 
 #[test]
@@ -147,7 +151,7 @@ fn rollover_preserves_held_keys_until_a_valid_report() {
 
 #[test]
 fn boot_interfaces_negotiate_protocol_before_configuring_endpoints() {
-    for (role, pipe) in [(HidRole::Keyboard, 0), (HidRole::Mouse, 2)] {
+    for (role, pipe) in [(HidRole::Keyboard, 0), (HidRole::Mouse, MOUSE_PIPE)] {
         let mut f = Fixture::new();
         let ep = EpInfo {
             iface: 3,
@@ -227,4 +231,21 @@ fn downstream_address_context_keeps_route_and_transaction_translator() {
             );
         }
     }
+}
+
+#[test]
+fn every_device_lane_can_deliver_keyboard_reports() {
+    let mut f = Fixture::new();
+    for index in 0..KEYBOARD_PIPES {
+        f.pipe(index, index as u32 + 1, 3, 8);
+    }
+    f.controller.start_pipes();
+    for index in 0..KEYBOARD_PIPES {
+        f.report(index, &[0, 0, 4 + index as u8, 0, 0, 0, 0, 0]);
+        f.event(index, 32, index as u32 + 1, 3, 1, 0);
+    }
+    f.controller.poll();
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23]));
+    crate::irq::MOUSE.with(|events| assert!(events.borrow().is_empty()));
+    assert!(f.controller.pipes[..KEYBOARD_PIPES].iter().all(|p| p.enq == 2));
 }
