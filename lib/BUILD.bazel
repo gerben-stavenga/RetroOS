@@ -148,3 +148,20 @@ rust_test(
     rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
     deps = [":lib", ":compact_fmt", "//klog"],
 )
+
+rust_test(
+    name = "ini_test",
+    srcs = ["src/ini.rs"],
+    crate_name = "ini_test",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests", "-Crelocation-model=static"],
+    edition = "2024",
+)
+
+# INI documents allocate; keep the allocator-free boot library independent.
+rust_library(
+    name = "ini",
+    srcs = ["src/ini.rs"],
+    crate_name = "ini",
+    edition = "2024",
+    rustc_flags = ["-Crelocation-model=static"] + panic_strategy(),
+)

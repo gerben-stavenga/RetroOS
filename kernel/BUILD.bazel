@@ -66,6 +66,7 @@ rust_library(
         "//ext4",
         "//klog",
         "//lib",
+        "//lib:ini",
         "//lib:compact_fmt",
         "//lib:vga",
         "//lib:sound",
@@ -110,12 +111,15 @@ rust_test(
 # tests. The metal-only boot entry remains cfg-gated out of this test.
 rust_test(
     name = "kernel_unit_test_host",
+    compile_data = ["//:etc/RETROOS.INI"],
     crate = ":kernel",
     data = [
+        "//:etc/RETROOS.INI",
         "//ext4:modern_image",
     ],
     rustc_env = {
         "EXT4_MODERN_IMAGE": "$(rlocationpath //ext4:modern_image)",
+        "RETROOS_TEST_INI": "$(execpath //:etc/RETROOS.INI)",
     },
     rustc_flags = [
         "-Cpanic=abort",

@@ -38,39 +38,14 @@ pub struct Bundle {
     pub subdir: String,
 }
 
-#[derive(Clone)]
-pub struct SmbMount {
-    pub drive: Option<u8>,
-    pub server: [u8; 4],
-    pub port: u16,
-    pub share: String,
-    pub path: String,
-    pub username: String,
-    pub password: String,
-    pub domain: String,
-    pub access: Access,
-    pub subdir: String,
-}
-impl core::fmt::Debug for SmbMount {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("SmbMount").field("path", &self.path).finish_non_exhaustive()
-    }
-}
-
 #[derive(Clone, Default, Debug)]
 pub struct Config {
     pub home: Option<String>,
-    pub dos_scaling: Option<crate::kernel::display::DosScaling>,
-    pub wifi: Option<crate::kernel::wifi::config::Profile>,
-    pub smb: Vec<SmbMount>,
     pub bundle: Option<Bundle>,
     pub mounts: Vec<Mount>,
-    pub environment: Vec<u8>,
-    pub linux_environment: Vec<u8>,
-    pub launch: Vec<(String, String)>,
 }
 
-fn canonical(path: &str) -> bool {
+pub(crate) fn canonical(path: &str) -> bool {
     path.starts_with('/')
         && !path.as_bytes().contains(&0)
         && (path == "/"
@@ -105,217 +80,88 @@ pub fn uuid(value: &str) -> Result<arch_abi::VolumeUuid, &'static str> {
 
 impl Config {
     pub fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
-        let text = core::str::from_utf8(bytes).map_err(|_| "configuration must be UTF-8")?;
         let mut config = Self::default();
-        let mut section = "";
-        for raw in text.lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with(['#', ';']) {
-                continue;
-            }
-            if line.starts_with('[') {
-                section = line
-                    .strip_prefix('[')
-                    .and_then(|s| s.strip_suffix(']'))
-                    .ok_or("invalid section")?
-                    .trim();
-                if section == "wifi" {
-                    if config.wifi.is_some() {
-                        return Err("duplicate Wi-Fi section");
-                    }
-                    config.wifi = Some(crate::kernel::wifi::config::Profile::default());
-                } else if section == "smb" {
-                    if config.smb.len() >= 8 { return Err("too many SMB mounts"); }
-                    config.smb.push(SmbMount { drive: None, server: [0;4], port: 445, share: String::new(), path: String::new(),
-                        username: String::new(), password: String::new(), domain: String::new(), access: Access::Rw, subdir: "/".into() });
-                } else if section == "bundle" {
-                    if config.bundle.is_some() { return Err("duplicate bundle section"); }
-                    config.bundle = Some(Bundle { source: String::new(), subdir: "/".into() });
-                } else if let Some(name) = section.strip_prefix("mount ") {
-                    let name = name
-                        .strip_prefix('"')
-                        .and_then(|s| s.strip_suffix('"'))
-                        .ok_or("mount name must be quoted")?;
-                    if name.is_empty() || config.mounts.iter().any(|m| m.name == name) {
-                        return Err("duplicate or empty mount name");
-                    }
-                    if config.mounts.len() == 24 {
-                        return Err("too many mounts");
-                    }
-                    config.mounts.push(Mount {
-                        name: name.to_string(),
-                        source: String::new(),
-                        path: String::new(),
-                        drive: None,
-                        access: Access::Ro,
-                        format: "auto".to_string(),
-                        partition: None,
-                        subdir: "/".to_string(),
-                        grant: "/".to_string(),
-                    });
-                } else if !section.eq_ignore_ascii_case("launch")
-                    && !matches!(section, "session" | "system" | "locale" | "clock" | "sound" | "environment" | "linux.environment") {
-                    return Err("unknown section");
+        for group in ini::parse(bytes)? {
+            let section = group.name;
+            if section == "bundle" {
+                if config.bundle.is_some() { return Err("duplicate bundle section"); }
+                config.bundle = Some(Bundle { source: String::new(), subdir: "/".into() });
+            } else if let Some(name) = section.strip_prefix("mount ") {
+                let name = name
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .ok_or("mount name must be quoted")?;
+                if name.is_empty() || config.mounts.iter().any(|m| m.name == name) {
+                    return Err("duplicate or empty mount name");
                 }
-                continue;
-            }
-            let (key, value) = line.split_once('=').ok_or("expected key=value")?;
-            let (key, value) = (key.trim(), value.trim());
-            if key.is_empty() || value.as_bytes().contains(&0) {
-                return Err("invalid key/value");
-            }
-            if section == "session" {
-                if key != "home" || config.home.is_some() || !canonical(value) {
-                    return Err("session home must be one canonical absolute path");
+                if config.mounts.len() == 24 {
+                    return Err("too many mounts");
                 }
-                config.home = Some(value.into());
-            } else if section == "linux.environment" {
-                let name = key.as_bytes();
-                if !name[0].is_ascii_alphabetic() && name[0] != b'_' || name.iter().any(|b| !b.is_ascii_alphanumeric() && *b != b'_') {
-                    return Err("invalid Linux environment name");
-                }
-                if config.linux_environment.len() + key.len() + value.len() + 2 > 32768 {
-                    return Err("Linux environment too large");
-                }
-                config.linux_environment.extend_from_slice(key.as_bytes());
-                config.linux_environment.push(b'=');
-                config.linux_environment.extend_from_slice(value.as_bytes());
-                config.linux_environment.push(0);
-            } else if section == "wifi" {
-                let profile=config.wifi.as_mut().ok_or("missing Wi-Fi section")?;
-                match key {
-                    "ssid"=>{if !profile.ssid.is_empty() {return Err("duplicate Wi-Fi SSID");}profile.ssid=value.as_bytes().to_vec();},
-                    "password"=>{if !profile.password.is_empty() {return Err("duplicate Wi-Fi password");}profile.password=zeroize::Zeroizing::new(value.as_bytes().to_vec());},
-                    "autoconnect"=>profile.auto_connect=match value {"true"|"yes"|"1"=>true,"false"|"no"|"0"=>false,_=>return Err("Wi-Fi autoconnect must be true or false")},
-                    _=>return Err("unknown Wi-Fi setting"),
-                }
-            } else if section == "smb" {
-                let mount = config.smb.last_mut().ok_or("missing SMB section")?;
-                match key {
-                    "drive" => {
-                        let bytes = value.as_bytes();
-                        if bytes.len() != 1 || !(b'E'..=b'L').contains(&bytes[0].to_ascii_uppercase()) {
-                            return Err("SMB drive must be E through L");
-                        }
-                        mount.drive = Some(bytes[0].to_ascii_uppercase());
-                    }
-                    "server" => {
-                        let octets: Vec<_> = value.split('.').map(|v| v.parse::<u8>()).collect();
-                        if octets.len()!=4 || octets.iter().any(|v|v.is_err()) { return Err("SMB server must be IPv4"); }
-                        for (i,octet) in octets.into_iter().enumerate() { mount.server[i] = octet.unwrap(); }
-                    }
-                    "port" => mount.port = value.parse().map_err(|_|"invalid SMB port")?,
-                    "share" => mount.share = value.into(), "path" => mount.path = value.into(),
-                    "username" => mount.username = value.into(), "password" => mount.password = value.into(),
-                    "access" => mount.access = match value {
-                        "ro" => Access::Ro, "rw" => Access::Rw,
-                        _ => return Err("SMB access must be ro or rw"),
-                    },
-                    "subdir" => mount.subdir = value.into(),
-                    "domain" => mount.domain = value.into(), _ => return Err("unknown SMB key"),
-                }
-            } else if section == "display" {
-                if key != "scaling" { return Err("unknown display setting"); }
-                use crate::kernel::display::DosScaling;
-                config.dos_scaling = Some(match value {
-                    "original_aspect" => DosScaling::OriginalAspect,
-                    "fill_screen" => DosScaling::FillScreen,
-                    "sharp_pixels" => DosScaling::SharpPixels,
-                    "square_pixels" => DosScaling::SquarePixels,
-                    _ => return Err("invalid display scaling mode"),
+                config.mounts.push(Mount {
+                    name: name.to_string(),
+                    source: String::new(),
+                    path: String::new(),
+                    drive: None,
+                    access: Access::Ro,
+                    format: "auto".to_string(),
+                    partition: None,
+                    subdir: "/".to_string(),
+                    grant: "/".to_string(),
                 });
-            } else if section == "bundle" {
-                let bundle = config.bundle.as_mut().ok_or("missing bundle section")?;
-                match key {
-                    "source" => bundle.source = value.into(),
-                    "subdir" => bundle.subdir = value.into(),
-                    _ => return Err("unknown bundle key"),
-                }
-            } else if section.eq_ignore_ascii_case("launch") {
-                if key.len() >= 16 || key.contains([' ', '\t', '/', '\\', ':']) {
-                    return Err("launch key must be a DOS basename under 16 bytes");
-                }
-                if line.len() > 78 {
-                    return Err("launch entry too long");
-                }
-                if value.split_ascii_whitespace().any(|flag|
-                    !["loadfix", "dos32a", "repair", "iopl3", "xms32k"]
-                        .iter().any(|known| flag.eq_ignore_ascii_case(known))
-                    && !(flag.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("cpu"))
-                        && flag[3..].bytes().all(|b| b.is_ascii_digit())
-                        && flag[3..].parse::<u8>().is_ok_and(|n| (5..=100).contains(&n) && n % 5 == 0))) {
-                    return Err("unknown launch flag");
-                }
-                config.launch.push((key.to_string(), value.to_string()));
-            } else if section.starts_with("mount ") {
-                let mount = config.mounts.last_mut().ok_or("missing mount section")?;
-                match key {
-                    "source" => mount.source = value.to_string(),
-                    "path" => mount.path = value.to_string(),
-                    "drive" => {
-                        let bytes = value.as_bytes();
-                        if bytes.len() != 1 || !bytes[0].is_ascii_alphabetic() {
-                            return Err("drive must be one letter");
-                        }
-                        let drive = bytes[0].to_ascii_uppercase();
-                        if matches!(drive, b'A' | b'B' | b'H') {
-                            return Err("A/B/H are reserved drives");
-                        }
-                        mount.drive = Some(drive);
+            } else if section != "session" { return Err("unknown BOOT.INI section"); }
+            for entry in group.entries {
+                let (key, value) = (entry.key, entry.value);
+                if section == "session" {
+                    if key != "home" || config.home.is_some() || !canonical(value) {
+                        return Err("session home must be one canonical absolute path");
                     }
-                    "access" => {
-                        mount.access = match value {
-                            "ro" => Access::Ro,
-                            "rw" => Access::Rw,
-                            "ram" => Access::Ram,
-                            _ => return Err("access must be ro, rw or ram"),
-                        }
+                    config.home = Some(value.into());
+                } else if section == "bundle" {
+                    let bundle = config.bundle.as_mut().ok_or("missing bundle section")?;
+                    match key {
+                        "source" => bundle.source = value.into(),
+                        "subdir" => bundle.subdir = value.into(),
+                        _ => return Err("unknown bundle key"),
                     }
-                    "format" => mount.format = value.to_string(),
-                    "partition" => {
-                        let n = value.parse().map_err(|_| "invalid partition number")?;
-                        if n == 0 {
-                            return Err("partition numbers start at 1");
+                } else if section.starts_with("mount ") {
+                    let mount = config.mounts.last_mut().ok_or("missing mount section")?;
+                    match key {
+                        "source" => mount.source = value.to_string(),
+                        "path" => mount.path = value.to_string(),
+                        "drive" => {
+                            let bytes = value.as_bytes();
+                            if bytes.len() != 1 || !bytes[0].is_ascii_alphabetic() {
+                                return Err("drive must be one letter");
+                            }
+                            let drive = bytes[0].to_ascii_uppercase();
+                            if matches!(drive, b'A' | b'B' | b'H') {
+                                return Err("A/B/H are reserved drives");
+                            }
+                            mount.drive = Some(drive);
                         }
-                        mount.partition = Some(n);
+                        "access" => {
+                            mount.access = match value {
+                                "ro" => Access::Ro,
+                                "rw" => Access::Rw,
+                                "ram" => Access::Ram,
+                                _ => return Err("access must be ro, rw or ram"),
+                            }
+                        }
+                        "format" => mount.format = value.to_string(),
+                        "partition" => {
+                            let n = value.parse().map_err(|_| "invalid partition number")?;
+                            if n == 0 {
+                                return Err("partition numbers start at 1");
+                            }
+                            mount.partition = Some(n);
+                        }
+                        "subdir" => mount.subdir = value.to_string(),
+                        "grant" => mount.grant = value.to_string(),
+                        _ => return Err("unknown mount key"),
                     }
-                    "subdir" => mount.subdir = value.to_string(),
-                    "grant" => mount.grant = value.to_string(),
-                    _ => return Err("unknown mount key"),
                 }
-            } else {
-                let key = match (section, key) {
-                    ("system", "start") => "START".to_string(),
-                    ("locale", "language") => "LOCALE".to_string(),
-                    ("locale", "keyboard") => "KEYBOARD".to_string(),
-                    ("locale", "codepage") => "CODEPAGE".to_string(),
-                    ("clock", "rtc") => "RTC".to_string(),
-                    ("clock", "utc_offset") => "UTC_OFFSET".to_string(),
-                    ("sound", "sb_audio") => "SB_AUDIO".to_string(),
-                    ("sound", "hda_output") => "HDA_OUTPUT".to_string(),
-                    ("sound", "volume") => "AUDIO_VOLUME".to_string(),
-                    ("environment", _) => key.to_ascii_uppercase(),
-                    _ => return Err("unknown setting"),
-                };
-                config.environment.extend_from_slice(key.as_bytes());
-                config.environment.push(b'=');
-                config.environment.extend_from_slice(value.as_bytes());
-                config.environment.push(0);
             }
         }
-        for (i, mount) in config.smb.iter().enumerate() {
-            if mount.server == [0; 4] || mount.port == 0
-                || mount.username.is_empty() || mount.share.is_empty()
-                || mount.share.contains(['/', '\\', ':'])
-                || !canonical(&mount.path) || !canonical(&mount.subdir) || mount.path == "/" && mount.access != Access::Ro
-                || config.smb[..i].iter().any(|s| s.path == mount.path
-                    || mount.drive.is_some() && s.drive == mount.drive)
-            {
-                return Err("invalid SMB mount");
-            }
-        }
-        config.environment.push(0);
-        config.linux_environment.push(0);
         if let Some(bundle) = &mut config.bundle {
             if !canonical(&bundle.subdir) { return Err("bundle subdir must be canonical"); }
             if let Some(id) = bundle.source.strip_prefix("UUID=") {
@@ -371,25 +217,12 @@ impl Config {
         // A file depends on the most specific configured mount containing it.
         // Reject cycles before any filesystem is opened writable.
         config.order()?;
-        if let Some(profile)=&config.wifi { profile.validate()?; }
         Ok(config)
     }
 
-    /// BOOT.INI owns storage policy; RETROOS.INI owns user settings.
     pub fn parse_boot(bytes: &[u8]) -> Result<Self, &'static str> {
         let config = Self::parse(bytes)?;
         if config.bundle.is_none() { return Err("BOOT.INI requires [bundle]"); }
-        if config.dos_scaling.is_some() || config.environment.iter().chain(config.linux_environment.iter()).any(|b| *b != 0) || !config.launch.is_empty() || !config.smb.is_empty() || config.wifi.is_some() {
-            return Err("user settings belong in RETROOS.INI");
-        }
-        Ok(config)
-    }
-
-    pub fn parse_user(bytes: &[u8]) -> Result<Self, &'static str> {
-        let config = Self::parse(bytes)?;
-        if config.bundle.is_some() || !config.mounts.is_empty() || config.home.is_some() {
-            return Err("bundle, mounts and session home belong in BOOT.INI");
-        }
         Ok(config)
     }
 
@@ -949,22 +782,10 @@ mod tests {
         assert_eq!(boot.bundle.unwrap().subdir, "/boot/release");
         assert!(Config::parse_boot(b"[bundle]\nsource=module\n[system]\nstart=DN.COM\n").is_err());
         assert!(Config::parse_boot(b"[mount \"session\"]\nsource=bundle\npath=/\n").is_err());
-        assert!(Config::parse_user(b"[bundle]\nsource=module\n").is_err());
-        assert!(Config::parse_user(b"[mount \"session\"]\nsource=bundle\npath=/\n").is_err());
-        let user = Config::parse_user(b"[locale]\nlanguage=it-IT\n[launch]\nALADDIN.EXE=xms32k\n").unwrap();
+        assert!(crate::kernel::user_config::Config::parse(b"[bundle]\nsource=module\n").is_err());
+        assert!(crate::kernel::user_config::Config::parse(b"[mount \"session\"]\nsource=bundle\npath=/\n").is_err());
+        let user = crate::kernel::user_config::Config::parse(b"[locale]\nlanguage=it-IT\n[launch]\nALADDIN.EXE=xms32k\n").unwrap();
         assert_eq!(user.launch, [("ALADDIN.EXE".into(), "xms32k".into())]);
-    }
-
-    #[test]
-    fn launch_cpu_percent_is_validated() {
-        for flag in ["cpu5", "cpu25", "CPU100"] {
-            let ini = alloc::format!("[launch]\nGAME.EXE=repair {}\n", flag);
-            assert!(Config::parse_user(ini.as_bytes()).is_ok());
-        }
-        for flag in ["cpu", "cpu0", "cpu1", "cpu26", "cpu101", "cpu999999", "cpu+25", "cpu25x"] {
-            let ini = alloc::format!("[launch]\nGAME.EXE={}\n", flag);
-            assert!(Config::parse_user(ini.as_bytes()).is_err());
-        }
     }
 
     #[test]
@@ -973,22 +794,11 @@ mod tests {
         let config = Config::parse_boot(bytes).unwrap();
         assert_eq!(config.home.as_deref(), Some("/home/alice"));
         assert_eq!(config.mounts[0].path, "/home/alice/DOS");
-        assert!(Config::parse_user(b"[session]\nhome=/home/alice\n").is_err());
+        assert!(crate::kernel::user_config::Config::parse(b"[session]\nhome=/home/alice\n").is_err());
         for home in ["relative", "/home/../alice", "/home//alice", "/home/alice/"] {
             assert!(Config::parse_boot(alloc::format!("[bundle]\nsource=module\n[session]\nhome={home}\n").as_bytes()).is_err());
         }
         assert!(Config::parse_boot(b"[bundle]\nsource=module\n[session]\nhome=/first\nhome=/second\n").is_err());
-    }
-
-    #[test]
-    fn linux_environment_is_separate_and_names_remain_case_sensitive() {
-        let c = Config::parse_user(b"[environment]\nHOME=C:\\DOS\nPATH=C:\\\n[linux.environment]\nHOME=/home/user\nMixed_case=kept\nPATH=\n").unwrap();
-        assert!(c.environment.starts_with(b"HOME=C:\\DOS\0"));
-        assert!(!c.environment.windows(10).any(|w| w == b"Mixed_case"));
-        assert_eq!(c.linux_environment, b"HOME=/home/user\0Mixed_case=kept\0PATH=\0\0");
-        assert!(Config::parse_user(b"[linux.environment]\n1BAD=value\n").is_err());
-        assert!(Config::parse_user(b"[linux.environment]\nBAD-NAME=value\n").is_err());
-        assert!(Config::parse_boot(b"[bundle]\nsource=module\n[linux.environment]\nHOME=/home/user\n").is_err());
     }
 
     #[test]
@@ -1003,118 +813,5 @@ mod tests {
         assert!(Config::parse(b"[mount \"loop\"]\nsource=file:/loop/a.bin\npath=/loop\n").is_err());
         assert!(Config::parse(b"[mount \"a\"]\nsource=bundle\npath=/a\ndrive=C\n[mount \"b\"]\nsource=bundle\npath=/b\ndrive=C\n").is_err());
     }
-    #[test]
-    fn settings_become_personality_neutral_policy() {
-        let c = Config::parse(
-            b"[locale]\nlanguage=it-IT\nkeyboard=us\n[system]\nstart=C:\\DN\\DN.COM\n",
-        )
-        .unwrap();
-        assert_eq!(
-            c.environment,
-            b"LOCALE=it-IT\0KEYBOARD=us\0START=C:\\DN\\DN.COM\0\0"
-        );
-        assert!(Config::parse(b"[mount \"bad\"]\nsource=UUID=ABCD-X234\npath=/\n").is_err());
-    }
 
-    #[test]
-    fn clock_settings_are_user_policy() {
-        let user = Config::parse_user(b"[clock]\nrtc=utc\nutc_offset=-07:00\n").unwrap();
-        assert_eq!(user.environment, b"RTC=utc\0UTC_OFFSET=-07:00\0\0");
-        assert!(Config::parse_boot(b"[bundle]\nsource=module\n[clock]\nrtc=utc\n").is_err());
-        assert!(Config::parse_user(b"[clock]\ntimezone=invalid\n").is_err());
-    }
-
-    #[test]
-    fn launch_entries_are_not_limited_to_a_fixed_table() {
-        let mut ini = String::from("[launch]\n");
-        for i in 0..128 {
-            ini.push_str(&alloc::format!("GAME{}.EXE=repair\n", i));
-        }
-        let config = Config::parse_user(ini.as_bytes()).unwrap();
-        assert_eq!(config.launch.len(), 128);
-        assert_eq!(config.launch[127], ("GAME127.EXE".into(), "repair".into()));
-    }
-
-    #[test]
-    fn launch_overrides_are_preserved_separately_from_environment() {
-        let c = Config::parse(
-            b"[environment]\nHOME=C:\\MC\n[launch]\nDOOM.EXE=repair\nALADDIN.EXE=xms32k\nCHESS.EXE=\n[locale]\nlanguage=en-US\n",
-        ).unwrap();
-        assert_eq!(c.environment, b"HOME=C:\\MC\0LOCALE=en-US\0\0");
-        assert_eq!(c.launch, alloc::vec![
-            ("DOOM.EXE".to_string(), "repair".to_string()),
-            ("ALADDIN.EXE".to_string(), "xms32k".to_string()),
-            ("CHESS.EXE".to_string(), "".to_string()),
-        ]);
-        assert!(Config::parse(b"[launch]\nDOOM.EXE=typo\n").is_err());
-        assert!(Config::parse(b"[launch]\nC:\\DOOM.EXE=repair\n").is_err());
-    }
-}
-
-#[cfg(test)]
-mod smb_config_tests {
-    use super::{Config, Access};
-    const MOUNT: &str = "[smb]\nserver=10.0.2.2\nshare=data\nusername=retroos\npassword=secret-test-value\npath=/SMB\n";
-    #[test]
-    fn smb_credentials_stay_out_of_guest_environment_and_debug_output() {
-        let c=Config::parse_user(MOUNT.as_bytes()).unwrap();
-        assert_eq!(c.smb.len(),1); assert_eq!(c.smb[0].port,445);
-        assert!(!c.environment.windows(6).any(|w|w==b"secret"));
-        assert!(!alloc::format!("{:?}",c).contains("secret-test-value"));
-        assert!(Config::parse_boot(MOUNT.as_bytes()).is_err());
-    }
-    #[test]
-    fn smb_drive_letters_are_explicit_and_unique() {
-        let config = [MOUNT, "drive=h\n"].concat();
-        assert_eq!(Config::parse_user(config.as_bytes()).unwrap().smb[0].drive, Some(b'H'));
-        for letter in ["A", "B", "C", "D", "M", "HH"] {
-            assert!(Config::parse_user([MOUNT, "drive=", letter, "\n"].concat().as_bytes()).is_err());
-        }
-        let duplicate = [config.as_str(), &config.replace("path=/SMB", "path=/OTHER")].concat();
-        assert!(Config::parse_user(duplicate.as_bytes()).is_err());
-    }
-    #[test]
-    fn smb_root_is_explicitly_readonly_and_data_keeps_its_access() {
-        let root = MOUNT.replace("path=/SMB", "path=/");
-        assert!(Config::parse_user(root.as_bytes()).is_err());
-        let root = [root.as_str(), "access=ro\n"].concat();
-        assert_eq!(Config::parse_user(root.as_bytes()).unwrap().smb[0].access, Access::Ro);
-        assert_eq!(Config::parse_user(MOUNT.as_bytes()).unwrap().smb[0].access, Access::Rw);
-        assert!(Config::parse_user([MOUNT, "access=ram\n"].concat().as_bytes()).is_err());
-    }
-    #[test]
-    fn smb_subdirectory_views_require_canonical_paths() {
-        let config = [MOUNT, "subdir=/home/retroos\n"].concat();
-        assert_eq!(Config::parse_user(config.as_bytes()).unwrap().smb[0].subdir, "/home/retroos");
-        assert!(Config::parse_user([MOUNT, "subdir=/home/../etc\n"].concat().as_bytes()).is_err());
-    }
-    #[test]
-    fn smb_rejects_invalid_addresses_paths_and_duplicate_mounts() {
-        for (old,new) in [("10.0.2.2","10.0.2.999"),("path=/SMB","path=/"),("path=/SMB","path=/net/../SMB"),("share=data","share=../data")] {
-            assert!(Config::parse_user(MOUNT.replace(old,new).as_bytes()).is_err());
-        }
-        assert!(Config::parse_user([MOUNT,MOUNT].concat().as_bytes()).is_err());
-    }
-}
-
-#[cfg(test)]
-mod wifi_config_tests {
-    use super::Config;
-    const PROFILE:&[u8]=b"[wifi]\nssid=test-ap\npassword=private-test-pass\nautoconnect=true\n";
-    #[test]
-    fn wifi_boot_profile_is_private_and_not_storage_policy() {
-        let c=Config::parse_user(PROFILE).unwrap();let p=c.wifi.as_ref().unwrap();
-        assert_eq!(p.ssid,b"test-ap");assert!(p.auto_connect);
-        assert!(!c.environment.windows(7).any(|b|b==b"private"));
-        assert!(!alloc::format!("{c:?}").contains("private-test-pass"));
-        assert!(Config::parse_boot(PROFILE).is_err());
-        let disabled=Config::parse_user(b"[wifi]\nssid=test\npassword=password\nautoconnect=false\n").unwrap();
-        assert!(!disabled.wifi.unwrap().auto_connect);
-    }
-    #[test]
-    fn wifi_configuration_rejects_missing_duplicate_and_invalid_fields() {
-        for bytes in [b"[wifi]\nssid=test\n".as_slice(), b"[wifi]\nssid=test\npassword=short\n", b"[wifi]\nssid=a\nssid=b\npassword=password\n",b"[wifi]\nssid=test\npassword=password\nunknown=1\n",b"[wifi]\nssid=test\npassword=password\nautoconnect=maybe\n"] {
-            assert!(Config::parse_user(bytes).is_err());
-        }
-    }
 }

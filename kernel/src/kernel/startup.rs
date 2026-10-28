@@ -575,7 +575,7 @@ fn mount_filesystems(
             .unwrap_or_else(|e| lib::compact_panic!("BOOT.INI mounts: {}", e));
         mount_kernel_log_fs();
         if let Some(bytes) = modules.config.as_ref() {
-            let user = crate::kernel::mount_config::Config::parse_user(bytes)
+            let user = crate::kernel::user_config::Config::parse(bytes)
                 .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e));
             let disk_settings = config.mounts.iter().any(|m| m.drive == Some(b'C') && m.source != "bundle");
             expose_user_config(bytes, disk_settings);
@@ -628,7 +628,7 @@ fn load_master_env() -> alloc::vec::Vec<u8> {
     let path = [root, b"RETROOS/RETROOS.INI"].concat();
     match crate::kernel::exec::load_file_resolved(&path) {
         Ok(bytes) => {
-            let user=crate::kernel::mount_config::Config::parse_user(&bytes)
+            let user=crate::kernel::user_config::Config::parse(&bytes)
                 .unwrap_or_else(|error| lib::compact_panic!("RETROOS.INI: {}", error));
             if let Some(mode) = user.dos_scaling { crate::kernel::display::set_dos_scaling(mode); }
             crate::kernel::linux::environment::configure(user.linux_environment);

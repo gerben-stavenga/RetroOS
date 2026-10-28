@@ -663,7 +663,7 @@ pub fn mount_configured() {
     let Ok(bytes) = crate::kernel::exec::load_file_resolved(&path) else {
         return;
     };
-    let Ok(config) = crate::kernel::mount_config::Config::parse_user(&bytes) else {
+    let Ok(config) = crate::kernel::user_config::Config::parse(&bytes) else {
         return;
     };
     for (index, mount) in config.smb.into_iter().enumerate() {

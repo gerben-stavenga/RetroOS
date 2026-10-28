@@ -890,3 +890,5 @@ filegroup(
     srcs = [":release_vm", ":release_machine", ":grub_module_usb_zip", ":grub_module_iso", ":usb_diagnostic_zip", ":release_checksums"],
     visibility = ["//visibility:public"],
 )
+
+exports_files(["etc/RETROOS.INI"], visibility = ["//kernel:__pkg__"])
