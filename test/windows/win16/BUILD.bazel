@@ -16,6 +16,7 @@ windows16_binary(name="window", obj=":window_obj", imports={
     "GlobalAlloc": "KERNEL.15", "GlobalReAlloc": "KERNEL.16", "GlobalFree": "KERNEL.17",
     "GlobalLock": "KERNEL.18", "GlobalUnlock": "KERNEL.19", "GlobalSize": "KERNEL.20", "GlobalHandle": "KERNEL.21",
     "AllocCStoDSAlias": "KERNEL.170", "FreeSelector": "KERNEL.176",
+    "AllocSelector": "KERNEL.175", "PrestoChangoSelector": "KERNEL.177",
     "GlobalAddAtom": "USER.268", "GlobalDeleteAtom": "USER.269",
     "GlobalFindAtom": "USER.270", "GlobalGetAtomName": "USER.271",
     "GetTempFileName": "KERNEL.97", "LoadLibrary": "KERNEL.95", "FreeLibrary": "KERNEL.96",

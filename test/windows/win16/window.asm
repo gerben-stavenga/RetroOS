@@ -21,7 +21,7 @@ extern _lopen, _lclose, _lread, _lcreat, _llseek, _lwrite
 extern GetTempFileName, LoadLibrary, FreeLibrary, GetModuleHandle, GetProcAddress, GetModuleUsage
 extern GetDriveType
 extern GlobalAlloc, GlobalLock, GlobalUnlock, GlobalFree, GlobalSize, GlobalReAlloc, GlobalHandle
-extern AllocCStoDSAlias, FreeSelector
+extern AllocCStoDSAlias, FreeSelector, AllocSelector, PrestoChangoSelector
 extern GlobalAddAtom, GlobalFindAtom, GlobalDeleteAtom, GlobalGetAtomName
 global _start
 _start:
@@ -97,22 +97,68 @@ _start:
     call far GlobalHandle
     cmp ax,[test_global]
     jne installer_fail
-    push ds
-    pop es
+    ; Keep ES pointing at the block while freeing it. Returning to the
+    ; guest must not reload a deleted selector in the kernel exit stub.
     push word [test_global]
     call far GlobalUnlock
     push word [test_global]
     call far GlobalFree
     test ax,ax
     jnz installer_fail
+    mov ax,es
+    test ax,ax
+    jnz installer_fail
+    push ds
+    pop es
     push cs
     call far AllocCStoDSAlias
     test ax,ax
     jz installer_fail
+    mov es,ax
     push ax
     call far FreeSelector
     test ax,ax
     jnz installer_fail
+    mov ax,es
+    test ax,ax
+    jnz installer_fail
+    push ds
+    pop es
+
+    ; Execute generated code through a data-to-code selector alias.
+    push word 0
+    push dword 16
+    call far GlobalAlloc
+    test ax,ax
+    jz installer_fail
+    mov [test_global],ax
+    mov es,ax
+    mov dword [es:0],0xcb1234b8 ; mov ax,1234h / retf
+    push ax
+    call far AllocSelector
+    test ax,ax
+    jz installer_fail
+    mov [test_generated+2],ax
+    push word [test_global]
+    push ax
+    call far PrestoChangoSelector
+    test ax,ax
+    jz installer_fail
+    ; A later allocation on the same heap page must preserve execute access.
+    push word 0
+    push dword 16
+    call far GlobalAlloc
+    push ax
+    call far GlobalFree
+    call far [test_generated]
+    cmp ax,0x1234
+    jne installer_fail
+    push word [test_generated+2]
+    call far FreeSelector
+    push word [test_global]
+    call far GlobalFree
+    push ds
+    pop es
 
     push ds
     push word atom_name
@@ -1642,6 +1688,7 @@ file_error_13: db "file step 13",0
 file_error_14: db "file step 14",0
 file_error_15: db "file step 15",0
 
+test_generated dd 0
 cursor_point: dw 0,0
 
 segment STACK stack class=STACK use16

@@ -1346,7 +1346,13 @@ pub(super) fn heap_alloc<A: crate::Arch>(machine: &mut A, state: &mut WindowsSta
     }
     state.heap_next = end;
     machine.zero(addr as usize, size as usize);
-    machine.set_page_flags(addr as usize / 4096, size.div_ceil(4096) as usize, true, false);
+    // Initialize permissions only on newly committed pages. The partially
+    // filled last page may already contain executable Win16 selector aliases.
+    let first_page = (addr as usize).div_ceil(4096);
+    let end_page = (end as usize).div_ceil(4096);
+    if end_page > first_page {
+        machine.set_page_flags(first_page, end_page - first_page, true, false);
+    }
     state.blocks.push(Block { addr, size, used: true });
     addr
 }

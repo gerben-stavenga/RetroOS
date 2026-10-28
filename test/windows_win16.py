@@ -14,6 +14,8 @@ def main():
     if engine not in ('kvm', 'tcg'):
         raise SystemExit('ENGINE must be kvm or tcg')
     host = 'retroos-host-kvm' if engine == 'kvm' else 'retroos-host'
+    subprocess.run(['bazelisk', 'build', '//tools/command:command_com'], cwd=ROOT, check=True)
+    command_binary = (ROOT / 'bazel-bin/tools/command/COMMAND.COM').resolve()
     targets = [f'//kernel:{host}', '//test/windows/win16:bridge', '//test/windows/win16:window', '//test/windows/win16:legacy_user',
                '//lib/windows/user32:user32_dll', '//lib/windows/kernel32:kernel32_dll',
                '//lib/windows/compat:gdi32_dll']
@@ -39,6 +41,20 @@ def main():
             log = result.stdout + result.stderr
             if result.returncode or f'WIN16 {program.upper()} PASS' not in log or any(x in log for x in ('PANIC', 'SEGV', ' FAIL')):
                 raise SystemExit(log)
+        # DOS parents encode cwd as C: or C:DIR/SUBDIR. Exercise the same
+        # shell fork/exec boundary used by DN, not just direct NE startup.
+        shutil.copyfile(command_binary, root / 'RETROOS/COMMAND.COM')
+        shutil.copyfile(ROOT / 'bazel-bin/test/windows/win16/bridge.exe', root / 'BRIDGE.EXE')
+        (root / 'LAUNCH/SUBDIR').mkdir(parents=True)
+        for cwd in ('/', '/LAUNCH/SUBDIR'):
+            result = subprocess.run(['python3', str(ROOT/'test/disk_fixture.py'), '--root', directory, '--',
+                str(ROOT/f'bazel-bin/kernel/{host}'), '--c-root', '/', '--cwd', cwd,
+                '--cmd', '/RETROOS/COMMAND.COM /C C:\\BRIDGE.EXE'],
+                cwd=ROOT, capture_output=True, text=True, timeout=40)
+            log = result.stdout + result.stderr
+            if result.returncode or 'WIN16 BRIDGE PASS' not in log or any(x in log for x in ('PANIC', 'SEGV', ' FAIL')):
+                raise SystemExit(log)
+        shutil.copyfile(ROOT / 'bazel-bin/test/windows/win16/window.exe', root / 'BRIDGE.EXE')
         # A missing runtime is an error, not permission to revive an old ABI.
         (system / 'USER.DLL').rename(system / 'USER.saved')
         # Failed launch leaves the desktop running. Bound this negative test

@@ -679,7 +679,7 @@ pub(super) fn exec<A: crate::Arch>(
     let cwd = if parent_cwd.is_empty() {
         super::dirname(&main_path).to_vec()
     } else if parent_cwd.get(1) == Some(&b':') {
-        crate::kernel::dos::dos_abs_to_vfs(parent_cwd).ok_or(-2)?
+        crate::kernel::dos::dos_abs_to_vfs(&crate::kernel::exec::absolute_dos_cwd(parent_cwd)).ok_or(-2)?
     } else {
         parent_cwd.to_vec()
     };
@@ -1198,6 +1198,13 @@ fn dispatch<A: crate::Arch>(
                     if src == 0 || dest & 7 != 7 || usize::from(dest>>3) >= windows.ldt.len() { return 0; }
                     desc ^= 1 << 43;
                     windows.ldt[usize::from(dest>>3)] = desc;
+                    if desc & (1 << 43) != 0 {
+                        // Executable aliases can point at generated code in
+                        // global memory. Keep its data alias writable too.
+                        let base = selector_base(windows, dest).unwrap() as usize;
+                        let limit = ((desc & 0xffff) | ((desc >> 32) & 0xf0000)) as usize;
+                        machine.set_page_flags(base / 4096, ((base % 4096) + limit + 1).div_ceil(4096), true, true);
+                    }
                     u32::from(dest)
                 }
                 _ => {
@@ -1551,6 +1558,18 @@ pub(super) fn handle_event<A: crate::Arch>(
             let old_ldt = windows.ldt.len();
             let result = dispatch(machine, kt, windows, state, regs, gate);
             if gate.module == Module::Kernel && matches!(gate.ordinal,15..=21|95|170|175..=177) {
+                // Like DPMI descriptor release, clear saved data segments
+                // whose selector was freed. The metal return stub reloads
+                // them before IRET; reloading a deleted descriptor faults in
+                // ring 0 even when the guest never uses that segment again.
+                for segment in [&mut regs.ds, &mut regs.es, &mut regs.fs, &mut regs.gs] {
+                    let selector = *segment as u16;
+                    if selector & 4 != 0
+                        && windows.ldt.get(usize::from(selector >> 3)) == Some(&0)
+                    {
+                        *segment = 0;
+                    }
+                }
                 sync_selectors(machine,windows,old_ldt);
                 dos.ldt[..windows.ldt.len()].copy_from_slice(&windows.ldt);
                 for i in 0..windows.ldt.len() { dos.ldt_alloc[i / 32] |= 1 << (i % 32); }

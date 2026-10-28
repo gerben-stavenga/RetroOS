@@ -231,6 +231,7 @@ mod tests {
     fn inherited_dos_cwd_becomes_an_absolute_dos_path_before_vfs_translation() {
         assert_eq!(absolute_dos_cwd(b"C:"), b"C:\\");
         assert_eq!(absolute_dos_cwd(b"C:/RC"), b"C:\\RC");
+        assert_eq!(absolute_dos_cwd(b"C:WINDOWS/APPS"), b"C:\\WINDOWS\\APPS");
         assert_eq!(absolute_dos_cwd(b"D:\\GAMES"), b"D:\\GAMES");
     }
 
@@ -376,7 +377,7 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
 
 // ── Path utilities ──────────────────────────────────────────────────────
 
-fn absolute_dos_cwd(cwd: &[u8]) -> Vec<u8> {
+pub(crate) fn absolute_dos_cwd(cwd: &[u8]) -> Vec<u8> {
     let mut path = cwd[..2].to_vec();
     path.push(b'\\');
     path.extend(cwd[2..].iter().copied()
