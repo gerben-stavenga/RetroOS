@@ -235,9 +235,6 @@ impl Config {
                         && flag[3..].parse::<u8>().is_ok_and(|n| (5..=100).contains(&n) && n % 5 == 0))) {
                     return Err("unknown launch flag");
                 }
-                if config.launch.len() == 32 {
-                    return Err("too many launch entries");
-                }
                 config.launch.push((key.to_string(), value.to_string()));
             } else if section.starts_with("mount ") {
                 let mount = config.mounts.last_mut().ok_or("missing mount section")?;
@@ -1014,6 +1011,17 @@ mod tests {
         assert_eq!(user.environment, b"RTC=utc\0UTC_OFFSET=-07:00\0\0");
         assert!(Config::parse_boot(b"[bundle]\nsource=module\n[clock]\nrtc=utc\n").is_err());
         assert!(Config::parse_user(b"[clock]\ntimezone=invalid\n").is_err());
+    }
+
+    #[test]
+    fn launch_entries_are_not_limited_to_a_fixed_table() {
+        let mut ini = String::from("[launch]\n");
+        for i in 0..128 {
+            ini.push_str(&alloc::format!("GAME{}.EXE=repair\n", i));
+        }
+        let config = Config::parse_user(ini.as_bytes()).unwrap();
+        assert_eq!(config.launch.len(), 128);
+        assert_eq!(config.launch[127], ("GAME127.EXE".into(), "repair".into()));
     }
 
     #[test]

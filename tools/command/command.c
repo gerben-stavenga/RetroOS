@@ -97,17 +97,12 @@ static void trace(int on) {
  * CL selects virtual IOPL, CH bit 0 caps classic XMS reports at 32767 KiB.
  * CH bit 1 is in-place EXEC; bits 10..15 encode CPU duty percent / 5. */
 
-#define LF_MAX_NAMES 32
 #define LF_NAME_LEN  16
 #define LF_F_LOADFIX 0x01
 #define LF_F_DOS32A  0x02
 #define LF_F_IOPL3   0x04
 #define LF_F_REPAIR  0x08
 #define LF_F_XMS32K  0x10
-
-static char          loadfix_names[LF_MAX_NAMES][LF_NAME_LEN];
-static unsigned int  loadfix_flags[LF_MAX_NAMES];
-static int           loadfix_count = 0;
 
 /* Last component of a DOS path: skip past any '\\', '/', or ':'. */
 static const char *basename_of(const char *path) {
@@ -141,15 +136,16 @@ static unsigned int parse_flag(const char *tok) {
     return 0;
 }
 
-static void load_launch_config(void) {
+static unsigned int lookup_flags(const char *program) {
+    const char *base = basename_of(program);
     FILE *f;
     char line[80];
     int in_launch = 0;
-    /* Embedded bootfs (always present, always mounted at C:\RETROOS) -- robust
-     * vs the ext4 root mounting at C:\DISK1 instead of C:\ on real installs. */
+    /* Scan on each launch: no fixed table and saved edits take effect without
+     * restarting a long-running shell or batch interpreter. */
     f = fopen("C:\\RETROOS\\RETROOS.INI", "r");
-    if (!f) return;
-    while (loadfix_count < LF_MAX_NAMES && fgets(line, sizeof(line), f) != 0) {
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f) != 0) {
         char *p = line + strspn(line, " \t");
         char *name, *tok;
         unsigned int flags = 0;
@@ -194,6 +190,7 @@ static void load_launch_config(void) {
             while (end > name && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
         }
         if (strlen(name) == 0 || strlen(name) >= LF_NAME_LEN || strpbrk(name, " \t\\/:") != 0) continue;
+        if (stricmp(base, name) != 0) continue;
         for (;;) {
             p += strspn(p, " \t");
             if (*p == 0) break;
@@ -207,19 +204,10 @@ static void load_launch_config(void) {
             }
         }
         if (flags == 0) flags = LF_F_LOADFIX;   /* legacy default */
-        strcpy(loadfix_names[loadfix_count], name);
-        loadfix_flags[loadfix_count] = flags;
-        loadfix_count++;
+        fclose(f);
+        return flags; /* Preserve first matching entry precedence. */
     }
     fclose(f);
-}
-
-static unsigned int lookup_flags(const char *name) {
-    const char *base = basename_of(name);
-    int i;
-    for (i = 0; i < loadfix_count; i++) {
-        if (stricmp(base, loadfix_names[i]) == 0) return loadfix_flags[i];
-    }
     return 0;
 }
 
@@ -1347,7 +1335,6 @@ static int is_flag(const char *arg, char letter) {
 
 int main(int argc, char *argv[]) {
     init_command_path(argc > 0 ? argv[0] : 0);
-    load_launch_config();
 
     /* Invocation contract: COMMAND.COM is always called as
      *   COMMAND.COM /L prog [args]   (LOADFIX trampoline)
