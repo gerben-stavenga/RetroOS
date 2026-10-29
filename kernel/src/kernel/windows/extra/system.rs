@@ -112,6 +112,12 @@ pub(super) fn call<A: crate::Arch>(
             1
         }
 
+        b"RetroGdiBitmapWrite" => {
+            let handle=a(0);let source=a(1) as usize;let count=a(2) as usize;
+            let Some((_,super::super::GdiObject::Bitmap{pixels,..}))=state.gdi_objects.iter_mut().find(|(h,_)|*h==handle) else{return 0;};
+            if count!=pixels.len()/4 {return 0;}
+            machine.copy_from(source,pixels);state.dirty=true;1
+        }
         b"RetroGdiBitmap" => {
             let (width,height)=(a(0),a(1));
             if width==0 || height==0 || width>2048 || height>2048 {return fail(state,87,0);}
@@ -120,6 +126,7 @@ pub(super) fn call<A: crate::Arch>(
             let handle=state.next_object;state.next_object+=1;
             state.gdi_objects.push((handle,super::super::GdiObject::Bitmap{width,height,pixels}));handle
         }
+        b"RetroGdiBitBlt" => super::super::dispatch(machine, kt, state, regs, super::super::Api::BitBlt),
         b"RetroGdiFillRect" => super::super::dispatch(machine, kt, state, regs, super::super::Api::FillRect),
         b"RetroGdiCurrentObject" => {
             state.dcs.iter().find(|d| d.handle == a(0)).map_or(0, |d| match a(1) {

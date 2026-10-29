@@ -34,7 +34,7 @@ bridge CreateCompatibleBitmap, 1051, 6
 bridge CreateCompatibleDC, 1052, 2
 gate CreateDC
 gate CreateEllipticRgn
-gate CreateFontIndirect
+bridge CreateFontIndirect, 1057, 4
 gate CreatePatternBrush
 bridge CreatePen, 1061, 8
 bridge CreateSolidBrush, 1066, 4
@@ -62,8 +62,8 @@ gate GetNearestColor
 gate CreateDiscardableBitmap
 gate SetMetaFileBits
 bridge ExtTextOut, 1351, 22
-gate CreatePalette
-gate AnimatePalette
+bridge CreatePalette, 1360, 4
+bridge AnimatePalette, 1367, 10
 gate CreateDIBitmap
 gate SetDIBitsToDevice
 
@@ -71,3 +71,17 @@ bridge GetBkColor, 1075, 2
 bridge GetTextColor, 1090, 2
 bridge SetTextAlign, 1346, 4
 bridge ExtFloodFill, 1372, 12
+
+bridge SetPolyFillMode, 1006, 4
+bridge Polyline, 1037, 8
+bridge CreateBitmap, 1048, 12
+bridge CreateFont, 1056, 30
+bridge GetBkMode, 1076, 2
+bridge SetBitmapBits, 1106, 10
+bridge AddFontResource, 1119, 4
+bridge RemoveFontResource, 1136, 4
+bridge GetBitmapDimension, 1162, 2
+bridge SetBitmapDimension, 1163, 6
+bridge EnumFontFamilies, 1330, 14
+bridge SetPaletteEntries, 1364, 10
+bridge GetSystemPaletteEntries, 1375, 10

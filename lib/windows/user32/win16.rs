@@ -3,6 +3,19 @@
 use crate::{Message, class, input, keyboard, menu, message, paint, rect, state, window};
 
 unsafe extern "system" {
+    fn SetBitmapBits(bitmap:u32,n:u32,p:*const u8)->i32;
+    fn CreateBitmap(w:i32,h:i32,planes:u32,depth:u32,p:*const u8)->u32;
+    fn CreateFontIndirectA(p:*const u8)->u32;
+    fn GetBkMode(dc:u32)->i32;
+    fn SetPolyFillMode(dc:u32,value:i32)->i32;
+    fn GetBitmapDimensionEx(h:u32,out:*mut [i32;2])->i32;
+    fn SetBitmapDimensionEx(h:u32,x:i32,y:i32,out:*mut [i32;2])->i32;
+    fn CreatePalette(p:*const u8)->u32;
+    fn SetPaletteEntries(h:u32,start:u32,n:u32,p:*const u32)->u32;
+    fn GetSystemPaletteEntries(dc:u32,start:u32,n:u32,p:*mut u32)->u32;
+    fn SelectPalette(dc:u32,p:u32,b:u32)->u32;
+    fn RealizePalette(dc:u32)->u32;
+
     fn GetPrivateProfileStringW(section:*const u16,key:*const u16,default:*const u16,out:*mut u16,capacity:u32,path:*const u16)->u32;
     fn PatBlt(dc:u32,x:i32,y:i32,width:i32,height:i32,rop:u32)->i32;
     fn ExtTextOutA(dc:u32,x:i32,y:i32,options:u32,rect:*const rect::Rect,text:u32,count:u32,dx:*const i32)->i32;
@@ -177,6 +190,28 @@ unsafe fn pointer(p: u32, bytes: usize) -> Option<u32> {
             return None;
         }
         base.checked_add(offset)
+    }
+}
+// Huge pointers cross consecutive 64 KiB selectors. Validate the whole
+// extent before handing a flat pointer to the shared file/memory functions.
+unsafe fn huge_pointer(p: u32, bytes: usize) -> Option<u32> {
+    unsafe {
+        if bytes == 0 { return Some(0); }
+        let mut sel = p >> 16;
+        let mut offset = p & 0xffff;
+        let start = segment(sel)?.0.checked_add(offset)?;
+        let mut next = start;
+        let mut remaining = bytes;
+        while remaining != 0 {
+            let (base, limit) = segment(sel)?;
+            if base.checked_add(offset)? != next || offset > limit { return None; }
+            let n = remaining.min((limit.min(65535) - offset + 1) as usize);
+            remaining -= n;
+            next = next.checked_add(n as u32)?;
+            sel = sel.checked_add(8)?;
+            offset = 0;
+        }
+        Some(start)
     }
 }
 unsafe fn far_pointer(p: u32) -> Option<u32> {
@@ -513,8 +548,8 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 GetPrivateProfileIntW(section.as_ptr(),key.as_ptr(),i(0),core::ptr::null())
             }
             447 => {
-                let (wp,lp)=to32(w(4),w(2),d(0));
-                crate::mdi::DefMDIChildProcA(h(8),w(4),wp,lp) as u32
+                let (wp,lp)=to32(w(6),w(4),d(0));
+                crate::mdi::DefMDIChildProcA(h(8),w(6),wp,lp) as u32
             }
             451 => crate::mdi::TranslateMDISysAccel(h(4),&read_message(d(0))?) as u32,
 
@@ -692,6 +727,23 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                     file
                 }
             }
+            2348 => {
+                let n = d(0) as usize;
+                if n != 0 {
+                    core::ptr::copy(huge_pointer(d(4), n)? as *const u8,
+                        huge_pointer(d(8), n)? as *mut u8, n);
+                }
+                0
+            }
+            2349 | 2350 => {
+                let n = d(0);
+                if n > i32::MAX as u32 { return Some(u32::MAX); }
+                let Some(buffer) = huge_pointer(d(4), n as usize) else { return Some(u32::MAX); };
+                let mut done = 0;
+                let ok = if o == 2349 { ReadFile(w(8), buffer, n, &mut done, 0) }
+                    else { WriteFile(w(8), buffer, n, &mut done, 0) };
+                if ok != 0 { done } else { u32::MAX }
+            }
             2084 => SetFilePointer(w(6), d(2) as i32, 0, w(0)),
             2082 | 2086 => {
                 let count = w(0);
@@ -836,14 +888,23 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             90 => input::IsDialogMessageA(h(4), &read_message(d(0))?) as u32,
             112 => message::WaitMessage() as u32,
             228 => encode(input::GetNextDlgTabItem(h(4), h(2), w(0))),
+            65 => {
+                let mut low = 0; let mut high = 0;
+                let result = crate::scrollbar::GetScrollRange(h(10), i(8), &mut low, &mut high);
+                (pointer(d(4), 2)? as *mut i16).write_unaligned(low as i16);
+                (pointer(d(0), 2)? as *mut i16).write_unaligned(high as i16);
+                result as u32
+            }
+            89 => encode(crate::dialog::CreateDialogParamA(w(10), string(d(6))?, h(4), procedure(d(0)), 0)),
+            243 => crate::dialog::GetDialogBaseUnits(),
             239 => crate::dialog::DialogBoxParamA(w(14), string(d(10))?, h(8), procedure(d(4)), d(0)) as u32,
             241 => encode(crate::dialog::CreateDialogParamA(w(14), string(d(10))?, h(8), procedure(d(4)), d(0))),
             250 => menu::GetMenuState(h(4), w(2), w(0)),
             272 => window::IsZoomed(h(0)) as u32,
             284 => state::with(|s| (0x8000usize.saturating_sub(s.win16_handles.len()) * 100 / 0x8000) as u32),
             308 => {
-                let (wp, lp) = to32(w(4), w(2), d(0));
-                crate::dialog::DefDlgProcA(h(8), w(4), wp, lp) as u32
+                let (wp, lp) = to32(w(6), w(4), d(0));
+                crate::dialog::DefDlgProcA(h(8), w(6), wp, lp) as u32
             }
             404 => {
                 let out = pointer(d(0), 26)?;
@@ -1192,8 +1253,9 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             457 => crate::resource::DestroyIcon(h(0)) as u32,
             179 => GetSystemMetrics(w(0)),
             236 => encode(input::GetCapture()),
-            242 => {
-                let p = d(10);
+            219 | 242 => {
+                let shift = if o == 219 { 0 } else { 4 };
+                let p = d(6 + shift);
                 let (_, limit) = segment(p >> 16)?;
                 let at = pointer(p, 1)?;
                 let bytes = core::slice::from_raw_parts(
@@ -1202,11 +1264,11 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 );
                 let converted = crate::win16_resource::dialog(bytes)?;
                 encode(crate::dialog::CreateDialogIndirectParamA(
-                    w(14),
+                    w(10 + shift),
                     converted.as_ptr() as u32,
-                    h(8),
-                    procedure(d(4)),
-                    d(0),
+                    h(4 + shift),
+                    procedure(d(shift)),
+                    if o == 219 { 0 } else { d(0) },
                 ))
             }
             244 => rect::EqualRect(&rectangle(d(4))?, &rectangle(d(0))?) as u32,
@@ -1225,6 +1287,56 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             }
             412 => menu::RemoveMenu(h(4), w(2), w(0)) as u32,
             413 => menu::DeleteMenu(h(4), w(2), w(0)) as u32,
+            282 => encode(SelectPalette(h(4),h(2),w(0))),
+            283 => RealizePalette(h(0)),
+            1006 => SetPolyFillMode(h(2),i(0)) as u32,
+            1037 => {
+                let count=w(0) as usize;
+                let points=pointer(d(2),count.checked_mul(4)?)?;
+                if count<2 {return Some(0);}
+                let mut old=[0;2];
+                MoveToEx(h(6),word(points,0) as i16 as i32,word(points,2) as i16 as i32,&mut old);
+                for n in 1..count {LineTo(h(6),word(points,n*4) as i16 as i32,word(points,n*4+2) as i16 as i32);}
+                MoveToEx(h(6),old[0],old[1],core::ptr::null_mut());1
+            }
+            1048 => {
+                let width=i(10);let height=i(8);let depth=w(4);let planes=w(6);
+                if width<0 || height<0 {return Some(0);}
+                let bytes=(width as usize).checked_mul(depth as usize)?.div_ceil(16)
+                    .checked_mul(2)?.checked_mul(height as usize)?;
+                let source=if d(0)==0 {0}else{huge_pointer(d(0),bytes)?};
+                encode(CreateBitmap(width,height,planes,depth,source as *const u8))
+            }
+            1056 | 1057 => {
+                let mut font=[0u8;60];
+                if o==1057 {
+                    let src=pointer(d(0),50)?;
+                    for n in 0..5 {font[n*4..n*4+4].copy_from_slice(&(word(src,n*2) as i16 as i32).to_le_bytes());}
+                    core::ptr::copy_nonoverlapping((src+10) as *const u8,font.as_mut_ptr().add(20),40);
+                } else {
+                    for n in 0..5 {font[n*4..n*4+4].copy_from_slice(&i(28-n*2).to_le_bytes());}
+                    for n in 0..8 {font[20+n]=w(18-n*2) as u8;}
+                    let face=string(d(0))? as *const u8;
+                    for n in 0..31 {let c=face.add(n).read();font[28+n]=c;if c==0 {break;}}
+                }
+                encode(CreateFontIndirectA(font.as_ptr()))
+            }
+            1076 => GetBkMode(h(0)) as u32,
+            // No external font resource loader or enumeration provider yet.
+            1119 | 1136 | 1330 => 0,
+            1106 => SetBitmapBits(h(8),d(4),huge_pointer(d(0),d(4) as usize)? as *const u8) as u32,
+            1162 | 1163 => {
+                let mut size=[0;2];
+                if o==1162 {GetBitmapDimensionEx(h(0),&mut size);}
+                else {SetBitmapDimensionEx(h(4),i(2),i(0),&mut size);}
+                size[0] as u16 as u32 | ((size[1] as u16 as u32)<<16)
+            }
+            1360 => {
+                let p=pointer(d(0),4)?;let n=word(p,2) as usize;
+                encode(CreatePalette(pointer(d(0),4+n*4)? as *const u8))
+            }
+            1364 | 1367 => SetPaletteEntries(h(8),w(6),w(4),pointer(d(0),w(4) as usize*4)? as *const u32),
+            1375 => GetSystemPaletteEntries(h(8),w(6),w(4),if d(0)==0 {core::ptr::null_mut()}else{pointer(d(0),w(4) as usize*4)? as *mut u32}),
             1001 => SetBkColor(h(4), d(0)),
             1002 => SetBkMode(h(2), w(0)) as u32,
             1003 => SetMapMode(h(2), i(0)) as u32,

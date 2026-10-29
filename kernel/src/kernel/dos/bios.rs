@@ -197,6 +197,7 @@ macro_rules! bda_field {
 pub(super) use bda_field;
 
 mod clock;
+pub(crate) use clock::win16_int1a;
 pub(super) mod keyboard;
 mod system;
 mod serial;

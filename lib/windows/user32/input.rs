@@ -308,9 +308,8 @@ pub extern "system" fn GetNextDlgTabItem(h: u32, c: u32, p: u32) -> u32 {
 pub extern "system" fn GetNextDlgGroupItem(h: u32, c: u32, p: u32) -> u32 {
     navigation(h, c, p != 0, false)
 }
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn IsDialogMessageW(h: u32, msg: *const crate::Message) -> i32 {
-    if msg.is_null() {
+unsafe fn dialog_message(h: u32, msg: *const crate::Message, wide: bool) -> i32 {
+    if msg.is_null() || window::IsWindow(h) == 0 {
         return 0;
     }
     let m = unsafe { msg.read_unaligned() };
@@ -341,11 +340,23 @@ pub unsafe extern "system" fn IsDialogMessageW(h: u32, msg: *const crate::Messag
         }
         return 1;
     }
-    0
+    // Once a message belongs to the dialog, IsDialogMessage performs
+    // translation and dispatch too. Callers may rely on it to process paint
+    // and ordinary control messages without a separate DispatchMessage call.
+    unsafe {
+        crate::keyboard::TranslateMessage(&m);
+        if wide { crate::DispatchMessageW(&m); }
+        else { crate::DispatchMessageA(&m); }
+    }
+    1
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn IsDialogMessageW(h: u32, msg: *const crate::Message) -> i32 {
+    unsafe { dialog_message(h, msg, true) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn IsDialogMessageA(h: u32, m: *const crate::Message) -> i32 {
-    unsafe { IsDialogMessageW(h, m) }
+    unsafe { dialog_message(h, m, false) }
 }
 
 #[unsafe(no_mangle)]

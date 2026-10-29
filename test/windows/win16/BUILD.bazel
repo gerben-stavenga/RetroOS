@@ -50,3 +50,26 @@ windows16_binary(name="window", obj=":window_obj", imports={
 nasm_library(name="legacy_user_obj", srcs=["legacy_user.asm"], copts=["-fobj"])
 windows16_dll(name="legacy_user", obj=":legacy_user_obj", out="LEGACYUSER.DLL",
     module_name="USER", exports=["CallWindowProc.122"], visibility=["//visibility:public"])
+
+nasm_library(name="fpmath_obj", srcs=["fpmath.asm"], copts=["-fobj"])
+windows16_binary(name="fpmath", obj=":fpmath_obj", imports={
+    "GetTickCount": "USER.13", "FpMath": "WIN87EM.1", "Debug": "KERNEL.115", "Exit": "KERNEL.1",
+}, visibility=["//visibility:public"])
+
+nasm_library(name="civ_apis_obj", srcs=["civ_apis.asm"], copts=["-fobj"])
+windows16_binary(name="civ_apis", obj=":civ_apis_obj", imports={
+    "Debug":"KERNEL.115", "Exit":"KERNEL.1", "GetTickCount":"USER.13",
+    "GlobalAlloc":"KERNEL.15", "GlobalLock":"KERNEL.18", "GlobalFree":"KERNEL.17",
+    "CreateDIBitmap":"GDI.442",
+    "hmemcpy":"KERNEL.348", "CreateBitmap":"GDI.48", "SetBitmapBits":"GDI.106",
+    "CreateCompatibleDC":"GDI.52", "SelectObject":"GDI.45", "DeleteDC":"GDI.68",
+    "DeleteObject":"GDI.69", "GetPixel":"GDI.83", "CreatePalette":"GDI.360",
+    "RealizePalette":"USER.283", "SelectPalette":"USER.282", "BitBlt":"GDI.34",
+    "SetPaletteEntries":"GDI.364", "GetBkMode":"GDI.76", "SetBkMode":"GDI.2",
+    "SetBitmapDimension":"GDI.163", "GetBitmapDimension":"GDI.162",
+    "GetOpenFileName":"COMMDLG.1", "CommDlgExtendedError":"COMMDLG.26",
+    "sndPlaySound":"MMSYSTEM.2",
+    "IsDialogMessage":"USER.90",
+    "RegisterClass":"USER.57", "CreateDialogIndirect":"USER.219",
+    "DestroyWindow":"USER.53", "DefDlgProc":"USER.308",
+}, visibility=["//visibility:public"])

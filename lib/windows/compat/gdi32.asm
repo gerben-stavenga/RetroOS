@@ -5,7 +5,9 @@ global %1
 %1: int 0x83
 %endmacro
 gate Arc
-gate BitBlt
+global _RetroGdiBitBlt@36
+_RetroGdiBitBlt@36:
+gate RetroGdiBitBlt
 gate CreateCompatibleBitmap
 gate CreateCompatibleDC
 gate CreatePen
@@ -18,7 +20,6 @@ gate LineTo
 gate MoveToEx
 gate Polygon
 gate SetBkColor
-gate SetBkMode
 gate SetLayout
 gate SetTextColor
 gate GetBkColor
@@ -74,8 +75,6 @@ gate RetroGdiObject
 global _CreateCompatibleDC@4
 _CreateCompatibleDC@4: jmp CreateCompatibleDC
 
-global _BitBlt@36
-_BitBlt@36: jmp BitBlt
 
 global _RetroGdiFillRect@12
 _RetroGdiFillRect@12:
@@ -94,3 +93,7 @@ global _GetBkColor@4
 _GetBkColor@4: jmp GetBkColor
 global _CreateSolidBrush@4
 _CreateSolidBrush@4: jmp CreateSolidBrush
+
+global _RetroGdiBitmapWrite@12
+_RetroGdiBitmapWrite@12:
+gate RetroGdiBitmapWrite

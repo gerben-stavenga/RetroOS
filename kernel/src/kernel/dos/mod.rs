@@ -69,6 +69,7 @@ pub(crate) use dos::dos_to_unix_datetime;
 pub use dfs::{c_root, set_c_root};
 pub(crate) use dfs::{DFS_PATH_MAX, vfs_to_dos, extra_drive_prefix, drive_available};
 pub(crate) use dos::win16_multiplex;
+pub(crate) use bios::win16_int1a;
 
 /// Look up `KEY` in a DOS environment block (the RETROOS.INI master
 /// env). Startup reads boot policy out of it — `SB_AUDIO=` — before any
@@ -242,6 +243,7 @@ pub struct DosState<A: crate::Arch> {
     pub pm_dos: bool,
     /// Clock for clients without a guest BIOS timer ISR (Win16).
     pub host_clock: Option<(u64, u64)>,
+    pub bios_clock: Option<(u32, u64)>,
 
     /// LIFO stack of suspended DOS continuations. A syscall that cannot finish
     /// synchronously moves its original return frame here with its callback,
@@ -352,6 +354,7 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::addr_of_mut!((*p).tf_sources).write(0);
             core::ptr::addr_of_mut!((*p).pm_dos).write(false);
             core::ptr::addr_of_mut!((*p).host_clock).write(None);
+            core::ptr::addr_of_mut!((*p).bios_clock).write(None);
             core::ptr::addr_of_mut!((*p).suspended_calls).write(alloc::vec::Vec::new());
             state.assume_init()
         }

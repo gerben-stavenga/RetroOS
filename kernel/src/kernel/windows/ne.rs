@@ -44,6 +44,7 @@ impl Segment {
 
 #[derive(Clone, Debug)]
 pub enum Target {
+    FpuFixup,
     Internal { segment: u8, offset: u16 },
     ImportOrdinal { module: Vec<u8>, ordinal: u16 },
     ImportName { module: Vec<u8>, name: Vec<u8> },
@@ -226,6 +227,11 @@ impl<'a> Image<'a> {
                     module: modules.get(first.wrapping_sub(1) as usize).ok_or(Error::BadImage)?.clone(),
                     name: counted(self.data, imported_names + second as usize)?,
                 },
+                // Windows software-coprocessor patch sites. The image already
+                // contains x87 instructions; native/emulated x87 needs no patch.
+                3 if source_type & 0x7f == 5 && flags & 4 != 0
+                    && (1..=6).contains(&first) && second == 0
+                    && usize::from(source_offset) + 2 <= segment.file_size => Target::FpuFixup,
                 _ => return Err(Error::BadImage),
             };
             out.push(Relocation { source_type, flags, source_offset, target });
@@ -301,6 +307,21 @@ mod tests {
         data[0x40 + 0x1c..0x40 + 0x1e].copy_from_slice(&1u16.to_le_bytes());
         data[0x40 + 0x36] = target_os;
         data
+    }
+
+    #[test]
+    fn floating_point_fixups_preserve_native_instructions() {
+        let mut data = image(2);
+        data.resize(0x100, 0);
+        data[0x80..0x82].copy_from_slice(&[0x9b, 0xdd]);
+        data[0x82..0x84].copy_from_slice(&1u16.to_le_bytes());
+        data[0x84..0x8c].copy_from_slice(&[5, 7, 0, 0, 5, 0, 0, 0]);
+        let segment = Segment {number:1,file_offset:0x80,file_size:2,alloc_size:2,flags:0x100};
+        let parsed = Image::parse(&data).unwrap();
+        assert!(matches!(parsed.relocations(segment).unwrap()[0].target, Target::FpuFixup));
+        assert_eq!(parsed.segment_bytes(segment).unwrap(), &[0x9b,0xdd]);
+        data[0x88]=99;
+        assert!(Image::parse(&data).unwrap().relocations(segment).is_err());
     }
 
     #[test]

@@ -43,6 +43,13 @@ pub(super) fn int08<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs
 // ============================================================================
 
 pub(super) fn int1a<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+    let rtc = matches!((regs.rax >> 8) as u8, 2 | 4);
+    int1a_registers(machine, regs);
+    if rtc { vm86_set_return_flag(machine, regs, 1, false); }
+}
+
+// Register-only BIOS clock ABI also used by protected-mode Win16 callers.
+pub(crate) fn int1a_registers<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         0x00 => {
@@ -67,7 +74,7 @@ pub(super) fn int1a<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
                 | ((bcd(hour) as u64) << 8)
                 | bcd(min) as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | ((bcd(sec) as u64) << 8);
-            vm86_set_return_flag(machine, regs, 1, false);
+            regs.clear_flag32(1);
         }
         0x04 => {
             // Read RTC date: CH=century CL=year DH=month DL=day,
@@ -80,8 +87,31 @@ pub(super) fn int1a<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
             regs.rdx = (regs.rdx & !0xFFFF)
                 | ((bcd(month) as u64) << 8)
                 | bcd(day) as u64;
-            vm86_set_return_flag(machine, regs, 1, false);
+            regs.clear_flag32(1);
         }
         _ => {}
+    }
+}
+
+/// Win16 has no BIOS IRQ0 handler advancing the BDA. Anchor its clock to
+/// monotonic host time; setting BIOS ticks changes this anchor, not the RTC.
+pub(crate) fn win16_int1a<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
+    let now=machine.now();
+    match (regs.rax>>8) as u8 {
+        0 => {
+            let (ticks,start)=*dos.bios_clock.get_or_insert_with(|| (bda_field!(machine,tick_count),now));
+            let elapsed=(u128::from(now.saturating_sub(start))*1_193_182/65_536_000_000_000) as u64;
+            let total=u64::from(ticks)+elapsed;
+            let days=total/0x1800b0;
+            bda_field!(machine,tick_count=(total%0x1800b0) as u32);
+            int1a_registers(machine,regs);
+            regs.rax=(regs.rax&!0xff)|days.min(255);
+            if days!=0 {dos.bios_clock=Some(((total%0x1800b0) as u32,now));}
+        }
+        1 => {
+            int1a_registers(machine,regs);
+            dos.bios_clock=Some((bda_field!(machine,tick_count),now));
+        }
+        _ => int1a_registers(machine,regs),
     }
 }

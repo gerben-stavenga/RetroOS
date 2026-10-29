@@ -127,8 +127,8 @@ bridge CreateDialogIndirectParam, 242, 16
 bridge EqualRect, 244, 8
 gate GetAsyncKeyState
 bridge GetDlgCtrlID, 277, 2
-gate SelectPalette
-gate RealizePalette
+bridge SelectPalette, 282, 6
+bridge RealizePalette, 283, 2
 gate GetDesktopWindow
 gate GetLastActivePopup
 gate CreateIcon
@@ -187,3 +187,8 @@ RetroNativeProcedures:
     align 16
 %assign native_index native_index + 1
 %endrep
+
+bridge GetScrollRange, 65, 12
+bridge CreateDialog, 89, 12
+bridge CreateDialogIndirect, 219, 12
+bridge GetDialogBaseUnits, 243, 0

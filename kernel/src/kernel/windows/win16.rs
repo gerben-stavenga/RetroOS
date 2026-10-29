@@ -251,8 +251,12 @@ fn descriptor(base: u32, limit: u32, code: bool) -> u64 {
 
 fn selector(ldt: &mut Vec<u64>, base: u32, size: usize, code: bool) -> Result<u16, i32> {
     if size == 0 || size > 0x10000 || ldt.len() >= 8192 { return Err(-8); }
+    // NE segments use Win16 global-heap storage, rounded to 32 bytes. The
+    // loader backs these ranges with whole pages; expose the allocation's
+    // padding too, while keeping the declared DGROUP/heap layout unchanged.
+    let allocated = size.div_ceil(32) * 32;
     let sel = ((ldt.len() as u16) << 3) | 7;
-    ldt.push(descriptor(base, size as u32 - 1, code));
+    ldt.push(descriptor(base, allocated as u32 - 1, code));
     Ok(sel)
 }
 
@@ -518,6 +522,7 @@ fn relocate_image<A: crate::Arch>(
         let base = segment_base(number)?;
         for relocation in image.relocations(segment).map_err(|_| -8)? {
             let (offset, target_selector) = match &relocation.target {
+                ne::Target::FpuFixup => continue,
                 ne::Target::Internal { segment, offset } => {
                     let selector = *selectors.get(segment.wrapping_sub(1) as usize).ok_or(-8)?;
                     (*offset, selector)
@@ -1176,11 +1181,19 @@ fn dispatch<A: crate::Arch>(
         }
         (Module::Kernel, 17..=21) => {
             let handle = stack_u16(machine,windows,regs,4).unwrap_or(0);
-            let Some(index) = state.global_blocks.iter().position(|b| b.handle == handle || b.selector == handle) else { return 0 };
+            let Some(index) = state.global_blocks.iter().position(|b| b.handle == handle || b.selector == handle) else {
+                return 0;
+            };
             let block = &mut state.global_blocks[index];
             match gate.ordinal {
-                17 => { if block.locks != 0 { u32::from(handle) } else { global_free(windows,state,index); 0 } }
-                18 => { if block.flags & 2 != 0 { block.locks = block.locks.saturating_add(1); } u32::from(block.selector)<<16 }
+                // GlobalFree releases a Win16 block even while it is locked.
+                17 => { global_free(windows,state,index); 0 }
+                18 => {
+                    if block.flags & 2 != 0 { block.locks = block.locks.saturating_add(1); }
+                    // Win16 also returns the selector in CX.
+                    regs.rcx = (regs.rcx & !0xffff) | u64::from(block.selector);
+                    u32::from(block.selector)<<16
+                }
                 19 => { block.locks = block.locks.saturating_sub(1); u32::from(block.locks != 0) }
                 20 => block.size,
                 _ => (u32::from(block.selector)<<16)|u32::from(block.handle),
@@ -1393,11 +1406,14 @@ fn dispatch<A: crate::Arch>(
         (Module::Gdi, 80) => {
             let index = stack_u16(machine, windows, regs, 4).unwrap_or(0);
             match index {
-                // WinMine's 16-bit signed comparison treats the modern
-                // high-colour sentinel (-1) as monochrome.  Advertise the
-                // classic 16-colour Windows display that this personality
-                // emulates instead.
-                8 => 640, 10 => 480, 12 => 4, 14 => 1, 24 => 16,
+                // Virtual 256-colour display; keep palette capabilities
+                // consistent with the shared palette APIs. A -1 colour count
+                // is misinterpreted as monochrome by some Win16 applications.
+                2 => 1, // DT_RASDISPLAY
+                8 => 640, 10 => 480, 12 => 8, 14 => 1, 24 => 256,
+                38 => 0x100, // RC_PALETTE
+                88 | 90 => 96,
+                104 => 256, 106 => 20,
                 _ => 0,
             }
         }
@@ -1451,13 +1467,21 @@ fn dispatch<A: crate::Arch>(
             let bits_pointer = stack_u32(machine, windows, regs, 10).unwrap_or(0);
             let header_pointer = stack_u32(machine, windows, regs, 18).unwrap_or(0);
             let Some(header) = far_linear(windows, header_pointer) else { return 0 };
-            let Some((width, height, bpp, palette_at)) = dib_header(machine, header) else {
+            let Some((width, height, bpp, _)) = dib_header(machine, header) else {
                 return 0;
             };
+            // The dimensions header and initialization BITMAPINFO are separate
+            // arguments; the colour table belongs to the latter.
+            let info = stack_u32(machine, windows, regs, 6)
+                .and_then(|pointer| far_linear(windows, pointer));
+            let init = stack_u32(machine, windows, regs, 14).unwrap_or(0) & 4 != 0; // CBM_INIT
             let handle = windows.next_object;
             windows.next_object = windows.next_object.wrapping_add(1);
             let mut pixels = vec![0u8; width * height * 4];
-            if let Some(bits) = far_linear(windows, bits_pointer) {
+            if init {
+                let Some(bits) = far_linear(windows, bits_pointer) else { return 0 };
+                let Some((iw, ih, ibpp, palette_at)) = info.and_then(|p| dib_header(machine, p)) else { return 0 };
+                if (iw, ih, ibpp) != (width, height, bpp) { return 0; }
                 decode_dib(machine, bits, palette_at, width, height, bpp, &mut pixels);
             }
             windows.gdi_objects.push((handle, super::GdiObject::Bitmap {
@@ -1530,6 +1554,10 @@ pub(super) fn handle_event<A: crate::Arch>(
         crate::KernelEvent::Irq => thread::KernelAction::Done,
         crate::KernelEvent::Hlt => crate::kernel::dos::win16_resume(machine, kt, dos, regs)
             .unwrap_or(thread::KernelAction::Done),
+        crate::KernelEvent::SoftInt(0x1a) => {
+            crate::kernel::dos::win16_int1a(machine, dos, regs);
+            thread::KernelAction::Done
+        }
         crate::KernelEvent::SoftInt(0x2f) => crate::kernel::dos::win16_multiplex(machine, dos, regs),
         crate::KernelEvent::SoftInt(0x21) => dos_call(machine, bios, kt, windows, dos, regs),
         crate::KernelEvent::SoftInt(GATE_VECTOR) => {

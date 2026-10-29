@@ -1,6 +1,7 @@
 load(":win16.bzl", "win16_dll")
 
 win16_dll("kernel", "KERNEL", [
+    "hmemcpy.348", "_hread.349", "_hwrite.350",
     "GetProfileInt.57", "GetHeapSpaces.138",
     "GlobalHandle.21", "GetFreeSpace.169", "AllocCStoDSAlias.170", "AllocSelector.175", "FreeSelector.176", "PrestoChangoSelector.177",
     "RetroBridgeConfig.423", "WinExec.166",
@@ -23,6 +24,20 @@ win16_dll("kernel", "KERNEL", [
 ])
 
 win16_dll("gdi", "GDI", [
+    "SetPolyFillMode.6",
+    "Polyline.37",
+    "CreateBitmap.48",
+    "CreateFont.56",
+    "GetBkMode.76",
+    "SetBitmapBits.106",
+    "AddFontResource.119",
+    "RemoveFontResource.136",
+    "GetBitmapDimension.162",
+    "SetBitmapDimension.163",
+    "EnumFontFamilies.330",
+    "SetPaletteEntries.364",
+    "GetSystemPaletteEntries.375",
+
     "GetBkColor.75", "GetTextColor.90", "SetTextAlign.346", "ExtFloodFill.372",
     "RetroBridgeConfig.423",
     "SetBkColor.1", "SetBkMode.2", "SetMapMode.3", "SetROP2.4",
@@ -46,6 +61,7 @@ win16_dll("gdi", "GDI", [
 ])
 
 win16_dll("user", "USER", [
+    "GetScrollRange.65", "CreateDialog.89", "CreateDialogIndirect.219", "GetDialogBaseUnits.243",
     "DefMDIChildProc.447", "TranslateMDISysAccel.451",
     "GetTickCount.13",
     "GetWindowTextLength.38",
@@ -117,3 +133,7 @@ win16_dll("shell", "SHELL", ["ShellAbout.22"])
 win16_dll("keyboard", "KEYBOARD", ["AnsiToOem.5", "OemToAnsi.6"])
 
 win16_dll("lzexpand", "LZEXPAND", ["LZCopy.1", "RetroBridgeConfig.423"])
+
+win16_dll("win87em", "WIN87EM", ["__FPMATH.1"])
+win16_dll("mmsystem", "MMSYSTEM", ["sndPlaySound.2", "mciSendCommand.701"])
+win16_dll("commdlg", "COMMDLG", ["GetOpenFileName.1", "GetSaveFileName.2", "CommDlgExtendedError.26"])

@@ -135,6 +135,8 @@ const SPECS: &[Spec] = &[
     spec(b"GDI32", b"RetroGdiTextOutW", 20),
     spec(b"GDI32", b"GetCurrentPositionEx", 8),
     spec(b"GDI32", b"RetroGdiBitmap", 12),
+    spec(b"GDI32", b"RetroGdiBitBlt", 36),
+    spec(b"GDI32", b"RetroGdiBitmapWrite", 12),
     spec(b"GDI32", b"GetPixel", 12),
     spec(b"GDI32", b"SetPixel", 16),
     spec(b"ADVAPI32", b"AdjustTokenPrivileges", 24),

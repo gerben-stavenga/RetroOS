@@ -78,3 +78,7 @@ gate PrestoChangoSelector
 
 bridge GetProfileInt, 2057, 10
 gate GetHeapSpaces
+
+bridge hmemcpy, 2348, 12
+bridge _hread, 2349, 10
+bridge _hwrite, 2350, 10

@@ -100,3 +100,39 @@ and polygon primitives; stock brushes/pens preserve their types and null behavio
 Win16 WM_CTLCOLOR is translated to the corresponding Win32 control-color message.
 The Win32 callback suite checks radio grouping, transparent group-box interiors,
 and rectangle brush/pen behavior.
+
+`WIN87EM.DLL` supplies ordinal 1 (`__FPMATH`) as guest x87 code for
+initialization, control/status, rounding, integer conversion, and coprocessor
+presence. The register-call operation numbers were checked against
+[Wine's WIN87EM interface](https://github.com/wine-mirror/wine/blob/master/dlls/win87em.dll16/win87em.c).
+This is not a software 8087 emulator; exception callback delivery and the
+save/restore/info exports are not implemented. The `fpmath` NE regression
+checks arithmetic, control-word restoration, conversion, and stack balance.
+
+Civilization for Windows now binds its imports and creates its custom dialogs.
+The adapters include huge-buffer memory/file operations, palette entries,
+indexed bitmap uploads/blits, and the protected-mode BIOS clock. Shared GDI
+retains uploaded indices for palette conversion; composed bitmap contents are
+preserved when subsequently used as a blit source. Palette changes do not yet
+recolour pixels already drawn to a window.
+
+MMSYSTEM reports sound/MCI services unavailable, and COMMDLG returns a dialog
+initialization error. External font-resource loading and enumeration are also
+unimplemented. These are failure-reporting compatibility exports, not working
+multimedia or common-dialog implementations.
+
+Local KVM acceptance reaches Civ's main menu, completes new-game setup, and
+reaches the opening capital-founding prompt. Palette rendering still has
+inaccuracies, and paths such as GetBitmapBits and FrameRect remain incomplete.
+The native presentation path still shows only the foremost top-level window,
+so Civ's separate Status window hides its map instead of composing both.
+This is not a complete gameplay acceptance test.
+Civilization II additionally imports video and AVI libraries.
+
+The `civ_apis` NE regression covers huge copies across a selector boundary,
+locked global-memory release, NE segment allocation padding, bitmap updates and
+two-stage palette blits, custom dialog class forwarding through DefDlgProc, non-keyboard dispatch through
+IsDialogMessage, separate DIB headers/palettes, BIOS clock advancement,
+optional-service failure results, and guest stack balance. Run it with the
+other Win16 tests using `ENGINE=kvm python3 test/windows_win16.py` or
+`ENGINE=tcg python3 test/windows_win16.py`.
