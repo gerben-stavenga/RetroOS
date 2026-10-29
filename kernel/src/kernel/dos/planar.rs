@@ -208,11 +208,10 @@ unsafe extern "C" fn planar_fault(pointer: *mut u8, wide: u32, address: u32) -> 
             context.yielded = true;
             0
         } else { u32::from(context.emulate(&mut frame, address)) };
-    let handled = if handled != 0 && frame.read(frame.flags_offset()) & 0x100 != 0 {
+    if handled != 0 && frame.read(frame.flags_offset()) & 0x100 != 0 {
         context.stepped = true;
         0
-    } else { handled };
-    handled
+    } else { handled }
 }
 
 #[cfg(target_arch = "x86")]

@@ -188,7 +188,7 @@ fn alu(regs: &mut Operands<'_>, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
     };
     let msb = 1u32 << (bits - 1);
     let (a, b) = (a & mask, b & mask);
-    let cf_in = (*regs.flags & 1) as u32;
+    let cf_in = *regs.flags & 1;
     match alu {
         0 | 2 => {
             // ADD / ADC
