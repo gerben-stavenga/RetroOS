@@ -11,9 +11,9 @@ sys.path.insert(0, str(ROOT / "tools"))
 from vm_mount_config import boot_configuration, split_configuration, volumes
 
 
-def prepare_boot(work, data, config=None):
+def prepare_boot(work, data, config=None, boot_image=None):
     boot = Path(work) / "fixture-boot.img"
-    shutil.copyfile(ROOT / "bazel-bin/boot_disk.bin", boot)
+    shutil.copyfile(boot_image or ROOT / "bazel-bin/boot_disk.bin", boot)
     boot.chmod(0o600)
     if config is None:
         with Path(data).open("rb") as stream:

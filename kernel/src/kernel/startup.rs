@@ -1906,7 +1906,7 @@ fn event_loop<A: crate::Arch>(
             // as KernelEvent::Irq rather than through the metal IRQ queue.
             irq_clock_wakeup = true;
         }
-        stats.post_run(machine, &kevent, &ctx.regs);
+        stats.post_run(machine, &kevent, &ctx.regs, ctx.device_cycles);
         let event_dispatch = event_sample.returned(machine, &kevent, &ctx.regs, &thread.personality);
         super::media::kernel_entry();
         let had_window = thread.has_primary_window();
@@ -2264,8 +2264,8 @@ fn dispatch<A: crate::Arch>(
     }
     if let crate::KernelEvent::PageFault { addr } = kevent {
         // A VGA planar-trap access (A0000 unmapped while unchained graphics
-        // needs the write/read planar logic) is decoded + emulated here, not a
-        // SEGV. Same path on both backends — both deliver this PageFault.
+        // needs the write/read planar logic) is emulated here on hosted
+        // backends. Native VGA is handled in ring 0; Voodoo still comes here.
         if matches!(thread.personality, thread::Personality::Linux(_))
             && crate::kernel::linux::try_vsyscall(machine, regs, addr) {
             return thread::KernelAction::Done;
@@ -3511,12 +3511,16 @@ impl EventStats {
         machine: &mut A,
         _event: &crate::KernelEvent,
         _regs: &Regs,
+        device_cycles: u64,
     ) {
         if !self.active {
             return;
         }
         let now = machine.rdtsc();
-        self.guest_cycles = self.guest_cycles.wrapping_add(now.wrapping_sub(self.last_tsc));
+        let elapsed = now.wrapping_sub(self.last_tsc);
+        let device_cycles = device_cycles.min(elapsed);
+        self.guest_cycles = self.guest_cycles.wrapping_add(elapsed - device_cycles);
+        self.kernel_cycles[PROFILE_DISPATCH] = self.kernel_cycles[PROFILE_DISPATCH].wrapping_add(device_cycles);
         self.last_tsc = now;
         if now.wrapping_sub(self.last_publish) >= Self::PUBLISH_CYCLES {
             unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, self.snapshot()) };

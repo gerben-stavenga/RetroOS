@@ -499,7 +499,7 @@ fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine:
 /// The shared live VGA store. `VgaState::layout()` maps logical
 /// `(plane, offset)` to its byte. Suspended owners retain a private snapshot;
 /// the running owner, guest aperture and renderer use the kernel store.
-const PLANES_LEN: usize = 4 * 0x10000;
+pub(in crate::kernel::dos) const PLANES_LEN: usize = 4 * 0x10000;
 const A0000: usize = 0xA0000;
 
 // The DOS VGA device owns the singleton, its size and its lifetime. Backends
@@ -641,7 +641,7 @@ fn live_vram_ptr() -> *mut u8 {
     base
 }
 
-fn live_vram_ptr_if_initialized() -> Option<core::ptr::NonNull<u8>> {
+pub(in crate::kernel::dos) fn live_vram_ptr_if_initialized() -> Option<core::ptr::NonNull<u8>> {
     core::ptr::NonNull::new(
         LIVE_VRAM.load(core::sync::atomic::Ordering::Relaxed),
     )
@@ -1298,35 +1298,13 @@ pub fn vram_write<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaS
     }
 }
 
-/// Commit the batch in order using the unchanged VGA state.
-pub fn flush_write_batch<A: arch_abi::GuestBytes>(machine: &mut A, state: &mut LegacyVgaState,
-    writes: &mut crate::kernel::dos::planar::FastWrites) {
-    let _live_access = live_access();
-    if let Some(base) = live_vram_ptr_if_initialized() {
-        let planes = unsafe { ::vga::memory::Memory::mapped(base.as_ptr(), PLANES_LEN) };
-        for (address, value, bytes) in writes.drain() {
-            for byte in 0..bytes {
-                vram_write_live(planes, state, address - A0000 as u32 + u32::from(byte),
-                    (value >> (byte * 8)) as u8);
-            }
-        }
-    } else {
-        for (address, value, bytes) in writes.drain() {
-            for byte in 0..bytes {
-                vram_write(machine, state, address - A0000 as u32 + u32::from(byte),
-                    (value >> (byte * 8)) as u8);
-            }
-        }
-    }
-}
-
 /// Apply one planar write through the permanent kernel mapping. The guest
 /// alias is intentionally absent while the VGA ALU is active; walking that
 /// alias through `GuestBytes` here used to perform four translated reads and
 /// up to four translated writes for every already-expensive #PF-emulated CPU
 /// byte.
 #[inline(always)]
-fn vram_write_live(planes: ::vga::memory::Memory<'_>, vga: &mut LegacyVgaState, off: u32, byte: u8) {
+pub(in crate::kernel::dos) fn vram_write_live(planes: ::vga::memory::Memory<'_>, vga: &mut LegacyVgaState, off: u32, byte: u8) {
     let (off, map_mask) = vga.cpu_write_address(off as usize);
     let layout = vga.layout();
 
@@ -1416,16 +1394,24 @@ pub fn copy_to_guest<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut DosVide
 /// Trapped planar VRAM read: load the 4 latches from the planes at A0000 offset
 /// `off` and return the byte the CPU sees (read map select, or color compare).
 pub fn vram_read<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaState, off: u32) -> u8 {
+    if let Some(base) = live_vram_ptr_if_initialized() {
+        let planes = unsafe { ::vga::memory::Memory::mapped(base.as_ptr(), PLANES_LEN) };
+        return vram_read_live(planes, vga, off);
+    }
     let (off, read_plane) = vga.cpu_read_address(off as usize);
     let layout = vga.layout();
-    let cur = if let Some(base) = live_vram_ptr_if_initialized() {
-        let planes = unsafe { core::slice::from_raw_parts(base.as_ptr(), PLANES_LEN) };
-        core::array::from_fn(|p| planes[layout.index(p, off)])
-    } else {
-        core::array::from_fn(|p| {
-            machine.read::<u8>(VGA_VRAM_BASE + layout.index(p, off))
-        })
-    };
+    let cur = core::array::from_fn(|p| machine.read::<u8>(VGA_VRAM_BASE + layout.index(p, off)));
+    finish_read(vga, read_plane, cur)
+}
+
+pub(in crate::kernel::dos) fn vram_read_live(planes: ::vga::memory::Memory<'_>, vga: &mut LegacyVgaState, off: u32) -> u8 {
+    let (off, read_plane) = vga.cpu_read_address(off as usize);
+    let layout = vga.layout();
+    let cur = core::array::from_fn(|p| planes.get(layout.index(p, off)).unwrap());
+    finish_read(vga, read_plane, cur)
+}
+
+fn finish_read(vga: &mut LegacyVgaState, read_plane: usize, cur: [u8; 4]) -> u8 {
     let mut gc = vga.gc.read();
     gc[4] = read_plane as u8;
     let (data, latches) = ::vga::planar_read(cur, &gc);
@@ -1719,52 +1705,6 @@ mod bios_memory_tests {
             aperture,
         };
         (memory, DosVideo::Vga(dev))
-    }
-
-    #[test]
-    fn queued_mov_stores_match_immediate_planar_writes_in_every_write_mode() {
-        use crate::kernel::dos::planar::{FastWrites, Store};
-        for mode in 0..4 {
-            let (mut direct, mut first) = setup(0x0d);
-            let (mut batched, mut second) = setup(0x0d);
-            let a = first.emulated_mut().unwrap().state.legacy_mut().unwrap();
-            let b = second.emulated_mut().unwrap().state.legacy_mut().unwrap();
-            for state in [&mut *a, &mut *b] {
-                state.gc.set(5, mode);
-                state.gc.set(3, 0x19); // XOR, rotated CPU data
-                state.gc.set(8, 0x5a);
-                state.seq.set(2, 9);
-                state.latches = [0x12, 0x34, 0x56, 0x78];
-            }
-            let mut writes = FastWrites::new();
-            let mut regs = crate::Regs::empty();
-            regs.err_code = 6;
-            regs.frame.rflags = 1 << 17;
-            // Admit the three operand widths before collecting a mixed batch.
-            for bytes in [1u8, 2, 4] {
-                let (code, len) = match bytes {
-                    1 => ([0x88, 7, 0, 0, 0, 0, 0, 0], 2),
-                    2 => ([0x89, 7, 0, 0, 0, 0, 0, 0], 2),
-                    _ => ([0x66, 0x89, 7, 0, 0, 0, 0, 0], 3),
-                };
-                regs.frame.rip = u64::from(bytes);
-                writes.remember(&regs, 0, false, code, 0, len);
-            }
-            for (address, value, bytes) in [
-                (0xa0003, 0x55, 1u8), (0xa0007, 0x1234, 2),
-                (0xa0020, 0x87654321, 4), (0xa0021, 0xabcdef, 4),
-            ] {
-                for byte in 0..bytes {
-                    vram_write(&mut direct, a, address - 0xa0000 + u32::from(byte),
-                        (value >> (byte * 8)) as u8);
-                }
-                assert!(writes.batch.push(Store { address, reg: value, ins_id: u16::from(bytes) }));
-            }
-            flush_write_batch(&mut batched, b, &mut writes);
-            assert!(writes.batch.drain().next().is_none());
-            assert_eq!(direct.planes, batched.planes, "write mode {mode}");
-            assert_eq!(a.latches, b.latches);
-        }
     }
 
     #[test]

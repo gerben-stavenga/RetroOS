@@ -35,6 +35,7 @@ def main():
     parser.add_argument('--cpus', type=int, default=2)
     parser.add_argument('--mode', choices=['profile', 'osd', 'timedemo'], default='profile')
     parser.add_argument('--no-build', action='store_true', help='Use the existing Bazel images')
+    parser.add_argument('--boot-image', type=Path, help='Use a saved boot image for before/after comparisons')
     options = parser.parse_args()
     if options.cpus < 1:
         parser.error('--cpus must be positive')
@@ -72,7 +73,7 @@ def main():
             mbr = stream.read(512)
         start = struct.unpack_from('<I', mbr, 454)[0] if mbr[450] else 0
         subprocess.run(['mcopy', '-o', '-i', f'{data}@@{start * 512}', str(short), '::GAMES/DOOMS/PERF.LMP'], check=True)
-    boot = prepare_boot(work, data)
+    boot = prepare_boot(work, data, boot_image=options.boot_image)
     shutil.copyfile('/usr/share/OVMF/OVMF_VARS_4M.fd', work / 'vars.fd')
     cmdline = 'GAMES/DOOMS/DOOM.EXE -' + ('timedemo' if mode == 'timedemo' else 'playdemo') + (' perf' if mode == 'timedemo' else ' demo1')
     args = ['qemu-system-x86_64', '-accel', 'kvm', '-cpu', 'host', '-smp', str(cpus), '-M', 'q35', '-m', '512', '-nodefaults', '-device', 'bochs-display', '-device', 'qemu-xhci', '-display', 'none', '-nic', 'none', '-serial', 'none', '-chardev', f'socket,id=mcp,path={work}/mcp.sock,server=on,wait=off', '-serial', 'chardev:mcp', '-fw_cfg', 'name=opt/mcp,string=com2', '-fw_cfg', 'name=opt/cmdline,string=' + cmdline, '-fw_cfg', 'name=opt/cwd,string=GAMES/DOOMS', '-drive', 'if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd', '-drive', f'if=pflash,format=raw,file={work}/vars.fd', '-drive', f'file={boot},if=none,id=boot,format=raw,snapshot=on', '-device', 'piix3-ide,id=boot-ide', '-device', 'ide-hd,drive=boot,bus=boot-ide.0,unit=0,bootindex=1', '-drive', f'file={data},if=none,id=data,format=raw,snapshot=on', '-device', 'ide-hd,drive=data,bus=ide.0', '-audiodev', f'wav,id=snd0,path={work}/audio.wav', '-device', 'intel-hda', '-device', 'hda-duplex,audiodev=snd0', '-debugcon', f'file:{work}/guest.log', '-no-reboot']

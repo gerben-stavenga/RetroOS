@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--no-build', action='store_true')
+    parser.add_argument('--cpus', type=int, default=1, choices=[1, 2])
     parser.add_argument('--boot-image', type=Path,
                         help='Test a saved kernel image, for throughput comparisons')
     args = parser.parse_args()
@@ -43,6 +44,7 @@ def main():
     command = ['./run.sh', 'qemu', '--kvm', '--headless', '--sound', 'none',
                '--data-image', str(disk), '--cmd', 'EGAPAGES.COM', '--',
                '-qmp', f'unix:{qmp},server=on,wait=off']
+    command += ['-smp', str(args.cpus)]
     if args.boot_image:
         boot = work / 'boot.img'
         subprocess.run(['cp', '--reflink=auto', '--sparse=always',
@@ -57,11 +59,11 @@ SCRIPT_DIR=$PWD
 WORK=$1 BOOT_IMAGE=$2 DATA_IMAGE=$3
 ARCH=386 FIRMWARE=uefi HEADLESS=1 KVM=1 SOUND=none HD=nvme FREEDOS=0
 COMMAND=EGAPAGES.COM HOST_DIR= SB_AUDIO=
-PASS=(-qmp "unix:$WORK/qmp.sock,server=on,wait=off")
+PASS=(-qmp "unix:$WORK/qmp.sock,server=on,wait=off" -smp "$4")
 run_vm() { "$@"; }
 source tools/run/qemu.sh
 launch
-''', 'ega-pages', str(work), str(boot), str(disk)]
+''', 'ega-pages', str(work), str(boot), str(disk), str(args.cpus)]
     with log.open('wb') as f:
         process = subprocess.Popen(command, cwd=ROOT, stdout=f, stderr=f,
                                    stdin=subprocess.DEVNULL, start_new_session=True)
@@ -105,10 +107,11 @@ launch
                 call('quit')
         process.wait(timeout=5)
         print(f'PASS: EGA page size, BDA offset, page selection and hidden-page redraw ({work})')
-        timing = re.search(r'EGA-MOV-CYCLES=([0-9A-F]{16})', content)
-        if timing:
+        for kind in ['MOV', 'UNROLLED', 'SHARED']:
+            timing = re.search(r'EGA-' + kind + r'-CYCLES=([0-9A-F]{16})', content)
+            assert timing, f'Missing {kind} throughput measurement'
             cycles = int(timing[1], 16)
-            print(f'MOV stores: {cycles} TSC ticks / 32768 = {cycles / 32768:.1f} ticks/store')
+            print(f'{kind} stores: {cycles} TSC ticks / 32768 = {cycles / 32768:.1f} ticks/store')
     finally:
         if process.poll() is None:
             import signal

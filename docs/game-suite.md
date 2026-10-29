@@ -94,10 +94,13 @@ kernel and COMMAND.COM artifacts. The suite remains opt-in, outside CI and
 page selection on UEFI/QEMU/KVM. It draws two different pages, selects page 1,
 redraws the hidden page 0, and verifies that page 1 remains visible. It also
 checks masked planar reads/writes and their flags, patched instruction bytes,
-the same instruction offset in different VM86 segments, queued MOV stores across
-the 256-entry limit, mixed store sizes, page-crossing stores, and draining
-before reads and VGA register changes. It reports TSC ticks for 32768 MOV
-stores, including the final drain. Use `--boot-image PATH --no-build` to compare
+the same instruction offset in different VM86 segments, looped and unrolled
+MOV stores, mixed store sizes, page-crossing stores, and ordering before reads
+and VGA register changes. It also checks PM16/PM32 stores and a descriptor-base
+change, SIB addressing with and without a base, size overrides, and direct-address
+MOV stores. Use `--cpus 1` or `--cpus 2` to cover inline and worker scanout. It reports TSC ticks for 32768 stores in the looped, distinct-immediate
+unrolled, and displacement-varying register-store cases. The unrolled sites collide in the former
+instruction cache. Use `--boot-image PATH --no-build` to compare
 saved kernel images with the same probe. This
 guards the graphics page-flip bug that made Cosmo and Duke Nukum flicker.
 The test uses a private disk and saves artifacts under `build/ci/ega-pages-*`.

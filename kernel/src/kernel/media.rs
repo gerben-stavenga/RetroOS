@@ -470,6 +470,15 @@ impl<T: Send + 'static> Drop for VideoService<T> {
 pub(crate) fn kernel_entry() {
     if !enabled() { video_checkpoint(); }
 }
+
+/// A native device-fault handler cannot run the inline renderer. Yield to
+/// the ordinary kernel entry when scanout has a phase to consume.
+#[cfg(target_arch = "x86")]
+pub(crate) fn inline_video_due() -> bool {
+    if enabled() { return false; }
+    let Some(service) = VIDEO_SERVICE.try_lock() else { return true; };
+    service.as_ref().is_some_and(|service| (service.due)())
+}
 fn video_checkpoint() {
     if let Some(service) = VIDEO_SERVICE.try_lock()
         && let Some(service) = *service

@@ -24,6 +24,7 @@ pub struct ExecutionContext<A: crate::Arch> {
     /// single active space ([`crate::Arch::activate`]); guest memory is reached
     /// through `machine`. `PhantomData` keeps `A` in the type.
     pub regs: crate::Regs,
+    pub device_cycles: u64,
     io_key: Option<crate::kernel::io_policy::PolicyKey>,
     io_policy: arch_abi::IoPolicy,
     _a: core::marker::PhantomData<A>,
@@ -45,6 +46,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
         ExecutionContext {
             tid,
             regs,
+            device_cycles: 0,
             io_key: None,
             io_policy: arch_abi::IoPolicy::deny_all(),
             _a: core::marker::PhantomData,
@@ -74,9 +76,12 @@ impl<A: crate::Arch> ExecutionContext<A> {
             self.io_key = Some(key);
         }
         machine.execution_profile_time(arch_abi::ExecutionProfileStage::PolicyLookup);
+        self.device_cycles = 0;
         if let thread::Personality::Dos(dos) = personality {
-            return crate::kernel::dos::execute_planar(machine, dos, &mut self.regs,
-                &self.io_policy);
+            let (event, cycles) = crate::kernel::dos::planar::execute(machine, dos,
+                &mut self.regs, &self.io_policy);
+            self.device_cycles = cycles;
+            return event;
         }
         machine.execute(&mut self.regs, &self.io_policy)
     }

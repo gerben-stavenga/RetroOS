@@ -21,90 +21,137 @@
 //! devices themselves, and travels with them.
 
 use crate::Regs;
-use super::super::planar::FastWrites;
+#[cfg(not(target_arch = "x86"))]
 use super::vga::{self, LegacyVgaState};
-use super::{set_string_index, step_string_index, string_index};
+use super::step_string_index;
+use core::mem::MaybeUninit;
 
-// Planar #PF decode is a kernel-side trap with no arch involvement: A0000 is
-// left unmapped while planar logic is needed, so the guest store/load faults,
-// the *existing* PageFault event arrives, and the instruction is emulated here
-// through `vga::vram_write`/`vga::vram_read`.
+// Native VGA faults invoke this decoder directly from the ring-0 aperture
+// handler. Hosted VGA and Voodoo supply a backend bus to the same decoder.
+
+/// Common native register view. Only even slots are read. Odd slots preserve
+/// native high halves (cleared by 32-bit writes), or are undefined on 32-bit entry.
+/// IP and flags refer to the separate CPU return frame.
+pub(in crate::kernel::dos) struct Operands<'a> {
+    pub gprs: &'a mut [MaybeUninit<u32>; 16],
+    pub ip: &'a mut u32,
+    pub flags: &'a mut u32,
+}
+impl Operands<'_> {
+    pub fn get(&self, index: u8, bytes: u32) -> u32 {
+        let reg = if bytes == 1 { index & 3 } else { index & 7 };
+        // Entry initializes every even slot. Odd slots are never read.
+        let value = unsafe { self.gprs[usize::from(reg) * 2].assume_init() };
+        match bytes { 1 if index & 4 != 0 => (value >> 8) & 255,
+            1 => value & 255, 2 => value & 65535, _ => value }
+    }
+    pub fn set(&mut self, index: u8, bytes: u32, value: u32) {
+        let reg = if bytes == 1 { index & 3 } else { index & 7 };
+        let shift = if bytes == 1 && index & 4 != 0 { 8 } else { 0 };
+        let mask = match bytes { 1 => 255 << shift, 2 => 65535, _ => u32::MAX };
+        let old = self.get(reg, 4);
+        self.gprs[usize::from(reg) * 2].write((old & !mask) | ((value << shift) & mask));
+        if bytes == 4 { self.gprs[usize::from(reg) * 2 + 1].write(0); }
+    }
+}
 
 /// Width of the data a string/mov op moves (bytes).
 fn opsize(op32: bool, byte_op: bool) -> u32 {
     if byte_op { 1 } else if op32 { 4 } else { 2 }
 }
 
-/// Operand of an already-admitted deferred store. The normal decoder admits
-/// only these MOV encodings; the fast handler merely records the raw GPR.
-pub(in crate::kernel::dos) fn deferred_store(code: &[u8], default32: bool, reg: u32) -> (u32, u8) {
-    let mut i = 0;
-    let mut p66 = false;
-    loop {
-        match code[i] {
-            0x66 => { p66 = true; i += 1; }
-            0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 => i += 1,
-            _ => break,
-        }
-    }
-    let opcode = code[i];
-    let bytes = opsize(default32 ^ p66, opcode & 1 == 0) as u8;
-    let value = match opcode {
-        0x88 if code[i + 1] & 0x20 != 0 => reg >> 8, // AH/CH/DH/BH
-        0x88 | 0x89 | 0xa2 | 0xa3 => reg,
-        0xc6 | 0xc7 => {
-            let mut raw = [0; 4];
-            raw[..usize::from(bytes)].copy_from_slice(&code[code.len() - usize::from(bytes)..]);
-            u32::from_le_bytes(raw)
-        }
-        _ => unreachable!("instruction was not admitted as a deferred store"),
-    };
-    (value, bytes)
+/// Decode a plain MOV store without an instruction-address cache. Used by
+/// both immediate native fault dispatch and the ordinary MMIO decoder.
+/// No guest memory is accessed here; truncation and other opcodes decline.
+#[cfg(test)]
+pub(in crate::kernel::dos) fn mov_store(code: &[u8], default32: bool,
+    regs: &Operands<'_>) -> Option<(u32, u32, u32)> {
+    decode_mov_store(code, default32, |index, bytes| gpr(regs, index, bytes))
 }
 
-/// Read/write an integer GP register by encoding `idx` and size `sz` (bytes).
-/// Maps the x86 register order (0=A,1=C,2=D,3=B,4=SP/AH..,5=BP/CH,6=SI,7=DI).
-fn gpr(regs: &mut Regs, idx: u8, sz: u32) -> u32 {
-    let full = match idx & 7 {
-        0 => regs.rax, 1 => regs.rcx, 2 => regs.rdx, 3 => regs.rbx,
-        4 => regs.frame.rsp, 5 => regs.rbp, 6 => regs.rsi, _ => regs.rdi,
-    } as u32;
-    if sz == 1 {
-        match idx & 7 {
-            0..=3 => full & 0xFF,            // al/cl/dl/bl
-            _ => (match idx & 3 { 0 => regs.rax, 1 => regs.rcx, 2 => regs.rdx, _ => regs.rbx } >> 8) as u32 & 0xFF, // ah/ch/dh/bh
-        }
-    } else if sz == 2 { full & 0xFFFF } else { full }
+#[cfg(test)]
+pub(in crate::kernel::dos) fn decode_mov_store(code: &[u8], default32: bool,
+    register: impl Fn(u8, u32) -> u32) -> Option<(u32, u32, u32)> {
+    decode_mov_store_from(|at| code[at], code.len(), default32, register)
 }
 
-fn set_gpr(regs: &mut Regs, idx: u8, sz: u32, val: u32) {
-    fn slot(regs: &mut Regs, i: u8) -> &mut u64 {
-        match i & 7 {
-            0 => &mut regs.rax, 1 => &mut regs.rcx, 2 => &mut regs.rdx, 3 => &mut regs.rbx,
-            4 => &mut regs.frame.rsp, 5 => &mut regs.rbp, 6 => &mut regs.rsi, _ => &mut regs.rdi,
-        }
-    }
-    if sz == 1 {
-        if idx & 4 == 0 {
-            let r = slot(regs, idx & 3); *r = (*r & !0xFF) | (val as u64 & 0xFF);     // al/cl/dl/bl
-        } else {
-            let r = slot(regs, idx & 3); *r = (*r & !0xFF00) | ((val as u64 & 0xFF) << 8); // ah/ch/dh/bh
-        }
-    } else if sz == 2 {
-        let r = slot(regs, idx); *r = (*r & !0xFFFF) | (val as u64 & 0xFFFF);
+/// Fetch only the bytes needed by this opcode. CR2 already supplies the
+/// destination, so displacement bytes need not be read at all. The native
+/// handler supplies a volatile reader bounded to the executable code page.
+#[cfg(test)]
+pub(in crate::kernel::dos) fn decode_mov_store_from(read: impl Fn(usize) -> u8,
+    available: usize, default32: bool, register: impl Fn(u8, u32) -> u32,
+) -> Option<(u32, u32, u32)> {
+    let (source, immediate, bytes, len) = decode_mov_encoding(&read, available, default32)?;
+    Some((if source == 255 { immediate } else { register(source, bytes) }, bytes, len))
+}
+
+// One decoder for native misses and ordinary MMIO. Keep register-frame access
+// outside it so the two callers do not instantiate separate opcode decoders.
+fn decode_mov_encoding(read: &dyn Fn(usize) -> u8, available: usize, default32: bool)
+    -> Option<(u8, u32, u32, u32)>
+{
+    let get = |at: usize| (at < available.min(15)).then(|| read(at));
+    let first = get(0)?;
+    // The overwhelmingly common forms need no prefix-state loop: bare MOV,
+    // or one ES override (Wolf3D's scalar stores). Other prefixes use the
+    // same operand decoder after resolving their sizes below.
+    let (plain, prefix_len) = if first == 0x26 { (get(1)?, 1) } else { (first, 0) };
+    let (opcode, mut i, op32, addr32) = if matches!(plain, 0x88 | 0x89 | 0xc6 | 0xc7 | 0xa2 | 0xa3) {
+        (plain, prefix_len + 1, default32, default32)
     } else {
-        let r = slot(regs, idx); *r = val as u64; // 32-bit write zero-extends
-    }
+        let mut i = 0;
+        let (mut p66, mut p67) = (false, false);
+        loop {
+            match get(i)? {
+                0x66 => p66 = true,
+                0x67 => p67 = true,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0xf2 | 0xf3 => {},
+                opcode => break (opcode, i + 1, default32 ^ p66, default32 ^ p67),
+            }
+            i += 1;
+        }
+    };
+    let bytes = opsize(op32, opcode & 1 == 0);
+    let mut source = 255;
+    let value = match opcode {
+        0x88 | 0x89 | 0xc6 | 0xc7 => {
+            let modrm = get(i)?;
+            if modrm >> 6 == 3 || (opcode >= 0xc6 && modrm & 0x38 != 0) { return None; }
+            let length = modrm_len(modrm, addr32,
+                |at| get(at as usize).unwrap_or(0), i as u32) as usize;
+            i += length;
+            if opcode >= 0xc6 {
+                let mut value = 0;
+                for byte in 0..bytes {
+                    value |= u32::from(get(i + byte as usize)?) << (byte * 8);
+                }
+                i += bytes as usize;
+                value
+            } else { source = (modrm >> 3) & 7; 0 }
+        }
+        0xa2 | 0xa3 => {
+            i += if addr32 { 4 } else { 2 };
+            source = 0;
+            0
+        }
+        _ => return None,
+    };
+    if i > available || i > 15 { return None; }
+    Some((source, value, bytes, i as u32))
 }
+
+fn gpr(regs: &Operands<'_>, idx: u8, sz: u32) -> u32 { regs.get(idx, sz) }
+fn set_gpr(regs: &mut Operands<'_>, idx: u8, sz: u32, value: u32) { regs.set(idx, sz, value); }
 
 /// Write the six status flags (CF/PF/AF/ZF/SF/OF) for an ALU result of width
 /// `sz` bytes, leaving the rest of EFLAGS untouched. CF/AF/OF are supplied by
 /// the caller (they depend on the operation); PF (always the low byte), ZF, and
 /// SF (the operand-width sign bit) derive from the result.
-fn write_flags(regs: &mut Regs, res: u32, sz: u32, cf: bool, af: bool, of: bool) {
-    const MASK: u64 = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+fn write_flags(regs: &mut Operands<'_>, res: u32, sz: u32, cf: bool, af: bool, of: bool) {
+    const MASK: u32 = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
     let msb = 1u32 << (sz * 8 - 1);
-    let mut f = regs.frame.rflags & !MASK;
+    let mut f = *regs.flags & !MASK;
     if cf {
         f |= 1 << 0;
     } // CF
@@ -123,7 +170,7 @@ fn write_flags(regs: &mut Regs, res: u32, sz: u32, cf: bool, af: bool, of: bool)
     if of {
         f |= 1 << 11;
     } // OF
-    regs.frame.rflags = f;
+    *regs.flags = f;
 }
 
 /// Compute an ALU op `a OP b` of width `sz` bytes (1/2/4), update EFLAGS, and
@@ -132,7 +179,7 @@ fn write_flags(regs: &mut Regs, res: u32, sz: u32, cf: bool, af: bool, of: bool)
 /// CF/OF/AF per the x86 spec; the arithmetic ops follow the standard
 /// borrow/overflow definitions. CMP computes a subtraction for flags but the
 /// caller discards the returned value. Inputs/outputs are masked to `sz`.
-fn alu(regs: &mut Regs, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
+fn alu(regs: &mut Operands<'_>, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
     let bits = sz * 8;
     let mask = if sz == 4 {
         0xFFFF_FFFFu32
@@ -141,7 +188,7 @@ fn alu(regs: &mut Regs, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
     };
     let msb = 1u32 << (bits - 1);
     let (a, b) = (a & mask, b & mask);
-    let cf_in = (regs.frame.rflags & 1) as u32;
+    let cf_in = (*regs.flags & 1) as u32;
     match alu {
         0 | 2 => {
             // ADD / ADC
@@ -180,10 +227,10 @@ fn alu(regs: &mut Regs, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
 
 /// Increment or decrement an operand while preserving CF, the one flag these
 /// operations deliberately do not share with ADD/SUB.
-fn inc_dec(regs: &mut Regs, value: u32, decrement: bool, sz: u32) -> u32 {
-    let carry = regs.frame.rflags & 1;
+fn inc_dec(regs: &mut Operands<'_>, value: u32, decrement: bool, sz: u32) -> u32 {
+    let carry = *regs.flags & 1;
     let res = alu(regs, if decrement { 5 } else { 0 }, value, 1, sz);
-    regs.frame.rflags = (regs.frame.rflags & !1) | carry;
+    *regs.flags = (*regs.flags & !1) | carry;
     res
 }
 
@@ -321,24 +368,27 @@ fn modrm_len(modrm: u8, addr32: bool, peek: impl Fn(u32) -> u8, after: u32) -> u
 pub enum MmioTarget<'a> {
     /// The VGA planar aperture selected by GC[6], through the graphics
     /// controller. Text-font access commonly selects B8000 rather than A0000.
-    Planar { vga: &'a mut LegacyVgaState, base: u32, len: u32, allow: &'a mut FastWrites },
+    #[cfg(not(target_arch = "x86"))]
+    Planar { vga: &'a mut LegacyVgaState, base: u32, len: u32 },
     /// The Voodoo's PCI aperture: registers, LFB and texture download.
     Voodoo(&'a mut super::vvoodoo::VVoodoo),
 }
 
 impl MmioTarget<'_> {
     #[inline]
-    fn write8<A: crate::Arch>(&mut self, machine: &mut A, off: u32, val: u8) {
+    fn write8<A: crate::Arch>(&mut self, _machine: &mut A, off: u32, val: u8) {
         match self {
-            Self::Planar { vga, .. } => vga::vram_write(machine, vga, off, val),
+            #[cfg(not(target_arch = "x86"))]
+            Self::Planar { vga, .. } => vga::vram_write(_machine, vga, off, val),
             Self::Voodoo(vd) => vd.write8(off, val),
         }
     }
 
     #[inline]
-    fn read8<A: crate::Arch>(&mut self, machine: &mut A, off: u32) -> u8 {
+    fn read8<A: crate::Arch>(&mut self, _machine: &mut A, off: u32) -> u8 {
         match self {
-            Self::Planar { vga, .. } => vga::vram_read(machine, vga, off),
+            #[cfg(not(target_arch = "x86"))]
+            Self::Planar { vga, .. } => vga::vram_read(_machine, vga, off),
             Self::Voodoo(vd) => vd.read8(off),
         }
     }
@@ -347,8 +397,10 @@ impl MmioTarget<'_> {
     /// here; the VGA has nothing to settle, every byte already landed.
     #[inline]
     fn end_instruction(&mut self) {
-        if let Self::Voodoo(vd) = self {
-            vd.flush();
+        match self {
+            Self::Voodoo(vd) => vd.flush(),
+            #[cfg(not(target_arch = "x86"))]
+            Self::Planar { .. } => {},
         }
     }
 
@@ -360,6 +412,7 @@ impl MmioTarget<'_> {
     #[inline]
     fn offset(&self, addr: u32) -> Option<u32> {
         match self {
+            #[cfg(not(target_arch = "x86"))]
             Self::Planar { base, len, .. } =>
                 (*base..base.saturating_add(*len)).contains(&addr).then(|| addr - *base),
             Self::Voodoo(vd) => vd.aperture_offset(addr),
@@ -368,22 +421,73 @@ impl MmioTarget<'_> {
 }
 
 
-/// The segment bases and the faulting offset are all independent inputs the
-/// decoder needs; bundling them would only move the list one level down.
+/// Memory and device access for the instruction decoder. Native VGA supplies
+/// this directly from its ring-0 fault context; hosted execution and Voodoo
+/// supply their backend here. The opcode decoder is compiled only once.
+pub(in crate::kernel::dos) trait FaultBus {
+    fn read8(&mut self, off: u32) -> u8;
+    fn write8(&mut self, off: u32, value: u8);
+    fn offset(&self, address: u32) -> Option<u32>;
+    fn guest_read(&self, address: u32) -> u8;
+    fn guest_write(&mut self, address: u32, value: u8);
+    fn fpu_st0(&self) -> [u8; 10];
+    fn fpu_pop(&mut self);
+    fn end_instruction(&mut self) {}
+}
+
+struct BackendBus<'a, 'b, A: crate::Arch> { machine: &'a mut A, target: &'a mut MmioTarget<'b> }
+impl<A: crate::Arch> FaultBus for BackendBus<'_, '_, A> {
+    fn read8(&mut self, off: u32) -> u8 { self.target.read8(self.machine, off) }
+    fn write8(&mut self, off: u32, value: u8) { self.target.write8(self.machine, off, value); }
+    fn offset(&self, address: u32) -> Option<u32> { self.target.offset(address) }
+    fn guest_read(&self, address: u32) -> u8 { self.machine.read::<u8>(address as usize) }
+    fn guest_write(&mut self, address: u32, value: u8) { self.machine.write(address as usize, value); }
+    fn fpu_st0(&self) -> [u8; 10] { self.machine.fpu_st0() }
+    fn fpu_pop(&mut self) { self.machine.fpu_pop(); }
+    fn end_instruction(&mut self) { self.target.end_instruction(); }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, target: &mut MmioTarget<'_>, cs_base: u32, def32: bool, ds_base: u32, es_base: u32, off: u32) -> bool {
-    let vm86 = regs.mode() == crate::UserMode::VM86;
-    let ip0 = if def32 { regs.ip32() } else { regs.ip32() & 0xFFFF };
+    let mut gprs = [MaybeUninit::uninit(); 16];
+    for (i, value) in [regs.rax, regs.rcx, regs.rdx, regs.rbx, regs.frame.rsp,
+        regs.rbp, regs.rsi, regs.rdi].into_iter().enumerate() {
+        gprs[2 * i].write(value as u32);
+        gprs[2 * i + 1].write((value >> 32) as u32);
+    }
+    let (mut ip, mut flags) = (regs.ip32(), regs.flags32());
+    let handled = emulate(&mut BackendBus { machine, target },
+        &mut Operands { gprs: &mut gprs, ip: &mut ip, flags: &mut flags },
+        cs_base, def32, ds_base, es_base, off);
+    for (i, slot) in [&mut regs.rax, &mut regs.rcx, &mut regs.rdx, &mut regs.rbx,
+        &mut regs.frame.rsp, &mut regs.rbp, &mut regs.rsi, &mut regs.rdi].into_iter().enumerate() {
+        *slot = u64::from(unsafe { gprs[2 * i].assume_init() })
+            | (u64::from(unsafe { gprs[2 * i + 1].assume_init() }) << 32);
+    }
+    regs.set_ip32(ip);
+    regs.set_flags32(flags);
+    handled
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::kernel::dos) fn emulate(bus: &mut dyn FaultBus, regs: &mut Operands<'_>, cs_base: u32, def32: bool,
+    ds_base: u32, es_base: u32, off: u32) -> bool {
+    let vm86 = *regs.flags & (1 << 17) != 0;
+    let ip0 = if def32 { *regs.ip } else { *regs.ip & 0xFFFF };
     // Pre-read the instruction (max 15 bytes) into a buffer so decoding doesn't
     // hold a borrow of `regs` while the emulation below mutates it.
     let mut buf = [0u8; 16];
     let code_addr = cs_base.wrapping_add(ip0);
-    if code_addr <= u32::MAX - 15 {
-        machine.copy_from(code_addr as usize, &mut buf);
-    } else {
-        for (k, byte) in buf.iter_mut().enumerate() {
-            *byte = machine.read::<u8>(code_addr.wrapping_add(k as u32) as usize);
-        }
+    for (k, byte) in buf.iter_mut().enumerate() {
+        *byte = bus.guest_read(code_addr.wrapping_add(k as u32));
+    }
+    if let Some((source, immediate, bytes, len)) = decode_mov_encoding(&|at| buf[at], buf.len(), def32) {
+        let value = if source == 255 { immediate } else { regs.get(source, bytes) };
+        for b in 0..bytes { bus.write8(off + b, (value >> (b * 8)) as u8); }
+        bus.end_instruction();
+        let next = ip0.wrapping_add(len);
+        *regs.ip = if def32 { next } else { next & 0xffff };
+        return true;
     }
     let peek = |o: u32| -> u8 { buf[(o & 15) as usize] };
 
@@ -392,8 +496,8 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
     // Interruptible `rep`: a real CPU services pending interrupts between string
     // iterations. We emulate the whole `rep` in one kernel call, so cap it at
     // REP_CHUNK iterations per fault; if CX isn't drained, `not_done` leaves EIP
-    // on the instruction so the guest re-faults to continue — and the event loop
-    // delivers any pending timer IRQ between chunks. Without this a big keen-4
+    // on the instruction so the guest re-faults to continue. Returning to the
+    // guest between chunks lets pending interrupts run. Without this a big keen-4
     // composite `rep movs` runs uninterruptibly, the owed ticks all fire at once
     // when it returns, and the guest's stack overflows.
     const REP_CHUNK: u32 = 2048;
@@ -419,29 +523,11 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
     let opcode = peek(i);
     i += 1;
 
-    let mut store = None;
     match opcode {
-        // mov r/m8, r8  — store AL-style
-        0x88 => {
-            let modrm = peek(i);
-            let val = gpr(regs, (modrm >> 3) & 7, 1) as u8;
-            i += modrm_len(modrm, addr32, peek, i);
-            target.write8(machine, off, val);
-            if modrm >> 6 != 3 { store = Some((modrm >> 3) & 3); }
-        }
-        // mov r/m16/32, r
-        0x89 => {
-            let modrm = peek(i);
-            let sz = opsize(op32, false);
-            let val = gpr(regs, (modrm >> 3) & 7, sz);
-            i += modrm_len(modrm, addr32, peek, i);
-            for b in 0..sz { target.write8(machine, off + b, (val >> (b * 8)) as u8); }
-            if modrm >> 6 != 3 { store = Some((modrm >> 3) & 7); }
-        }
         // mov r8, r/m8 — load
         0x8A => {
             let modrm = peek(i);
-            let v = target.read8(machine, off);
+            let v = bus.read8(off);
             set_gpr(regs, (modrm >> 3) & 7, 1, v as u32);
             i += modrm_len(modrm, addr32, peek, i);
         }
@@ -450,7 +536,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let modrm = peek(i);
             let sz = opsize(op32, false);
             let mut v = 0u32;
-            for b in 0..sz { v |= (target.read8(machine, off + b) as u32) << (b * 8); }
+            for b in 0..sz { v |= (bus.read8(off + b) as u32) << (b * 8); }
             set_gpr(regs, (modrm >> 3) & 7, sz, v);
             i += modrm_len(modrm, addr32, peek, i);
         }
@@ -462,36 +548,9 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
         0xA0 | 0xA1 => {
             let sz = opsize(op32, opcode == 0xA0);
             let mut v = 0u32;
-            for b in 0..sz { v |= (target.read8(machine, off + b) as u32) << (b * 8); }
+            for b in 0..sz { v |= (bus.read8(off + b) as u32) << (b * 8); }
             set_gpr(regs, 0, sz, v);
             i += if addr32 { 4 } else { 2 };
-        }
-        0xA2 | 0xA3 => {
-            let sz = opsize(op32, opcode == 0xA2);
-            let val = gpr(regs, 0, sz);
-            for b in 0..sz { target.write8(machine, off + b, (val >> (b * 8)) as u8); }
-            i += if addr32 { 4 } else { 2 };
-            store = Some(0);
-        }
-        // mov r/m8, imm8
-        0xC6 => {
-            let modrm = peek(i);
-            let l = modrm_len(modrm, addr32, peek, i);
-            let imm = peek(i + l);
-            i += l + 1;
-            target.write8(machine, off, imm);
-            if modrm & 0x38 == 0 && modrm >> 6 != 3 { store = Some(255); }
-        }
-        // mov r/m16/32, imm16/32 — Keen clears VRAM with `mov word es:[di],0`.
-        0xC7 => {
-            let modrm = peek(i);
-            let l = modrm_len(modrm, addr32, peek, i);
-            let sz = opsize(op32, false);
-            let mut imm = 0u32;
-            for b in 0..sz { imm |= (peek(i + l + b) as u32) << (b * 8); }
-            i += l + sz;
-            for b in 0..sz { target.write8(machine, off + b, (imm >> (b * 8)) as u8); }
-            if modrm & 0x38 == 0 && modrm >> 6 != 3 { store = Some(255); }
         }
         // xchg r/m8, r8 — Keen 4's Galaxy engine does `xchg es:[di], al` to
         // touch planar VRAM: the read half loads the GC latches, the write half
@@ -504,8 +563,8 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let ridx = (modrm >> 3) & 7;
             let regval = gpr(regs, ridx, 1) as u8;
             i += modrm_len(modrm, addr32, peek, i);
-            let memval = target.read8(machine, off);
-            target.write8(machine, off, regval);
+            let memval = bus.read8(off);
+            bus.write8(off, regval);
             set_gpr(regs, ridx, 1, memval as u32);
         }
         // xchg r/m16/32, r — the word/dword form, byte-by-byte so each byte
@@ -518,8 +577,8 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             i += modrm_len(modrm, addr32, peek, i);
             let mut memval = 0u32;
             for b in 0..sz {
-                memval |= (target.read8(machine, off + b) as u32) << (b * 8);
-                target.write8(machine, off + b, (regval >> (b * 8)) as u8);
+                memval |= (bus.read8(off + b) as u32) << (b * 8);
+                bus.write8(off + b, (regval >> (b * 8)) as u8);
             }
             set_gpr(regs, ridx, sz, memval);
         }
@@ -528,29 +587,28 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let sz = opsize(op32, opcode == 0xAA);
             let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
             let chunk = total.min(REP_CHUNK);
-            let al = regs.rax as u32;
-            let df = regs.frame.rflags & (1 << 10) != 0;
-            let mut di = string_index(regs.rdi, addr32);
+            let al = regs.get(0, 4);
+            let df = *regs.flags & (1 << 10) != 0;
+            let mut di = regs.get(7, if addr32 { 4 } else { 2 });
             for _ in 0..chunk {
                 let addr = es_base.wrapping_add(di);
                 for b in 0..sz {
                     let byte = (al >> (b * 8)) as u8;
                     let byte_addr = addr.wrapping_add(b);
-                    if let Some(o) = target.offset(byte_addr) {
-                        target.write8(machine, o, byte);
+                    if let Some(o) = bus.offset(byte_addr) {
+                        bus.write8(o, byte);
                     } else {
-                        machine.write::<u8>(byte_addr as usize, byte);
+                        bus.guest_write(byte_addr, byte);
                     }
                 }
                 di = step_string_index(di, sz, addr32, df);
             }
             // Advance DI by the chunk; on `rep`, drop CX by the chunk and, if it
             // isn't drained, leave EIP on the instruction (`not_done`) to resume.
-            set_string_index(&mut regs.rdi, di, addr32);
+            regs.set(7, if addr32 { 4 } else { 2 }, di);
             if rep {
                 let rem = total - chunk;
-                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
-                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                regs.set(1, if addr32 { 4 } else { 2 }, rem);
                 not_done = rem > 0;
             }
         }
@@ -565,29 +623,28 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let sz = opsize(op32, opcode == 0xAC);
             let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
             let chunk = total.min(REP_CHUNK);
-            let df = regs.frame.rflags & (1 << 10) != 0;
+            let df = *regs.flags & (1 << 10) != 0;
             // `rep lods` with CX=0 is a no-op — leave the accumulator untouched.
-            let mut si = string_index(regs.rsi, addr32);
+            let mut si = regs.get(6, if addr32 { 4 } else { 2 });
             for _ in 0..chunk {
                 let addr = ds_base.wrapping_add(si);
                 let mut val = 0u32;
                 for b in 0..sz {
                     let byte_addr = addr.wrapping_add(b);
-                    let byte = if let Some(o) = target.offset(byte_addr) {
-                        target.read8(machine, o)
+                    let byte = if let Some(o) = bus.offset(byte_addr) {
+                        bus.read8(o)
                     } else {
-                        machine.read::<u8>(byte_addr as usize)
+                        bus.guest_read(byte_addr)
                     };
                     val |= (byte as u32) << (b * 8);
                 }
                 set_gpr(regs, 0, sz, val);
                 si = step_string_index(si, sz, addr32, df);
             }
-            set_string_index(&mut regs.rsi, si, addr32);
+            regs.set(6, if addr32 { 4 } else { 2 }, si);
             if rep {
                 let rem = total - chunk;
-                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
-                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                regs.set(1, if addr32 { 4 } else { 2 }, rem);
                 not_done = rem > 0;
             }
         }
@@ -610,9 +667,9 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let sz = opsize(op32, opcode == 0xA4);
             let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
             let chunk = total.min(REP_CHUNK);
-            let df = regs.frame.rflags & (1 << 10) != 0;
-            let mut si = string_index(regs.rsi, addr32);
-            let mut di = string_index(regs.rdi, addr32);
+            let df = *regs.flags & (1 << 10) != 0;
+            let mut si = regs.get(6, if addr32 { 4 } else { 2 });
+            let mut di = regs.get(7, if addr32 { 4 } else { 2 });
             for _ in 0..chunk {
                 for b in 0..sz {
                     let src = ds_base.wrapping_add(si).wrapping_add(b);
@@ -622,26 +679,25 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                     // through `vram_read` — which also loads the GC latches, so a
                     // VRAM→VRAM `rep movs` (Keen's Galaxy engine composites screens
                     // from off-screen VRAM) is the correct EGA latch copy.
-                    let byte = if let Some(o) = target.offset(src) {
-                        target.read8(machine, o)
+                    let byte = if let Some(o) = bus.offset(src) {
+                        bus.read8(o)
                     } else {
-                        machine.read::<u8>(src as usize)
+                        bus.guest_read(src)
                     };
-                    if let Some(o) = target.offset(dst) {
-                        target.write8(machine, o, byte);
+                    if let Some(o) = bus.offset(dst) {
+                        bus.write8(o, byte);
                     } else {
-                        machine.write::<u8>(dst as usize, byte);
+                        bus.guest_write(dst, byte);
                     }
                 }
                 si = step_string_index(si, sz, addr32, df);
                 di = step_string_index(di, sz, addr32, df);
             }
-            set_string_index(&mut regs.rsi, si, addr32);
-            set_string_index(&mut regs.rdi, di, addr32);
+            regs.set(6, if addr32 { 4 } else { 2 }, si);
+            regs.set(7, if addr32 { 4 } else { 2 }, di);
             if rep {
                 let rem = total - chunk;
-                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
-                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                regs.set(1, if addr32 { 4 } else { 2 }, rem);
                 not_done = rem > 0;
             }
         }
@@ -656,9 +712,9 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let sz = opsize(op32, opcode == 0xAE);
             let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
             let chunk = total.min(REP_CHUNK);
-            let df = regs.frame.rflags & (1 << 10) != 0;
-            let acc = regs.rax as u32;
-            let mut di = string_index(regs.rdi, addr32);
+            let df = *regs.flags & (1 << 10) != 0;
+            let acc = regs.get(0, 4);
+            let mut di = regs.get(7, if addr32 { 4 } else { 2 });
             let mut done_n = 0u32;
             let mut stop = false;
             while done_n < chunk {
@@ -666,10 +722,10 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                 let mut mem = 0u32;
                 for b in 0..sz {
                     let byte_addr = addr.wrapping_add(b);
-                    let byte = if let Some(o) = target.offset(byte_addr) {
-                        target.read8(machine, o)
+                    let byte = if let Some(o) = bus.offset(byte_addr) {
+                        bus.read8(o)
                     } else {
-                        machine.read::<u8>(byte_addr as usize)
+                        bus.guest_read(byte_addr)
                     };
                     mem |= (byte as u32) << (b * 8);
                 }
@@ -678,15 +734,14 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                 done_n += 1;
                 if rep {
                     // repe (F3) continues while ZF=1; repne (F2) while ZF=0.
-                    let zf = regs.frame.rflags & (1 << 6) != 0;
+                    let zf = *regs.flags & (1 << 6) != 0;
                     if zf == repne { stop = true; break; }
                 }
             }
-            set_string_index(&mut regs.rdi, di, addr32);
+            regs.set(7, if addr32 { 4 } else { 2 }, di);
             if rep {
                 let rem = total - done_n;
-                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
-                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                regs.set(1, if addr32 { 4 } else { 2 }, rem);
                 // Re-fault to resume only if the chunk cap (not the ZF condition)
                 // stopped us with counts left.
                 not_done = !stop && rem > 0;
@@ -701,9 +756,9 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let sz = opsize(op32, opcode == 0xA6);
             let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
             let chunk = total.min(REP_CHUNK);
-            let df = regs.frame.rflags & (1 << 10) != 0;
-            let mut si = string_index(regs.rsi, addr32);
-            let mut di = string_index(regs.rdi, addr32);
+            let df = *regs.flags & (1 << 10) != 0;
+            let mut si = regs.get(6, if addr32 { 4 } else { 2 });
+            let mut di = regs.get(7, if addr32 { 4 } else { 2 });
             let mut done_n = 0u32;
             let mut stop = false;
             while done_n < chunk {
@@ -712,8 +767,8 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                 for b in 0..sz {
                     let s = ds_base.wrapping_add(si).wrapping_add(b);
                     let d = es_base.wrapping_add(di).wrapping_add(b);
-                    let sb = match target.offset(s) { Some(o) => target.read8(machine, o), None => machine.read::<u8>(s as usize) };
-                    let db = match target.offset(d) { Some(o) => target.read8(machine, o), None => machine.read::<u8>(d as usize) };
+                    let sb = match bus.offset(s) { Some(o) => bus.read8(o), None => bus.guest_read(s) };
+                    let db = match bus.offset(d) { Some(o) => bus.read8(o), None => bus.guest_read(d) };
                     src1 |= (sb as u32) << (b * 8);
                     src2 |= (db as u32) << (b * 8);
                 }
@@ -722,16 +777,15 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                 di = step_string_index(di, sz, addr32, df);
                 done_n += 1;
                 if rep {
-                    let zf = regs.frame.rflags & (1 << 6) != 0;
+                    let zf = *regs.flags & (1 << 6) != 0;
                     if zf == repne { stop = true; break; }
                 }
             }
-            set_string_index(&mut regs.rsi, si, addr32);
-            set_string_index(&mut regs.rdi, di, addr32);
+            regs.set(6, if addr32 { 4 } else { 2 }, si);
+            regs.set(7, if addr32 { 4 } else { 2 }, di);
             if rep {
                 let rem = total - done_n;
-                regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
-                           else { (regs.rcx & !0xFFFF) | (rem as u64 & 0xFFFF) };
+                regs.set(1, if addr32 { 4 } else { 2 }, rem);
                 not_done = !stop && rem > 0;
             }
         }
@@ -757,7 +811,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let reg = gpr(regs, ridx, sz);
             let mut mem = 0u32;
             for b in 0..sz {
-                mem |= (target.read8(machine, off + b) as u32) << (b * 8);
+                mem |= (bus.read8(off + b) as u32) << (b * 8);
             }
             if reg_is_dst {
                 let res = alu(regs, group, reg, mem, sz);
@@ -769,7 +823,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                 if group != 7 {
                     // CMP: no write-back
                     for b in 0..sz {
-                        target.write8(machine, off + b, (res >> (b * 8)) as u8);
+                        bus.write8(off + b, (res >> (b * 8)) as u8);
                     }
                 }
             }
@@ -788,7 +842,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let reg = gpr(regs, ridx, sz);
             let mut mem = 0u32;
             for b in 0..sz {
-                mem |= (target.read8(machine, off + b) as u32) << (b * 8);
+                mem |= (bus.read8(off + b) as u32) << (b * 8);
             }
             alu(regs, 4, mem, reg, sz); // group 4 = AND, result discarded
         }
@@ -813,11 +867,11 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             }
             i += l + immsz;
             let mut mem = 0u32;
-            for b in 0..sz { mem |= (target.read8(machine, off + b) as u32) << (b * 8); }
+            for b in 0..sz { mem |= (bus.read8(off + b) as u32) << (b * 8); }
             let res = alu(regs, group, mem, imm, sz);
             if group != 7 {
                 // CMP: flags only, no write-back
-                for b in 0..sz { target.write8(machine, off + b, (res >> (b * 8)) as u8); }
+                for b in 0..sz { bus.write8(off + b, (res >> (b * 8)) as u8); }
             }
         }
         // Grp4: INC/DEC r/m8. A planar blitter uses `inc byte es:[di]`
@@ -830,9 +884,9 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let modrm = peek(i);
             let ext = (modrm >> 3) & 7;
             i += modrm_len(modrm, addr32, peek, i);
-            let mem = u32::from(target.read8(machine, off));
+            let mem = u32::from(bus.read8(off));
             let res = inc_dec(regs, mem, ext == 1, 1);
-            target.write8(machine, off, res as u8);
+            bus.write8(off, res as u8);
         }
         // x87 stores into the aperture: `fst`/`fstp` (ModR/M reg field 2 and 3)
         // in single (0xD9), double (0xDD) and integer (0xDB dword, 0xDF word,
@@ -846,7 +900,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let modrm = peek(i);
             let ext = (modrm >> 3) & 7;
             i += modrm_len(modrm, addr32, peek, i);
-            let st0 = machine.fpu_st0();
+            let st0 = bus.fpu_st0();
             let (bytes, raw): (u32, u64) = match opcode {
                 0xD9 => (4, f80_to_f32_bits(st0) as u64),
                 0xDD => (8, f80_to_f64_bits(st0)),
@@ -855,11 +909,11 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                 _ => (2, f80_to_int(st0, 16) as i16 as u16 as u64),
             };
             for b in 0..bytes {
-                target.write8(machine, off + b, (raw >> (b * 8)) as u8);
+                bus.write8(off + b, (raw >> (b * 8)) as u8);
             }
             // Every integer store but `fist` pops, as does `fstp`.
             if ext == 3 || ext == 7 {
-                machine.fpu_pop();
+                bus.fpu_pop();
             }
         }
         _ => {
@@ -871,48 +925,72 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                 ip0,
                 &buf[..]
             );
-            target.end_instruction();
+            bus.end_instruction();
             return false;
         }
     }
 
-    if !rep && i <= 8
-        && let (Some(gpr_index), MmioTarget::Planar { allow, .. }) = (store, &mut *target)
-    {
-        allow.remember(regs, cs_base, def32, buf[..8].try_into().unwrap(), gpr_index, i as u8);
-    }
-
     // Commit anything the target buffered across this instruction (the Voodoo
     // gathers bytes into whole register dwords).
-    target.end_instruction();
+    bus.end_instruction();
 
     // Advance EIP past the emulated instruction — unless a `rep` was capped
     // mid-string (`not_done`), in which case leave EIP on the instruction so the
     // guest re-executes it (and re-faults) to finish the remaining CX, after the
     // event loop gets a chance to deliver any pending interrupt.
     let new_ip = if not_done { ip0 } else { ip0.wrapping_add(i) };
-    let cur_ip = regs.ip32();
-    if vm86 { regs.set_ip32((cur_ip & !0xFFFF) | (new_ip & 0xFFFF)); }
-    else { regs.set_ip32(new_ip); }
+    let cur_ip = *regs.ip;
+    if vm86 { *regs.ip = (cur_ip & !0xFFFF) | (new_ip & 0xFFFF); }
+    else { *regs.ip = new_ip; }
     true
 }
 
 #[cfg(test)]
 mod tests {
-    use super::deferred_store;
     use super::inc_dec;
     use super::super::{set_string_index, step_string_index, string_index};
-    use crate::Regs;
+    use super::{Operands, MaybeUninit};
 
     #[test]
-    fn deferred_mov_uses_captured_register_or_instruction_immediate() {
-        assert_eq!(deferred_store(&[0x88, 0x27], false, 0x12345678), (0x123456, 1)); // AH
-        assert_eq!(deferred_store(&[0x26, 0x89, 7], false, 0x12345678), (0x12345678, 2));
-        assert_eq!(deferred_store(&[0x66, 0x89, 7], false, 0x12345678), (0x12345678, 4));
-        assert_eq!(deferred_store(&[0x66, 0x89, 7], true, 0x12345678), (0x12345678, 2));
-        assert_eq!(deferred_store(&[0xc6, 7, 0xab], false, 0), (0xab, 1));
-        assert_eq!(deferred_store(&[0xc7, 7, 0x34, 0x12], false, 0), (0x1234, 2));
-        assert_eq!(deferred_store(&[0x66, 0xc7, 7, 0x78, 0x56, 0x34, 0x12], false, 0), (0x12345678, 4));
+    fn scalar_mov_fetches_opcode_and_modrm_without_reading_displacement() {
+        let reads = core::cell::Cell::new(0);
+        // ES:MOV [DI+disp16],AL. The fault address already includes disp16.
+        let header = [0x26, 0x88, 0x85];
+        let decoded = super::decode_mov_store_from(|at| {
+            reads.set(reads.get() + 1);
+            header[at] // fetching either displacement byte would panic
+        }, 5, false, |index, bytes| {
+            assert_eq!((index, bytes), (0, 1));
+            0x5a
+        });
+        assert_eq!(decoded, Some((0x5a, 1, 5)));
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[test]
+    fn immediate_mov_decoder_handles_widths_registers_and_immediates() {
+        let mut words = [MaybeUninit::new(0); 16];
+        let (mut ip, mut flags) = (0, 0);
+        let mut regs = Operands { gprs: &mut words, ip: &mut ip, flags: &mut flags };
+        regs.set(0, 4, 0x12345678);
+        for (code, default32, expected) in [
+            (&[0x88, 0x27][..], false, (0x56, 1, 2)), // AH
+            (&[0x26, 0x89, 7][..], false, (0x5678, 2, 3)),
+            (&[0x66, 0x89, 7][..], false, (0x12345678, 4, 3)),
+            (&[0x66, 0x89, 7][..], true, (0x5678, 2, 3)),
+            (&[0xc6, 7, 0xab][..], false, (0xab, 1, 3)),
+            (&[0xc7, 7, 0x34, 0x12][..], false, (0x1234, 2, 4)),
+            (&[0xa2, 0x34, 0x12][..], false, (0x78, 1, 3)),
+            (&[0x89, 0x84, 0x8d, 1, 2, 3, 4][..], true, (0x12345678, 4, 7)),
+        ] {
+            assert_eq!(super::mov_store(code, default32, &mut regs), Some(expected));
+            for len in 0..code.len() {
+                assert_eq!(super::mov_store(&code[..len], default32, &mut regs), None);
+            }
+        }
+        for code in [&[0xf3, 0xaa][..], &[0x89, 0xc0], &[0xc6, 0x0f, 1], &[0x8a, 7]] {
+            assert_eq!(super::mov_store(code, false, &mut regs), None);
+        }
     }
 
     #[test]
@@ -930,19 +1008,21 @@ mod tests {
 
     #[test]
     fn byte_inc_dec_flags_can_preserve_carry() {
-        let mut regs = Regs::empty();
-        regs.frame.rflags = 1; // CF set before INC
+        let mut words = [MaybeUninit::new(0); 16];
+        let (mut ip, mut flags) = (0, 0);
+        let mut regs = Operands { gprs: &mut words, ip: &mut ip, flags: &mut flags };
+        *regs.flags = 1; // CF set before INC
         let incremented = inc_dec(&mut regs, 0x7f, false, 1);
         assert_eq!(incremented, 0x80);
-        assert_eq!(regs.frame.rflags & 1, 1); // INC preserves CF
-        assert_ne!(regs.frame.rflags & (1 << 11), 0); // signed overflow
-        assert_ne!(regs.frame.rflags & (1 << 4), 0); // auxiliary carry
+        assert_eq!(*regs.flags & 1, 1); // INC preserves CF
+        assert_ne!(*regs.flags & (1 << 11), 0); // signed overflow
+        assert_ne!(*regs.flags & (1 << 4), 0); // auxiliary carry
 
-        regs.frame.rflags = 0; // CF clear before DEC
+        *regs.flags = 0; // CF clear before DEC
         let decremented = inc_dec(&mut regs, 0x80, true, 1);
         assert_eq!(decremented, 0x7f);
-        assert_eq!(regs.frame.rflags & 1, 0); // DEC preserves CF
-        assert_ne!(regs.frame.rflags & (1 << 11), 0); // signed overflow
-        assert_ne!(regs.frame.rflags & (1 << 4), 0); // auxiliary borrow
+        assert_eq!(*regs.flags & 1, 0); // DEC preserves CF
+        assert_ne!(*regs.flags & (1 << 11), 0); // signed overflow
+        assert_ne!(*regs.flags & (1 << 4), 0); // auxiliary borrow
     }
 }

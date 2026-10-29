@@ -126,7 +126,6 @@ pub(super) fn set_desc_limit(desc: &mut u64, limit: u32) {
 /// returned directly into its destination instead of duplicated on the
 /// kernel stack.
 pub(in crate::kernel::dos) fn install_kernel_ldt_slots<A: crate::Arch>(dos: &mut thread::DosState<A>) {
-    dos.planar_writes.clear();
     // Reserve + install each kernel slot.
     let mark = |dos: &mut thread::DosState<A>, idx: usize, desc: u64| {
         dos.ldt[idx] = desc;
