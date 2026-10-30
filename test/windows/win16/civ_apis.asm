@@ -1,6 +1,7 @@
 bits 16
 segment _TEXT public class=CODE use16
 extern Debug, Exit, GetTickCount, GlobalAlloc, GlobalLock, GlobalFree
+extern IsBadReadPtr, IsBadWritePtr, IsBadCodePtr, IsBadHugeReadPtr, IsBadHugeWritePtr
 extern CreateDIBitmap
 extern hmemcpy, CreateBitmap, SetBitmapBits, CreateCompatibleDC, SelectObject
 extern GetTextExtent, GetTextExtentPoint, GetPaletteEntries, GetTextAlign, GetBitmapDimensionEx
@@ -21,6 +22,38 @@ _start:
     mov byte [es:31],0x5a
     cmp byte [es:31],0x5a
     jne fail
+    push dword 0
+    push word 1
+    call far IsBadReadPtr
+    cmp ax,1
+    jne fail
+    push ds
+    push word initial_sp
+    push word 2
+    call far IsBadWritePtr
+    test ax,ax
+    jnz fail
+    push cs
+    push word _start
+    call far IsBadCodePtr
+    test ax,ax
+    jnz fail
+    push ds
+    push word initial_sp
+    call far IsBadCodePtr
+    cmp ax,1
+    jne fail
+    push cs
+    push word _start
+    push word 1
+    call far IsBadWritePtr
+    cmp ax,1
+    jne fail
+    push dword 0
+    push dword 0
+    call far IsBadHugeWritePtr
+    test ax,ax
+    jnz fail
     call far GetTickCount
     push word 0x42
     push dword 70000
@@ -34,6 +67,33 @@ _start:
     jne fail
     mov [source_pointer],ax
     mov [source_pointer+2],dx
+    push dword [source_pointer]
+    push dword 70000
+    call far IsBadHugeWritePtr
+    test ax,ax
+    jnz fail
+    push dword [source_pointer]
+    push dword 70001
+    call far IsBadHugeReadPtr
+    cmp ax,1
+    jne fail
+    push word [source_pointer+2]
+    push word 65535
+    push word 2
+    call far IsBadReadPtr
+    cmp ax,1
+    jne fail
+    push word [source_pointer+2]
+    push word 65535
+    push dword 2
+    call far IsBadHugeReadPtr
+    test ax,ax
+    jnz fail
+    push dword [source_pointer]
+    push dword 0xffffffff
+    call far IsBadHugeReadPtr
+    cmp ax,1
+    jne fail
     mov es,dx
     mov word [es:0],0x1234
     add dx,8
@@ -65,6 +125,11 @@ _start:
     call far GlobalFree
     test ax,ax
     jnz fail
+    push dword [source_pointer]
+    push word 1
+    call far IsBadReadPtr
+    cmp ax,1
+    jne fail
     push word [destination]
     call far GlobalFree
     test ax,ax

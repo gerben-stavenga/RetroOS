@@ -53,3 +53,5 @@ windows_watcom_binary(
     src = "repaint.c",
     visibility = ["//visibility:public"],
 )
+
+windows_watcom_binary(name="popup", src="popup.c", visibility=["//visibility:public"])

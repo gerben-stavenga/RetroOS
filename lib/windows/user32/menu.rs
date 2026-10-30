@@ -1,6 +1,9 @@
 //! Menu handles, item trees and resource decoding live in the guest.
 use crate::{state, text, window};
 use alloc::vec::Vec;
+#[path = "popup.rs"]
+mod popup;
+pub use popup::TrackPopupMenu;
 #[derive(Clone)]
 pub struct Item {
     flags: u32,
@@ -426,7 +429,7 @@ pub unsafe extern "system" fn DrawMenuBar(h: u32) -> i32 {
     crate::frame::paint(h);
     1
 }
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Popup {
     pub hwnd: u32,
     menu: u32,
@@ -484,7 +487,7 @@ pub fn draw(h: u32, dc: u32) {
             s.menu_popup
                 .as_ref()
                 .filter(|p| p.hwnd == h)
-                .map(|p| (p.clone(), rows(s, p))),
+                .map(|p| (*p, rows(s, p))),
         )
     });
     for (item, r) in bar {
@@ -492,39 +495,43 @@ pub fn draw(h: u32, dc: u32) {
         crate::frame::label(dc, r[0] + 8, r[1] + 1, &display_label(&item.label), 0);
     }
     if let Some((p, items)) = popup {
-        crate::frame::bevel(dc, p.rect);
-        for (index, (i, r)) in items.iter().enumerate() {
-            if i.flags & 0x800 != 0 {
-                crate::frame::fill(dc, [r[0] + 2, r[1] + 3, r[2] - 2, r[1] + 4], 0x808080);
-                continue;
-            }
-            let hot = p.hot == Some(index) && i.flags & 3 == 0;
-            crate::frame::fill(dc, *r, if hot { 0x800000 } else { 0xc0c0c0 });
-            let color = if i.flags & 3 != 0 {
-                0x808080
-            } else if hot {
-                0xffffff
-            } else {
-                0
-            };
-            let label = display_label(&i.label);
-            let mut parts = label.split(|&c| c == 9);
-            crate::frame::label(dc, r[0] + 18, r[1] + 2, parts.next().unwrap_or(&[]), color);
-            if let Some(accel) = parts.next() {
-                crate::frame::label(
-                    dc,
-                    r[2] - 4 - accel.len() as i32 * 8,
-                    r[1] + 2,
-                    accel,
-                    color,
-                );
-            }
-            if i.flags & 8 != 0 {
-                crate::frame::label(dc, r[0] + 3, r[1] + 2, &[42], color);
-            }
+        draw_popup(dc, &p, &items);
+    }
+}
+fn draw_popup(dc: u32, p: &Popup, items: &[(Item, [i32; 4])]) {
+    crate::frame::bevel(dc, p.rect);
+    for (index, (i, r)) in items.iter().enumerate() {
+        if i.flags & 0x800 != 0 {
+            crate::frame::fill(dc, [r[0] + 2, r[1] + 3, r[2] - 2, r[1] + 4], 0x808080);
+            continue;
+        }
+        let hot = p.hot == Some(index) && i.flags & 3 == 0;
+        crate::frame::fill(dc, *r, if hot { 0x800000 } else { 0xc0c0c0 });
+        let color = if i.flags & 3 != 0 {
+            0x808080
+        } else if hot {
+            0xffffff
+        } else {
+            0
+        };
+        let label = display_label(&i.label);
+        let mut parts = label.split(|&c| c == 9);
+        crate::frame::label(dc, r[0] + 18, r[1] + 2, parts.next().unwrap_or(&[]), color);
+        if let Some(accel) = parts.next() {
+            crate::frame::label(
+                dc,
+                r[2] - 4 - accel.len() as i32 * 8,
+                r[1] + 2,
+                accel,
+                color,
+            );
+        }
+        if i.flags & 8 != 0 {
+            crate::frame::label(dc, r[0] + 3, r[1] + 2, &[42], color);
         }
     }
 }
+
 pub fn pointer(h: u32, message: u32, x: i32, y: i32) {
     let opening = state::with(|s| {
         if let Some(p) = s.menu_popup.as_mut().filter(|p| p.hwnd == h) {
@@ -589,7 +596,7 @@ pub fn pointer(h: u32, message: u32, x: i32, y: i32) {
     let mut close = false;
     let mut changed = false;
     state::with(|s| {
-        let Some(p) = s.menu_popup.as_ref().filter(|p| p.hwnd == h).cloned() else {
+        let Some(p) = s.menu_popup.as_ref().filter(|p| p.hwnd == h).copied() else {
             return;
         };
         let hit = rows(s, &p)

@@ -12,7 +12,7 @@ nasm_library(
 windows_rust_library(
     name = "user32_rust",
     crate_root = "user32.rs",
-    srcs = ["caret.rs", "mdi.rs", "messagebox.rs", "scrollbar.rs", "bitmap.rs", "win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
+    srcs = ["caret.rs", "mdi.rs", "messagebox.rs", "scrollbar.rs", "bitmap.rs", "win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "popup.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
 )
 
 windows_dll(
@@ -157,6 +157,7 @@ windows_dll(
         "GetDlgItemInt": "_GetDlgItemInt@16",
         "AdjustWindowRect": "_AdjustWindowRect@12",
         "AdjustWindowRectEx": "_AdjustWindowRectEx@16",
+        "TrackPopupMenu": "_TrackPopupMenu@28",
         "GetMenuItemRect": "_GetMenuItemRect@16",
         "CreateMenu": "_CreateMenu@0",
         "CreatePopupMenu": "_CreatePopupMenu@0",
@@ -583,7 +584,7 @@ windows_dll(
         "CreateWindowExA", "CreateWindowExW", "DefWindowProcW", "DrawIcon", "DestroyIcon", "DialogBoxParamW",
         "DispatchMessageA", "DispatchMessageW", "DrawEdge", "EndDialog", "EndPaint", "FillRect", "FrameRect",
         "GetClientRect", "GetDC", "GetDlgItem", "GetDlgItemInt",
-        "GetDlgItemTextW", "GetMenuItemRect", "GetMessageW", "GetSysColorBrush",
+        "GetDlgItemTextW", "TrackPopupMenu", "GetMenuItemRect", "GetMessageW", "GetSysColorBrush",
         "GetSystemMetrics", "GetDesktopWindow", "InflateRect", "InvalidateRect", "KillTimer",
         "LoadAcceleratorsW", "LoadCursorW", "LoadIconW", "LoadMenuW",
         "LoadStringW", "MapWindowPoints", "MessageBoxW", "MoveWindow",

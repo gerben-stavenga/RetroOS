@@ -302,6 +302,7 @@ fn to32(m: u32, w: u32, l: u32) -> (u32, u32) {
 }
 fn to16(m: u32, w: u32, l: u32) -> (u32, u32) {
     match m {
+        0x116 | 0x117 | 0x125 => (encode(w),l),
         0x132..=0x138 => (encode(w), encode(l) | ((m - 0x132) << 16)),
         0x111 => (w & 0xffff, encode(l) | (w & 0xffff_0000)),
         0x114 | 0x115 => (w & 0xffff, (w >> 16) | (encode(l) << 16)),
@@ -984,6 +985,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             264 => menu::GetMenuItemID(h(2),i(0)),
             403 => class::UnregisterClassA(string(d(2))?,h(0)) as u32,
             415 => encode(menu::CreatePopupMenu()),
+            416 => menu::TrackPopupMenu(h(14),w(12),i(10),i(8),i(6),h(4),core::ptr::null()) as u32,
             34 => window::EnableWindow(h(2), i(0)) as u32,
             35 => window::IsWindowEnabled(h(0)) as u32,
             36 => window::GetWindowTextA(h(6), pointer(d(2), w(0) as usize)?, i(0)) as u32,

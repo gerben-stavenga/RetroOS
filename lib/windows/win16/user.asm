@@ -226,3 +226,5 @@ bridge UnregisterClass, 403, 6
 bridge CreatePopupMenu, 415, 0
 
 bridge ShowScrollBar, 267, 6
+
+bridge TrackPopupMenu, 416, 16

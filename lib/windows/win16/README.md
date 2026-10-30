@@ -171,7 +171,7 @@ Civilization II additionally imports video and AVI libraries.
 Local tests with its original Video for Windows runtime now get beyond the
 initializer/segment-count restrictions, but still stop at missing imports
 (including RegOpenKey and LocalHandle); Civ II itself currently stops at
-TrackPopupMenu (USER.416).
+timeKillEvent (MMSYSTEM.603). Multimedia callback timers are not implemented yet.
 This does not yet establish AVI or Indeo playback support; those runtime files
 are not bundled with RetroOS.
 
@@ -191,3 +191,19 @@ handle. Drawing and thumb dragging reuse the scrollbar-control implementation;
 SB_CTL toggles the child control. Visibility changes preserve range/position,
 resize the client area, and cancel capture when hiding an active standard bar.
 The current scrollbar implementation does not auto-repeat held arrows/pages.
+
+TrackPopupMenu uses the shared USER menu painter and a separate owned popup
+window. Its modal loop runs on the guest stack, including nested submenus;
+Win16 USER.416 is a thin adapter to the same implementation. Keyboard and mouse
+selection, disabled items, cancellation, return-command mode, and queued
+WM_COMMAND delivery are covered by the callback tests. Cleanup also covers
+owner destruction, menu destruction during initialization, and WM_QUIT.
+Mnemonic selection, hover-triggered submenus, WM_MENUSELECT notifications, and
+scrolling oversized popup menus are not implemented yet.
+
+Win16 pointer probes (IsBadReadPtr, IsBadWritePtr, IsBadCodePtr and their huge
+range variants) run inside KERNEL.DLL using selector access rights and limits.
+Huge ranges walk RetroOS's consecutive 64 KiB selectors; ordinary ranges must
+fit one segment. The NE regression covers invalid/freed selectors, code versus
+data permissions, exact allocation boundaries, overflowing lengths, and huge
+ranges crossing a selector boundary. DebugBreak executes a guest breakpoint.

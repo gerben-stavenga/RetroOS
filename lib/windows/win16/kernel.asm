@@ -182,3 +182,118 @@ bridge _hwrite, 2350, 10
 
 bridge GetCurrentTask, 2036, 0
 gate GlobalHandleNoRIP
+
+global DebugBreak
+DebugBreak:
+    int3
+    retf
+
+; Pointer probes use descriptor permissions and limits without touching memory.
+; Huge pointers advance by AHINCR (8) at each 64 KiB boundary.
+%macro pointer_probe 4
+ global %1
+%1:
+    push bp
+    mov bp,sp
+    push ebx
+    push ecx
+    push edx
+    push esi
+    push edi
+    mov bl,%3                 ; 0=read, 1=write, 2=code
+    mov bh,%4                 ; huge range
+%if %2 = 8
+    mov ecx,[ss:bp+6]
+%elif %2 = 6
+    movzx ecx,word [ss:bp+6]
+%else
+    mov ecx,1
+%endif
+    movzx eax,word [ss:bp+%2+2]
+    mov dx,[ss:bp+%2+4]
+    call probe_range
+    pop edi
+    pop esi
+    pop edx
+    pop ecx
+    pop ebx
+    pop bp
+    retf %2
+%endmacro
+pointer_probe IsBadReadPtr, 6, 0, 0
+pointer_probe IsBadWritePtr, 6, 1, 0
+pointer_probe IsBadCodePtr, 4, 2, 0
+pointer_probe IsBadHugeReadPtr, 8, 0, 1
+pointer_probe IsBadHugeWritePtr, 8, 1, 1
+
+probe_range:
+    test ecx,ecx
+    jz .good
+.next:
+    lar esi,dx
+    jnz .bad
+    test esi,0x8000           ; present
+    jz .bad
+    test esi,0x1000           ; application segment
+    jz .bad
+    cmp bl,2
+    je .code
+    cmp bl,1
+    je .write
+    verr dx
+    jnz .bad
+    jmp .limit
+.write:
+    verw dx
+    jnz .bad
+    jmp .limit
+.code:
+    test esi,0x0800
+    jz .bad
+.limit:
+    lsl edi,dx
+    jnz .bad
+    ; Expand-down data segments have a lower exclusive limit.
+    test esi,0x0800
+    jnz .normal
+    test esi,0x0400
+    jz .normal
+    cmp eax,edi
+    jbe .bad
+    mov edi,0xffff
+    test esi,0x400000
+    jz .normal
+    mov edi,0xffffffff
+.normal:
+    test bh,bh
+    jz .bounded
+    cmp edi,0xffff
+    jbe .bounded
+    mov edi,0xffff
+.bounded:
+    cmp eax,edi
+    ja .bad
+    sub edi,eax
+    dec ecx
+    cmp ecx,edi
+    jbe .good
+    inc ecx
+    test bh,bh
+    jz .bad
+    ; A short final selector cannot be crossed to an unrelated allocation.
+    add edi,eax
+    cmp edi,0xffff
+    jne .bad
+    mov esi,0x10000
+    sub esi,eax
+    sub ecx,esi
+    add dx,8
+    jc .bad
+    xor eax,eax
+    jmp .next
+.good:
+    xor ax,ax
+    ret
+.bad:
+    mov ax,1
+    ret

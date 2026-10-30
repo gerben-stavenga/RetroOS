@@ -1,5 +1,6 @@
 bits 16
 segment _TEXT public class=CODE use16
+extern TrackPopupMenu
 extern ShowScrollBar
 extern GetClassName, GetClassWord, GetScrollPos, GetWindow, GetNextWindow, UnionRect, SetRectEmpty, IsRectEmpty
 extern CreatePopupMenu, GetMenuItemCount, GetMenuItemID, AppendMenu, DestroyMenu, UnregisterClass
@@ -870,6 +871,26 @@ _start:
     push word [test_popup]
     push word 0
     call far GetMenuItemID
+    cmp ax,123
+    jne fail
+    push word [hwnd]
+    push word 0x100
+    push word 0x28
+    push dword 0
+    call far PostMessage
+    push word [hwnd]
+    push word 0x100
+    push word 0x0d
+    push dword 0
+    call far PostMessage
+    push word [test_popup]
+    push word 0x100
+    push word 300
+    push word 200
+    push word 0
+    push word [hwnd]
+    push dword 0
+    call far TrackPopupMenu
     cmp ax,123
     jne fail
     push word [test_popup]

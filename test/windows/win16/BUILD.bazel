@@ -6,6 +6,7 @@ windows16_binary(name="bridge", obj=":bridge_obj", imports={
 }, visibility=["//visibility:public"])
 nasm_library(name="window_obj", srcs=["window.asm"], copts=["-fobj"])
 windows16_binary(name="window", obj=":window_obj", imports={
+    "TrackPopupMenu":"USER.416",
     "ShowScrollBar":"USER.267",
     "GetClassName":"USER.58", "GetClassWord":"USER.129", "GetScrollPos":"USER.63",
     "GetWindow":"USER.262", "GetNextWindow":"USER.230", "UnionRect":"USER.80", "SetRectEmpty":"USER.73", "IsRectEmpty":"USER.75",
@@ -67,6 +68,8 @@ windows16_binary(name="fpmath", obj=":fpmath_obj", imports={
 
 nasm_library(name="civ_apis_obj", srcs=["civ_apis.asm"], copts=["-fobj"])
 windows16_binary(name="civ_apis", obj=":civ_apis_obj", imports={
+    "IsBadReadPtr":"KERNEL.334", "IsBadWritePtr":"KERNEL.335", "IsBadCodePtr":"KERNEL.336",
+    "IsBadHugeReadPtr":"KERNEL.346", "IsBadHugeWritePtr":"KERNEL.347",
     "Debug":"KERNEL.115", "Exit":"KERNEL.1", "GetTickCount":"USER.13",
     "GlobalAlloc":"KERNEL.15", "GlobalLock":"KERNEL.18", "GlobalFree":"KERNEL.17",
     "GetTextExtent":"GDI.91", "GetTextExtentPoint":"GDI.471", "GetPaletteEntries":"GDI.363", "GetTextAlign":"GDI.345", "GetBitmapDimensionEx":"GDI.468",

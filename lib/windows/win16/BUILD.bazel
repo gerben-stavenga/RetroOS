@@ -1,6 +1,9 @@
 load(":win16.bzl", "win16_dll")
 
 win16_dll("kernel", "KERNEL", [
+    "DebugBreak.203",
+    "IsBadReadPtr.334", "IsBadWritePtr.335", "IsBadCodePtr.336",
+    "IsBadHugeReadPtr.346", "IsBadHugeWritePtr.347",
     "hmemcpy.348", "_hread.349", "_hwrite.350",
     "GetProfileInt.57", "GetHeapSpaces.138",
     "GlobalHandle.21", "GlobalHandleNoRIP.159", "GetCurrentTask.36", "GetFreeSpace.169", "AllocCStoDSAlias.170", "AllocSelector.175", "FreeSelector.176", "PrestoChangoSelector.177",
@@ -63,7 +66,7 @@ win16_dll("gdi", "GDI", [
 ])
 
 win16_dll("user", "USER", [
-    "ShowScrollBar.267",
+    "TrackPopupMenu.416", "ShowScrollBar.267",
     "GetClassName.58", "GetScrollPos.63", "SetRectEmpty.73", "IsRectEmpty.75", "UnionRect.80", "GetClassWord.129", "GetNextWindow.230", "GetWindow.262", "GetMenuItemCount.263", "GetMenuItemID.264", "UnregisterClass.403", "CreatePopupMenu.415",
     "MapWindowPoints.258", "InSendMessage.251", "SetMessageQueue.266", "EnumWindows.54", "EnumChildWindows.55", "GetWindowTask.224", "EnumTaskWindows.225",
     "CreateCaret.163", "DestroyCaret.164", "SetCaretPos.165", "HideCaret.166", "ShowCaret.167", "SetCaretBlinkTime.168", "GetCaretBlinkTime.169", "GetCaretPos.183",
