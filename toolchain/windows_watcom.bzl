@@ -166,3 +166,24 @@ windows16_binary = rule(
         "_linker": attr.label(default="@open_watcom//:binl64/wlink", allow_single_file=True, executable=True, cfg="exec"),
     },
 )
+
+def _windows_native_binary_impl(ctx):
+    response = ctx.actions.declare_file(ctx.label.name + ".lnk")
+    ctx.actions.write(response, "\n".join([
+        "format windows nt", "option quiet", "option start=_start",
+        "option stack=65536", "name " + ctx.outputs.exe.path,
+        "file " + ctx.file.obj.path,
+    ] + ["import %s %s" % (symbol, target) for symbol, target in ctx.attr.imports.items()]) + "\n")
+    ctx.actions.run(executable=ctx.executable._linker, arguments=["@" + response.path],
+        inputs=[response, ctx.file.obj], outputs=[ctx.outputs.exe])
+    return [DefaultInfo(files=depset([ctx.outputs.exe]))]
+
+windows_native_binary = rule(
+    implementation=_windows_native_binary_impl,
+    outputs={"exe": "%{name}.exe"},
+    attrs={
+        "obj": attr.label(allow_single_file=True, mandatory=True),
+        "imports": attr.string_dict(),
+        "_linker": attr.label(default="@open_watcom//:binl64/wlink", allow_single_file=True, executable=True, cfg="exec"),
+    },
+)

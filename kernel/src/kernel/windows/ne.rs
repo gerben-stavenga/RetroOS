@@ -38,6 +38,7 @@ pub struct Segment {
 }
 
 impl Segment {
+    pub fn is_32bit(self) -> bool { self.flags & 0x2000 != 0 }
     pub fn is_code(self) -> bool { self.flags & 1 == 0 }
     pub fn has_relocations(self) -> bool { self.flags & 0x0100 != 0 }
 }

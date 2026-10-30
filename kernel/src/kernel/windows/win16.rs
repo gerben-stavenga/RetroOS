@@ -365,6 +365,16 @@ struct LoadedModule {
     data: Vec<u8>,
     selectors: Vec<u16>,
     references: u16,
+    pe_owner: Option<(u32, Vec<(u32, u32)>)>,
+}
+
+fn wine_module_file(name: &[u8]) -> Vec<u8> {
+    match name {
+        b"KERNEL" | b"KRNL386" => b"KRNL386.EXE16".to_vec(),
+        b"USER" => b"USER.EXE16".to_vec(),
+        b"GDI" => b"GDI.EXE16".to_vec(),
+        _ => { let mut file = module_file(name); file.extend_from_slice(b"16"); file }
+    }
 }
 
 fn module_file(name: &[u8]) -> Vec<u8> {
@@ -412,8 +422,39 @@ fn load_module_file(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), 
             return Ok((rooted, data));
         }
     }
+    let builtin = join(&system, &wine_module_file(name));
+    if let Ok(data) = crate::kernel::exec::load_file_resolved(&builtin) {
+        // A malformed builtin must fail here, not masquerade as a missing DLL.
+        let pe = super::pe::Image::parse(&data).map_err(|_| -8)?;
+        pe.embedded_ne().map_err(|_| -8)?.ok_or(-8)?;
+        return Ok((builtin, data));
+    }
     crate::compact_println!("Windows: missing Win16 {}", core::str::from_utf8(&file).unwrap_or("dll"));
     Err(-2)
+}
+
+/// Map the owning PE first so absolute addresses in the NE thunk bytes have
+/// their PE base relocations applied before those segments are copied.
+fn embedded_module<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
+    path: &[u8], data: Vec<u8>) -> Result<(Vec<u8>, Option<(u32, Vec<(u32, u32)>)>), i32>
+{
+    if ne::Image::parse(&data).is_ok() { return Ok((data, None)); }
+    let pe = super::pe::Image::parse(&data).map_err(|_| -8)?;
+    let (rva, bytes) = pe.embedded_ne().map_err(|_| -8)?.ok_or(-8)?;
+    let size = bytes.len();
+    let (owner, initializers) = super::load_library(machine, windows, &super::guest_windows_path(path))
+        .map_err(|status| { crate::compact_println!("Windows: Wine Win16 PE owner load failed ({})", status); -8 })?;
+    // Retain the initializer requirement; builtin NE startup cannot use the
+    // retired Retro16 bridge or start the application before PE initialization.
+    let address = owner.checked_add(rva).ok_or(-8)?;
+    let relocated = (0..size).map(|offset| machine.read::<u8>(address as usize + offset)).collect();
+    Ok((relocated, Some((owner, initializers))))
+}
+
+fn segment_selector(ldt: &mut Vec<u64>, base: u32, size: usize, segment: ne::Segment) -> Result<u16, i32> {
+    let value = selector(ldt, base, size, segment.is_code())?;
+    if segment.is_32bit() { ldt[usize::from(value >> 3)] |= 1u64 << 54; }
+    Ok(value)
 }
 
 fn module_segment_base(base: u32, segment: u16) -> Result<u32, i32> {
@@ -598,7 +639,7 @@ pub(super) fn exec<A: crate::Arch>(
         let base = segment_base(number)?;
         machine.zero(base as usize, size);
         machine.copy_to(base as usize, image.segment_bytes(segment).map_err(|_| -8)?);
-        selectors.push(selector(&mut ldt, base, size, segment.is_code())?);
+        selectors.push(segment_selector(&mut ldt, base, size, segment)?);
     }
 
     let main_path = if launcher == Some(thread::PersonalityName::Dos) {
@@ -619,6 +660,10 @@ pub(super) fn exec<A: crate::Arch>(
     // that only import KERNEL or MMSYSTEM. Include that runtime dependency
     // before relocation and bridge initialization.
     pending.push((b"USER".to_vec(), main_path.clone()));
+    let mut windows = WindowsState::new();
+    windows.modules.push(super::Module {
+        name: super::module_name(&main_path), path: main_path.clone(), data: Vec::new(), base: SEGMENT_BASE,
+    });
     let mut modules = Vec::new();
     let mut next = 0;
     while next < pending.len() {
@@ -627,6 +672,7 @@ pub(super) fn exec<A: crate::Arch>(
         let canonical = canonical_module_name(&name);
         if modules.iter().any(|loaded: &LoadedModule| loaded.name == canonical) { continue; }
         let (module_path, module_data) = load_module_file(&canonical, &importer)?;
+        let (module_data, pe_owner) = embedded_module(machine, &mut windows, &module_path, module_data)?;
         let module_image = ne::Image::parse(&module_data).map_err(|_| -8)?;
         let mut module_selectors = Vec::with_capacity(module_image.header.segment_count as usize);
         let module_base = module_allocation(&modules, module_image.header.segment_count)?;
@@ -636,7 +682,7 @@ pub(super) fn exec<A: crate::Arch>(
             let size = module_segment_size(&module_image, number)?;
             machine.zero(base as usize, size);
             machine.copy_to(base as usize, module_image.segment_bytes(segment).map_err(|_| -8)?);
-            module_selectors.push(selector(&mut ldt, base, size, segment.is_code())?);
+            module_selectors.push(segment_selector(&mut ldt, base, size, segment)?);
         }
         let dependencies = module_image.modules().map_err(|_| -8)?;
         modules.push(LoadedModule {
@@ -647,11 +693,14 @@ pub(super) fn exec<A: crate::Arch>(
             data: module_data,
             selectors: module_selectors,
             references: 1,
+            pe_owner,
         });
         pending.extend(dependencies.into_iter().map(|dependency| {
             (dependency, module_path.clone())
         }));
     }
+
+    let wine = modules.iter().any(|module| module.pe_owner.is_some());
 
     // Preserve the launcher's command tail in the shared PMDOS PSP.
     let tail = &cmdtail[..cmdtail.len().min(126)];
@@ -668,8 +717,10 @@ pub(super) fn exec<A: crate::Arch>(
     let mut gates = Vec::new();
     // These private gates are called inside KERNEL.DLL, not through an NE
     // import relocation, so register them explicitly in the matched runtime.
-    for ordinal in [426, 427] {
-        imported_target(machine, &ldt, &modules, &mut gates, b"KERNEL", Some(ordinal), None)?;
+    if !wine {
+        for ordinal in [426, 427] {
+            imported_target(machine, &ldt, &modules, &mut gates, b"KERNEL", Some(ordinal), None)?;
+        }
     }
 
     relocate_image(
@@ -711,8 +762,14 @@ pub(super) fn exec<A: crate::Arch>(
     machine.set_page_flags(ENV_BASE as usize / 4096, 1, true, false);
     machine.set_page_flags(RESOURCE_BASE as usize / 4096, 16, true, false);
 
+    if wine {
+        crate::compact_println!("Windows: Wine embedded NE interfaces loaded; Wine Win16 thread/relay initialization is not implemented");
+        return Err(-38);
+    }
+    // The legacy bridge creates its own PE main-module record.
+    windows.modules.clear();
+
     let current = thread::get_thread(threads, tid).ok_or(-8)?;
-    let mut windows = WindowsState::new();
     windows.next_object = 0x0100;
     // Window DCs now belong to guest USER. Do not reserve a numeric DC that
     // could collide with a subsequently allocated real bitmap/window context.
@@ -1687,6 +1744,7 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
     let start = state.modules.len();
     let old_ldt = windows.ldt.len();
     let old_gates = state.gates.len();
+    let old_pe_modules = windows.modules.len();
     let mut mapped = Vec::new();
     let result = (|| {
         let mut pending = vec![(name.clone(), windows.exec_path_str().to_vec())];
@@ -1696,6 +1754,7 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
             let name = canonical_module_name(&name);
             if state.modules.iter().any(|m| m.name == name) { continue; }
             let (path, data) = load_module_file(&name, &importer)?;
+            let (data, pe_owner) = embedded_module(machine, windows, &path, data)?;
             let image = ne::Image::parse(&data).map_err(|_| -8)?;
             let mut selectors = Vec::new();
             let module_base = module_allocation(&state.modules, image.header.segment_count)?;
@@ -1707,11 +1766,15 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
                 machine.set_page_flags(base as usize/4096, size.div_ceil(4096), true, false);
                 machine.zero(base as usize, size);
                 machine.copy_to(base as usize, image.segment_bytes(segment).map_err(|_| -8)?);
-                selectors.push(selector(&mut windows.ldt, base, size, segment.is_code())?);
+                selectors.push(segment_selector(&mut windows.ldt, base, size, segment)?);
             }
             let dependencies = image.modules().map_err(|_| -8)?;
-            state.modules.push(LoadedModule { initialized: if image.header.entry_segment == 0 { 2 } else { 0 }, base: module_base, kind: module(&name), name, data, selectors, references: 1 });
+            state.modules.push(LoadedModule { initialized: if image.header.entry_segment == 0 { 2 } else { 0 }, base: module_base, kind: module(&name), name, data, selectors, references: 1, pe_owner });
             pending.extend(dependencies.into_iter().map(|dep| (dep, path.clone())));
+        }
+        if state.modules[start..].iter().any(|module| module.pe_owner.is_some()) {
+            crate::compact_println!("Windows: Wine Win16 relay initialization is not implemented");
+            return Err(-38);
         }
         let entry = super::export_address(&windows.modules, b"USER32", b"Retro16Enter")?;
         let back = super::export_address(&windows.modules, b"USER32", b"Retro16Return")?;
@@ -1750,6 +1813,7 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
     })();
     if result.is_err() {
         for (base, count) in mapped { machine.unmap_range(base, count); }
+        super::rollback_modules(machine, windows, old_pe_modules);
         state.modules.truncate(start);
         state.gates.truncate(old_gates);
         windows.ldt.truncate(old_ldt);
@@ -1782,5 +1846,32 @@ fn next_initializer(state: &State, root: u16) -> Result<Option<usize>, i32> {
     } else {
         let index = state.modules.iter().position(|m| m.selectors.first() == Some(&root)).ok_or(-2)?;
         visit(state, index, &mut seen)
+    }
+}
+
+#[cfg(test)]
+mod embedded_ne_tests {
+    use super::*;
+
+    #[test]
+    fn wine_code_selector_preserves_default_operand_size() {
+        let mut ldt = Vec::new();
+        for flags in [0u16, 0x2000, 1] {
+            let segment = ne::Segment { number: 1, file_offset: 0, file_size: 64, alloc_size: 64, flags };
+            let sel = segment_selector(&mut ldt, 0x12340000, 64, segment).unwrap();
+            let descriptor = ldt[usize::from(sel >> 3)];
+            assert_eq!(descriptor & (1 << 54) != 0, flags & 0x2000 != 0);
+            assert_eq!(descriptor & (1 << 43) != 0, flags & 1 == 0);
+            assert_eq!(selector_base_from_ldt(&ldt, sel), Some(0x12340000));
+        }
+    }
+
+    #[test]
+    fn wine_container_names_and_pe_module_identity() {
+        assert_eq!(wine_module_file(b"KERNEL"), b"KRNL386.EXE16");
+        assert_eq!(wine_module_file(b"USER"), b"USER.EXE16");
+        assert_eq!(wine_module_file(b"WIN87EM"), b"WIN87EM.DLL16");
+        assert_eq!(super::super::module_name(b"krnl386.exe16"), b"KRNL386.EXE16");
+        assert_eq!(super::super::module_name(b"ntdll"), b"NTDLL.DLL");
     }
 }

@@ -1,0 +1,35 @@
+load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load(":modules.bzl", "WINE_DLLS", "WINE_FILES")
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:windows_rust.bzl", "windows_rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["SOURCE.txt", "build_ntdll.py"])
+
+[genrule(
+    name = name + "_dll",
+    srcs = ["@wine_pe//:pe/" + name + ".dll"],
+    outs = [name.upper() + ".DLL"],
+    cmd = "cp $< $@",
+) for name in WINE_DLLS]
+
+pkg_tar(name = "runtime", files = WINE_FILES)
+
+genrule(
+    name = "backend_asm",
+    srcs = ["//lib/wine/ntdll:backend-abi.json", "build_backend.py"],
+    outs = ["backend.asm"],
+    cmd = "python3 $(location build_backend.py) --abi $(location //lib/wine/ntdll:backend-abi.json) --asm $@",
+)
+nasm_library(name = "retroos_obj", srcs = [":backend_asm"], copts = ["-fwin32"])
+windows_rust_library(name = "backend_rust", crate_root = "backend.rs")
+genrule(
+    name = "retroos_dll",
+    srcs = [":retroos_obj", ":backend_rust", "//lib/wine/ntdll:backend-abi.json", "build_backend.py"],
+    tools = ["@open_watcom//:binl64/wlink"],
+    outs = ["RETROOS.DLL"],
+    cmd = "python3 $(location build_backend.py) --abi $(location //lib/wine/ntdll:backend-abi.json) " +
+          "--obj $(location :retroos_obj) --library $(location :backend_rust) " +
+          "--linker $(location @open_watcom//:binl64/wlink) --output $@",
+)

@@ -2,6 +2,7 @@
 """Verify that GetDC drawing reaches scanout without any keyboard/mouse input."""
 import os
 from pathlib import Path
+from wine_runtime import install as install_windows_runtime
 import shutil
 import subprocess
 import tempfile
@@ -18,16 +19,14 @@ def main():
     subprocess.run([
         "bazelisk", "build", f"//kernel:{target}",
         "//test/windows/callbacks:repaint",
-        "//lib/windows/kernel32:kernel32_dll", "//lib/windows/user32:user32_dll",
-        "//lib/windows/compat:gdi32_dll", "--platforms=@platforms//host",
+        "//lib/wine:runtime", "--platforms=@platforms//host",
     ], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-repaint-") as directory:
         work = Path(directory)
         root = work / "drive"
         system = root / "RETROOS/WINDOWS/SYSTEM32"
         system.mkdir(parents=True)
-        for name, folder in (("KERNEL32", "kernel32"), ("USER32", "user32"), ("GDI32", "compat")):
-            shutil.copyfile(ROOT / "bazel-bin/lib/windows" / folder / f"{name}.DLL", system / f"{name}.DLL")
+        install_windows_runtime(root)
         shutil.copyfile(ROOT / "bazel-bin/test/windows/callbacks/repaint.exe", root / "REPAINT.EXE")
         machine = Machine([
             "python3", str(ROOT / "test/disk_fixture.py"), "--root", str(root), "--",

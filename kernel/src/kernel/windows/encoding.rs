@@ -1,6 +1,8 @@
 //! Win32 encoding contracts backed by the shared UTF-8 conversion layer.
 use super::*;
-use crate::kernel::text::{Encoding, from_utf16, to_utf16};
+use crate::kernel::text::{Encoding, to_utf16};
+#[cfg(test)]
+use crate::kernel::text::from_utf16;
 
 pub(super) fn ansi() -> Encoding { Encoding::for_codepage(u32::from(lib::locale::current().ansi)).unwrap() }
 
@@ -41,59 +43,6 @@ pub(super) fn units<A: crate::Arch>(m: &A, address: u32, count: i32) -> Result<V
         if count == -1 && unit == 0 { return Ok(value); }
     }
     if count == -1 { Err(ERROR_INVALID_PARAMETER) } else { Ok(value) }
-}
-
-pub(super) fn multi_to_wide<A: crate::Arch>(m: &mut A, s: &mut WindowsState, r: &Regs) -> u32 {
-    let id = arg(m, r, 0);
-    let Some(page) = page(id) else { return fail(s, ERROR_INVALID_PARAMETER, 0); };
-    let flags = arg(m, r, 1);
-    let utf8 = matches!(page, Encoding::Utf8);
-    if flags & !if utf8 { 8 } else { 1 | 4 | 8 } != 0 { return fail(s, 1004, 0); }
-    let input = arg(m, r, 2);
-    let out = arg(m, r, 4) as usize;
-    let cap = arg(m, r, 5) as i32;
-    if cap < 0 || (cap != 0 && out == 0) || input as usize == out {
-        return fail(s, ERROR_INVALID_PARAMETER, 0);
-    }
-    let data = match bytes(m, input, arg(m, r, 3) as i32) {
-        Ok(data) => data, Err(e) => return fail(s, e, 0),
-    };
-    let text = if flags & 4 != 0 {
-        let Encoding::SingleByte(page) = page else { unreachable!() };
-        Ok(data.iter().map(|&b| page.decode_glyph(b)).collect())
-    } else { page.decode(&data, flags & 8 != 0) };
-    let Ok(text) = text else { return fail(s, 1113, 0); };
-    let wide = to_utf16(&text);
-    if cap == 0 { return wide.len() as u32; }
-    if (cap as usize) < wide.len() { return fail(s, 122, 0); }
-    for (i, &unit) in wide.iter().enumerate() { m.write::<u16>(out + i * 2, unit); }
-    wide.len() as u32
-}
-
-pub(super) fn wide_to_multi<A: crate::Arch>(m: &mut A, s: &mut WindowsState, r: &Regs) -> u32 {
-    let Some(page) = page(arg(m, r, 0)) else { return fail(s, ERROR_INVALID_PARAMETER, 0); };
-    let flags = arg(m, r, 1);
-    let utf8 = matches!(page, Encoding::Utf8);
-    if flags & !if utf8 { 0x80 } else { 0x400 } != 0 { return fail(s, 1004, 0); }
-    let input = arg(m, r, 2);
-    let out = arg(m, r, 4) as usize;
-    let cap = arg(m, r, 5) as i32;
-    let default = arg(m, r, 6) as usize;
-    let used = arg(m, r, 7) as usize;
-    if cap < 0 || (cap != 0 && out == 0) || input as usize == out
-        || (utf8 && (default != 0 || used != 0)) {
-        return fail(s, ERROR_INVALID_PARAMETER, 0);
-    }
-    let data = match units(m, input, arg(m, r, 3) as i32) {
-        Ok(data) => data, Err(e) => return fail(s, e, 0),
-    };
-    let Ok(text) = from_utf16(&data, flags & 0x80 != 0) else { return fail(s, 1113, 0); };
-    let replacement = if default == 0 { b'?' } else { m.read::<u8>(default) };
-    let (bytes, substituted) = page.encode(&text, replacement);
-    if cap != 0 && (cap as usize) < bytes.len() { return fail(s, 122, 0); }
-    if used != 0 { m.write::<u32>(used, u32::from(substituted)); }
-    if cap != 0 { m.copy_to(out, &bytes); }
-    bytes.len() as u32
 }
 
 pub(super) fn encode(text: &[u8], wide: bool) -> Vec<u16> {

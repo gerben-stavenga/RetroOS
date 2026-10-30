@@ -1,0 +1,22 @@
+Wine 11.0, upstream Windows PE DLLs from WineHQ.
+Binary package: wine-stable-i386 11.0.0.0~noble-1 (i386)
+https://dl.winehq.org/wine-builds/ubuntu/pool/main/w/wine/wine-stable-i386_11.0.0.0~noble-1_i386.deb
+SHA256: b322b50f9e8bd59687840d9a7bad10d70b12ef9bdb873298e858ff93a6205e56
+
+Upstream source: https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz
+SHA256: c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701
+Repository: https://gitlab.winehq.org/wine/wine/-/tree/wine-11.0
+Wine sources retain their original copyright and LGPL notices.
+The WineHQ PE DLLs are unmodified except NTDLL, which is built from the
+complete Wine 11.0 PE-side source. lib/wine/build_ntdll.py adapts its i386
+system-call veneers and Unix host-call connections to named RETROOS.DLL
+imports. No Unix implementation is linked into NTDLL. The Wine source and
+adapter/build scripts together describe the modified DLL's complete build.
+The Wine-derived NTDLL retains Wine's LGPL terms; RETROOS.DLL is separate.
+
+Build prerequisites: Linux x86-64, Clang/LLD (i386 Windows target), llvm-dlltool,
+GCC, make, bison, dpkg-deb and Python 3. Flex is fetched at a pinned version.
+
+Port status: runtime integration in progress. These DLLs require the RetroOS
+NT backend, WIN32U implementation, and WOW loader before Windows applications
+can run. Bundling is not a claim of executable compatibility.

@@ -146,7 +146,6 @@ pub(super) fn call<A: crate::Arch>(
             if (0x40000..=0x40005).contains(&h) || (0x30000..0x30100).contains(&h) { return 2; }
             if (0x40006..=0x40008).contains(&h) { return 1; }
             state.gdi_objects.iter().find_map(|(id,o)| if *id!=h {None} else {Some(match o {
-                super::super::GdiObject::Brush(_)=>2, super::super::GdiObject::Pen(_)=>1,
                 super::super::GdiObject::Font=>6, super::super::GdiObject::Bitmap{..}=>7,
             })}).unwrap_or(0)
         }

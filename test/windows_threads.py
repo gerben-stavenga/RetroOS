@@ -2,6 +2,7 @@
 """Check Win32 protection, threads, DLL initialization, MC CRT directories and cross-personality launches."""
 import os
 from pathlib import Path
+from wine_runtime import install as install_windows_runtime
 import shutil
 import subprocess
 import tempfile
@@ -22,24 +23,20 @@ def main():
         "//test/windows/threads:threads", "//test/windows/threads:probe_dll",
         "//test/windows/threads:spawn_child", "//test/os2/hello:hello_lx",
         "//lib/os2/doscalls:doscalls_dll",
-        "//lib/windows/kernel32:kernel32_dll",
-        "//lib/windows/compat:gdi32_dll", "//lib/windows/compat:advapi32_dll",
-        "//lib/windows/user32:user32_dll", "--platforms=@platforms//host",
+        "//lib/wine:runtime",
+        "--platforms=@platforms//host",
     ], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-winthreads-") as directory:
         root = Path(directory)
+        install_windows_runtime(root)
         system = root / "RETROOS/WINDOWS/SYSTEM32"
-        system.mkdir(parents=True)
+        system.mkdir(parents=True, exist_ok=True)
         (root / "APPS").mkdir()
         (root / "WORK").mkdir()
         os2_system = root / "RETROOS/OS2/DLL"
-        os2_system.mkdir(parents=True)
+        os2_system.mkdir(parents=True, exist_ok=True)
         (root / "RETROOS/COMMAND.COM").write_bytes(command_image)
         for source, destination in [
-            ("lib/windows/kernel32/KERNEL32.DLL", system / "KERNEL32.DLL"),
-            ("lib/windows/user32/USER32.DLL", system / "USER32.DLL"),
-            ("lib/windows/compat/GDI32.DLL", system / "GDI32.DLL"),
-            ("lib/windows/compat/ADVAPI32.DLL", system / "ADVAPI32.DLL"),
             ("test/windows/threads/threads.exe", root / "WINTHREAD.EXE"),
             ("test/windows/threads/PROBE.DLL", root / "PROBE.DLL"),
             ("test/windows/threads/spawn_child.exe", root / "APPS/WINCHILD.EXE"),

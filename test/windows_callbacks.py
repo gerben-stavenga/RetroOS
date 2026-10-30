@@ -2,6 +2,7 @@
 """Exercise guest-stack USER32 callbacks, including nesting and thread switches."""
 import os
 from pathlib import Path
+from wine_runtime import install as install_windows_runtime
 import shutil
 import subprocess
 import tempfile
@@ -16,18 +17,14 @@ def main():
     target = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
     subprocess.run([
         "bazelisk", "build", f"//kernel:{target}",
-        "//test/windows/callbacks:callbacks", "//test/windows/callbacks:dynamic", "//test/windows/callbacks:lifecycle", "//test/windows/callbacks:messages", "//test/windows/callbacks:events", "//test/windows/callbacks:regions", "//test/windows/callbacks:bitmap_profile", "//test/windows/callbacks:frame", "//test/windows/callbacks:popup", "//test/windows/callbacks:multimedia", "//test/windows/callbacks:mmio", "//test/windows/callbacks:text", "//lib/windows/compat:winmm_dll",
-        "//lib/windows/kernel32:kernel32_dll",
-        "//lib/windows/user32:user32_dll", "//lib/windows/compat:gdi32_dll", "--platforms=@platforms//host",
+        "//test/windows/callbacks:callbacks", "//test/windows/callbacks:dynamic", "//test/windows/callbacks:lifecycle", "//test/windows/callbacks:messages", "//test/windows/callbacks:events", "//test/windows/callbacks:regions", "//test/windows/callbacks:bitmap_profile", "//test/windows/callbacks:frame", "//test/windows/callbacks:popup", "//test/windows/callbacks:multimedia", "//test/windows/callbacks:mmio", "//test/windows/callbacks:text", "//lib/wine:runtime",
+        "--platforms=@platforms//host",
     ], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-wincallbacks-") as directory:
         root = Path(directory)
         system = root / "RETROOS/WINDOWS/SYSTEM32"
         system.mkdir(parents=True)
-        for name in ("kernel32", "user32"):
-            shutil.copyfile(ROOT / f"bazel-bin/lib/windows/{name}/{name.upper()}.DLL", system / f"{name.upper()}.DLL")
-        shutil.copyfile(ROOT / "bazel-bin/lib/windows/compat/GDI32.DLL", system / "GDI32.DLL")
-        shutil.copyfile(ROOT / "bazel-bin/lib/windows/compat/WINMM.DLL", system / "WINMM.DLL")
+        install_windows_runtime(root)
         for program in ("callbacks", "dynamic", "lifecycle", "messages", "events", "regions", "bitmap_profile", "frame", "popup", "multimedia", "mmio", "text"):
             shutil.copyfile(ROOT / f"bazel-bin/test/windows/callbacks/{program}.exe", root / "CALLBACK.EXE")
             try:

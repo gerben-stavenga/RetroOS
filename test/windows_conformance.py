@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from wine_runtime import install as install_windows_runtime
 import re
 import shutil
 import signal
@@ -21,8 +22,8 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 SUMMARY = re.compile(r"(\w+): (\d+) tests executed \((\d+) marked as todo, (\d+) failures?\), (\d+) skipped\.")
 LIBS = ["ddraw", "dsound", "dinput", "winmm", "ole32", "user32", "gdi32", "kernel32", "advapi32", "dxguid", "uuid", "ksuser"]
-DLLS = {"kernel32": "lib/windows/kernel32", "user32": "lib/windows/user32",
-        **{name: "lib/windows/compat" for name in ("gdi32", "advapi32", "winmm", "ole32", "ntdll")}}
+DLLS = {name: "lib/wine" for name in ("kernel32", "user32", "gdi32", "advapi32", "winmm", "ole32")}
+DLLS["ntdll"] = "lib/wine/ntdll"
 
 
 def digest(path):
@@ -79,8 +80,7 @@ def run_guest(target, program, unit, out, timeout):
         drive = Path(directory)
         system = drive / "RETROOS/WINDOWS/SYSTEM32"
         system.mkdir(parents=True)
-        for name, folder in DLLS.items():
-            shutil.copyfile(ROOT / "bazel-bin" / folder / f"{name.upper()}.DLL", system / f"{name.upper()}.DLL")
+        install_windows_runtime(drive)
         # Each invocation gets a fresh disk, including test-created files.
         shutil.copyfile(program, drive / program.name)
         (drive / "WINDOWS/SYSTEM").mkdir(parents=True)
@@ -113,8 +113,8 @@ def run_guest(target, program, unit, out, timeout):
         return observe((out / f"{unit}.log").read_text(errors="replace"), process.returncode, timed_out)
 
 
-def import_audit(program, exports, fallback):
-    """List static imports absent from both guest DLL exports and fallback gates.
+def import_audit(program, exports):
+    """List static imports absent from guest DLL exports.
 
     Availability is not implementation quality: a success-returning stub still
     appears available here. Runtime observations remain the authoritative result.
@@ -132,8 +132,7 @@ def import_audit(program, exports, fallback):
             elif line.startswith("The "):
                 module = None
     missing = [f"{module.upper()}.DLL!{name}" for module, name in imports
-               if name.lower() not in exports.get(module, set())
-               and (module, name.lower()) not in fallback]
+               if name.lower() not in exports.get(module, set())]
     return sorted(set(missing))
 
 
@@ -176,13 +175,10 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     target = "retroos-host-kvm" if args.engine == "kvm" else "retroos-host"
     subprocess.run(["bazelisk", "build", f"//kernel:{target}",
-                    *(f"//{folder}:{name}_dll" for name, folder in DLLS.items()),
+                    "//lib/wine:runtime",
                     "--platforms=@platforms//host"], cwd=ROOT, check=True)
     exports = {name: exported_names(ROOT / "bazel-bin" / folder / f"{name.upper()}.DLL")
                for name, folder in DLLS.items()}
-    fallback = {(module.lower(), name.lower()) for module, name in re.findall(
-        r'spec\(b"([^"\n]+)", b"([^"\n]+)"',
-        (ROOT / "kernel/src/kernel/windows/extra.rs").read_text())}
     flags = ["-O1", "-march=i486", "-w", "-D__USE_MINGW_ANSI_STDIO=0", "-D__NO_CTYPE_INLINES"]
     runtime = out / "runtime.o"
     command([cc, *flags, "-ffreestanding", "-fno-tree-loop-distribute-patterns", "-c",
@@ -211,7 +207,7 @@ def main():
             (out / f"{unit}.build.log").write_text(build_log)
             result = run_guest(target, program, unit, out, args.timeout)
             result["exe_sha256"] = digest(program)
-            result["missing_static_imports"] = import_audit(program, exports, fallback)
+            result["missing_static_imports"] = import_audit(program, exports)
         except RuntimeError as error:
             (out / f"{unit}.build.log").write_text(str(error))
             result = {"status": "build-error"}

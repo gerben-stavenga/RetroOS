@@ -296,3 +296,26 @@ crate.annotation(
 crate.annotation(crate = "sha2", rustc_flags = ['--cfg=sha2_backend="soft"'])
 crate.annotation(crate = "sha1", rustc_flags = ['--cfg=sha1_backend="soft"'])
 crate.annotation(crate = "aes", rustc_flags = ['--cfg=aes_backend="soft"'])
+
+# Wine is kept outside the RetroOS kernel and fetched at a fixed release.
+wine_repository = use_repo_rule("//toolchain:wine_repository.bzl", "wine_repository")
+wine_repository(name = "wine_pe")
+wine_build_tools_repository = use_repo_rule("//toolchain:wine_repository.bzl", "wine_build_tools_repository")
+wine_build_tools_repository(name = "wine_build_tools")
+wine_http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+wine_http_file(
+    name = "wine_source_tar",
+    urls = ["https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz"],
+    sha256 = "c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701",
+    downloaded_file_path = "wine-11.0.tar.xz",
+)
+http_archive(
+    name = "wine_source",
+    urls = ["https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz"],
+    sha256 = "c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701",
+    strip_prefix = "wine-11.0",
+    build_file_content = '''
+package(default_visibility = ["//visibility:public"])
+exports_files(["COPYING.LIB"])
+''',
+)

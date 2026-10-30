@@ -64,24 +64,9 @@ cp -f "$REPO/bazel-bin/test/os2/hello/hello_lx.exe" "$C/OS2/APPS/HELLO.EXE"
 cp -f "$REPO/bazel-bin/test/os2/pm_smoke/pm_smoke.exe" "$C/OS2/APPS/PMSMOKE.EXE"
 cp -f "$REPO/bazel-bin/test/os2/watcom_io/watcom_io.exe" "$C/OS2/APPS/WATCIO.EXE"
 
-# Native Win32 replacement DLLs and console acceptance programs.
-bazelisk build \
-    //lib/windows/kernel32:kernel32_dll \
-    //lib/windows/user32:user32_dll \
-    //lib/windows/win16:kernel_dll \
-    //lib/windows/win16:user_dll \
-    //lib/windows/win16:gdi_dll \
-    //lib/windows/win16:shell_dll \
-    //lib/windows/win16:sound_dll \
-    //test/windows/hello:hello \
-    //test/windows/watcom_io:watcom_io
-cp -f "$REPO/bazel-bin/lib/windows/kernel32/KERNEL32.DLL" "$C/WINDOWS/SYSTEM32/"
-cp -f "$REPO/bazel-bin/lib/windows/user32/USER32.DLL" "$C/WINDOWS/SYSTEM32/"
-cp -f "$REPO/bazel-bin/lib/windows/win16/KERNEL.DLL" "$C/WINDOWS/SYSTEM/"
-cp -f "$REPO/bazel-bin/lib/windows/win16/USER.DLL" "$C/WINDOWS/SYSTEM/"
-cp -f "$REPO/bazel-bin/lib/windows/win16/GDI.DLL" "$C/WINDOWS/SYSTEM/"
-cp -f "$REPO/bazel-bin/lib/windows/win16/SHELL.DLL" "$C/WINDOWS/SYSTEM/"
-cp -f "$REPO/bazel-bin/lib/windows/win16/SOUND.DLL" "$C/WINDOWS/SYSTEM/"
+# Wine Windows runtime and console acceptance programs.
+bazelisk build //lib/wine:runtime //test/windows/hello:hello //test/windows/watcom_io:watcom_io
+tar -xf "$REPO/bazel-bin/lib/wine/runtime.tar" -C "$C"
 cp -f "$REPO/bazel-bin/test/windows/hello/hello.exe" "$C/WINDOWS/APPS/HELLO.EXE"
 cp -f "$REPO/bazel-bin/test/windows/watcom_io/watcom_io.exe" "$C/WINDOWS/APPS/WATCIO.EXE"
 

@@ -1,0 +1,51 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:windows_watcom.bzl", "windows_native_binary", "windows_dll")
+
+nasm_library(name = "probe_obj", srcs = ["probe.asm"], copts = ["-fwin32"])
+nasm_library(name = "portable_obj", srcs = ["probe.asm"], copts = ["-fwin32", "-DPORTABLE_ONLY"])
+windows_native_binary(
+    name = "portable",
+    obj = ":portable_obj",
+    imports = {name: "NTDLL." + name for name in [
+        "RtlInitAnsiString", "RtlInitUnicodeString", "RtlMoveMemory", "RtlZeroMemory", "NtTerminateProcess", "NtAllocateVirtualMemory", "NtFreeVirtualMemory",
+        "RtlCreateHeap", "RtlAllocateHeap", "RtlReAllocateHeap", "RtlFreeHeap",
+    ]} | {"RetroWriteFile": "RETROOS.RetroWriteFile", "RtlCompareMemory": "FORWARD.Entry"},
+    visibility = ["//visibility:public"],
+)
+windows_native_binary(
+    name = "probe",
+    obj = ":probe_obj",
+    imports = {name: "NTDLL." + name for name in [
+        "RtlInitAnsiString", "RtlInitUnicodeString", "RtlMoveMemory",
+        "RtlZeroMemory", "NtTerminateProcess", "NtAllocateVirtualMemory", "NtFreeVirtualMemory",
+        "RtlCreateHeap", "RtlAllocateHeap", "RtlReAllocateHeap", "RtlFreeHeap",
+        "LdrLoadDll", "LdrGetDllHandle", "LdrGetProcedureAddress", "LdrResolveDelayLoadedAPI",
+    ]} | {"RetroWriteFile": "RETROOS.RetroWriteFile", "RtlCompareMemory": "FORWARD.Entry"},
+    visibility = ["//visibility:public"],
+)
+
+[nasm_library(name = name + "_obj", srcs = [name + ".asm"], copts = ["-fwin32"])
+ for name in ["lazy", "initdep", "reject"]]
+windows_dll(
+    name = "lazy", obj = ":lazy_obj", out = "LAZY.DLL", module_name = "LAZY",
+    entry = "DllMain", exports = ["Value"],
+    imports = {"Ready": "INITDEP.Ready", "LdrGetDllHandle": "NTDLL.LdrGetDllHandle"},
+    visibility = ["//visibility:public"],
+)
+windows_dll(
+    name = "initdep", obj = ":initdep_obj", out = "INITDEP.DLL", module_name = "INITDEP",
+    entry = "DllMain", exports = ["Ready"], visibility = ["//visibility:public"],
+)
+windows_dll(
+    name = "reject", obj = ":reject_obj", out = "REJECT.DLL", module_name = "REJECT",
+    entry = "DllMain", exports = ["Rejected"], visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "forwarders",
+    srcs = ["forward.py"],
+    outs = ["FORWARD.DLL", "RELAY.DLL"],
+    cmd = "python3 $(location forward.py) $(location FORWARD.DLL) RELAY.Entry && " +
+          "python3 $(location forward.py) $(location RELAY.DLL) NTDLL.RtlCompareMemory",
+    visibility = ["//visibility:public"],
+)

@@ -1,14 +1,15 @@
 //! Native Windows personality.
 //!
-//! PE imports resolve against ordinary replacement DLLs. INT 83h exports
-//! enter kernel services and complete their stdcall returns. DLL guest code
-//! handles window callbacks with ordinary calls and returns on the guest stack.
+//! PE imports resolve against Wine and RetroOS backend DLLs. Only explicit
+//! private INT 83h exports enter kernel services. Windows API behavior belongs
+//! in userspace; missing exports never synthesize kernel implementations.
 
 extern crate alloc;
 
 pub mod pe;
 pub mod ne;
 mod atoms;
+mod memory;
 mod extra;
 mod encoding;
 mod threads;
@@ -23,7 +24,6 @@ const DLL_BASE_FIRST: u32 = 0x1000_0000;
 const DLL_BASE_STRIDE: u32 = 0x0100_0000;
 const STACK_TOP: u32 = 0xbff0_0000;
 pub(super) const USER_LIMIT: u32 = 0xc000_0000;
-const TRAMPOLINE: u32 = 0x7ff0_0000;
 const TEB_BASE: u32 = 0x7ffd_e000;
 const PEB_BASE: u32 = 0x7ffd_f000;
 const PROCESS_DATA: u32 = 0x7ffd_c000;
@@ -80,79 +80,29 @@ pub fn print_recent_apis() {
 const INVALID_HANDLE_VALUE: u32 = 0xffff_ffff;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
 const ERROR_INVALID_HANDLE: u32 = 6;
-const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Api {
-    CloseHandle,
-    CreateEventA,
-    CreateFileA,
+    BitBlt,
+    DeleteDC,
+    DeleteObject,
+    EndPaint,
     ExitProcess,
-    FlushFileBuffers,
-    GetACP,
-    GetCPInfo,
-    GetCommandLineA,
-    GetCommandLineW,
-    GetConsoleMode,
-    GetCurrentThreadId,
-    GetFileType,
-    GetLastError,
-    GetModuleFileNameA,
-    GetModuleFileNameW,
-    GetModuleHandleA,
-    GetOEMCP,
-    GetProcAddress,
-    GetModuleHandleW,
-    GetStartupInfoA,
-    GetTickCount64,
-    GetStdHandle,
-    GetVersion,
-    LoadLibraryA,
-    MultiByteToWideChar,
-    ReadConsoleInputA,
-    ReadFile,
-    SetConsoleCtrlHandler,
-    SetConsoleMode,
-    SetEnvironmentVariableA,
-    SetFilePointer,
-    SetStdHandle,
-    SetUnhandledExceptionFilter,
-    UnhandledExceptionFilter,
-    VirtualAlloc,
-    VirtualFree,
-    VirtualQuery,
-    WideCharToMultiByte,
-    WriteConsoleA,
-    WriteFile,
-    UpdateWindow,
+    Extension,
+    FillRect,
     InvalidateRect,
     RetroWndProcReturn,
-    BeginPaint,
-    EndPaint,
-    GetDC,
-    ReleaseDC,
-    FillRect,
-    DrawEdge,
-    GetSysColorBrush,
-    CreateCompatibleDC,
     SelectObject,
-    BitBlt,
-    CreateSolidBrush,
-    CreatePen,
-    DeleteObject,
-    DeleteDC,
-    GetStockObject,
-    MoveToEx,
-    LineTo,
-    Ellipse,
-    Polygon,
-    SetBkColor,
-    SetTextColor,
     TextOutW,
-    GetTextExtentPoint32W,
-    Extension,
-    Stub(u32),
+    WriteFile,
+    Yield,
+    Unsupported,
+    MemoryReserve,
+    MemoryCommit,
+    MemoryDecommit,
+    MemoryRelease,
+
 }
 
 #[derive(Clone, Copy)]
@@ -195,8 +145,6 @@ enum GdiObject {
         height: u32,
         pixels: Vec<u8>,
     },
-    Brush(u32),
-    Pen(u32),
     Font,
 }
 
@@ -255,6 +203,7 @@ pub struct WindowsState {
     ldt: Vec<u64>,
     modules: Vec<Module>,
     allocations: Vec<(u32, u32)>,
+    memory: Vec<memory::Region>,
     protections: Vec<(u32, u32)>,
     heap_next: u32,
     blocks: Vec<extra::Block>,
@@ -267,7 +216,6 @@ pub struct WindowsState {
     /// Last `SetConsoleMode` value for the three standard handles. S-Lang
     /// refuses to start the screen if the input handle still has processed
     /// mode (bit 0) set, which is what a constant mode of 3 reported.
-    std_mode: [u32; 3],
     last_error: u32,
     error_mode: u32,
     pub cwd: [u8; 128],
@@ -288,7 +236,6 @@ pub struct WindowsState {
     messages: Vec<Message>,
     user_events: Vec<u32>,
     registered_messages: Vec<(Vec<u8>,u32)>,
-    trampolines: Vec<extra::Bound>,
     // DLL initialization only; USER32 window callbacks use ordinary guest calls.
     callback: Option<Callback>,
     callback_stack: Vec<Callback>,
@@ -319,6 +266,7 @@ impl WindowsState {
             ldt: vec![0],
             modules: Vec::new(),
             allocations: Vec::new(),
+            memory: Vec::new(),
             protections: Vec::new(),
             heap_next: HEAP_BASE,
             blocks: Vec::new(),
@@ -328,7 +276,6 @@ impl WindowsState {
             finds: Vec::new(),
             next_find: 0x30000,
             console: extra::Console::new(),
-            std_mode: [0; 3],
             last_error: 0,
             error_mode: 0,
             cwd: [0; 128],
@@ -349,7 +296,6 @@ impl WindowsState {
             messages: Vec::new(),
             user_events: Vec::new(),
             registered_messages: Vec::new(),
-            trampolines: Vec::new(),
             callback: None,
             callback_stack: Vec::new(),
             callback_return: 0,
@@ -620,7 +566,7 @@ fn descriptor(base: u32, limit: u32) -> u64 {
 fn module_name(name: &[u8]) -> Vec<u8> {
     let mut out = name.to_vec();
     out.make_ascii_uppercase();
-    if !out.ends_with(b".DLL") {
+    if !out.contains(&b'.') {
         out.extend_from_slice(b".DLL");
     }
     out
@@ -783,76 +729,114 @@ fn change_protection<A: crate::Arch>(machine: &mut A, state: &mut WindowsState,
     Ok(old)
 }
 
-fn resolve_export(module: &Module, symbol: &pe::ImportSymbol) -> Result<u32, i32> {
-    let image = pe::Image::parse(&module.data).map_err(|_| 8)?;
-    let export = image
-        .exports()
-        .map_err(|_| 8)?
-        .into_iter()
-        .find(|e| match symbol {
-            pe::ImportSymbol::Name(n) => e.name.eq_ignore_ascii_case(n),
-            pe::ImportSymbol::Ordinal(n) => e.ordinal == *n,
-        })
-        .ok_or(127)?;
-    // Forwarded exports are deliberately outside the initial replacement-DLL surface.
-    if export.rva >= image.header.export.rva
-        && export.rva
-            < image
-                .header
-                .export
-                .rva
-                .saturating_add(image.header.export.size)
-    {
-        return Err(127);
+// Both startup imports and dynamic loads follow only requested forwarders.
+// Loading every export's target would pull optional DLLs into every process.
+fn ensure_dependency(modules: &mut Vec<Module>, name: &[u8], importer: usize) -> Result<usize, i32> {
+    if let Some(index) = find_module(modules, name) { return Ok(index); }
+    let (path, data) = load_dependency(name, &modules[importer].path)?;
+    let image = pe::Image::parse(&data).map_err(|_| 8)?;
+    if !image.is_dll() { return Err(8); }
+    let index = modules.len();
+    let base = DLL_BASE_FIRST.checked_add((index as u32 - 1).checked_mul(DLL_BASE_STRIDE).ok_or(8)?).ok_or(8)?;
+    if image.header.size_image > DLL_BASE_STRIDE || base.checked_add(image.header.size_image).is_none_or(|end| end > HEAP_BASE) {
+        return Err(8);
     }
-    module.base.checked_add(export.rva).ok_or(8)
+    modules.push(Module { name: module_name(name), path, data, base });
+    Ok(index)
 }
 
-fn apply_imports<A: crate::Arch>(
-    machine: &mut A,
-    modules: &[Module],
-    index: usize,
-    trampolines: &mut Vec<extra::Bound>,
-) -> Result<(), i32> {
+fn load_import_dependencies(modules: &mut Vec<Module>, start: usize) -> Result<(), i32> {
+    let mut index = start;
+    while index < modules.len() {
+        let imports = pe::Image::parse(&modules[index].data).map_err(|_| 8)?.imports().map_err(|_| 8)?;
+        for import in imports {
+            let mut target = ensure_dependency(modules, &import.module, index)?;
+            let mut symbol = import.symbol;
+            let mut visited = Vec::new();
+            loop {
+                if visited.contains(&(target, symbol.clone())) { return Err(127); }
+                visited.push((target, symbol.clone()));
+                let image = pe::Image::parse(&modules[target].data).map_err(|_| 8)?;
+                // apply_imports emits the diagnostic for absent exports.
+                let Some(rva) = image.export_rva(&symbol).map_err(|_| 8)? else { break; };
+                let Some((name, next)) = image.forwarder(rva).map_err(|_| 8)? else { break; };
+                target = ensure_dependency(modules, &name, target)?;
+                symbol = next;
+            }
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn resolve_export(modules: &[Module], mut index: usize, symbol: &pe::ImportSymbol) -> Result<u32, i32> {
+    let mut symbol = symbol.clone();
+    let mut visited = Vec::new();
+    loop {
+        if visited.contains(&(index, symbol.clone())) { return Err(127); }
+        visited.push((index, symbol.clone()));
+        let module = &modules[index];
+        let image = pe::Image::parse(&module.data).map_err(|_| 8)?;
+        let rva = image.export_rva(&symbol).map_err(|_| 8)?.ok_or(127)?;
+        if let Some((name, next)) = image.forwarder(rva).map_err(|_| 8)? {
+            index = find_module(modules, &name).ok_or(2)?;
+            symbol = next;
+        } else { return module.base.checked_add(rva).ok_or(8); }
+    }
+}
+
+fn apply_imports<A: crate::Arch>(machine: &mut A, modules: &[Module], index: usize) -> Result<(), i32> {
     let image = pe::Image::parse(&modules[index].data).map_err(|_| 8)?;
     for import in image.imports().map_err(|_| 8)? {
         let target_index = find_module(modules, &import.module).ok_or(2)?;
-        let address = match resolve_export(&modules[target_index], &import.symbol) {
-            Ok(address) => address,
-            Err(127) => {
-                let name = match &import.symbol {
-                    pe::ImportSymbol::Name(name) => name.clone(),
-                    pe::ImportSymbol::Ordinal(n) => alloc::format!("#{n}").into_bytes(),
-                };
-                let Some(spec) = extra::lookup(&import.module, &name) else {
-                    crate::compact_println!(
-                        "Windows: unresolved {}!{}",
-                        core::str::from_utf8(&import.module).unwrap_or("dll"),
-                        core::str::from_utf8(&name).unwrap_or("symbol")
-                    );
-                    return Err(127);
-                };
-                if trampolines.len() >= 2048 {
-                    return Err(8);
-                }
-                let at = TRAMPOLINE as usize + trampolines.len() * 2;
-                if trampolines.is_empty() {
-                    machine.zero(TRAMPOLINE as usize, 4096);
-                }
-                machine.write::<u8>(at, 0xcd);
-                machine.write::<u8>(at + 1, 0x83);
-                trampolines.push(extra::Bound {
-                    name: spec.name,
-                    address: at as u32,
-                    arg_bytes: spec.arg_bytes,
-                });
-                at as u32
-            }
-            Err(error) => return Err(error),
-        };
+        let address = resolve_export(modules, target_index, &import.symbol).map_err(|error| {
+            let name = match &import.symbol {
+                pe::ImportSymbol::Name(name) => name.clone(),
+                pe::ImportSymbol::Ordinal(n) => alloc::format!("#{n}").into_bytes(),
+            };
+            crate::compact_println!("Windows: unresolved {}!{}",
+                core::str::from_utf8(&import.module).unwrap_or("dll"),
+                core::str::from_utf8(&name).unwrap_or("symbol"));
+            error
+        })?;
         machine.write::<u32>((modules[index].base + import.iat_rva) as usize, address);
     }
     Ok(())
+}
+
+fn dll_initializers(modules: &[Module], start: usize) -> Result<Vec<(u32, u32)>, i32> {
+    fn visit(modules: &[Module], index: usize, start: usize, seen: &mut [bool], output: &mut Vec<(u32,u32)>) -> Result<(),i32> {
+        if index < start || seen[index] { return Ok(()); }
+        seen[index] = true; // Circular DLL dependencies are permitted.
+        let image = pe::Image::parse(&modules[index].data).map_err(|_| 8)?;
+        for import in image.imports().map_err(|_| 8)? {
+            let dependency = find_module(modules, &import.module).ok_or(2)?;
+            visit(modules, dependency, start, seen, output)?;
+            let address = resolve_export(modules, dependency, &import.symbol)?;
+            if let Some(target) = modules.iter().position(|m| address >= m.base && address - m.base < DLL_BASE_STRIDE) {
+                visit(modules, target, start, seen, output)?;
+            }
+        }
+        if image.header.entry_rva != 0 {
+            output.push((modules[index].base, modules[index].base.checked_add(image.header.entry_rva).ok_or(8)?));
+        }
+        Ok(())
+    }
+    let mut seen = vec![false; modules.len()];
+    let mut output = Vec::new();
+    for index in start..modules.len() { visit(modules, index, start, &mut seen, &mut output)?; }
+    Ok(output)
+}
+
+fn rollback_modules<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, start: usize) {
+    for module in &state.modules[start..] {
+        if let Ok(image) = pe::Image::parse(&module.data) {
+            machine.unmap_range(module.base as usize / 4096, (image.header.size_image as usize).div_ceil(4096));
+        }
+    }
+    state.gates.retain(|gate| !state.modules[start..].iter().any(|module|
+        gate.return_ip >= module.base && gate.return_ip - module.base < DLL_BASE_STRIDE));
+    state.modules.truncate(start);
 }
 
 /// Map a DLL requested after startup, retaining the process's import gates.
@@ -870,47 +854,25 @@ fn load_library<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, name:
     let image=pe::Image::parse(&data).map_err(|_|193u32)?;
     if !image.is_dll() {return Err(193);}
     let start=state.modules.len();
-    let old_trampolines=state.trampolines.len();
-    let old_gates=state.gates.len();
-    let base=DLL_BASE_FIRST.checked_add((start as u32-1)*DLL_BASE_STRIDE).ok_or(8u32)?;
+    let base=DLL_BASE_FIRST.checked_add((start as u32-1).checked_mul(DLL_BASE_STRIDE).ok_or(8u32)?).ok_or(8u32)?;
+    if image.header.size_image > DLL_BASE_STRIDE || base.checked_add(image.header.size_image).is_none_or(|end| end > HEAP_BASE) { return Err(8); }
     if crate::kernel::startup::trace_enabled() {
         crate::compact_dbg_println!("[win32-load] {} base={:08x}",core::str::from_utf8(&path).unwrap_or("?"),base);
     }
     state.modules.push(Module{name:module_name(file),path,data,base});
     let result=(|| {
-        let mut index=start;
-        while index<state.modules.len() {
-            let imports=pe::Image::parse(&state.modules[index].data).map_err(|_|193u32)?.imports().map_err(|_|193u32)?;
-            for import in imports {
-                if find_module(&state.modules,&import.module).is_some() {continue;}
-                let (path,data)=load_dependency(&import.module,&state.modules[index].path).map_err(|_|126u32)?;
-                let image=pe::Image::parse(&data).map_err(|_|193u32)?;
-                if !image.is_dll() {return Err(193);}
-                let base=DLL_BASE_FIRST.checked_add((state.modules.len() as u32-1)*DLL_BASE_STRIDE).ok_or(8u32)?;
-                state.modules.push(Module{name:module_name(&import.module),path,data,base});
-            }
-            index+=1;
-        }
+        load_import_dependencies(&mut state.modules, start).map_err(|e| e as u32)?;
         for module in &state.modules[start..] {map_module(machine,module).map_err(|_|8u32)?;}
-        let old=state.trampolines.len();
-        machine.set_page_flags(TRAMPOLINE as usize/4096,1,true,false);
-        for index in start..state.modules.len() {apply_imports(machine,&state.modules,index,&mut state.trampolines).map_err(|_|127u32)?;}
-        for bound in &state.trampolines[old..] {state.gates.push(Gate{return_ip:bound.address+2,api:Api::Extension,arg_bytes:bound.arg_bytes,name:bound.name});}
-        machine.set_page_flags(TRAMPOLINE as usize/4096,1,false,true);
-        let mut dlls=Vec::new();
+        for index in start..state.modules.len() {apply_imports(machine,&state.modules,index).map_err(|_|127u32)?;}
         for module in &state.modules[start..] {
             protect_module(machine,module).map_err(|_|8u32)?;
-            let image=pe::Image::parse(&module.data).map_err(|_|193u32)?;
             register_module_gates(machine, module, &mut state.gates).map_err(|e| e as u32)?;
-            if image.header.entry_rva!=0 {dlls.push((module.base,module.base+image.header.entry_rva));}
         }
+        let dlls = dll_initializers(&state.modules, start).map_err(|e| e as u32)?;
         Ok((base,dlls))
     })();
-    machine.set_page_flags(TRAMPOLINE as usize/4096,1,false,true);
     if result.is_err() {
-        state.modules.truncate(start);
-        state.trampolines.truncate(old_trampolines);
-        state.gates.truncate(old_gates);
+        rollback_modules(machine, state, start);
     }
     result
 }
@@ -922,11 +884,12 @@ fn dll_startup_stub<A: crate::Arch>(
     machine: &mut A,
     dlls: &[(u32, u32)],
     exe_entry: u32,
+    abort: u32,
 ) -> Result<u32, i32> {
-    dll_startup_stub_at(machine, dlls, exe_entry, 0x7ff2_0000)
+    dll_startup_stub_at(machine, dlls, exe_entry, 0x7ff2_0000, abort)
 }
 
-fn dll_startup_stub_at<A: crate::Arch>(machine: &mut A, dlls: &[(u32,u32)], exe_entry: u32, stub: u32) -> Result<u32,i32> {
+fn dll_startup_stub_at<A: crate::Arch>(machine: &mut A, dlls: &[(u32,u32)], exe_entry: u32, stub: u32, abort: u32) -> Result<u32,i32> {
     let mut code = Vec::new();
     for &(base, entry) in dlls {
         code.extend_from_slice(&[0x68, 0, 0, 0, 0]);
@@ -936,6 +899,12 @@ fn dll_startup_stub_at<A: crate::Arch>(machine: &mut A, dlls: &[(u32,u32)], exe_
         code.push(0xb8);
         code.extend_from_slice(&entry.to_le_bytes());
         code.extend_from_slice(&[0xff, 0xd0]);
+        // A failed attach must not fall through into the application's entry.
+        code.extend_from_slice(&[0x85, 0xc0, 0x75, 14, 0x68]);
+        code.extend_from_slice(&0xc0000142u32.to_le_bytes());
+        code.push(0xb8);
+        code.extend_from_slice(&abort.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0, 0x0f, 0x0b]);
     }
     code.push(0x68);
     code.extend_from_slice(&exe_entry.to_le_bytes());
@@ -950,157 +919,14 @@ fn dll_startup_stub_at<A: crate::Arch>(machine: &mut A, dlls: &[(u32,u32)], exe_
 }
 
 const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
-    (b"KERNEL32", b"CloseHandle", Api::CloseHandle, 4),
-    (b"KERNEL32", b"CreateEventA", Api::CreateEventA, 16),
-    (b"KERNEL32", b"CreateFileA", Api::CreateFileA, 28),
-    (b"KERNEL32", b"ExitProcess", Api::ExitProcess, 4),
-    (b"KERNEL32", b"FlushFileBuffers", Api::FlushFileBuffers, 4),
-    (b"KERNEL32", b"GetACP", Api::GetACP, 0),
-    (b"KERNEL32", b"GetCPInfo", Api::GetCPInfo, 8),
-    (b"KERNEL32", b"GetCommandLineA", Api::GetCommandLineA, 0),
-    (b"KERNEL32", b"GetCommandLineW", Api::GetCommandLineW, 0),
-    (b"KERNEL32", b"GetConsoleMode", Api::GetConsoleMode, 8),
-    (
-        b"KERNEL32",
-        b"GetCurrentThreadId",
-        Api::GetCurrentThreadId,
-        0,
-    ),
-    (b"KERNEL32", b"GetFileType", Api::GetFileType, 4),
-    (b"KERNEL32", b"GetLastError", Api::GetLastError, 0),
-    (
-        b"KERNEL32",
-        b"GetModuleFileNameA",
-        Api::GetModuleFileNameA,
-        12,
-    ),
-    (
-        b"KERNEL32",
-        b"GetModuleFileNameW",
-        Api::GetModuleFileNameW,
-        12,
-    ),
-    (b"KERNEL32", b"GetModuleHandleA", Api::GetModuleHandleA, 4),
-    (b"KERNEL32", b"GetModuleHandleW", Api::GetModuleHandleW, 4),
-    (b"KERNEL32", b"GetOEMCP", Api::GetOEMCP, 0),
-    (b"KERNEL32", b"GetProcAddress", Api::GetProcAddress, 8),
-    (b"KERNEL32", b"GetStdHandle", Api::GetStdHandle, 4),
-    (b"KERNEL32", b"GetStartupInfoA", Api::GetStartupInfoA, 4),
-    (b"KERNEL32", b"GetTickCount64", Api::GetTickCount64, 0),
-    (b"KERNEL32", b"GetVersion", Api::GetVersion, 0),
-    (b"KERNEL32", b"LoadLibraryA", Api::LoadLibraryA, 4),
-    (
-        b"KERNEL32",
-        b"MultiByteToWideChar",
-        Api::MultiByteToWideChar,
-        24,
-    ),
-    (
-        b"KERNEL32",
-        b"ReadConsoleInputA",
-        Api::ReadConsoleInputA,
-        16,
-    ),
-    (b"KERNEL32", b"ReadFile", Api::ReadFile, 20),
-    (
-        b"KERNEL32",
-        b"SetConsoleCtrlHandler",
-        Api::SetConsoleCtrlHandler,
-        8,
-    ),
-    (b"KERNEL32", b"SetConsoleMode", Api::SetConsoleMode, 8),
-    (
-        b"KERNEL32",
-        b"SetEnvironmentVariableA",
-        Api::SetEnvironmentVariableA,
-        8,
-    ),
-    (b"KERNEL32", b"SetFilePointer", Api::SetFilePointer, 16),
-    (b"KERNEL32", b"SetStdHandle", Api::SetStdHandle, 8),
-    (
-        b"KERNEL32",
-        b"SetUnhandledExceptionFilter",
-        Api::SetUnhandledExceptionFilter,
-        4,
-    ),
-    (
-        b"KERNEL32",
-        b"UnhandledExceptionFilter",
-        Api::UnhandledExceptionFilter,
-        4,
-    ),
-    (b"KERNEL32", b"VirtualAlloc", Api::VirtualAlloc, 16),
-    (b"KERNEL32", b"VirtualFree", Api::VirtualFree, 12),
-    (b"KERNEL32", b"VirtualQuery", Api::VirtualQuery, 12),
-    (
-        b"KERNEL32",
-        b"WideCharToMultiByte",
-        Api::WideCharToMultiByte,
-        32,
-    ),
-    (b"KERNEL32", b"WriteConsoleA", Api::WriteConsoleA, 20),
-    (b"KERNEL32", b"WriteFile", Api::WriteFile, 20),
-    (b"USER32", b"BeginPaint", Api::BeginPaint, 8),
-    (b"USER32", b"CheckMenuItem", Api::Stub(0), 12),
-    (b"USER32", b"DestroyIcon", Api::Stub(1), 4),
-    (b"USER32", b"DialogBoxParamW", Api::Stub(0), 20),
-    (b"USER32", b"DrawEdge", Api::DrawEdge, 16),
-    (b"USER32", b"EndDialog", Api::Stub(1), 8),
-    (b"USER32", b"EndPaint", Api::EndPaint, 8),
-    (b"USER32", b"FillRect", Api::FillRect, 12),
-    (b"USER32", b"GetDC", Api::GetDC, 4),
-    (b"USER32", b"GetDlgItemTextW", Api::Stub(0), 16),
-    (b"USER32", b"GetSysColorBrush", Api::GetSysColorBrush, 4),
-    (b"USER32", b"InvalidateRect", Api::InvalidateRect, 12),
-    (b"USER32", b"LoadAcceleratorsW", Api::Stub(0), 8),
-    (b"USER32", b"LoadCursorW", Api::Stub(1), 8),
-    (b"USER32", b"LoadIconW", Api::Stub(1), 8),
-    (b"USER32", b"LoadMenuW", Api::Stub(0), 8),
-    (b"USER32", b"LoadStringW", Api::Stub(0), 16),
-    (b"USER32", b"MessageBoxW", Api::Stub(1), 16),
-    (b"USER32", b"RetroWndProcReturn", Api::RetroWndProcReturn, 0),
-    (b"USER32", b"ReleaseCapture", Api::Stub(1), 0),
-    (b"USER32", b"ReleaseDC", Api::ReleaseDC, 8),
-    (b"USER32", b"SetCapture", Api::Stub(1), 4),
-    (b"USER32", b"SetDlgItemTextW", Api::Stub(1), 12),
-    (b"USER32", b"SetMenu", Api::Stub(1), 8),
-    (b"USER32", b"TranslateAcceleratorW", Api::Stub(0), 12),
-    (b"USER32", b"UpdateWindow", Api::UpdateWindow, 4),
-    (b"GDI32", b"Arc", Api::Stub(1), 36),
-    (b"GDI32", b"BitBlt", Api::BitBlt, 36),
-    (b"GDI32", b"CreateCompatibleDC", Api::CreateCompatibleDC, 4),
-    (b"GDI32", b"CreateFontW", Api::Stub(1), 56),
-    (b"GDI32", b"CreatePen", Api::CreatePen, 12),
-    (b"GDI32", b"CreateSolidBrush", Api::CreateSolidBrush, 4),
-    (b"GDI32", b"DeleteDC", Api::DeleteDC, 4),
-    (b"GDI32", b"DeleteObject", Api::DeleteObject, 4),
-    (b"GDI32", b"Ellipse", Api::Ellipse, 20),
-    (b"GDI32", b"GetLayout", Api::Stub(0), 4),
-    (b"GDI32", b"GetStockObject", Api::GetStockObject, 4),
-    (
-        b"GDI32",
-        b"GetTextExtentPoint32W",
-        Api::GetTextExtentPoint32W,
-        16,
-    ),
-    (b"GDI32", b"LineTo", Api::LineTo, 12),
-    (b"GDI32", b"MoveToEx", Api::MoveToEx, 16),
-    (b"GDI32", b"Polygon", Api::Polygon, 12),
-    (b"GDI32", b"SelectObject", Api::SelectObject, 8),
-    (b"GDI32", b"SetBkColor", Api::SetBkColor, 8),
-    (b"GDI32", b"SetBkMode", Api::Stub(1), 8),
-    (b"GDI32", b"SetLayout", Api::Stub(0), 8),
-    (b"GDI32", b"SetTextColor", Api::SetTextColor, 8),
-    (b"GDI32", b"TextOutW", Api::TextOutW, 20),
-    (b"ADVAPI32", b"RegCloseKey", Api::Stub(0), 4),
-    (b"ADVAPI32", b"RegCreateKeyExW", Api::Stub(1), 36),
-    (b"ADVAPI32", b"RegQueryValueExW", Api::Stub(2), 24),
-    (b"ADVAPI32", b"RegSetValueExW", Api::Stub(0), 24),
-    (b"COMCTL32", b"InitCommonControlsEx", Api::Stub(1), 4),
-    (b"DWMAPI", b"DwmSetWindowAttribute", Api::Stub(0), 16),
-    (b"SHELL32", b"ExtractIconA", Api::Stub(0), 12),
-    (b"SHELL32", b"ShellAboutW", Api::Stub(1), 16),
-    (b"WINMM", b"PlaySoundW", Api::Stub(1), 12),
+    (b"RETROOS", b"RetroProcessExit", Api::ExitProcess, 4),
+    (b"RETROOS", b"RetroWriteFile", Api::WriteFile, 20),
+    (b"RETROOS", b"RetroYield", Api::Yield, 0),
+    (b"RETROOS", b"RetroMemoryReserve", Api::MemoryReserve, 8),
+    (b"RETROOS", b"RetroMemoryCommit", Api::MemoryCommit, 12),
+    (b"RETROOS", b"RetroMemoryDecommit", Api::MemoryDecommit, 8),
+    (b"RETROOS", b"RetroMemoryRelease", Api::MemoryRelease, 4),
+    (b"RETROOS", b"RetroUnsupported", Api::Unsupported, 4),
 ];
 
 /// Real DLL functions execute as guest code. Only explicit INT 83h exports
@@ -1113,9 +939,7 @@ fn register_module_gates<A: crate::Arch>(machine: &A, module: &Module, gates: &m
         if machine.read::<u16>(address as usize) != 0x83cd { continue; }
         let core = API_SPECS.iter().find(|(dll, name, _, _)|
             dll_name.eq_ignore_ascii_case(dll) && export.name == *name);
-        let spec = core.map(|(_, name, api, bytes)| (*name, *api, *bytes))
-            .or_else(|| extra::lookup(&module.name, &export.name)
-                .map(|spec| (spec.name, Api::Extension, spec.arg_bytes)));
+        let spec = core.map(|(_, name, api, bytes)| (*name, *api, *bytes));
         if let Some((name, api, arg_bytes)) = spec {
             gates.push(Gate { return_ip: address + 2, api, arg_bytes, name });
         }
@@ -1125,7 +949,7 @@ fn register_module_gates<A: crate::Arch>(machine: &A, module: &Module, gates: &m
 
 fn export_address(modules: &[Module], module: &[u8], name: &[u8]) -> Result<u32, i32> {
     let i = find_module(modules, module).ok_or(2)?;
-    resolve_export(&modules[i], &pe::ImportSymbol::Name(name.to_vec()))
+    resolve_export(modules, i, &pe::ImportSymbol::Name(name.to_vec()))
 }
 
 pub(super) fn windows_path(state: &WindowsState, path: &[u8], create: bool) -> Result<Vec<u8>, u32> {
@@ -1241,42 +1065,12 @@ pub fn exec_pe_into<A: crate::Arch>(
         data,
         base: main_header.image_base,
     }];
-    let mut i = 0;
-    while i < modules.len() {
-        let imports = pe::Image::parse(&modules[i].data)
-            .map_err(|_| 8)?
-            .imports()
-            .map_err(|_| 8)?;
-        for import in imports {
-            if find_module(&modules, &import.module).is_some() {
-                continue;
-            }
-            let (dll_path, dll_data) = load_dependency(&import.module, &modules[i].path)?;
-            let image = pe::Image::parse(&dll_data).map_err(|_| 8)?;
-            if !image.is_dll() {
-                return Err(8);
-            }
-            let slot = modules.len() as u32;
-            modules.push(Module {
-                name: module_name(&import.module),
-                path: dll_path,
-                data: dll_data,
-                base: DLL_BASE_FIRST
-                    .checked_add((slot - 1) * DLL_BASE_STRIDE)
-                    .ok_or(8)?,
-            });
-        }
-        i += 1;
-    }
+    load_import_dependencies(&mut modules, 0)?;
     for module in &modules {
         map_module(machine, module)?;
     }
-    let mut trampolines = Vec::new();
     for n in 0..modules.len() {
-        apply_imports(machine, &modules, n, &mut trampolines)?;
-    }
-    if !trampolines.is_empty() {
-        machine.set_page_flags(TRAMPOLINE as usize / 4096, 1, false, true);
+        apply_imports(machine, &modules, n)?;
     }
 
     let stack_size = main_header
@@ -1323,22 +1117,12 @@ pub fn exec_pe_into<A: crate::Arch>(
         .base
         .checked_add(main_header.entry_rva)
         .ok_or(8)?;
-    // Real DLLs (MSVCRT) allocate their thread data in DllMain. The stub
-    // system libraries have no entry point and are skipped.
-    let mut dlls = Vec::new();
-    for module in modules.iter().skip(1) {
-        let image = pe::Image::parse(&module.data).map_err(|_| 8)?;
-        if image.header.entry_rva != 0 {
-            dlls.push((
-                module.base,
-                module.base.checked_add(image.header.entry_rva).ok_or(8)?,
-            ));
-        }
-    }
+    let dlls = dll_initializers(&modules, 1)?;
     let entry = if dlls.is_empty() {
         entry
     } else {
-        dll_startup_stub(machine, &dlls, entry)?
+        let abort = export_address(&modules, b"RETROOS", b"RetroProcessExit")?;
+        dll_startup_stub(machine, &dlls, entry, abort)?
     };
     let current = thread::get_thread(threads, tid).ok_or(8)?;
     thread::init_process_thread(current, entry, stack);
@@ -1360,14 +1144,6 @@ pub fn exec_pe_into<A: crate::Arch>(
     for module in &modules {
         register_module_gates(machine, module, &mut state.gates)?;
     }
-    for bound in &trampolines {
-        state.gates.push(Gate {
-            return_ip: bound.address + 2,
-            api: Api::Extension,
-            arg_bytes: bound.arg_bytes,
-            name: bound.name,
-        });
-    }
     state.callback_return = export_address(&modules, b"USER32", b"RetroWndProcReturn").unwrap_or(0);
     if state.callback_return == 0 {
         state.callback_return=0x7ff6_0000;
@@ -1379,7 +1155,6 @@ pub fn exec_pe_into<A: crate::Arch>(
     if main_header.subsystem == 3 {
         extra::open_console(&mut state);
     }
-    state.trampolines = trampolines;
     state.modules = modules;
     state.on_resume(machine);
     current.personality = thread::Personality::Windows(state.into());
@@ -1531,33 +1306,6 @@ fn io_write<A: crate::Arch>(
     1
 }
 
-fn io_read<A: crate::Arch>(
-    machine: &mut A,
-    kt: &mut thread::KernelThread<A>,
-    handle: usize,
-    ptr: usize,
-    len: usize,
-    actual: usize,
-) -> u32 {
-    if handle >= thread::MAX_FDS {
-        return 0;
-    }
-    let mut data = vec![0; len];
-    let n = match kt.fds[handle] {
-        thread::FdKind::Vfs(h) => crate::kernel::vfs::read_by_handle(h, &mut data),
-        thread::FdKind::PipeRead(p) => crate::kernel::kpipe::read(p, &mut data) as i32,
-        _ => -1,
-    };
-    if n < 0 {
-        return 0;
-    }
-    machine.copy_to(ptr, &data[..n as usize]);
-    if actual != 0 {
-        machine.write::<u32>(actual, n as u32);
-    }
-    1
-}
-
 pub(super) fn copy_ascii<A: crate::Arch>(machine: &mut A, out: usize, cap: usize, text: &[u8]) -> u32 {
     if cap == 0 {
         return 0;
@@ -1611,7 +1359,7 @@ fn system_color(index: u32) -> u32 {
     }
 }
 
-fn object_color(state: &WindowsState, handle: u32, default: u32) -> u32 {
+fn object_color(_state: &WindowsState, handle: u32, default: u32) -> u32 {
     if (0x40000..=0x40008).contains(&handle) {
         return match handle - 0x40000 {
             0 | 6 => 0x00ff_ffff, 1 => 0x00c0_c0c0, 2 => 0x0080_8080,
@@ -1621,15 +1369,7 @@ fn object_color(state: &WindowsState, handle: u32, default: u32) -> u32 {
     if (0x30000..0x30100).contains(&handle) {
         return system_color(handle - 0x30000);
     }
-    match state
-        .gdi_objects
-        .iter()
-        .find(|(h, _)| *h == handle)
-        .map(|(_, o)| o)
-    {
-        Some(GdiObject::Brush(color)) | Some(GdiObject::Pen(color)) => *color,
-        _ => default,
-    }
+    default
 }
 
 fn dc_bitmap(state: &WindowsState, dc: u32) -> Option<u32> {
@@ -1779,29 +1519,6 @@ fn fill_pixels_unclipped(
     }
 }
 
-fn line(state: &mut WindowsState, dc: u32, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: u32) {
-    let dx = (x1 - x0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let dy = -(y1 - y0).abs();
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut error = dx + dy;
-    loop {
-        put_pixel(state, dc, x0, y0, color);
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-        let twice = error * 2;
-        if twice >= dy {
-            error += dy;
-            x0 += sx;
-        }
-        if twice <= dx {
-            error += dx;
-            y0 += sy;
-        }
-    }
-}
-
 fn rect_from_guest<A: crate::Arch>(machine: &A, address: usize) -> (i32, i32, i32, i32) {
     (
         machine.read::<u32>(address) as i32,
@@ -1819,337 +1536,19 @@ fn dispatch<A: crate::Arch>(
     api: Api,
 ) -> u32 {
     match api {
-        Api::GetLastError => state.last_error,
-        Api::GetACP => u32::from(lib::locale::current().ansi),
-        Api::GetOEMCP => u32::from(lib::codepage::current_codepage().id),
-        Api::GetVersion => 0x0000_0004,
-        Api::GetCurrentThreadId => (kt.tid + 1) as u32,
-        Api::GetCommandLineA => state.command_line_a,
-        Api::GetCommandLineW => state.command_line_w,
-        Api::GetStdHandle => match arg(machine, regs, 0) as i32 {
-            -10 => 0,
-            -11 => 1,
-            -12 => 2,
-            _ => INVALID_HANDLE_VALUE,
+        Api::Yield => 0,
+        Api::MemoryReserve | Api::MemoryCommit | Api::MemoryDecommit | Api::MemoryRelease => {
+            let base = arg(machine, regs, 0);
+            let size = if api == Api::MemoryRelease { 0 } else { arg(machine, regs, 1) };
+            let flags = if api == Api::MemoryCommit { arg(machine, regs, 2) } else { 0 };
+            memory::call(machine, state, api, base, size, flags)
         },
-        Api::SetStdHandle => {
-            let slot = match arg(machine, regs, 0) as i32 {
-                -10 => 0,
-                -11 => 1,
-                -12 => 2,
-                _ => return fail(state, ERROR_INVALID_PARAMETER, 0),
-            };
-            let source = arg(machine, regs, 1) as usize;
-            if source >= thread::MAX_FDS {
-                fail(state, ERROR_INVALID_HANDLE, 0)
-            } else {
-                kt.fds[slot] = kt.fds[source];
-                1
-            }
-        }
-        Api::GetFileType => {
-            let h = arg(machine, regs, 0) as usize;
-            if h >= thread::MAX_FDS {
-                return fail(state, ERROR_INVALID_HANDLE, 0);
-            }
-            match kt.fds[h] {
-                thread::FdKind::Vfs(_) => 1,
-                thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_) => 3,
-                thread::FdKind::ConsoleOut => 2,
-                _ => 0,
-            }
-        }
-        Api::WriteConsoleA => {
-            let ptr = arg(machine, regs, 1) as usize;
-            let len = arg(machine, regs, 2) as usize;
-            let written = arg(machine, regs, 3) as usize;
-            extra::write_console_text(machine, state, ptr, len);
-            if written != 0 {
-                machine.write::<u32>(written, len as u32);
-            }
-            1
-        }
         Api::WriteFile => io_write(
             machine, kt, arg(machine, regs, 0) as usize,
             arg(machine, regs, 1) as usize, arg(machine, regs, 2) as usize,
             arg(machine, regs, 3) as usize, state.console.output_cp,
         ),
-        Api::ReadFile => io_read(
-            machine,
-            kt,
-            arg(machine, regs, 0) as usize,
-            arg(machine, regs, 1) as usize,
-            arg(machine, regs, 2) as usize,
-            arg(machine, regs, 3) as usize,
-        ),
-        Api::CreateFileA => {
-            let raw = match encoding::file_string(machine, state, arg(machine, regs, 0), false) {
-                Ok(v) => v,
-                Err(e) => return fail(state, e, INVALID_HANDLE_VALUE),
-            };
-            create_file(machine, kt, state, &raw, arg(machine, regs, 4))
-        }
-        Api::CloseHandle => {
-            let h = arg(machine, regs, 0);
-            if h >= 0x10000 {
-                return 1;
-            }
-            let h = h as usize;
-            if h >= thread::MAX_FDS || kt.fds[h].is_none() {
-                fail(state, ERROR_INVALID_HANDLE, 0)
-            } else {
-                kt.close_fd(h);
-                1
-            }
-        }
-        Api::FlushFileBuffers => 1,
-        Api::SetFilePointer => {
-            let h = arg(machine, regs, 0) as usize;
-            if h >= thread::MAX_FDS {
-                return fail(state, ERROR_INVALID_HANDLE, INVALID_HANDLE_VALUE);
-            }
-            let thread::FdKind::Vfs(vh) = kt.fds[h] else {
-                return fail(state, ERROR_INVALID_HANDLE, INVALID_HANDLE_VALUE);
-            };
-            let high_ptr = arg(machine, regs, 2) as usize;
-            let low = arg(machine, regs, 1);
-            let offset = if high_ptr == 0 {
-                i64::from(low as i32)
-            } else {
-                (i64::from(machine.read::<i32>(high_ptr)) << 32) | i64::from(low)
-            };
-            let Ok(offset) = i32::try_from(offset) else {
-                return fail(state, ERROR_INVALID_PARAMETER, INVALID_HANDLE_VALUE);
-            };
-            let pos = crate::kernel::vfs::seek_by_handle(
-                vh, offset, arg(machine, regs, 3) as i32,
-            );
-            if pos < 0 {
-                fail(state, ERROR_INVALID_PARAMETER, INVALID_HANDLE_VALUE)
-            } else {
-                if high_ptr != 0 {
-                    machine.write::<u32>(high_ptr, 0);
-                }
-                pos as u32
-            }
-        }
-        Api::VirtualAlloc => {
-            let requested = arg(machine, regs, 0);
-            let size = arg(machine, regs, 1).max(1).next_multiple_of(4096);
-            let base = if requested != 0 {
-                requested & !4095
-            } else {
-                state.heap_next
-            };
-            let Some(end) = base.checked_add(size) else {
-                return fail(state, ERROR_NOT_ENOUGH_MEMORY, 0);
-            };
-            if end >= USER_LIMIT {
-                return fail(state, ERROR_NOT_ENOUGH_MEMORY, 0);
-            }
-            if requested == 0 {
-                state.heap_next = end;
-            }
-            machine.zero(base as usize, size as usize);
-            let protection = arg(machine,regs,3);
-            let Some((write,execute)) = protection_flags(protection) else {
-                return fail(state, ERROR_INVALID_PARAMETER, 0);
-            };
-            machine.set_page_flags(base as usize / 4096, size as usize / 4096, write, execute);
-            state.allocations.push((base, size));
-            for page in (base..end).step_by(4096) { state.protections.push((page,protection)); }
-            base
-        }
-        Api::VirtualFree => {
-            let base = arg(machine, regs, 0);
-            if let Some(n) = state.allocations.iter().position(|&(a, _)| a == base) {
-                state.allocations.swap_remove(n);
-                1
-            } else {
-                fail(state, ERROR_INVALID_PARAMETER, 0)
-            }
-        }
-        Api::VirtualQuery => {
-            let address = arg(machine, regs, 0);
-            let out = arg(machine, regs, 1) as usize;
-            let len = arg(machine, regs, 2);
-            if len < 28 {
-                return 0;
-            }
-            let (base, size) =
-                if address >= state.stack_base && address < state.stack_base + state.stack_size {
-                    (state.stack_base, state.stack_size)
-                } else if let Some(&(base, size)) = state
-                    .allocations
-                    .iter()
-                    .find(|&&(base, size)| address >= base && address < base + size)
-                {
-                    (base, size)
-                } else if let Some(module) = state.modules.iter().find(|module| {
-                    pe::Image::parse(&module.data).is_ok_and(|image|
-                        address >= module.base && address < module.base + image.header.size_image)
-                }) {
-                    (module.base,pe::Image::parse(&module.data).unwrap().header.size_image)
-                } else {
-                    (address & !4095, 4096)
-                };
-            machine.write::<u32>(out, base);
-            machine.write::<u32>(out + 4, base);
-            machine.write::<u32>(out + 8, 0x04);
-            machine.write::<u32>(out + 12, size);
-            machine.write::<u32>(out + 16, 0x1000);
-            machine.write::<u32>(out + 20, memory_protection(state,address).unwrap_or(0));
-            machine.write::<u32>(out + 24, 0x20000);
-            28
-        }
-        Api::GetModuleHandleA | Api::LoadLibraryA | Api::GetModuleHandleW => {
-            let p = arg(machine, regs, 0);
-            if p == 0 {
-                state.modules[0].base
-            } else {
-                let name = match api {
-                    Api::GetModuleHandleW => w_string(machine, p),
-                    _ => c_string(machine, p),
-                };
-                let name = match name {
-                    Ok(v) => v,
-                    Err(e) => return fail(state, e, 0),
-                };
-                if let Some(n) = find_module(&state.modules, &name) {
-                    state.modules[n].base
-                } else {
-                    fail(state, 126, 0)
-                }
-            }
-        }
-        Api::GetProcAddress => {
-            let base = arg(machine, regs, 0);
-            let p = arg(machine, regs, 1);
-            let Some(module) = state.modules.iter().find(|m| m.base == base) else {
-                return fail(state, 126, 0);
-            };
-            let symbol = if p <= 0xffff {
-                pe::ImportSymbol::Ordinal(p as u16)
-            } else {
-                match c_string(machine, p) {
-                    Ok(n) => pe::ImportSymbol::Name(n),
-                    Err(e) => return fail(state, e, 0),
-                }
-            };
-            let module_name = module.name.clone();
-            let result = match resolve_export(module, &symbol) {
-                Ok(address) => address,
-                Err(_) => {
-                    let spec = match &symbol {
-                        pe::ImportSymbol::Name(name) => extra::lookup(&module_name,name),
-                        _ => None,
-                    };
-                    if let Some(spec) = spec {
-                        if let Some(bound) = state.trampolines.iter().find(|b| b.name == spec.name) {
-                            bound.address
-                        } else if state.trampolines.len() < 2048 {
-                            let address = TRAMPOLINE + state.trampolines.len() as u32 * 2;
-                            machine.set_page_flags(TRAMPOLINE as usize/4096,1,true,false);
-                            machine.copy_to(address as usize,&[0xcd,0x83]);
-                            machine.set_page_flags(TRAMPOLINE as usize/4096,1,false,true);
-                            state.trampolines.push(extra::Bound{name:spec.name,address,arg_bytes:spec.arg_bytes});
-                            state.gates.push(Gate{return_ip:address+2,api:Api::Extension,name:spec.name,arg_bytes:spec.arg_bytes});
-                            address
-                        } else { fail(state,8,0) }
-                    } else { fail(state,127,0) }
-                }
-            };
-            if crate::kernel::startup::trace_enabled() && let pe::ImportSymbol::Name(name) = &symbol {
-                crate::compact_dbg_println!("[win32-proc] {}!{}={:08x}",core::str::from_utf8(&module_name).unwrap_or("?"),core::str::from_utf8(name).unwrap_or("?"),result);
-            }
-            result
-        }
-        Api::GetModuleFileNameA => {
-            let module = arg(machine, regs, 0);
-            let path = if module == 0 {
-                &state.modules[0].path
-            } else {
-                match state.modules.iter().find(|m| m.base == module) {
-                    Some(m) => &m.path,
-                    None => return fail(state, 126, 0),
-                }
-            };
-            copy_ascii(
-                machine,
-                arg(machine, regs, 1) as usize,
-                arg(machine, regs, 2) as usize,
-                &guest_windows_path(path),
-            )
-        }
-        Api::GetModuleFileNameW => {
-            let module = arg(machine, regs, 0);
-            let path = if module == 0 {
-                &state.modules[0].path
-            } else {
-                match state.modules.iter().find(|m| m.base == module) {
-                    Some(m) => &m.path,
-                    None => return fail(state, 126, 0),
-                }
-            };
-            let text = guest_windows_path(path);
-            encoding::copy(machine, arg(machine, regs, 1) as usize,
-                arg(machine, regs, 2) as usize, &text, true)
-        }
-        Api::GetCPInfo => {
-            let Some(page) = encoding::page(arg(machine, regs, 0)) else {
-                return fail(state, ERROR_INVALID_PARAMETER, 0);
-            };
-            let out = arg(machine, regs, 1) as usize;
-            machine.zero(out, 20);
-            machine.write::<u32>(out, if matches!(page, crate::kernel::text::Encoding::Utf8) { 4 } else { 1 });
-            machine.write::<u8>(out + 4, b'?');
-            1
-        }
-        Api::MultiByteToWideChar => encoding::multi_to_wide(machine, state, regs),
-        Api::WideCharToMultiByte => encoding::wide_to_multi(machine, state, regs),
-        Api::GetConsoleMode => {
-            let handle = arg(machine, regs, 0) as usize;
-            let mode = state.std_mode.get(handle).copied().unwrap_or(0);
-            machine.write::<u32>(arg(machine, regs, 1) as usize, mode);
-            1
-        }
-        Api::SetConsoleMode => {
-            let handle = arg(machine, regs, 0) as usize;
-            if let Some(slot) = state.std_mode.get_mut(handle) {
-                *slot = arg(machine, regs, 1);
-            }
-            1
-        }
-        Api::SetConsoleCtrlHandler => 1,
-        Api::SetEnvironmentVariableA => extra::set_environment(machine, state, regs, false),
-        Api::SetUnhandledExceptionFilter => 0,
-        Api::UnhandledExceptionFilter => 1,
-        Api::CreateEventA => {
-            let h = state.next_object;
-            state.next_object += 1;
-            h
-        }
-        Api::ReadConsoleInputA => extra::read_input(
-            machine,
-            state,
-            arg(machine, regs, 1) as usize,
-            arg(machine, regs, 2),
-            arg(machine, regs, 3) as usize,
-            true,
-            false,
-        ),
-        Api::GetStartupInfoA => {
-            let out = arg(machine, regs, 0) as usize;
-            machine.zero(out, 68);
-            machine.write::<u32>(out, 68);
-            0
-        }
-        Api::GetTickCount64 => {
-            let ticks = machine.now() / 1_000_000;
-            regs.rdx = ticks >> 32;
-            ticks as u32
-        }
-        Api::UpdateWindow | Api::InvalidateRect => {
+        Api::InvalidateRect => {
             let hwnd = arg(machine, regs, 0);
             if state.windows.iter().any(|w| w.hwnd == hwnd) {
                 queue_paint(state, hwnd);
@@ -2159,64 +1558,9 @@ fn dispatch<A: crate::Arch>(
             }
         }
         Api::RetroWndProcReturn => 0,
-        Api::BeginPaint => {
-            let hwnd = arg(machine, regs, 0);
-            let out = arg(machine, regs, 1) as usize;
-            let Some(window) = state.windows.iter().find(|w| w.hwnd == hwnd) else {
-                return 0;
-            };
-            machine.zero(out, 64);
-            machine.write::<u32>(out, state.paint_dc);
-            machine.write::<u32>(out + 8, 0);
-            machine.write::<u32>(out + 12, 0);
-            machine.write::<u32>(out + 16, window.width);
-            machine.write::<u32>(out + 20, window.height);
-            state.paint_hwnd = hwnd;
-            state.paint_dc
-        }
         Api::EndPaint => {
             state.dirty = true;
             1
-        }
-        Api::GetDC => {
-            state.paint_hwnd = arg(machine, regs, 0);
-            state.paint_dc
-        }
-        Api::ReleaseDC => 1,
-        Api::GetSysColorBrush => 0x30000 + arg(machine, regs, 0),
-        Api::CreateSolidBrush => {
-            let handle = state.next_object;
-            state.next_object += 1;
-            state
-                .gdi_objects
-                .push((handle, GdiObject::Brush(arg(machine, regs, 0))));
-            handle
-        }
-        Api::CreatePen => {
-            let handle = state.next_object;
-            state.next_object += 1;
-            state
-                .gdi_objects
-                .push((handle, GdiObject::Pen(arg(machine, regs, 2))));
-            handle
-        }
-        Api::CreateCompatibleDC => {
-            let handle = state.next_object;
-            state.next_object += 1;
-            state.dcs.push(DeviceContext {
-                viewport: None,
-                handle,
-                window: None,
-                bitmap: None,
-                x: 0,
-                y: 0,
-                pen: 0x40007,
-                brush: 0x40000,
-                font: 1,
-                bk: 0x00ff_ffff,
-                text: 0,
-            });
-            handle
         }
         Api::SelectObject => {
             let dc = arg(machine, regs, 0);
@@ -2228,8 +1572,6 @@ fn dispatch<A: crate::Arch>(
                 .find(|(h, _)| *h == object)
                 .map(|(_, o)| match o {
                     GdiObject::Bitmap { .. } => 0,
-                    GdiObject::Brush(_) => 1,
-                    GdiObject::Pen(_) => 2,
                     GdiObject::Font => 3,
                 }) };
             let Some(context) = state.dcs.iter_mut().find(|d| d.handle == dc) else {
@@ -2275,13 +1617,6 @@ fn dispatch<A: crate::Arch>(
                 0
             }
         }
-        Api::GetStockObject => {
-            match arg(machine, regs, 0) {
-                index @ 0..=8 => 0x40000 + index,
-                index @ 10..=17 => 0x30000 + index,
-                _ => 0,
-            }
-        }
         Api::FillRect => {
             let dc = arg(machine, regs, 0);
             let rect = arg(machine, regs, 1) as usize;
@@ -2291,131 +1626,6 @@ fn dispatch<A: crate::Arch>(
             let color = object_color(state, brush, 0x00c0_c0c0);
             let (l, t, r, b) = rect_from_guest(machine, rect);
             fill_pixels(state, dc, l, t, r, b, color);
-            1
-        }
-        Api::DrawEdge => {
-            let dc = arg(machine, regs, 0);
-            let rect = arg(machine, regs, 1) as usize;
-            let (l, t, r, b) = rect_from_guest(machine, rect);
-            line(state, dc, l, t, r - 1, t, 0x00ff_ffff);
-            line(state, dc, l, t, l, b - 1, 0x00ff_ffff);
-            line(state, dc, l, b - 1, r - 1, b - 1, 0x0080_8080);
-            line(state, dc, r - 1, t, r - 1, b - 1, 0x0080_8080);
-            1
-        }
-        Api::MoveToEx => {
-            let dc = arg(machine, regs, 0);
-            let x = arg(machine, regs, 1) as i32;
-            let y = arg(machine, regs, 2) as i32;
-            let Some(context) = state.dcs.iter_mut().find(|d| d.handle == dc) else {
-                return 0;
-            };
-            let old = arg(machine, regs, 3) as usize;
-            if old != 0 {
-                machine.write::<u32>(old, context.x as u32);
-                machine.write::<u32>(old + 4, context.y as u32);
-            }
-            context.x = x;
-            context.y = y;
-            1
-        }
-        Api::LineTo => {
-            let dc = arg(machine, regs, 0);
-            let x = arg(machine, regs, 1) as i32;
-            let y = arg(machine, regs, 2) as i32;
-            let Some((x0, y0, pen)) = state
-                .dcs
-                .iter()
-                .find(|d| d.handle == dc)
-                .map(|d| (d.x, d.y, d.pen))
-            else {
-                return 0;
-            };
-            let color = object_color(state, pen, 0);
-            if pen != 0x40008 { line(state, dc, x0, y0, x, y, color); }
-            if let Some(context) = state.dcs.iter_mut().find(|d| d.handle == dc) {
-                context.x = x;
-                context.y = y;
-            }
-            1
-        }
-        Api::Ellipse => {
-            let dc = arg(machine, regs, 0);
-            let l = arg(machine, regs, 1) as i32;
-            let t = arg(machine, regs, 2) as i32;
-            let r = arg(machine, regs, 3) as i32;
-            let b = arg(machine, regs, 4) as i32;
-            let brush = state
-                .dcs
-                .iter()
-                .find(|d| d.handle == dc)
-                .map_or(0x30005, |d| d.brush);
-            let color = object_color(state, brush, 0);
-            let cx = (l + r) / 2;
-            let cy = (t + b) / 2;
-            let rx = ((r - l) / 2).max(1);
-            let ry = ((b - t) / 2).max(1);
-            for y in t..b {
-                for x in l..r {
-                    let dx = x - cx;
-                    let dy = y - cy;
-                    if dx * dx * ry * ry + dy * dy * rx * rx <= rx * rx * ry * ry {
-                        put_pixel(state, dc, x, y, color);
-                    }
-                }
-            }
-            1
-        }
-        Api::Polygon => {
-            let dc = arg(machine, regs, 0);
-            let points = arg(machine, regs, 1) as usize;
-            let count = arg(machine, regs, 2) as usize;
-            let pen = state
-                .dcs
-                .iter()
-                .find(|d| d.handle == dc)
-                .map_or(0x30008, |d| d.pen);
-            if pen == 0x40008 { return 1; }
-            let color = object_color(state, pen, 0);
-            if count > 1 && count < 1024 {
-                for i in 0..count {
-                    let j = (i + 1) % count;
-                    let x0 = machine.read::<u32>(points + i * 8) as i32;
-                    let y0 = machine.read::<u32>(points + i * 8 + 4) as i32;
-                    let x1 = machine.read::<u32>(points + j * 8) as i32;
-                    let y1 = machine.read::<u32>(points + j * 8 + 4) as i32;
-                    line(state, dc, x0, y0, x1, y1, color);
-                }
-            }
-            1
-        }
-        Api::SetBkColor | Api::SetTextColor => {
-            let dc = arg(machine, regs, 0);
-            let color = arg(machine, regs, 1);
-            let Some(context) = state.dcs.iter_mut().find(|d| d.handle == dc) else {
-                return 0xffff_ffff;
-            };
-            if api == Api::SetBkColor {
-                let old = context.bk;
-                context.bk = color;
-                old
-            } else {
-                let old = context.text;
-                context.text = color;
-                old
-            }
-        }
-        Api::GetTextExtentPoint32W => {
-            let count = arg(machine, regs, 2) as i32;
-            let text = if count == 0 { alloc::string::String::new() } else {
-                let units = match encoding::units(machine, arg(machine, regs, 1), count) {
-                    Ok(units) => units, Err(e) => return fail(state, e, 0),
-                };
-                crate::kernel::text::from_utf16(&units, false).unwrap()
-            };
-            let out = arg(machine, regs, 3) as usize;
-            machine.write::<u32>(out, text.chars().count() as u32 * 8);
-            machine.write::<u32>(out + 4, 16);
             1
         }
         Api::TextOutW => {
@@ -2518,8 +1728,7 @@ fn dispatch<A: crate::Arch>(
             1
         }
         Api::Extension => 0,
-        Api::Stub(result) => result,
-        Api::ExitProcess => unreachable!(),
+        Api::ExitProcess | Api::Unsupported => unreachable!(),
     }
 }
 
@@ -2551,20 +1760,10 @@ pub fn handle_event<A: crate::Arch>(
                 return thread::KernelAction::Exit(-1);
             };
             if let Some(action) = threads::call(machine,state,regs,gate) { return action; }
-            if gate.api == Api::LoadLibraryA {
-                let name=match c_string(machine,arg(machine,regs,0)) {Ok(name)=>name,Err(error)=>{let result=fail(state,error,0);finish(machine,regs,gate,result);return thread::KernelAction::Done;}};
-                match load_library(machine,state,&name) {
-                    Ok((base,dlls)) if !dlls.is_empty() => {
-                        let stub=0x7ff5_0000 + (state.modules.len() as u32)*4096;
-                        match dll_startup_stub_at(machine,&dlls,state.callback_return,stub) {
-                            Ok(entry)=>{if let Some(outer)=state.callback.take() {state.callback_stack.push(outer);} state.callback=Some(Callback{gate,module_result:Some(base)});regs.set_ip32(entry);},
-                            Err(_)=>{let result=fail(state,8,0);finish(machine,regs,gate,result);},
-                        }
-                    }
-                    Ok((base,_))=>finish(machine,regs,gate,base),
-                    Err(error)=>{let result=fail(state,error,0);finish(machine,regs,gate,result);},
-                }
-                return thread::KernelAction::Done;
+            if gate.api == Api::Unsupported {
+                let name = raw_string(machine, arg(machine, regs, 0)).unwrap_or_default();
+                crate::compact_println!("Wine backend not implemented: {}", core::str::from_utf8(&name).unwrap_or("?"));
+                return thread::KernelAction::Exit(-38);
             }
             if gate.api == Api::ExitProcess {
                 return thread::KernelAction::Exit(arg(machine, regs, 0) as i32);
@@ -2632,6 +1831,30 @@ pub fn handle_event<A: crate::Arch>(
             crate::compact_println!("Windows: unhandled event {:?} at {:#x}", event, regs.ip32());
             thread::KernelAction::Exit(-1)
         }
+    }
+}
+
+#[cfg(test)]
+mod forwarder_tests {
+    use super::*;
+
+    fn module(name: &[u8], base: u32, forward: Option<&[u8]>) -> Module {
+        Module { name: name.to_vec(), path: name.to_vec(), base, data: pe::export_test_image(forward) }
+    }
+
+    #[test]
+    fn follows_name_then_ordinal_forwarder_and_rejects_cycles() {
+        let mut modules = vec![
+            module(b"FIRST.DLL", 0x10000000, Some(b"second.Entry")),
+            module(b"SECOND.DLL", 0x11000000, Some(b"THIRD.#7")),
+            module(b"THIRD.DLL", 0x12000000, None),
+        ];
+        let symbol = pe::ImportSymbol::Name(b"Entry".to_vec());
+        assert_eq!(resolve_export(&modules, 0, &symbol), Ok(0x12000300));
+        modules[2] = module(b"THIRD.DLL", 0x12000000, Some(b"FIRST.Entry"));
+        assert_eq!(resolve_export(&modules, 0, &symbol), Err(127));
+        modules.pop();
+        assert_eq!(resolve_export(&modules, 0, &symbol), Err(2));
     }
 }
 

@@ -1,3 +1,5 @@
+load("//lib/wine:modules.bzl", "WINE_FILES")
+
 """Filesystem layout: paths are relative to their destination volume.
 
 BOOT_FILES and LINUX_FILES are rebuilt with the kernel. DATA_FILES and
@@ -26,32 +28,6 @@ BOOT_FILES = {
     "//shell:shell_elf": "RETROOS/SHELL.ELF",
     # Personality DLL facades travel with the matched kernel. All supported
     # boot sources expose RETROOS/ through a writable session overlay.
-    "//lib/windows/kernel32:kernel32_dll": "RETROOS/WINDOWS/SYSTEM32/KERNEL32.DLL",
-    "//lib/windows/user32:user32_dll":     "RETROOS/WINDOWS/SYSTEM32/USER32.DLL",
-    "//lib/windows/compat:advapi32_dll":   "RETROOS/WINDOWS/SYSTEM32/ADVAPI32.DLL",
-    "//lib/windows/compat:comctl32_dll":   "RETROOS/WINDOWS/SYSTEM32/COMCTL32.DLL",
-    "//lib/windows/compat:dwmapi_dll":     "RETROOS/WINDOWS/SYSTEM32/DWMAPI.DLL",
-    "//lib/windows/compat:gdi32_dll":      "RETROOS/WINDOWS/SYSTEM32/GDI32.DLL",
-    "//lib/windows/compat:shell32_dll":    "RETROOS/WINDOWS/SYSTEM32/SHELL32.DLL",
-    "//lib/windows/compat:winmm_dll":      "RETROOS/WINDOWS/SYSTEM32/WINMM.DLL",
-    "//lib/windows/compat:gdiplus_dll": "RETROOS/WINDOWS/SYSTEM32/GDIPLUS.DLL",
-    "//lib/windows/compat:iphlpapi_dll": "RETROOS/WINDOWS/SYSTEM32/IPHLPAPI.DLL",
-    "//lib/windows/compat:mpr_dll": "RETROOS/WINDOWS/SYSTEM32/MPR.DLL",
-    "//lib/windows/compat:ntdll_dll": "RETROOS/WINDOWS/SYSTEM32/NTDLL.DLL",
-    "//lib/windows/compat:ole32_dll": "RETROOS/WINDOWS/SYSTEM32/OLE32.DLL",
-    "//lib/windows/compat:wininet_dll": "RETROOS/WINDOWS/SYSTEM32/WININET.DLL",
-    "//lib/windows/compat:wsock32_dll": "RETROOS/WINDOWS/SYSTEM32/WSOCK32.DLL",
-    "//lib/windows/compat:msvcrt_dll": "RETROOS/WINDOWS/SYSTEM32/MSVCRT.DLL",
-    "//lib/windows/win16:kernel_dll":     "RETROOS/WINDOWS/SYSTEM/KERNEL.DLL",
-    "//lib/windows/win16:user_dll":       "RETROOS/WINDOWS/SYSTEM/USER.DLL",
-    "//lib/windows/win16:gdi_dll":        "RETROOS/WINDOWS/SYSTEM/GDI.DLL",
-    "//lib/windows/win16:shell_dll":      "RETROOS/WINDOWS/SYSTEM/SHELL.DLL",
-    "//lib/windows/win16:mmsystem_dll": "RETROOS/WINDOWS/SYSTEM/MMSYSTEM.DLL",
-    "//lib/windows/win16:commdlg_dll": "RETROOS/WINDOWS/SYSTEM/COMMDLG.DLL",
-    "//lib/windows/win16:win87em_dll": "RETROOS/WINDOWS/SYSTEM/WIN87EM.DLL",
-    "//lib/windows/win16:sound_dll":      "RETROOS/WINDOWS/SYSTEM/SOUND.DLL",
-    "//lib/windows/win16:lzexpand_dll": "RETROOS/WINDOWS/SYSTEM/LZEXPAND.DLL",
-    "//lib/windows/win16:keyboard_dll":   "RETROOS/WINDOWS/SYSTEM/KEYBOARD.DLL",
     "//lib/os2/doscalls:doscalls_dll":     "RETROOS/OS2/DLL/DOSCALLS.DLL",
     "//lib/os2/kbdcalls:kbdcalls_dll":     "RETROOS/OS2/DLL/KBDCALLS.DLL",
     "//lib/os2/viocalls:viocalls_dll":     "RETROOS/OS2/DLL/VIOCALLS.DLL",
@@ -65,6 +41,8 @@ BOOT_FILES = {
     "//lib/os2/pmshapi:pmshapi_dll":     "RETROOS/OS2/DLL/PMSHAPI.DLL",
     "//lib/os2/helpmgr:helpmgr_dll":     "RETROOS/OS2/DLL/HELPMGR.DLL",
 }
+
+BOOT_FILES.update(WINE_FILES)
 
 DATA_FILES = {
     # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).

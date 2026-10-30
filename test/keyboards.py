@@ -6,6 +6,7 @@ fixture checks BIOS/KBD OEM bytes, Win32 UTF-16/UTF-8 events, Linux UTF-8 input,
 and an explicit keyboard choice independent of the regional profile.
 """
 from pathlib import Path
+from wine_runtime import install as install_windows_runtime
 import shutil
 import subprocess
 import tempfile
@@ -17,23 +18,21 @@ ROOT = Path(__file__).resolve().parent.parent
 def main():
     targets = ["//kernel:retroos-host-kvm", "//test/dos/locale:keyboard",
                "//test/windows/locale:keyboard", "//test/os2/locale:keyboard",
-               "//test/linux/runtime:keyboard", "//lib/windows/kernel32:kernel32_dll",
-               "//lib/windows/user32:user32_dll", "//lib/windows/compat:gdi32_dll", "//lib/os2/doscalls:doscalls_dll",
+               "//test/linux/runtime:keyboard", "//lib/wine:runtime",
+               "//lib/os2/doscalls:doscalls_dll",
                "//lib/os2/kbdcalls:kbdcalls_dll", "//lib/os2/nls:nls_dll"]
     subprocess.run(["bazelisk", "build", *targets, "--platforms=@platforms//host"], cwd=ROOT, check=True)
     linux = subprocess.check_output(["bazelisk", "cquery", "//test/linux/runtime:keyboard",
                                     "--platforms=@platforms//host", "--output=files"], cwd=ROOT, text=True).strip()
     with tempfile.TemporaryDirectory(prefix="retroos-keyboard-") as directory:
         root = Path(directory)
+        install_windows_runtime(root)
         for folder in ["RETROOS/WINDOWS/SYSTEM32", "RETROOS/OS2/DLL"]:
-            (root / folder).mkdir(parents=True)
+            (root / folder).mkdir(parents=True, exist_ok=True)
         for source, destination in [
             ("test/dos/locale/KEYBOARD.COM", "DOS.COM"),
             ("test/windows/locale/keyboard.exe", "WIN.EXE"),
             ("test/os2/locale/keyboard.exe", "OS2.EXE"),
-            ("lib/windows/kernel32/KERNEL32.DLL", "RETROOS/WINDOWS/SYSTEM32/KERNEL32.DLL"),
-            ("lib/windows/user32/USER32.DLL", "RETROOS/WINDOWS/SYSTEM32/USER32.DLL"),
-            ("lib/windows/compat/GDI32.DLL", "RETROOS/WINDOWS/SYSTEM32/GDI32.DLL"),
             ("lib/os2/doscalls/DOSCALLS.DLL", "RETROOS/OS2/DLL/DOSCALLS.DLL"),
             ("lib/os2/kbdcalls/KBDCALLS.DLL", "RETROOS/OS2/DLL/KBDCALLS.DLL"),
             ("lib/os2/nls/NLS.DLL", "RETROOS/OS2/DLL/NLS.DLL"),

@@ -2,6 +2,7 @@
 """Exercise real NE -> guest Rust -> nested NE callbacks on both CPU backends."""
 import os
 from pathlib import Path
+from wine_runtime import install as install_windows_runtime
 import shutil
 import signal
 import subprocess
@@ -17,10 +18,8 @@ def main():
     subprocess.run(['bazelisk', 'build', '//tools/command:command_com'], cwd=ROOT, check=True)
     command_binary = (ROOT / 'bazel-bin/tools/command/COMMAND.COM').resolve()
     targets = [f'//kernel:{host}', '//test/windows/win16:bridge', '//test/windows/win16:fpmath', '//test/windows/win16:civ_apis', '//test/windows/win16:window', '//test/windows/win16:legacy_user',
-               '//lib/windows/user32:user32_dll', '//lib/windows/kernel32:kernel32_dll',
-               '//lib/windows/compat:gdi32_dll', '//lib/windows/compat:winmm_dll', '//test/windows/win16:multimedia', '//test/windows/win16:mmio', '//test/windows/win16:text', '//test/windows/win16:clipping']
+               '//lib/wine:runtime', '//test/windows/win16:multimedia', '//test/windows/win16:mmio', '//test/windows/win16:text', '//test/windows/win16:clipping']
     targets += [f'//test/windows/win16:{name}' for name in ('initializers','init_dependency','init_nested','init_large','init_failure')]
-    targets += [f'//lib/windows/win16:{name}_dll' for name in ('user','kernel','gdi','sound','shell','keyboard','lzexpand','win87em','mmsystem','commdlg')]
     subprocess.run(['bazelisk', 'build', *targets, '--platforms=@platforms//host'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-win16-') as directory:
         root = Path(directory)
@@ -29,10 +28,7 @@ def main():
         system.mkdir(parents=True)
         system32 = root / 'RETROOS/WINDOWS/SYSTEM32'
         system32.mkdir()
-        for name in ('USER','KERNEL','GDI','SOUND','SHELL','KEYBOARD','LZEXPAND','WIN87EM','MMSYSTEM','COMMDLG'):
-            shutil.copyfile(ROOT / f'bazel-bin/lib/windows/win16/{name}.DLL', system / f'{name}.DLL')
-        for name, folder in [('USER32','user32'), ('KERNEL32','kernel32'), ('GDI32','compat'), ('WINMM','compat')]:
-            shutil.copyfile(ROOT / f'bazel-bin/lib/windows/{folder}/{name}.DLL', system32 / f'{name}.DLL')
+        install_windows_runtime(root)
         shutil.copyfile(ROOT / 'bazel-bin/test/windows/win16/LEGACYUSER.DLL', root / 'USER.DLL')
         for name in ('INITDEP','INITNEST','INITLARGE','INITFAIL'):
             shutil.copyfile(ROOT / f'bazel-bin/test/windows/win16/{name}.DLL', root / f'{name}.DLL')

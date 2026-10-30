@@ -239,3 +239,24 @@ rust_binary(
         "//lib:sound",
     ],
 )
+
+rust_test(
+    name = "wine_ne_test",
+    crate_root = "tests/wine_ne.rs",
+    srcs = ["tests/wine_ne.rs", "src/kernel/windows/pe.rs", "src/kernel/windows/ne.rs"],
+    edition = "2024",
+    data = ["@wine_pe//:pe/" + name for name in [
+        "krnl386.exe16", "user.exe16", "gdi.exe16", "mmsystem.dll16", "commdlg.dll16", "win87em.dll16",
+    ]],
+    compile_data = ["@wine_pe//:pe/" + name for name in [
+        "krnl386.exe16", "user.exe16", "gdi.exe16", "mmsystem.dll16", "commdlg.dll16", "win87em.dll16",
+    ]],
+    rustc_env = {
+        "WINE_KERNEL16": "$(execpath @wine_pe//:pe/krnl386.exe16)",
+        "WINE_USER16": "$(execpath @wine_pe//:pe/user.exe16)",
+        "WINE_GDI16": "$(execpath @wine_pe//:pe/gdi.exe16)",
+        "WINE_MM16": "$(execpath @wine_pe//:pe/mmsystem.dll16)",
+        "WINE_DIALOG16": "$(execpath @wine_pe//:pe/commdlg.dll16)",
+        "WINE_FPU16": "$(execpath @wine_pe//:pe/win87em.dll16)",
+    },
+)

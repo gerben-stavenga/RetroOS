@@ -13,6 +13,24 @@ fn u16_at(data: &[u8], at: usize) -> Result<u16, Error> {
 }
 
 #[cfg(test)]
+pub(super) fn export_test_image(forward: Option<&[u8]>) -> Vec<u8> {
+    let mut data = alloc::vec![0; 0x400];
+    data[..4].copy_from_slice(b"PE\0\0");
+    for (at, value) in [(4, 0x14cu16), (20, 224), (22, 0x2102), (24, 0x10b)] {
+        data[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+    for (at, value) in [(56, 4096u32), (80, 4096), (84, 0x400), (116, 16),
+        (120, 0x100), (124, 0x100), (0x110, 7), (0x114, 2), (0x118, 1),
+        (0x11c, 0x140), (0x120, 0x150), (0x124, 0x158),
+        (0x140, if forward.is_some() { 0x180 } else { 0x300 }), (0x150, 0x170)] {
+        data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    data[0x170..0x176].copy_from_slice(b"Entry\0");
+    if let Some(target) = forward { data[0x180..0x180 + target.len()].copy_from_slice(target); }
+    data
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use alloc::vec;
@@ -26,6 +44,35 @@ mod tests {
         data[..2].copy_from_slice(b"MZ");
         put32(&mut data, 0x3c, 64);
         assert_eq!(Image::parse(&data).err(), Some(Error::BadMagic));
+    }
+
+    #[test]
+    fn export_names_are_case_sensitive_and_ordinal_holes_are_absent() {
+        let mut data = export_test_image(None);
+        let image = Image::parse(&data).unwrap();
+        assert_eq!(image.export_rva(&ImportSymbol::Name(b"Entry".to_vec())), Ok(Some(0x300)));
+        assert_eq!(image.export_rva(&ImportSymbol::Name(b"entry".to_vec())), Ok(None));
+        assert_eq!(image.export_rva(&ImportSymbol::Ordinal(8)), Ok(None));
+        put32(&mut data, 0x118, 0); // Ordinal-only exports have no name table entry.
+        assert_eq!(Image::parse(&data).unwrap().export_rva(&ImportSymbol::Ordinal(7)), Ok(Some(0x300)));
+    }
+
+    #[test]
+    fn forwarder_names_ordinals_and_bounds() {
+        for (target, expected) in [
+            (&b"NTDLL.RtlMoveMemory"[..], (b"NTDLL".to_vec(), ImportSymbol::Name(b"RtlMoveMemory".to_vec()))),
+            (&b"ntdll.dll.#7"[..], (b"ntdll.dll".to_vec(), ImportSymbol::Ordinal(7))),
+        ] {
+            let data = export_test_image(Some(target));
+            assert_eq!(Image::parse(&data).unwrap().forwarder(0x180), Ok(Some(expected)));
+        }
+        for target in [&b"missing_separator"[..], b".Entry", b"NTDLL.", b"NTDLL.#", b"NTDLL.#65536", b"NTDLL.#x"] {
+            let data = export_test_image(Some(target));
+            assert_eq!(Image::parse(&data).unwrap().forwarder(0x180), Err(Error::BadTable));
+        }
+        let mut data = export_test_image(Some(b"NTDLL.Entry"));
+        data[0x180..0x200].fill(b'A'); // NUL after the export directory is invalid.
+        assert_eq!(Image::parse(&data).unwrap().forwarder(0x180), Err(Error::BadTable));
     }
 
     #[test]
@@ -94,7 +141,7 @@ pub struct Section {
     pub characteristics: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportSymbol { Name(Vec<u8>), Ordinal(u16) }
 
 #[derive(Clone, Debug)]
@@ -183,6 +230,27 @@ impl<'a> Image<'a> {
             }
         }
         Err(Error::BadTable)
+    }
+
+    /// Wine stores an NE image behind this data export, not in the outer DOS stub.
+    /// The descriptor's e_res2[0..2] holds its byte length before Wine initializes it.
+    pub fn embedded_ne(&self) -> Result<Option<(u32, &'a [u8])>, Error> {
+        let symbol = ImportSymbol::Name(b"__wine_spec_dos_header".to_vec());
+        let Some(rva) = self.export_rva(&symbol)? else { return Ok(None); };
+        if self.forwarder(rva)?.is_some() { return Err(Error::BadTable); }
+        let header = self.bytes_at_rva(rva, 64)?;
+        if header.get(..2) != Some(b"MZ") { return Err(Error::BadMagic); }
+        let size = u32_at(header, 40)?;
+        if size < 64 || rva.checked_add(size).is_none_or(|end| end > self.header.size_image) {
+            return Err(Error::BadTable);
+        }
+        let bytes = self.bytes_at_rva(rva, size as usize)?;
+        let ne = super::ne::Image::parse(bytes).map_err(|_| Error::BadTable)?;
+        for number in 1..=ne.header.segment_count {
+            ne.segment(number).map_err(|_| Error::BadTable)?;
+        }
+        ne.modules().map_err(|_| Error::BadTable)?;
+        Ok(Some((rva, bytes)))
     }
 
     pub fn bytes_at_rva(&self, rva: u32, size: usize) -> Result<&'a [u8], Error> {
@@ -277,9 +345,56 @@ impl<'a> Image<'a> {
             if index >= function_count { return Err(Error::BadTable); }
             let fr = self.bytes_at_rva(functions + index * 4, 4)?;
             let rva = u32::from_le_bytes([fr[0], fr[1], fr[2], fr[3]]);
-            out.push(Export { name: self.c_string(name_rva)?, ordinal: (ordinal_base + index) as u16, rva });
+            if rva == 0 { continue; }
+            let ordinal = ordinal_base.checked_add(index).filter(|&n| n <= u16::MAX as u32).ok_or(Error::BadTable)?;
+            out.push(Export { name: self.c_string(name_rva)?, ordinal: ordinal as u16, rva });
         }
         Ok(out)
+    }
+
+    pub fn export_rva(&self, symbol: &ImportSymbol) -> Result<Option<u32>, Error> {
+        if self.header.export.rva == 0 { return Ok(None); }
+        let rva = match symbol {
+            ImportSymbol::Name(name) => self.exports()?.into_iter()
+                .find(|export| export.name == *name).map(|export| export.rva),
+            ImportSymbol::Ordinal(ordinal) => {
+                let directory = self.bytes_at_rva(self.header.export.rva, 40)?;
+                let base = u32_at(directory, 16)?;
+                let Some(index) = u32::from(*ordinal).checked_sub(base) else { return Ok(None); };
+                if index >= u32_at(directory, 20)? { return Ok(None); }
+                let at = u32_at(directory, 28)?.checked_add(index.checked_mul(4).ok_or(Error::BadTable)?)
+                    .ok_or(Error::BadTable)?;
+                Some(u32_at(self.bytes_at_rva(at, 4)?, 0)?)
+            }
+        };
+        let Some(rva) = rva.filter(|&rva| rva != 0) else { return Ok(None); };
+        if rva >= self.header.size_image { return Err(Error::BadTable); }
+        Ok(Some(rva))
+    }
+
+    /// A forwarder resides inside the export directory, including its NUL.
+    /// Ordinal forwarders are decimal (`module.#123`), not named exports.
+    pub fn forwarder(&self, rva: u32) -> Result<Option<(Vec<u8>, ImportSymbol)>, Error> {
+        let directory = self.header.export;
+        let end = directory.rva.checked_add(directory.size).ok_or(Error::BadTable)?;
+        if rva < directory.rva || rva >= end { return Ok(None); }
+        let bytes = self.bytes_at_rva(rva, (end - rva).min(1025) as usize)?;
+        let length = bytes.iter().position(|&b| b == 0).ok_or(Error::BadTable)?;
+        let text = &bytes[..length];
+        let separator = text.iter().rposition(|&b| b == b'.').ok_or(Error::BadTable)?;
+        let (module, target) = (&text[..separator], &text[separator + 1..]);
+        if module.is_empty() || target.is_empty() { return Err(Error::BadTable); }
+        let symbol = if target[0] == b'#' {
+            if target.len() == 1 { return Err(Error::BadTable); }
+            let mut ordinal = 0u16;
+            for &digit in &target[1..] {
+                if !digit.is_ascii_digit() { return Err(Error::BadTable); }
+                ordinal = ordinal.checked_mul(10).and_then(|n| n.checked_add(u16::from(digit - b'0')))
+                    .ok_or(Error::BadTable)?;
+            }
+            ImportSymbol::Ordinal(ordinal)
+        } else { ImportSymbol::Name(target.to_vec()) };
+        Ok(Some((module.to_vec(), symbol)))
     }
 
     pub fn reloc_blocks(&self) -> Result<Vec<(u32, Vec<u16>)>, Error> {

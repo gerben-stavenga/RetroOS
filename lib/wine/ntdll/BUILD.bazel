@@ -1,0 +1,12 @@
+package(default_visibility = ["//visibility:public"])
+
+genrule(
+    name = "ntdll_dll",
+    srcs = ["@wine_source_tar//file"],
+    tools = ["//lib/wine:build_ntdll.py", "@wine_build_tools//:usr/bin/flex"],
+    outs = ["NTDLL.DLL", "backend-abi.json"],
+    cmd = "python3 $(location //lib/wine:build_ntdll.py) " +
+          "--source $(location @wine_source_tar//file) " +
+          "--flex $(location @wine_build_tools//:usr/bin/flex) " +
+          "--output $(location NTDLL.DLL) --abi $(location backend-abi.json)",
+)
