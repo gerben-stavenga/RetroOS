@@ -67,17 +67,50 @@ org 100h
 .mouse:
     mov ax, 0bh
     int 33h
+%ifdef TWO_MICE
+    test byte [seen], 8
+    jnz .second_motion
+    cmp cx, 0
+    jle .buttons
+    or byte [seen], 2
+    jmp .buttons
+.second_motion:
+    cmp cx, 0
+    jge .buttons
+    or byte [seen], 16
+%else
     or cx, dx
     jz .buttons
     or byte [seen], 2
+%endif
 .buttons:
     mov ax, 3
     int 33h
+%ifdef TWO_MICE
+    test byte [seen], 8
+    jnz .second_button
+%endif
     test bx, 1
     jz .check
     or byte [seen], 4
 .check:
-%ifdef FOUR_KEYBOARDS
+%ifdef TWO_MICE
+    test byte [seen], 8
+    jnz .final_check
+    cmp byte [seen], 7
+    jne .loop
+    or byte [seen], 8
+    mov dx, first_mouse
+    mov ah, 9
+    int 21h
+    jmp .loop
+.second_button:
+    test bx, 2
+    jz .final_check
+    or byte [seen], 32
+.final_check:
+    cmp byte [seen], 63
+%elifdef FOUR_KEYBOARDS
     cmp byte [seen], 63
 %elifdef TWO_KEYBOARDS
     cmp byte [seen], 15
@@ -98,12 +131,13 @@ key_a db 'USB KEY a',13,10,'$'
 key_b db 'USB KEY b',13,10,'$'
 key_c db 'USB KEY c',13,10,'$'
 key_d db 'USB KEY d',13,10,'$'
+first_mouse db 'USB MOUSE 1',13,10,'$'
 ready db 'USB INPUT READY',13,10,'$'
 passed db 'USB INPUT PASS',13,10,'$'
 '''
 
 
-def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, second_keyboard=None, four_keyboards=False):
+def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, second_keyboard=None, four_keyboards=False, second_mouse=None):
     log = work / (name + '.log')
     qmp = work / (name + '.sock')
     boot = prepare_boot(work, disk)
@@ -114,7 +148,7 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
         '-drive', f'file={boot},format=raw,snapshot=on',
         '-drive', f'file={disk},format=raw,snapshot=on',
         '-qmp', f'unix:{qmp},server=on,wait=off',
-        '-fw_cfg', 'name=opt/cmdline,string=' + ('FOUR.COM' if four_keyboards else 'DUAL.COM' if second_keyboard is not None else 'INPUT.COM'),
+        '-fw_cfg', 'name=opt/cmdline,string=' + ('MICE.COM' if second_mouse is not None else 'FOUR.COM' if four_keyboards else 'DUAL.COM' if second_keyboard is not None else 'INPUT.COM'),
     ]
     if uefi:
         args[0] = 'qemu-system-x86_64'
@@ -133,6 +167,7 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
         # to both independently, while both remain connected and configured.
         args += ['-vga', 'none', '-device', 'VGA,id=video0',
                  '-device', 'secondary-vga,id=video1']
+    if second_keyboard is not None:
         second_port = ',port=' + chain[:-1] + '1' if hubs and second_keyboard == keyboard else ''
         args += ['-device', f'usb-kbd,id=kbd2,display=video1,bus=usb{second_keyboard}.0{second_port}']
     if four_keyboards:
@@ -144,6 +179,9 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
     mouse_port = ',port=' + chain[:-1] + '4' if hubs and mouse == keyboard else ''
     args += ['-device', f'usb-kbd,id=kbd,bus=usb{keyboard}.0{key_port}' + (',display=video0' if second_keyboard is not None else ''),
              '-device', f'usb-mouse,id=mouse,bus=usb{mouse}.0{mouse_port}']
+    if second_mouse is not None:
+        port = ',port=' + chain[:-1] + '5' if hubs and second_mouse == keyboard else ''
+        args += ['-device', f'usb-mouse,id=mouse2,bus=usb{second_mouse}.0{port}']
     with (work / (name + '.stderr')).open('w') as errors:
         proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=errors,
                                 stdin=subprocess.DEVNULL)
@@ -191,14 +229,30 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
                             if down and sent == key:
                                 wait_for('USB KEY ' + key)
                             time.sleep(.03 if four_keyboards and not uefi else .2)
-                call('input-send-event', {'events': [
+                arguments = {'events': [
                     {'type': 'rel', 'data': {'axis': 'x', 'value': 20}},
-                    {'type': 'btn', 'data': {'down': True, 'button': 'left'}}]})
+                    {'type': 'btn', 'data': {'down': True, 'button': 'left'}}]}
+                if second_mouse is not None:
+                    # QEMU mice share a console; activate each input handler
+                    # explicitly so motion comes from two distinct USB devices.
+                    mice = sorted(call('query-mice'), key=lambda item: item['index'])
+                    assert len(mice) == 2 and all(not item['absolute'] for item in mice), mice
+                    call('human-monitor-command', {'command-line': 'mouse_set ' + str(mice[0]['index'])})
+                call('input-send-event', arguments)
+                if second_mouse is not None:
+                    wait_for('USB MOUSE 1')
+                    call('input-send-event', {'events': [
+                        {'type': 'btn', 'data': {'down': False, 'button': 'left'}}]})
+                    call('human-monitor-command', {'command-line': 'mouse_set ' + str(mice[1]['index'])})
+                    call('input-send-event', {'events': [
+                        {'type': 'rel', 'data': {'axis': 'x', 'value': -20}},
+                        {'type': 'btn', 'data': {'down': True, 'button': 'right'}}]})
                 text = wait_for('All commands done')
             assert 'USB INPUT PASS' in text, text
             assert text.count('xHCI: running') == min(controllers, 4), text
             assert text.count('xHCI: hub ready') == hubs, text
             assert text.count('xHCI: keyboard ready') == (4 if four_keyboards else 2 if second_keyboard is not None else 1), text
+            assert text.count('xHCI: mouse ready') == (2 if second_mouse is not None else 1), text
             for expected in ('xHCI: keyboard ready', 'xHCI: mouse ready',
                              'IRQ: no i8042'):
                 assert expected in text, text
@@ -230,10 +284,17 @@ def main():
         subprocess.run(['mcopy', '-i', str(disk), str(probe), '::DUAL.COM'], check=True)
         subprocess.run(['nasm', '-DTWO_KEYBOARDS', '-DFOUR_KEYBOARDS', '-f', 'bin', str(source), '-o', str(probe)], check=True)
         subprocess.run(['mcopy', '-i', str(disk), str(probe), '::FOUR.COM'], check=True)
+        subprocess.run(['nasm', '-DTWO_MICE', '-f', 'bin', str(source), '-o', str(probe)], check=True)
+        subprocess.run(['mcopy', '-i', str(disk), str(probe), '::MICE.COM'], check=True)
         subprocess.run(['mmd', '-i', str(disk), '::RETROOS'], check=True)
         subprocess.run(['mcopy', '-i', str(disk), str(ROOT / 'etc/RETROOS.INI'), '::RETROOS/RETROOS.INI'], check=True)
+        session(work, disk, 'two-mice', 1, 0, 0, second_mouse=0)
+        session(work, disk, 'two-mice-deep-hub', 1, 0, 0, second_mouse=0, hubs=3)
+        session(work, disk, 'two-mice-split', 2, 0, 0, second_mouse=1)
+        session(work, disk, 'two-mice-uefi', 1, 0, 0, second_mouse=0, hubs=1, uefi=True)
         session(work, disk, 'four-keyboards', 1, 0, 0, second_keyboard=0, four_keyboards=True)
-        session(work, disk, 'four-keyboards-deep-hub', 1, 0, 0, hubs=3, second_keyboard=0, four_keyboards=True)
+        # Four hubs + four keyboards + one mouse exceeds the old eight-device limit.
+        session(work, disk, 'four-keyboards-deep-hub', 1, 0, 0, hubs=4, second_keyboard=0, four_keyboards=True)
         session(work, disk, 'four-keyboards-uefi', 1, 0, 0, uefi=True, hubs=1, second_keyboard=0, four_keyboards=True)
         session(work, disk, 'two-keyboards', 1, 0, 0, second_keyboard=0)
         session(work, disk, 'two-keyboards-hub', 1, 0, 0, hubs=1, second_keyboard=0)

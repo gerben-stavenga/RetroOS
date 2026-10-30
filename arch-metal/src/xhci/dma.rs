@@ -8,15 +8,15 @@ pub(super) const INCTX_OFF: usize = 0x4000; // input context (Address Device / C
 pub(super) const DEVCTX0_OFF: usize = 0x5000; // retained device lane 0: output context
 pub(super) const EP0_0_OFF: usize = 0x6000; // retained device lane 0: control transfer ring
 pub(super) const XFER_OFF: usize = 0x7000; // control-transfer data buffer (descriptors)
-pub(super) const INT0_OFF: usize = 0x8000; // packed HID pipes 0..4 (8 KiB)
+pub(super) const INT0_OFF: usize = 0x8000; // packed HID pipes 0..8 (8 KiB)
 pub(super) const DEVCTX1_OFF: usize = 0xA000;
 pub(super) const EP0_1_OFF: usize = 0xB000;
-pub(super) const INT1_OFF: usize = 0xC000; // packed HID pipes 4..9 (within 16 KiB)
+pub(super) const INT1_OFF: usize = 0xC000; // packed HID pipes 8..24 (16 KiB)
 // The ten-bit scratchpad count can require 1023 pointers (two pages).
-// Six additional context/control-ring pairs for hubs and downstream devices.
+// Ten additional context/control-ring pairs for hubs and downstream devices.
 pub(super) const EXTRA_DEVICES_OFF: usize = 0x10000;
-pub(super) const SCRATCH_OFF: usize = 0x1C000;
-pub(super) const DMA_PAGES: usize = 30;
+pub(super) const SCRATCH_OFF: usize = 0x24000;
+pub(super) const DMA_PAGES: usize = 38;
 
 /// Fill the array before publishing it to the controller. Scratchpad pages
 /// need not be contiguous. The allocator returns permanent, zeroed DMA pages;
@@ -95,6 +95,9 @@ mod tests {
             assert!(ep0 + 4096 <= SCRATCH_OFF);
         }
         assert!(0x10000 + (DMA_PAGES + 1) * 4096 <= super::super::CONTROLLER_STRIDE);
+        assert!(super::super::MMIO_BASE as u64
+            + super::super::MAX_CONTROLLERS as u64 * super::super::CONTROLLER_STRIDE as u64
+            <= 1u64 << 32);
     }
 
     #[test]

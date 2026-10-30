@@ -1182,8 +1182,10 @@ nested route strings, and supplies transaction-translator ancestry for
 low/full-speed devices below a high-speed hub. High-speed hubs use their
 default single-TT alternate setting. Input devices must be connected at boot.
 
-Each of up to four controllers retains at most eight devices, including hubs,
-with at most two keyboard endpoints and one mouse endpoint. Routes support
+Each of up to four controllers retains at most twelve devices, including hubs,
+with a keyboard and a mouse endpoint for every retained HID device. Each mouse
+has an independent report pipe; button state is combined across mice so an
+idle interface cannot release a button held on another mouse. Routes support
 five downstream tiers and hub ports 1–15. Boot interfaces are switched to boot
 protocol; a legacy report-ID layout supports certain gaming keyboards.
 SuperSpeed hubs, hotplug, EHCI/OHCI/UHCI, USB game controllers, and general HID
@@ -1192,7 +1194,9 @@ report-descriptor parsing remain unsupported. In KLOG, `keyboard ready` /
 
 Run `python3 test/xhci_smoke.py` for direct devices, powered hubs, nested hubs
 (including a five-hub chain), split controllers and BIOS/UEFI. PS/2 is disabled;
-the DOS probe must receive a keyboard press, mouse motion and a click. QEMU's
+the DOS probe must receive a keyboard press, mouse motion and a click. Two-mouse
+cases activate each QEMU mouse separately and require movement and clicks from
+both devices. QEMU's
 hub model is full-speed, so physical high-speed hub/TT operation and the KVM
 switch reported in issue #71 still require testing on the affected hardware.
 `bazelisk test //arch-metal:xhci_dma_test` also checks route limits, inherited

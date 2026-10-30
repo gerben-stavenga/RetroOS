@@ -1,6 +1,6 @@
 //! Compact xHCI USB host-controller driver for USB-HID keyboard and mouse input.
-//! Each controller retains up to eight devices (including USB 1/2 hubs),
-//! a keyboard endpoint for every retained device, and a mouse. Reports feed the same
+//! Each controller retains up to twelve devices (including USB 1/2 hubs),
+//! and keyboard/mouse endpoints for every retained device. Reports feed the same
 //! `irq::QUEUE` as i8042 input, so nothing above the arch boundary depends on
 //! the physical input bus.
 
@@ -56,10 +56,10 @@ fn for_each_xhci(mut found: impl FnMut(u8, u8, u8)) {
 
 // ── Controller MMIO ────────────────────────────────────────────────────────
 // Four disjoint windows above the framebuffer and LAPIC/HPET/IOAPIC mappings.
-// Each reserves 64 KiB MMIO + 120 KiB DMA + one scratchpad mapping page.
-// The 192 KiB stride leaves space between controllers and below the VA ceiling.
+// Each reserves 64 KiB MMIO + 152 KiB DMA + one scratchpad mapping page.
+// The 224 KiB stride leaves space between controllers and below the VA ceiling.
 const MMIO_BASE: usize = 0xFFF1_0000;
-const CONTROLLER_STRIDE: usize = 0x30000;
+const CONTROLLER_STRIDE: usize = 0x38000;
 const MAX_CONTROLLERS: usize = 4;
 
 // ── DMA region: DCBAA + command ring + event ring + ERST in one contiguous
@@ -76,13 +76,13 @@ mod port;
 use dma::*;
 use hub::Route;
 const RING_TRBS: usize = 256;
-const DEVICE_LANES: usize = 8;
+const DEVICE_LANES: usize = 12;
 const KEYBOARD_PIPES: usize = DEVICE_LANES;
 const MOUSE_PIPE: usize = KEYBOARD_PIPES;
-const HID_PIPES: usize = KEYBOARD_PIPES + 1;
-// Only one report is outstanding per HID pipe. Pack a 1 KiB transfer ring
-// and report buffer into each 2 KiB slice of the existing HID DMA windows.
-const HID_RING_TRBS: usize = 64;
+const HID_PIPES: usize = KEYBOARD_PIPES + DEVICE_LANES;
+// Only one report is outstanding per HID pipe. Pack a 512-byte transfer ring
+// and report buffer into each 1 KiB slice of the HID DMA windows.
+const HID_RING_TRBS: usize = 32;
 
 fn device_context_off(lane: usize) -> usize {
     match lane {
@@ -104,8 +104,8 @@ fn ep0_off(lane: usize) -> usize {
 
 fn interrupt_off(pipe: usize) -> usize {
     assert!(pipe < HID_PIPES);
-    if pipe < 4 { INT0_OFF + pipe * 0x800 }
-    else { INT1_OFF + (pipe - 4) * 0x800 }
+    if pipe < 8 { INT0_OFF + pipe * 0x400 }
+    else { INT1_OFF + (pipe - 8) * 0x400 }
 }
 
 fn report_off(pipe: usize) -> usize {
@@ -229,12 +229,6 @@ fn emit_key(sc: u8, extended: bool, release: bool) {
 
 /// Decode the HID boot-mouse prefix: buttons, signed X, signed Y. HID mouse Y
 /// is already positive toward the bottom of the screen, matching `Irq::Mouse`.
-fn process_mouse_report(r: &[u8; 16], len: usize) {
-    if let Some((dx, dy, buttons)) = decode_mouse_report(r, len) {
-        crate::irq::push_mouse(dx, dy, buttons);
-    }
-}
-
 fn decode_mouse_report(r: &[u8; 16], len: usize) -> Option<(i16, i16, u8)> {
     (len >= 3).then_some((r[1] as i8 as i16, r[2] as i8 as i16, r[0] & 0x07))
 }
@@ -892,7 +886,17 @@ impl Controller {
 
     /// Called from the timer IRQ: dispatch completed keyboard/mouse reports and
     /// re-arm their pipes. Cheap when idle (one event-ring cycle-bit check).
+    #[cfg(test)]
     fn poll(&mut self) {
+        self.poll_with_buttons(0);
+    }
+
+    fn mouse_buttons(&self) -> u8 {
+        self.pipes[MOUSE_PIPE..].iter().filter(|pipe| pipe.ready)
+            .fold(0, |buttons, pipe| buttons | pipe.prev[0])
+    }
+
+    fn poll_with_buttons(&mut self, other_buttons: u8) {
         if !self.pipes.iter().any(|pipe| pipe.ready) {
             return;
         }
@@ -923,8 +927,9 @@ impl Controller {
                             len,
                             id_prefixed,
                         );
-                    } else {
-                        process_mouse_report(&report, len);
+                    } else if let Some((dx, dy, buttons)) = decode_mouse_report(&report, len) {
+                        self.pipes[index].prev[0] = buttons;
+                        crate::irq::push_mouse(dx, dy, self.mouse_buttons() | other_buttons);
                     }
                 }
                 self.arm_report(index);
@@ -1164,8 +1169,8 @@ impl Controller {
         }
     }
 
-    /// Probe for an xHCI controller, retain a keyboard per device and one mouse,
-    /// configure their interrupt endpoints, and arm their first reports. `self.poll()`
+    /// Probe for an xHCI controller, retain keyboard/mouse endpoints per device,
+    /// configure their interrupt endpoints, and arm their first reports. Polling
     /// (driven by the timer IRQ) then streams input into the shared IRQ queue.
     fn init(&mut self) {
         let (bus, dev, func) = self.pci;
@@ -1285,7 +1290,7 @@ impl Controller {
         }
         let hub::Inventory {
             keyboards,
-            mouse,
+            mice,
             devices,
             ..
         } = inventory;
@@ -1333,33 +1338,40 @@ impl Controller {
         if keyboard_count == 0 {
             lib::compact_println!("xHCI: no keyboard found");
         }
-        if let Some((slot, dev, ep)) = mouse
-            && configured[dev.lane]
-            && self.configure_hid(slot, &dev, ep, HidRole::Mouse, MOUSE_PIPE, stride)
-        {
-            self.pipes[MOUSE_PIPE].ready = true;
-            let _ = compact_fmt::writeln!(
-                &mut lib::log::DebugCon,
-                "xHCI: mouse ready (slot {} port {} ep {} mps {}) at {:02x}:{:02x}.{}",
-                slot,
-                dev.port,
-                ep.ep,
-                ep.mps,
-                self.pci.0,
-                self.pci.1,
-                self.pci.2
-            );
-        } else {
+        let mut mouse_count = 0;
+        for (index, selected) in mice.iter().enumerate() {
+            let pipe = MOUSE_PIPE + index;
+            if let Some((slot, dev, ep)) = selected
+                && configured[dev.lane]
+                && self.configure_hid(*slot, dev, *ep, HidRole::Mouse, pipe, stride)
+            {
+                self.pipes[pipe].ready = true;
+                mouse_count += 1;
+                let _ = compact_fmt::writeln!(
+                    &mut lib::log::DebugCon,
+                    "xHCI: mouse ready (slot {} port {} ep {} mps {}) at {:02x}:{:02x}.{}",
+                    *slot,
+                    dev.port,
+                    ep.ep,
+                    ep.mps,
+                    self.pci.0,
+                    self.pci.1,
+                    self.pci.2
+                );
+            }
+        }
+        if mouse_count == 0 {
             lib::compact_println!("xHCI: no mouse found");
         }
         self.start_pipes();
     }
 }
 
-// Boot initializes with interrupts disabled. Afterwards only the timer IRQ
-// mutates these instances; no controller is moved or reinitialized at runtime.
-static mut CONTROLLERS: [Controller; MAX_CONTROLLERS] =
-    [const { Controller::new(0, (0, 0, 0)) }; MAX_CONTROLLERS];
+// Boot initializes permanent controller state in the loader-reserved pool.
+// This keeps the larger input capacity out of the size-constrained core image.
+// Afterwards only the BSP timer IRQ mutates it; addresses never change.
+static mut CONTROLLERS: [*mut Controller; MAX_CONTROLLERS] =
+    [core::ptr::null_mut(); MAX_CONTROLLERS];
 static mut CONTROLLER_COUNT: usize = 0;
 
 pub fn init() {
@@ -1375,9 +1387,14 @@ pub fn init() {
             );
             return;
         }
-        let controller = &mut *(&raw mut CONTROLLERS).cast::<Controller>().add(index);
-        *controller = Controller::new(index, (bus, dev, func));
-        controller.init();
+        let Ok(storage) = crate::boot_mem::allocate_permanent(core::alloc::Layout::new::<Controller>()) else {
+            lib::compact_println!("xHCI: no boot memory for controller state");
+            return;
+        };
+        let controller = storage.cast::<Controller>();
+        controller.write(Controller::new(index, (bus, dev, func)));
+        (*controller).init();
+        CONTROLLERS[index] = controller;
         CONTROLLER_COUNT += 1;
     });
     if unsafe { CONTROLLER_COUNT } == 0 {
@@ -1389,7 +1406,12 @@ pub fn poll() {
     // Called with interrupts disabled on the boot CPU, never during init.
     unsafe {
         for index in 0..CONTROLLER_COUNT {
-            (&mut *(&raw mut CONTROLLERS).cast::<Controller>().add(index)).poll();
+            let base = (&raw mut CONTROLLERS).cast::<*mut Controller>();
+            let mut other_buttons = 0;
+            for other in 0..CONTROLLER_COUNT {
+                if other != index { other_buttons |= (&**base.add(other)).mouse_buttons(); }
+            }
+            (&mut **base.add(index)).poll_with_buttons(other_buttons);
         }
     }
 }

@@ -39,7 +39,7 @@ impl Fixture {
             let trb = (c.dma_va + EVT_OFF + index * 16) as *mut u32;
             trb.add(2).write((cc << 24) | residual);
             trb.add(3)
-                .write(1 | (kind << 10) | (dci << 16) | (slot << 24));
+                .write(c.evt_cycle | (kind << 10) | (dci << 16) | (slot << 24));
         }
     }
 
@@ -97,6 +97,58 @@ fn short_mouse_report_does_not_invent_motion_or_release_buttons() {
     f.controller.poll();
     crate::irq::MOUSE.with(|events| assert!(events.borrow().is_empty()));
     assert_eq!(f.controller.pipes[MOUSE_PIPE].enq, 2);
+}
+
+#[test]
+fn every_mouse_pipe_delivers_and_wraps_without_an_idle_mouse_releasing_buttons() {
+    let mut f = Fixture::new();
+    for index in 0..DEVICE_LANES {
+        f.pipe(MOUSE_PIPE + index, index as u32 + 1, 5, 8);
+    }
+    f.controller.start_pipes();
+    // The first, idle composite interface must not suppress any later mouse.
+    let mut event = 0;
+    for _ in 0..HID_RING_TRBS + 1 {
+        for index in 1..DEVICE_LANES {
+            f.report(MOUSE_PIPE + index, &[1, index as u8, 0xfe]);
+            f.event(event, 32, index as u32 + 1, 5, 13, 5);
+            f.controller.poll();
+            event = (event + 1) % RING_TRBS;
+        }
+    }
+    f.report(MOUSE_PIPE, &[0, 0, 0]);
+    f.event(event, 32, 1, 5, 13, 5);
+    f.controller.poll();
+    crate::irq::MOUSE.with(|events| {
+        let events = events.borrow();
+        assert_eq!(events.len(), (HID_RING_TRBS + 1) * (DEVICE_LANES - 1) + 1);
+        for (index, &(dx, dy, buttons)) in events[..events.len() - 1].iter().enumerate() {
+            assert_eq!((dx, dy, buttons), ((index % (DEVICE_LANES - 1) + 1) as i16, -2, 1));
+        }
+        assert_eq!(events.last(), Some(&(0, 0, 1)));
+    });
+    // Releasing the last held button releases the combined button state.
+    for index in 1..DEVICE_LANES {
+        f.report(MOUSE_PIPE + index, &[0, 0, 0]);
+        event += 1;
+        f.event(event, 32, index as u32 + 1, 5, 13, 5);
+        f.controller.poll();
+    }
+    crate::irq::MOUSE.with(|events| assert_eq!(events.borrow().last(), Some(&(0, 0, 0))));
+}
+
+#[test]
+fn mouse_buttons_from_another_controller_survive_idle_reports() {
+    let mut f = Fixture::new();
+    f.pipe(MOUSE_PIPE, 1, 3, 8);
+    f.controller.start_pipes();
+    f.report(MOUSE_PIPE, &[2, 4, 0]);
+    f.event(0, 32, 1, 3, 13, 5);
+    f.controller.poll_with_buttons(1);
+    f.report(MOUSE_PIPE, &[0, 0, 0]);
+    f.event(1, 32, 1, 3, 13, 5);
+    f.controller.poll_with_buttons(1);
+    crate::irq::MOUSE.with(|events| assert_eq!(*events.borrow(), [(4, 0, 3), (0, 0, 1)]));
 }
 
 #[test]
@@ -245,7 +297,8 @@ fn every_device_lane_can_deliver_keyboard_reports() {
         f.event(index, 32, index as u32 + 1, 3, 1, 0);
     }
     f.controller.poll();
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23]));
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(),
+        [0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26]));
     crate::irq::MOUSE.with(|events| assert!(events.borrow().is_empty()));
     assert!(f.controller.pipes[..KEYBOARD_PIPES].iter().all(|p| p.enq == 2));
 }

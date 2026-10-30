@@ -54,7 +54,7 @@ impl Route {
 
 pub(super) struct Inventory {
     pub keyboards: [Option<(u32, PortDevice, EpInfo)>; DEVICE_LANES],
-    pub mouse: Option<(u32, PortDevice, EpInfo)>,
+    pub mice: [Option<(u32, PortDevice, EpInfo)>; DEVICE_LANES],
     pub devices: [Option<(u32, PortDevice)>; DEVICE_LANES],
     pub used: usize,
 }
@@ -62,10 +62,31 @@ impl Inventory {
     pub fn new() -> Self {
         Self {
             keyboards: [None; DEVICE_LANES],
-            mouse: None,
+            mice: [None; DEVICE_LANES],
             devices: [None; DEVICE_LANES],
             used: 0,
         }
+    }
+
+    fn retain_hid(&mut self, slot: u32, dev: PortDevice) -> bool {
+        let mut retained = false;
+        if let Some(ep) = dev.keyboard
+            && let Some(index) = self.keyboards.iter().position(Option::is_none)
+        {
+            self.keyboards[index] = Some((slot, dev, ep));
+            retained = true;
+        }
+        if let Some(ep) = dev.mouse
+            && let Some(index) = self.mice.iter().position(Option::is_none)
+        {
+            self.mice[index] = Some((slot, dev, ep));
+            retained = true;
+        }
+        if retained {
+            self.devices[dev.lane] = Some((slot, dev));
+            self.used += 1;
+        }
+        retained
     }
 }
 
@@ -173,23 +194,7 @@ impl Controller {
             }
             return;
         }
-        let mut retained = false;
-        if let Some(ep) = dev.keyboard
-            && let Some(index) = inventory.keyboards.iter().position(Option::is_none)
-        {
-            inventory.keyboards[index] = Some((slot, dev, ep));
-            retained = true;
-        }
-        if inventory.mouse.is_none()
-            && let Some(ep) = dev.mouse
-        {
-            inventory.mouse = Some((slot, dev, ep));
-            retained = true;
-        }
-        if retained {
-            inventory.devices[lane] = Some((slot, dev));
-            inventory.used += 1;
-        } else {
+        if !inventory.retain_hid(slot, dev) {
             self.disable_slot(slot);
         }
     }
@@ -330,6 +335,28 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn composite_mouse_does_not_exclude_later_mice_or_keyboards_behind_hubs() {
+        let mut inventory = Inventory::new();
+        // The issue #71 topology has four retained hubs before its HID devices.
+        inventory.used = 4;
+        let endpoint = EpInfo { iface: 0, boot: true, ep: 1, mps: 8, interval: 10 };
+        for index in 0..5 {
+            let lane = inventory.used;
+            let dev = PortDevice {
+                lane, port: 1, speed: 2, dev_class: 0, cfg_value: 1,
+                keyboard: (index != 1).then_some(endpoint),
+                mouse: Some(endpoint),
+            };
+            assert!(inventory.retain_hid(index as u32 + 1, dev));
+            assert_eq!(inventory.devices[lane].unwrap().0, index as u32 + 1);
+        }
+        assert_eq!(inventory.used, 9);
+        assert_eq!(inventory.keyboards.iter().flatten().count(), 4);
+        assert_eq!(inventory.mice.iter().flatten().count(), 5);
+        assert_eq!(inventory.mice[1].unwrap().0, 2);
+    }
+
     #[test]
     fn nested_routes_keep_root_and_tt_ancestor() {
         let hs = Route::root(7);

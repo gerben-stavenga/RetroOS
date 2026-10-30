@@ -1,5 +1,12 @@
 extern crate alloc;
 
+#[allow(dead_code)]
+mod boot_mem {
+    pub fn allocate_permanent(_: core::alloc::Layout) -> Result<*mut u8, ()> {
+        panic!("boot allocation in host test")
+    }
+}
+
 // Exercise the real driver against allocated register/ring memory. Privileged
 // operations are deliberately unavailable in this host test.
 #[allow(dead_code)]
