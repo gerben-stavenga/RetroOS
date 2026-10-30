@@ -109,7 +109,10 @@ def _windows16_dll_impl(ctx):
             "option modname=%s" % ctx.attr.module_name,
             "name %s" % output.path,
             "file %s" % obj.path,
-        ] + ["export %s" % symbol for symbol in ctx.attr.exports]) + "\n",
+        ] + (["option start=%s" % ctx.attr.entry] if ctx.attr.entry else [])
+        + (["option heapsize=%d" % ctx.attr.heap_size] if ctx.attr.heap_size else [])
+        + ["import %s %s" % (symbol, target) for symbol, target in ctx.attr.imports.items()]
+        + ["export %s" % symbol for symbol in ctx.attr.exports]) + "\n",
     )
     ctx.actions.run(
         executable = ctx.executable._linker,
@@ -125,6 +128,9 @@ def _windows16_dll_impl(ctx):
 windows16_dll = rule(
     implementation = _windows16_dll_impl,
     attrs = {
+        "entry": attr.string(),
+        "heap_size": attr.int(default = 0),
+        "imports": attr.string_dict(),
         "obj": attr.label(allow_single_file = True, mandatory = True),
         "out": attr.output(mandatory = True),
         "module_name": attr.string(mandatory = True),

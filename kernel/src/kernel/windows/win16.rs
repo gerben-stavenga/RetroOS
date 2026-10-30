@@ -16,7 +16,6 @@ use super::{ne, WindowsState, GATE_VECTOR};
 const SEGMENT_BASE: u32 = 0x0100_0000;
 const SEGMENT_STRIDE: u32 = 0x0001_0000;
 const MODULE_BASE: u32 = 0x0200_0000;
-const MODULE_STRIDE: u32 = 0x0010_0000;
 const PSP_BASE: u32 = 0x0008_0000;
 const ENV_BASE: u32 = 0x0008_1000;
 const RESOURCE_BASE: u32 = 0x0302_0000;
@@ -148,7 +147,8 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::Kernel, 89) => (8, true, "lstrcat"),
         (Module::Kernel, 90) => (4, false, "lstrlen"),
         (Module::Kernel, 91) => (0, false, "InitTask"),
-        (Module::Kernel, 95) => (4, false, "LoadLibrary"),
+        (Module::Kernel, 426) => (4, false, "RetroLoadLibrary"),
+        (Module::Kernel, 427) => (10, false, "RetroNextInitializer"),
         (Module::Kernel, 96) => (2, false, "FreeLibrary"),
         (Module::Kernel, 102) => (0, false, "DOS3Call"),
         (Module::Kernel, 107) => (2, false, "SetErrorMode"),
@@ -333,6 +333,9 @@ fn register_gate(
 }
 
 struct LoadedModule {
+    // 0: pending, 1: running (recursive loads must not reenter), 2: ready, 3: failed.
+    initialized: u8,
+    base: u32,
     name: Vec<u8>,
     kind: Option<Module>,
     data: Vec<u8>,
@@ -389,12 +392,22 @@ fn load_module_file(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), 
     Err(-2)
 }
 
-fn module_segment_base(module_index: usize, segment: u16) -> Result<u32, i32> {
+fn module_segment_base(base: u32, segment: u16) -> Result<u32, i32> {
     if segment == 0 { return Err(-8); }
-    MODULE_BASE
-        .checked_add(u32::try_from(module_index).map_err(|_| -8)? * MODULE_STRIDE)
-        .and_then(|base| base.checked_add((u32::from(segment) - 1) * SEGMENT_STRIDE))
-        .ok_or(-8)
+    base.checked_add((u32::from(segment) - 1) * SEGMENT_STRIDE).ok_or(-8)
+}
+
+fn module_allocation(modules: &[LoadedModule], segments: u16) -> Result<u32, i32> {
+    let base = modules.last().map_or(MODULE_BASE, |m| m.base + m.selectors.len() as u32 * SEGMENT_STRIDE);
+    let end = base.checked_add(u32::from(segments) * SEGMENT_STRIDE).ok_or(-8)?;
+    if segments == 0 || end > RESOURCE_BASE { return Err(-8); }
+    Ok(base)
+}
+
+fn module_segment_size(image: &ne::Image<'_>, number: u16) -> Result<usize, i32> {
+    let segment = image.segment(number).map_err(|_| -8)?;
+    let heap = if number == image.header.auto_data { usize::from(image.header.heap_size) } else { 0 };
+    Ok(segment.alloc_size.saturating_add(heap).min(0x10000))
 }
 
 fn patch_chain<A: crate::Arch>(
@@ -508,11 +521,11 @@ fn relocate_image<A: crate::Arch>(
     modules: &[LoadedModule],
     ldt: &[u64],
     gates: &mut Vec<Gate>,
-    mut segment_base: impl FnMut(u16) -> Result<u32, i32>,
+    image_base: u32,
 ) -> Result<(), i32> {
     for number in 1..=image.header.segment_count {
         let segment = image.segment(number).map_err(|_| -8)?;
-        let base = segment_base(number)?;
+        let base = module_segment_base(image_base, number)?;
         for relocation in image.relocations(segment).map_err(|_| -8)? {
             let (offset, target_selector) = match &relocation.target {
                 ne::Target::FpuFixup => continue,
@@ -588,18 +601,19 @@ pub(super) fn exec<A: crate::Arch>(
         let (module_path, module_data) = load_module_file(&canonical, &importer)?;
         let module_image = ne::Image::parse(&module_data).map_err(|_| -8)?;
         let mut module_selectors = Vec::with_capacity(module_image.header.segment_count as usize);
-        let module_index = modules.len();
+        let module_base = module_allocation(&modules, module_image.header.segment_count)?;
         for number in 1..=module_image.header.segment_count {
             let segment = module_image.segment(number).map_err(|_| -8)?;
-            let base = module_segment_base(module_index, number)?;
-            machine.zero(base as usize, segment.alloc_size);
-            machine.copy_to(base as usize,
-                module_image.segment_bytes(segment).map_err(|_| -8)?);
-            module_selectors.push(selector(
-                &mut ldt, base, segment.alloc_size, segment.is_code())?);
+            let base = module_segment_base(module_base, number)?;
+            let size = module_segment_size(&module_image, number)?;
+            machine.zero(base as usize, size);
+            machine.copy_to(base as usize, module_image.segment_bytes(segment).map_err(|_| -8)?);
+            module_selectors.push(selector(&mut ldt, base, size, segment.is_code())?);
         }
         let dependencies = module_image.modules().map_err(|_| -8)?;
         modules.push(LoadedModule {
+            initialized: if module_image.header.entry_segment == 0 { 2 } else { 0 },
+            base: module_base,
             name: canonical.clone(),
             kind: module(&canonical),
             data: module_data,
@@ -624,15 +638,20 @@ pub(super) fn exec<A: crate::Arch>(
     machine.write::<u16>((PSP_BASE + 0x2c) as usize, env_selector);
     machine.zero(RESOURCE_BASE as usize, 0x10000);
     let mut gates = Vec::new();
+    // These private gates are called inside KERNEL.DLL, not through an NE
+    // import relocation, so register them explicitly in the matched runtime.
+    for ordinal in [426, 427] {
+        imported_target(machine, &ldt, &modules, &mut gates, b"KERNEL", Some(ordinal), None)?;
+    }
 
     relocate_image(
-        machine, &image, &selectors, &modules, &ldt, &mut gates, segment_base,
+        machine, &image, &selectors, &modules, &ldt, &mut gates, SEGMENT_BASE,
     )?;
-    for (module_index, loaded) in modules.iter().enumerate() {
+    for loaded in &modules {
         let module_image = ne::Image::parse(&loaded.data).map_err(|_| -8)?;
         relocate_image(
             machine, &module_image, &loaded.selectors, &modules, &ldt, &mut gates,
-            |number| module_segment_base(module_index, number),
+            loaded.base,
         )?;
     }
     for number in 1..=header.segment_count {
@@ -648,13 +667,13 @@ pub(super) fn exec<A: crate::Arch>(
             segment.is_code(),
         );
     }
-    for (module_index, loaded) in modules.iter().enumerate() {
+    for loaded in &modules {
         let module_image = ne::Image::parse(&loaded.data).map_err(|_| -8)?;
         for number in 1..=module_image.header.segment_count {
             let segment = module_image.segment(number).map_err(|_| -8)?;
             machine.set_page_flags(
-                module_segment_base(module_index, number)? as usize / 4096,
-                segment.alloc_size.div_ceil(4096),
+                module_segment_base(loaded.base, number)? as usize / 4096,
+                module_segment_size(&module_image, number)?.div_ceil(4096),
                 !segment.is_code(),
                 segment.is_code(),
             );
@@ -738,6 +757,21 @@ pub(super) fn exec<A: crate::Arch>(
         resource_next: 0,
         resources: Vec::new(),
     });
+    // Initializers run as ordinary far calls in KERNEL.DLL on the guest stack.
+    // The same runner is used by LoadLibrary; no kernel callback continuation.
+    if windows.win16.as_ref().is_some_and(|s| s.modules.iter().any(|m| m.initialized == 0)) {
+        let state = windows.win16.as_ref().ok_or(-8)?;
+        let kernel = state.modules.iter().find(|m| m.kind == Some(Module::Kernel)).ok_or(-8)?;
+        let entry = ne::Image::parse(&kernel.data).map_err(|_| -8)?.entry(428).map_err(|_| -8)?;
+        let regs = &mut current.kernel.vcpu.regs;
+        let stack = selector_base(&windows, regs.frame.ss as u16).ok_or(-8)? as usize;
+        let sp = (regs.sp32() as u16).checked_sub(4).ok_or(-8)?;
+        machine.write::<u16>(stack + sp as usize, regs.ip32() as u16);
+        machine.write::<u16>(stack + sp as usize + 2, regs.code_seg());
+        regs.frame.rsp = u64::from(sp);
+        regs.frame.cs = u64::from(kernel.selectors[entry.0 as usize-1]);
+        regs.frame.rip = u64::from(entry.1);
+    }
     windows.on_resume(machine);
     dos.ldt[..windows.ldt.len()].copy_from_slice(&windows.ldt);
     for i in 0..windows.ldt.len() { dos.ldt_alloc[i / 32] |= 1 << (i % 32); }
@@ -1265,9 +1299,40 @@ fn dispatch<A: crate::Arch>(
             imported_target(machine, &windows.ldt, &state.modules, &mut state.gates, &module_name, ordinal, name.as_deref())
                 .map_or(0, |(offset, selector)| (u32::from(selector)<<16)|u32::from(offset))
         }
-        (Module::Kernel, 95) => {
+        (Module::Kernel, 426) => {
             let Some(name) = stack_u32(machine, windows, regs, 4).and_then(|p| far_string(machine, windows, p)) else { return 2 };
             load_dynamic(machine, windows, state, &name).map_or_else(|e| if e == -2 {2} else {11}, u32::from)
+        }
+        (Module::Kernel, 427) => {
+            let Some(pointer) = stack_u32(machine, windows, regs, 4) else { return 11; };
+            let Some(&descriptor) = windows.ldt.get((pointer >> 19) as usize) else { return 11; };
+            let limit = (descriptor & 0xffff) | ((descriptor >> 32) & 0xf0000);
+            if u64::from(pointer as u16) + 11 > limit { return 11; }
+            let Some(out) = far_linear(windows, pointer) else { return 11; };
+            let success = stack_u16(machine, windows, regs, 8).unwrap_or(0);
+            let previous = stack_u16(machine, windows, regs, 10).unwrap_or(0);
+            let root = stack_u16(machine, windows, regs, 12).unwrap_or(0);
+            if previous != 0 {
+                let Some(m) = state.modules.iter_mut().find(|m| m.selectors.first() == Some(&previous)) else { return 11; };
+                if m.initialized != 1 { return 11; }
+                m.initialized = if success != 0 { 2 } else { 3 };
+                if success == 0 { return 11; }
+            }
+            match next_initializer(state, root) {
+                Ok(Some(index)) => {
+                    let m = &mut state.modules[index];
+                    let Ok(image) = ne::Image::parse(&m.data) else { return 11; };
+                    let Some(&cs) = m.selectors.get(image.header.entry_segment.wrapping_sub(1) as usize) else { return 11; };
+                    let ds = m.selectors.get(image.header.auto_data.wrapping_sub(1) as usize).copied().unwrap_or(0);
+                    let instance = if ds != 0 { ds } else { m.selectors[0] };
+                    let words = [image.header.entry_offset, cs, ds, image.header.heap_size, instance, m.selectors[0]];
+                    for (i, word) in words.into_iter().enumerate() { machine.write::<u16>(out + i*2, word); }
+                    m.initialized = 1;
+                    0xffff
+                }
+                Ok(None) => 0,
+                Err(_) => 11,
+            }
         }
         (Module::Kernel, 96) => {
             let h = stack_u16(machine, windows, regs, 4).unwrap_or(0);
@@ -1526,7 +1591,7 @@ pub(super) fn handle_event<A: crate::Arch>(
             }
             let old_ldt = windows.ldt.len();
             let result = dispatch(machine, kt, windows, state, regs, gate);
-            if gate.module == Module::Kernel && matches!(gate.ordinal,15..=17|95|170|175..=177) {
+            if gate.module == Module::Kernel && matches!(gate.ordinal,15..=17|426|170|175..=177) {
                 // Lock/unlock/size/handle queries (18..=21) only touch block
                 // metadata. Rebuilding the descriptor mirror and reloading the
                 // LDT for each query makes resource-heavy Win16 startup crawl.
@@ -1585,12 +1650,14 @@ fn dos_call<A: crate::Arch>(
 fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, state: &mut State, name: &[u8]) -> Result<u16, i32> {
     let name = canonical_module_name(name);
     if let Some(m) = state.modules.iter_mut().find(|m| m.name == name) {
+        if m.initialized == 3 { return Err(-8); }
         m.references = m.references.saturating_add(1);
         return Ok(m.selectors[0]);
     }
     let start = state.modules.len();
     let old_ldt = windows.ldt.len();
     let old_gates = state.gates.len();
+    let mut mapped = Vec::new();
     let result = (|| {
         let mut pending = vec![(name.clone(), windows.exec_path_str().to_vec())];
         let mut next = 0;
@@ -1600,21 +1667,20 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
             if state.modules.iter().any(|m| m.name == name) { continue; }
             let (path, data) = load_module_file(&name, &importer)?;
             let image = ne::Image::parse(&data).map_err(|_| -8)?;
-            // Guest facades have no LibMain. Do not silently skip a DLL initializer.
-            if image.header.entry_segment != 0 || image.header.segment_count > 16 { return Err(-8); }
             let mut selectors = Vec::new();
-            let index = state.modules.len();
-            if index >= ((RESOURCE_BASE - MODULE_BASE) / MODULE_STRIDE) as usize { return Err(-8); }
+            let module_base = module_allocation(&state.modules, image.header.segment_count)?;
             for n in 1..=image.header.segment_count {
                 let segment = image.segment(n).map_err(|_| -8)?;
-                let base = module_segment_base(index, n)?;
-                machine.set_page_flags(base as usize/4096, segment.alloc_size.div_ceil(4096), true, false);
-                machine.zero(base as usize, segment.alloc_size);
+                let base = module_segment_base(module_base, n)?;
+                let size = module_segment_size(&image, n)?;
+                mapped.push((base as usize / 4096, size.div_ceil(4096)));
+                machine.set_page_flags(base as usize/4096, size.div_ceil(4096), true, false);
+                machine.zero(base as usize, size);
                 machine.copy_to(base as usize, image.segment_bytes(segment).map_err(|_| -8)?);
-                selectors.push(selector(&mut windows.ldt, base, segment.alloc_size, segment.is_code())?);
+                selectors.push(selector(&mut windows.ldt, base, size, segment.is_code())?);
             }
             let dependencies = image.modules().map_err(|_| -8)?;
-            state.modules.push(LoadedModule { kind: module(&name), name, data, selectors, references: 1 });
+            state.modules.push(LoadedModule { initialized: if image.header.entry_segment == 0 { 2 } else { 0 }, base: module_base, kind: module(&name), name, data, selectors, references: 1 });
             pending.extend(dependencies.into_iter().map(|dep| (dep, path.clone())));
         }
         let entry = super::export_address(&windows.modules, b"USER32", b"Retro16Enter")?;
@@ -1622,7 +1688,7 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
         for index in start..state.modules.len() {
             let m = &state.modules[index];
             let image = ne::Image::parse(&m.data).map_err(|_| -8)?;
-            relocate_image(machine, &image, &m.selectors, &state.modules, &windows.ldt, &mut state.gates, |n| module_segment_base(index, n))?;
+            relocate_image(machine, &image, &m.selectors, &state.modules, &windows.ldt, &mut state.gates, m.base)?;
             if let Ok((segment, offset)) = image.entry_by_name(b"RetroBridgeConfig") {
                 let base = selector_base(windows, m.selectors[segment as usize-1]).ok_or(-8)?;
                 machine.write::<u32>((base+u32::from(offset)) as usize, entry);
@@ -1632,7 +1698,7 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
             }
             for n in 1..=image.header.segment_count {
                 let seg = image.segment(n).map_err(|_| -8)?;
-                machine.set_page_flags(module_segment_base(index,n)? as usize/4096, seg.alloc_size.div_ceil(4096), !seg.is_code(), seg.is_code());
+                machine.set_page_flags(module_segment_base(m.base,n)? as usize/4096, module_segment_size(&image, n)?.div_ceil(4096), !seg.is_code(), seg.is_code());
             }
         }
         // Extend the guest selector translation table without reinitializing USER state.
@@ -1653,9 +1719,38 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
         Ok(state.modules[start].selectors[0])
     })();
     if result.is_err() {
+        for (base, count) in mapped { machine.unmap_range(base, count); }
         state.modules.truncate(start);
         state.gates.truncate(old_gates);
         windows.ldt.truncate(old_ldt);
     }
     result
+}
+
+/// Dependency-first initialization. A running module breaks a dependency cycle
+/// and permits a DLL to call LoadLibrary recursively from its own LibMain.
+fn next_initializer(state: &State, root: u16) -> Result<Option<usize>, i32> {
+    fn visit(state: &State, index: usize, seen: &mut Vec<usize>) -> Result<Option<usize>, i32> {
+        let m = &state.modules[index];
+        if m.initialized == 3 { return Err(-8); }
+        if m.initialized == 1 || seen.contains(&index) { return Ok(None); }
+        seen.push(index);
+        let image = ne::Image::parse(&m.data).map_err(|_| -8)?;
+        for name in image.modules().map_err(|_| -8)? {
+            let name = canonical_module_name(&name);
+            let dependency = state.modules.iter().position(|m| m.name == name).ok_or(-2)?;
+            if let Some(next) = visit(state, dependency, seen)? { return Ok(Some(next)); }
+        }
+        Ok((m.initialized == 0).then_some(index))
+    }
+    let mut seen = Vec::new();
+    if root == 0 {
+        for index in 0..state.modules.len() {
+            if let Some(next) = visit(state, index, &mut seen)? { return Ok(Some(next)); }
+        }
+        Ok(None)
+    } else {
+        let index = state.modules.iter().position(|m| m.selectors.first() == Some(&root)).ok_or(-2)?;
+        visit(state, index, &mut seen)
+    }
 }

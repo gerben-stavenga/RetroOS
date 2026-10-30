@@ -48,7 +48,104 @@ gate lstrcpy
 gate lstrcat
 gate lstrlen
 gate InitTask
-gate LoadLibrary
+; Loader policy runs in the kernel; LibMain executes here on the caller's
+; guest stack. All suspended state survives nested LoadLibrary calls naturally.
+gate RetroLoadLibrary
+gate RetroNextInitializer
+
+global LoadLibrary
+LoadLibrary:
+    push bp
+    mov bp, sp
+    pushfd
+    pushad
+    push ds
+    push es
+    push fs
+    push gs
+    push word [ss:bp+8]
+    push word [ss:bp+6]
+    push cs
+    call RetroLoadLibrary
+    cmp ax,32
+    jb .done
+    call initialize_modules
+.done:
+    mov [ss:bp-8],ax
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popad
+    popfd
+    pop bp
+    retf 4
+
+global RetroInitLibraries
+RetroInitLibraries:
+    pushfd
+    pushad
+    push ds
+    push es
+    push fs
+    push gs
+    xor ax,ax
+    call initialize_modules
+    test ax,ax
+    jz .done
+    push ax
+    push cs
+    call FatalExit
+.done:
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popad
+    popfd
+    retf
+
+; AX=root handle (zero for process startup). The 12-byte initializer record,
+; root handle and acknowledgement are local to this guest stack frame.
+initialize_modules:
+    push bp
+    mov bp,sp
+    sub sp,16
+    mov [ss:bp-4],ax
+    mov word [ss:bp-2],0
+    mov ax,1
+.next:
+    push word [ss:bp-4]
+    push word [ss:bp-2]
+    push ax
+    push ss
+    lea ax,[bp-16]
+    push ax
+    push cs
+    call RetroNextInitializer
+    test ax,ax
+    jz .ready
+    cmp ax,0xffff
+    jne .return
+    mov ax,[ss:bp-6]
+    mov [ss:bp-2],ax
+    mov ax,[ss:bp-12]
+    mov ds,ax
+    mov es,ax
+    mov cx,[ss:bp-10]
+    mov di,[ss:bp-8]
+    xor bx,bx
+    xor si,si
+    push bp
+    call far [ss:bp-16]
+    pop bp
+    jmp .next
+.ready:
+    mov ax,[ss:bp-4]
+.return:
+    mov sp,bp
+    pop bp
+    ret
 gate FreeLibrary
 bridge GetTempFileName, 2097, 12
 gate DOS3Call

@@ -15,6 +15,7 @@ win16_dll("kernel", "KERNEL", [
     "FreeProcInstance.52", "GetProfileString.58", "FindResource.60",
     "LoadResource.61", "LockResource.62", "FreeResource.63", "OpenFile.74",
     "_lclose.81", "_lread.82", "_lcreat.83", "_llseek.84", "_lopen.85", "_lwrite.86", "lstrcpy.88", "lstrcat.89", "lstrlen.90", "InitTask.91",
+    "RetroLoadLibrary.426", "RetroNextInitializer.427", "RetroInitLibraries.428",
     "LoadLibrary.95", "FreeLibrary.96", "GetTempFileName.97", "DOS3Call.102",
     "SetErrorMode.107", "OutputDebugString.115", "LocalShrink.121",
     "GetPrivateProfileInt.127",
@@ -61,6 +62,7 @@ win16_dll("gdi", "GDI", [
 ])
 
 win16_dll("user", "USER", [
+    "CreateCaret.163", "DestroyCaret.164", "SetCaretPos.165", "HideCaret.166", "ShowCaret.167", "SetCaretBlinkTime.168", "GetCaretBlinkTime.169", "GetCaretPos.183",
     "GetScrollRange.65", "CreateDialog.89", "CreateDialogIndirect.219", "GetDialogBaseUnits.243",
     "DefMDIChildProc.447", "TranslateMDISysAccel.451",
     "GetTickCount.13",

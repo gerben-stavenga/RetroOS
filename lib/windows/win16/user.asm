@@ -192,3 +192,12 @@ bridge GetScrollRange, 65, 12
 bridge CreateDialog, 89, 12
 bridge CreateDialogIndirect, 219, 12
 bridge GetDialogBaseUnits, 243, 0
+
+bridge CreateCaret, 163, 8
+bridge DestroyCaret, 164, 0
+bridge SetCaretPos, 165, 4
+bridge HideCaret, 166, 2
+bridge ShowCaret, 167, 2
+bridge SetCaretBlinkTime, 168, 2
+bridge GetCaretBlinkTime, 169, 0
+bridge GetCaretPos, 183, 4

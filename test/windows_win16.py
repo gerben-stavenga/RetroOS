@@ -19,6 +19,7 @@ def main():
     targets = [f'//kernel:{host}', '//test/windows/win16:bridge', '//test/windows/win16:fpmath', '//test/windows/win16:civ_apis', '//test/windows/win16:window', '//test/windows/win16:legacy_user',
                '//lib/windows/user32:user32_dll', '//lib/windows/kernel32:kernel32_dll',
                '//lib/windows/compat:gdi32_dll']
+    targets += [f'//test/windows/win16:{name}' for name in ('initializers','init_dependency','init_nested','init_large','init_failure')]
     targets += [f'//lib/windows/win16:{name}_dll' for name in ('user','kernel','gdi','sound','shell','keyboard','lzexpand','win87em','mmsystem','commdlg')]
     subprocess.run(['bazelisk', 'build', *targets, '--platforms=@platforms//host'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-win16-') as directory:
@@ -33,7 +34,9 @@ def main():
         for name, folder in [('USER32','user32'), ('KERNEL32','kernel32'), ('GDI32','compat')]:
             shutil.copyfile(ROOT / f'bazel-bin/lib/windows/{folder}/{name}.DLL', system32 / f'{name}.DLL')
         shutil.copyfile(ROOT / 'bazel-bin/test/windows/win16/LEGACYUSER.DLL', root / 'USER.DLL')
-        for program in ('bridge', 'window', 'fpmath', 'civ_apis'):
+        for name in ('INITDEP','INITNEST','INITLARGE','INITFAIL'):
+            shutil.copyfile(ROOT / f'bazel-bin/test/windows/win16/{name}.DLL', root / f'{name}.DLL')
+        for program in ('bridge', 'window', 'fpmath', 'civ_apis', 'initializers'):
             shutil.copyfile(ROOT / f'bazel-bin/test/windows/win16/{program}.exe', root / 'BRIDGE.EXE')
             process = subprocess.Popen(['python3', str(ROOT/'test/disk_fixture.py'), '--root', directory, '--',
                 str(ROOT/f'bazel-bin/kernel/{host}'), '--c-root', '/', '--cmd', '/BRIDGE.EXE probe' if program == 'window' else '/BRIDGE.EXE'],

@@ -23,6 +23,19 @@ restored around callbacks; no suspended Rust frame is overwritten by reentry.
 This is currently one NE task per process, not support for concurrent Win16 tasks
 sharing the same adapter state.
 
+DLL initializers run dependency-first as ordinary far calls from KERNEL.DLL,
+both before EXE entry and during LoadLibrary. Nested LoadLibrary calls keep
+their state on the guest stack; a running initializer is not entered again.
+An initializer returning zero makes the load fail. DLL segment ranges are
+packed into the reserved module address region rather than limited to 16
+segments per DLL. The `initializers` regression covers a 19-segment DLL,
+startup dependencies, recursive loading, one-time initialization, failure
+results, and preservation of the caller's stack and data selector.
+
+Caret creation, positioning, visibility counts, blinking and destruction use
+the same guest USER32 implementation from Win16 and Win32. Window destruction
+also releases its caret.
+
 The saved NE frame has the following byte offsets:
 
 | Offset | Value |
@@ -136,6 +149,11 @@ coordinates. Shared USER32 supplies ordering and routes pointer input; the
 desktop composes the surfaces, including separate map and Status windows.
 This is not a complete gameplay acceptance test.
 Civilization II additionally imports video and AVI libraries.
+Local tests with its original Video for Windows runtime now get beyond the
+initializer/segment-count restrictions, but still stop at missing imports
+(including EnumTaskWindows, GlobalHandleNoRIP, RegOpenKey and timeGetTime).
+This does not yet establish AVI or Indeo playback support; those runtime files
+are not bundled with RetroOS.
 
 The `civ_apis` NE regression covers huge copies across a selector boundary,
 locked global-memory release, NE segment allocation padding, bitmap updates and

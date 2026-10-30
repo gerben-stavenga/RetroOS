@@ -12,7 +12,7 @@ nasm_library(
 windows_rust_library(
     name = "user32_rust",
     crate_root = "user32.rs",
-    srcs = ["mdi.rs", "messagebox.rs", "scrollbar.rs", "bitmap.rs", "win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
+    srcs = ["caret.rs", "mdi.rs", "messagebox.rs", "scrollbar.rs", "bitmap.rs", "win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
 )
 
 windows_dll(
@@ -126,6 +126,15 @@ windows_dll(
         "_WideCharToMultiByte@32": "KERNEL32.WideCharToMultiByte",
     },
     export_aliases = {
+        "CreateCaret": "_CreateCaret@16",
+        "DestroyCaret": "_DestroyCaret@0",
+        "SetCaretPos": "_SetCaretPos@8",
+        "GetCaretPos": "_GetCaretPos@4",
+        "ShowCaret": "_ShowCaret@4",
+        "HideCaret": "_HideCaret@4",
+        "SetCaretBlinkTime": "_SetCaretBlinkTime@4",
+        "GetCaretBlinkTime": "_GetCaretBlinkTime@0",
+
         "GetSystemMetrics": "_GetSystemMetrics@4",
         "GetDesktopWindow": "_GetDesktopWindow@0",
         "FrameRect": "_FrameRect@12",
@@ -370,6 +379,7 @@ windows_dll(
     out = "USER32.DLL",
     module_name = "USER32",
     exports = [
+        "CreateCaret", "DestroyCaret", "SetCaretPos", "GetCaretPos", "ShowCaret", "HideCaret", "SetCaretBlinkTime", "GetCaretBlinkTime",
         "WaitMessage",
         "IsZoomed",
         "DefMDIChildProcA",

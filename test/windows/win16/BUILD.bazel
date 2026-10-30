@@ -74,3 +74,22 @@ windows16_binary(name="civ_apis", obj=":civ_apis_obj", imports={
     "RegisterClass":"USER.57", "CreateDialogIndirect":"USER.219",
     "DestroyWindow":"USER.53", "DefDlgProc":"USER.308",
 }, visibility=["//visibility:public"])
+
+nasm_library(name="init_dependency_obj", srcs=["init_dependency.asm"], copts=["-fobj"])
+windows16_dll(name="init_dependency", obj=":init_dependency_obj", out="INITDEP.DLL",
+    module_name="INITDEP", entry="_start", heap_size=64, exports=["Check.1"], visibility=["//visibility:public"])
+windows16_dll(name="init_nested", obj=":init_dependency_obj", out="INITNEST.DLL",
+    module_name="INITNEST", entry="_start", heap_size=64, exports=["Check.1"], visibility=["//visibility:public"])
+nasm_library(name="init_large_obj", srcs=["init_large.asm"], copts=["-fobj"])
+windows16_dll(name="init_large", obj=":init_large_obj", out="INITLARGE.DLL",
+    module_name="INITLARGE", entry="_start", heap_size=64, exports=["Check.1"],
+    imports={"Dependency":"INITDEP.1", "LoadLibrary":"KERNEL.95", "GetProcAddress":"KERNEL.50"},
+    visibility=["//visibility:public"])
+nasm_library(name="init_failure_obj", srcs=["init_failure.asm"], copts=["-fobj"])
+windows16_dll(name="init_failure", obj=":init_failure_obj", out="INITFAIL.DLL",
+    module_name="INITFAIL", entry="_start", exports=["Check.1"], visibility=["//visibility:public"])
+nasm_library(name="initializers_obj", srcs=["initializers.asm"], copts=["-fobj"])
+windows16_binary(name="initializers", obj=":initializers_obj", imports={
+    "Debug":"KERNEL.115", "Exit":"KERNEL.1", "GetTickCount":"USER.13", "Dependency":"INITDEP.1",
+    "LoadLibrary":"KERNEL.95", "GetProcAddress":"KERNEL.50",
+}, visibility=["//visibility:public"])

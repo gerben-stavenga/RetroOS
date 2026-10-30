@@ -276,6 +276,7 @@ pub extern "system" fn DestroyWindow(hwnd: u32) -> i32 {
     if ready == 0 {
         return 0;
     }
+    crate::caret::destroy_window(hwnd);
     unsafe {
         SendMessageW(hwnd, 2, 0, 0);
     }

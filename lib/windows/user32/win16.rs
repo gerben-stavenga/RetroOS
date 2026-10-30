@@ -1299,6 +1299,20 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             412 => menu::RemoveMenu(h(4), w(2), w(0)) as u32,
             413 => menu::DeleteMenu(h(4), w(2), w(0)) as u32,
             282 => encode(SelectPalette(h(4),h(2),w(0))),
+            163 => crate::caret::CreateCaret(h(6),h(4),w(2) as i16 as i32,w(0) as i16 as i32) as u32,
+            164 => crate::caret::DestroyCaret() as u32,
+            165 => crate::caret::SetCaretPos(w(2) as i16 as i32,w(0) as i16 as i32) as u32,
+            166 => crate::caret::HideCaret(h(0)) as u32,
+            167 => crate::caret::ShowCaret(h(0)) as u32,
+            168 => crate::caret::SetCaretBlinkTime(w(0)) as u32,
+            169 => crate::caret::GetCaretBlinkTime(),
+            183 => {
+                let out=pointer(d(0),4)? as *mut i16;
+                let mut pos=[0;2];
+                let result=crate::caret::GetCaretPos(&mut pos);
+                if result!=0 {out.write_unaligned(pos[0] as i16);out.add(1).write_unaligned(pos[1] as i16);}
+                result as u32
+            }
             283 => RealizePalette(h(0)),
             1006 => SetPolyFillMode(h(2),i(0)) as u32,
             1036 => {

@@ -95,6 +95,36 @@ int main(void)
         CHECK(SetDIBitsToDevice(dc,0,0,2,2,0,0,0,2,bits,&info,DIB_RGB_COLORS)==2);
         SetPixel(dc,1,1,RGB(22,33,44));
     }
+    /* Shared caret drawing, balanced visibility, movement and cleanup. */
+    {
+        HWND owner=CreateWindowExA(0,"STATIC","caret",WS_POPUP,0,0,64,32,0,0,0,0);
+        HDC screen=GetDC(owner);
+        RECT area={0,0,64,32};
+        POINT position;
+        DWORD previous=GetCaretBlinkTime();
+        FillRect(screen,&area,GetStockObject(BLACK_BRUSH));
+        CHECK(SetCaretBlinkTime(0x7fffffff));
+        CHECK(CreateCaret(owner,0,2,4));
+        CHECK(SetCaretPos(3,5));
+        CHECK(GetCaretPos(&position) && position.x==3 && position.y==5);
+        CHECK(GetPixel(screen,3,5)==RGB(0,0,0));
+        CHECK(ShowCaret(owner));
+        CHECK(GetPixel(screen,3,5)==RGB(255,255,255));
+        CHECK(SetCaretPos(8,5));
+        CHECK(GetPixel(screen,3,5)==RGB(0,0,0));
+        CHECK(GetPixel(screen,8,5)==RGB(255,255,255));
+        CHECK(HideCaret(owner));CHECK(HideCaret(owner));CHECK(ShowCaret(owner));
+        CHECK(GetPixel(screen,8,5)==RGB(0,0,0));
+        CHECK(ShowCaret(owner));
+        CHECK(GetPixel(screen,8,5)==RGB(255,255,255));
+        CHECK(DestroyCaret());
+        CHECK(GetPixel(screen,8,5)==RGB(0,0,0));
+        CHECK(!DestroyCaret());
+        CHECK(CreateCaret(owner,0,1,2));
+        ReleaseDC(owner,screen);DestroyWindow(owner);
+        CHECK(!DestroyCaret());
+        CHECK(SetCaretBlinkTime(previous));
+    }
     /* Four-bit DDB bright colors use the standard static palette. */
     {
         BYTE data[2]={0x89,0xaf}, readback[2]={0,0};
