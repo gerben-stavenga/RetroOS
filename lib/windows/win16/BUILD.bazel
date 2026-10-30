@@ -3,7 +3,7 @@ load(":win16.bzl", "win16_dll")
 win16_dll("kernel", "KERNEL", [
     "hmemcpy.348", "_hread.349", "_hwrite.350",
     "GetProfileInt.57", "GetHeapSpaces.138",
-    "GlobalHandle.21", "GetFreeSpace.169", "AllocCStoDSAlias.170", "AllocSelector.175", "FreeSelector.176", "PrestoChangoSelector.177",
+    "GlobalHandle.21", "GlobalHandleNoRIP.159", "GetCurrentTask.36", "GetFreeSpace.169", "AllocCStoDSAlias.170", "AllocSelector.175", "FreeSelector.176", "PrestoChangoSelector.177",
     "RetroBridgeConfig.423", "WinExec.166",
     "FatalExit.1", "GetVersion.3", "LocalInit.4", "LocalAlloc.5",
     "LocalReAlloc.6", "LocalFree.7", "LocalLock.8", "LocalUnlock.9",
@@ -25,6 +25,7 @@ win16_dll("kernel", "KERNEL", [
 ])
 
 win16_dll("gdi", "GDI", [
+    "GetNearestPaletteIndex.370", "MoveToEx.483", "GetTextExtentPoint.471", "GetTextAlign.345", "GetPaletteEntries.363", "GetBitmapDimensionEx.468",
     "SetPolyFillMode.6",
     "Polyline.37",
     "CreateBitmap.48",
@@ -62,6 +63,9 @@ win16_dll("gdi", "GDI", [
 ])
 
 win16_dll("user", "USER", [
+    "ShowScrollBar.267",
+    "GetClassName.58", "GetScrollPos.63", "SetRectEmpty.73", "IsRectEmpty.75", "UnionRect.80", "GetClassWord.129", "GetNextWindow.230", "GetWindow.262", "GetMenuItemCount.263", "GetMenuItemID.264", "UnregisterClass.403", "CreatePopupMenu.415",
+    "MapWindowPoints.258", "InSendMessage.251", "SetMessageQueue.266", "EnumWindows.54", "EnumChildWindows.55", "GetWindowTask.224", "EnumTaskWindows.225",
     "CreateCaret.163", "DestroyCaret.164", "SetCaretPos.165", "HideCaret.166", "ShowCaret.167", "SetCaretBlinkTime.168", "GetCaretBlinkTime.169", "GetCaretPos.183",
     "GetScrollRange.65", "CreateDialog.89", "CreateDialogIndirect.219", "GetDialogBaseUnits.243",
     "DefMDIChildProc.447", "TranslateMDISysAccel.451",
@@ -137,5 +141,5 @@ win16_dll("keyboard", "KEYBOARD", ["AnsiToOem.5", "OemToAnsi.6"])
 win16_dll("lzexpand", "LZEXPAND", ["LZCopy.1", "RetroBridgeConfig.423"])
 
 win16_dll("win87em", "WIN87EM", ["__FPMATH.1"])
-win16_dll("mmsystem", "MMSYSTEM", ["sndPlaySound.2", "mciSendCommand.701"])
+win16_dll("mmsystem", "MMSYSTEM", ["sndPlaySound.2", "mciSendCommand.701", "timeGetTime.607", "timeBeginPeriod.605", "timeEndPeriod.606", "timeGetDevCaps.604", "timeGetSystemTime.601", "RetroBridgeConfig.423"])
 win16_dll("commdlg", "COMMDLG", ["GetOpenFileName.1", "GetSaveFileName.2", "CommDlgExtendedError.26"])

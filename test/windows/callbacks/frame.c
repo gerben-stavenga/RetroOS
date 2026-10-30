@@ -1,9 +1,16 @@
 #include <windows.h>
 #include <stdio.h>
-static unsigned errors, command;
+static unsigned errors, command, sizes, scroll_code, scroll_position, scroll_axis, thumb_ends;
+static LPARAM scroll_source;
 #define CHECK(x) do {if(!(x)){++errors;printf("frame check failed line %u\n",__LINE__);}}while(0)
 static LRESULT CALLBACK proc(HWND h,UINT m,WPARAM w,LPARAM l)
 {
+    if(m==WM_SIZE)++sizes;
+    if(m==WM_HSCROLL || m==WM_VSCROLL) {
+        scroll_axis=m;scroll_code=LOWORD(w);scroll_position=HIWORD(w);scroll_source=l;
+        if(scroll_code==SB_THUMBPOSITION)++thumb_ends;
+        return 0;
+    }
     if(m==WM_COMMAND){command=LOWORD(w);return 0;}
     return DefWindowProcA(h,m,w,l);
 }
@@ -39,6 +46,45 @@ int main(void)
     SendMessageA(h,WM_NCLBUTTONDOWN,HTMENU,MAKELPARAM(item.left+25,item.bottom+10));
     SendMessageA(h,WM_NCLBUTTONUP,HTMENU,MAKELPARAM(item.left+25,item.bottom+10));
     CHECK(command==42);
+    /* Standard bars change the client area and share control interaction code. */
+    {
+        RECT before,after;unsigned old_sizes;HWND bar;
+        CHECK(GetClientRect(h,&before));old_sizes=sizes;
+        CHECK(ShowScrollBar(h,SB_BOTH,TRUE));
+        CHECK(GetClientRect(h,&after));
+        CHECK(after.right==before.right-16 && after.bottom==before.bottom-16);
+        CHECK((GetWindowLongA(h,GWL_STYLE)&(WS_HSCROLL|WS_VSCROLL))==(WS_HSCROLL|WS_VSCROLL));
+        CHECK(sizes==old_sizes+1);old_sizes=sizes;
+        CHECK(ShowScrollBar(h,SB_BOTH,TRUE) && sizes==old_sizes);
+        CHECK(SendMessageA(h,WM_NCHITTEST,0,MAKELPARAM(origin.x+after.right+8,origin.y+20))==HTVSCROLL);
+        CHECK(SendMessageA(h,WM_NCHITTEST,0,MAKELPARAM(origin.x+20,origin.y+after.bottom+8))==HTHSCROLL);
+        whole=GetWindowDC(h);
+        CHECK(GetPixel(whole,origin.x-outer.left+after.right,origin.y-outer.top)==RGB(255,255,255));
+        ReleaseDC(h,whole);
+        SetScrollRange(h,SB_VERT,0,100,FALSE);SetScrollPos(h,SB_VERT,0,TRUE);
+        SendMessageA(h,WM_NCLBUTTONDOWN,HTVSCROLL,MAKELPARAM(origin.x+after.right+8,origin.y+after.bottom-4));
+        CHECK(GetCapture()==h && scroll_axis==WM_VSCROLL && scroll_code==SB_LINEDOWN && scroll_source==0);
+        SendMessageA(h,WM_LBUTTONUP,0,MAKELPARAM(after.right+8,after.bottom-4));
+        CHECK(GetCapture()==0 && scroll_code==SB_ENDSCROLL);
+        SendMessageA(h,WM_NCLBUTTONDOWN,HTVSCROLL,MAKELPARAM(origin.x+after.right+8,origin.y+20));
+        SendMessageA(h,WM_MOUSEMOVE,MK_LBUTTON,MAKELPARAM(after.right+8,64));
+        CHECK(scroll_code==SB_THUMBTRACK && scroll_position>0 && scroll_position<=100);
+        SendMessageA(h,WM_LBUTTONUP,0,MAKELPARAM(after.right+8,64));
+        CHECK(thumb_ends==1 && scroll_code==SB_ENDSCROLL && GetCapture()==0);
+        SetScrollPos(h,SB_HORZ,37,FALSE);
+        SendMessageA(h,WM_NCLBUTTONDOWN,HTHSCROLL,MAKELPARAM(origin.x+4,origin.y+after.bottom+8));
+        CHECK(scroll_axis==WM_HSCROLL && scroll_code==SB_LINELEFT);
+        CHECK(ShowScrollBar(h,SB_HORZ,FALSE));CHECK(GetCapture()==0);
+        CHECK(GetClientRect(h,&after) && after.right==before.right-16 && after.bottom==before.bottom);
+        CHECK(GetScrollPos(h,SB_HORZ)==37);
+        CHECK(ShowScrollBar(h,SB_BOTH,FALSE));
+        CHECK(GetClientRect(h,&after) && EqualRect(&before,&after));
+        CHECK(!ShowScrollBar(h,99,TRUE));CHECK(!ShowScrollBar((HWND)0x12345678,SB_BOTH,TRUE));
+        bar=CreateWindowExA(0,"SCROLLBAR","",WS_CHILD|WS_VISIBLE,0,0,16,80,h,0,cls.hInstance,0);
+        CHECK(bar && ShowScrollBar(bar,SB_CTL,FALSE) && !IsWindowVisible(bar));
+        CHECK(ShowScrollBar(bar,SB_CTL,TRUE) && IsWindowVisible(bar));
+        CHECK(DestroyWindow(bar));
+    }
     edit=CreateWindowExA(0,"EDIT","",WS_CHILD|WS_VISIBLE,5,5,80,20,h,(HMENU)100,cls.hInstance,0);
     CHECK(edit!=0);CHECK(SetDlgItemInt(h,100,(UINT)-123,TRUE));
     CHECK((int)GetDlgItemInt(h,100,&valid,TRUE)==-123&&valid);

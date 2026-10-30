@@ -6,6 +6,15 @@ windows16_binary(name="bridge", obj=":bridge_obj", imports={
 }, visibility=["//visibility:public"])
 nasm_library(name="window_obj", srcs=["window.asm"], copts=["-fobj"])
 windows16_binary(name="window", obj=":window_obj", imports={
+    "ShowScrollBar":"USER.267",
+    "GetClassName":"USER.58", "GetClassWord":"USER.129", "GetScrollPos":"USER.63",
+    "GetWindow":"USER.262", "GetNextWindow":"USER.230", "UnionRect":"USER.80", "SetRectEmpty":"USER.73", "IsRectEmpty":"USER.75",
+    "CreatePopupMenu":"USER.415", "GetMenuItemCount":"USER.263", "GetMenuItemID":"USER.264", "AppendMenu":"USER.411", "DestroyMenu":"USER.152", "UnregisterClass":"USER.403",
+    "MapWindowPoints":"USER.258",
+    "InSendMessage":"USER.251", "SetMessageQueue":"USER.266",
+    "EnumWindows":"USER.54", "EnumTaskWindows":"USER.225", "GetWindowTask":"USER.224",
+    "timeBeginPeriod":"MMSYSTEM.605", "timeEndPeriod":"MMSYSTEM.606", "timeGetDevCaps":"MMSYSTEM.604", "timeGetSystemTime":"MMSYSTEM.601",
+    "GetCurrentTask":"KERNEL.36", "GlobalHandleNoRIP":"KERNEL.159", "timeGetTime":"MMSYSTEM.607",
     "GetDriveType": "KERNEL.136",
     "GetPrivateProfileString": "KERNEL.128",
     "PatBlt": "GDI.29",
@@ -60,6 +69,8 @@ nasm_library(name="civ_apis_obj", srcs=["civ_apis.asm"], copts=["-fobj"])
 windows16_binary(name="civ_apis", obj=":civ_apis_obj", imports={
     "Debug":"KERNEL.115", "Exit":"KERNEL.1", "GetTickCount":"USER.13",
     "GlobalAlloc":"KERNEL.15", "GlobalLock":"KERNEL.18", "GlobalFree":"KERNEL.17",
+    "GetTextExtent":"GDI.91", "GetTextExtentPoint":"GDI.471", "GetPaletteEntries":"GDI.363", "GetTextAlign":"GDI.345", "GetBitmapDimensionEx":"GDI.468",
+    "GetNearestPaletteIndex":"GDI.370", "MoveToEx":"GDI.483",
     "CreateDIBitmap":"GDI.442",
     "CreatePatternBrush":"GDI.60", "GetObject":"GDI.82", "GetBitmapBits":"GDI.74", "FrameRect":"USER.83", "GetStockObject":"GDI.87",
     "hmemcpy":"KERNEL.348", "CreateBitmap":"GDI.48", "SetBitmapBits":"GDI.106",

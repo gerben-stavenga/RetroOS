@@ -32,6 +32,13 @@ segments per DLL. The `initializers` regression covers a 19-segment DLL,
 startup dependencies, recursive loading, one-time initialization, failure
 results, and preservation of the caller's stack and data selector.
 
+Window/task enumeration invokes NE callbacks on the guest stack, including
+nested enumeration and early termination, and uses the shared USER window
+lists. Task IDs identify the single NE task within its process. MapWindowPoints
+converts POINT16 arrays through shared USER coordinate mapping; MoveToEx
+translates its optional previous-position result through shared GDI. Message queue
+capacity requests reserve shared queue storage without discarding queued events.
+
 Caret creation, positioning, visibility counts, blinking and destruction use
 the same guest USER32 implementation from Win16 and Win32. Window destruction
 also releases its caret.
@@ -126,6 +133,8 @@ Civilization for Windows now binds its imports and creates its custom dialogs.
 The adapters include huge-buffer memory/file operations, palette entries,
 indexed bitmap uploads/blits, and the protected-mode BIOS clock. Shared GDI
 retains uploaded indices, including complete indexed intermediate copies.
+GetNearestPaletteIndex searches logical entries independently of realized device
+slots, using the same guest GDI implementation for Win16 and Win32.
 Logical palettes map onto 256 device slots with 20 static colors; reserved
 entries remain distinct during fades. Win16 and Win32 share realization,
 reserved-entry animation, system-palette queries, and pattern-brush snapshots.
@@ -133,7 +142,17 @@ Composed bitmap contents are preserved when subsequently used as a blit source.
 Palette changes do not yet
 recolour pixels already drawn to a window.
 
-MMSYSTEM reports sound/MCI services unavailable, and COMMDLG returns a dialog
+Text extents now share guest GDI's ANSI conversion and measurement path: both
+Win16 GetTextExtent/GetTextExtentPoint and Win32 GetTextExtentPointA/
+GetTextExtentPoint32A honor the explicit byte count. Metrics still describe the
+stock 8x16 font actually rendered; scalable fonts are not implied. The adapters
+also cover class names/words, window relationships, menu item queries and popup
+creation, rectangle queries/unions, palette readback, and bitmap dimensions.
+Class-word access checks two-byte bounds rather than reading a DWORD.
+
+MMSYSTEM clock and system-time queries use the existing millisecond clock.
+Timer period requests are validated and balanced; they do not change the hardware
+timer or implement multimedia callback timers. MMSYSTEM reports sound/MCI services unavailable, and COMMDLG returns a dialog
 initialization error. External font-resource loading and enumeration are also
 unimplemented. These are failure-reporting compatibility exports, not working
 multimedia or common-dialog implementations.
@@ -151,7 +170,8 @@ This is not a complete gameplay acceptance test.
 Civilization II additionally imports video and AVI libraries.
 Local tests with its original Video for Windows runtime now get beyond the
 initializer/segment-count restrictions, but still stop at missing imports
-(including EnumTaskWindows, GlobalHandleNoRIP, RegOpenKey and timeGetTime).
+(including RegOpenKey and LocalHandle); Civ II itself currently stops at
+TrackPopupMenu (USER.416).
 This does not yet establish AVI or Indeo playback support; those runtime files
 are not bundled with RetroOS.
 
@@ -163,3 +183,11 @@ IsDialogMessage, separate DIB headers/palettes, BIOS clock advancement,
 optional-service failure results, and guest stack balance. Run it with the
 other Win16 tests using `ENGINE=kvm python3 test/windows_win16.py` or
 `ENGINE=tcg python3 test/windows_win16.py`.
+
+ShowScrollBar shares USER policy between Win16 and Win32. Standard horizontal
+and vertical bars reserve client space, paint in the frame, participate in
+non-client hit testing, and send owner scroll notifications with a null control
+handle. Drawing and thumb dragging reuse the scrollbar-control implementation;
+SB_CTL toggles the child control. Visibility changes preserve range/position,
+resize the client area, and cancel capture when hiding an active standard bar.
+The current scrollbar implementation does not auto-repeat held arrows/pages.

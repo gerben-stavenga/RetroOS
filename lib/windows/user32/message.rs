@@ -56,6 +56,16 @@ pub fn ensure_queue() -> u32 {
         event
     })
 }
+/// Win16 requests an initial queue capacity; queues can continue growing.
+#[unsafe(no_mangle)]
+pub extern "system" fn SetMessageQueue(capacity: i32) -> i32 {
+    if capacity <= 0 || ensure_queue() == 0 { return 0; }
+    let thread = current();
+    state::with(|s| {
+        let Some(q) = s.queues.iter_mut().find(|q| q.thread == thread) else { return 0; };
+        q.messages.try_reserve((capacity as usize).saturating_sub(q.messages.len())).is_ok() as i32
+    })
+}
 fn pump_input() {
     // Keep draining and routing ordered even if a kernel gate switches threads.
     state::with(|s| {

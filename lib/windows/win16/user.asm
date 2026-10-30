@@ -201,3 +201,28 @@ bridge ShowCaret, 167, 2
 bridge SetCaretBlinkTime, 168, 2
 bridge GetCaretBlinkTime, 169, 0
 bridge GetCaretPos, 183, 4
+
+bridge EnumWindows, 54, 8
+bridge EnumChildWindows, 55, 10
+bridge GetWindowTask, 224, 2
+bridge EnumTaskWindows, 225, 10
+
+bridge InSendMessage, 251, 0
+bridge SetMessageQueue, 266, 2
+
+bridge MapWindowPoints, 258, 10
+
+bridge GetClassName, 58, 8
+bridge GetScrollPos, 63, 4
+bridge SetRectEmpty, 73, 4
+bridge IsRectEmpty, 75, 4
+bridge UnionRect, 80, 12
+bridge GetClassWord, 129, 4
+bridge GetNextWindow, 230, 4
+bridge GetWindow, 262, 4
+bridge GetMenuItemCount, 263, 2
+bridge GetMenuItemID, 264, 4
+bridge UnregisterClass, 403, 6
+bridge CreatePopupMenu, 415, 0
+
+bridge ShowScrollBar, 267, 6

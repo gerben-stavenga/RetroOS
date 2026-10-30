@@ -938,12 +938,40 @@ pub unsafe extern "system" fn CreatePalette(p:*const u8)->u32 {
     with(|s|{let h=s.next;s.next+=1;s.palettes.push((h,entries));h})
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "system" fn GetPaletteEntries(handle:u32,start:u32,count:u32,out:*mut u32)->u32 {
+    with(|s| {
+        let entries=if handle==0x3000f {&palette::STATIC[..]}
+            else if let Some((_,v))=s.palettes.iter().find(|(h,_)|*h==handle) {&v[..]}
+            else {return 0;};
+        if out.is_null() {return entries.len() as u32;}
+        let Some(entries)=entries.get(start as usize..) else {return 0;};
+        let count=(count as usize).min(entries.len());
+        for (i,&entry) in entries[..count].iter().enumerate() {unsafe {out.add(i).write_unaligned(entry);}}
+        count as u32
+    })
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn SetPaletteEntries(palette:u32,start:u32,n:u32,p:*const u32)->u32 {
     if p.is_null(){return 0;}
     with(|s|{let Some((_,v))=s.palettes.iter_mut().find(|(h,_)|*h==palette) else{return 0;};
         let start=start as usize;if start>=v.len(){return 0;}
         let n=(n as usize).min(v.len()-start);
         for i in 0..n {v[start+i]=unsafe{p.add(i).read_unaligned()};}n as u32})
+}
+/// Return a logical entry index, independent of the realized device slots.
+#[unsafe(no_mangle)]
+pub extern "system" fn GetNearestPaletteIndex(handle:u32,color:u32)->u32 {
+    with(|s| {
+        let entries = if handle == 0x3000f { &palette::STATIC[..] }
+            else if let Some((_, entries)) = s.palettes.iter().find(|(h,_)|*h==handle) { &entries[..] }
+            else { return u32::MAX; };
+        entries.iter().enumerate().min_by_key(|(_, entry)| {
+            [0,8,16].iter().map(|shift| {
+                let delta=((color>>shift)&255) as i32 - ((**entry>>shift)&255) as i32;
+                delta*delta
+            }).sum::<i32>()
+        }).map_or(u32::MAX,|(i,_)| i as u32)
+    })
 }
 #[unsafe(no_mangle)]
 pub extern "system" fn SelectPalette(dc:u32,palette:u32,background:u32)->u32 {

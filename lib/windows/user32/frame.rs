@@ -60,13 +60,15 @@ pub fn margins(style: u32, ex: u32, has_menu: bool) -> [i32; 4] {
     ]
 }
 pub fn client(s: &state::State, w: &state::Window) -> [i32; 4] {
-    let m = margins(
+    let mut m = margins(
         w.style,
         w.ex_style,
         s.attached_menus
             .iter()
             .any(|a| a.hwnd == w.hwnd && a.menu != 0),
     );
+    if w.style & 0x00200000 != 0 { m[2] += 16; }
+    if w.style & 0x00100000 != 0 { m[3] += 16; }
     [
         m[0].min(w.width),
         m[1].min(w.height),
@@ -247,6 +249,7 @@ pub fn paint(h: u32) {
             label(dc, x + 4, b + 2, &[b'x' as u16], 0);
         }
     }
+    crate::scrollbar::draw_frame(dc,h);
     menu::draw(h, dc);
     // Preserve the application's client pixels, except where a popup covers
     // them. The screen sees only the final copy, never the clearing passes.
@@ -286,6 +289,11 @@ pub fn hit(s: &state::State, h: u32, x: i32, y: i32) -> u32 {
         return 0;
     }
     let r = client(s, w);
+    for bar in 0..2 {
+        if crate::scrollbar::area(s,w,bar).is_some_and(|a| x>=a[0] && y>=a[1] && x<a[2] && y<a[3]) {
+            return if bar==0 {6} else {7};
+        }
+    }
     let b = margins(w.style, 0, false)[0];
     if w.style & CAPTION == CAPTION && y >= b && y < b + CAPTION_HEIGHT {
         if w.style & 0x80000 != 0 && x >= w.width - b - 18 {
@@ -347,6 +355,7 @@ pub fn input(s: &mut state::State, m: &mut crate::Message) {
                 return;
             };
             let r = client(s, w);
+            if x<r[0] || y<r[1] || x>=r[2] || y>=r[3] {break;}
             let child = s.windows.iter().find(|w| {
                 w.parent == m.hwnd
                     && w.style & 0x18000000 == 0x10000000
@@ -392,6 +401,7 @@ pub fn local(h: u32, l: u32) -> (i32, i32) {
     )
 }
 pub fn message(h: u32, m: u32, w: u32, l: u32) -> Option<i32> {
+    if let Some(result)=crate::scrollbar::frame_message(h,m,w,l) { return Some(result); }
     match m {
         0x85 | 0x86 => {
             paint(h);

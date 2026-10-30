@@ -47,7 +47,7 @@ bridge GetMapMode, 1081, 2
 bridge GetObject, 1082, 8
 bridge GetPixel, 1083, 6
 bridge GetStockObject, 1087, 2
-gate GetTextExtent
+bridge GetTextExtent, 1091, 8
 gate GetTextMetrics
 gate GetViewportExt
 gate GetWindowExt
@@ -85,3 +85,13 @@ bridge SetBitmapDimension, 1163, 6
 bridge EnumFontFamilies, 1330, 14
 bridge SetPaletteEntries, 1364, 10
 bridge GetSystemPaletteEntries, 1375, 10
+
+bridge GetNearestPaletteIndex, 1370, 6
+
+bridge MoveToEx, 1483, 10
+
+bridge GetTextExtentPoint, 1471, 12
+
+bridge GetTextAlign, 1345, 2
+bridge GetPaletteEntries, 1363, 10
+bridge GetBitmapDimensionEx, 1468, 6

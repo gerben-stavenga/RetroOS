@@ -251,3 +251,16 @@ pub unsafe extern "system" fn SetClassLongA(h: u32, i: i32, v: u32) -> u32 {
 pub unsafe extern "system" fn SetClassLongW(h: u32, i: i32, v: u32) -> u32 {
     unsafe { long(h, i, Some(v), true) }
 }
+
+/// WORD access also permits the last two bytes of class extra storage.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn GetClassWord(hwnd:u32,index:i32)->u32 {
+    if index<0 { return unsafe {GetClassLongA(hwnd,index)} & 0xffff; }
+    state::with(|s| {
+        let Some(w)=s.windows.iter().find(|w|w.hwnd==hwnd) else {return state::error(1400);};
+        let Some(c)=s.classes.iter().find(|c|c.atom==w.class) else {return state::error(1411);};
+        let at=index as usize;
+        let Some(bytes)=c.extra.get(at..at.saturating_add(2)) else {return state::error(1413);};
+        u32::from(u16::from_le_bytes([bytes[0],bytes[1]]))
+    })
+}

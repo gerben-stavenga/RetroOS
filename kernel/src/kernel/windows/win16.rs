@@ -122,6 +122,7 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::Kernel, 19) => (2, false, "GlobalUnlock"),
         (Module::Kernel, 20) => (2, true, "GlobalSize"),
         (Module::Kernel, 21) => (2, true, "GlobalHandle"),
+        (Module::Kernel, 159) => (2, true, "GlobalHandleNoRIP"),
         (Module::Kernel, 138) => (2, true, "GetHeapSpaces"),
         (Module::Kernel, 169) => (2, true, "GetFreeSpace"),
         (Module::Kernel, 170) => (2, false, "AllocCStoDSAlias"),
@@ -173,7 +174,6 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::Gdi, 54) => (8, false, "CreateEllipticRgn"),
         (Module::Gdi, 57) => (4, false, "CreateFontIndirect"),
         (Module::Gdi, 67) => (8, false, "DPtoLP"),
-        (Module::Gdi, 91) => (8, true, "GetTextExtent"),
         (Module::Gdi, 93) => (6, false, "GetTextMetrics"),
         (Module::Gdi, 94) => (2, true, "GetViewportExt"),
         (Module::Gdi, 96) => (2, true, "GetWindowExt"),
@@ -1206,7 +1206,7 @@ fn dispatch<A: crate::Arch>(
             global_free(windows,state,index);
             next
         }
-        (Module::Kernel, 17..=21) => {
+        (Module::Kernel, 17..=21 | 159) => {
             let handle = stack_u16(machine,windows,regs,4).unwrap_or(0);
             let Some(index) = state.global_blocks.iter().position(|b| b.handle == handle || b.selector == handle) else {
                 return 0;
@@ -1446,10 +1446,6 @@ fn dispatch<A: crate::Arch>(
             windows.next_object = windows.next_object.wrapping_add(1);
             windows.gdi_objects.push((handle, super::GdiObject::Font));
             handle
-        }
-        (Module::Gdi, 91) => {
-            let count = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
-            count.saturating_mul(8) | (16 << 16)
         }
         (Module::Gdi, 93) => {
             let Some(out) = stack_u32(machine, windows, regs, 4)

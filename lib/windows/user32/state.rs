@@ -56,6 +56,7 @@ pub struct Window {
 pub struct State {
     pub carets: Vec<crate::caret::Caret>,
     pub caret_interval: u32,
+    pub timer_periods: Vec<u16>,
     pub win16_handles: Vec<u32>,
     pub win16_procs: Vec<u32>,
     pub win16_native_procs: Vec<u32>,
@@ -97,6 +98,7 @@ static GLOBAL: Global = Global {
     state: UnsafeCell::new(State {
         carets: Vec::new(),
         caret_interval: 500,
+        timer_periods: Vec::new(),
         win16_handles: Vec::new(),
         win16_procs: Vec::new(),
         win16_native_procs: Vec::new(),

@@ -5,6 +5,7 @@ pub struct Info {
     minimum: i32,
     maximum: i32,
     position: i32,
+    pressed: bool,
     tracking: Option<(i32, i32)>, // pointer offset within thumb, tracked value
 }
 impl Default for Info {
@@ -13,6 +14,7 @@ impl Default for Info {
             minimum: 0,
             maximum: 100,
             position: 0,
+            pressed: false,
             tracking: None,
         }
     }
@@ -30,8 +32,12 @@ fn change(hwnd: u32, bar: i32, f: impl FnOnce(&mut Info) -> i32) -> Option<i32> 
             .map(|w| f(&mut w.control.scroll[index]))
     })
 }
-fn repaint(hwnd: u32, redraw: i32) {
+fn repaint(hwnd: u32, bar: i32, redraw: i32) {
     if redraw != 0 {
+        if bar != 2 {
+            crate::frame::paint(hwnd);
+            return;
+        }
         unsafe {
             paint::InvalidateRect(hwnd, 0, 0);
         }
@@ -45,7 +51,7 @@ pub extern "system" fn SetScrollPos(hwnd: u32, bar: i32, position: i32, redraw: 
         old
     });
     if old.is_some() {
-        repaint(hwnd, redraw);
+        repaint(hwnd, bar, redraw);
     }
     old.unwrap_or(0)
 }
@@ -71,7 +77,7 @@ pub extern "system" fn SetScrollRange(
         1
     });
     if result.is_some() {
-        repaint(hwnd, redraw);
+        repaint(hwnd, bar, redraw);
     }
     result.unwrap_or(0)
 }
@@ -130,7 +136,13 @@ pub fn draw(dc: u32, hwnd: u32, width: i32, height: i32, style: u32) {
     }) else {
         return;
     };
-    let vertical = style & 1 != 0;
+    draw_at(dc, [0, 0, width, height], style & 1 != 0, info);
+}
+fn draw_at(dc: u32, area: [i32; 4], vertical: bool, info: Info) {
+    let [x, y, right, bottom] = area;
+    let (width, height) = (right - x, bottom - y);
+    let translate = |r: [i32; 4]| [r[0] + x, r[1] + y, r[2] + x, r[3] + y];
+    let fill = |dc, r, brush| fill(dc, translate(r), brush);
     let cross = if vertical { width } else { height };
     let (length, arrow, thumb, start) = geometry(width, height, vertical, info);
     fill(dc, [0, 0, width, height], 1);
@@ -140,7 +152,7 @@ pub fn draw(dc: u32, hwnd: u32, width: i32, height: i32, style: u32) {
         }
         let r = rect(vertical, a, 0, b, cross);
         fill(dc, r, 1);
-        crate::frame::bevel(dc, r);
+        crate::frame::bevel(dc, translate(r));
     }
     if arrow >= 5 && cross >= 5 {
         let center = cross / 2;
@@ -171,12 +183,15 @@ pub fn draw(dc: u32, hwnd: u32, width: i32, height: i32, style: u32) {
         }
     }
 }
-fn notify(hwnd: u32, code: u32, position: i32) {
+fn notify(hwnd: u32, bar: i32, code: u32, position: i32) {
     let target = state::with(|s| {
-        s.windows
-            .iter()
-            .find(|w| w.hwnd == hwnd)
-            .map(|w| (w.parent, w.style & 1 != 0))
+        s.windows.iter().find(|w| w.hwnd == hwnd).map(|w| {
+            if bar == 2 {
+                (w.parent, w.style & 1 != 0)
+            } else {
+                (hwnd, bar == 1)
+            }
+        })
     });
     if let Some((parent, vertical)) = target {
         unsafe {
@@ -184,7 +199,7 @@ fn notify(hwnd: u32, code: u32, position: i32) {
                 parent,
                 if vertical { 0x115 } else { 0x114 },
                 code | ((position as u16 as u32) << 16),
-                hwnd,
+                if bar == 2 { hwnd } else { 0 },
             );
         }
     }
@@ -218,8 +233,26 @@ pub unsafe fn message(hwnd: u32, msg: u32, wp: u32, lp: u32) -> Option<i32> {
     } else {
         lp as u16 as i16 as i32
     };
+    pointer_message(hwnd, 2, width, height, vertical, info, msg, coordinate)
+}
+#[allow(clippy::too_many_arguments)]
+fn pointer_message(
+    hwnd: u32,
+    bar: i32,
+    width: i32,
+    height: i32,
+    vertical: bool,
+    info: Info,
+    msg: u32,
+    coordinate: i32,
+) -> Option<i32> {
     let (length, arrow, thumb, start) = geometry(width, height, vertical, info);
     if msg == 0x201 {
+        change(hwnd, bar, |s| {
+            s.pressed = true;
+            s.tracking = None;
+            0
+        });
         unsafe {
             input::SetFocus(hwnd);
         }
@@ -227,7 +260,7 @@ pub unsafe fn message(hwnd: u32, msg: u32, wp: u32, lp: u32) -> Option<i32> {
             input::SetCapture(hwnd);
         }
         if coordinate >= start && coordinate < start + thumb && info.minimum < info.maximum {
-            change(hwnd, 2, |s| {
+            change(hwnd, bar, |s| {
                 s.tracking = Some((coordinate - start, s.position));
                 0
             });
@@ -241,7 +274,7 @@ pub unsafe fn message(hwnd: u32, msg: u32, wp: u32, lp: u32) -> Option<i32> {
             } else {
                 3
             };
-            notify(hwnd, code, 0);
+            notify(hwnd, bar, code, 0);
         }
     } else if msg == 0x200 {
         if let Some((offset, _)) = info.tracking {
@@ -254,26 +287,196 @@ pub unsafe fn message(hwnd: u32, msg: u32, wp: u32, lp: u32) -> Option<i32> {
             } else {
                 i64::from(info.minimum)
             } as i32;
-            change(hwnd, 2, |s| {
+            change(hwnd, bar, |s| {
                 s.tracking = Some((offset, p));
                 0
             });
-            repaint(hwnd, 1);
-            notify(hwnd, 5, p);
+            repaint(hwnd, bar, 1);
+            notify(hwnd, bar, 5, p);
         }
     } else if input::GetCapture() == hwnd {
-        change(hwnd, 2, |s| {
+        change(hwnd, bar, |s| {
             s.tracking = None;
+            s.pressed = false;
             0
         });
         unsafe {
             input::ReleaseCapture();
         }
         if let Some((_, p)) = info.tracking {
-            notify(hwnd, 4, p);
+            notify(hwnd, bar, 4, p);
         }
-        notify(hwnd, 8, 0);
-        repaint(hwnd, 1);
+        notify(hwnd, bar, 8, 0);
+        repaint(hwnd, bar, 1);
     }
     Some(0)
+}
+
+/// Standard scroll bars occupy the frame, sharing state with SB_HORZ/SB_VERT.
+pub fn area(s: &state::State, w: &state::Window, bar: i32) -> Option<[i32; 4]> {
+    let mask = if bar == 0 { 0x00100000 } else { 0x00200000 };
+    if w.style & mask == 0 {
+        return None;
+    }
+    let r = crate::frame::client(s, w);
+    let m = crate::frame::margins(w.style, w.ex_style, false);
+    let a = if bar == 0 {
+        [r[0], r[3], r[2], (r[3] + 16).min(w.height - m[3])]
+    } else {
+        [r[2], r[1], (r[2] + 16).min(w.width - m[2]), r[3]]
+    };
+    (a[0] < a[2] && a[1] < a[3]).then_some(a)
+}
+pub fn draw_frame(dc: u32, hwnd: u32) {
+    let bars = state::with(|s| {
+        s.windows
+            .iter()
+            .find(|w| w.hwnd == hwnd)
+            .map(|w| [0, 1].map(|bar| area(s, w, bar).map(|a| (a, w.control.scroll[bar as usize]))))
+    });
+    if let Some(bars) = bars {
+        for (bar, entry) in bars.into_iter().enumerate() {
+            if let Some((a, info)) = entry {
+                draw_at(dc, a, bar == 1, info);
+            }
+        }
+    }
+}
+pub fn frame_message(hwnd: u32, msg: u32, hit: u32, lp: u32) -> Option<i32> {
+    if msg == 0x215 {
+        let changed = state::with(|s| {
+            s.windows
+                .iter_mut()
+                .find(|w| w.hwnd == hwnd)
+                .is_some_and(|w| {
+                    let changed = w.control.scroll[..2].iter().any(|i| i.pressed);
+                    for i in &mut w.control.scroll[..2] {
+                        i.pressed = false;
+                        i.tracking = None;
+                    }
+                    changed
+                })
+        });
+        if changed {
+            crate::frame::paint(hwnd);
+        }
+        return None;
+    }
+    if !matches!(msg, 0xa0..=0xa2 | 0x200 | 0x202) {
+        return None;
+    }
+    let captured = input::GetCapture() == hwnd;
+    let (bar, a, info, origin) = state::with(|s| {
+        let w = s.windows.iter().find(|w| w.hwnd == hwnd)?;
+        let bar = if matches!(msg, 0xa0..=0xa2) && (hit == 6 || hit == 7) {
+            hit as i32 - 6
+        } else if matches!(msg, 0x200 | 0x202) && captured {
+            (0..2).find(|&b| w.control.scroll[b].pressed)? as i32
+        } else {
+            return None;
+        };
+        let origin = if msg < 0x200 {
+            crate::frame::origin(s, hwnd, false)?
+        } else {
+            let c = crate::frame::client(s, w);
+            (-c[0], -c[1])
+        };
+        Some((
+            bar,
+            area(s, w, bar)?,
+            w.control.scroll[bar as usize],
+            origin,
+        ))
+    })?;
+    let x = (lp as u16 as i16) as i32 - origin.0 - a[0];
+    let y = ((lp >> 16) as u16 as i16) as i32 - origin.1 - a[1];
+    pointer_message(
+        hwnd,
+        bar,
+        a[2] - a[0],
+        a[3] - a[1],
+        bar == 1,
+        info,
+        if msg < 0x200 { msg + 0x160 } else { msg },
+        if bar == 1 { y } else { x },
+    )
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn ShowScrollBar(hwnd: u32, bar: i32, show: i32) -> i32 {
+    if !(0..=3).contains(&bar) {
+        return state::error(87) as i32;
+    }
+    if crate::window::IsWindow(hwnd) == 0 {
+        return state::error(1400) as i32;
+    }
+    if bar == 2 {
+        if show == 0 {
+            change(hwnd, 2, |s| {
+                s.pressed = false;
+                s.tracking = None;
+                0
+            });
+            if input::GetCapture() == hwnd {
+                unsafe { input::ReleaseCapture(); }
+            }
+        }
+        crate::window::ShowWindow(hwnd, if show != 0 { 5 } else { 0 });
+        return 1;
+    }
+    let mask = match bar {
+        0 => 0x00100000,
+        1 => 0x00200000,
+        _ => 0x00300000,
+    };
+    let Some((changed, cancelled)) = state::with(|s| {
+        let w = s.windows.iter_mut().find(|w| w.hwnd == hwnd)?;
+        let old = w.style;
+        if show != 0 {
+            w.style |= mask;
+        } else {
+            w.style &= !mask;
+        }
+        let mut cancelled = false;
+        if show == 0 {
+            for b in 0..2 {
+                if bar == 3 || bar == b {
+                    let info = &mut w.control.scroll[b as usize];
+                    cancelled |= info.pressed;
+                    info.pressed = false;
+                    info.tracking = None;
+                }
+            }
+        }
+        Some((old != w.style, cancelled))
+    }) else {
+        return 0;
+    };
+    if cancelled && input::GetCapture() == hwnd {
+        unsafe {
+            input::ReleaseCapture();
+        }
+    }
+    if changed {
+        crate::window::SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x37);
+        let size = state::with(|s| {
+            s.windows.iter().find(|w| w.hwnd == hwnd).map(|w| {
+                let r = crate::frame::client(s, w);
+                let kind = if w.style & 0x20000000 != 0 {
+                    1
+                } else if w.style & 0x01000000 != 0 {
+                    2
+                } else {
+                    0
+                };
+                (kind, crate::frame::pack(r[2] - r[0], r[3] - r[1]))
+            })
+        });
+        if let Some((kind, size)) = size {
+            unsafe {
+                paint::InvalidateRect(hwnd, 0, 1);
+                crate::SendMessageW(hwnd, 5, kind, size);
+            }
+        }
+    }
+    1
 }

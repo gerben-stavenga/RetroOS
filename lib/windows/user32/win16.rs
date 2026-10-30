@@ -16,7 +16,10 @@ unsafe extern "system" {
     fn GetBitmapDimensionEx(h:u32,out:*mut [i32;2])->i32;
     fn SetBitmapDimensionEx(h:u32,x:i32,y:i32,out:*mut [i32;2])->i32;
     fn CreatePalette(p:*const u8)->u32;
+    fn GetNearestPaletteIndex(palette:u32,color:u32)->u32;
     fn AnimatePalette(h:u32,start:u32,n:u32,p:*const u32)->u32;
+    fn GetPaletteEntries(palette:u32,start:u32,count:u32,out:*mut u32)->u32;
+    fn GetTextAlign(dc:u32)->u32;
     fn SetPaletteEntries(h:u32,start:u32,n:u32,p:*const u32)->u32;
     fn GetSystemPaletteEntries(dc:u32,start:u32,n:u32,p:*mut u32)->u32;
     fn SelectPalette(dc:u32,p:u32,b:u32)->u32;
@@ -73,6 +76,7 @@ unsafe extern "system" {
     fn SetMapMode(dc: u32, mode: i32) -> i32;
     fn GetMapMode(dc: u32) -> i32;
     fn SetROP2(dc: u32, mode: i32) -> i32;
+    fn GetTextExtentPoint32A(dc:u32,text:*const u8,count:i32,out:*mut [i32;2])->i32;
     fn MoveToEx(dc: u32, x: i32, y: i32, old: *mut [i32; 2]) -> i32;
     fn LineTo(dc: u32, x: i32, y: i32) -> i32;
     fn TextOutA(dc: u32, x: i32, y: i32, text: u32, count: i32) -> i32;
@@ -352,6 +356,17 @@ pub unsafe fn invoke(
     }
     unsafe { Some(callback(original(address), hwnd, msg, wp, lp, wide).unwrap_or(0) as i32) }
 }
+// The callback context lives on the ordinary guest stack, so enumeration can
+// reenter USER or start another enumeration without global callback state.
+unsafe extern "system" fn enum_window_callback(hwnd: u32, context: u32) -> i32 {
+    unsafe {
+        let context = &*(context as *const [u32; 2]);
+        let mut args = [0u8; 6];
+        args[..4].copy_from_slice(&context[1].to_le_bytes());
+        args[4..].copy_from_slice(&(encode(hwnd) as u16).to_le_bytes());
+        (Retro16Call(context[0], args.as_ptr(), 6, 0) as u16 != 0) as i32
+    }
+}
 unsafe fn callback(proc: u32, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool) -> Option<u32> {
     unsafe {
         let frame = Retro16Config[3] as *const u32;
@@ -561,6 +576,17 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
 
             1075 => GetBkColor(h(0)),
             1090 => GetTextColor(h(0)),
+            1345 => GetTextAlign(h(0)),
+            1363 => {
+                let out=if d(0)==0 {0} else {pointer(d(0),w(4) as usize*4)?};
+                GetPaletteEntries(h(8),w(6),w(4),out as *mut u32)
+            },
+            1468 => {
+                let out=pointer(d(0),4)?;let mut size=[0;2];
+                let result=GetBitmapDimensionEx(h(4),&mut size);
+                if result!=0 {putw(out,0,size[0] as u32);putw(out,2,size[1] as u32);}
+                result as u32
+            },
             1346 => SetTextAlign(h(2),w(0)),
             1372 => ExtFloodFill(h(10),i(8),i(6),d(2),w(0)) as u32,
             268 => GlobalAddAtomA(string(d(0))?),
@@ -786,7 +812,57 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             }
             10 => message::SetTimer(h(8), w(6), w(4), procedure(d(0))),
             12 => message::KillTimer(h(2), w(0)) as u32,
-            13 | 15 => crate::runtime::GetTickCount(),
+            13 | 15 | 3607 => crate::runtime::GetTickCount(),
+            // The underlying clock already has millisecond resolution. Keep
+            // begin/end requests balanced without changing the hardware timer.
+            3605 | 3606 => {
+                let period=w(0) as u16;
+                if period==0 {97} else {state::with(|s| {
+                    if o==3605 {s.timer_periods.push(period);0}
+                    else if let Some(i)=s.timer_periods.iter().position(|&p|p==period) {s.timer_periods.remove(i);0}
+                    else {97}
+                })}
+            },
+            3604 => {
+                if w(0)<4 {11} else {
+                    let p=pointer(d(2),4)?;
+                    putw(p,0,1);putw(p,2,65535);0
+                }
+            },
+            3601 => {
+                if w(0)>=8 && d(2)!=0 {
+                    let p=pointer(d(2),8)?;
+                    putw(p,0,1);putl(p,2,crate::runtime::GetTickCount());
+                }
+                0
+            },
+            2036 => { let id=crate::runtime::GetCurrentThreadId() & 0xffff; id | (id<<16) },
+            258 => {
+                let count=w(0) as usize;
+                if count==0 {return Some(window::MapWindowPoints(h(8),h(6),core::ptr::null_mut(),0));}
+                let p=pointer(d(2),count*4)?;
+                let mut points=alloc::vec::Vec::with_capacity(count);
+                for n in 0..count {points.push(rect::Point {
+                    x:word(p,n*4) as i16 as i32,y:word(p,n*4+2) as i16 as i32,
+                });}
+                let result=window::MapWindowPoints(h(8),h(6),points.as_mut_ptr(),count as u32);
+                for (n,point) in points.into_iter().enumerate() {
+                    putw(p,n*4,point.x as u32);putw(p,n*4+2,point.y as u32);
+                }
+                result
+            },
+            251 => message::InSendMessage() as u32,
+            266 => message::SetMessageQueue(w(0) as i16 as i32) as u32,
+            224 => window::GetWindowThreadProcessId(h(0),core::ptr::null_mut()) & 0xffff,
+            54 | 55 | 225 => {
+                let context=[d(4),d(0)];
+                let data=&context as *const [u32;2] as u32;
+                match o {
+                    54 => window::EnumWindows(enum_window_callback,data) as u32,
+                    55 => window::EnumChildWindows(h(8),enum_window_callback,data) as u32,
+                    _ => input::EnumThreadWindows(w(8),enum_window_callback as *const () as u32,data) as u32,
+                }
+            },
             18 => encode(input::SetCapture(h(0))),
             19 => input::ReleaseCapture() as u32,
             22 => encode(input::SetFocus(h(0))),
@@ -884,6 +960,30 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 }
             }
             1150 => UnrealizeObject(h(0)) as u32,
+            58 => {
+                let count=i(0);
+                if count<=0 {0} else {window::GetClassNameA(h(6),pointer(d(2),count as usize)?,count)}
+            },
+            267 => crate::scrollbar::ShowScrollBar(h(4),i(2),i(0)) as u32,
+            63 => crate::scrollbar::GetScrollPos(h(2),i(0)) as u32,
+            73 => {let out=pointer(d(0),8)?;for n in 0..4 {putw(out,n*2,0);}1},
+            75 => rect::IsRectEmpty(&rectangle(d(0))?) as u32,
+            80 => {
+                let left=rectangle(d(4))?;let right=rectangle(d(0))?;
+                let mut out=rect::Rect {left:0,top:0,right:0,bottom:0};
+                let result=rect::UnionRect(&mut out,&left,&right);
+                write_rect(d(8),&out)?;result as u32
+            },
+            129 => {
+                let index=i(0);
+                let value=if index<0 {class::GetClassLongA(h(2),index)} else {class::GetClassWord(h(2),index)};
+                if matches!(index,-14|-12|-16) {encode(value)} else {value}
+            },
+            230 | 262 => encode(window::GetWindow(h(2),w(0))),
+            263 => menu::GetMenuItemCount(h(0)) as u32,
+            264 => menu::GetMenuItemID(h(2),i(0)),
+            403 => class::UnregisterClassA(string(d(2))?,h(0)) as u32,
+            415 => encode(menu::CreatePopupMenu()),
             34 => window::EnableWindow(h(2), i(0)) as u32,
             35 => window::IsWindowEnabled(h(0)) as u32,
             36 => window::GetWindowTextA(h(6), pointer(d(2), w(0) as usize)?, i(0)) as u32,
@@ -1313,6 +1413,25 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 if result!=0 {out.write_unaligned(pos[0] as i16);out.add(1).write_unaligned(pos[1] as i16);}
                 result as u32
             }
+            1091 | 1471 => {
+                let shift=if o==1471 {4} else {0};
+                let count=i(shift);
+                if count<0 {return Some(0);}
+                let text=if count==0 {0} else {pointer(d(shift+2),count as usize)?};
+                let out=if o==1471 {pointer(d(0),4)?} else {0};
+                let mut size=[0;2];
+                let result=GetTextExtentPoint32A(h(shift+6),text as *const u8,count,&mut size);
+                if result==0 {0} else if o==1091 {(size[0] as u32 & 0xffff) | ((size[1] as u32)<<16)}
+                else {putw(out,0,size[0] as u32);putw(out,2,size[1] as u32);result as u32}
+            },
+            1483 => {
+                let out=if d(0)==0 {0} else {pointer(d(0),4)?};
+                let mut old=[0;2];
+                let result=MoveToEx(h(8),i(6),i(4),&mut old);
+                if result!=0 && out!=0 {putw(out,0,old[0] as u32);putw(out,2,old[1] as u32);}
+                result as u32
+            },
+            1370 => GetNearestPaletteIndex(h(4),d(0)),
             283 => RealizePalette(h(0)),
             1006 => SetPolyFillMode(h(2),i(0)) as u32,
             1036 => {

@@ -37,6 +37,12 @@ int main(void)
     WCHAR text[32];
     HANDLE file;
     DWORD written;
+    { SIZE size={-1,-1};
+      CHECK(GetTextExtentPoint32A(dc,"ABCextra",3,&size) && size.cx==24 && size.cy==16);
+      CHECK(GetTextExtentPointA(dc,"ABC",0,&size) && size.cx==0);
+      CHECK(!GetTextExtentPoint32A(dc,"ABC",-1,&size));
+      CHECK(!GetTextExtentPoint32A(dc,0,3,&size));
+    }
     {
         HDC memory=CreateCompatibleDC(0);
         HBITMAP mono=CreateCompatibleBitmap(memory,9,2);
@@ -148,6 +154,14 @@ int main(void)
         HBITMAP sb=CreateBitmap(2,1,1,8,indices), mb=CreateBitmap(2,1,1,8,0);
         HPALETTE old_source,old_middle,old_dst;
         SelectObject(source,sb);SelectObject(middle,mb);
+        CHECK(GetPaletteEntries(palette,0,0,0)==2);
+        { PALETTEENTRY readback[2];
+          CHECK(GetPaletteEntries(palette,1,2,readback)==1 && readback[0].peFlags==PC_RESERVED);
+          CHECK(GetPaletteEntries(palette,3,1,readback)==0);
+        }
+        CHECK(GetNearestPaletteIndex(palette,RGB(0,0,0))==0);
+        CHECK(GetNearestPaletteIndex((HPALETTE)0x12345678,RGB(0,0,0))==CLR_INVALID);
+        CHECK(GetNearestPaletteIndex(GetStockObject(DEFAULT_PALETTE),RGB(255,255,255))==19);
         old_source=SelectPalette(source,palette,FALSE);
         old_middle=SelectPalette(middle,palette,FALSE);
         old_dst=SelectPalette(dc,palette,FALSE);
@@ -155,6 +169,7 @@ int main(void)
         CHECK(BitBlt(middle,0,0,2,1,source,0,0,SRCCOPY));
         CHECK(GetPixel(middle,0,0)==0 && GetPixel(middle,1,0)==0);
         CHECK(SetPaletteEntries(palette,0,2,colors)==2);
+        CHECK(GetNearestPaletteIndex(palette,RGB(colors[1].peRed,colors[1].peGreen,colors[1].peBlue))==1);
         RealizePalette(source);
         CHECK(BitBlt(dc,0,0,2,1,middle,0,0,SRCCOPY));
         CHECK(GetPixel(dc,0,0)==RGB(255,0,0));
@@ -297,10 +312,12 @@ int main(void)
         MSG msg;
         HWND parent,child;
         HDC pdc;
-        wc.lpfnWndProc=paint_order_proc;wc.lpszClassName="PaintOrder";
+        wc.lpfnWndProc=paint_order_proc;wc.lpszClassName="PaintOrder";wc.cbClsExtra=2;
         wc.hInstance=GetModuleHandleA(0);
         CHECK(RegisterClassA(&wc)!=0);
         parent=CreateWindowA("PaintOrder","",WS_POPUP|WS_VISIBLE,0,0,100,80,0,0,wc.hInstance,0);
+        SetLastError(0);CHECK(GetClassWord(parent,0)==0 && GetLastError()==0);
+        SetLastError(0);CHECK(GetClassWord(parent,1)==0 && GetLastError()==1413);
         child=CreateWindowA("PaintOrder","",WS_CHILD|WS_VISIBLE,10,10,30,30,parent,0,wc.hInstance,0);
         UpdateWindow(parent);
         InvalidateRect(child,0,TRUE);

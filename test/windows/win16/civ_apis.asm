@@ -3,6 +3,9 @@ segment _TEXT public class=CODE use16
 extern Debug, Exit, GetTickCount, GlobalAlloc, GlobalLock, GlobalFree
 extern CreateDIBitmap
 extern hmemcpy, CreateBitmap, SetBitmapBits, CreateCompatibleDC, SelectObject
+extern GetTextExtent, GetTextExtentPoint, GetPaletteEntries, GetTextAlign, GetBitmapDimensionEx
+extern MoveToEx
+extern GetNearestPaletteIndex
 extern DeleteDC, DeleteObject, GetPixel, CreatePalette, SetPaletteEntries, AnimatePalette
 extern GetBkMode, SetBkMode, GetOpenFileName, CommDlgExtendedError, sndPlaySound
 extern SetBitmapDimension, GetBitmapDimension, SelectPalette, RealizePalette, BitBlt
@@ -80,6 +83,50 @@ _start:
     call far CreateCompatibleDC
     mov [dc],ax
     push ax
+    push ds
+    push word extent_text
+    push word 3
+    push ds
+    push word extent_size
+    call far GetTextExtentPoint
+    test ax,ax
+    jz fail
+    cmp dword [extent_size],0x00100018
+    jne fail
+    push word [dc]
+    push ds
+    push word extent_text
+    push word 3
+    call far GetTextExtent
+    cmp ax,24
+    jne fail
+    cmp dx,16
+    jne fail
+    push word [dc]
+    call far GetTextAlign
+    test ax,ax
+    jnz fail
+    mov ax,[dc]
+    push ax
+    push word -5
+    push word 37
+    push dword 0
+    call far MoveToEx
+    test ax,ax
+    jz fail
+    push word [dc]
+    push word 0
+    push word 0
+    push ds
+    push word previous_point
+    call far MoveToEx
+    test ax,ax
+    jz fail
+    cmp word [previous_point],-5
+    jne fail
+    cmp word [previous_point+2],37
+    jne fail
+    push word [dc]
     push word [bitmap]
     call far SelectObject
     mov [old_bitmap],ax
@@ -205,6 +252,12 @@ _start:
     jne fail
     cmp dx,34
     jne fail
+    push word [bitmap]
+    push ds
+    push word extent_size
+    call far GetBitmapDimensionEx
+    cmp dword [extent_size],0x0022000c
+    jne fail
     push word [dc]
     push word 1
     call far SetBkMode
@@ -261,6 +314,22 @@ _start:
     jz fail
     mov [pal],ax
     push ax
+    push word 1
+    push word 2
+    push ds
+    push word palette_result
+    call far GetPaletteEntries
+    cmp ax,1
+    jne fail
+    cmp dword [palette_result],0x0100ff00
+    jne fail
+    mov ax,[pal]
+    push ax
+    push dword 0x0000fe00
+    call far GetNearestPaletteIndex
+    cmp ax,1
+    jne fail
+    push word [pal]
     push word 0
     push word 1
     push ds
@@ -536,6 +605,10 @@ dib_header:
     dd 0,4,0,0,2,0
     dd 0,0xff00
  dib_bits db 1,0,0,0
+previous_point dd 0
+extent_text db "ABCmore",0
+extent_size dd 0
+palette_result times 2 dd 0
 palette dw 0x300,2
 entries dd 0x010000ff,0x0100ff00
 passed db 'WIN16 CIV_APIS PASS',0

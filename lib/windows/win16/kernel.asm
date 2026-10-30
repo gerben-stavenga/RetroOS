@@ -179,3 +179,6 @@ gate GetHeapSpaces
 bridge hmemcpy, 2348, 12
 bridge _hread, 2349, 10
 bridge _hwrite, 2350, 10
+
+bridge GetCurrentTask, 2036, 0
+gate GlobalHandleNoRIP

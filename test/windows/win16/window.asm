@@ -1,5 +1,12 @@
 bits 16
 segment _TEXT public class=CODE use16
+extern ShowScrollBar
+extern GetClassName, GetClassWord, GetScrollPos, GetWindow, GetNextWindow, UnionRect, SetRectEmpty, IsRectEmpty
+extern CreatePopupMenu, GetMenuItemCount, GetMenuItemID, AppendMenu, DestroyMenu, UnregisterClass
+extern MapWindowPoints
+extern InSendMessage, SetMessageQueue
+extern timeBeginPeriod, timeEndPeriod, timeGetDevCaps, timeGetSystemTime
+extern EnumWindows, EnumTaskWindows, GetCurrentTask, GetWindowTask, GlobalHandleNoRIP, timeGetTime
 extern GetPrivateProfileString
 extern PatBlt
 extern SetTextAlign, ExtFloodFill, ExtTextOut, SetBkColor
@@ -37,6 +44,17 @@ _start:
     push ds
     pop es
     mov [initial_sp], sp
+    call far InSendMessage
+    test ax,ax
+    jnz fail
+    push word 0
+    call far SetMessageQueue
+    test ax,ax
+    jnz fail
+    push word 64
+    call far SetMessageQueue
+    test ax,ax
+    jz fail
     push ds
     push word ini_section
     push ds
@@ -94,7 +112,7 @@ _start:
     cmp byte [es:bx],0x5a
     jne installer_fail
     push dx
-    call far GlobalHandle
+    call far GlobalHandleNoRIP
     cmp ax,[test_global]
     jne installer_fail
     ; Keep ES pointing at the block while freeing it. Returning to the
@@ -765,6 +783,7 @@ _start:
     push ds
     push word wc
     call far RegisterClass
+    mov [class_atom],ax
     test ax, ax
     jz fail
     push ds
@@ -785,13 +804,186 @@ _start:
     jz fail
     mov [hwnd], ax
     push ax
+    push word -32
+    call far GetClassWord
+    cmp ax,[class_atom]
+    jne fail
+    push word [hwnd]
+    push ds
+    push word class_result
+    push word 32
+    call far GetClassName
+    cmp ax,11
+    jne fail
+    cmp dword [class_result],'Win1'
+    jne fail
+    push word [hwnd]
+    push word 0
+    call far GetScrollPos
+    test ax,ax
+    jnz fail
+    push word [hwnd]
+    push word 0
+    call far GetWindow
+    cmp ax,[hwnd]
+    jne fail
+    push word [hwnd]
+    push word 0
+    call far GetNextWindow
+    cmp ax,[hwnd]
+    jne fail
+    push ds
+    push word union_result
+    call far SetRectEmpty
+    push ds
+    push word union_result
+    call far IsRectEmpty
+    test ax,ax
+    jz fail
+    push ds
+    push word union_result
+    push ds
+    push word union_left
+    push ds
+    push word union_right
+    call far UnionRect
+    test ax,ax
+    jz fail
+    cmp dword [union_result],0x0002fffe
+    jne fail
+    cmp dword [union_result+4],0x0028001e
+    jne fail
+    call far CreatePopupMenu
+    mov [test_popup],ax
+    push ax
+    push word 0
+    push word 123
+    push ds
+    push word title
+    call far AppendMenu
+    test ax,ax
+    jz fail
+    push word [test_popup]
+    call far GetMenuItemCount
+    cmp ax,1
+    jne fail
+    push word [test_popup]
+    push word 0
+    call far GetMenuItemID
+    cmp ax,123
+    jne fail
+    push word [test_popup]
+    call far DestroyMenu
+    test ax,ax
+    jz fail
+    push word [hwnd]
+    push ds
+    push word scroll_before
+    call far GetClientRect
+    push word [hwnd]
+    push word 3
+    push word 1
+    call far ShowScrollBar
+    test ax,ax
+    jz fail
+    push word [hwnd]
+    push ds
+    push word scroll_after
+    call far GetClientRect
+    mov ax,[scroll_before+4]
+    sub ax,16
+    cmp ax,[scroll_after+4]
+    jne fail
+    mov ax,[scroll_before+6]
+    sub ax,16
+    cmp ax,[scroll_after+6]
+    jne fail
+    push word [hwnd]
+    push word 3
+    push word 0
+    call far ShowScrollBar
+    test ax,ax
+    jz fail
+    call far GetCurrentTask
+    mov [task],ax
+    push ax
+    push cs
+    push word enum_proc
+    push dword 0x1234abcd
+    call far EnumTaskWindows
+    test ax,ax
+    jz fail
+    cmp word [enumerated],1
+    jne fail
+    cmp word [enum_stopped],1
+    jne fail
+    call far GetTickCount
+    shl edx,16
+    mov dx,ax
+    mov [mm_clock_start],edx
+    call far timeGetTime
+    shl edx,16
+    mov dx,ax
+    sub edx,[mm_clock_start]
+    cmp edx,1000
+    ja fail
+    push word 0
+    call far timeBeginPeriod
+    cmp ax,97
+    jne fail
+    push word 1
+    call far timeBeginPeriod
+    test ax,ax
+    jnz fail
+    push word 1
+    call far timeEndPeriod
+    test ax,ax
+    jnz fail
+    push word 1
+    call far timeEndPeriod
+    cmp ax,97
+    jne fail
+    push ds
+    push word mm_caps
+    push word 4
+    call far timeGetDevCaps
+    test ax,ax
+    jnz fail
+    cmp word [mm_caps],1
+    jne fail
+    cmp word [mm_caps+2],65535
+    jne fail
+    push ds
+    push word mm_time
+    push word 8
+    call far timeGetSystemTime
+    cmp word [mm_time],1
+    jne fail
+    push word [hwnd]
     push ds
     push word cursor_point
     call far ClientToScreen
+    mov eax,[cursor_point]
+    mov [mapped_point],eax
     push word [hwnd]
     push ds
     push word cursor_point
     call far ScreenToClient
+    push word [hwnd]
+    push word 0
+    push ds
+    push word cursor_point
+    push word 1
+    call far MapWindowPoints
+    mov eax,[cursor_point]
+    cmp eax,[mapped_point]
+    jne fail
+    push word 0
+    push word [hwnd]
+    push ds
+    push word cursor_point
+    push word 1
+    call far MapWindowPoints
     cmp word [cursor_point],123
     jne fail
     cmp word [cursor_point+2],234
@@ -1242,6 +1434,12 @@ _start:
     call far DestroyWindow
     push word [hwnd]
     call far DestroyWindow
+    push ds
+    push word classname
+    push ds
+    call far UnregisterClass
+    test ax,ax
+    jz fail
     cmp word [destroyed], 1
     jne fail
     cmp sp, [initial_sp]
@@ -1566,7 +1764,54 @@ combo_subclass:
     call far CallWindowProc
     pop bp
     retf 10
+enum_proc:
+    push bp
+    mov bp,sp
+    cmp dword [ss:bp+6],0x1234abcd
+    jne fail
+    mov ax,[ss:bp+10]
+    cmp ax,[hwnd]
+    jne fail
+    inc word [enumerated]
+    push ax
+    call far GetWindowTask
+    cmp ax,[task]
+    jne fail
+    push cs
+    push word enum_stop
+    push dword 0x98765432
+    call far EnumWindows
+    test ax,ax
+    jnz fail
+    mov ax,1
+    pop bp
+    retf 6
+enum_stop:
+    push bp
+    mov bp,sp
+    cmp dword [ss:bp+6],0x98765432
+    jne fail
+    inc word [enum_stopped]
+    xor ax,ax
+    mov dx,0xffff ; BOOL is AX, not DX:AX.
+    pop bp
+    retf 6
 segment _DATA public class=DATA use16
+task dw 0
+enumerated dw 0
+enum_stopped dw 0
+mm_clock_start dd 0
+mapped_point dd 0
+mm_caps dd 0
+class_atom dw 0
+class_result times 32 db 0
+union_left dw 1,2,10,20
+union_right dw -2,4,30,40
+union_result times 4 dw 0
+test_popup dw 0
+scroll_before times 4 dw 0
+scroll_after times 4 dw 0
+mm_time times 8 db 0
 combo: dw 0
 combo_proc: dd 0
 combo_seen: dw 0

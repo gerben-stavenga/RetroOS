@@ -314,3 +314,15 @@ pub unsafe extern "system" fn ExtTextOutW(dc:u32,mut x:i32,mut y:i32,options:u32
     if options&4!=0 {unsafe {crate::RetroGdiClip(dc,saved.as_ref().map_or(core::ptr::null(),|r|r.as_ptr()),saved.as_ref().map_or(-1,|r|r.len() as i32));}}
     result
 }
+
+/// ANSI measurement uses the same code-page conversion and metrics as drawing.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn GetTextExtentPoint32A(dc:u32,text:*const u8,count:i32,out:*mut [i32;2])->i32 {
+    unsafe extern "system" { fn GetTextExtentPoint32W(dc:u32,text:*const u16,count:i32,out:*mut [i32;2])->i32; }
+    let mut bounds=Rect::default();
+    if count<0 || out.is_null() || (count!=0 && text.is_null()) || unsafe {crate::RetroGdiBounds(dc,&mut bounds)}==0 {return 0;}
+    let mut units=alloc::vec![0u16;count as usize];
+    let n=if count==0 {0} else {unsafe {MultiByteToWideChar(0,0,text,count,units.as_mut_ptr(),count)}};
+    if count!=0 && n==0 {return 0;}
+    unsafe {GetTextExtentPoint32W(dc,units.as_ptr(),n,out)}
+}
