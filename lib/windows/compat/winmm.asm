@@ -1,4 +1,7 @@
 bits 32
 section .text
 global PlaySoundW
-PlaySoundW: int 0x83
+; No Windows PCM backend is registered. Do not claim successful playback.
+PlaySoundW:
+    xor eax,eax
+    ret 12

@@ -387,6 +387,34 @@ pub extern "system" fn SelectClipRgn(dc: u32, h: u32) -> i32 {
         }
     })
 }
+// Both ABIs use the same rectangle algebra and drawing clip primitive.
+fn clip_rect(dc: u32, left: i32, top: i32, right: i32, bottom: i32, mode: u32) -> i32 {
+    let mut visible = Rect::default();
+    if unsafe { RetroGdiBounds(dc, &mut visible) } == 0 { return 0; }
+    let rect = Rect {
+        left: left.min(right), top: top.min(bottom),
+        right: left.max(right), bottom: top.max(bottom),
+    };
+    with(|s| {
+        let current = s.clips.iter().find(|(id,_)| *id == dc)
+            .map_or(core::slice::from_ref(&visible), |(_,r)|r.as_slice());
+        let result = combine(current, core::slice::from_ref(&rect), mode);
+        // Keep the guest clip unchanged if the drawing primitive rejects it.
+        if unsafe { RetroGdiClip(dc,result.as_ptr(),result.len() as i32) } == 0 { return 0; }
+        let complexity = kind(&result);
+        s.clips.retain(|(id,_)| *id != dc);
+        s.clips.push((dc,result));
+        complexity
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn IntersectClipRect(dc: u32, left: i32, top: i32, right: i32, bottom: i32) -> i32 {
+    clip_rect(dc,left,top,right,bottom,1)
+}
+#[unsafe(no_mangle)]
+pub extern "system" fn ExcludeClipRect(dc: u32, left: i32, top: i32, right: i32, bottom: i32) -> i32 {
+    clip_rect(dc,left,top,right,bottom,4)
+}
 #[unsafe(no_mangle)]
 pub extern "system" fn GetClipRgn(dc: u32, h: u32) -> i32 {
     with(|s| {

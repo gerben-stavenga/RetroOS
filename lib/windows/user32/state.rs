@@ -54,6 +54,7 @@ pub struct Window {
 }
 
 pub struct State {
+    pub mmio_buffers: Vec<(u32,u16)>,
     pub carets: Vec<crate::caret::Caret>,
     pub caret_interval: u32,
     pub win16_handles: Vec<u32>,
@@ -95,6 +96,7 @@ unsafe impl Sync for Global {}
 static GLOBAL: Global = Global {
     locked: AtomicBool::new(false),
     state: UnsafeCell::new(State {
+        mmio_buffers: Vec::new(),
         carets: Vec::new(),
         caret_interval: 500,
         win16_handles: Vec::new(),

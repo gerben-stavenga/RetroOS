@@ -1,5 +1,6 @@
 bits 16
 segment _TEXT public class=CODE use16
+extern AdjustWindowRect, AdjustWindowRectEx
 extern TrackPopupMenu
 extern ShowScrollBar
 extern GetClassName, GetClassWord, GetScrollPos, GetWindow, GetNextWindow, UnionRect, SetRectEmpty, IsRectEmpty
@@ -29,6 +30,7 @@ extern _lopen, _lclose, _lread, _lcreat, _llseek, _lwrite
 extern GetTempFileName, LoadLibrary, FreeLibrary, GetModuleHandle, GetProcAddress, GetModuleUsage
 extern GetDriveType
 extern GlobalAlloc, GlobalLock, GlobalUnlock, GlobalFree, GlobalSize, GlobalReAlloc, GlobalHandle
+extern GetSelectorBase, SetSelectorBase, GetSelectorLimit, SetSelectorLimit
 extern AllocCStoDSAlias, FreeSelector, AllocSelector, PrestoChangoSelector
 extern GlobalAddAtom, GlobalFindAtom, GlobalDeleteAtom, GlobalGetAtomName
 global _start
@@ -45,6 +47,48 @@ _start:
     push ds
     pop es
     mov [initial_sp], sp
+    push ds
+    push word adjusted_rect
+    push dword 0x00c40000 ; caption + sizing frame
+    push word 1
+    call far AdjustWindowRect
+    test ax,ax
+    jz fail
+    cmp word [adjusted_rect],-14
+    jne fail
+    cmp word [adjusted_rect+2],-63
+    jne fail
+    cmp word [adjusted_rect+4],104
+    jne fail
+    cmp word [adjusted_rect+6],84
+    jne fail
+    push ds
+    push word adjusted_ex_rect
+    push dword 0x00c40000
+    push word 1
+    push dword 0x200 ; client edge
+    call far AdjustWindowRectEx
+    test ax,ax
+    jz fail
+    cmp word [adjusted_ex_rect],-16
+    jne fail
+    cmp word [adjusted_ex_rect+2],-65
+    jne fail
+    cmp word [adjusted_ex_rect+4],106
+    jne fail
+    cmp word [adjusted_ex_rect+6],86
+    jne fail
+    cmp word [adjusted_ex_rect+8],0x55aa
+    jne fail
+    push dword 0
+    push dword 0
+    push word 0
+    call far AdjustWindowRect
+    test ax,ax
+    jnz fail
+    cmp sp,[initial_sp]
+    jne fail
+
     call far InSendMessage
     test ax,ax
     jnz fail
@@ -143,6 +187,55 @@ _start:
     jnz installer_fail
     push ds
     pop es
+
+    ; Rebase a data alias to a real byte and exercise inclusive/page limits.
+    push ds
+    call far AllocSelector
+    test ax,ax
+    jz installer_fail
+    mov [test_generated+2],ax
+    push ds
+    call far GetSelectorBase
+    shl edx,16
+    mov dx,ax
+    add edx,test_global
+    push word [test_generated+2]
+    push edx
+    call far SetSelectorBase
+    cmp ax,[test_generated+2]
+    jne installer_fail
+    push word [test_generated+2]
+    push dword 1
+    call far SetSelectorLimit
+    cmp ax,[test_generated+2]
+    jne installer_fail
+    push word [test_generated+2]
+    call far GetSelectorLimit
+    cmp ax,1
+    jne installer_fail
+    test dx,dx
+    jnz installer_fail
+    mov word [test_global],0x5678
+    mov es,[test_generated+2]
+    cmp word [es:0],0x5678
+    jne installer_fail
+    push word [test_generated+2]
+    push dword 0x123456
+    call far SetSelectorLimit
+    push word [test_generated+2]
+    call far GetSelectorLimit
+    cmp ax,0x3fff
+    jne installer_fail
+    cmp dx,0x12
+    jne installer_fail
+    push word [test_generated+2]
+    call far FreeSelector
+    push ds
+    pop es
+    push word [test_generated+2]
+    call far GetSelectorBase
+    or ax,dx
+    jnz installer_fail
 
     ; Execute generated code through a data-to-code selector alias.
     push word 0
@@ -1956,6 +2049,8 @@ file_error_15: db "file step 15",0
 
 test_generated dd 0
 cursor_point: dw 0,0
+adjusted_rect: dw -10,-20,100,80
+adjusted_ex_rect: dw -10,-20,100,80,0x55aa
 
 segment STACK stack class=STACK use16
     resb 8192

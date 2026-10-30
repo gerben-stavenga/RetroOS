@@ -12,7 +12,7 @@ nasm_library(
 windows_rust_library(
     name = "user32_rust",
     crate_root = "user32.rs",
-    srcs = ["caret.rs", "mdi.rs", "messagebox.rs", "scrollbar.rs", "bitmap.rs", "win16_resource.rs", "win16.rs", "frame.rs", "menu.rs", "popup.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
+    srcs = ["caret.rs", "mdi.rs", "messagebox.rs", "scrollbar.rs", "bitmap.rs", "win16_resource.rs", "win16.rs", "win16_mmio.rs", "frame.rs", "menu.rs", "popup.rs", "keyboard.rs", "drawing.rs", "input.rs", "dialog.rs", "controls.rs", "paint.rs", "resource.rs", "format.rs", "message.rs", "rect.rs", "runtime.rs", "state.rs", "text.rs", "class.rs", "window.rs"],
 )
 
 windows_dll(
@@ -105,6 +105,7 @@ windows_dll(
 
         "_CreateRectRgn@16": "GDI32.CreateRectRgn",
         "_GetClipBox@8": "GDI32.GetClipBox",
+        "_IntersectClipRect@20": "GDI32.IntersectClipRect", "_ExcludeClipRect@20": "GDI32.ExcludeClipRect",
         "_SelectClipRgn@8": "GDI32.SelectClipRgn",
         "_CombineRgn@16": "GDI32.CombineRgn",
         "_DeleteObject@4": "GDI32.DeleteObject",
@@ -293,6 +294,8 @@ windows_dll(
         "DestroyCursor": "_DestroyIcon@4",
         "wvsprintfA": "_wvsprintfA@12",
         "wvsprintfW": "_wvsprintfW@12",
+        "CharUpperBuffA": "_CharUpperBuffA@8", "CharUpperBuffW": "_CharUpperBuffW@8",
+        "CharLowerBuffA": "_CharLowerBuffA@8", "CharLowerBuffW": "_CharLowerBuffW@8",
         "CharUpperA": "_CharUpperA@4",
         "CharUpperW": "_CharUpperW@4",
         "CharLowerA": "_CharLowerA@4",
@@ -506,6 +509,7 @@ windows_dll(
 
         "wvsprintfA",
         "wvsprintfW",
+        "CharUpperBuffA", "CharUpperBuffW", "CharLowerBuffA", "CharLowerBuffW",
         "CharUpperW",
         "CharLowerA",
         "CharLowerW",

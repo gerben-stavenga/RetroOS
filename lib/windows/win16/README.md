@@ -8,6 +8,8 @@ Microsoft code. Core NE facades load exclusively from
 a missing runtime is an error. Other dependencies retain application-local
 lookup (for example, a game-supplied COMMDLG.DLL). The kernel maps the DLLs,
 establishes descriptors and binds two far pointers per facade; it does not suspend a kernel continuation for callbacks.
+USER is also an implicit runtime dependency for NE programs without USER
+imports, because it supplies the shared bridge's return thunks.
 
 ```
 NE caller -> USER.DLL / GDI.DLL -> USER32 Rust adapter -> shared USER32 / GDI32
@@ -171,6 +173,22 @@ initialization error. External font-resource loading and enumeration are also
 unimplemented. These optional services remain failure-reporting exports;
 working timers do not establish sound, movie playback, or common-dialog support.
 
+MCI device lookup, driver-data queries, and error-string output are shared with
+WINMM. With no playback driver installed, named devices are absent, invalid
+device-data/yield operations fail, and MCI_OPEN reports CANNOT_LOAD_DRIVER
+(or NULL_PARAMETER_BLOCK when its arguments are missing). The special `all`
+device ID is translated between Win16 and Win32 widths; closing the empty set
+succeeds. ANSI and UTF-16 error strings are bounded and NUL-terminated, including
+short buffers. Unknown errors return false and an empty output string.
+
+Wave-output imports use the shared WINMM no-device behavior: enumeration
+returns zero devices, opening WAVE_MAPPER reports NODRIVER, and explicit device
+IDs report BADDEVICEID. Header/write/position operations reject invalid handles
+without modifying caller buffers or invoking callbacks. Error text is bounded
+and NUL-terminated. PlaySoundW reports failure instead of claiming playback.
+This fixes import resolution, not Windows PCM playback: a real PCM stream
+interface and the Win16 buffer/callback adapters are still required.
+
 Local KVM acceptance reaches Civ's main menu, completes new-game setup, and
 reaches the opening capital-founding prompt with colored terrain, units,
 leader portraits, and patterned window backgrounds. Fades that only change the
@@ -184,8 +202,12 @@ This is not a complete gameplay acceptance test.
 Civilization II additionally imports video and AVI libraries.
 Local tests with its original Video for Windows runtime now get beyond the
 initializer/segment-count restrictions, but still stop at missing imports
-(including RegOpenKey and LocalHandle); Civ II itself currently stops at
-mciGetDeviceID (MMSYSTEM.703).
+(including RegOpenKey and LocalHandle); the current Civ II launch stops at
+ResizePalette (GDI.368). Shared WINMM now implements buffered DOS and memory
+MMIO, file seeking, buffer advancement, and RIFF chunk reading/writing. Win16
+adapters translate MMIOINFO and selector-backed buffers; close releases owned
+buffers. Custom I/O procedures, mmioSetBuffer, and special filename operations
+(parse/delete/exist/temporary-name flags) are not implemented.
 This does not yet establish AVI or Indeo playback support; those runtime files
 are not bundled with RetroOS.
 
@@ -221,3 +243,34 @@ Huge ranges walk RetroOS's consecutive 64 KiB selectors; ordinary ranges must
 fit one segment. The NE regression covers invalid/freed selectors, code versus
 data permissions, exact allocation boundaries, overflowing lengths, and huge
 ranges crossing a selector boundary. DebugBreak executes a guest breakpoint.
+
+The installable-driver entry points are exported through shared WINMM. Driver
+loading is still unsupported: OpenDriver returns null, and operations on absent
+drivers fail without callbacks. DefDriverProc handles the default lifecycle
+messages. USER.251 is SendDriverMessage; InSendMessage uses USER.192.
+GlobalFix/GlobalUnfix use the existing global-memory lock count, preventing
+movable blocks from being relocated until their pins have been released.
+
+Selector base and limit queries run in the guest DLL, using the descriptor
+mirror and LSL respectively. SetSelectorBase/SetSelectorLimit update the existing
+LDT and refresh that mirror. The Win16 regression checks rebased memory access,
+inclusive limits, page-granularity limits, and queries on freed selectors.
+
+AnsiUpperBuff/AnsiLowerBuff delegate to shared USER32 CharUpperBuffA/CharLowerBuffA.
+The buffer APIs process explicit lengths, including embedded NULs, and use the
+current ANSI code page. Win32 also exports the UTF-16 W variants. The Win16
+adapter interprets length zero as 64 KiB; Win32 length zero is a no-op. Regression
+tests cover accented characters, sentinel bytes, full-segment buffers, and stack
+balance.
+
+IntersectClipRect and ExcludeClipRect share GDI32 region algebra with Win32.
+They preserve existing application clips, handle empty and disjoint regions,
+and publish the resulting rectangles through the existing drawing primitive.
+Tests check actual pixels, right/bottom edges, negative coordinates, clip reset,
+invalid DCs, and Win16 stack balance. They use the current device-coordinate
+(MM_TEXT) drawing model; general logical-to-device mapping remains incomplete.
+
+Win16 AdjustWindowRect/AdjustWindowRectEx widen signed RECT16 coordinates and
+call the same guest framing implementation as Win32, then narrow the result.
+The NE regression checks caption/menu/frame margins, extended client edges,
+negative coordinates, untouched adjacent bytes, null pointers and stack balance.

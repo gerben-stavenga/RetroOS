@@ -1,5 +1,7 @@
 //! Win16 ABI adapters for the ordinary guest USER implementation.
 //! Segment and structure translation happens here, never in kernel callbacks.
+#[path = "win16_mmio.rs"]
+mod mmio;
 use crate::{Message, class, input, keyboard, menu, message, paint, rect, state, window};
 
 unsafe extern "system" {
@@ -93,6 +95,8 @@ unsafe extern "system" {
         sy: i32,
         rop: u32,
     ) -> i32;
+    fn IntersectClipRect(dc:u32,left:i32,top:i32,right:i32,bottom:i32)->i32;
+    fn ExcludeClipRect(dc:u32,left:i32,top:i32,right:i32,bottom:i32)->i32;
     fn SelectClipRgn(dc: u32, region: u32) -> i32;
     fn SelectObject(dc: u32, object: u32) -> u32;
     fn CreateCompatibleBitmap(dc: u32, w: i32, h: i32) -> u32;
@@ -584,6 +588,20 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             24 => window::RemovePropA(h(4), string(d(0))?),
             25 => window::GetPropA(h(4), string(d(0))?),
             26 => window::SetPropA(h(6), string(d(2))?, w(0)),
+            437 | 438 => {
+                let count = if w(0)==0 {65536} else {w(0)};
+                let buffer = huge_pointer(d(2),count as usize)?;
+                if o==437 {crate::text::CharUpperBuffA(buffer,count)}
+                else {crate::text::CharLowerBuffA(buffer,count)}
+            }
+            102 | 454 => {
+                let off = if o==454 {4} else {0};
+                let p=d(6+off);
+                let mut r=rectangle(p)?;
+                let result=crate::frame::AdjustWindowRectEx(&mut r,d(2+off),w(off),if o==454 {d(0)} else {0});
+                if result!=0 {write_rect(p,&r)?;}
+                result as u32
+            }
             431 | 432 => {
                 let p = d(0);
                 let value = if p >> 16 == 0 { p } else { string(p)? };
@@ -870,6 +888,108 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             10 => message::SetTimer(h(8), w(6), w(4), procedure(d(0))),
             12 => message::KillTimer(h(2), w(0)) as u32,
             13 | 15 | 3607 => crate::runtime::GetTickCount(),
+            251 => {
+                let entry=multimedia_export(b"SendDriverMessage\0");
+                if entry==0 {0} else {core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32,u32,u32)->u32>(entry)(w(10),w(8),d(4),d(0))}
+            }
+            252 => {
+                let entry=multimedia_export(b"OpenDriverA\0");
+                let name=if d(8)==0 {0} else {string(d(8))?};
+                let section=if d(4)==0 {0} else {string(d(4))?};
+                if entry==0 {0} else {core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32,u32)->u32>(entry)(name,section,d(0))}
+            }
+            253 => {
+                let entry=multimedia_export(b"CloseDriver\0");
+                if entry==0 {0} else {core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32,u32)->u32>(entry)(w(8),d(4),d(0))}
+            }
+            254 => {
+                let entry=multimedia_export(b"GetDriverModuleHandle\0");
+                if entry==0 {0} else {core::mem::transmute::<u32,unsafe extern "system" fn(u32)->u32>(entry)(w(0))}
+            }
+            255 => {
+                let entry=multimedia_export(b"DefDriverProc\0");
+                if entry==0 {0} else {core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32,u32,u32,u32)->u32>(entry)(d(12),w(10),w(8),d(4),d(0))}
+            }
+            2186 => segment(w(0)).map_or(0, |(base,_)|base),
+            4210..=4225 => return mmio::dispatch(o,a),
+            3401 => {
+                let entry=multimedia_export(b"waveOutGetNumDevs\0");
+                if entry==0 {0} else {core::mem::transmute::<u32,unsafe extern "system" fn()->u32>(entry)()}
+            },
+            3403 => {
+                let entry=multimedia_export(b"waveOutGetErrorTextA\0");
+                if entry==0 {6} else if d(2)==0 {11} else if let Some(p)=pointer(d(2),w(0) as usize) {
+                    core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32,u32)->u32>(entry)(w(6),p,w(0))
+                } else {11}
+            },
+            3402 => {
+                let entry=multimedia_export(b"waveOutGetDevCapsA\0");
+                let device=if w(6)==0xffff {u32::MAX} else {w(6)};
+                // No driver currently writes capabilities. Use native scratch
+                // storage so a Win32 layout can never overwrite a Win16 buffer.
+                let mut caps=[0u32;21];
+                if entry==0 {6} else {
+                    core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32,u32)->u32>(entry)(device,caps.as_mut_ptr() as u32,if w(0)==0 {0} else {52})
+                }
+            },
+            3404 => {
+                let entry=multimedia_export(b"waveOutOpen\0");
+                let device=if w(16)==0xffff {u32::MAX} else {w(16)};
+                // Until a PCM backend exists, opening never dereferences the
+                // format, retains a callback, or returns a handle. Keep those
+                // Win16 layouts out of the native API rather than passing raw
+                // segmented pointers as flat pointers.
+                if entry==0 {6} else {
+                    core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32,u32,u32,u32,u32)->u32>(entry)(0,device,0,0,d(4),d(0))
+                }
+            },
+            3405 | 3409 | 3410 | 3411 => {
+                let name:&[u8]=match o {3405=>b"waveOutClose\0",3409=>b"waveOutPause\0",3410=>b"waveOutRestart\0",_=>b"waveOutReset\0"};
+                let entry=multimedia_export(name);
+                if entry==0 {5} else {core::mem::transmute::<u32,unsafe extern "system" fn(u32)->u32>(entry)(w(0))}
+            },
+            3406 | 3407 | 3408 | 3412 => {
+                let name:&[u8]=match o {3406=>b"waveOutPrepareHeader\0",3407=>b"waveOutUnprepareHeader\0",3408=>b"waveOutWrite\0",_=>b"waveOutGetPosition\0"};
+                let entry=multimedia_export(name);
+                // There are no valid wave handles; the native rejection leaves
+                // both header and sample data untouched.
+                if entry==0 {5} else {core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32,u32)->u32>(entry)(w(6),0,w(0))}
+            },
+            3703 => {
+                let entry=multimedia_export(b"mciGetDeviceIDA\0");
+                if entry==0 {0} else {
+                    core::mem::transmute::<u32,unsafe extern "system" fn(u32)->u32>(entry)(if d(0)==0 {0} else {string(d(0))?})
+                }
+            },
+            3706 => {
+                let entry=multimedia_export(b"mciGetErrorStringA\0");
+                if entry==0 || d(2)==0 || w(0)==0 {0} else {
+                    core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32,u32)->u32>(entry)(d(6),pointer(d(2),w(0) as usize)?,w(0))
+                }
+            },
+            3707 | 3708 => {
+                let entry=multimedia_export(if o==3707 {b"mciSetDriverData\0"} else {b"mciGetDriverData\0"});
+                if entry==0 {0} else if o==3707 {
+                    core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32)->u32>(entry)(w(4),d(0))
+                } else {core::mem::transmute::<u32,unsafe extern "system" fn(u32)->u32>(entry)(w(0))}
+            },
+            3714 | 3716 => {
+                let entry=multimedia_export(if o==3714 {b"mciSetYieldProc\0"} else {b"mciGetYieldProc\0"});
+                // With no open MCI device, the shared implementation rejects
+                // these calls without invoking or retaining a yield callback.
+                if entry==0 {0} else if o==3714 {
+                    core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32,u32)->u32>(entry)(w(8),d(4),d(0))
+                } else {
+                    core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32)->u32>(entry)(w(4),if d(0)==0 {0} else {pointer(d(0),4)?})
+                }
+            },
+            3701 => {
+                let entry=multimedia_export(b"mciSendCommandA\0");
+                let device=if w(10)==0xffff {u32::MAX} else {w(10)};
+                if entry==0 {266} else {
+                    core::mem::transmute::<u32,unsafe extern "system" fn(u32,u32,u32,u32)->u32>(entry)(device,w(8),d(4),if d(0)==0 {0} else {pointer(d(0),4)?})
+                }
+            },
             3602 => return set_multimedia_timer(a,_frame),
             3603 | 3605 | 3606 => {
                 let name:&[u8]=match o {3603=>b"timeKillEvent\0",3605=>b"timeBeginPeriod\0",_=>b"timeEndPeriod\0"};
@@ -910,7 +1030,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 }
                 result
             },
-            251 => message::InSendMessage() as u32,
+            192 => message::InSendMessage() as u32,
             266 => message::SetMessageQueue(w(0) as i16 as i32) as u32,
             224 => window::GetWindowThreadProcessId(h(0),core::ptr::null_mut()) & 0xffff,
             54 | 55 | 225 => {
@@ -1601,6 +1721,8 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 MoveToEx(h(4), i(2), i(0), &mut old);
                 old[0] as u16 as u32 | ((old[1] as u16 as u32) << 16)
             }
+            1021 => ExcludeClipRect(h(8),i(6),i(4),i(2),i(0)) as u32,
+            1022 => IntersectClipRect(h(8),i(6),i(4),i(2),i(0)) as u32,
             1027 => Rectangle(h(8), i(6), i(4), i(2), i(0)) as u32,
             1031 => SetPixel(h(8), i(6), i(4), d(0)),
             1033 => TextOutA(h(10), i(8), i(6), pointer(d(2), w(0) as usize)?, i(0)) as u32,

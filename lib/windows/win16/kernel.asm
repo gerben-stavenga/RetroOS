@@ -297,3 +297,23 @@ probe_range:
 .bad:
     mov ax,1
     ret
+
+gate GlobalFix
+gate GlobalUnfix
+
+bridge GetSelectorBase, 2186, 2
+gate SetSelectorBase
+global GetSelectorLimit
+GetSelectorLimit:
+    push bp
+    mov bp,sp
+    xor eax,eax
+    lsl eax,[ss:bp+6]
+    jz .valid
+    xor eax,eax
+.valid:
+    mov edx,eax
+    shr edx,16
+    pop bp
+    retf 2
+gate SetSelectorLimit

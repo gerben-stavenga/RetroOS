@@ -127,16 +127,7 @@ unsafe fn case(value: u32, wide: bool, upper: bool) -> u32 {
         unsafe { read(value, wide) }
     };
     for c in &mut chars {
-        if let Some(ch) = char::from_u32(*c as u32) {
-            let mapped = if upper {
-                ch.to_uppercase().next().unwrap()
-            } else {
-                ch.to_lowercase().next().unwrap()
-            };
-            if mapped as u32 <= 0xffff {
-                *c = mapped as u16;
-            }
-        }
+        *c = case_unit(*c, upper);
     }
     if scalar {
         if wide {
@@ -163,3 +154,90 @@ case_api!(CharUpperA, false, true);
 case_api!(CharUpperW, true, true);
 case_api!(CharLowerA, false, false);
 case_api!(CharLowerW, true, false);
+
+// USER case conversion maps individual UTF-16 code units in place.
+fn case_unit(value: u16, upper: bool) -> u16 {
+    let Some(ch) = char::from_u32(value as u32) else {
+        return value;
+    };
+    let mapped = if upper {
+        ch.to_uppercase().next().unwrap()
+    } else {
+        ch.to_lowercase().next().unwrap()
+    };
+    u16::try_from(mapped as u32).unwrap_or(value)
+}
+
+unsafe fn case_buffer(address: u32, count: u32, wide: bool, upper: bool) -> u32 {
+    if address == 0 || count == 0 || count > i32::MAX as u32 {
+        return 0;
+    }
+    let Some(bytes) = count.checked_mul(if wide { 2 } else { 1 }) else {
+        return 0;
+    };
+    if address.checked_add(bytes).is_none() {
+        return 0;
+    }
+    if wide {
+        for i in 0..count as usize {
+            let p = unsafe { (address as *mut u16).add(i) };
+            unsafe {
+                p.write_unaligned(case_unit(p.read_unaligned(), upper));
+            }
+        }
+    } else {
+        // Explicit lengths preserve embedded NULs. Convert through the current
+        // ANSI code page, including multibyte characters, rather than ASCII.
+        let n = unsafe {
+            MultiByteToWideChar(
+                0,
+                0,
+                address as *const u8,
+                count as i32,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if n <= 0 {
+            return 0;
+        }
+        let mut chars = vec![0; n as usize];
+        if unsafe {
+            MultiByteToWideChar(
+                0,
+                0,
+                address as *const u8,
+                count as i32,
+                chars.as_mut_ptr(),
+                n,
+            )
+        } != n
+        {
+            return 0;
+        }
+        for c in &mut chars {
+            *c = case_unit(*c, upper);
+        }
+        let mapped = ansi(&chars);
+        // An in-place API cannot change the caller's buffer extent.
+        if mapped.len() != count as usize {
+            return 0;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(mapped.as_ptr(), address as *mut u8, mapped.len());
+        }
+    }
+    count
+}
+macro_rules! case_buffer_api {
+    ($name:ident, $wide:expr, $upper:expr) => {
+        #[unsafe(no_mangle)]
+        pub unsafe extern "system" fn $name(address: u32, count: u32) -> u32 {
+            unsafe { case_buffer(address, count, $wide, $upper) }
+        }
+    };
+}
+case_buffer_api!(CharUpperBuffA, false, true);
+case_buffer_api!(CharUpperBuffW, true, true);
+case_buffer_api!(CharLowerBuffA, false, false);
+case_buffer_api!(CharLowerBuffW, true, false);

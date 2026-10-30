@@ -208,7 +208,12 @@ bridge EnumChildWindows, 55, 10
 bridge GetWindowTask, 224, 2
 bridge EnumTaskWindows, 225, 10
 
-bridge InSendMessage, 251, 0
+bridge InSendMessage, 192, 0
+bridge SendDriverMessage, 251, 12
+bridge OpenDriver, 252, 12
+bridge CloseDriver, 253, 10
+bridge GetDriverModuleHandle, 254, 2
+bridge DefDriverProc, 255, 16
 bridge SetMessageQueue, 266, 2
 
 bridge MapWindowPoints, 258, 10
@@ -229,3 +234,9 @@ bridge CreatePopupMenu, 415, 0
 bridge ShowScrollBar, 267, 6
 
 bridge TrackPopupMenu, 416, 16
+
+bridge AnsiUpperBuff, 437, 6
+bridge AnsiLowerBuff, 438, 6
+
+bridge AdjustWindowRect, 102, 10
+bridge AdjustWindowRectEx, 454, 14

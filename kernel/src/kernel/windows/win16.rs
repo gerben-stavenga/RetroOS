@@ -121,6 +121,8 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::Kernel, 18) => (2, true, "GlobalLock"),
         (Module::Kernel, 19) => (2, false, "GlobalUnlock"),
         (Module::Kernel, 20) => (2, true, "GlobalSize"),
+        (Module::Kernel, 197) => (2, false, "GlobalFix"),
+        (Module::Kernel, 198) => (2, false, "GlobalUnfix"),
         (Module::Kernel, 21) => (2, true, "GlobalHandle"),
         (Module::Kernel, 159) => (2, true, "GlobalHandleNoRIP"),
         (Module::Kernel, 138) => (2, true, "GetHeapSpaces"),
@@ -129,6 +131,8 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::Kernel, 175) => (2, false, "AllocSelector"),
         (Module::Kernel, 176) => (2, false, "FreeSelector"),
         (Module::Kernel, 177) => (4, false, "PrestoChangoSelector"),
+        (Module::Kernel, 187) => (6, false, "SetSelectorBase"),
+        (Module::Kernel, 189) => (6, false, "SetSelectorLimit"),
         (Module::Kernel, 23) => (2, false, "LockSegment"),
         (Module::Kernel, 24) => (2, false, "UnlockSegment"),
         (Module::Kernel, 25) => (4, true, "GlobalCompact"),
@@ -299,6 +303,26 @@ fn sync_selectors<A: crate::Arch>(machine: &mut A, windows: &WindowsState, old_l
     if let Ok(config) = super::export_address(&windows.modules,b"USER32",b"Retro16Config") {
         machine.write::<u32>(config as usize+24,windows.ldt.len() as u32);
     }
+}
+
+// Keep descriptor arithmetic out of the large, architecture-generic dispatcher.
+#[inline(never)]
+fn set_selector(ldt: &mut [u64], sel: u16, value: u32, limit: bool) -> u32 {
+    if sel & 7 != 7 { return 0; }
+    let Some(desc) = ldt.get_mut(usize::from(sel >> 3)) else { return 0; };
+    if *desc & (1 << 47) == 0 { return 0; }
+    if limit {
+        let pages = value > 0xfffff;
+        let encoded = u64::from(if pages {value >> 12} else {value});
+        *desc = (*desc & !0x008f_0000_0000_ffff)
+            | (encoded & 0xffff) | ((encoded & 0xf0000) << 32)
+            | if pages {1 << 55} else {0};
+    } else {
+        let base = u64::from(value);
+        *desc = (*desc & !0xff00_00ff_ffff_0000)
+            | ((base & 0xffffff) << 16) | ((base & 0xff000000) << 32);
+    }
+    u32::from(sel)
 }
 
 fn selector_base_from_ldt(ldt: &[u64], selector: u16) -> Option<u32> {
@@ -591,6 +615,10 @@ pub(super) fn exec<A: crate::Arch>(
     // this same graph.
     let mut pending: Vec<(Vec<u8>, Vec<u8>)> = image.modules().map_err(|_| -8)?
         .into_iter().map(|name| (name, main_path.clone())).collect();
+    // USER supplies the guest bridge's return thunks even for applications
+    // that only import KERNEL or MMSYSTEM. Include that runtime dependency
+    // before relocation and bridge initialization.
+    pending.push((b"USER".to_vec(), main_path.clone()));
     let mut modules = Vec::new();
     let mut next = 0;
     while next < pending.len() {
@@ -1206,7 +1234,7 @@ fn dispatch<A: crate::Arch>(
             global_free(windows,state,index);
             next
         }
-        (Module::Kernel, 17..=21 | 159) => {
+        (Module::Kernel, 17..=21 | 159 | 197 | 198) => {
             let handle = stack_u16(machine,windows,regs,4).unwrap_or(0);
             let Some(index) = state.global_blocks.iter().position(|b| b.handle == handle || b.selector == handle) else {
                 return 0;
@@ -1221,10 +1249,16 @@ fn dispatch<A: crate::Arch>(
                     regs.rcx = (regs.rcx & !0xffff) | u64::from(block.selector);
                     u32::from(block.selector)<<16
                 }
-                19 => { block.locks = block.locks.saturating_sub(1); u32::from(block.locks != 0) }
+                197 => { block.locks = block.locks.saturating_add(1); u32::from(block.selector) }
+                19 | 198 => { block.locks = block.locks.saturating_sub(1); u32::from(block.locks != 0) }
                 20 => block.size,
                 _ => (u32::from(block.selector)<<16)|u32::from(block.handle),
             }
+        }
+        (Module::Kernel, 187 | 189) => {
+            let sel = stack_u16(machine,windows,regs,8).unwrap_or(0);
+            let value = stack_u32(machine,windows,regs,4).unwrap_or(0);
+            set_selector(&mut windows.ldt, sel, value, gate.ordinal == 189)
         }
         (Module::Kernel, 170 | 175 | 176 | 177) => {
             let src = stack_u16(machine,windows,regs,if gate.ordinal == 177 {6} else {4}).unwrap_or(0);
@@ -1587,7 +1621,7 @@ pub(super) fn handle_event<A: crate::Arch>(
             }
             let old_ldt = windows.ldt.len();
             let result = dispatch(machine, kt, windows, state, regs, gate);
-            if gate.module == Module::Kernel && matches!(gate.ordinal,15..=17|426|170|175..=177) {
+            if gate.module == Module::Kernel && matches!(gate.ordinal,15..=17|426|170|175..=177|187|189) {
                 // Lock/unlock/size/handle queries (18..=21) only touch block
                 // metadata. Rebuilding the descriptor mirror and reloading the
                 // LDT for each query makes resource-heavy Win16 startup crawl.

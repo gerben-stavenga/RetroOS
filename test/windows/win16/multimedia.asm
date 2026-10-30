@@ -1,10 +1,56 @@
 bits 16
 segment _TEXT public class=CODE use16
+extern mciGetDeviceID, mciSetDriverData, mciGetDriverData, mciGetErrorString, mciSendCommand
+extern waveOutGetNumDevs, waveOutOpen, waveOutClose, waveOutGetErrorText, waveOutWrite
+extern OpenDriver, CloseDriver, SendDriverMessage, GetDriverModuleHandle, DefDriverProc
 extern LoadCursor, DestroyCursor
 extern Debug, Exit, timeSetEvent, timeKillEvent, timeGetTime, CallWindowProc
 global _start
 _start:
     mov [initial_sp],sp
+    push ds
+    push word absent_device
+    push dword 0
+    push dword 0x12345678
+    call far OpenDriver
+    test ax,ax
+    jnz fail
+    push word 0x1234
+    push word 3
+    push dword 0x12345678
+    push dword 0x87654321
+    call far SendDriverMessage
+    or ax,dx
+    jnz fail
+    push word 0x1234
+    push dword 0x12345678
+    push dword 0x87654321
+    call far CloseDriver
+    or ax,dx
+    jnz fail
+    push word 0x1234
+    call far GetDriverModuleHandle
+    test ax,ax
+    jnz fail
+    push dword 0x12345678
+    push word 0x1234
+    push word 1
+    push dword 0x87654321
+    push dword 0
+    call far DefDriverProc
+    cmp ax,1
+    jne fail
+    test dx,dx
+    jnz fail
+    push dword 0
+    push word 0
+    push word 3
+    push dword 0
+    push dword 0
+    call far DefDriverProc
+    or ax,dx
+    jnz fail
+
     push word 0
     push dword 32512
     call far LoadCursor
@@ -14,6 +60,93 @@ _start:
     call far DestroyCursor
     test ax,ax
     jz fail
+    push ds
+    push word all_devices
+    call far mciGetDeviceID
+    cmp ax,0xffff
+    jne fail
+    push ds
+    push word absent_device
+    call far mciGetDeviceID
+    test ax,ax
+    jnz fail
+    push word 1
+    push dword 0x12345678
+    call far mciSetDriverData
+    test ax,ax
+    jnz fail
+    push word 1
+    call far mciGetDriverData
+    or ax,dx
+    jnz fail
+    push word 0
+    push word 0x803
+    push dword 0
+    push ds
+    push word open_parms
+    call far mciSendCommand
+    cmp ax,266
+    jne fail
+    test dx,dx
+    jnz fail
+    push dword 266
+    push ds
+    push word error_text
+    push word 4
+    call far mciGetErrorString
+    test ax,ax
+    jz fail
+    cmp byte [error_text+3],0
+    jne fail
+    cmp byte [error_text+4],'!'
+    jne fail
+    push word 0xffff
+    push word 0x804
+    push dword 0
+    push dword 0
+    call far mciSendCommand
+    or ax,dx
+    jnz fail
+    call far waveOutGetNumDevs
+    test ax,ax
+    jnz fail
+    push ds
+    push word wave_handle
+    push word 0xffff
+    push ds
+    push word open_parms
+    push dword 0
+    push dword 0x12345678
+    push dword 0
+    call far waveOutOpen
+    cmp ax,6
+    jne fail
+    cmp dword [wave_handle],0xfeedbeef
+    jne fail
+    push word 1
+    push ds
+    push word open_parms
+    push word 20
+    call far waveOutWrite
+    cmp ax,5
+    jne fail
+    cmp dword [open_parms],0
+    jne fail
+    push word 1
+    call far waveOutClose
+    cmp ax,5
+    jne fail
+    push word 6
+    push ds
+    push word error_text
+    push word 4
+    call far waveOutGetErrorText
+    test ax,ax
+    jnz fail
+    cmp byte [error_text+3],0
+    jne fail
+    cmp byte [error_text+4],'!'
+    jne fail
     push word 30
     push word 1
     push cs
@@ -136,6 +269,11 @@ nested:
     xor dx,dx
     retf 10
 segment _DATA public class=DATA use16
+all_devices db "aLl",0
+absent_device db "civmovie",0
+error_text db "xxxx!"
+wave_handle dd 0xfeedbeef
+open_parms times 5 dd 0
 initial_sp dw 0
 calls dw 0
 timer_id dw 0

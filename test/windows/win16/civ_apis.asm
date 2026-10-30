@@ -1,5 +1,6 @@
 bits 16
 segment _TEXT public class=CODE use16
+extern GlobalFix, GlobalUnfix, GlobalReAlloc
 extern Debug, Exit, GetTickCount, GlobalAlloc, GlobalLock, GlobalFree
 extern IsBadReadPtr, IsBadWritePtr, IsBadCodePtr, IsBadHugeReadPtr, IsBadHugeWritePtr
 extern CreateDIBitmap
@@ -55,6 +56,46 @@ _start:
     test ax,ax
     jnz fail
     call far GetTickCount
+    push word 0x42
+    push dword 16
+    call far GlobalAlloc
+    test ax,ax
+    jz fail
+    mov [source],ax
+    push ax
+    call far GlobalFix
+    test ax,ax
+    jz fail
+    push word [source]
+    call far GlobalFix
+    test ax,ax
+    jz fail
+    push word [source]
+    push dword 32
+    push word 2
+    call far GlobalReAlloc
+    test ax,ax
+    jnz fail
+    push word [source]
+    call far GlobalUnfix
+    push word [source]
+    push dword 32
+    push word 2
+    call far GlobalReAlloc
+    test ax,ax
+    jnz fail
+    push word [source]
+    call far GlobalUnfix
+    push word [source]
+    push dword 32
+    push word 2
+    call far GlobalReAlloc
+    test ax,ax
+    jz fail
+    push ax
+    call far GlobalFree
+    test ax,ax
+    jnz fail
     push word 0x42
     push dword 70000
     call far GlobalAlloc

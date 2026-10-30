@@ -4,6 +4,10 @@
 #![allow(non_snake_case)]
 #![deny(unsafe_op_in_unsafe_fn)]
 extern crate alloc;
+mod driver;
+mod mci;
+mod mmio;
+mod wave;
 #[allow(dead_code)]
 #[path = "../user32/runtime.rs"]
 mod runtime;

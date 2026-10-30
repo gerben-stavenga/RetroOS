@@ -95,3 +95,6 @@ bridge GetTextExtentPoint, 1471, 12
 bridge GetTextAlign, 1345, 2
 bridge GetPaletteEntries, 1363, 10
 bridge GetBitmapDimensionEx, 1468, 6
+
+bridge ExcludeClipRect, 1021, 10
+bridge IntersectClipRect, 1022, 10
