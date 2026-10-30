@@ -29,7 +29,7 @@ static LRESULT CALLBACK paint_order_proc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 int main(void)
 {
     HDC dc=CreateCompatibleDC(0);
-    HBITMAP bitmap=CreateCompatibleBitmap(dc,2,2);
+    HBITMAP bitmap=CreateBitmap(2,2,1,32,0);
     BITMAPINFO info;
     /* Two DWORD-aligned 24-bit rows, bottom-up: blue/white then red/green. */
     BYTE bits[16]={255,0,0,255,255,255,0,0, 0,0,255,0,255,0,0,0};
@@ -37,6 +37,31 @@ int main(void)
     WCHAR text[32];
     HANDLE file;
     DWORD written;
+    {
+        HDC memory=CreateCompatibleDC(0);
+        HBITMAP mono=CreateCompatibleBitmap(memory,9,2);
+        HBITMAP color=CreateBitmap(9,2,1,8,0);
+        HBITMAP same;
+        BITMAP object;
+        CHECK(GetObjectW(mono,sizeof(object),&object)==sizeof(object));
+        CHECK(object.bmBitsPixel==1 && object.bmWidthBytes==2);
+        SelectObject(memory,color);
+        same=CreateCompatibleBitmap(memory,9,2);
+        CHECK(GetObjectW(same,sizeof(object),&object)==sizeof(object));
+        CHECK(object.bmBitsPixel==8 && object.bmWidthBytes==10);
+        CHECK(GetBitmapBits(same,0,0)==20);
+        DeleteDC(memory);DeleteObject(mono);DeleteObject(color);DeleteObject(same);
+    }
+    {
+        RECT desktop;
+        HWND root=GetDesktopWindow();
+        CHECK(root && IsWindow(root) && IsWindowVisible(root));
+        CHECK(GetWindowRect(root,&desktop));
+        CHECK(desktop.right==GetSystemMetrics(SM_CXSCREEN));
+        CHECK(desktop.bottom==GetSystemMetrics(SM_CYSCREEN));
+        CHECK(GetSystemMetrics(SM_CXFULLSCREEN)==desktop.right);
+        CHECK(GetSystemMetrics(SM_CYFULLSCREEN)==desktop.bottom-GetSystemMetrics(SM_CYCAPTION));
+    }
     memset(&info,0,sizeof(info));
     info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
     info.bmiHeader.biWidth=2;info.bmiHeader.biHeight=2;
@@ -50,6 +75,112 @@ int main(void)
     CHECK(GetPixel(dc,0,0)==RGB(0,0,255));CHECK(GetPixel(dc,0,1)==RGB(255,0,0));
     CHECK(SetPixel(dc,1,1,RGB(22,33,44))==RGB(22,33,44));
     CHECK(GetPixel(dc,1,1)==RGB(22,33,44));
+    /* Win32 and the Win16 bridge must read rendered pixels, not upload caches. */
+    {
+        BYTE readback[16];
+        RECT border={0,0,2,2};
+        BITMAP object;
+        CHECK(GetObjectW(bitmap,sizeof(object),&object)==sizeof(object));
+        CHECK(object.bmWidth==2 && object.bmHeight==2);
+        CHECK(GetBitmapBits(bitmap,0,0)==16);
+        memset(readback,0xa5,sizeof(readback));
+        CHECK(GetBitmapBits(bitmap,7,readback)==0);
+        CHECK(readback[0]==0xa5);
+        CHECK(GetBitmapBits(bitmap,16,readback)==16);
+        CHECK(readback[12]==44 && readback[13]==33 && readback[14]==22);
+        CHECK(FrameRect(dc,&border,GetStockObject(WHITE_BRUSH)));
+        CHECK(GetBitmapBits(bitmap,16,readback)==16);
+        CHECK(readback[0]==255 && readback[13]==255 && readback[14]==255);
+        /* Restore pixels needed by the following blit tests. */
+        CHECK(SetDIBitsToDevice(dc,0,0,2,2,0,0,0,2,bits,&info,DIB_RGB_COLORS)==2);
+        SetPixel(dc,1,1,RGB(22,33,44));
+    }
+    /* Four-bit DDB bright colors use the standard static palette. */
+    {
+        BYTE data[2]={0x89,0xaf}, readback[2]={0,0};
+        HDC memory=CreateCompatibleDC(0);
+        HBITMAP image=CreateBitmap(4,1,1,4,data);
+        HGDIOBJ old=SelectObject(memory,image);
+        CHECK(GetPixel(memory,0,0)==RGB(128,128,128));
+        CHECK(GetPixel(memory,1,0)==RGB(255,0,0));
+        CHECK(GetPixel(memory,2,0)==RGB(0,255,0));
+        CHECK(GetPixel(memory,3,0)==RGB(255,255,255));
+        CHECK(GetBitmapBits(image,2,readback)==2 && memcmp(data,readback,2)==0);
+        SelectObject(memory,old);DeleteObject(image);DeleteDC(memory);
+    }
+    /* Intermediate indexed copies retain colour identities across a fade. */
+    {
+        struct {WORD version,count; PALETTEENTRY entries[2];} table={0x300,2,{{0,0,0,PC_RESERVED},{0,0,0,PC_RESERVED}}};
+        PALETTEENTRY colors[2]={{255,0,0,PC_RESERVED},{0,255,0,PC_RESERVED}};
+        BYTE indices[2]={10,11};
+        HPALETTE palette=CreatePalette((LOGPALETTE *)&table);
+        HDC source=CreateCompatibleDC(0), middle=CreateCompatibleDC(0);
+        HBITMAP sb=CreateBitmap(2,1,1,8,indices), mb=CreateBitmap(2,1,1,8,0);
+        HPALETTE old_source,old_middle,old_dst;
+        SelectObject(source,sb);SelectObject(middle,mb);
+        old_source=SelectPalette(source,palette,FALSE);
+        old_middle=SelectPalette(middle,palette,FALSE);
+        old_dst=SelectPalette(dc,palette,FALSE);
+        CHECK(RealizePalette(source)==2);
+        CHECK(BitBlt(middle,0,0,2,1,source,0,0,SRCCOPY));
+        CHECK(GetPixel(middle,0,0)==0 && GetPixel(middle,1,0)==0);
+        CHECK(SetPaletteEntries(palette,0,2,colors)==2);
+        RealizePalette(source);
+        CHECK(BitBlt(dc,0,0,2,1,middle,0,0,SRCCOPY));
+        CHECK(GetPixel(dc,0,0)==RGB(255,0,0));
+        CHECK(GetPixel(dc,1,0)==RGB(0,255,0));
+        {
+            PALETTEENTRY device[2], animated={0,0,255,0};
+            CHECK(GetSystemPaletteEntries(dc,10,2,device)==2);
+            CHECK(device[0].peRed==255 && device[1].peGreen==255);
+            CHECK(AnimatePalette(palette,0,1,&animated));
+            CHECK(GetSystemPaletteEntries(dc,10,2,device)==2);
+            CHECK(device[0].peBlue==255 && device[0].peRed==0);
+            CHECK(BitBlt(dc,0,0,2,1,middle,0,0,SRCCOPY));
+            CHECK(GetPixel(dc,0,0)==RGB(0,0,255));
+        }
+        SelectPalette(source,old_source,FALSE);SelectPalette(middle,old_middle,FALSE);
+        SelectPalette(dc,old_dst,FALSE);
+        DeleteDC(source);DeleteDC(middle);DeleteObject(sb);DeleteObject(mb);DeleteObject(palette);
+        CHECK(SetDIBitsToDevice(dc,0,0,2,2,0,0,0,2,bits,&info,DIB_RGB_COLORS)==2);
+        SetPixel(dc,1,1,RGB(22,33,44));
+    }
+    /* Pattern brushes snapshot their bitmap and repeat with the DC origin. */
+    {
+        BYTE pattern_bits[16]={0,0,255,0, 0,255,0,0, 255,0,0,0, 255,255,255,0};
+        HBITMAP image=CreateBitmap(2,2,1,32,pattern_bits);
+        HBRUSH pattern=CreatePatternBrush(image);
+        HDC target=CreateCompatibleDC(0);
+        HBITMAP surface=CreateBitmap(4,4,1,32,0);
+        RECT area={0,0,4,4};
+        HGDIOBJ previous;
+        HRGN clip;
+        CHECK(pattern!=0);
+        CHECK(DeleteObject(image));
+        SelectObject(target,surface);
+        CHECK(FillRect(target,&area,pattern));
+        CHECK(GetPixel(target,0,0)==RGB(255,0,0));
+        CHECK(GetPixel(target,1,0)==RGB(0,255,0));
+        CHECK(GetPixel(target,0,1)==RGB(0,0,255));
+        CHECK(GetPixel(target,3,3)==RGB(255,255,255));
+        CHECK(SetBrushOrgEx(target,1,-1,0));
+        CHECK(FillRect(target,&area,pattern));
+        CHECK(GetPixel(target,0,0)==RGB(255,255,255));
+        CHECK(GetPixel(target,0,1)==RGB(0,255,0));
+        clip=CreateRectRgn(1,1,3,3);
+        SelectClipRgn(target,clip);
+        SetBrushOrgEx(target,0,0,0);
+        CHECK(FillRect(target,&area,pattern));
+        CHECK(GetPixel(target,0,0)==RGB(255,255,255));
+        CHECK(GetPixel(target,2,2)==RGB(255,0,0));
+        SelectClipRgn(target,0);
+        previous=SelectObject(target,pattern);
+        CHECK(PatBlt(target,0,0,4,4,PATINVERT));
+        CHECK(PatBlt(target,0,0,4,4,PATINVERT));
+        CHECK(GetPixel(target,2,2)==RGB(255,0,0));
+        SelectObject(target,previous);
+        DeleteObject(pattern);DeleteObject(clip);DeleteDC(target);DeleteObject(surface);
+    }
     /* SRCCOPY respects source bounds and destination clips, ignores ROP2,
        and snapshots overlapping copies within the same bitmap. */
     {
@@ -85,6 +216,13 @@ int main(void)
         CHECK(GetPixel(dst,0,0)==RGB(10,20,30));
         CHECK(GetPixel(dst,1,0)==RGB(245,235,225));
         CHECK(GetPixel(dst,0,1)==0);CHECK(GetPixel(dst,1,1)==RGB(255,255,255));
+        {
+            RECT edge={0,0,4,4};
+            CHECK(FrameRect(dst,&edge,GetStockObject(WHITE_BRUSH)));
+            CHECK(GetPixel(dst,0,0)==RGB(255,255,255));
+            CHECK(GetPixel(dst,3,3)==RGB(255,255,255));
+            CHECK(GetPixel(dst,2,2)==RGB(0,0,255));
+        }
         DeleteObject(clip);DeleteDC(dst);DeleteObject(db);
     }
     {

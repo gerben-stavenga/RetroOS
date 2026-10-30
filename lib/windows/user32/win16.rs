@@ -4,6 +4,11 @@ use crate::{Message, class, input, keyboard, menu, message, paint, rect, state, 
 
 unsafe extern "system" {
     fn SetBitmapBits(bitmap:u32,n:u32,p:*const u8)->i32;
+    fn GetBitmapBits(bitmap: u32, n: i32, p: *mut u8) -> i32;
+    fn GetObjectW(object: u32, n: i32, p: *mut u32) -> i32;
+    fn Polygon(dc: u32, points: *const [i32; 2], count: i32) -> i32;
+    fn GetDeviceCaps(dc: u32, index: i32) -> i32;
+    fn CreatePatternBrush(bitmap: u32) -> u32;
     fn CreateBitmap(w:i32,h:i32,planes:u32,depth:u32,p:*const u8)->u32;
     fn CreateFontIndirectA(p:*const u8)->u32;
     fn GetBkMode(dc:u32)->i32;
@@ -11,6 +16,7 @@ unsafe extern "system" {
     fn GetBitmapDimensionEx(h:u32,out:*mut [i32;2])->i32;
     fn SetBitmapDimensionEx(h:u32,x:i32,y:i32,out:*mut [i32;2])->i32;
     fn CreatePalette(p:*const u8)->u32;
+    fn AnimatePalette(h:u32,start:u32,n:u32,p:*const u32)->u32;
     fn SetPaletteEntries(h:u32,start:u32,n:u32,p:*const u32)->u32;
     fn GetSystemPaletteEntries(dc:u32,start:u32,n:u32,p:*mut u32)->u32;
     fn SelectPalette(dc:u32,p:u32,b:u32)->u32;
@@ -1050,6 +1056,10 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 FillRect(h(6), &[r.left, r.top, r.right, r.bottom], h(0)) as u32
             }
             84 => crate::resource::DrawIcon(h(6), i(4), i(2), h(0)) as u32,
+            83 => {
+                let r = rectangle(d(2))?;
+                crate::drawing::FrameRect(h(6), &[r.left, r.top, r.right, r.bottom], h(0)) as u32
+            }
             85 => {
                 let r = rectangle(d(2))?;
                 let mut r32 = [r.left, r.top, r.right, r.bottom];
@@ -1252,6 +1262,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             174 => encode(crate::resource::LoadIconA(w(4), string(d(0))?)),
             457 => crate::resource::DestroyIcon(h(0)) as u32,
             179 => GetSystemMetrics(w(0)),
+            286 => encode(window::GetDesktopWindow()),
             236 => encode(input::GetCapture()),
             219 | 242 => {
                 let shift = if o == 219 { 0 } else { 4 };
@@ -1290,6 +1301,15 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             282 => encode(SelectPalette(h(4),h(2),w(0))),
             283 => RealizePalette(h(0)),
             1006 => SetPolyFillMode(h(2),i(0)) as u32,
+            1036 => {
+                let count = i(0);
+                if count < 2 { return Some(0); }
+                let source = pointer(d(2), count as usize * 4)?;
+                let points: alloc::vec::Vec<[i32; 2]> = (0..count as usize).map(|n| {
+                    [word(source, n * 4) as i16 as i32, word(source, n * 4 + 2) as i16 as i32]
+                }).collect();
+                Polygon(h(6), points.as_ptr(), count) as u32
+            }
             1037 => {
                 let count=w(0) as usize;
                 let points=pointer(d(2),count.checked_mul(4)?)?;
@@ -1325,6 +1345,45 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             // No external font resource loader or enumeration provider yet.
             1119 | 1136 | 1330 => 0,
             1106 => SetBitmapBits(h(8),d(4),huge_pointer(d(0),d(4) as usize)? as *const u8) as u32,
+            1074 => {
+                let total = GetBitmapBits(h(8), 0, core::ptr::null_mut());
+                if d(0) == 0 { total as u32 } else {
+                    let count = (d(4) as i32).max(0).min(total.max(0));
+                    if count == 0 { return Some(0); }
+                    GetBitmapBits(h(8), count, huge_pointer(d(0), count as usize)? as *mut u8) as u32
+                }
+            }
+            1082 => {
+                let mut object = [0u32; 24];
+                let size = GetObjectW(h(6), 96, object.as_mut_ptr());
+                if size == 24 {
+                    if i(4) < 14 { return Some(0); }
+                    let n = 14;
+                    let mut bitmap = [0u8; 14];
+                    for (i, v) in object[..4].iter().enumerate() {
+                        bitmap[i * 2..i * 2 + 2].copy_from_slice(&(*v as u16).to_le_bytes());
+                    }
+                    bitmap[8] = object[4] as u8;
+                    bitmap[9] = (object[4] >> 16) as u8;
+                    let out = pointer(d(0), n)?;
+                    core::ptr::copy_nonoverlapping(bitmap.as_ptr(), out as *mut u8, n);
+                    n as u32
+                } else if size == 92 {
+                    if i(4) < 50 { return Some(0); }
+                    let mut font = [0u8; 50];
+                    for (n, value) in object[..5].iter().enumerate() {
+                        font[n * 2..n * 2 + 2].copy_from_slice(&(*value as u16).to_le_bytes());
+                    }
+                    let bytes = core::slice::from_raw_parts(object.as_ptr().cast::<u8>(), 92);
+                    font[10..18].copy_from_slice(&bytes[20..28]);
+                    for n in 0..32 {
+                        let c = u16::from_le_bytes([bytes[28 + n * 2], bytes[29 + n * 2]]);
+                        font[18 + n] = u8::try_from(c).unwrap_or(b'?');
+                    }
+                    core::ptr::copy_nonoverlapping(font.as_ptr(), pointer(d(0), 50)? as *mut u8, 50);
+                    50
+                } else { 0 }
+            }
             1162 | 1163 => {
                 let mut size=[0;2];
                 if o==1162 {GetBitmapDimensionEx(h(0),&mut size);}
@@ -1335,7 +1394,8 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 let p=pointer(d(0),4)?;let n=word(p,2) as usize;
                 encode(CreatePalette(pointer(d(0),4+n*4)? as *const u8))
             }
-            1364 | 1367 => SetPaletteEntries(h(8),w(6),w(4),pointer(d(0),w(4) as usize*4)? as *const u32),
+            1367 => AnimatePalette(h(8),w(6),w(4),pointer(d(0),w(4) as usize*4)? as *const u32),
+            1364 => SetPaletteEntries(h(8),w(6),w(4),pointer(d(0),w(4) as usize*4)? as *const u32),
             1375 => GetSystemPaletteEntries(h(8),w(6),w(4),if d(0)==0 {core::ptr::null_mut()}else{pointer(d(0),w(4) as usize*4)? as *mut u32}),
             1001 => SetBkColor(h(4), d(0)),
             1002 => SetBkMode(h(2), w(0)) as u32,
@@ -1357,10 +1417,12 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             1051 => encode(CreateCompatibleBitmap(h(4), i(2), i(0))),
             1052 => encode(CreateCompatibleDC(h(0))),
             1061 => encode(CreatePen(w(6), i(4), d(0))),
+            1060 => encode(CreatePatternBrush(h(0))),
             1066 => encode(CreateSolidBrush(d(0))),
             1068 => DeleteDC(h(0)) as u32,
             1069 => DeleteObject(h(0)) as u32,
             1081 => GetMapMode(h(0)) as u32,
+            1080 => GetDeviceCaps(h(2), i(0)) as u32,
             1083 => GetPixel(h(4), i(2), i(0)),
             1087 => encode(GetStockObject(w(0))),
             _ => return None,

@@ -9,6 +9,9 @@ use alloc::{vec, vec::Vec};
 
 const CHILD: u32 = 0x4000_0000;
 const VISIBLE: u32 = 0x1000_0000;
+pub(crate) const DESKTOP: u32 = 0xfffe;
+#[unsafe(no_mangle)]
+pub extern "system" fn GetDesktopWindow() -> u32 { DESKTOP }
 unsafe extern "system" {
     fn GetSystemMetrics(index: u32) -> u32;
     fn RetroSurfaceCreate(x: i32, y: i32, width: i32, height: i32, parent: u32) -> u32;
@@ -22,6 +25,7 @@ unsafe extern "system" {
         visible: u32,
     ) -> u32;
     fn RetroReleaseWindow(hwnd: u32) -> u32;
+    fn RetroSurfaceOrder(hwnd: u32, after: u32) -> u32;
 }
 pub(crate) fn update(hwnd: u32) {
     let info = state::with(|s| {
@@ -103,7 +107,10 @@ pub unsafe fn create(mut cs: CreateStruct, wide: bool) -> u32 {
     let title = unsafe { text::read(cs.title, wide) };
     let show = cs.style & VISIBLE != 0;
     state::with(|s| {
-        s.windows.push(Window {
+        // Top-level windows start in front; child creation order also defines
+        // dialog tab/radio groups and must remain stable.
+        let at = if parent == 0 { 0 } else { s.windows.len() };
+        s.windows.insert(at, Window {
             hwnd,
             class: class.atom,
             thread,
@@ -294,6 +301,7 @@ pub extern "system" fn DestroyWindow(hwnd: u32) -> i32 {
 }
 #[unsafe(no_mangle)]
 pub extern "system" fn IsWindow(hwnd: u32) -> i32 {
+    if hwnd == DESKTOP { return 1; }
     state::with(|s| i32::from(s.windows.iter().any(|w| w.hwnd == hwnd)))
 }
 #[unsafe(no_mangle)]
@@ -307,6 +315,7 @@ pub extern "system" fn IsWindowUnicode(hwnd: u32) -> i32 {
 }
 #[unsafe(no_mangle)]
 pub extern "system" fn IsWindowVisible(hwnd: u32) -> i32 {
+    if hwnd == DESKTOP { return 1; }
     state::with(|s| {
         let mut handle = hwnd;
         for _ in 0..=s.windows.len() {
@@ -465,6 +474,7 @@ pub extern "system" fn SetWindowPos(
             };
             s.windows.insert(at, w);
         });
+        unsafe { RetroSurfaceOrder(hwnd, pos.after); }
     }
     update(hwnd);
     crate::frame::paint(hwnd);
@@ -992,6 +1002,9 @@ fn origin(hwnd: u32) -> Option<(i32, i32)> {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn GetClientRect(hwnd: u32, out: *mut crate::rect::Rect) -> i32 {
+    if hwnd == DESKTOP {
+        return unsafe { crate::rect::SetRect(out, 0, 0, GetSystemMetrics(0) as i32, GetSystemMetrics(1) as i32) };
+    }
     if out.is_null() {
         return state::error(87) as i32;
     }
@@ -1008,6 +1021,7 @@ pub unsafe extern "system" fn GetClientRect(hwnd: u32, out: *mut crate::rect::Re
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn GetWindowRect(hwnd: u32, out: *mut crate::rect::Rect) -> i32 {
+    if hwnd == DESKTOP { return unsafe { GetClientRect(hwnd, out) }; }
     if out.is_null() {
         return 0;
     }

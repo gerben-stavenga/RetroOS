@@ -168,16 +168,11 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::Gdi, 14) => (6, true, "SetViewportExt"),
         (Module::Gdi, 23) => (18, false, "Arc"),
         (Module::Gdi, 35) => (24, false, "StretchBlt"),
-        (Module::Gdi, 36) => (8, false, "Polygon"),
         (Module::Gdi, 38) => (14, true, "Escape"),
         (Module::Gdi, 53) => (16, false, "CreateDC"),
         (Module::Gdi, 54) => (8, false, "CreateEllipticRgn"),
         (Module::Gdi, 57) => (4, false, "CreateFontIndirect"),
-        (Module::Gdi, 60) => (2, false, "CreatePatternBrush"),
         (Module::Gdi, 67) => (8, false, "DPtoLP"),
-        (Module::Gdi, 74) => (10, true, "GetBitmapBits"),
-        (Module::Gdi, 80) => (4, false, "GetDeviceCaps"),
-        (Module::Gdi, 82) => (8, false, "GetObject"),
         (Module::Gdi, 91) => (8, true, "GetTextExtent"),
         (Module::Gdi, 93) => (6, false, "GetTextMetrics"),
         (Module::Gdi, 94) => (2, true, "GetViewportExt"),
@@ -200,12 +195,10 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::User, 176) => (10, false, "LoadString"),
         (Module::User, 177) => (6, false, "LoadAccelerators"),
         (Module::User, 178) => (8, false, "TranslateAccelerator"),
-        (Module::User, 286) => (0, false, "GetDesktopWindow"),
         (Module::User, 287) => (2, false, "GetLastActivePopup"),
         (Module::User, 420) => (0, false, "wsprintf"),
 
         (Module::User, 16) => (4, false, "ClipCursor"),
-        (Module::User, 83) => (8, false, "FrameRect"),
         (Module::User, 100) => (12, false, "DlgDirList"),
         (Module::User, 104) => (2, false, "MessageBeep"),
         (Module::User, 118) => (4, false, "RegisterWindowMessage"),
@@ -1389,58 +1382,6 @@ fn dispatch<A: crate::Arch>(
             windows.gdi_objects.push((handle, super::GdiObject::Font));
             handle
         }
-        (Module::Gdi, 60) => {
-            let bitmap = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
-            let Some(color) = windows.gdi_objects.iter().find_map(|(handle, object)| {
-                match object {
-                    super::GdiObject::Bitmap { pixels, .. } if *handle == bitmap => pixels
-                        .get(..4).map(|pixel| u32::from_le_bytes(pixel.try_into().unwrap())),
-                    _ => None,
-                }
-            }) else { return 0 };
-            let handle = windows.next_object;
-            windows.next_object = windows.next_object.wrapping_add(1);
-            windows.gdi_objects.push((handle, super::GdiObject::Brush(color)));
-            handle
-        }
-        (Module::Gdi, 80) => {
-            let index = stack_u16(machine, windows, regs, 4).unwrap_or(0);
-            match index {
-                // Virtual 256-colour display; keep palette capabilities
-                // consistent with the shared palette APIs. A -1 colour count
-                // is misinterpreted as monochrome by some Win16 applications.
-                2 => 1, // DT_RASDISPLAY
-                8 => 640, 10 => 480, 12 => 8, 14 => 1, 24 => 256,
-                38 => 0x100, // RC_PALETTE
-                88 | 90 => 96,
-                104 => 256, 106 => 20,
-                _ => 0,
-            }
-        }
-        (Module::Gdi, 82) => {
-            let Some(out) = stack_u32(machine, windows, regs, 4)
-                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
-            let capacity = usize::from(stack_u16(machine, windows, regs, 8).unwrap_or(0));
-            let handle = u32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0));
-            let Some(object) = windows.gdi_objects.iter()
-                .find(|(object_handle, _)| *object_handle == handle)
-                .map(|(_, object)| object) else { return 0 };
-            match object {
-                super::GdiObject::Bitmap { width, height, .. } if capacity >= 14 => {
-                    machine.zero(out, 14);
-                    machine.write::<i16>(out + 2, *width as i16);
-                    machine.write::<i16>(out + 4, *height as i16);
-                    machine.write::<i16>(out + 6, width.saturating_add(7).div_ceil(8) as i16);
-                    machine.write::<u8>(out + 8, 1);
-                    machine.write::<u8>(out + 9, 1);
-                    14
-                }
-                _ => {
-                    machine.zero(out, capacity);
-                    capacity as u32
-                }
-            }
-        }
         (Module::Gdi, 91) => {
             let count = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
             count.saturating_mul(8) | (16 << 16)
@@ -1585,7 +1526,10 @@ pub(super) fn handle_event<A: crate::Arch>(
             }
             let old_ldt = windows.ldt.len();
             let result = dispatch(machine, kt, windows, state, regs, gate);
-            if gate.module == Module::Kernel && matches!(gate.ordinal,15..=21|95|170|175..=177) {
+            if gate.module == Module::Kernel && matches!(gate.ordinal,15..=17|95|170|175..=177) {
+                // Lock/unlock/size/handle queries (18..=21) only touch block
+                // metadata. Rebuilding the descriptor mirror and reloading the
+                // LDT for each query makes resource-heavy Win16 startup crawl.
                 // Like DPMI descriptor release, clear saved data segments
                 // whose selector was freed. The metal return stub reloads
                 // them before IRET; reloading a deleted descriptor faults in

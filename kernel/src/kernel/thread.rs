@@ -258,8 +258,8 @@ impl<A: crate::Arch> Personality<A> {
             Self::Os2(state) if key == crate::kernel::gui::SurfaceKey(1) => {
                 crate::kernel::os2::surface_buffer(state)
             }
-            Self::Windows(state) if key == crate::kernel::gui::SurfaceKey(1) => {
-                crate::kernel::windows::surface_buffer(state)
+            Self::Windows(state) => {
+                crate::kernel::windows::surface_buffer(state, key)
             }
             Self::Dos(state) if key == crate::kernel::gui::SurfaceKey(2) => {
                 crate::kernel::dos::surface_buffer(state, format)

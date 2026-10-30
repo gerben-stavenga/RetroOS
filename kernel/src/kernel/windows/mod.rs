@@ -135,9 +135,7 @@ enum Api {
     FillRect,
     DrawEdge,
     GetSysColorBrush,
-    GetSystemMetrics,
     CreateCompatibleDC,
-    CreateCompatibleBitmap,
     SelectObject,
     BitBlt,
     CreateSolidBrush,
@@ -286,6 +284,7 @@ pub struct WindowsState {
     stack_base: u32,
     stack_size: u32,
     windows: Vec<Window>,
+    presentations: Vec<(u32, crate::kernel::gui::NodeId)>,
     messages: Vec<Message>,
     user_events: Vec<u32>,
     registered_messages: Vec<(Vec<u8>,u32)>,
@@ -346,6 +345,7 @@ impl WindowsState {
             stack_base: 0,
             stack_size: 0,
             windows: Vec::new(),
+            presentations: Vec::new(),
             messages: Vec::new(),
             user_events: Vec::new(),
             registered_messages: Vec::new(),
@@ -449,11 +449,16 @@ impl WindowsState {
             return;
         };
         let hwnd = window.hwnd;
-        self.mouse_x =
-            (self.mouse_x + i32::from(dx)).clamp(0, window.width.saturating_sub(1) as i32);
-        self.mouse_y =
-            (self.mouse_y + i32::from(dy)).clamp(0, window.height.saturating_sub(1) as i32);
-        let lparam = (self.mouse_x as u32 & 0xffff) | ((self.mouse_y as u32 & 0xffff) << 16);
+        let (width, height) = self.windows.iter().filter(|w| w.visible && w.parent == 0)
+            .fold((640, 480), |(width, height), w| (
+                width.max(w.x.saturating_add(w.width as i32)),
+                height.max(w.y.saturating_add(w.height as i32))));
+        self.mouse_x = self.mouse_x.saturating_add(i32::from(dx)).clamp(0, width - 1);
+        self.mouse_y = self.mouse_y.saturating_add(i32::from(dy)).clamp(0, height - 1);
+        // USER32 routes this desktop position, including capture and hit tests.
+        let x = self.mouse_x - window.x;
+        let y = self.mouse_y - window.y;
+        let lparam = (x as u32 & 0xffff) | ((y as u32 & 0xffff) << 16);
         self.messages.push(Message {
             hwnd,
             message: 0x0200,
@@ -510,7 +515,9 @@ pub fn exec_ne_into<A: crate::Arch>(
     win16::exec(machine, threads, tid, data, path, parent_cwd, launcher, cmdtail)
 }
 
-/// Publish the foremost native Win32 top-level window into the shared desktop.
+/// Publish guest-owned top-level surfaces. USER32 owns placement and window
+/// policy; the desktop composes every surface rather than discarding all but
+/// the last one (for example, a game's floating status/tool window).
 pub fn render<A: crate::Arch>(
     _machine: &mut A,
     _bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -519,70 +526,82 @@ pub fn render<A: crate::Arch>(
     desktop: &mut crate::kernel::gui::Desktop,
     endpoint: crate::kernel::gui::EndpointId,
 ) {
-    const WINDOW_SURFACE: crate::kernel::gui::SurfaceKey = crate::kernel::gui::SurfaceKey(1);
-    const WINDOW_PRESENTATION: crate::kernel::gui::PresentationKey =
-        crate::kernel::gui::PresentationKey(1);
+    publish_surfaces(state, desktop, endpoint);
+}
+
+fn publish_surfaces(
+    state: &mut WindowsState,
+    desktop: &mut crate::kernel::gui::Desktop,
+    endpoint: crate::kernel::gui::EndpointId,
+) {
+    use crate::kernel::gui::{Point, PresentationKey, Rect, SurfaceKey, Transaction};
     let focus_changed = desktop.focus(endpoint);
-    let Some(index) = state.windows.iter()
-        .rposition(|window| window.visible && window.parent == 0) else {
-        return;
-    };
-    let (width, height) = (
-        state.windows[index].width as usize,
-        state.windows[index].height as usize,
-    );
-    let surface = desktop
-        .ensure_surface(endpoint, WINDOW_SURFACE)
-        .expect("create Win32 surface");
-    let node = desktop
-        .ensure_window_node(
-            endpoint,
-            WINDOW_PRESENTATION,
-            crate::kernel::gui::Rect::new(0, 0, width as u32, height as u32),
-        )
-        .expect("create Win32 presentation node");
-    let placement = desktop
-        .geometry(node)
-        .expect("live Win32 presentation node");
-    let pointer_changed = if state.cursor_visible { desktop.set_pointer(crate::kernel::gui::Point {
-        x: placement.x + state.mouse_x,
-        y: placement.y + state.mouse_y,
-    }) } else { desktop.clear_pointer() };
+    let pointer_changed = if state.cursor_visible {
+        desktop.set_pointer(Point { x: state.mouse_x, y: state.mouse_y })
+    } else { desktop.clear_pointer() };
     if !state.dirty && !state.cursor_dirty && !focus_changed && !pointer_changed {
         return;
     }
-    let geometry = crate::kernel::gui::Rect::new(
-        placement.x, placement.y, width as u32, height as u32,
-    );
-    let structural = desktop.node_state(node).is_none_or(|current| {
-        current.geometry != geometry || current.content != Some(surface) || !current.visible
+    let mut transaction = Transaction::new(endpoint);
+    let mut structural = false;
+    let order_changed = state.presentations.iter().map(|&(hwnd, _)| hwnd)
+        .ne(state.windows.iter().filter(|w| w.parent == 0).map(|w| w.hwnd));
+    state.presentations.retain(|&(hwnd, node)| {
+        if state.windows.iter().any(|w| w.hwnd == hwnd && w.parent == 0) {
+            true
+        } else {
+            transaction.destroy(node);
+            structural = true;
+            false
+        }
     });
-    if structural {
-        let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
-        transaction
-            .set_geometry(node, geometry)
-            .attach(node, Some(surface))
-            .set_visible(node, true);
-        desktop.commit(transaction).expect("commit Win32 presentation node");
+    for window in state.windows.iter().filter(|w| w.parent == 0) {
+        let key = SurfaceKey(u64::from(window.hwnd));
+        let surface = desktop.ensure_surface(endpoint, key).expect("create Windows surface");
+        let geometry = Rect::new(window.x, window.y, window.width, window.height);
+        let node = desktop.ensure_node(endpoint, PresentationKey(key.0), geometry)
+            .expect("create Windows presentation");
+        if !state.presentations.iter().any(|&(hwnd, _)| hwnd == window.hwnd) {
+            state.presentations.push((window.hwnd, node));
+        }
+        if desktop.node_state(node).is_none_or(|current| {
+            current.geometry != geometry || current.content != Some(surface)
+                || current.visible != window.visible
+        }) {
+            transaction.set_geometry(node, geometry).attach(node, Some(surface))
+                .set_visible(node, window.visible);
+            structural = true;
+        }
+        if state.dirty {
+            desktop.damage_surface(endpoint, key);
+        }
+        if order_changed {
+            // Native surface order is supplied by guest USER32, back to front.
+            transaction.raise(node);
+            structural = true;
+        }
     }
-    if state.dirty || state.cursor_dirty {
-        desktop.damage_surface(endpoint, WINDOW_SURFACE);
+    if structural { desktop.commit(transaction).expect("commit Windows presentations"); }
+    if order_changed {
+        for (i, window) in state.windows.iter().filter(|w| w.parent == 0).enumerate() {
+            if let Some(j) = state.presentations.iter().position(|&(hwnd, _)| hwnd == window.hwnd) {
+                state.presentations.swap(i, j);
+            }
+        }
     }
-
     state.dirty = false;
     state.cursor_dirty = false;
 }
 
-pub fn surface_buffer<'a>(
-    state: &'a WindowsState,
-) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
-    let window = state.windows.iter().rfind(|window| window.visible && window.parent == 0)?;
+pub fn surface_buffer(
+    state: &WindowsState,
+    key: crate::kernel::gui::SurfaceKey,
+) -> Option<crate::kernel::gui::PixelBuffer<'_>> {
+    let window = state.windows.iter().find(|w| u64::from(w.hwnd) == key.0 && w.parent == 0)?;
     crate::kernel::gui::PixelBuffer::new(
         window.width as usize,
         window.height as usize,
         window.width as usize * 4,
-        // GDI stores COLORREF (red in the low byte). The console rasterizer
-        // writes native packed pixels instead.
         if window.hwnd == state.console.hwnd { vga::PixelFormat::NATIVE }
         else { vga::PixelFormat { red_pos: 0, blue_pos: 16, ..vga::PixelFormat::NATIVE } },
         &window.pixels,
@@ -1032,7 +1051,6 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
     (b"USER32", b"GetDC", Api::GetDC, 4),
     (b"USER32", b"GetDlgItemTextW", Api::Stub(0), 16),
     (b"USER32", b"GetSysColorBrush", Api::GetSysColorBrush, 4),
-    (b"USER32", b"GetSystemMetrics", Api::GetSystemMetrics, 4),
     (b"USER32", b"InvalidateRect", Api::InvalidateRect, 12),
     (b"USER32", b"LoadAcceleratorsW", Api::Stub(0), 8),
     (b"USER32", b"LoadCursorW", Api::Stub(1), 8),
@@ -1050,12 +1068,6 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
     (b"USER32", b"UpdateWindow", Api::UpdateWindow, 4),
     (b"GDI32", b"Arc", Api::Stub(1), 36),
     (b"GDI32", b"BitBlt", Api::BitBlt, 36),
-    (
-        b"GDI32",
-        b"CreateCompatibleBitmap",
-        Api::CreateCompatibleBitmap,
-        12,
-    ),
     (b"GDI32", b"CreateCompatibleDC", Api::CreateCompatibleDC, 4),
     (b"GDI32", b"CreateFontW", Api::Stub(1), 56),
     (b"GDI32", b"CreatePen", Api::CreatePen, 12),
@@ -2147,17 +2159,6 @@ fn dispatch<A: crate::Arch>(
             }
         }
         Api::RetroWndProcReturn => 0,
-        Api::GetSystemMetrics => match arg(machine, regs, 0) {
-            0 => 1024,
-            1 => 768,
-            2 | 3 => 16,
-            4 => 20,
-            5 | 6 => 1,
-            7 | 8 => 3,
-            15 => 19,
-            32 | 33 => 4,
-            _ => 0,
-        },
         Api::BeginPaint => {
             let hwnd = arg(machine, regs, 0);
             let out = arg(machine, regs, 1) as usize;
@@ -2197,21 +2198,6 @@ fn dispatch<A: crate::Arch>(
             state
                 .gdi_objects
                 .push((handle, GdiObject::Pen(arg(machine, regs, 2))));
-            handle
-        }
-        Api::CreateCompatibleBitmap => {
-            let width = arg(machine, regs, 1).clamp(1, 2048);
-            let height = arg(machine, regs, 2).clamp(1, 2048);
-            let handle = state.next_object;
-            state.next_object += 1;
-            state.gdi_objects.push((
-                handle,
-                GdiObject::Bitmap {
-                    width,
-                    height,
-                    pixels: vec![0; width as usize * height as usize * 4],
-                },
-            ));
             handle
         }
         Api::CreateCompatibleDC => {
@@ -2681,6 +2667,41 @@ mod path_tests {
 #[cfg(test)]
 mod damage_tests {
     use super::*;
+
+    #[test]
+    fn independent_windows_keep_surfaces_geometry_and_z_order() {
+        use crate::kernel::gui::{Content, Desktop, EndpointId, SurfaceKey};
+        let mut state = WindowsState::new();
+        state.cursor_visible = false;
+        for (hwnd, x, width, color) in [(10, 0, 4, 0x0000ffu32), (11, 2, 2, 0xff0000)] {
+            state.windows.push(Window { hwnd, parent: 0, x, y: 0, width, height: 1,
+                visible: true, pixels: color.to_le_bytes().repeat(width as usize) });
+        }
+        let mut desktop = Desktop::new();
+        let endpoint = EndpointId(1);
+        let mut compose = |state: &mut WindowsState| {
+            state.dirty = true;
+            publish_surfaces(state, &mut desktop, endpoint);
+            let content: Vec<_> = state.windows.iter().map(|w| {
+                let key = SurfaceKey(u64::from(w.hwnd));
+                Content { id: desktop.ensure_surface(endpoint, key).unwrap(),
+                    buffer: surface_buffer(state, key).unwrap() }
+            }).collect();
+            let mut output = Vec::new();
+            desktop.compose_surfaces(&content, 4, 1, vga::PixelFormat::NATIVE, &mut output).unwrap();
+            output.chunks_exact(4).map(|p| u32::from_le_bytes(p.try_into().unwrap())).collect::<Vec<_>>()
+        };
+        assert_eq!(compose(&mut state), vec![0xff0000, 0xff0000, 0xff, 0xff]);
+        state.windows.swap(0, 1);
+        assert_eq!(compose(&mut state), vec![0xff0000; 4]);
+        state.windows[1].visible = false;
+        let output = compose(&mut state);
+        assert_eq!(&output[2..], &[0xff, 0xff]);
+        state.windows.remove(0);
+        compose(&mut state);
+        assert_eq!(state.presentations.len(), 1);
+        assert!(surface_buffer(&state, SurfaceKey(11)).is_none());
+    }
 
     #[test]
     fn window_writes_damage_scanout_but_offscreen_work_and_reads_do_not() {

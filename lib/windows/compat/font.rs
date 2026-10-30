@@ -159,6 +159,9 @@ pub unsafe extern "system" fn SelectObject(dc: u32, obj: u32) -> u32 {
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn GetObjectW(h: u32, size: i32, out: u32) -> i32 {
+    if let Some(result) = unsafe { crate::bitmap_object(h, size, out) } {
+        return result;
+    }
     if !is_font(h) {
         return unsafe { RetroGdiObject(h, size.max(0) as u32, out) };
     }

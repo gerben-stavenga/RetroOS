@@ -5,6 +5,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 extern crate alloc;
 mod font;
+mod palette;
 #[allow(dead_code)]
 #[path = "../user32/runtime.rs"]
 mod runtime;
@@ -31,9 +32,11 @@ impl Rect {
 }
 struct State {
     palettes: Vec<(u32, Vec<u32>)>,
-    realized_palette: u32,
+    primary_palette: u32,
+    device_palette: palette::Device,
     selected_palettes: Vec<(u32, u32)>,
     bitmap_sizes: Vec<(u32, [i32; 2])>,
+    patterns: Vec<(u32, usize, usize, u32, Vec<u8>)>,
     bitmap_formats: Vec<(u32, usize, usize, u32, Vec<u8>)>,
     bitmap_drawn: Vec<u32>,
     poly_modes: Vec<(u32, i32)>,
@@ -55,9 +58,11 @@ unsafe impl Sync for Global {}
 static GLOBAL: Global = Global {
     lock: AtomicBool::new(false),
     state: UnsafeCell::new(State {
-        realized_palette: 0x3000f,
+        primary_palette: 0x3000f,
+        device_palette: palette::Device::new(),
         palettes: Vec::new(), selected_palettes: Vec::new(),
         bitmap_drawn: Vec::new(),
+        patterns: Vec::new(),
         bitmap_formats: Vec::new(), bitmap_sizes: Vec::new(), poly_modes: Vec::new(), bk_modes: Vec::new(),
         fonts: Vec::new(),
         selected_fonts: Vec::new(),
@@ -327,7 +332,7 @@ pub extern "system" fn DeleteObject(h: u32) -> i32 {
     let found = with(|s| {
         if let Some(i) = s.palettes.iter().position(|(id,_)| *id == h) {
             if s.selected_palettes.iter().any(|(_,p)| *p == h) {return false;}
-            s.palettes.remove(i); true
+            s.palettes.remove(i); s.device_palette.remove(h); true
         } else if let Some(i) = s.regions.iter().position(|(id, _)| *id == h) {
             s.regions.remove(i);
             true
@@ -347,7 +352,7 @@ pub extern "system" fn DeleteObject(h: u32) -> i32 {
         0
     } else {
         let result=unsafe { RetroGdiDeleteObject(h) };
-        if result!=0 {with(|s| {s.bitmap_formats.retain(|(id,_,_,_,_)|*id!=h);s.bitmap_drawn.retain(|id|*id!=h);s.bitmap_sizes.retain(|(id,_)|*id!=h);});}
+        if result!=0 {with(|s| {s.patterns.retain(|(id,_,_,_,_)|*id!=h);s.bitmap_formats.retain(|(id,_,_,_,_)|*id!=h);s.bitmap_drawn.retain(|id|*id!=h);s.bitmap_sizes.retain(|(id,_)|*id!=h);});}
         result
     }
 }
@@ -468,6 +473,40 @@ unsafe extern "system" {
     fn RetroGdiBitmap(width: u32, height: u32, pixels: *const u32) -> u32;
 }
 #[unsafe(no_mangle)]
+pub extern "system" fn GetDeviceCaps(_dc: u32, index: i32) -> i32 {
+    match index {
+        0 => 0x300,
+        2 => 1,
+        8 => 1024,
+        10 => 768,
+        12 => 8,
+        14 => 1,
+        24 | 104 => 256,
+        38 => 0x100 | 1 | 0x80 | 0x200 | 0x800,
+        88 | 90 => 96,
+        106 => 20,
+        _ => 0,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn CreateCompatibleBitmap(dc: u32, width: i32, height: i32) -> u32 {
+    let selected = unsafe { RetroGdiCurrentObject(dc, 7) };
+    // A fresh memory DC contains the stock monochrome bitmap. A window DC
+    // uses the virtual display's depth; selecting a bitmap overrides it.
+    let depth = if dc == 0 || selected == 1 { 1 } else {
+        with(|s| s.bitmap_formats.iter().find(|(h, _, _, _, _)| *h == selected)
+            .map_or(8, |(_, _, _, depth, _)| *depth))
+    };
+    let bitmap = unsafe { CreateBitmap(width, height, 1, depth, core::ptr::null()) };
+    if bitmap != 0 {
+        // There is no uploaded image to replay: later GDI drawing owns these
+        // pixels. SetBitmapBits explicitly supplies a new upload when used.
+        with(|s| s.bitmap_drawn.push(bitmap));
+    }
+    bitmap
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn CreateBitmap(
     width: i32,
     height: i32,
@@ -488,7 +527,8 @@ pub unsafe extern "system" fn CreateBitmap(
     let mut bytes = vec![0; stride * height];
     if !source.is_null() {
         unsafe { core::ptr::copy_nonoverlapping(source, bytes.as_mut_ptr(), bytes.len()); }
-        decode_bitmap(&bytes, width, height, depth, &[], &mut pixels);
+        let colors = with(|s| s.device_palette.colors);
+        decode_bitmap(&bytes, width, height, depth, &colors, &mut pixels);
     }
     let handle = unsafe { RetroGdiBitmap(width as u32, height as u32, pixels.as_ptr()) };
     if handle != 0 {
@@ -636,8 +676,109 @@ pub unsafe extern "system" fn SetDIBitsToDevice(
 
 unsafe extern "system" {
     fn RetroGdiCurrentObject(dc: u32, kind: u32) -> u32;
-    fn RetroGdiFillRect(dc: u32, rect: *const [i32; 4], brush: u32) -> i32;
+    fn RetroGdiSolidFillRect(dc: u32, rect: *const [i32; 4], brush: u32) -> i32;
     fn Polygon(dc: u32, points: *const [i32; 2], count: i32) -> i32;
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn CreatePatternBrush(bitmap: u32) -> u32 {
+    unsafe extern "system" { fn CreateSolidBrush(color: u32) -> u32; }
+    let mut object = [0u32; 6];
+    if unsafe { font::GetObjectW(bitmap, 24, object.as_mut_ptr() as u32) } != 24 {
+        return 0;
+    }
+    let (width, height, depth) = (object[1] as usize, object[2] as usize, object[4] >> 16);
+    if width == 0 || height == 0 || width > 2048 || height > 2048
+        || !matches!(depth, 1 | 4 | 8 | 24 | 32) { return 0; }
+    let size = (width * depth as usize).div_ceil(16) * 2 * height;
+    // An uploaded indexed bitmap already has exact palette indices. Preserve
+    // them even when the currently realized palette has duplicate colours.
+    let uploaded = with(|s| {
+        if s.bitmap_drawn.contains(&bitmap) || !matches!(depth, 4 | 8) { return None; }
+        s.bitmap_formats.iter().find(|(h, _, _, _, _)| *h == bitmap)
+            .map(|(_, _, _, _, bytes)| bytes.clone())
+    });
+    let bytes = if let Some(bytes) = uploaded { bytes } else {
+        let mut bytes = vec![0; size];
+        if unsafe { GetBitmapBits(bitmap, size as i32, bytes.as_mut_ptr()) } != size as i32 {
+            return 0;
+        }
+        bytes
+    };
+    // The native handle supplies ordinary selection/lifetime behavior. The
+    // immutable pattern snapshot and its interpretation belong to guest GDI.
+    let brush = unsafe { CreateSolidBrush(0) };
+    if brush != 0 { with(|s| s.patterns.push((brush, width, height, depth, bytes))); }
+    brush
+}
+
+unsafe fn pattern_fill(dc: u32, rect: [i32; 4], brush: u32, rop: u32) -> Option<i32> {
+    let (width, height, depth, bytes, palette, origin) = with(|s| {
+        let (_, w, h, depth, bytes) = s.patterns.iter().find(|(id, _, _, _, _)| *id == brush)?;
+        let colors = s.device_palette.colors.to_vec();
+        let origin = s.brush_origins.iter().find(|(h, _)| *h == dc).map_or([0; 2], |(_, p)| *p);
+        Some((*w, *h, *depth, bytes.clone(), colors, origin))
+    })?;
+    let mut bounds = Rect::default();
+    if unsafe { RetroGdiBounds(dc, &mut bounds) } == 0 { return Some(0); }
+    let [left, top, right, bottom] = rect;
+    let (left, top) = (left.max(bounds.left), top.max(bounds.top));
+    let (right, bottom) = (right.min(bounds.right), bottom.min(bounds.bottom));
+    if right <= left || bottom <= top { return Some(1); }
+    let mut pattern = vec![0; width * height];
+    decode_bitmap(&bytes, width, height, depth, &palette, &mut pattern);
+    if depth == 1 {
+        unsafe extern "system" { fn GetTextColor(dc: u32) -> u32; fn GetBkColor(dc: u32) -> u32; }
+        let text = unsafe { GetTextColor(dc) };
+        let background = unsafe { GetBkColor(dc) };
+        for pixel in &mut pattern { *pixel = if *pixel == 0 { text } else { background }; }
+    }
+    let (w, h) = ((right - left) as usize, (bottom - top) as usize);
+    let mut pixels = vec![0; w * h];
+    for y in 0..h {
+        let py = (i64::from(top) + y as i64 - i64::from(origin[1])).rem_euclid(height as i64) as usize;
+        for x in 0..w {
+            let px = (i64::from(left) + x as i64 - i64::from(origin[0])).rem_euclid(width as i64) as usize;
+            pixels[y * w + x] = pattern[py * width + px];
+        }
+    }
+    // Expand once in guest memory and submit one blit, including the native
+    // destination clip and ROP. No syscall per pattern tile or pixel.
+    let bitmap = unsafe { RetroGdiBitmap(w as u32, h as u32, pixels.as_ptr()) };
+    if bitmap == 0 { return Some(0); }
+    let source = unsafe { CreateCompatibleDC(dc) };
+    if source == 0 { DeleteObject(bitmap); return Some(0); }
+    let old = unsafe { font::SelectObject(source, bitmap) };
+    // The requested operation uses P and D; the temporary bitmap supplies P
+    // through S. Replicate the resulting S,D truth table for both P values.
+    let truth = (rop >> 16) as u8;
+    let sd = (truth & 3) | ((truth >> 2) & 12);
+    let mapped = u32::from(sd | (sd << 4)) << 16;
+    let result = unsafe { RetroGdiBitBlt(dc, left, top, w as i32, h as i32, source, 0, 0, mapped) };
+    unsafe { font::SelectObject(source, old); }
+    DeleteDC(source);
+    DeleteObject(bitmap);
+    if result != 0 { mark_bitmap_drawn(dc); }
+    Some(result)
+}
+
+fn mark_bitmap_drawn(dc: u32) {
+    let bitmap = unsafe { RetroGdiCurrentObject(dc, 7) };
+    with(|s| {
+        if s.bitmap_formats.iter().any(|(h, _, _, _, _)| *h == bitmap)
+            && !s.bitmap_drawn.contains(&bitmap) { s.bitmap_drawn.push(bitmap); }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn RetroGdiFillRect(dc: u32, rect: *const [i32; 4], brush: u32) -> i32 {
+    if rect.is_null() { return 0; }
+    if let Some(result) = unsafe { pattern_fill(dc, rect.read_unaligned(), brush, 0x00f00021) } {
+        return result;
+    }
+    let result = unsafe { RetroGdiSolidFillRect(dc, rect, brush) };
+    if result != 0 { mark_bitmap_drawn(dc); }
+    result
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn Rectangle(
@@ -749,6 +890,11 @@ pub unsafe extern "system" fn PatBlt(dc:u32,x:i32,y:i32,width:i32,height:i32,rop
     // A pattern operation cannot depend on the source operand. Reuse the
     // shared raster operation and clipping with an identical source view.
     if ((truth >> 2) ^ truth) & 0x33 != 0 {return 0;}
+    let brush = unsafe { RetroGdiCurrentObject(dc, 2) };
+    if let Some(result) = unsafe { pattern_fill(dc,
+        [x, y, x.saturating_add(width), y.saturating_add(height)], brush, rop) } {
+        return result;
+    }
     unsafe {BitBlt(dc,x,y,width,height,dc,x,y,rop)}
 }
 
@@ -800,32 +946,126 @@ pub unsafe extern "system" fn SetPaletteEntries(palette:u32,start:u32,n:u32,p:*c
         for i in 0..n {v[start+i]=unsafe{p.add(i).read_unaligned()};}n as u32})
 }
 #[unsafe(no_mangle)]
-pub extern "system" fn SelectPalette(dc:u32,palette:u32,_background:u32)->u32 {
+pub extern "system" fn SelectPalette(dc:u32,palette:u32,background:u32)->u32 {
     with(|s|{if palette != 0x3000f && !s.palettes.iter().any(|(h,_)|*h==palette){return 0;}
+        if background == 0 { s.primary_palette = palette; }
         if let Some((_,p))=s.selected_palettes.iter_mut().find(|(h,_)|*h==dc){core::mem::replace(p,palette)}
         else{s.selected_palettes.push((dc,palette));0x3000f}})
 }
 #[unsafe(no_mangle)]
 pub extern "system" fn RealizePalette(dc:u32)->u32 {
-    // The backing surface is true colour, but DDB uploads still use the
-    // logical device palette when their memory DC has no explicit palette.
     with(|s| {
-        s.realized_palette = s.selected_palettes.iter().find(|(h,_)|*h==dc)
-            .map_or(0x3000f,|(_,p)|*p);
-    });
-    0
+        let id = s.selected_palettes.iter().find(|(h,_)|*h==dc).map_or(0x3000f,|(_,p)|*p);
+        let Some((_, entries)) = s.palettes.iter().find(|(h,_)|*h==id) else { return 0; };
+        s.device_palette.realize(id, entries, id == s.primary_palette)
+    })
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn AnimatePalette(palette:u32,start:u32,n:u32,p:*const u32)->i32 {
+    if p.is_null() || n > 256 { return 0; }
+    let entries: Vec<u32> = (0..n as usize).map(|i| unsafe {p.add(i).read_unaligned()}).collect();
+    with(|s| {
+        let Some((_, logical)) = s.palettes.iter_mut().find(|(h,_)|*h==palette) else {return 0;};
+        s.device_palette.animate(palette, logical, start as usize, &entries);
+        1
+    })
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn GetSystemPaletteEntries(_dc:u32,start:u32,n:u32,p:*mut u32)->u32 {
     if p.is_null(){return 256;}
     let count=n.min(256u32.saturating_sub(start));
+    let colors = with(|s| s.device_palette.colors);
     for i in 0..count {let index=start+i;
-        let c=system_palette_color(index);
+        let c=colors[index as usize];
         unsafe{p.add(i as usize).write_unaligned(c);}}
     count
 }
 
 unsafe extern "system" {fn RetroGdiBitmapWrite(bitmap:u32,pixels:*const u32,count:u32)->i32;}
+unsafe extern "system" {
+    fn RetroGdiBitmapRead(bitmap: u32, pixels: *mut u32, count: u32) -> i32;
+}
+
+unsafe fn bitmap_object(bitmap: u32, size: i32, out: u32) -> Option<i32> {
+    let format = with(|s| s.bitmap_formats.iter().find(|(h, _, _, _, _)| *h == bitmap)
+        .map(|(_, w, h, depth, _)| (*w, *h, *depth)))?;
+    if out == 0 { return Some(24); }
+    if size < 24 { return Some(0); }
+    let (width, height, depth) = format;
+    let object = [0, width as u32, height as u32,
+        ((width * depth as usize).div_ceil(16) * 2) as u32, 1 | (depth << 16), 0];
+    unsafe { core::ptr::copy_nonoverlapping(object.as_ptr().cast::<u8>(), out as *mut u8, 24); }
+    Some(24)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn GetBitmapBits(bitmap: u32, count: i32, out: *mut u8) -> i32 {
+    let format = with(|s| s.bitmap_formats.iter()
+        .find(|(h, _, _, _, _)| *h == bitmap).cloned());
+    let (width, height, depth, original) = if let Some((_, w, h, d, bytes)) = format {
+        (w, h, d, bytes)
+    } else {
+        // Bitmaps made by the native surface primitive are true colour.
+        let mut object = [0u32; 6];
+        if unsafe { font::GetObjectW(bitmap, 24, object.as_mut_ptr() as u32) } != 24 {
+            return 0;
+        }
+        (object[1] as usize, object[2] as usize, 32, Vec::new())
+    };
+    let stride = (width * depth as usize).div_ceil(16) * 2;
+    let total = stride * height;
+    if out.is_null() { return total as i32; }
+    if count <= 0 { return 0; }
+    let rows = (count as usize / stride).min(height);
+    if rows == 0 { return 0; }
+    let mut pixels = vec![0; width * height];
+    if unsafe { RetroGdiBitmapRead(bitmap, pixels.as_mut_ptr(), pixels.len() as u32) } == 0 {
+        return 0;
+    }
+    let palette = with(|s| s.device_palette.colors);
+    let colors: Vec<u32> = if depth <= 8 {
+        (0..1u32 << depth).map(|i| {
+            if depth == 1 { if i == 0 { 0 } else { 0xffffff } }
+            else { bitmap_color(i as usize, depth, &palette) }
+        }).collect()
+    } else { Vec::new() };
+    let mut bytes = vec![0u8; rows * stride];
+    for y in 0..rows {
+        for x in 0..width {
+            let c = pixels[y * width + x] & 0xffffff;
+            let row = y * stride;
+            if depth <= 8 {
+                let old = match depth {
+                    1 => original.get(row + x / 8).map(|v| (v >> (7 - x % 8)) & 1),
+                    4 => original.get(row + x / 2).map(|v| (v >> (4 * (1 - x % 2))) & 15),
+                    _ => original.get(row + x).copied(),
+                };
+                // Preserve identical-colour palette indices when possible.
+                let index = old.filter(|i| colors[*i as usize] == c).unwrap_or_else(|| {
+                    colors.iter().enumerate().min_by_key(|(_, color)| {
+                        [0, 8, 16].iter().map(|shift| {
+                            let d = ((c >> shift) & 255) as i32 - ((*color >> shift) & 255) as i32;
+                            d * d
+                        }).sum::<i32>()
+                    }).map_or(0, |(i, _)| i as u8)
+                });
+                match depth {
+                    1 => bytes[row + x / 8] |= index << (7 - x % 8),
+                    4 => bytes[row + x / 2] |= index << (4 * (1 - x % 2)),
+                    _ => bytes[row + x] = index,
+                }
+            } else {
+                let at = row + x * (depth as usize / 8);
+                bytes[at] = (c >> 16) as u8;
+                bytes[at + 1] = (c >> 8) as u8;
+                bytes[at + 2] = c as u8;
+            }
+        }
+    }
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()); }
+    bytes.len() as i32
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn SetBitmapBits(bitmap:u32,count:u32,source:*const u8)->i32 {
     if source.is_null() || count==0 || count>i32::MAX as u32 {return 0;}
@@ -837,7 +1077,8 @@ pub unsafe extern "system" fn SetBitmapBits(bitmap:u32,count:u32,source:*const u
         Some((*width,*height,*depth,bytes.clone(),n))
     }) else{return 0;};
     let mut pixels = vec![0; width * height];
-    decode_bitmap(&bytes, width, height, depth, &[], &mut pixels);
+    let colors = with(|s| s.device_palette.colors);
+        decode_bitmap(&bytes, width, height, depth, &colors, &mut pixels);
     if unsafe{RetroGdiBitmapWrite(bitmap,pixels.as_ptr(),pixels.len() as u32)}!=0 {n as i32}else{0}
 }
 
@@ -854,7 +1095,7 @@ fn decode_bitmap(bytes: &[u8], width: usize, height: usize, depth: u32, palette:
                         let value = bytes[row + x / 2];
                         if x & 1 == 0 { value >> 4 } else { value & 15 }
                     } as usize;
-                    palette.get(index).copied().unwrap_or_else(|| system_palette_color(index as u32)) & 0xffffff
+                    bitmap_color(index, depth, palette)
                 }
                 _ => {
                     let at = row + x * (depth as usize / 8);
@@ -864,32 +1105,58 @@ fn decode_bitmap(bytes: &[u8], width: usize, height: usize, depth: u32, palette:
         }
     }
 }
-fn system_palette_color(index: u32) -> u32 {
-    (index & 7) * 255 / 7 | (((index >> 3) & 7) * 255 / 7) << 8 | (((index >> 6) & 3) * 255 / 3) << 16
+fn bitmap_color(index: usize, depth: u32, palette: &[u32]) -> u32 {
+    // A four-bit DDB uses the standard 16-color palette. Its bright half
+    // corresponds to the final eight static slots of the 256-color device.
+    let slot = if depth == 4 && index >= 8 { index + 240 } else { index };
+    palette.get(slot).copied().unwrap_or(0) & 0xffffff
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn BitBlt(dst: u32, x: i32, y: i32, width: i32, height: i32, src: u32, sx: i32, sy: i32, rop: u32) -> i32 {
     let bitmap = unsafe { RetroGdiCurrentObject(src, 7) };
-    // Keep source indices intact: each blit resolves them using the DC's
-    // current logical palette, including changes made by AnimatePalette.
+    // Keep source indices intact: each blit resolves them using the
+    // current device palette, including changes made by AnimatePalette.
     let indexed = with(|s| {
         if s.bitmap_drawn.contains(&bitmap) { return None; }
         let (_, w, h, depth, bytes) = s.bitmap_formats.iter().find(|(id, _, _, depth, _)| *id == bitmap && matches!(depth, 4 | 8))?;
-        let selected = |dc| s.selected_palettes.iter().find(|(h, _)| *h == dc)
-            .and_then(|(_, id)| s.palettes.iter().find(|(h, _)| h == id));
-        let palette = selected(src).or_else(|| selected(dst))
-            .or_else(|| s.palettes.iter().find(|(h, _)| *h == s.realized_palette))
-            .map_or_else(Vec::new, |(_, entries)| entries.clone());
+        let palette = s.device_palette.colors.to_vec();
         Some((*w, *h, *depth, bytes.clone(), palette))
     });
-    if let Some((w, h, depth, bytes, palette)) = indexed {
+    if let Some((w, h, depth, bytes, palette)) = &indexed {
         let mut pixels = vec![0; w * h];
-        decode_bitmap(&bytes, w, h, depth, &palette, &mut pixels);
+        decode_bitmap(bytes, *w, *h, *depth, palette, &mut pixels);
         if unsafe { RetroGdiBitmapWrite(bitmap, pixels.as_ptr(), pixels.len() as u32) } == 0 { return 0; }
     }
     let result = unsafe { RetroGdiBitBlt(dst, x, y, width, height, src, sx, sy, rop) };
     if result != 0 && !(dst == src && x == sx && y == sy && rop == 0x00cc0020) {
         let target = unsafe { RetroGdiCurrentObject(dst, 7) };
+        // A complete indexed SRCCOPY preserves indices, including entries
+        // which currently have identical RGB values during a palette fade.
+        // Converting this intermediate image to RGB permanently would lose
+        // those identities before its next blit to the window.
+        let preserved = if let Some((sw, sh, 8, bytes, _)) = &indexed {
+            with(|s| {
+                if rop != 0x00cc0020 || x != 0 || y != 0 || sx < 0 || sy < 0
+                    || width <= 0 || height <= 0 { return false; }
+                if s.clips.iter().find(|(h, _)| *h == dst).is_some_and(|(_, clips)| {
+                    !clips.iter().any(|r| r.left <= 0 && r.top <= 0 && r.right >= width && r.bottom >= height)
+                }) { return false; }
+                let Some((_, dw, dh, 8, output)) = s.bitmap_formats.iter_mut()
+                    .find(|(h, _, _, _, _)| *h == target) else { return false; };
+                if (*dw, *dh) != (width as usize, height as usize)
+                    || sx as usize + *dw > *sw || sy as usize + *dh > *sh { return false; }
+                let source_stride = sw.div_ceil(2) * 2;
+                let destination_stride = dw.div_ceil(2) * 2;
+                for row in 0..*dh {
+                    let from = (sy as usize + row) * source_stride + sx as usize;
+                    output[row * destination_stride..row * destination_stride + *dw]
+                        .copy_from_slice(&bytes[from..from + *dw]);
+                }
+                s.bitmap_drawn.retain(|h| *h != target);
+                true
+            })
+        } else { false };
+        if preserved { return result; }
         // The destination now contains rendered pixels. Do not overwrite a
         // composed image with the bytes originally supplied to CreateBitmap
         // when that image is subsequently used as a blit source.

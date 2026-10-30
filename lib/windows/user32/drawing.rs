@@ -1,6 +1,35 @@
 //! Text layout belongs to USER32; GDI supplies metrics and draws glyphs.
 use crate::text;
 use alloc::{vec, vec::Vec};
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn FillRect(dc: u32, rect: *const [i32; 4], brush: u32) -> i32 {
+    unsafe extern "system" {
+        fn RetroGdiFillRect(dc: u32, rect: *const [i32; 4], brush: u32) -> i32;
+        fn GetSysColorBrush(index: u32) -> u32;
+    }
+    let brush = if (1..=31).contains(&brush) { unsafe { GetSysColorBrush(brush - 1) } } else { brush };
+    unsafe { RetroGdiFillRect(dc, rect, brush) }
+}
+// Both the Win16 thunk and Win32 export use the same logical-coordinate edges.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn FrameRect(dc: u32, rect: *const [i32; 4], brush: u32) -> i32 {
+    unsafe extern "system" {
+        fn FillRect(dc: u32, rect: *const [i32; 4], brush: u32) -> i32;
+    }
+    if rect.is_null() { return 0; }
+    let [left, top, right, bottom] = unsafe { rect.read_unaligned() };
+    if left >= right || top >= bottom { return 0; }
+    let mut result = 1;
+    for edge in [
+        [left, top, right, top + 1],
+        [left, bottom - 1, right, bottom],
+        [left, top, left + 1, bottom],
+        [right - 1, top, right, bottom],
+    ] {
+        result &= unsafe { FillRect(dc, &edge, brush) };
+    }
+    result
+}
 unsafe extern "system" {
     fn TextOutW(dc: u32, x: i32, y: i32, text: *const u16, count: i32) -> i32;
     fn GetTextExtentPoint32W(dc: u32, text: *const u16, count: i32, size: *mut [i32; 2]) -> i32;

@@ -112,8 +112,12 @@ checks arithmetic, control-word restoration, conversion, and stack balance.
 Civilization for Windows now binds its imports and creates its custom dialogs.
 The adapters include huge-buffer memory/file operations, palette entries,
 indexed bitmap uploads/blits, and the protected-mode BIOS clock. Shared GDI
-retains uploaded indices for palette conversion; composed bitmap contents are
-preserved when subsequently used as a blit source. Palette changes do not yet
+retains uploaded indices, including complete indexed intermediate copies.
+Logical palettes map onto 256 device slots with 20 static colors; reserved
+entries remain distinct during fades. Win16 and Win32 share realization,
+reserved-entry animation, system-palette queries, and pattern-brush snapshots.
+Composed bitmap contents are preserved when subsequently used as a blit source.
+Palette changes do not yet
 recolour pixels already drawn to a window.
 
 MMSYSTEM reports sound/MCI services unavailable, and COMMDLG returns a dialog
@@ -122,15 +126,20 @@ unimplemented. These are failure-reporting compatibility exports, not working
 multimedia or common-dialog implementations.
 
 Local KVM acceptance reaches Civ's main menu, completes new-game setup, and
-reaches the opening capital-founding prompt. Palette rendering still has
-inaccuracies, and paths such as GetBitmapBits and FrameRect remain incomplete.
-The native presentation path still shows only the foremost top-level window,
-so Civ's separate Status window hides its map instead of composing both.
+reaches the opening capital-founding prompt with colored terrain, units,
+leader portraits, and patterned window backgrounds. Fades that only change the
+palette still need indexed window surfaces; the current window buffers hold RGB. Bitmap readback, bitmap metadata, compatible-bitmap creation,
+device capabilities, rectangle framing, polygons, desktop queries and screen
+metrics now use shared guest implementations or shared drawing primitives.
+The native presentation path retains all top-level surfaces at their guest
+coordinates. Shared USER32 supplies ordering and routes pointer input; the
+desktop composes the surfaces, including separate map and Status windows.
 This is not a complete gameplay acceptance test.
 Civilization II additionally imports video and AVI libraries.
 
 The `civ_apis` NE regression covers huge copies across a selector boundary,
 locked global-memory release, NE segment allocation padding, bitmap updates and
+readback after drawing, WORD-aligned bitmap metadata, rectangle framing,
 two-stage palette blits, custom dialog class forwarding through DefDlgProc, non-keyboard dispatch through
 IsDialogMessage, separate DIB headers/palettes, BIOS clock advancement,
 optional-service failure results, and guest stack balance. Run it with the

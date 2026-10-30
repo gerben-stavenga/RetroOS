@@ -61,7 +61,7 @@ bridge OffsetRect, 77, 8
 bridge InflateRect, 78, 8
 bridge IntersectRect, 79, 12
 bridge FillRect, 81, 8
-gate FrameRect
+bridge FrameRect, 83, 8
 bridge DrawIcon, 84, 8
 bridge DrawText, 85, 14
 bridge DialogBox, 87, 12
@@ -129,7 +129,7 @@ gate GetAsyncKeyState
 bridge GetDlgCtrlID, 277, 2
 bridge SelectPalette, 282, 6
 bridge RealizePalette, 283, 2
-gate GetDesktopWindow
+bridge GetDesktopWindow, 286, 0
 gate GetLastActivePopup
 gate CreateIcon
 bridge InsertMenu, 410, 12

@@ -4,11 +4,13 @@ section .text
 global %1
 %1: int 0x83
 %endmacro
+global _RetroGdiBitmapRead@12
+_RetroGdiBitmapRead@12:
+gate RetroGdiBitmapRead
 gate Arc
 global _RetroGdiBitBlt@36
 _RetroGdiBitBlt@36:
 gate RetroGdiBitBlt
-gate CreateCompatibleBitmap
 gate CreateCompatibleDC
 gate CreatePen
 gate CreateSolidBrush
@@ -76,9 +78,9 @@ global _CreateCompatibleDC@4
 _CreateCompatibleDC@4: jmp CreateCompatibleDC
 
 
-global _RetroGdiFillRect@12
-_RetroGdiFillRect@12:
-gate RetroGdiFillRect
+global _RetroGdiSolidFillRect@12
+_RetroGdiSolidFillRect@12:
+gate RetroGdiSolidFillRect
 global _RetroGdiCurrentObject@8
 _RetroGdiCurrentObject@8:
 gate RetroGdiCurrentObject
@@ -91,6 +93,8 @@ gate GetObjectType
 
 global _GetBkColor@4
 _GetBkColor@4: jmp GetBkColor
+global _GetTextColor@4
+_GetTextColor@4: jmp GetTextColor
 global _CreateSolidBrush@4
 _CreateSolidBrush@4: jmp CreateSolidBrush
 

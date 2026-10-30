@@ -112,6 +112,13 @@ pub(super) fn call<A: crate::Arch>(
             1
         }
 
+        b"RetroGdiBitmapRead" => {
+            let Some((_, super::super::GdiObject::Bitmap { pixels, .. })) =
+                state.gdi_objects.iter().find(|(h, _)| *h == a(0)) else { return 0; };
+            if a(2) as usize != pixels.len() / 4 { return 0; }
+            machine.copy_to(a(1) as usize, pixels);
+            1
+        }
         b"RetroGdiBitmapWrite" => {
             let handle=a(0);let source=a(1) as usize;let count=a(2) as usize;
             let Some((_,super::super::GdiObject::Bitmap{pixels,..}))=state.gdi_objects.iter_mut().find(|(h,_)|*h==handle) else{return 0;};
@@ -127,7 +134,7 @@ pub(super) fn call<A: crate::Arch>(
             state.gdi_objects.push((handle,super::super::GdiObject::Bitmap{width,height,pixels}));handle
         }
         b"RetroGdiBitBlt" => super::super::dispatch(machine, kt, state, regs, super::super::Api::BitBlt),
-        b"RetroGdiFillRect" => super::super::dispatch(machine, kt, state, regs, super::super::Api::FillRect),
+        b"RetroGdiSolidFillRect" => super::super::dispatch(machine, kt, state, regs, super::super::Api::FillRect),
         b"RetroGdiCurrentObject" => {
             state.dcs.iter().find(|d| d.handle == a(0)).map_or(0, |d| match a(1) {
                 1 => d.pen, 2 => d.brush, 6 => d.font, 7 => d.bitmap.unwrap_or(1), _ => 0,
@@ -164,8 +171,8 @@ pub(super) fn call<A: crate::Arch>(
 
         b"RetroPointerVisible" => { state.cursor_visible = a(0) != 0; state.cursor_dirty = true; 1 }
         b"RetroPointerPosition" => {
-            let (x,y)=state.windows.iter().rfind(|w|w.parent==0 && w.visible).map_or((0,0),|w|(w.x,w.y));
-            state.mouse_x=(a(0) as i32).saturating_sub(x);state.mouse_y=(a(1) as i32).saturating_sub(y);
+            state.mouse_x = a(0) as i32;
+            state.mouse_y = a(1) as i32;
             state.cursor_dirty=true;1
         }
         b"RetroReadEvent" => {
@@ -298,6 +305,18 @@ pub(super) fn call<A: crate::Arch>(
                 x: a(0) as i32, y: a(1) as i32, width, height, visible: false,
                 pixels: vec![0xc0; width as usize * height as usize * 4] });
             hwnd
+        }
+        b"RetroSurfaceOrder" => {
+            let (hwnd, after) = (a(0), a(1));
+            let Some(index) = state.windows.iter().position(|w| w.hwnd == hwnd) else { return 0; };
+            if hwnd == after { return 1; }
+            let window = state.windows.remove(index);
+            let at = if after == 1 { 0 }
+                else if after == 0 || after >= 0xffff_fffe { state.windows.len() }
+                else { state.windows.iter().position(|w| w.hwnd == after).unwrap_or(state.windows.len()) };
+            state.windows.insert(at, window);
+            state.dirty = true;
+            1
         }
         b"RetroSurfaceUpdate" => {
             let hwnd = a(0);

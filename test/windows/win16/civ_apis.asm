@@ -3,10 +3,11 @@ segment _TEXT public class=CODE use16
 extern Debug, Exit, GetTickCount, GlobalAlloc, GlobalLock, GlobalFree
 extern CreateDIBitmap
 extern hmemcpy, CreateBitmap, SetBitmapBits, CreateCompatibleDC, SelectObject
-extern DeleteDC, DeleteObject, GetPixel, CreatePalette, SetPaletteEntries
+extern DeleteDC, DeleteObject, GetPixel, CreatePalette, SetPaletteEntries, AnimatePalette
 extern GetBkMode, SetBkMode, GetOpenFileName, CommDlgExtendedError, sndPlaySound
 extern SetBitmapDimension, GetBitmapDimension, SelectPalette, RealizePalette, BitBlt
 extern IsDialogMessage
+extern GetBitmapBits, FrameRect, GetStockObject, GetObject, CreatePatternBrush
 extern RegisterClass, CreateDialogIndirect, DestroyWindow, DefDlgProc
 
 global _start
@@ -112,6 +113,89 @@ _start:
     cmp dx,0xff
     jne fail
     push word [bitmap]
+    push word 14
+    push ds
+    push word bitmap_info
+    call far GetObject
+    cmp ax,14
+    jne fail
+    cmp word [bitmap_info+6],2
+    jne fail
+    cmp word [bitmap_info+8],0x101
+    jne fail
+    ; Read actual DDB storage, including complete-row count semantics.
+    push word [bitmap]
+    push dword 0
+    push ds
+    push word readback
+    call far GetBitmapBits
+    or ax,dx
+    jnz fail
+    push word [bitmap]
+    push dword 0
+    push dword 0
+    call far GetBitmapBits
+    cmp ax,2
+    jne fail
+    push word [bitmap]
+    push dword 1
+    push ds
+    push word readback
+    call far GetBitmapBits
+    or ax,dx
+    jnz fail
+    cmp word [readback],0xa55a
+    jne fail
+    push word [bitmap]
+    push dword 2
+    push ds
+    push word readback
+    call far GetBitmapBits
+    cmp ax,2
+    jne fail
+    cmp word [readback],0x40
+    jne fail
+    push word [bitmap]
+    call far CreatePatternBrush
+    test ax,ax
+    jz fail
+    mov [pattern_brush],ax
+    ; Drawing must invalidate the original upload for bitmap readback.
+    push word 4
+    call far GetStockObject
+    push word [dc]
+    push ds
+    push word frame_rect
+    push ax
+    call far FrameRect
+    test ax,ax
+    jz fail
+    push word [bitmap]
+    push dword 2
+    push ds
+    push word readback
+    call far GetBitmapBits
+    cmp ax,2
+    jne fail
+    cmp word [readback],0
+    jne fail
+    push word [dc]
+    push ds
+    push word frame_rect
+    push word [pattern_brush]
+    call far FrameRect
+    test ax,ax
+    jz fail
+    push word [bitmap]
+    push dword 2
+    push ds
+    push word readback
+    call far GetBitmapBits
+    cmp word [readback],0x40
+    jne fail
+    push word [pattern_brush]
+    call far DeleteObject
+    push word [bitmap]
     push word 12
     push word 34
     call far SetBitmapDimension
@@ -208,6 +292,8 @@ _start:
     test ax,ax
     jz fail
     mov [old_palette],ax
+    push word [dc]
+    call far RealizePalette
     call indexed_blit
     push word [dc]
     push word 0
@@ -222,7 +308,7 @@ _start:
     push word 1
     push ds
     push word blue
-    call far SetPaletteEntries
+    call far AnimatePalette
     call indexed_blit
     push word [dc]
     push word 0
@@ -431,8 +517,12 @@ pal dw 0
 old_palette dw 0
 copy_bitmap dw 0
 copy_dc dw 0
-indices db 0,1
-blue dd 0xff0000
+indices db 10,11
+blue dd 0x01ff0000
+frame_rect dw 0,0,8,1
+pattern_brush dw 0
+readback dw 0xa55a
+bitmap_info times 14 db 0
 bits_a db 0x80,0
 bits_b db 0x40,0
 dib_header:
@@ -447,7 +537,7 @@ dib_header:
     dd 0,0xff00
  dib_bits db 1,0,0,0
 palette dw 0x300,2
-entries dd 0xff,0xff00
+entries dd 0x010000ff,0x0100ff00
 passed db 'WIN16 CIV_APIS PASS',0
 failed db 'WIN16 CIV_APIS FAIL',0
 segment STACK stack class=STACK use16

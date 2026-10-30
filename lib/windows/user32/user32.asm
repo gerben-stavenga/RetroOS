@@ -8,15 +8,9 @@ global %1
 %endmacro
 
 gate DrawEdge
-global _FillRect@12
-_FillRect@12:
-gate FillRect
 global _GetSysColorBrush@4
 _GetSysColorBrush@4:
 gate GetSysColorBrush
-global _GetSystemMetrics@4
-_GetSystemMetrics@4:
-gate GetSystemMetrics
 gate RetroWndProcReturn
 
 ; Private kernel operations return normally to this guest DLL. All suspended
@@ -31,6 +25,9 @@ gate RetroSurfaceCreate
 global _RetroSurfaceUpdate@28
 _RetroSurfaceUpdate@28:
 gate RetroSurfaceUpdate
+global _RetroSurfaceOrder@8
+_RetroSurfaceOrder@8:
+gate RetroSurfaceOrder
 
 global _RetroReadEvent@8
 _RetroReadEvent@8:

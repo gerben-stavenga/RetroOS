@@ -4,6 +4,37 @@ use crate::{menu, paint, state};
 const CAPTION: u32 = 0x00c00000;
 pub const CAPTION_HEIGHT: i32 = 20;
 pub const MENU_HEIGHT: i32 = 19;
+/// Metrics describe the shared virtual desktop and guest frame layout.
+#[unsafe(no_mangle)]
+pub extern "system" fn GetSystemMetrics(index: u32) -> i32 {
+    match index {
+        0 | 16 | 78 => 1024,
+        1 | 79 => 768,
+        17 => 768 - CAPTION_HEIGHT,
+        2 | 3 | 9 | 10 | 20 | 21 | 49 | 50 => 16,
+        4 => CAPTION_HEIGHT,
+        5 | 6 | 19 | 80 => 1,
+        7 | 8 => 3,
+        11..=14 => 32,
+        15 => MENU_HEIGHT,
+        28 | 34 => 112,
+        29 | 35 => 28,
+        30 | 31 | 54 | 55 => 18,
+        32 | 33 | 36 | 37 => 4,
+        38 | 39 => 75,
+        43 | 45 | 46 | 68 | 69 => 2,
+        47 | 57 => 160,
+        48 | 58 => 24,
+        51 => 15,
+        52 | 53 | 71 | 72 => 13,
+        56 => 8,
+        59 => 1036,
+        60 => 780,
+        61 => 1032,
+        62 => 776,
+        _ => 0,
+    }
+}
 pub fn margins(style: u32, ex: u32, has_menu: bool) -> [i32; 4] {
     let b = if style & 0x40000 != 0 {
         4
@@ -44,7 +75,7 @@ pub fn client(s: &state::State, w: &state::Window) -> [i32; 4] {
     ]
 }
 pub fn origin(s: &state::State, hwnd: u32, client_area: bool) -> Option<(i32, i32)> {
-    if hwnd == 0 {
+    if hwnd == 0 || hwnd == crate::window::DESKTOP {
         return Some((0, 0));
     }
     let w = s.windows.iter().find(|w| w.hwnd == hwnd)?;
@@ -298,6 +329,18 @@ pub fn input(s: &mut state::State, m: &mut crate::Message) {
         x = screen.0 - o.0;
         y = screen.1 - o.1;
     } else {
+        // Native input supplies a desktop point. Select the top-level window
+        // here, alongside child hit testing and capture, so Win16 and Win32
+        // share the same routing policy.
+        let Some(window) = s.windows.iter().find(|w| {
+            w.parent == 0 && w.style & 0x18000000 == 0x10000000
+                && screen.0 >= w.x && screen.1 >= w.y
+                && screen.0 < w.x.saturating_add(w.width)
+                && screen.1 < w.y.saturating_add(w.height)
+        }) else { m.message = 0; return; };
+        m.hwnd = window.hwnd;
+        x = screen.0 - window.x;
+        y = screen.1 - window.y;
         // Child positions are relative to their parent's client origin.
         loop {
             let Some(w) = s.windows.iter().find(|w| w.hwnd == m.hwnd) else {
