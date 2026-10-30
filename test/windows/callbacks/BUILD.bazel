@@ -55,3 +55,5 @@ windows_watcom_binary(
 )
 
 windows_watcom_binary(name="popup", src="popup.c", visibility=["//visibility:public"])
+
+windows_watcom_binary(name="multimedia", src="multimedia.c", visibility=["//visibility:public"])

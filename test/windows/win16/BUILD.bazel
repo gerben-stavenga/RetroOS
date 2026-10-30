@@ -107,3 +107,10 @@ windows16_binary(name="initializers", obj=":initializers_obj", imports={
     "Debug":"KERNEL.115", "Exit":"KERNEL.1", "GetTickCount":"USER.13", "Dependency":"INITDEP.1",
     "LoadLibrary":"KERNEL.95", "GetProcAddress":"KERNEL.50",
 }, visibility=["//visibility:public"])
+
+nasm_library(name="multimedia_obj", srcs=["multimedia.asm"], copts=["-fobj"])
+windows16_binary(name="multimedia", obj=":multimedia_obj", imports={
+    "LoadCursor":"USER.173", "DestroyCursor":"USER.458",
+    "Debug":"KERNEL.115", "Exit":"KERNEL.1", "CallWindowProc":"USER.122",
+    "timeSetEvent":"MMSYSTEM.602", "timeKillEvent":"MMSYSTEM.603", "timeGetTime":"MMSYSTEM.607",
+}, visibility=["//visibility:public"])

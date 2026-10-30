@@ -1,4 +1,4 @@
-//! Win32 threads share one address space and run cooperatively at API gates.
+//! Windows threads share one address space and switch at API gates and interrupts.
 //! Each context owns its registers, stack, TEB image, TLS values and last error.
 use super::*;
 use alloc::boxed::Box;

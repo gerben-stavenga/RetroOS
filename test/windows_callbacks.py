@@ -16,7 +16,7 @@ def main():
     target = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
     subprocess.run([
         "bazelisk", "build", f"//kernel:{target}",
-        "//test/windows/callbacks:callbacks", "//test/windows/callbacks:dynamic", "//test/windows/callbacks:lifecycle", "//test/windows/callbacks:messages", "//test/windows/callbacks:events", "//test/windows/callbacks:regions", "//test/windows/callbacks:bitmap_profile", "//test/windows/callbacks:frame", "//test/windows/callbacks:popup",
+        "//test/windows/callbacks:callbacks", "//test/windows/callbacks:dynamic", "//test/windows/callbacks:lifecycle", "//test/windows/callbacks:messages", "//test/windows/callbacks:events", "//test/windows/callbacks:regions", "//test/windows/callbacks:bitmap_profile", "//test/windows/callbacks:frame", "//test/windows/callbacks:popup", "//test/windows/callbacks:multimedia", "//lib/windows/compat:winmm_dll",
         "//lib/windows/kernel32:kernel32_dll",
         "//lib/windows/user32:user32_dll", "//lib/windows/compat:gdi32_dll", "--platforms=@platforms//host",
     ], cwd=ROOT, check=True)
@@ -27,7 +27,8 @@ def main():
         for name in ("kernel32", "user32"):
             shutil.copyfile(ROOT / f"bazel-bin/lib/windows/{name}/{name.upper()}.DLL", system / f"{name.upper()}.DLL")
         shutil.copyfile(ROOT / "bazel-bin/lib/windows/compat/GDI32.DLL", system / "GDI32.DLL")
-        for program in ("callbacks", "dynamic", "lifecycle", "messages", "events", "regions", "bitmap_profile", "frame", "popup"):
+        shutil.copyfile(ROOT / "bazel-bin/lib/windows/compat/WINMM.DLL", system / "WINMM.DLL")
+        for program in ("callbacks", "dynamic", "lifecycle", "messages", "events", "regions", "bitmap_profile", "frame", "popup", "multimedia"):
             shutil.copyfile(ROOT / f"bazel-bin/test/windows/callbacks/{program}.exe", root / "CALLBACK.EXE")
             try:
                 result = subprocess.run([
@@ -41,7 +42,7 @@ def main():
                 marker in log for marker in ("PANIC", "SEGV", "WINCALLBACK FAIL")
             ):
                 raise SystemExit(log)
-        print(f"PASS: USER32 lifecycle, callbacks, thread queues, nested cross-thread sends, timers, event waits, GDI regions/bitmaps, window frames/menus and INI profiles ({engine})")
+        print(f"PASS: USER32 lifecycle, callbacks, thread queues, nested cross-thread sends, timers, event waits, GDI regions/bitmaps, window frames/menus, multimedia timers and INI profiles ({engine})")
 
 
 if __name__ == "__main__":

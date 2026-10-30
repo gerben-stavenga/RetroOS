@@ -2535,6 +2535,7 @@ pub fn handle_event<A: crate::Arch>(
     if !A::seg_is_32(regs.code_seg()) && let Some(mut win16) = state.win16.take() {
         let action = win16::handle_event(machine, bios, kt, state, &mut win16, process.dos.as_mut().expect("NE DOS services"), regs, event);
         state.win16 = Some(win16);
+        if matches!(event, crate::KernelEvent::Irq) { threads::schedule(machine,state,regs); }
         return action;
     }
     match event {

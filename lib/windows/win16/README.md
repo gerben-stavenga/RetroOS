@@ -20,8 +20,10 @@ NE caller -> USER.DLL / GDI.DLL -> USER32 Rust adapter -> shared USER32 / GDI32
 256 KiB guest stack before calling Rust. `Retro16Return` is the reverse callback
 entry. Every nested call has its own saved frame. The stack cursor is saved and
 restored around callbacks; no suspended Rust frame is overwritten by reentry.
-This is currently one NE task per process, not support for concurrent Win16 tasks
-sharing the same adapter state.
+The mutable bridge context, including its temporary far pointers, is per-thread
+through the TEB's WOW32Reserved field. A multimedia worker can enter NE while
+the application's window callback is suspended. This remains one NE task per
+process, rather than multiple independent Win16 tasks sharing an address space.
 
 DLL initializers run dependency-first as ordinary far calls from KERNEL.DLL,
 both before EXE entry and during LoadLibrary. Nested LoadLibrary calls keep
@@ -150,12 +152,24 @@ also cover class names/words, window relationships, menu item queries and popup
 creation, rectangle queries/unions, palette readback, and bitmap dimensions.
 Class-word access checks two-byte bounds rather than reading a DWORD.
 
-MMSYSTEM clock and system-time queries use the existing millisecond clock.
-Timer period requests are validated and balanced; they do not change the hardware
-timer or implement multimedia callback timers. MMSYSTEM reports sound/MCI services unavailable, and COMMDLG returns a dialog
+MMSYSTEM timers use the same guest WINMM implementation as Win32. One guest
+worker handles one-shot and periodic callbacks without requiring a message
+loop. Cancellation includes self-cancellation and synchronous cancellation of
+an active callback. Missed periodic ticks are coalesced, preserving cadence
+without a burst of delayed callbacks. The Win16 adapter captures the caller's
+data selector and uses a separate 64 KiB callback stack, allocated lazily once
+per task. Callback records are released after their last invocation or cancellation.
+The ordinary guest scheduler also runs on interrupts from 16-bit code, so a
+busy NE application cannot prevent the timer worker from running.
+
+Clock/system-time queries and balanced period requests share WINMM's millisecond
+clock; period requests do not reprogram hardware. Win32 event-set timers work;
+event-pulse mode is rejected until PulseEvent is implemented. This is not a
+hard real-time timing guarantee. MMSYSTEM reports sound/MCI services unavailable,
+and COMMDLG returns a dialog
 initialization error. External font-resource loading and enumeration are also
-unimplemented. These are failure-reporting compatibility exports, not working
-multimedia or common-dialog implementations.
+unimplemented. These optional services remain failure-reporting exports;
+working timers do not establish sound, movie playback, or common-dialog support.
 
 Local KVM acceptance reaches Civ's main menu, completes new-game setup, and
 reaches the opening capital-founding prompt with colored terrain, units,
@@ -171,7 +185,7 @@ Civilization II additionally imports video and AVI libraries.
 Local tests with its original Video for Windows runtime now get beyond the
 initializer/segment-count restrictions, but still stop at missing imports
 (including RegOpenKey and LocalHandle); Civ II itself currently stops at
-timeKillEvent (MMSYSTEM.603). Multimedia callback timers are not implemented yet.
+mciGetDeviceID (MMSYSTEM.703).
 This does not yet establish AVI or Indeo playback support; those runtime files
 are not bundled with RetroOS.
 

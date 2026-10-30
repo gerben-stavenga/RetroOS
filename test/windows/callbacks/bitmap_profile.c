@@ -345,6 +345,12 @@ int main(void)
         CHECK(point.x==35&&point.y==46);
         CHECK(ScreenToClient(window,&point));
         CHECK(point.x==5&&point.y==6);
+        {
+            HCURSOR owned=LoadImageA(0,IDC_ARROW,IMAGE_CURSOR,32,32,0);
+            CHECK(owned!=0 && owned!=arrow);
+            CHECK(DestroyCursor(owned));CHECK(!DestroyCursor(owned));
+            CHECK(DestroyCursor(arrow));CHECK(LoadCursorA(0,IDC_ARROW)==arrow);
+        }
         old=SetCursor(arrow);
         CHECK(GetCursor()==arrow);
         CHECK(ShowCursor(FALSE)==-1);

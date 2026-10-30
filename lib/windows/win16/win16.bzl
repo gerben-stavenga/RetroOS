@@ -1,7 +1,7 @@
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:windows_watcom.bzl", "windows16_dll")
 
-def win16_dll(name, module, exports):
+def win16_dll(name, module, exports, imports = {}):
     nasm_library(
         name = name + "_obj",
         srcs = [name + ".asm"],
@@ -14,5 +14,6 @@ def win16_dll(name, module, exports):
         out = module + ".DLL",
         module_name = module,
         exports = exports,
+        imports = imports,
         visibility = ["//visibility:public"],
     )

@@ -62,6 +62,8 @@ unsafe extern "system" {
     fn SetFilePointer(handle: u32, offset: i32, high: u32, origin: u32) -> u32;
     fn SetEndOfFile(handle: u32) -> i32;
 
+    fn Retro16Context() -> *mut u32;
+    fn Retro16SwapContext(context: *mut u32) -> *mut u32;
     fn Retro16Call(proc: u32, args: *const u8, bytes: u32, reserve: u32) -> u32;
     fn Rectangle(dc: u32, l: i32, t: i32, r: i32, b: i32) -> i32;
     fn GetSystemMetrics(index: u32) -> u32;
@@ -104,6 +106,60 @@ unsafe extern "system" {
 }
 unsafe extern "C" {
     pub(super) static Retro16Config: [u32; 12];
+}
+unsafe extern "system" {
+    fn LoadLibraryA(name:*const u8)->u32;
+    fn GetProcAddress(module:u32,name:*const u8)->u32;
+}
+unsafe fn multimedia_export(name:&[u8])->u32 {
+    let path=b"WINMM.DLL\0";
+    let mut module=unsafe {crate::runtime::GetModuleHandleA(path.as_ptr() as u32)};
+    if module==0 {module=unsafe {LoadLibraryA(path.as_ptr())};}
+    if module==0 {0} else {unsafe {GetProcAddress(module,name.as_ptr())}}
+}
+struct MultimediaCallback {proc:u32,ds:u16,stack:u16,user:u32}
+unsafe extern "system" fn free_multimedia_callback(user:u32) {
+    unsafe {drop(alloc::boxed::Box::from_raw(user as *mut MultimediaCallback));}
+}
+unsafe extern "system" fn multimedia_callback(id:u32,_msg:u32,user:u32,_a:u32,_b:u32) {
+    unsafe {
+        let callback=&*(user as *const MultimediaCallback);
+        let Some((base,limit))=segment(callback.stack as u32) else {return;};
+        if limit<65535 {return;}
+        let saved=base+65536-64;
+        (saved as *mut u8).add(6).cast::<u16>().write_unaligned(callback.ds);
+        let frame=[0,saved,callback.stack as u32,0,0];
+        let bottom:u32;
+        core::arch::asm!("mov {0:e}, fs:[8]",out(reg) bottom,options(nostack,readonly,preserves_flags));
+        let mut context=[0,frame.as_ptr() as u32,bottom,0,0,0,0];
+        let previous=Retro16SwapContext(context.as_mut_ptr());
+        // Pascal order on entry: dw2, dw1, dwUser, uMsg, uTimerID.
+        let mut args=[0u8;16];
+        args[8..12].copy_from_slice(&callback.user.to_le_bytes());
+        args[14..16].copy_from_slice(&(id as u16).to_le_bytes());
+        Retro16Call(callback.proc,args.as_ptr(),16,0);
+        Retro16SwapContext(previous);
+    }
+}
+unsafe fn set_multimedia_timer(a:u32,frame:*const u32)->Option<u32> {
+    unsafe {
+        let readw=|n:u32| (a.wrapping_add(n) as *const u16).read_unaligned() as u32;
+        let readd=|n:u32| (a.wrapping_add(n) as *const u32).read_unaligned();
+        let flags=readw(2);
+        // Win16's interface accepts function callbacks, not Win32 event handles.
+        if flags&!(1|0x100)!=0 {return Some(0);}
+        let proc=readd(8);pointer(proc,1)?;
+        let saved=frame.add(1).read();
+        let ds=(saved as *const u8).add(6).cast::<u16>().read_unaligned();
+        let entry=multimedia_export(b"RetroTimeSetEvent\0");
+        if entry==0 {return Some(0);}
+        let callback=alloc::boxed::Box::new(MultimediaCallback {proc,ds,stack:readw(0) as u16,user:readd(4)});
+        let user=alloc::boxed::Box::into_raw(callback) as u32;
+        let set:unsafe extern "system" fn(u32,u32,u32,u32,u32,u32)->u32=core::mem::transmute(entry);
+        let id=set(readw(14),readw(12),multimedia_callback as *const () as u32,user,flags,free_multimedia_callback as *const () as u32);
+        if id==0 {free_multimedia_callback(user);}
+        Some(id)
+    }
 }
 const PROC: u32 = 0xfffd_0000;
 
@@ -370,7 +426,7 @@ unsafe extern "system" fn enum_window_callback(hwnd: u32, context: u32) -> i32 {
 }
 unsafe fn callback(proc: u32, hwnd: u32, msg: u32, wp: u32, lp: u32, wide: bool) -> Option<u32> {
     unsafe {
-        let frame = Retro16Config[3] as *const u32;
+        let frame = Retro16Context().add(1).read() as *const u32;
         if frame.is_null() {
             return None;
         }
@@ -814,28 +870,30 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
             10 => message::SetTimer(h(8), w(6), w(4), procedure(d(0))),
             12 => message::KillTimer(h(2), w(0)) as u32,
             13 | 15 | 3607 => crate::runtime::GetTickCount(),
-            // The underlying clock already has millisecond resolution. Keep
-            // begin/end requests balanced without changing the hardware timer.
-            3605 | 3606 => {
-                let period=w(0) as u16;
-                if period==0 {97} else {state::with(|s| {
-                    if o==3605 {s.timer_periods.push(period);0}
-                    else if let Some(i)=s.timer_periods.iter().position(|&p|p==period) {s.timer_periods.remove(i);0}
-                    else {97}
-                })}
-            },
-            3604 => {
-                if w(0)<4 {11} else {
-                    let p=pointer(d(2),4)?;
-                    putw(p,0,1);putw(p,2,65535);0
+            3602 => return set_multimedia_timer(a,_frame),
+            3603 | 3605 | 3606 => {
+                let name:&[u8]=match o {3603=>b"timeKillEvent\0",3605=>b"timeBeginPeriod\0",_=>b"timeEndPeriod\0"};
+                let entry=multimedia_export(name);
+                if entry==0 {11} else {
+                    core::mem::transmute::<u32,unsafe extern "system" fn(u32)->u32>(entry)(w(0))
                 }
             },
-            3601 => {
-                if w(0)>=8 && d(2)!=0 {
-                    let p=pointer(d(2),8)?;
-                    putw(p,0,1);putl(p,2,crate::runtime::GetTickCount());
+            3604 | 3601 => {
+                let required=if o==3604 {4} else {8};
+                if w(0)<required || d(2)==0 {11} else {
+                    let p=pointer(d(2),required as usize)?;
+                    let name:&[u8]=if o==3604 {b"timeGetDevCaps\0"} else {b"timeGetSystemTime\0"};
+                    let entry=multimedia_export(name);
+                    if entry==0 {11} else {
+                        let mut value=[0u32;3];
+                        let result=core::mem::transmute::<u32,unsafe extern "system" fn(*mut u32,u32)->u32>(entry)(value.as_mut_ptr(),12);
+                        if result==0 {
+                            putw(p,0,value[0]);
+                            if o==3604 {putw(p,2,value[1]);} else {putl(p,2,value[1]);}
+                        }
+                        result
+                    }
                 }
-                0
             },
             2036 => { let id=crate::runtime::GetCurrentThreadId() & 0xffff; id | (id<<16) },
             258 => {
@@ -1285,7 +1343,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 }
                 // NE-to-NE forwarding preserves segmented LPARAM buffers.
                 pointer(proc, 1)?;
-                let active = Retro16Config[3] as *const u32;
+                let active = Retro16Context().add(1).read() as *const u32;
                 let saved = active.add(1).read();
                 let (base, _) = segment(active.add(2).read())?;
                 if saved.checked_sub(base)? < 256 {
@@ -1362,7 +1420,7 @@ unsafe fn dispatch(o: u32, a: u32, _frame: *const u32) -> Option<u32> {
                 }
             }
             174 => encode(crate::resource::LoadIconA(w(4), string(d(0))?)),
-            457 => crate::resource::DestroyIcon(h(0)) as u32,
+            457 | 458 => crate::resource::DestroyIcon(h(0)) as u32,
             179 => GetSystemMetrics(w(0)),
             286 => encode(window::GetDesktopWindow()),
             236 => encode(input::GetCapture()),

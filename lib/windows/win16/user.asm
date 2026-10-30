@@ -142,6 +142,7 @@ gate lstrcmp
 bridge AnsiUpper, 431, 4
 bridge AnsiLower, 432, 4
 bridge DestroyIcon, 457, 2
+bridge DestroyCursor, 458, 2
 gate DrawFocusRect
 gate lstrcmpi
 gate AnsiNext

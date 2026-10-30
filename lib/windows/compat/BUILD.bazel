@@ -171,7 +171,30 @@ windows_dll(
 )
 
 compat_dll("shell32", "SHELL32", ["ExtractIconA", "ShellAboutW"])
-compat_dll("winmm", "WINMM", ["PlaySoundW"])
+nasm_library(name="winmm_obj", srcs=["winmm.asm"], copts=["-fwin32"])
+windows_rust_library(name="winmm_rust", crate_root="winmm.rs", srcs=["//lib/windows/user32:runtime.rs"])
+windows_dll(
+    name="winmm_dll", obj=":winmm_obj", libraries=[":winmm_rust"],
+    out="WINMM.DLL", module_name="WINMM",
+    imports={
+        "_HeapAlloc@12":"KERNEL32.HeapAlloc", "_HeapFree@12":"KERNEL32.HeapFree",
+        "_GetProcessHeap@0":"KERNEL32.GetProcessHeap", "_ExitProcess@4":"KERNEL32.ExitProcess",
+        "_GetTickCount@0":"KERNEL32.GetTickCount", "_Sleep@4":"KERNEL32.Sleep",
+        "_GetCurrentThreadId@0":"KERNEL32.GetCurrentThreadId",
+        "_CreateEventA@16":"KERNEL32.CreateEventA", "_SetEvent@4":"KERNEL32.SetEvent",
+        "_WaitForSingleObject@8":"KERNEL32.WaitForSingleObject",
+        "_CreateThread@24":"KERNEL32.CreateThread", "_CloseHandle@4":"KERNEL32.CloseHandle",
+    },
+    export_aliases={
+        "timeSetEvent":"_timeSetEvent@20", "RetroTimeSetEvent":"_RetroTimeSetEvent@24",
+        "timeKillEvent":"_timeKillEvent@4", "timeGetTime":"_timeGetTime@0",
+        "timeBeginPeriod":"_timeBeginPeriod@4", "timeEndPeriod":"_timeEndPeriod@4",
+        "timeGetDevCaps":"_timeGetDevCaps@8", "timeGetSystemTime":"_timeGetSystemTime@8",
+    },
+    exports=["PlaySoundW", "timeSetEvent", "RetroTimeSetEvent", "timeKillEvent", "timeGetTime",
+             "timeBeginPeriod", "timeEndPeriod", "timeGetDevCaps", "timeGetSystemTime"],
+    visibility=["//visibility:public"],
+)
 
 # Optional desktop, network and CRT facades used by console applications.
 compat_dll("gdiplus", "GDIPLUS", [
