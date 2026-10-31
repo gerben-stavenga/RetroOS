@@ -2258,6 +2258,10 @@ pub(crate) fn new_win16<A: crate::Arch>(machine: &mut A, psp: u16) -> alloc::box
     dos.current_psp = psp;
     dos.dta = (u32::from(psp) << 4) + 0x80;
     dos::init_win16_psp(machine, psp);
+    let mut regs = Regs::empty();
+    dos_reset_blocks(machine, &mut dos, &mut regs, dos::heap_start());
+    // The NE loader keeps its PSP and environment in these two adjacent pages.
+    dos_keep_resident_block(machine, &mut dos, &mut regs, psp, 0x200, psp);
     dos
 }
 pub(crate) fn win16_int21<A: crate::Arch>(
@@ -2285,4 +2289,29 @@ pub(crate) fn win16_resume<A: crate::Arch>(
 ) -> Option<thread::KernelAction> {
     if dos.suspended_calls.is_empty() { return None; }
     Some(dos::poll_suspended_call(machine, kt, dos, regs))
+}
+
+/// Wine's DOS-memory adapter uses the same allocation ledger as INT 21h.
+pub(crate) fn win16_memory<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>,
+    op: u32, address: u32, bytes: u32, exact: bool) -> u32
+{
+    let mut regs = Regs::empty();
+    if op == 0 { return 1; } // new_win16 already installed the DOS memory image.
+    if op == 4 { return u32::from(largest_dos_block(dos)) * 16; }
+    let paras = match bytes.checked_add(15).map(|n| n / 16).and_then(|n| u16::try_from(n).ok()) {
+        Some(n) => n, None => return if op == 3 { u32::MAX } else { 0 },
+    };
+    if op == 1 { return dos_alloc_block(machine, dos, &mut regs, paras).map_or(0, |seg| u32::from(seg) * 16); }
+    if address & 15 != 0 || address >= 0xa0000 { return if op == 3 { u32::MAX } else { 0 }; }
+    let seg = (address / 16) as u16;
+    if op == 2 { return dos_free_block(machine, dos, &mut regs, seg).is_ok() as u32; }
+    if op == 3 {
+        return match dos_resize_block(machine, dos, &mut regs, seg, paras) {
+            Ok(()) => u32::from(paras) * 16,
+            Err((8, max)) if !exact => dos_resize_block(machine, dos, &mut regs, seg, max)
+                .map_or(u32::MAX, |_| u32::from(max) * 16),
+            Err(_) => u32::MAX,
+        };
+    }
+    0
 }

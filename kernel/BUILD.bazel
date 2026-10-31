@@ -245,13 +245,14 @@ rust_test(
     crate_root = "tests/wine_ne.rs",
     srcs = ["tests/wine_ne.rs", "src/kernel/windows/pe.rs", "src/kernel/windows/ne.rs"],
     edition = "2024",
-    data = ["@wine_pe//:pe/" + name for name in [
+    data = ["//lib/wine/ntdll:KRNL386.EXE16"] + ["@wine_pe//:pe/" + name for name in [
         "krnl386.exe16", "user.exe16", "gdi.exe16", "mmsystem.dll16", "commdlg.dll16", "win87em.dll16",
     ]],
-    compile_data = ["@wine_pe//:pe/" + name for name in [
+    compile_data = ["//lib/wine/ntdll:KRNL386.EXE16"] + ["@wine_pe//:pe/" + name for name in [
         "krnl386.exe16", "user.exe16", "gdi.exe16", "mmsystem.dll16", "commdlg.dll16", "win87em.dll16",
     ]],
     rustc_env = {
+        "WINE_BUILT_KERNEL16": "$(execpath //lib/wine/ntdll:KRNL386.EXE16)",
         "WINE_KERNEL16": "$(execpath @wine_pe//:pe/krnl386.exe16)",
         "WINE_USER16": "$(execpath @wine_pe//:pe/user.exe16)",
         "WINE_GDI16": "$(execpath @wine_pe//:pe/gdi.exe16)",

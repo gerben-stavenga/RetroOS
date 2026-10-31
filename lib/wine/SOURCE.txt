@@ -7,16 +7,47 @@ Upstream source: https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz
 SHA256: c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701
 Repository: https://gitlab.winehq.org/wine/wine/-/tree/wine-11.0
 Wine sources retain their original copyright and LGPL notices.
-The WineHQ PE DLLs are unmodified except NTDLL, which is built from the
-complete Wine 11.0 PE-side source. lib/wine/build_ntdll.py adapts its i386
+The WineHQ PE DLLs are unmodified except NTDLL, KRNL386.EXE16 and WIN32U, built
+from complete Wine 11.0 PE-side sources. lib/wine/build_ntdll.py adapts its i386
 system-call veneers and Unix host-call connections to named RETROOS.DLL
 imports. No Unix implementation is linked into NTDLL. The Wine source and
 adapter/build scripts together describe the modified DLL's complete build.
-The Wine-derived NTDLL retains Wine's LGPL terms; RETROOS.DLL is separate.
+KRNL386.EXE16 exposes its existing Wine relays and selector setup through
+small added exports, including initial NE task entry through Wine's own
+module loader and TDB/TIB setup, the initial task event, and winevdm's
+GDI/USER/MMSYSTEM initialization order. Its selector initialization preserves descriptors already
+allocated by the RetroOS NE loader. DOS memory allocation uses RetroOS's
+existing DOS allocator and preserves the installed BIOS/IVT.
 
-Build prerequisites: Linux x86-64, Clang/LLD (i386 Windows target), llvm-dlltool,
-GCC, make, bison, dpkg-deb and Python 3. Flex is fetched at a pinned version.
+WIN32U includes Wine's drawing and window-management implementation as PE code,
+not its Unix syscall entry surface. win32u-pe.patch adapts synchronization to
+NTDLL RTL locks, uses PE exception handling, and disables unavailable Linux DRM,
+OpenGL/Vulkan host loading. FreeType is statically linked as PE code. Font files use NT file/section APIs;
+font selection, metrics and rasterization remain in Wine userspace. Server requests and user callbacks are named backend
+imports, not Unix host calls. User callbacks call Wine's own NTDLL dispatcher
+through a userspace wrapper; NtCallbackReturn restores that wrapper without
+a kernel transition. Nested callbacks keep separate return-data buffers in FLS.
+All three source-built DLLs retain Wine's LGPL
+terms. RETROOS.DLL is separate; server.c includes Wine's directory-mask matcher
+from dlls/ntdll/unix/file.c under LGPL-2.1-or-later, with its notices retained.
+The adapter marshals Wine server requests to native object primitives and NT
+directory queries to the VFS. NLS data is shipped from the same Wine source.
+graphics.c is compiled into WIN32U as its RetroOS USER display driver. It uses
+RetroGraphics in RETROOS.DLL for virtual-screen discovery and software-surface
+transport to the native compositor; it does not call a Unix graphics backend.
+
+Build prerequisites: Linux x86-64, Clang 19/LLD (i386 Windows target), llvm-dlltool,
+llvm-ar, GCC, make, patch, bison, dpkg-deb and Python 3. Flex is fetched at a pinned version.
 
 Port status: runtime integration in progress. These DLLs require the RetroOS
 NT backend, WIN32U implementation, and WOW loader before Windows applications
 can run. Bundling is not a claim of executable compatibility.
+
+FreeType 2.13.3 is included under the FreeType License (FREETYPE-LICENSE.TXT).
+Portions of this software are copyright (c) 2024 The FreeType Project
+(www.freetype.org). All rights reserved.
+Source: https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.xz
+SHA256: 0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289
+lib/wine/build_freetype.py builds the unmodified FreeType sources and adapts
+Wine's font file mapping and static library binding. Wine's bundled TrueType
+fonts come from the Wine 11.0 source archive above.

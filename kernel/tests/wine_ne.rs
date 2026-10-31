@@ -5,6 +5,7 @@ mod pe;
 mod ne;
 
 const MODULES: &[&[u8]] = &[
+    include_bytes!(env!("WINE_BUILT_KERNEL16")),
     include_bytes!(env!("WINE_KERNEL16")),
     include_bytes!(env!("WINE_USER16")),
     include_bytes!(env!("WINE_GDI16")),
@@ -42,5 +43,13 @@ fn corrupt_descriptor_extent_is_rejected() {
     for size in [0u32, 63, u32::MAX] {
         bytes[offset + 40..offset + 44].copy_from_slice(&size.to_le_bytes());
         assert!(pe::Image::parse(&bytes).unwrap().embedded_ne().is_err());
+    }
+}
+
+#[test]
+fn source_built_kernel_exposes_wines_existing_relays() {
+    let image = pe::Image::parse(MODULES[0]).unwrap();
+    for name in [b"RetroWineCallFrom16".as_slice(), b"RetroWineCallFrom16Regs", b"RetroWineConfigureSelectors", b"RetroWineImportSelectors"] {
+        assert!(image.export_rva(&pe::ImportSymbol::Name(name.to_vec())).unwrap().is_some());
     }
 }

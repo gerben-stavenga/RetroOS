@@ -1332,7 +1332,7 @@ fn launch_win16<A: crate::Arch>(
         t.kernel.tid as usize
     };
     crate::kernel::kpipe::add_reader(cpipe);
-    crate::kernel::windows::exec_ne_into(machine, threads, tid, buf, path, cwd, None, cmdtail)
+    crate::kernel::windows::exec_ne_into(machine, threads, tid, buf, path, cwd, None, cmdtail, &[])
         .unwrap_or_else(|e| {
             lib::compact_panic!(
                 "Windows NE exec failed ({}): errno {}",
@@ -1871,7 +1871,7 @@ fn event_loop<A: crate::Arch>(
                     &mut display,
                     &mut windows,
                 ),
-                None => core::hint::spin_loop(),
+                None => machine.idle(),
             }
             continue;
         }

@@ -335,7 +335,7 @@ fn take_word(text: &[u8]) -> Option<(&[u8], &[u8])> {
     }
 }
 
-fn virtual_key(scan: u16, ascii: u8) -> u16 {
+pub(super) fn virtual_key(scan: u16, ascii: u8) -> u16 {
     match scan {
         0x01 => 0x1b,
         0x02..=0x0b => b"1234567890"[(scan - 0x02) as usize] as u16,
@@ -1615,7 +1615,9 @@ mod keyboard_tests {
 pub(super) fn windows_environment(inherited: &[u8]) -> Vec<u8> {
     let mut entries: Vec<Vec<u8>> = [
         b"COMSPEC=C:\\RETROOS\\COMMAND.COM".to_vec(),
-        b"PATH=C:\\RETROOS;C:\\".to_vec(),
+        b"PATH=C:\\RETROOS\\WINDOWS\\SYSTEM32;C:\\RETROOS\\WINDOWS\\SYSTEM;C:\\RETROOS;C:\\".to_vec(),
+        b"SystemRoot=C:\\RETROOS\\WINDOWS".to_vec(),
+        b"windir=C:\\RETROOS\\WINDOWS".to_vec(),
         b"TEMP=C:\\TEMP".to_vec(),
     ].into();
     for entry in inherited.split(|&byte| byte == 0).take_while(|entry| !entry.is_empty()) {

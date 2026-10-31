@@ -316,6 +316,15 @@ http_archive(
     strip_prefix = "wine-11.0",
     build_file_content = '''
 package(default_visibility = ["//visibility:public"])
-exports_files(["COPYING.LIB"])
+exports_files(["COPYING.LIB", "include/windef.h"] + glob(["nls/*.nls", "fonts/*.ttf"]))
+filegroup(name="headers", srcs=glob(["include/**"]))
 ''',
+)
+
+# FreeType is linked into Wine WIN32U, never into the kernel.
+wine_http_file(
+    name = "wine_freetype_tar",
+    urls = ["https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.xz"],
+    sha256 = "0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289",
+    downloaded_file_path = "freetype-2.13.3.tar.xz",
 )

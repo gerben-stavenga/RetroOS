@@ -147,6 +147,7 @@ fn main() {
     // the deep driver call sites (portio), and the host environment facts the
     // platform probe reads (HostStdout debug, no fbcon, not metal).
     install_hosted_backend();
+    arch::register_rtc();
     install_socket_backend_hosted();
     kernel::host_console_init();
     // Display: the kernel emulates the VGA (single-VGA design) and renders

@@ -469,3 +469,32 @@ pub fn attach_fw_cfg(cmdline: Option<&str>, cwd: Option<&str>) {
     }
     register(FW_CFG_SEL, FW_CFG_DATA, Box::new(FwCfg { files, sel: 0, pos: 0 }));
 }
+
+/// Read-only CMOS calendar backed by the host clock. The hosted kernel reads
+/// the same RTC ports as metal instead of having a Windows-specific time path.
+pub fn register_rtc() {
+    struct Rtc { index: u8, calendar: libc::tm }
+    impl PortIo for Rtc {
+        fn write(&mut self, port: u16, _width: u8, value: u32) {
+            if port == 0x70 {
+                self.index = value as u8 & 0x7f;
+                if self.index == 0x0a {
+                    let now = unsafe { libc::time(core::ptr::null_mut()) };
+                    unsafe { libc::localtime_r(&now, &mut self.calendar); }
+                }
+            }
+        }
+        fn read(&mut self, port: u16, _width: u8) -> u32 {
+            if port != 0x71 { return 0xff; }
+            let t = &self.calendar;
+            match self.index {
+                0 => t.tm_sec as u32, 2 => t.tm_min as u32, 4 => t.tm_hour as u32,
+                6 => t.tm_wday as u32 + 1, 7 => t.tm_mday as u32,
+                8 => t.tm_mon as u32 + 1, 9 => (t.tm_year as u32 + 1900) % 100,
+                0x32 => (t.tm_year as u32 + 1900) / 100,
+                0x0a => 0, 0x0b => 6, 0x0d => 0x80, _ => 0,
+            }
+        }
+    }
+    register(0x70, 0x71, Box::new(Rtc { index: 0, calendar: unsafe { core::mem::zeroed() } }));
+}

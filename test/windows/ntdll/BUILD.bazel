@@ -7,20 +7,24 @@ windows_native_binary(
     name = "portable",
     obj = ":portable_obj",
     imports = {name: "NTDLL." + name for name in [
-        "RtlInitAnsiString", "RtlInitUnicodeString", "RtlMoveMemory", "RtlZeroMemory", "NtTerminateProcess", "NtAllocateVirtualMemory", "NtFreeVirtualMemory",
+        "NtWaitForAlertByThreadId", "NtAlertThreadByThreadId", "NtCreateThreadEx", "NtResumeThread", "NtQueryInformationThread", "RtlGetFullPathName_U", "RtlInitAnsiString", "RtlInitUnicodeString", "RtlMoveMemory", "RtlZeroMemory", "NtTerminateProcess", "NtAllocateVirtualMemory", "NtFreeVirtualMemory",
         "RtlCreateHeap", "RtlAllocateHeap", "RtlReAllocateHeap", "RtlFreeHeap",
-    ]} | {"RetroWriteFile": "RETROOS.RetroWriteFile", "RtlCompareMemory": "FORWARD.Entry"},
+        "NtQueryKey", "NtEnumerateKey", "NtEnumerateValueKey", "NtDeleteKey", "NtCreateSemaphore", "NtReleaseSemaphore", "NtQuerySemaphore", "NtCreateMutant", "NtReleaseMutant", "NtQueryMutant", "NtDelayExecution", "NtWriteFile", "NtSetInformationFile", "NtFlushBuffersFile", "NtCreateFile", "NtCallbackReturn", "NtWaitForSingleObject", "NtWaitForMultipleObjects", "NtQuerySection", "NtQueryVirtualMemory", "NtCreateSection", "NtQueryAttributesFile", "NtQueryFullAttributesFile", "NtQueryDirectoryFile", "NtAddAtom", "NtFindAtom", "NtDeleteAtom", "NtQueryInformationAtom", "wine_server_call", "NtOpenSection", "NtMapViewOfSection", "NtUnmapViewOfSection", "NtOpenFile", "NtReadFile", "NtQueryInformationFile", "NtCreateEvent", "NtSetEvent", "NtResetEvent", "NtQueryEvent", "NtProtectVirtualMemory", "NtSetInformationThread", "NtSetLdtEntries", "NtQueryInformationToken", "NtQuerySystemTime", "NtQueryPerformanceCounter", "NtDeleteValueKey", "NtCreateKey", "NtSetValueKey", "NtQueryValueKey", "NtClose", "__wine_dbg_strdup", "RetroWineInitializeLocale", "RetroWineInitializePeb", "RtlAcquirePebLock", "RtlReleasePebLock",
+        "NtInitializeNlsFiles", "NtGetNlsSectionPtr", "NtQueryDefaultLocale", "NtQueryInformationProcess",
+    ]} | {"RetroGraphics": "RETROOS.RetroGraphics", "RetroUserCallback": "RETROOS.RetroUserCallback", "RetroWriteFile": "RETROOS.RetroWriteFile", "RtlCompareMemory": "FORWARD.Entry"},
     visibility = ["//visibility:public"],
 )
 windows_native_binary(
     name = "probe",
     obj = ":probe_obj",
     imports = {name: "NTDLL." + name for name in [
-        "RtlInitAnsiString", "RtlInitUnicodeString", "RtlMoveMemory",
+        "NtWaitForAlertByThreadId", "NtAlertThreadByThreadId", "NtCreateThreadEx", "NtResumeThread", "NtQueryInformationThread", "RtlGetFullPathName_U", "RtlInitAnsiString", "RtlInitUnicodeString", "RtlMoveMemory",
         "RtlZeroMemory", "NtTerminateProcess", "NtAllocateVirtualMemory", "NtFreeVirtualMemory",
         "RtlCreateHeap", "RtlAllocateHeap", "RtlReAllocateHeap", "RtlFreeHeap",
+        "NtQueryKey", "NtEnumerateKey", "NtEnumerateValueKey", "NtDeleteKey", "NtCreateSemaphore", "NtReleaseSemaphore", "NtQuerySemaphore", "NtCreateMutant", "NtReleaseMutant", "NtQueryMutant", "NtDelayExecution", "NtWriteFile", "NtSetInformationFile", "NtFlushBuffersFile", "NtCreateFile", "NtCallbackReturn", "NtWaitForSingleObject", "NtWaitForMultipleObjects", "NtQuerySection", "NtQueryVirtualMemory", "NtCreateSection", "NtQueryAttributesFile", "NtQueryFullAttributesFile", "NtQueryDirectoryFile", "NtAddAtom", "NtFindAtom", "NtDeleteAtom", "NtQueryInformationAtom", "wine_server_call", "NtOpenSection", "NtMapViewOfSection", "NtUnmapViewOfSection", "NtOpenFile", "NtReadFile", "NtQueryInformationFile", "NtCreateEvent", "NtSetEvent", "NtResetEvent", "NtQueryEvent", "NtProtectVirtualMemory", "NtSetInformationThread", "NtSetLdtEntries", "NtQueryInformationToken", "NtQuerySystemTime", "NtQueryPerformanceCounter", "NtDeleteValueKey", "NtCreateKey", "NtSetValueKey", "NtQueryValueKey", "NtClose", "__wine_dbg_strdup", "RetroWineInitializeLocale", "RetroWineInitializePeb", "RtlAcquirePebLock", "RtlReleasePebLock",
+        "NtInitializeNlsFiles", "NtGetNlsSectionPtr", "NtQueryDefaultLocale", "NtQueryInformationProcess",
         "LdrLoadDll", "LdrGetDllHandle", "LdrGetProcedureAddress", "LdrResolveDelayLoadedAPI",
-    ]} | {"RetroWriteFile": "RETROOS.RetroWriteFile", "RtlCompareMemory": "FORWARD.Entry"},
+    ]} | {"RetroGraphics": "RETROOS.RetroGraphics", "RetroUserCallback": "RETROOS.RetroUserCallback", "RetroWriteFile": "RETROOS.RetroWriteFile", "RtlCompareMemory": "FORWARD.Entry"},
     visibility = ["//visibility:public"],
 )
 
@@ -47,5 +51,16 @@ genrule(
     outs = ["FORWARD.DLL", "RELAY.DLL"],
     cmd = "python3 $(location forward.py) $(location FORWARD.DLL) RELAY.Entry && " +
           "python3 $(location forward.py) $(location RELAY.DLL) NTDLL.RtlCompareMemory",
+    visibility = ["//visibility:public"],
+)
+
+nasm_library(name = "fonts_obj", srcs = ["fonts.asm"], copts = ["-fwin32"])
+windows_native_binary(
+    name = "fonts",
+    obj = ":fonts_obj",
+    imports = {name: "GDI32." + name for name in [
+        "CreateCompatibleDC", "DeleteDC", "CreateFontIndirectW", "SelectObject",
+        "DeleteObject", "GetTextExtentPoint32W", "GetTextFaceW", "GetGlyphOutlineW",
+    ]} | {"RetroWriteFile": "RETROOS.RetroWriteFile", "NtTerminateProcess": "NTDLL.NtTerminateProcess"},
     visibility = ["//visibility:public"],
 )

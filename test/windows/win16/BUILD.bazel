@@ -143,3 +143,11 @@ windows16_binary(name="clipping", obj=":clipping_obj", imports={
     "SelectObject":"GDI.45", "DeleteDC":"GDI.68", "DeleteObject":"GDI.69", "PatBlt":"GDI.29", "GetPixel":"GDI.83",
     "IntersectClipRect":"GDI.22", "ExcludeClipRect":"GDI.21", "SelectClipRgn":"GDI.44",
 }, visibility=["//visibility:public"])
+
+nasm_library(name="keyboard_obj", srcs=["keyboard.asm"], copts=["-fobj"])
+windows16_binary(name="keyboard", obj=":keyboard_obj", imports={
+    "InitTask":"KERNEL.91", "DOSExit":"KERNEL.102",
+    "RegisterClass":"USER.57", "CreateWindow":"USER.41", "DefWindowProc":"USER.107",
+    "SetActiveWindow":"USER.59", "SetFocus":"USER.22", "GetMessage":"USER.108",
+    "TranslateMessage":"USER.113", "DispatchMessage":"USER.114",
+}, visibility=["//visibility:public"])

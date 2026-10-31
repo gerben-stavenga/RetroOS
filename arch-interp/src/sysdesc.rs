@@ -65,25 +65,25 @@ pub(crate) fn if_to_vif(flags: u32) -> u32 {
 pub(crate) const SYS_BASE: u64 = 0xFFFE_0000;
 pub(crate) const GDT_ADDR: u64 = SYS_BASE; // 256-byte GDT (32 entries)
 pub(crate) const LDT_ADDR: u64 = SYS_BASE + 0x1000; // up to LDT_MAX_BYTES
-pub(crate) const TRAMP_ADDR: u64 = SYS_BASE + 0x5000; // the `iretd` byte (TCG)
-pub(crate) const RING0_SP_TOP: u64 = SYS_BASE + 0x7000; // ring-0 stack top (frame just below)
+pub(crate) const TRAMP_ADDR: u64 = SYS_BASE + 0x11000; // the `iretd` byte (TCG)
+pub(crate) const RING0_SP_TOP: u64 = SYS_BASE + 0x13000; // ring-0 stack top (frame just below)
 // KVM-engine pages (the in-guest trap shim; unused — but still allocated and
 // mapped — on the TCG engine, whose traps surface as Unicorn hooks instead):
 #[cfg(feature = "kvm")]
-pub(crate) const IDT_ADDR: u64 = SYS_BASE + 0x8000; // 256 × 8-byte interrupt gates
+pub(crate) const IDT_ADDR: u64 = SYS_BASE + 0x14000; // 256 × 8-byte interrupt gates
 #[cfg(feature = "kvm")]
-pub(crate) const STUB_ADDR: u64 = SYS_BASE + 0x9000; // 256 × 16-byte exit stubs
-pub(crate) const TSS_ADDR: u64 = SYS_BASE + 0xA000; // TSS + all-deny IOPB
+pub(crate) const STUB_ADDR: u64 = SYS_BASE + 0x15000; // 256 × 16-byte exit stubs
+pub(crate) const TSS_ADDR: u64 = SYS_BASE + 0x16000; // TSS + all-deny IOPB
 // Long-mode (64-bit user slices) shim pages, KVM engine only: 64-bit gates are
 // 16 bytes and the TSS64 layout differs, so they get their own pages. The
 // stubs are shared — `push imm` / `out imm8, al` decode identically in 64-bit.
 #[cfg(feature = "kvm")]
-pub(crate) const IDT64_ADDR: u64 = SYS_BASE + 0xB000; // 256 × 16-byte long-mode gates
+pub(crate) const IDT64_ADDR: u64 = SYS_BASE + 0x17000; // 256 × 16-byte long-mode gates
 #[cfg(feature = "kvm")]
-pub(crate) const TSS64_ADDR: u64 = SYS_BASE + 0xC000; // TSS64 + all-deny IOPB
-pub(crate) const SYS_SIZE: usize = 0xD000;
+pub(crate) const TSS64_ADDR: u64 = SYS_BASE + 0x18000; // TSS64 + all-deny IOPB
+pub(crate) const SYS_SIZE: usize = 0x19000;
 pub(crate) const GDT_BYTES: usize = 32 * 8;
-pub(crate) const LDT_MAX_BYTES: usize = 0x4000; // 2048 descriptors
+pub(crate) const LDT_MAX_BYTES: usize = 0x10000; // all 8192 architectural descriptors
 
 // Flat ring-0 selectors the supervisor scraps run under (GDT indices 1 and 3,
 // to match the kernel's `descriptors.rs` KERNEL_CS=0x08 / KERNEL_DS=0x18 layout).

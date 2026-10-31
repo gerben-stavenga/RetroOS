@@ -557,7 +557,8 @@ impl<A: crate::Arch> Personality<A> {
                     crate::kernel::linux::complete_pending_io(machine, kt, linux, regs);
                 }
             }
-            Self::Os2(_) | Self::Windows(_) => {}
+            Self::Windows(windows) => crate::kernel::windows::poll_threads(machine,kt,windows,regs),
+            Self::Os2(_) => {}
         }
     }
 }

@@ -73,7 +73,7 @@ pub fn dispatch<A: crate::Arch>(
         thread::Personality::Windows(windows) => {
             for evt in guest_events {
                 match evt {
-                    crate::Irq::Key(scancode) => windows.process_key(&kt.fds, scancode),
+                    crate::Irq::Key(scancode) => windows.process_key(&kt.fds, scancode, machine.now()),
                     crate::Irq::Mouse { dx, dy, buttons } => windows.process_mouse(dx, dy, buttons),
                     _ => {}
                 }

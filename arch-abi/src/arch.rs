@@ -251,6 +251,10 @@ pub trait Arch: Sized + GuestBytes {
     /// forces `execute` to return, while this clock remains the sole authority
     /// for how much time elapsed.
     fn now(&self) -> u64;
+    /// No guest thread can run this iteration. Hardware clocks keep ticking;
+    /// deterministic interpreters must also advance idle time without retiring
+    /// synthetic guest instructions. Return promptly to service input/devices.
+    fn idle(&mut self) { core::hint::spin_loop(); }
     /// Millisecond compatibility view for devices not yet converted to the
     /// high-resolution timeline.
     fn get_ticks(&self) -> u64 { self.now() / 1_000_000 }

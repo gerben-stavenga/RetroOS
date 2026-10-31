@@ -10,9 +10,19 @@ pub mod pe;
 pub mod ne;
 mod atoms;
 mod memory;
+mod registry;
+mod native_file;
+mod session;
+mod sections;
+mod user_objects;
+mod user_queue;
+mod graphics;
+mod classes;
 mod extra;
 mod encoding;
 mod threads;
+mod exceptions;
+mod wine_startup;
 mod win16;
 
 use crate::Regs;
@@ -24,8 +34,20 @@ const DLL_BASE_FIRST: u32 = 0x1000_0000;
 const DLL_BASE_STRIDE: u32 = 0x0100_0000;
 const STACK_TOP: u32 = 0xbff0_0000;
 pub(super) const USER_LIMIT: u32 = 0xc000_0000;
-const TEB_BASE: u32 = 0x7ffd_e000;
-const PEB_BASE: u32 = 0x7ffd_f000;
+// Wine places 0x800 bytes of per-thread debug storage after the TEB.
+const TEB_BASE: u32 = 0x7ffd_d000;
+const TEB_SIZE: usize = 8192;
+// TEB scratch string used by Wine's ANSI-to-Unicode filename conversion.
+const TEB_STATIC_STRING: u32 = 0xbf8;
+const TEB_STATIC_BUFFER: u32 = 0xc00;
+fn initialize_teb_string<A: crate::Arch>(machine: &mut A) {
+    machine.write::<u16>((TEB_BASE + TEB_STATIC_STRING) as usize, 0);
+    machine.write::<u16>((TEB_BASE + TEB_STATIC_STRING + 2) as usize, 522);
+    machine.write::<u32>((TEB_BASE + TEB_STATIC_STRING + 4) as usize, TEB_BASE + TEB_STATIC_BUFFER);
+}
+// Wine stores debug-channel options on the page following the PEB.
+const PEB_BASE: u32 = 0x7ffd_9000;
+const PEB_SIZE: usize = 8192;
 const PROCESS_DATA: u32 = 0x7ffd_c000;
 const HEAP_BASE: u32 = 0x5000_0000;
 
@@ -98,6 +120,34 @@ enum Api {
     WriteFile,
     Yield,
     Unsupported,
+    MapFile,
+    LocaleId,
+    Registry,
+    Clock,
+    SetSelectors,
+    MemoryProtect,
+    SystemInfo,
+    ClearTls,
+    FileKind,
+    NativeFile,
+    Session,
+    Section,
+    MemoryQuery,
+    Wait,
+    NativeThread,
+    RestoreContext,
+    UserObject,
+    WindowObject,
+    WindowTree,
+    Cursor,
+    Graphics,
+    UniqueId,
+    Class,
+    Atom,
+    DosMemory,
+    Event,
+    Sync,
+    UserQueue,
     MemoryReserve,
     MemoryCommit,
     MemoryDecommit,
@@ -176,7 +226,9 @@ pub struct WindowsProcess<A: crate::Arch> {
 impl<A: crate::Arch> WindowsProcess<A> {
     pub fn on_resume(&mut self, machine: &mut A) {
         self.state.on_resume(machine);
-        if let Some(dos) = &self.dos { machine.load_ldt(&dos.ldt[..]); }
+        if let Some(dos) = &mut self.dos {
+            dos.ldt[..self.state.ldt.len()].copy_from_slice(&self.state.ldt);
+        }
     }
     pub fn on_exit(&mut self, machine: &mut A, regs: &mut Regs) {
         if let Some(dos) = &mut self.dos { dos.on_exit(machine, regs, false); }
@@ -200,10 +252,17 @@ pub struct WindowsState {
     file_oem: bool,
     gates: Vec<Gate>,
     threads: threads::State,
+    exceptions: exceptions::State,
+    registry: registry::Handles,
     ldt: Vec<u64>,
     modules: Vec<Module>,
     allocations: Vec<(u32, u32)>,
     memory: Vec<memory::Region>,
+    session: session::State,
+    sections: sections::State,
+    user_objects: user_objects::State,
+    user_queues: user_queue::State,
+    classes: classes::State,
     protections: Vec<(u32, u32)>,
     heap_next: u32,
     blocks: Vec<extra::Block>,
@@ -229,6 +288,7 @@ pub struct WindowsState {
     process_handle: u32,
     process_tid: u32,
     process_exit_code: Option<u32>,
+    teb_base: u32,
     stack_base: u32,
     stack_size: u32,
     windows: Vec<Window>,
@@ -263,10 +323,17 @@ impl WindowsState {
             file_oem: false,
             gates: Vec::new(),
             threads: threads::State::default(),
+            exceptions: exceptions::State::default(),
+            registry: registry::Handles::default(),
             ldt: vec![0],
             modules: Vec::new(),
             allocations: Vec::new(),
             memory: Vec::new(),
+            session: session::State::default(),
+            sections: sections::State::default(),
+            user_objects: user_objects::State::default(),
+            user_queues: user_queue::State::default(),
+            classes: classes::State::default(),
             protections: Vec::new(),
             heap_next: HEAP_BASE,
             blocks: Vec::new(),
@@ -289,6 +356,7 @@ impl WindowsState {
             process_handle: 0,
             process_tid: 0,
             process_exit_code: None,
+            teb_base: TEB_BASE,
             stack_base: 0,
             stack_size: 0,
             windows: Vec::new(),
@@ -360,20 +428,10 @@ impl WindowsState {
             threads::signal(&mut self.threads, event);
         }
     }
-    pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8) {
+    pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8, now: u64) {
         let pressed = crate::kernel::keyboard::update_console(&mut self.console.keyboard,scancode);
         if crate::kernel::keyboard::event().scan == 0 { return; }
-        let hwnd = self
-            .windows
-            .iter()
-            .rfind(|w| w.visible && w.parent == 0)
-            .map_or(0, |w| w.hwnd);
-        self.messages.push(Message {
-            hwnd,
-            message: if scancode & 0x80 == 0 { 0x0100 } else { 0x0101 },
-            wparam: u32::from(scancode & 0x7f),
-            lparam: 0,
-        });
+        user_queue::keyboard_event(self, crate::kernel::keyboard::event(), crate::kernel::keyboard::control_state(), now);
         self.wake_user();
         extra::push_key(&mut self.console, scancode, crate::kernel::keyboard::event(), crate::kernel::keyboard::control_state());
         if !pressed {
@@ -457,8 +515,9 @@ pub fn exec_ne_into<A: crate::Arch>(
     parent_cwd: &[u8],
     launcher: Option<thread::PersonalityName>,
     cmdtail: &[u8],
+    parent_env: &[u8],
 ) -> Result<(), i32> {
-    win16::exec(machine, threads, tid, data, path, parent_cwd, launcher, cmdtail)
+    win16::exec(machine, threads, tid, data, path, parent_cwd, launcher, cmdtail, parent_env)
 }
 
 /// Publish guest-owned top-level surfaces. USER32 owns placement and window
@@ -675,8 +734,11 @@ fn memory_protection(state: &WindowsState, address: u32) -> Option<u32> {
     if let Some(&(_, protection)) = state.protections.iter().find(|&&(p, _)| p == page) {
         return Some(protection);
     }
+    if let Some(flags) = memory::permissions(state, address) {
+        return Some(match flags { 0 => 2, 1 => 4, 2 => 0x20, _ => 0x40 });
+    }
     for module in &state.modules {
-        let image = pe::Image::parse(&module.data).ok()?;
+        let Ok(image) = pe::Image::parse(&module.data) else { continue; };
         if address >= module.base && address < module.base.checked_add(image.header.size_image)? {
             for section in image.sections().ok()? {
                 let start = module.base.checked_add(section.rva)?;
@@ -719,6 +781,7 @@ fn change_protection<A: crate::Arch>(machine: &mut A, state: &mut WindowsState,
     let old = memory_protection(state,address).ok_or(487u32)?;
     for page in (start..limit).step_by(4096) {
         if memory_protection(state,page).is_none() { return Err(487); }
+        if !memory::can_protect(state, page, write, execute) { return Err(5); }
     }
     machine.set_page_flags(start as usize / 4096, ((limit-start)/4096) as usize, write,execute);
     for page in (start..limit).step_by(4096) {
@@ -922,6 +985,34 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
     (b"RETROOS", b"RetroProcessExit", Api::ExitProcess, 4),
     (b"RETROOS", b"RetroWriteFile", Api::WriteFile, 20),
     (b"RETROOS", b"RetroYield", Api::Yield, 0),
+    (b"RETROOS", b"RetroMapFile", Api::MapFile, 12),
+    (b"RETROOS", b"RetroLocaleId", Api::LocaleId, 0),
+    (b"RETROOS", b"RetroRegistry", Api::Registry, 28),
+    (b"RETROOS", b"RetroClock", Api::Clock, 4),
+    (b"RETROOS", b"RetroMemoryProtect", Api::MemoryProtect, 12),
+    (b"RETROOS", b"RetroSystemInfo", Api::SystemInfo, 4),
+    (b"RETROOS", b"RetroClearTls", Api::ClearTls, 4),
+    (b"RETROOS", b"RetroFileKind", Api::FileKind, 4),
+    (b"RETROOS", b"RetroFile", Api::NativeFile, 28),
+    (b"RETROOS", b"RetroSession", Api::Session, 24),
+    (b"RETROOS", b"RetroSection", Api::Section, 24),
+    (b"RETROOS", b"RetroMemoryQuery", Api::MemoryQuery, 8),
+    (b"RETROOS", b"RetroWait", Api::Wait, 20),
+    (b"RETROOS", b"RetroThread", Api::NativeThread, 12),
+    (b"RETROOS", b"RetroRestoreContext", Api::RestoreContext, 4),
+    (b"RETROOS", b"RetroUserObject", Api::UserObject, 24),
+    (b"RETROOS", b"RetroWindow", Api::WindowObject, 24),
+    (b"RETROOS", b"RetroWindowTree", Api::WindowTree, 12),
+    (b"RETROOS", b"RetroCursor", Api::Cursor, 8),
+    (b"RETROOS", b"RetroGraphics", Api::Graphics, 12),
+    (b"RETROOS", b"RetroUniqueId", Api::UniqueId, 4),
+    (b"RETROOS", b"RetroClass", Api::Class, 20),
+    (b"RETROOS", b"RetroAtom", Api::Atom, 20),
+    (b"RETROOS", b"RetroDosMemory", Api::DosMemory, 16),
+    (b"RETROOS", b"RetroEvent", Api::Event, 16),
+    (b"RETROOS", b"RetroSync", Api::Sync, 24),
+    (b"RETROOS", b"RetroQueue", Api::UserQueue, 12),
+    (b"RETROOS", b"RetroSetSelectors", Api::SetSelectors, 24),
     (b"RETROOS", b"RetroMemoryReserve", Api::MemoryReserve, 8),
     (b"RETROOS", b"RetroMemoryCommit", Api::MemoryCommit, 12),
     (b"RETROOS", b"RetroMemoryDecommit", Api::MemoryDecommit, 8),
@@ -1086,11 +1177,11 @@ pub fn exec_pe_into<A: crate::Arch>(
         false,
     );
     machine.zero(PROCESS_DATA as usize, 4096);
-    machine.zero(TEB_BASE as usize, 4096);
-    machine.zero(PEB_BASE as usize, 4096);
+    machine.zero(TEB_BASE as usize, TEB_SIZE);
+    machine.zero(PEB_BASE as usize, PEB_SIZE);
     machine.set_page_flags(PROCESS_DATA as usize / 4096, 1, true, false);
-    machine.set_page_flags(TEB_BASE as usize / 4096, 1, true, false);
-    machine.set_page_flags(PEB_BASE as usize / 4096, 1, true, false);
+    machine.set_page_flags(TEB_BASE as usize / 4096, TEB_SIZE / 4096, true, false);
+    machine.set_page_flags(PEB_BASE as usize / 4096, PEB_SIZE / 4096, true, false);
 
     machine.write::<u32>(TEB_BASE as usize, 0xffff_ffff); // SEH end marker
     machine.write::<u32>((TEB_BASE + 4) as usize, STACK_TOP);
@@ -1099,6 +1190,9 @@ pub fn exec_pe_into<A: crate::Arch>(
     machine.write::<u32>((TEB_BASE + 0x20) as usize, 1);
     machine.write::<u32>((TEB_BASE + 0x24) as usize, tid as u32 + 1);
     machine.write::<u32>((TEB_BASE + 0x30) as usize, PEB_BASE);
+    initialize_teb_string(machine);
+    machine.write::<u8>((PEB_BASE + 4096) as usize, 7);
+    machine.write::<u32>((PEB_BASE + 0x64) as usize, 1);
     machine.write::<u32>((PEB_BASE + 8) as usize, modules[0].base);
     machine.write::<u32>((PEB_BASE + 0x10) as usize, PROCESS_DATA);
 
@@ -1122,7 +1216,13 @@ pub fn exec_pe_into<A: crate::Arch>(
         entry
     } else {
         let abort = export_address(&modules, b"RETROOS", b"RetroProcessExit")?;
-        dll_startup_stub(machine, &dlls, entry, abort)?
+        if let Ok(attach_module) = export_address(&modules, b"NTDLL", b"RetroWineAttachModule") {
+            let initializers: Vec<_> = dlls.iter().map(|&(base, _)| (base, attach_module)).collect();
+            let attach = dll_startup_stub(machine, &initializers, entry, abort)?;
+            wine_startup::bootstrap(machine, &modules, 0, attach, abort, Vec::new())?
+        } else {
+            dll_startup_stub(machine, &dlls, entry, abort)?
+        }
     };
     let current = thread::get_thread(threads, tid).ok_or(8)?;
     thread::init_process_thread(current, entry, stack);
@@ -1156,6 +1256,8 @@ pub fn exec_pe_into<A: crate::Arch>(
         extra::open_console(&mut state);
     }
     state.modules = modules;
+    initialize_process_strings(machine,&mut state)?;
+    initialize_environment(machine,&mut state)?;
     state.on_resume(machine);
     current.personality = thread::Personality::Windows(state.into());
     Ok(())
@@ -1537,6 +1639,91 @@ fn dispatch<A: crate::Arch>(
 ) -> u32 {
     match api {
         Api::Yield => 0,
+        Api::UserQueue => user_queue::call(machine,state,core::array::from_fn(|i|arg(machine,regs,i))),
+        Api::Sync => threads::sync(machine, state, core::array::from_fn(|i| arg(machine, regs, i))),
+        Api::Event => threads::event(machine, state, arg(machine, regs, 0), arg(machine, regs, 1), arg(machine, regs, 2), arg(machine, regs, 3)),
+        Api::Atom => atoms::call(machine,core::array::from_fn(|i| arg(machine,regs,i))),
+        Api::Class => classes::call(machine,state,core::array::from_fn(|i| arg(machine,regs,i))),
+        Api::UniqueId => { let out=arg(machine,regs,0); machine.write::<u64>(out as usize,user_objects::next_id()); 0 },
+        Api::Graphics => graphics::call(machine,state,core::array::from_fn(|i|arg(machine,regs,i))),
+        Api::Cursor => user_objects::cursor_call(machine,state,core::array::from_fn(|i|arg(machine,regs,i))),
+        Api::WindowTree => user_objects::tree_call(machine,state,core::array::from_fn(|i|arg(machine,regs,i))),
+        Api::WindowObject => user_objects::window_call(machine, state, core::array::from_fn(|i| arg(machine, regs, i))),
+        Api::UserObject => user_objects::call(machine, state, core::array::from_fn(|i| arg(machine, regs, i))),
+        Api::MemoryQuery => {
+            let Some(info)=memory::query(state,arg(machine,regs,0)) else {return 0xc000000d;};
+            let out=arg(machine,regs,1) as usize;
+            for (i,value) in info.into_iter().enumerate() {machine.write::<u32>(out+i*4,value);}
+            0
+        },
+        Api::Section => sections::call(machine, kt, state, core::array::from_fn(|i| arg(machine, regs, i))),
+        Api::Session => session::call(machine, state, core::array::from_fn(|i| arg(machine, regs, i))),
+        Api::NativeFile => native_file::call(machine, kt, state, core::array::from_fn(|i| arg(machine, regs, i))),
+        Api::FileKind => match kt.fds.get(arg(machine, regs, 0) as usize) {
+            Some(thread::FdKind::Vfs(_) | thread::FdKind::Dir { .. }) => 1,
+            Some(thread::FdKind::ConsoleOut) => 2,
+            Some(thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_)) => 3,
+            _ => 0,
+        },
+        Api::ClearTls => threads::clear_tls(machine, &mut state.threads, arg(machine, regs, 0)),
+        Api::SystemInfo => {
+            let out = arg(machine, regs, 0) as usize;
+            machine.write::<u32>(out, machine.total_page_count().unwrap_or(machine.free_page_count()) as u32);
+            machine.write::<u32>(out + 4, machine.free_page_count() as u32);
+            0
+        },
+        Api::MemoryProtect => change_protection(machine, state, arg(machine, regs, 0),
+            arg(machine, regs, 1), arg(machine, regs, 2)).unwrap_or(0),
+        Api::SetSelectors => {
+            let entries: [(u32, u64); 2] = core::array::from_fn(|i| (
+                arg(machine, regs, i * 3), u64::from(arg(machine, regs, i * 3 + 1))
+                    | (u64::from(arg(machine, regs, i * 3 + 2)) << 32)));
+            for &(selector, descriptor) in &entries {
+                if selector == 0 { continue; }
+                if selector > 65535 || selector & 7 != 7 || selector >> 3 < 32
+                    || (descriptor != 0 && (descriptor >> 44 & 7 != 7)) { return 0xc000000d; }
+            }
+            for (selector, descriptor) in entries {
+                if selector == 0 { continue; }
+                let index = (selector >> 3) as usize;
+                if state.ldt.len() <= index { state.ldt.resize(index + 1, 0); }
+                state.ldt[index] = descriptor;
+            }
+            machine.load_ldt(&state.ldt);
+            0
+        },
+        Api::Clock => {
+            let out = arg(machine, regs, 0) as usize;
+            let Some(unix) = crate::kernel::clock::rtc_unix_timestamp() else { return 0xc0000001; };
+            machine.write::<u64>(out, (u64::from(unix) + 11_644_473_600) * 10_000_000);
+            machine.write::<u64>(out + 8, machine.now() / 100);
+            machine.write::<i32>(out + 16, -crate::kernel::clock::utc_offset_minutes());
+            0
+        },
+        Api::Registry => registry::call(machine, &mut state.registry, core::array::from_fn(|i| arg(machine, regs, i))),
+        Api::LocaleId => lib::locale::current().lcid,
+        Api::MapFile => {
+            let name = arg(machine, regs, 0);
+            let base_out = arg(machine, regs, 1);
+            let size_out = arg(machine, regs, 2);
+            if base_out == 0 || size_out == 0 { return 0xc0000005; }
+            let Ok(name) = raw_string(machine, name) else { return 0xc000000d; };
+            let Ok(path) = windows_path(state, &name, false) else { return 0xc0000034; };
+            let Ok(data) = crate::kernel::exec::load_file_resolved(&path) else { return 0xc0000034; };
+            let Some(size) = u32::try_from(data.len()).ok().and_then(|n| n.checked_add(4095)).map(|n| n & !4095) else { return 0xc0000017; };
+            if size == 0 { return 0xc000011e; }
+            let base = memory::call(machine, state, Api::MemoryReserve, 0, size, 0);
+            if base == 0 { return 0xc0000017; }
+            if memory::call(machine, state, Api::MemoryCommit, base, size, 1) == 0 {
+                memory::call(machine, state, Api::MemoryRelease, base, 0, 0);
+                return 0xc0000017;
+            }
+            machine.copy_to(base as usize, &data);
+            machine.set_page_flags(base as usize / 4096, size as usize / 4096, false, false);
+            machine.write::<u32>(base_out as usize, base);
+            machine.write::<u32>(size_out as usize, data.len() as u32);
+            0
+        },
         Api::MemoryReserve | Api::MemoryCommit | Api::MemoryDecommit | Api::MemoryRelease => {
             let base = arg(machine, regs, 0);
             let size = if api == Api::MemoryRelease { 0 } else { arg(machine, regs, 1) };
@@ -1728,10 +1915,12 @@ fn dispatch<A: crate::Arch>(
             1
         }
         Api::Extension => 0,
-        Api::ExitProcess | Api::Unsupported => unreachable!(),
+        Api::ExitProcess | Api::Unsupported | Api::DosMemory | Api::Wait | Api::NativeThread | Api::RestoreContext => unreachable!(),
     }
 }
 
+// Keep Windows-only call frames off the shared DOS/Linux event dispatcher.
+#[inline(never)]
 pub fn handle_event<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -1744,11 +1933,12 @@ pub fn handle_event<A: crate::Arch>(
     if !A::seg_is_32(regs.code_seg()) && let Some(mut win16) = state.win16.take() {
         let action = win16::handle_event(machine, bios, kt, state, &mut win16, process.dos.as_mut().expect("NE DOS services"), regs, event);
         state.win16 = Some(win16);
-        if matches!(event, crate::KernelEvent::Irq) { threads::schedule(machine,state,regs); }
+        if matches!(event, crate::KernelEvent::Irq) { if !threads::schedule(machine,state,regs) {kt.state=thread::ThreadState::Blocked;} }
         return action;
     }
     match event {
-        crate::KernelEvent::Irq => { threads::schedule(machine,state,regs); thread::KernelAction::Done },
+        crate::KernelEvent::Irq => {
+            if !threads::schedule(machine,state,regs) {kt.state=thread::ThreadState::Blocked;} thread::KernelAction::Done },
         crate::KernelEvent::SoftInt(GATE_VECTOR) => {
             let Some(gate) = state
                 .gates
@@ -1759,10 +1949,37 @@ pub fn handle_event<A: crate::Arch>(
                 crate::compact_println!("Windows: invalid API gate at {:#x}", regs.ip32());
                 return thread::KernelAction::Exit(-1);
             };
-            if let Some(action) = threads::call(machine,state,regs,gate) { return action; }
+            if let Some(action) = threads::call(machine,state,kt,regs,gate) { return action; }
             if gate.api == Api::Unsupported {
                 let name = raw_string(machine, arg(machine, regs, 0)).unwrap_or_default();
                 crate::compact_println!("Wine backend not implemented: {}", core::str::from_utf8(&name).unwrap_or("?"));
+                let lock = machine.read::<u32>((PEB_BASE + 0x1c) as usize);
+                crate::compact_println!("Wine PEB lock={:#x} thread={} fs={:#x}", lock,
+                    machine.read::<u32>((state.teb_base + 0x24) as usize), regs.fs);
+                if memory_protection(state, lock).is_some() {
+                    crate::compact_println!("Wine PEB lock count={} recursion={} owner={:#x}",
+                        machine.read::<i32>(lock as usize + 4), machine.read::<u32>(lock as usize + 8),
+                        machine.read::<u32>(lock as usize + 12));
+                }
+                let caller = machine.read::<u32>(regs.sp32() as usize + 8);
+                for module in &state.modules {
+                    if caller >= module.base && caller - module.base < DLL_BASE_STRIDE {
+                        crate::compact_println!("Wine backend caller: {}+{:#x}", core::str::from_utf8(&module.name).unwrap_or("?"), caller - module.base);
+                    }
+                }
+                let mut frame = regs.rbp as u32;
+                for _ in 0..8 {
+                    if frame < state.stack_base || frame.checked_add(8).is_none_or(|end| end > state.stack_base + state.stack_size) { break; }
+                    let caller = machine.read::<u32>(frame as usize + 4);
+                    for module in &state.modules {
+                        if caller >= module.base && caller - module.base < DLL_BASE_STRIDE {
+                            crate::compact_println!("Wine backend frame: {}+{:#x}", core::str::from_utf8(&module.name).unwrap_or("?"), caller - module.base);
+                        }
+                    }
+                    let next = machine.read::<u32>(frame as usize);
+                    if next <= frame { break; }
+                    frame = next;
+                }
                 return thread::KernelAction::Exit(-38);
             }
             if gate.api == Api::ExitProcess {
@@ -1784,24 +2001,11 @@ pub fn handle_event<A: crate::Arch>(
                 finish(machine, regs, callback.gate, result);
                 return thread::KernelAction::Done;
             }
-            if gate.api == Api::Extension
-                && (gate.name.eq_ignore_ascii_case(b"CreateProcessA")
-                    || gate.name.eq_ignore_ascii_case(b"CreateProcessW"))
-            {
-                match extra::create_process(machine, state, regs, gate.name.ends_with(b"W")) {
-                    Ok(action) => {
-                        finish(machine, regs, gate, 0);
-                        return action;
-                    }
-                    Err(error) => {
-                        state.last_error = error;
-                        finish(machine, regs, gate, 0);
-                        return thread::KernelAction::Done;
-                    }
-                }
-            }
-            let result = if gate.api == Api::Extension {
-                extra::call(machine, kt, state, regs, gate.name)
+            let result = if gate.api == Api::DosMemory {
+                if let Some(dos) = &mut process.dos {
+                    crate::kernel::dos::win16_memory(machine, dos, arg(machine, regs, 0),
+                        arg(machine, regs, 1), arg(machine, regs, 2), arg(machine, regs, 3) != 0)
+                } else { 0 }
             } else {
                 dispatch(machine, kt, state, regs, gate.api)
             };
@@ -1817,18 +2021,31 @@ pub fn handle_event<A: crate::Arch>(
                 // INT advances EIP past its two-byte gate before the handler
                 // runs. Retry the same call once input becomes available.
                 regs.frame.rip -= 2;
-                threads::schedule(machine,state,regs);
+                if !threads::schedule(machine,state,regs) {kt.state=thread::ThreadState::Blocked;}
                 return thread::KernelAction::Done;
             }
+            if gate.api == Api::SetSelectors && result == 0 {
+                if let Some(dos) = &mut process.dos {
+                    dos.ldt[..state.ldt.len()].copy_from_slice(&state.ldt);
+                }
+            }
             finish(machine, regs, gate, result);
-            threads::schedule(machine,state,regs);
+            if !threads::schedule(machine,state,regs) {kt.state=thread::ThreadState::Blocked;}
             thread::KernelAction::Done
         }
+        crate::KernelEvent::Exception(13) if exceptions::deliver(machine,state,regs,0xc0000005) => thread::KernelAction::Done,
         crate::KernelEvent::PageFault { .. } => {
             unreachable!("page faults are handled by the event loop")
         }
         _ => {
             crate::compact_println!("Windows: unhandled event {:?} at {:#x}", event, regs.ip32());
+            crate::compact_println!("Windows fault: cs={:#x} ss={:#x} fs={:#x} ds={:#x} es={:#x} sp={:#x} ax={:#x} bx={:#x} cx={:#x} dx={:#x}",regs.frame.cs,regs.frame.ss,regs.fs,regs.ds,regs.es,regs.sp32(),regs.rax,regs.rbx,regs.rcx,regs.rdx);
+            for module in &state.modules {
+                if regs.ip32()>=module.base && regs.ip32()-module.base<DLL_BASE_STRIDE {
+                    crate::compact_println!("Windows fault in {}+{:#x}",core::str::from_utf8(&module.name).unwrap_or("?"),regs.ip32()-module.base);
+                }
+            }
+
             thread::KernelAction::Exit(-1)
         }
     }
@@ -1988,4 +2205,51 @@ mod damage_tests {
             "offscreen menu composition must stay invisible"
         );
     }
+}
+
+pub(crate) fn poll_threads<A: crate::Arch>(machine:&mut A,kt:&mut thread::KernelThread<A>,process:&mut WindowsProcess<A>,regs:&mut Regs) {
+    user_queue::poll(machine,&mut process.state);
+    threads::poll(machine,kt,&mut process.state,regs);
+}
+
+fn initialize_environment<A: crate::Arch>(machine:&mut A,state:&mut WindowsState)->Result<(),i32> {
+    let text=alloc::string::String::from_utf8_lossy(&state.environment);
+    let units:Vec<u16>=text.encode_utf16().collect();
+    let size=((units.len()*2+4095)&!4095) as u32;
+    let base=memory::call(machine,state,Api::MemoryReserve,0,size,0);
+    if base==0 {return Err(-12);}
+    if memory::call(machine,state,Api::MemoryCommit,base,size,1)==0 {
+        memory::call(machine,state,Api::MemoryRelease,base,0,0);
+        return Err(-12);
+    }
+    for (i,unit) in units.iter().enumerate() {machine.write::<u16>(base as usize+i*2,*unit);}
+    machine.write::<u32>((PROCESS_DATA+0x48) as usize,base);
+    machine.write::<u32>((PROCESS_DATA+0x290) as usize,(units.len()*2) as u32);
+    machine.write::<u32>((PROCESS_DATA+0x294) as usize,1);
+    Ok(())
+}
+
+fn process_cwd(path:&[u8])->Vec<u8> {
+    let mut path=guest_windows_path(path);
+    if path.last()!=Some(&b'\\'){path.push(b'\\');}
+    path
+}
+fn initialize_process_strings<A:crate::Arch>(machine:&mut A,state:&mut WindowsState)->Result<(),i32>{
+    machine.write::<u32>(PROCESS_DATA as usize,4096);
+    machine.write::<u32>((PROCESS_DATA+4) as usize,0x298);
+    machine.write::<u32>((PROCESS_DATA+8) as usize,1);
+    let image=guest_windows_path(state.exec_path_str());
+    let cwd=process_cwd(state.cwd_str());
+    for (field,buffer,value) in [(0x24u32,0x400u32,cwd.as_slice()),
+        (0x30,0x600,b"C:\\RETROOS\\WINDOWS\\SYSTEM32;C:\\RETROOS\\WINDOWS\\SYSTEM".as_slice()),
+        (0x38,0x800,image.as_slice()),(0x40,0xa00,image.as_slice())] {
+        let units=encoding::encode(value,true);
+        if units.len()>=256{return Err(-8);}
+        encoding::copy(machine,(PROCESS_DATA+buffer) as usize,256,value,true);
+        machine.write::<u16>((PROCESS_DATA+field) as usize,(units.len()*2) as u16);
+        machine.write::<u16>((PROCESS_DATA+field+2) as usize,512);
+        machine.write::<u32>((PROCESS_DATA+field+4) as usize,PROCESS_DATA+buffer);
+    }
+    state.command_line_w=PROCESS_DATA+0xa00;
+    Ok(())
 }

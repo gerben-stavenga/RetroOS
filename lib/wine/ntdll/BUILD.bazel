@@ -2,11 +2,13 @@ package(default_visibility = ["//visibility:public"])
 
 genrule(
     name = "ntdll_dll",
-    srcs = ["@wine_source_tar//file"],
+    srcs = ["@wine_freetype_tar//file", "//lib/wine:build_freetype.py", "//lib/wine:font_mapping.c", "@wine_source_tar//file", "//lib/wine:win32u-pe.patch", "//lib/wine:graphics.c"],
     tools = ["//lib/wine:build_ntdll.py", "@wine_build_tools//:usr/bin/flex"],
-    outs = ["NTDLL.DLL", "backend-abi.json"],
+    outs = ["NTDLL.DLL", "backend-abi.json", "KRNL386.EXE16", "WIN32U.DLL"],
     cmd = "python3 $(location //lib/wine:build_ntdll.py) " +
-          "--source $(location @wine_source_tar//file) " +
+          "--source $(location @wine_source_tar//file) --freetype $(location @wine_freetype_tar//file) " +
           "--flex $(location @wine_build_tools//:usr/bin/flex) " +
-          "--output $(location NTDLL.DLL) --abi $(location backend-abi.json)",
+          "--output $(location NTDLL.DLL) --abi $(location backend-abi.json) " +
+          "--kernel16 $(location KRNL386.EXE16) " +
+          "--graphics-driver $(location //lib/wine:graphics.c) --graphics $(location WIN32U.DLL) --graphics-patch $(location //lib/wine:win32u-pe.patch)",
 )

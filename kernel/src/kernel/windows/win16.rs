@@ -6,6 +6,8 @@
 
 extern crate alloc;
 
+mod wine;
+
 use alloc::{vec, vec::Vec};
 
 use crate::Regs;
@@ -621,6 +623,7 @@ pub(super) fn exec<A: crate::Arch>(
     parent_cwd: &[u8],
     launcher: Option<thread::PersonalityName>,
     cmdtail: &[u8],
+    parent_env: &[u8],
 ) -> Result<(), i32> {
     let image = ne::Image::parse(&data).map_err(|_| -8)?;
     let header = image.header;
@@ -762,12 +765,8 @@ pub(super) fn exec<A: crate::Arch>(
     machine.set_page_flags(ENV_BASE as usize / 4096, 1, true, false);
     machine.set_page_flags(RESOURCE_BASE as usize / 4096, 16, true, false);
 
-    if wine {
-        crate::compact_println!("Windows: Wine embedded NE interfaces loaded; Wine Win16 thread/relay initialization is not implemented");
-        return Err(-38);
-    }
     // The legacy bridge creates its own PE main-module record.
-    windows.modules.clear();
+    if !wine { windows.modules.clear(); }
 
     let current = thread::get_thread(threads, tid).ok_or(-8)?;
     windows.next_object = 0x0100;
@@ -775,6 +774,7 @@ pub(super) fn exec<A: crate::Arch>(
     // could collide with a subsequently allocated real bitmap/window context.
     windows.paint_dc = 0;
     windows.ldt = ldt;
+    windows.environment=super::extra::windows_environment(parent_env);
     windows.exec_path_len = main_path.len().min(windows.exec_path.len());
     windows.exec_path[..windows.exec_path_len]
         .copy_from_slice(&main_path[..windows.exec_path_len]);
@@ -803,7 +803,7 @@ pub(super) fn exec<A: crate::Arch>(
     let code_selector = *selectors.get(header.entry_segment.wrapping_sub(1) as usize).ok_or(-8)?;
 
     current.kernel.vcpu.regs.init_user_process(0, 0);
-    init_bridge(machine, &mut windows, &modules, &current.kernel.vcpu.regs, tid, &data, data_selector)?;
+    if !wine { init_bridge(machine, &mut windows, &modules, &current.kernel.vcpu.regs, tid, &data, data_selector)?; }
     let bridge_cs = current.kernel.vcpu.regs.code_seg();
     let regs = &mut current.kernel.vcpu.regs;
     regs.frame.rip = u64::from(header.entry_offset);
@@ -844,7 +844,7 @@ pub(super) fn exec<A: crate::Arch>(
     });
     // Initializers run as ordinary far calls in KERNEL.DLL on the guest stack.
     // The same runner is used by LoadLibrary; no kernel callback continuation.
-    if windows.win16.as_ref().is_some_and(|s| s.modules.iter().any(|m| m.initialized == 0)) {
+    if !wine && windows.win16.as_ref().is_some_and(|s| s.modules.iter().any(|m| m.initialized == 0)) {
         let state = windows.win16.as_ref().ok_or(-8)?;
         let kernel = state.modules.iter().find(|m| m.kind == Some(Module::Kernel)).ok_or(-8)?;
         let entry = ne::Image::parse(&kernel.data).map_err(|_| -8)?.entry(428).map_err(|_| -8)?;
@@ -856,6 +856,11 @@ pub(super) fn exec<A: crate::Arch>(
         regs.frame.rsp = u64::from(sp);
         regs.frame.cs = u64::from(kernel.selectors[entry.0 as usize-1]);
         regs.frame.rip = u64::from(entry.1);
+    }
+    if wine {
+        let target = current.kernel.vcpu.regs.clone();
+        current.kernel.vcpu.regs.init_user_process(0, 0);
+        wine::start(machine, &mut windows, &mut current.kernel.vcpu.regs, tid, &target)?;
     }
     windows.on_resume(machine);
     dos.ldt[..windows.ldt.len()].copy_from_slice(&windows.ldt);

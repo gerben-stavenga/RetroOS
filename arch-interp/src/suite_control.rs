@@ -55,6 +55,10 @@ pub fn advance(instructions: u64) {
     TIME.fetch_add((numerator / u128::from(speed)) as u64, Ordering::Relaxed);
     *remainder = (numerator % u128::from(speed)) as u64;
 }
+/// Idle time is real emulated time, but does not consume an instruction budget.
+pub fn advance_idle(nanoseconds:u64) {
+    if enabled() {TIME.fetch_add(nanoseconds,Ordering::Relaxed);}
+}
 /// Called on the CPU thread between kernel event-loop iterations.
 pub fn gate() {
     if !enabled() { return; }

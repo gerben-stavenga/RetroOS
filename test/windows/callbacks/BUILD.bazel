@@ -59,3 +59,11 @@ windows_watcom_binary(name="popup", src="popup.c", visibility=["//visibility:pub
 windows_watcom_binary(name="multimedia", src="multimedia.c", visibility=["//visibility:public"])
 windows_watcom_binary(name="mmio", src="mmio.c", visibility=["//visibility:public"])
 windows_watcom_binary(name="text", src="text.c", visibility=["//visibility:public"])
+
+genrule(
+    name = "wine_keyboard",
+    srcs = ["wine_keyboard.c", "build_wine_keyboard.py", "@wine_source//:headers", "@wine_source//:include/windef.h"],
+    outs = ["wine_keyboard.exe"],
+    cmd = "python3 $(location build_wine_keyboard.py) $(location wine_keyboard.c) $(location @wine_source//:include/windef.h) $@",
+    visibility = ["//visibility:public"],
+)

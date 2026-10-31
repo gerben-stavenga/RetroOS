@@ -130,6 +130,20 @@ const VIRT_INSTR_PER_MS: u64 = 6_000;
 /// Retired guest instructions, the source of virtual time.
 #[cfg(feature = "tcg")]
 static VIRT_CYCLES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "tcg")]
+static VIRT_IDLE_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Let timers advance while the kernel has parked all guest contexts. Keep
+/// idle duration separate from retired-instruction accounting.
+pub fn idle() {
+    #[cfg(feature = "tcg")]
+    {
+        const STEP_NS:u64=1_000_000;
+        VIRT_IDLE_NS.fetch_add(STEP_NS,Ordering::Relaxed);
+        crate::suite_control::advance_idle(STEP_NS);
+    }
+    std::thread::yield_now();
+}
 
 /// Advance virtual time by `instructions` retired in a run slice. Called by the
 /// CPU core (`cpu::execute`) after each `emu_start`.
@@ -145,7 +159,7 @@ pub fn advance_virtual_time(instructions: u64) {
 pub fn now() -> u64 {
     if crate::suite_control::enabled() { return crate::suite_control::now(); }
     let cycles = VIRT_CYCLES.load(Ordering::Relaxed);
-    (u128::from(cycles) * 1_000_000 / u128::from(VIRT_INSTR_PER_MS)) as u64
+    ((u128::from(cycles) * 1_000_000 / u128::from(VIRT_INSTR_PER_MS)) as u64).saturating_add(VIRT_IDLE_NS.load(Ordering::Relaxed))
 }
 
 /// Guest-perceived milliseconds on the KVM engine: real elapsed time. The
