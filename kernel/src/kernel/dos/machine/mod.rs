@@ -281,18 +281,24 @@ impl AudioDevices {
     }
     /// Media-core mixer: resident sample storage only; IRQ delivery is deferred
     /// to the guest core. The surrounding Shared guard excludes port accesses.
-    pub fn mix(&mut self, now_ns: u64, span: crate::kernel::sound::AudioSpan<'_>) {
-        self.mix_with(now_ns, span, None);
+    /// Returns the rendered prefix; the engine retains the rest across DMA handoff.
+    pub fn mix(&mut self, now_ns: u64, span: crate::kernel::sound::AudioSpan<'_>) -> usize {
+        self.mix_with(now_ns, span, None)
     }
     pub fn mix_guest<A: crate::Arch>(&mut self, machine: &mut A, now_ns: u64,
-        span: crate::kernel::sound::AudioSpan<'_>) {
-        self.mix_with(now_ns, span, Some(&mut |addr, bytes| machine.copy_from(addr, bytes)));
+        span: crate::kernel::sound::AudioSpan<'_>) -> usize {
+        self.mix_with(now_ns, span, Some(&mut |addr, bytes| machine.copy_from(addr, bytes)))
     }
     fn mix_with(&mut self, now_ns: u64, span: crate::kernel::sound::AudioSpan<'_>,
-        copy: Option<vsb::DmaCopy<'_>>) {
+        copy: Option<vsb::DmaCopy<'_>>) -> usize {
+        let count = match &mut self.sb.device {
+            SbDevice::Emulated(sb) => sb.mix_limit(now_ns, span.rate, span.frames.len()),
+            _ => span.frames.len(),
+        };
+        if count == 0 { return 0; }
+        let span = crate::kernel::sound::AudioSpan { frames: &mut span.frames[..count], ..span };
         let mut irq = VirtualPic::new();
         if let SbDevice::Emulated(sb) = &mut self.sb.device {
-            let _ = sb.take_restart();
             sb.mix_resident(span.rate, span.frames, span.physical_sb, copy);
             sb.clock_tick(now_ns, &mut irq, self.sb.blaster.irq);
         }
@@ -302,6 +308,7 @@ impl AudioDevices {
         self.spk.mix_into(span.rate, (gain, gain), span.frames);
         self.gus.deliver_events(&mut irq);
         for line in 0..16 { if irq.is_requested(line) { self.pending_irqs |= 1 << line; } }
+        count
     }
 }
 

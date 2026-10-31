@@ -416,6 +416,8 @@ const MIX_CHUNK: usize = 128;
 /// silent machine. It deliberately knows nothing about rings or cursors.
 pub struct Clock {
     produced_q16: u64,
+    /// Already budgeted time withheld at a source buffer boundary.
+    pending_frames: u64,
 }
 
 impl Default for Clock {
@@ -424,7 +426,7 @@ impl Default for Clock {
 
 impl Clock {
     pub const fn new() -> Self {
-        Self { produced_q16: 0 }
+        Self { produced_q16: 0, pending_frames: 0 }
     }
 
     /// Absolute source-frame frontier: where an event arriving now is stamped.
@@ -436,13 +438,14 @@ impl Clock {
         let before = self.produced_frames();
         self.produced_q16 +=
             (rate_q16 as u128 * dt_ns as u128 / 1_000_000_000) as u64;
+        self.produced_q16 += core::mem::take(&mut self.pending_frames) << RATE_FP_SHIFT;
         self.produced_frames() - before
     }
 
     fn frames_for(&self, rate_q16: u64, dt_ns: u64) -> u64 {
         let after = self.produced_q16 as u128
             + rate_q16 as u128 * dt_ns as u128 / 1_000_000_000;
-        (after >> RATE_FP_SHIFT) as u64 - self.produced_frames()
+        (after >> RATE_FP_SHIFT) as u64 - self.produced_frames() + self.pending_frames
     }
 }
 
@@ -452,7 +455,7 @@ impl Clock {
 /// therefore do not depend on output hardware existing.
 fn advance_resident(
     clock: &mut Clock, mut sink: Option<&mut Sink>, dt_ns: u64, stamp: u64,
-    mut mix: impl FnMut(AudioSpan<'_>),
+    mut mix: impl FnMut(AudioSpan<'_>) -> usize,
 ) {
     let mut elapsed_ns = dt_ns;
     let mut written = 0;
@@ -515,6 +518,7 @@ fn advance_resident(
             output.ns_since_cursor = 0;
             output.rate_q16 = None;
             elapsed_ns = 0;
+            clock.pending_frames = 0;
         }
     }
 
@@ -545,18 +549,24 @@ fn advance_resident(
     while remaining > 0 {
         let run = usize::try_from(remaining.min(MIX_CHUNK as u64)).unwrap();
         frames[..run].fill((0, 0));
-        mix(AudioSpan {
+        let mixed = mix(AudioSpan {
             rate: mix_rate,
             base_frame: base,
             physical_sb: sink.as_ref().is_some_and(|output| output.is_sb()),
             frames: &mut frames[..run],
         });
         if let (Some(output), Some(gain_q16)) = (sink.as_deref_mut(), gain_q16) {
-            output.play(&frames[..run], gain_q16);
+            output.play(&frames[..mixed], gain_q16);
         }
-        base += run as u64;
-        remaining -= run as u64;
+        base += mixed as u64;
+        remaining -= mixed as u64;
+        if mixed < run { break; }
     }
+    // Return unrendered work to the clock. No zero samples are committed
+    // while a finite DMA transfer hands its next buffer over through an IRQ.
+    clock.produced_q16 -= remaining << RATE_FP_SHIFT;
+    clock.pending_frames = remaining;
+    let produced = produced - remaining;
     // Publish the pitch timebase, not the effective frame-count rate. The OSD
     // "Mix rate" reads this, and after the pitch/count split it is `s` that the
     // audio actually plays at; `rate_q16` swings with the latency servo and no
@@ -660,7 +670,7 @@ impl Engine {
         self.advance(now, machine.rdtsc(), None, |source, now, span| source.mix_guest(machine, now, span));
     }
     fn advance(&mut self, now: u64, stamp: u64, reader: Option<arch_abi::GuestReadView>,
-        mut mix: impl FnMut(&mut super::dos::AudioDevices, u64, AudioSpan<'_>)) {
+        mut mix: impl FnMut(&mut super::dos::AudioDevices, u64, AudioSpan<'_>) -> usize) {
         let elapsed = now.saturating_sub(self.last_ns);
         if elapsed == 0 { return; }
         let _stall = super::portio::StallWatch::new("audio service");
@@ -687,7 +697,45 @@ impl Engine {
         self.last_ns = now;
         LAST_AUDIO_MS.store((now / 1_000_000) as u32, Ordering::Relaxed);
         advance_resident(&mut self.clock, self.sink.as_mut(), elapsed, stamp, |span| {
-            if let Some(source) = source.as_mut() { mix(source, now, span); }
+            if let Some(source) = source.as_mut() { mix(source, now, span) } else { span.frames.len() }
         });
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+
+    #[test]
+    fn a_partial_source_span_is_retried_without_skipping_or_replaying_frames() {
+        let mut clock = Clock::new();
+        let rate = u64::from(DEFAULT_RATE);
+        advance_resident(&mut clock, None, 1_000_000, 0, |span| {
+            assert_eq!(span.base_frame, 0);
+            13
+        });
+        let first_budget = rate / 1000;
+        assert_eq!(clock.produced_frames(), 13);
+        assert_eq!(clock.pending_frames, first_budget - 13);
+        let mut resumed = 0;
+        advance_resident(&mut clock, None, 1_000_000, 0, |span| {
+            assert_eq!(span.base_frame, 13 + resumed);
+            resumed += span.frames.len() as u64;
+            span.frames.len()
+        });
+        assert_eq!(resumed, 2 * first_budget - 13);
+        assert_eq!(clock.pending_frames, 0);
+        assert_eq!(clock.produced_frames(), 2 * first_budget);
+        for _ in 2..10 {
+            advance_resident(&mut clock, None, 1_000_000, 0, |span| span.frames.len());
+        }
+        let mut uninterrupted = Clock::new();
+        for _ in 0..10 {
+            advance_resident(&mut uninterrupted, None, 1_000_000, 0, |span| span.frames.len());
+        }
+        // Deferral preserves the clock's fractional remainder, including its
+        // normal fixed-point rounding, exactly as uninterrupted production does.
+        assert_eq!(clock.produced_q16, uninterrupted.produced_q16);
+
     }
 }

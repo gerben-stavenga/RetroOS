@@ -108,6 +108,9 @@ pub(super) const SPEAKER_SCALE_Q16: i32 = 1_454;
 /// A temporarily reduced output rate can consume slightly more than one DSP
 /// source frame per output frame.
 const DSP_SCRATCH_BYTES: usize = 256 * 4;
+// Allow the guest two ordinary 1 ms service opportunities to chain a buffer.
+// Returning to the worker, rather than waiting here, leaves graphics runnable.
+const DMA_REFILL_GRACE_NS: u64 = 2_000_000;
 
 // The event loop cannot schedule a 156-us one-byte transfer while KVM runs
 // guest-only code. Three TF retirements cross the usual DSP-write helper's
@@ -248,6 +251,12 @@ pub struct EmulatedSb {
     /// the byte; a few retired guest instructions preserve that ordering
     /// while still meeting old drivers' very short probe windows.
     probe_steps: u8,
+    /// Nonblocking IRQ handoff: retain the unrendered span briefly so the
+    /// guest can chain its next single-cycle buffer. An unchained effect must
+    /// not hold the other sources indefinitely.
+    refill_until: u64,
+    refill_phase: u64,
+    refill_rate: u32,
     /// Linearized guest DMA window for the software mixer. The emulated SB16
     /// is capped at the canonical mix rate, so one 128-frame 16-bit stereo
     /// block is the strict maximum. Audio mixing therefore never allocates.
@@ -275,7 +284,7 @@ impl EmulatedSb {
             worker_dma: false,
             mix_pos_q32: 0,
             est_frames: 0, est_ns: 0, est_cap: 0, est_slope: 0, est_served: 0,
-            probe_steps: 0,
+            probe_steps: 0, refill_until: 0, refill_phase: 0, refill_rate: 0,
             dsp_scratch: [0; DSP_SCRATCH_BYTES],
         })
     }
@@ -643,7 +652,10 @@ impl EmulatedSb {
         if !self.core.take_restart() {
             return false;
         }
-        self.mix_pos_q32 = 0;
+        self.mix_pos_q32 = if self.refill_until != 0 && self.refill_rate == self.core.rate() {
+            self.refill_phase
+        } else { 0 };
+        self.refill_until = 0;
         self.est_frames = 0;
         self.est_ns = 0;
         self.est_cap = 0;
@@ -663,6 +675,18 @@ impl EmulatedSb {
         // The worker owns this copy. Sample a complete ring so a delayed
         // mixer quantum can wrap or catch up without reading stale bytes.
         copy(self.dma_base as usize, &mut self.dma_image)
+    }
+
+    pub(super) fn mix_limit(&mut self, now: u64, rate: u32, requested: usize) -> usize {
+        self.take_restart();
+        if self.refill_until != 0 {
+            if now < self.refill_until { return 0; }
+            self.refill_until = 0;
+        }
+        let Some(end) = self.core.single_boundary() else { return requested };
+        let step = (u64::from(self.core.rate().max(1)) << 32) / u64::from(rate.max(1));
+        ((end << 32).saturating_sub(self.mix_pos_q32).div_ceil(step.max(1)) as usize)
+            .min(requested)
     }
 
     pub(super) fn mix_resident(
@@ -711,11 +735,18 @@ impl EmulatedSb {
     pub(super) fn clock_tick(&mut self, now_ns: u64,
         vpic: &mut super::vpic::VirtualPic, irq: u8) {
         let produced = self.mix_pos_q32 >> 32;
+        let boundary = self.core.single_boundary();
+        let short_probe = self.core.short_probe_active();
         if self.probe_steps == 0
             && self.core.advance(sound::sb::Step::Clock { now: now_ns, produced }, None).irq
             && !vpic.is_requested(irq)
         {
             vpic.raise(irq);
+        }
+        if let Some(end) = boundary && !self.core.playing() && !short_probe {
+            self.refill_until = now_ns.saturating_add(DMA_REFILL_GRACE_NS);
+            self.refill_phase = self.mix_pos_q32.saturating_sub(end << 32);
+            self.refill_rate = self.core.rate();
         }
         // Re-anchor the count-read estimator on the reconciled cursor and
         // measure the frames-per-nanosecond slope from this pump interval. A cursor
@@ -867,4 +898,55 @@ machine: &mut A,
             return if low { v as u8 } else { (v >> 8) as u8 };
         }
     dma.io_read(machine, port)
+}
+
+#[cfg(test)]
+mod single_cycle_tests {
+    use super::*;
+
+    fn start(sb: &mut EmulatedSb) {
+        sb.core.begin(sound::sb::Start { bits: 8, stereo: false, signed: false,
+            single: true, block_override: Some(879) }, 880);
+    }
+
+    #[test]
+    fn chained_dma_yields_without_padding_and_preserves_fractional_phase() {
+        let mut sb = EmulatedSb::new();
+        sb.core.port_write(0x22c, 0x40, 0);
+        sb.core.port_write(0x22c, 0xe9, 0);
+        sb.dma_image.resize(880, 255);
+        start(&mut sb);
+        let mut irq = VirtualPic::new();
+        let mut played = 0;
+        for tick in 1..=21 {
+            let now = tick * 1_000_000;
+            let n = sb.mix_limit(now, 48_000, 48);
+            let mut samples = [(0, 0); 48];
+            sb.mix_resident(48_000, &mut samples[..n], false, None);
+            assert!(samples[..n].iter().all(|&(l, r)| l > 0 && r > 0));
+            sb.clock_tick(now, &mut irq, 7);
+            played += n;
+        }
+        assert_eq!(played, 972); // ceil(880 * 48000 / 43478)
+        assert!(irq.is_requested(7));
+        assert_eq!(sb.mix_limit(21_500_000, 48_000, 48), 0);
+        let carry = sb.refill_phase;
+        assert!(carry > 0);
+        sb.core.port_read(0x22e);
+        start(&mut sb);
+        assert_eq!(sb.mix_limit(21_600_000, 48_000, 36), 36);
+        assert_eq!(sb.mix_pos_q32, carry);
+    }
+
+    #[test]
+    fn an_unchained_effect_releases_other_audio_after_the_handoff_deadline() {
+        let mut sb = EmulatedSb::new();
+        start(&mut sb);
+        sb.take_restart();
+        sb.mix_pos_q32 = 880 << 32;
+        sb.clock_tick(100_000_000, &mut VirtualPic::new(), 7);
+        assert_eq!(sb.mix_limit(101_000_000, 48_000, 48), 0);
+        assert_eq!(sb.mix_limit(102_000_000, 48_000, 48), 48);
+        assert!(!sb.core.playing());
+    }
 }

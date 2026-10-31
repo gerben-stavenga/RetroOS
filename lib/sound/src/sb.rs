@@ -344,11 +344,6 @@ pub struct Sb {
     /// This DSP playback (re)started: tell the host to reset its incremental
     /// source phase to DSP frame zero.
     restarted: bool,
-    /// Tiny single-cycle transfer: a DMA-wiring probe wanting its completion
-    /// IRQ within milliseconds — completed on virtual time, not drain.
-    probe: bool,
-    /// Host clock at the first tick of a probe transfer.
-    start_ns: u64,
     /// Block IRQs raised / serviced (guest read the DMA count or status port —
     /// poll-bool/poll-dma/irq-mix all do). Their gap is the commit horizon: a
     /// serviced block means the guest has refilled its slot, so the ring is
@@ -399,7 +394,7 @@ impl Sb {
             single: false,
             buf_frames: 0, block_frames: 0,
             cursor: 0, next_irq: 0,
-            restarted: false, probe: false, start_ns: 0,
+            restarted: false,
             blocks_done: 0, blocks_acked: 0,
             write_busy: 0, dma_tc: false, tc_status: 0,
             stream_hold: false, done_ns: 0,
@@ -694,15 +689,10 @@ impl Sb {
         self.blocks_done = 0;
         self.blocks_acked = 0;
         self.restarted = true; // host: reset its incremental DSP source phase
-        // A single-cycle DMA transfer has its own finite device clock: it
-        // starts when the DSP command arms DRQ and reaches terminal count
-        // after `buf_frames / rate`, independent of how much older music is
-        // queued in the final speaker sink. Treating only sub-256-byte blocks
-        // this way made Duke3D's larger 16-bit channel-5 self-test wait behind
-        // the GUS output cushion and time out as "conflicting DMA channel".
-        // Auto-init rings advance through the regular CPU producer.
-        self.probe = s.single;
-        self.start_ns = 0;
+        // Tiny wiring probes retain the instruction-delayed completion path.
+        // Ordinary single-cycle audio uses the same produced-sample clock as
+        // auto-init; classifying all single-cycle playback as a timed probe
+        // inserts a new pump delay at every buffer boundary.
         self.dma_tc = false; // restart re-loads the count registers
         self.playing = self.buf_frames > 0;
         if self.playing {
@@ -766,7 +756,7 @@ impl Sb {
     /// `produced` is the number of this card's frames the CPU-clocked mixer has
     /// consumed. The final HDA/AC'97/SB sink trails behind by its pipe depth and
     /// has no bearing on this DMA cursor. Also ends the hangover hold and
-    /// completes single-cycle transfers on their CPU-time clock.
+    /// completes single-cycle transfers at their exact source-frame boundary.
     fn advance_clock(&mut self, now: u64, produced: u64) -> bool {
         let mut raise = false;
         if self.silence_until_ns != 0 && now >= self.silence_until_ns {
@@ -783,18 +773,7 @@ impl Sb {
             }
             return raise;
         }
-        let guest_now = if self.probe {
-            // Single-cycle DMA advances continuously on the DSP's virtual
-            // sample clock, independent of final-speaker stream priming.
-            if self.start_ns == 0 {
-                self.start_ns = now;
-            }
-            ((u128::from(now.saturating_sub(self.start_ns))
-                * u128::from(self.rate.max(1)) / 1_000_000_000) as u64)
-                .min(self.next_irq)
-        } else {
-            produced
-        };
+        let guest_now = produced;
         while self.playing && guest_now >= self.next_irq {
             raise |= self.block_irq();
             if self.single {
@@ -901,7 +880,7 @@ impl Sb {
     /// Whether this transfer needs the machine's sub-millisecond completion
     /// path rather than the regular audio clock.
     pub fn short_probe_active(&self) -> bool {
-        self.probe && self.playing
+        self.single && self.playing
             && self.block_frames as u64 * 1_000_000_000
                 < self.rate.max(1) as u64 * 1_000_000
     }
@@ -1136,6 +1115,11 @@ impl Sb {
         self.cursor
     }
 
+    /// A finite transfer must yield at this boundary before mixing its successor.
+    pub fn single_boundary(&self) -> Option<u64> {
+        (self.playing && self.single).then_some(self.next_irq)
+    }
+
     /// The next block boundary in session frames. An estimate must never
     /// cross it: the boundary belongs to `advance_clock`, which raises the
     /// completion IRQ as it passes — a count that crossed first would show
@@ -1199,6 +1183,18 @@ mod tests {
         assert!(block[1].0 < 0);
         assert_eq!(block[2], (0, 0), "partial samples must not become sound");
         assert_eq!(sb.cursor_frames(), 0, "rendering is independent of the device clock");
+    }
+
+    #[test]
+    fn finite_dma_completes_from_consumed_samples_not_pump_time() {
+        let mut sb = Sb::new();
+        sb.begin(Start { bits: 8, stereo: false, signed: false, single: true,
+            block_override: Some(879) }, 880);
+        assert!(!sb.advance(Step::Clock { now: 1_000_000_000, produced: 879 }, None).irq);
+        assert!(sb.playing());
+        assert!(sb.advance(Step::Clock { now: 1_000_000_000, produced: 880 }, None).irq);
+        assert!(!sb.playing());
+        assert!(sb.at_terminal_count());
     }
 
     fn sb16_command(sb: &mut Sb, command: u8) -> Start {
