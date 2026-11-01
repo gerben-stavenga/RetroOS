@@ -16,6 +16,36 @@ _start:
     jne fail
 .tail_ok:
     mov [initial_sp],sp
+    ; Allocation information returns a usable resident media pointer, not
+    ; the stale BX left by an earlier API. Empty A: retains AL=FF failure.
+    mov byte [stage],'D'
+    push ds
+    mov bx,0xadad
+    mov dx,1
+    mov ax,0x1c00
+    call far DOS3Call
+    cmp al,0xff
+    jne .allocation_fail
+    cmp byte [bx],0xf0
+    jne .allocation_fail
+    pop ds
+    push ds
+    mov bx,0xadad
+    mov dx,3
+    mov ax,0x1c00
+    int 0x21
+    cmp al,8
+    jne .allocation_fail
+    cmp cx,512
+    jne .allocation_fail
+    cmp byte [bx],0xf8
+    jne .allocation_fail
+    pop ds
+    jmp .allocation_ok
+.allocation_fail:
+    pop ds
+    jmp fail
+.allocation_ok:
     ; Wine creates and writes; direct DOS seeks the same handle.
     push ds
     push word filename

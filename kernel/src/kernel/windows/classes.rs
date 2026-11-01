@@ -156,6 +156,9 @@ impl State {
 }
 
 impl Class {
+    pub(super) fn matches_atom(&self, atom: u32) -> bool {
+        self.atom == atom
+    }
     pub(super) fn is_desktop(&self) -> bool {
         self.atom == 32769 && !self.local
     }

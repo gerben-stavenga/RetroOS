@@ -383,6 +383,20 @@ NTSTATUS WINAPI RetroServerCall(struct __server_request_info *data)
         }
         return status;
     }
+    if(request.request_header.req==REQ_get_class_windows)
+    {
+        ULONG params[16]={0},result[8]={0};
+        const struct get_class_windows_request *r=&request.get_class_windows_request;
+        params[0]=r->parent;params[1]=r->child;params[2]=r->atom;
+        params[3]=(ULONG)name;params[4]=length;
+        params[5]=data->reply_data?capacity/sizeof(ULONG):0;params[6]=(ULONG)data->reply_data;
+        status=RetroWindowTree(17,params,result);
+        memset(&data->u.reply,0,sizeof(data->u.reply));
+        data->u.reply.reply_header.error=status;
+        data->u.reply.get_class_windows_reply.count=result[0];
+        if(!status) data->u.reply.reply_header.reply_size=result[0]*sizeof(ULONG);
+        return status;
+    }
     if(request.request_header.req==REQ_get_visible_region)
     {
         ULONG params[16]={0},result[12]={0};

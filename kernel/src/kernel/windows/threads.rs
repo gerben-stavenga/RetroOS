@@ -676,6 +676,8 @@ fn native<A: crate::Arch>(
         static NEXT_THREAD: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0x10000);
         let id = NEXT_THREAD.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let parent = state.threads.contexts[state.threads.active].id;
+        state.user_objects.inherit_thread(parent, id);
         let pid = machine.read::<u32>((state.teb_base + 0x20) as usize);
         for (offset, value) in [
             (0, u32::MAX),

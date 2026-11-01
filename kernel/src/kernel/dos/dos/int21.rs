@@ -1212,6 +1212,11 @@ pub(super) fn int_21h<A: crate::Arch>(
                 regs.rdx=saved_dx;
             } else {
                 regs.rax=(saved_ax & !0xff)|(regs.rax & 0xff);
+            }
+            // Keep the resident media pointer addressable even when a drive
+            // has no inserted disk. DOS callers can probe removable drives
+            // and inspect the descriptor before checking AL for failure.
+            if (1..=26).contains(&drive) {
                 let address=LOW_MEM_BASE+core::mem::offset_of!(LowMem,allocation_media) as u32+u32::from(drive-1);
                 machine.write::<u8>(address as usize,if drive<=2 {0xf0}else{0xf8});
                 if regs.mode()!=crate::UserMode::VM86 {

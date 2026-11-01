@@ -129,6 +129,11 @@ impl Drop for State {
 }
 const BASE: u32 = 0x74000000;
 impl State {
+    pub(super) fn inherit_thread(&mut self, parent: u32, child: u32) {
+        if let Some(desktop) = self.desktops.iter().find(|d| d.0 == parent).map(|d| d.1) {
+            self.desktops.push((child, desktop));
+        }
+    }
     fn get(&self, h: u32) -> Option<Arc<Object>> {
         h.checked_sub(BASE)
             .filter(|n| n % 4 == 0)
@@ -571,6 +576,39 @@ pub(super) fn tree_call<A: crate::Arch>(
     let mut windows = desktop.windows.lock();
     machine.zero(out as usize, 32);
     match op {
+        // FindWindowEx enumerates siblings by class; the portable Wine code
+        // applies its title filter to this ordered candidate list.
+        17 => {
+            let mut atom = p[2];
+            if atom == 0 && p[4] != 0 {
+                if p[4] > 510 || p[4] & 1 != 0 { return 0xc000000d; }
+                let name: Vec<u16> = (0..p[4] / 2)
+                    .map(|i| machine.read::<u16>((p[3] + i * 2) as usize)).collect();
+                let Ok(name) = alloc::string::String::from_utf16(&name) else { return 0xc000000d; };
+                let Ok(found) = atoms::USER.lock().lookup(&name, false) else { return 0; };
+                atom = u32::from(found);
+            }
+            let parent = if p[0] == 0 { None } else {
+                let Some(w) = windows.iter().find(|w| matches_handle(w.handle,p[0])) else { return 0xc0000008; };
+                Some(w.handle)
+            };
+            let root = windows.first().map(|w| w.handle).unwrap_or(0);
+            let message = windows.get(1).map(|w| w.handle).unwrap_or(0);
+            let start = if p[1] == 0 { 0 } else {
+                let Some(i) = windows.iter().position(|w| matches_handle(w.handle,p[1])) else { return 0xc0000008; };
+                if windows[i].parent != parent.unwrap_or(root) { return 0; }
+                i + 1
+            };
+            let list: Vec<u32> = windows[start..].iter().filter(|w| w.linked
+                && parent.map_or(w.parent == root || w.parent == message, |p| w.parent == p)
+                && (atom == 0 || w._class.matches_atom(atom)))
+                .map(|w| w.handle).collect();
+            machine.write::<u32>(out as usize, list.len() as u32);
+            if list.len() > p[5] as usize { return 0xc0000023; }
+            for (i, h) in list.into_iter().enumerate() {
+                machine.write::<u32>(p[6] as usize + i * 4, h);
+            }
+        }
         16 => return paint::visible_region(machine, &windows, p, out),
         13 | 14 => return paint::call(machine, &mut windows, op, p, out),
         // No layered attributes have been set: Wine expects this error for

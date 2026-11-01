@@ -6,8 +6,23 @@
 #include <winuser.h>
 __declspec(dllimport) BOOL WINAPI RetroWriteFile(DWORD,const void *,DWORD,DWORD *,void *);
 static unsigned errors;
+static HDESK desktop;
 static void check(BOOL ok) { if(!ok) errors++; }
 static LRESULT CALLBACK proc(HWND w,UINT m,WPARAM a,LPARAM b) {return DefWindowProcA(w,m,a,b);}
+static DWORD WINAPI gui_thread(void *unused)
+{
+    HWND window; HDC dc;
+    check(GetThreadDesktop(GetCurrentThreadId())==desktop);
+    window=CreateWindowExA(0,"SurfaceProbe","thread surface",WS_POPUP|WS_VISIBLE,
+        40,50,80,60,0,0,GetModuleHandleA(0),0);
+    check(window!=0);
+    dc=GetDC(window);check(dc!=0);
+    check(SetPixel(dc,3,4,RGB(51,34,17))==RGB(51,34,17));
+    check(GetPixel(dc,3,4)==RGB(51,34,17));
+    ReleaseDC(window,dc);
+    DestroyWindow(window);
+    return 0;
+}
 void start(void)
 {
     WNDCLASSA c={0}; HWND top,child,nested; HDC dc,parent; RECT clip; DWORD written;
@@ -18,6 +33,11 @@ void start(void)
     child=CreateWindowExA(0,c.lpszClassName,"child",WS_CHILD|WS_VISIBLE,10,20,80,60,top,0,c.hInstance,0);
     nested=CreateWindowExA(0,c.lpszClassName,"nested",WS_CHILD|WS_VISIBLE,5,6,30,20,child,0,c.hInstance,0);
     check(top && child && nested);
+    check(FindWindowExA(0,0,"surfaceprobe","surface")==top);
+    check(FindWindowExA(top,0,MAKEINTATOM(atom),"child")==child);
+    check(FindWindowExA(child,0,"SurfaceProbe",0)==nested);
+    check(FindWindowExA(top,child,"SurfaceProbe",0)==0);
+    check(FindWindowExA(top,0,"MissingProbeClass",0)==0);
     dc=GetDC(nested);check(dc!=0);
     check(GetClipBox(dc,&clip)!=ERROR);
     check(clip.left==0 && clip.top==0 && clip.right==30 && clip.bottom==20);
@@ -35,6 +55,11 @@ void start(void)
     }
     for(unsigned i=0;i<1000;i++)
         for(unsigned j=0;j<32;j++) check(GetClassLongA(many[j],GCW_ATOM)==atom);
+    /* A new GUI thread inherits its creator's desktop, and can create and
+     * paint a top-level window without starting a separate desktop process. */
+    desktop=GetThreadDesktop(GetCurrentThreadId());check(desktop!=0);
+    HANDLE thread=CreateThread(0,0,gui_thread,0,0,0);check(thread!=0);
+    if(thread) {check(WaitForSingleObject(thread,5000)==WAIT_OBJECT_0);CloseHandle(thread);}
     DestroyWindow(top);
     if(errors) RetroWriteFile(1,"SURFACE FAIL\n",13,&written,0);
     else RetroWriteFile(1,"SURFACE PASS\n",13,&written,0);

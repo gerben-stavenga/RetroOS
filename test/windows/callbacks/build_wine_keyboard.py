@@ -12,6 +12,9 @@ imports={
  'RETROOS':{'RetroWriteFile':20},
 }
 imports['KERNEL32'].update({'GlobalMemoryStatusEx':4,'GlobalMemoryStatus':4})
+imports['KERNEL32'].update({'CreateThread':24,'WaitForSingleObject':8,'CloseHandle':4,'GetCurrentThreadId':0})
+imports['USER32']['GetThreadDesktop']=4
+imports['USER32']['FindWindowExA']=16
 with tempfile.TemporaryDirectory() as d:
  w=Path(d);obj=w/'test.o';libs=[]
  subprocess.run(['clang-19','-target','i686-windows','-O2','-ffreestanding','-fno-stack-protector','-D__WINE_PE_BUILD','-D_UCRT','-I'+str(header.parent),'-I'+str(header.parent/'msvcrt'),'-c',str(source),'-o',str(obj)],check=True)

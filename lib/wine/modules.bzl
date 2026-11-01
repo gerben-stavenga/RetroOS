@@ -7,7 +7,7 @@ Display and session-service integration is still in progress.
 
 WINE_DLLS = [
     "advapi32", "combase", "comctl32", "comdlg32", "coml2", "gdi32",
-    "imm32", "msacm32", "msvcrt", "ole32",
+    "imm32", "lz32", "msacm32", "msvcrt", "ole32",
     "oleaut32", "rpcrt4", "sechost", "shcore", "shell32", "shlwapi",
     "ucrtbase", "user32", "version", "mpr", "cryptbase", "msvfw32",
     "wsock32", "dplayx", "iphlpapi", "dnsapi", "nsi",
@@ -18,7 +18,7 @@ WINE_DLLS = [
 
 # These are PE modules containing Wine's Win16 adapters, not standalone NE
 # DLLs. Preserve their names; the WOW loader must bind their 16-bit exports.
-WINE_WIN16 = [ "user.exe16", "gdi.exe16", "commdlg.dll16", "win87em.dll16", "system.drv16", "comm.drv16", "sound.drv16", "keyboard.drv16", "msvideo.dll16", "avifile.dll16", "toolhelp.dll16", "wing.dll16", "shell.dll16", "mouse.drv16", "display.drv16"]
+WINE_WIN16 = [ "user.exe16", "gdi.exe16", "commdlg.dll16", "lzexpand.dll16", "win87em.dll16", "system.drv16", "comm.drv16", "sound.drv16", "keyboard.drv16", "msvideo.dll16", "avifile.dll16", "toolhelp.dll16", "wing.dll16", "shell.dll16", "mouse.drv16", "display.drv16"]
 
 WINE_FILES = {
     "//lib/wine:" + name + "_dll": "RETROOS/WINDOWS/SYSTEM32/" + name.upper() + ".DLL"
