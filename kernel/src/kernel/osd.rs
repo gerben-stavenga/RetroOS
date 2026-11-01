@@ -673,7 +673,9 @@ impl WindowEntry {
 /// open — at the event-loop point where the whole thread table is borrowable.
 /// Single-threaded cooperative kernel, so a plain `static mut` behind
 /// accessors, the same discipline as the flags above.
-static mut WINDOWS: [WindowEntry; MAX_LIST] = [WindowEntry::EMPTY; MAX_LIST];
+// Allocate entries as tasks appear, after heap initialization. Keeping the
+// maximum-sized table in BSS needlessly consumes the bootstrap mapping.
+static mut WINDOWS: alloc::vec::Vec<WindowEntry> = alloc::vec::Vec::new();
 static WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PICK_SEL: AtomicUsize = AtomicUsize::new(0);
 static PICKER: AtomicBool = AtomicBool::new(false);
@@ -766,15 +768,20 @@ pub fn refresh_windows<A: crate::Arch>(
         let n = name.len().min(16);
         // SAFETY: single-threaded cooperative kernel; no concurrent access.
         unsafe {
-            let p = &mut (*core::ptr::addr_of_mut!(WINDOWS))[count];
+            let entries = &mut *core::ptr::addr_of_mut!(WINDOWS);
             let mut entry = WindowEntry::EMPTY;
             entry.tid = i as u16;
             entry.endpoint = t.window_endpoint();
             entry.focused = i == focused;
             entry.name[..n].copy_from_slice(&name[..n]);
             entry.name_len = n as u8;
-            changed |= *p != entry;
-            *p = entry;
+            if count == entries.len() {
+                entries.push(entry);
+                changed = true;
+            } else {
+                changed |= entries[count] != entry;
+                entries[count] = entry;
+            }
         }
         count += 1;
     }
@@ -791,7 +798,7 @@ pub fn refresh_windows<A: crate::Arch>(
 
 fn window_at(idx: usize) -> WindowEntry {
     // SAFETY: single-threaded; idx bounded by the caller against WINDOW_COUNT.
-    unsafe { (*core::ptr::addr_of!(WINDOWS))[idx] }
+    unsafe { (&*core::ptr::addr_of!(WINDOWS))[idx] }
 }
 
 /// Highlighted task while the window picker is open. Merely browsing never

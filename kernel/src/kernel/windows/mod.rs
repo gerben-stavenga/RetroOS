@@ -13,6 +13,7 @@ mod memory;
 mod registry;
 mod native_file;
 mod session;
+mod shared_data;
 mod sections;
 mod user_objects;
 mod user_queue;
@@ -289,6 +290,7 @@ pub struct WindowsState {
     process_tid: u32,
     process_exit_code: Option<u32>,
     teb_base: u32,
+    teb_selector: u16,
     stack_base: u32,
     stack_size: u32,
     windows: Vec<Window>,
@@ -357,6 +359,7 @@ impl WindowsState {
             process_tid: 0,
             process_exit_code: None,
             teb_base: TEB_BASE,
+            teb_selector: 0x0f,
             stack_base: 0,
             stack_size: 0,
             windows: Vec::new(),
@@ -448,61 +451,15 @@ impl WindowsState {
         }
     }
 
-    pub fn process_mouse(&mut self, dx: i16, dy: i16, buttons: u8) {
-        let Some(window) = self.windows.iter().rfind(|w| w.visible && w.parent == 0) else {
-            return;
-        };
-        let hwnd = window.hwnd;
-        let (width, height) = self.windows.iter().filter(|w| w.visible && w.parent == 0)
-            .fold((640, 480), |(width, height), w| (
-                width.max(w.x.saturating_add(w.width as i32)),
-                height.max(w.y.saturating_add(w.height as i32))));
-        self.mouse_x = self.mouse_x.saturating_add(i32::from(dx)).clamp(0, width - 1);
-        self.mouse_y = self.mouse_y.saturating_add(i32::from(dy)).clamp(0, height - 1);
-        // USER32 routes this desktop position, including capture and hit tests.
-        let x = self.mouse_x - window.x;
-        let y = self.mouse_y - window.y;
-        let lparam = (x as u32 & 0xffff) | ((y as u32 & 0xffff) << 16);
-        self.messages.push(Message {
-            hwnd,
-            message: 0x0200,
-            wparam: buttons as u32,
-            lparam,
-        });
-        if buttons & 1 != 0 && self.mouse_buttons & 1 == 0 {
-            self.messages.push(Message {
-                hwnd,
-                message: 0x0201,
-                wparam: 1,
-                lparam,
-            });
-        } else if buttons & 1 == 0 && self.mouse_buttons & 1 != 0 {
-            self.messages.push(Message {
-                hwnd,
-                message: 0x0202,
-                wparam: 0,
-                lparam,
-            });
-        }
-        if buttons & 2 != 0 && self.mouse_buttons & 2 == 0 {
-            self.messages.push(Message {
-                hwnd,
-                message: 0x0204,
-                wparam: 2,
-                lparam,
-            });
-        } else if buttons & 2 == 0 && self.mouse_buttons & 2 != 0 {
-            self.messages.push(Message {
-                hwnd,
-                message: 0x0205,
-                wparam: 0,
-                lparam,
-            });
-        }
-        self.wake_user();
+    pub fn process_mouse(&mut self, dx: i16, dy: i16, buttons: u8, now: u64) {
+        self.mouse_x = self.mouse_x.saturating_add(i32::from(dx)).clamp(0, 639);
+        self.mouse_y = self.mouse_y.saturating_add(i32::from(dy)).clamp(0, 479);
+        user_queue::mouse_event(self, buttons, now);
         self.mouse_buttons = buttons;
         self.cursor_dirty = true;
+        self.wake_user();
     }
+
 }
 
 #[allow(clippy::too_many_arguments)] // Shared executable launch context.
@@ -2208,11 +2165,13 @@ mod damage_tests {
 }
 
 pub(crate) fn poll_threads<A: crate::Arch>(machine:&mut A,kt:&mut thread::KernelThread<A>,process:&mut WindowsProcess<A>,regs:&mut Regs) {
+    shared_data::update(machine);
     user_queue::poll(machine,&mut process.state);
     threads::poll(machine,kt,&mut process.state,regs);
 }
 
 fn initialize_environment<A: crate::Arch>(machine:&mut A,state:&mut WindowsState)->Result<(),i32> {
+    shared_data::initialize(machine);
     let text=alloc::string::String::from_utf8_lossy(&state.environment);
     let units:Vec<u16>=text.encode_utf16().collect();
     let size=((units.len()*2+4095)&!4095) as u32;

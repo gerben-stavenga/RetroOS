@@ -67,3 +67,19 @@ genrule(
     cmd = "python3 $(location build_wine_keyboard.py) $(location wine_keyboard.c) $(location @wine_source//:include/windef.h) $@",
     visibility = ["//visibility:public"],
 )
+
+genrule(
+    name = "wine_surface",
+    srcs = ["wine_surface.c", "build_wine_keyboard.py", "@wine_source//:headers", "@wine_source//:include/windef.h"],
+    outs = ["wine_surface.exe"],
+    cmd = "python3 $(location build_wine_keyboard.py) $(location wine_surface.c) $(location @wine_source//:include/windef.h) $@",
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "wine_mouse",
+    srcs = ["wine_mouse.c", "build_wine_keyboard.py", "@wine_source//:headers", "@wine_source//:include/windef.h"],
+    outs = ["wine_mouse.exe"],
+    cmd = "python3 $(location build_wine_keyboard.py) $(location wine_mouse.c) $(location @wine_source//:include/windef.h) $@",
+    visibility = ["//visibility:public"],
+)

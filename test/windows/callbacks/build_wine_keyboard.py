@@ -1,11 +1,12 @@
-"""Link the keyboard probe without a C runtime; it exercises Wine APIs directly."""
+"""Link the Wine probes without a C runtime; it exercises Wine APIs directly."""
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 source,header,output=map(lambda p:Path(p).resolve(),sys.argv[1:])
 imports={
- 'USER32':{'RegisterClassA':4,'CreateWindowExA':48,'DefWindowProcA':16,'SetForegroundWindow':4,'SetActiveWindow':4,'SetFocus':4,'PeekMessageA':20,'GetMessageA':16,'GetKeyState':4,'GetAsyncKeyState':4,'TranslateMessage':4,'PostQuitMessage':4},
+ 'USER32':{'RegisterClassA':4,'CreateWindowExA':48,'DefWindowProcA':16,'SetForegroundWindow':4,'SetActiveWindow':4,'SetFocus':4,'PeekMessageA':20,'GetMessageA':16,'GetKeyState':4,'GetAsyncKeyState':4,'TranslateMessage':4,'PostQuitMessage':4,'GetClassLongA':8,'GetDC':4,'ReleaseDC':8,'DestroyWindow':4,'SetCapture':4,'ReleaseCapture':0,'GetCursorPos':4,'DispatchMessageA':4},
+ 'GDI32':{'SetPixel':16,'GetPixel':12,'GetClipBox':8},
  'KERNEL32':{'GetModuleHandleA':4,'GetLastError':0,'lstrlenA':4,'ExitProcess':4},
  'RETROOS':{'RetroWriteFile':20},
 }

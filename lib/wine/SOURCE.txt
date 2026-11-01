@@ -17,7 +17,9 @@ small added exports, including initial NE task entry through Wine's own
 module loader and TDB/TIB setup, the initial task event, and winevdm's
 GDI/USER/MMSYSTEM initialization order. Its selector initialization preserves descriptors already
 allocated by the RetroOS NE loader. DOS memory allocation uses RetroOS's
-existing DOS allocator and preserves the installed BIOS/IVT.
+existing DOS allocator and preserves the installed BIOS/IVT. The Win16-to-32-bit
+relay clears DF before entering compiled PE code, after saving caller flags for
+register-entry APIs.
 
 WIN32U includes Wine's drawing and window-management implementation as PE code,
 not its Unix syscall entry surface. win32u-pe.patch adapts synchronization to

@@ -79,6 +79,12 @@ NTSTATUS WINAPI RetroServerCall(struct __server_request_info *data)
     if(data->data_count>1) return STATUS_NOT_SUPPORTED;
     if(data->data_count) { name=data->data[0].ptr; length=data->data[0].size; }
     if(length!=request.request_header.request_size || (length && !name)) return STATUS_INVALID_PARAMETER;
+    /* No clipboard producer is installed yet. Window teardown still queries
+     * the current owner; an unopened, empty clipboard has no owner or viewer. */
+    if(request.request_header.req==REQ_get_clipboard_info) {
+        memset(&data->u.reply,0,sizeof(data->u.reply));
+        return STATUS_SUCCESS;
+    }
     if(request.request_header.req==REQ_get_thread_input || request.request_header.req==REQ_get_msg_queue || request.request_header.req==REQ_get_msg_queue_handle ||
        request.request_header.req==REQ_set_queue_mask || request.request_header.req==REQ_get_queue_status ||
        request.request_header.req==REQ_set_win_timer || request.request_header.req==REQ_kill_win_timer ||
@@ -147,7 +153,7 @@ NTSTATUS WINAPI RetroServerCall(struct __server_request_info *data)
                 if(capacity<sizeof(hardware) || !data->reply_data) {
                     status=STATUS_BUFFER_OVERFLOW;data->u.reply.reply_header.error=status;break;
                 }
-                hardware.hw_id=result[10]; hardware.source.device=IMDT_KEYBOARD;hardware.source.origin=IMO_HARDWARE;
+                hardware.hw_id=result[10]; hardware.source.device=(result[1]>=WM_MOUSEFIRST && result[1]<=WM_MOUSELAST)?IMDT_MOUSE:IMDT_KEYBOARD;hardware.source.origin=IMO_HARDWARE;
                 memcpy(data->reply_data,&hardware,sizeof(hardware));
                 data->u.reply.reply_header.reply_size=sizeof(hardware);
             }
@@ -343,7 +349,7 @@ NTSTATUS WINAPI RetroServerCall(struct __server_request_info *data)
             const struct set_window_pos_request *r=&request.set_window_pos_request;
             operation=3;params[0]=r->handle;params[1]=r->previous;params[2]=r->swp_flags;params[3]=r->paint_flags;
             params[4]=r->window.left;params[5]=r->window.top;params[6]=r->window.right;params[7]=r->window.bottom;
-            params[8]=r->client.left;params[9]=r->client.top;params[10]=r->client.right;params[11]=r->client.bottom;break;
+            params[8]=r->client.left;params[9]=r->client.top;params[10]=r->client.right;params[11]=r->client.bottom;params[12]=(ULONG)name;params[13]=length;break;
         }
         }
         status=RetroWindowTree(operation,params,result);
@@ -357,14 +363,29 @@ NTSTATUS WINAPI RetroServerCall(struct __server_request_info *data)
         }
         return status;
     }
-    if(request.request_header.req==REQ_get_visible_region || request.request_header.req==REQ_get_window_rectangles ||
+    if(request.request_header.req==REQ_get_visible_region)
+    {
+        ULONG params[16]={0},result[12]={0};
+        params[0]=request.get_visible_region_request.window;params[1]=request.get_visible_region_request.flags;
+        params[2]=(ULONG)data->reply_data;params[3]=data->reply_data?capacity:0;
+        status=RetroWindowTree(16,params,result);
+        memset(&data->u.reply,0,sizeof(data->u.reply));
+        data->u.reply.reply_header.error=status;
+        data->u.reply.get_visible_region_reply.top_win=result[0];
+        data->u.reply.get_visible_region_reply.paint_flags=result[1];
+        data->u.reply.get_visible_region_reply.top_rect=(struct rectangle){result[2],result[3],result[4],result[5]};
+        data->u.reply.get_visible_region_reply.win_rect=(struct rectangle){result[6],result[7],result[8],result[9]};
+        data->u.reply.get_visible_region_reply.total_size=result[10];
+        if(!status)data->u.reply.reply_header.reply_size=result[10];
+        return status;
+    }
+    if(request.request_header.req==REQ_get_window_rectangles ||
        request.request_header.req==REQ_get_window_tree)
     {
         ULONG result[32]={0}, window;
         struct rectangle rect;
         unsigned int i;
         switch(request.request_header.req) {
-        case REQ_get_visible_region: window=request.get_visible_region_request.window; break;
         case REQ_get_window_rectangles: window=request.get_window_rectangles_request.handle; break;
         case REQ_get_window_tree: window=request.get_window_tree_request.handle; break;
         default: window=0; break;
@@ -373,19 +394,6 @@ NTSTATUS WINAPI RetroServerCall(struct __server_request_info *data)
         for(i=0;i<sizeof(data->u.reply);i++) ((volatile BYTE *)&data->u.reply)[i]=0;
         rect.left=result[24];rect.top=result[25];rect.right=result[26];rect.bottom=result[27];
         if(!status) switch(request.request_header.req) {
-        case REQ_get_visible_region:
-            data->u.reply.get_visible_region_reply.top_win=result[0];
-            data->u.reply.get_visible_region_reply.top_rect=rect;
-            data->u.reply.get_visible_region_reply.win_rect=rect;
-            if((result[1]&WS_VISIBLE) && rect.right>rect.left && rect.bottom>rect.top) {
-                data->u.reply.get_visible_region_reply.total_size=sizeof(rect);
-                if(capacity<sizeof(rect) || !data->reply_data) status=STATUS_BUFFER_OVERFLOW;
-                else {
-                    for(i=0;i<sizeof(rect);i++) ((BYTE *)data->reply_data)[i]=((BYTE *)&rect)[i];
-                    data->u.reply.reply_header.reply_size=sizeof(rect);
-                }
-            }
-            break;
         case REQ_get_window_rectangles:
             {
                 struct rectangle client={result[28],result[29],result[30],result[31]};

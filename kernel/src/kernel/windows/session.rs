@@ -4,6 +4,12 @@ use super::*;
 // Wine 11's session header contains 32744 user entries of 32 bytes each.
 // The session exists for the lifetime of the kernel, including when no app has a view.
 const SIZE: u32 = 1024 * 1024;
+const SLOT_SIZE: usize = 8192;
+// Wine caches mapped blocks with block.offset < object.offset. Its server
+// puts allocation metadata before each published record. Reserve a prefix too,
+// so no record starts on a 64 KiB mapping boundary or straddles its block.
+const PREFIX: usize = 16;
+const PAYLOAD_SIZE: usize = SLOT_SIZE - PREFIX - 16;
 struct Arena {
     header: usize,
     chunks: Vec<usize>,
@@ -23,8 +29,8 @@ pub(super) fn allocate_object<A: crate::Arch>(machine: &mut A, id: u64) -> u64 {
     let offset = if let Some(o) = arena.free.pop() {
         o
     } else {
-        let o = arena.next;
-        arena.next += 8192;
+        let o = arena.next + PREFIX as u64;
+        arena.next += SLOT_SIZE as u64;
         o
     };
     let index = (offset - SIZE as u64) as usize / 65536;
@@ -37,7 +43,7 @@ pub(super) fn allocate_object<A: crate::Arch>(machine: &mut A, id: u64) -> u64 {
     // Preserve the seqlock generation across reuse so cached locators notice it.
     unsafe {
         let version = begin_write(ptr);
-        core::ptr::write_bytes(ptr.add(8), 0, 8184);
+        core::ptr::write_bytes(ptr.add(8), 0, SLOT_SIZE - PREFIX - 8);
         core::ptr::write_volatile(ptr.add(8) as *mut u64, id);
         end_write(ptr, version);
     }
@@ -152,7 +158,7 @@ pub(super) fn write_object(offset: u64, data: &[u8]) {
     write_object_part(offset, 0, data);
 }
 pub(super) fn write_object_part(offset: u64, start: usize, data: &[u8]) {
-    assert!(start <= 8176 && data.len() <= 8176 - start);
+    assert!(start <= PAYLOAD_SIZE && data.len() <= PAYLOAD_SIZE - start);
     let arena = BACKING.lock();
     let ptr = (arena.chunks[(offset - SIZE as u64) as usize / 65536] + offset as usize % 65536)
         as *mut u8;

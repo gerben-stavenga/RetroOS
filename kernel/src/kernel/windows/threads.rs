@@ -320,9 +320,21 @@ pub(super) fn schedule<A: crate::Arch>(
         state.stack_base = c.stack_base;
         state.stack_size = c.stack_size;
         state.teb_base = c.teb;
-        let index = regs.fs as usize >> 3;
+        // Win16 may temporarily use FS for application data (or leave it null).
+        // Rebind the designated TEB descriptor, never the interrupted FS value.
+        let index = state.teb_selector as usize >> 3;
         if index != 0 && index < state.ldt.len() {
             state.ldt[index] = descriptor(c.teb, (TEB_SIZE - 1) as u32);
+            if state.win16.is_some() {
+                let copy = machine.read::<u32>((PEB_BASE + 0x220) as usize) as usize;
+                if copy != 0 {
+                    let bits = (TEB_SIZE - 1) as u32
+                        | (((state.ldt[index] >> 40) as u32 & 0x1f) << 24)
+                        | (1 << 30);
+                    machine.write::<u32>(copy + index * 4, c.teb);
+                    machine.write::<u32>(copy + 32768 + index * 4, bits);
+                }
+            }
             machine.load_ldt(&state.ldt);
         }
     } else {
@@ -681,7 +693,7 @@ fn native<A: crate::Arch>(
         machine.write::<u32>(sp as usize + 8, p[2]);
         let mut child = Regs::empty();
         child.init_user_process(p[0], sp);
-        child.fs = regs.fs;
+        child.fs = state.teb_selector as u64;
         let handle = 0x72000000 | state.next_object;
         state.next_object += 4;
         state.threads.contexts.push(Context {

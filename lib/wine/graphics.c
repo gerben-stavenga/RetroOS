@@ -42,15 +42,25 @@ static BOOL surface_flush(struct window_surface *surface,const RECT *rect,const 
                           const BITMAPINFO *info,const void *bits,BOOL shape_changed,
                           const BITMAPINFO *shape_info,const void *shape_bits)
 {
-    ULONG p[12]={0};
-    RECT window;
+    ULONG p[13]={0};
+    RECT window,clip,damage;
     if(info->bmiHeader.biBitCount!=32 || info->bmiHeader.biCompression!=BI_RGB ||
        info->bmiHeader.biHeight>=0 || surface->shape_region || surface->alpha_mask ||
        surface->color_key!=CLR_INVALID) return FALSE;
     if(!get_window_rect(surface->hwnd,&window,96)) return FALSE;
-    p[0]=HandleToULong(surface->hwnd);p[1]=window.left+surface->rect.left;p[2]=window.top+surface->rect.top;
-    p[3]=info->bmiHeader.biWidth;p[4]=-info->bmiHeader.biHeight;p[5]=(ULONG)bits;
-    p[6]=dirty->left;p[7]=dirty->top;p[8]=dirty->right;p[9]=dirty->bottom;
+    /* Wine rounds backing surfaces up. Only the actual window is visible;
+     * the padded rows/columns are allocation space, not desktop contents. */
+    clip=(RECT){0,0,info->bmiHeader.biWidth,-info->bmiHeader.biHeight};
+    window.right-=window.left;window.bottom-=window.top;
+    window.left=window.top=0;
+    OffsetRect(&window,-surface->rect.left,-surface->rect.top);
+    if(!intersect_rect(&clip,&clip,&window) || !intersect_rect(&damage,dirty,&clip)) return TRUE;
+    if(!get_window_rect(surface->hwnd,&window,96)) return FALSE;
+    p[0]=HandleToULong(surface->hwnd);p[1]=window.left+surface->rect.left+clip.left;p[2]=window.top+surface->rect.top+clip.top;
+    p[3]=clip.right-clip.left;p[4]=clip.bottom-clip.top;
+    p[5]=(ULONG)bits+(clip.top*info->bmiHeader.biWidth+clip.left)*4;
+    p[6]=damage.left-clip.left;p[7]=damage.top-clip.top;p[8]=damage.right-clip.left;p[9]=damage.bottom-clip.top;
+    p[12]=info->bmiHeader.biWidth;
     p[10]=!!(get_window_long(surface->hwnd,GWL_STYLE)&WS_VISIBLE);
     return !RetroGraphics(1,p,NULL);
 }
@@ -71,17 +81,17 @@ static BOOL create_surface(HWND hwnd,BOOL layered,const RECT *rect,struct window
 }
 static void retro_destroy_window(HWND hwnd)
 {
-    ULONG p[12]={HandleToULong(hwnd)};
+    ULONG p[13]={HandleToULong(hwnd)};
     RetroGraphics(2,p,NULL);
 }
 static void position_changed(HWND hwnd,HWND after,HWND owner,UINT flags,
                              const struct window_rects *rects,struct window_surface *surface)
 {
-    ULONG p[12]={HandleToULong(hwnd)};
+    ULONG p[13]={HandleToULong(hwnd)};
     RECT window;
     if(!surface || surface->funcs!=&surface_funcs){retro_destroy_window(hwnd);return;}
     if(!get_window_rect(hwnd,&window,96))return;
-    p[1]=window.left+surface->rect.left;p[2]=window.top+surface->rect.top;
+    p[1]=window.left+max(0,surface->rect.left);p[2]=window.top+max(0,surface->rect.top);
     p[10]=!!(get_window_long(hwnd,GWL_STYLE)&WS_VISIBLE);
     p[11]=HandleToULong(after);
     RetroGraphics(3,p,NULL);

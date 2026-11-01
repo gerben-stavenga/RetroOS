@@ -1,6 +1,6 @@
 bits 16
 segment _TEXT public class=CODE use16
-extern Debug, Exit, CreateCompatibleDC, CreateCompatibleBitmap, SelectObject, DeleteDC, DeleteObject
+extern DOSExit, CreateCompatibleDC, CreateCompatibleBitmap, SelectObject, DeleteDC, DeleteObject
 extern IntersectClipRect, ExcludeClipRect, SelectClipRgn, PatBlt, GetPixel
 %macro clip 6
     push word [dc]
@@ -36,8 +36,11 @@ extern IntersectClipRect, ExcludeClipRect, SelectClipRgn, PatBlt, GetPixel
 global _start
 _start:
     mov [initial_sp],sp
+    ; A Win16 caller may leave DF set; the PE relay must establish the C ABI.
+    std
     push word 0
     call far CreateCompatibleDC
+    cld
     test ax,ax
     jz fail
     mov [dc],ax
@@ -79,24 +82,24 @@ _start:
     call far DeleteObject
     cmp sp,[initial_sp]
     jne fail
-    push ds
-    push word passed
-    call far Debug
-    push word 0
-    call far Exit
+    mov dx,passed
+    mov ah,9
+    int 0x21
+    mov ax,0x4c00
+    call far DOSExit
 fail:
-    push ds
-    push word failed
-    call far Debug
-    push word 1
-    call far Exit
+    mov dx,failed
+    mov ah,9
+    int 0x21
+    mov ax,0x4c01
+    call far DOSExit
 segment _DATA public class=DATA use16
 initial_sp dw 0
 dc dw 0
 bitmap dw 0
 old_bitmap dw 0
-passed db 'WIN16 CLIPPING PASS',0
-failed db 'WIN16 CLIPPING FAIL',0
+passed db 'WIN16 CLIPPING PASS',13,10,'$'
+failed db 'WIN16 CLIPPING FAIL',13,10,'$'
 segment STACK stack class=STACK use16
     resb 8192
 group DGROUP _DATA STACK

@@ -1724,10 +1724,14 @@ fn dos_call<A: crate::Arch>(
     kt: &mut thread::KernelThread<A>, windows: &mut WindowsState,
     dos: &mut crate::kernel::dos::DosState<A>, regs: &mut Regs,
 ) -> thread::KernelAction {
+    // DOS helpers resolve segmented buffers through their descriptor view.
+    // Windows threads rebind the TEB selector between calls, so the last
+    // SetSelectors snapshot may belong to a different thread.
+    dos.ldt[..windows.ldt.len()].copy_from_slice(&windows.ldt);
     let previous_cwd = super::guest_windows_path(windows.cwd_str());
     dos.dfs.init_from_vfs(&previous_cwd);
     let action = crate::kernel::dos::win16_int21(machine, bios, kt, dos, regs);
-    machine.load_ldt(&dos.ldt[..]);
+    machine.load_ldt(&windows.ldt);
     let mut path = alloc::vec![b'A' + dos.dfs.current_drive_number(), b':', b'\\'];
     path.extend_from_slice(dos.dfs.get_cwd());
     if !path.eq_ignore_ascii_case(&previous_cwd)

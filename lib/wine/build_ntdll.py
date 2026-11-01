@@ -189,6 +189,14 @@ def main():
         spec32.write_text(spec32.read_text().replace(" -syscall", ""))
         ft = prepare_fonts(source, args.freetype, work)
         contract = prepare(source, work)
+        # The portable PE backend has no Unix syscall dispatcher to clear DF.
+        # Establish the 32-bit C ABI at the Win16 relay boundary, after saving
+        # the caller's flags for register-entry APIs that restore them on return.
+        relay = source / "tools/winebuild/relay.c"
+        text = relay.read_text()
+        marker = '    if (reg_func) output( "\\tpushfl\\n" );'
+        assert text.count(marker) == 1
+        relay.write_text(text.replace(marker, marker + '\n    output( "\\tcld\\n" );'))
         # Expose Wine's own relay assembly and its selector variables. RetroOS
         # supplies the process/thread state; no replacement thunk implementation.
         spec = source / "dlls/krnl386.exe16/krnl386.exe16.spec"

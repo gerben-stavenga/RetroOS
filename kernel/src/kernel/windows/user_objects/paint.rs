@@ -363,3 +363,124 @@ mod tests {
         assert!(combine(&cut, &b, 1).is_empty());
     }
 }
+
+// Children draw into their nearest ancestor with a surface. Coordinates on the
+// wire are screen coordinates, while the stored rectangles are parent-relative.
+pub(super) fn surface_window(windows: &[WindowRecord], mut i: usize) -> usize {
+    while windows[i].paint_flags & 1 == 0 {
+        let Some(parent) = windows.iter().position(|w| w.handle == windows[i].parent) else {
+            break;
+        };
+        if windows[parent].parent == 0 {
+            break;
+        }
+        i = parent;
+    }
+    i
+}
+fn screen_rect(windows: &[WindowRecord], i: usize, rect: Rect) -> Rect {
+    let (x, y) = origin(windows, i);
+    shift(rect, x - windows[i].rect[0], y - windows[i].rect[1])
+}
+fn window_region(windows: &[WindowRecord], i: usize, rect: Rect) -> Vec<Rect> {
+    let mut region = vec![screen_rect(windows, i, rect)];
+    region.retain(|r| valid(*r));
+    if let Some(shape) = &windows[i].shape {
+        let (x, y) = origin(windows, i);
+        let shape: Vec<_> = shape.iter().map(|r| shift(*r, x, y)).collect();
+        region = combine(&region, &shape, 1);
+    }
+    region
+}
+pub(super) fn visible_region<A: crate::Arch>(
+    machine: &mut A,
+    windows: &[WindowRecord],
+    p: [u32; 16],
+    out: u32,
+) -> u32 {
+    let Some(i) = windows.iter().position(|w| matches_handle(w.handle, p[0])) else {
+        return 0xc0010578;
+    };
+    let flags = p[1];
+    let top = surface_window(windows, i);
+    let w = &windows[i];
+    let target = if flags & 1 != 0 {
+        w.rect
+    } else {
+        w.client_rect
+    };
+    let mut region = if visible(windows, i) {
+        if flags & 0x20 != 0 {
+            if let Some(parent) = windows
+                .iter()
+                .position(|x| x.handle == w.parent && x.parent != 0)
+            {
+                window_region(windows, parent, windows[parent].client_rect)
+            } else {
+                window_region(windows, i, target)
+            }
+        } else {
+            window_region(
+                windows,
+                i,
+                if flags & 1 != 0 {
+                    w.visible_rect
+                } else {
+                    w.client_rect
+                },
+            )
+        }
+    } else {
+        Vec::new()
+    };
+    if flags & 8 != 0 {
+        for (j, child) in windows.iter().enumerate() {
+            if child.parent == w.handle && visible(windows, j) && child.ex_style & 0x20 == 0 {
+                region = combine(&region, &window_region(windows, j, child.visible_rect), 2);
+            }
+        }
+    }
+    let mut current = i;
+    while let Some(parent) = windows
+        .iter()
+        .position(|x| x.handle == windows[current].parent && x.parent != 0)
+    {
+        if windows[current].style & 0x04000000 != 0 || (current == i && flags & 0x10 != 0) {
+            for (j, sibling) in windows[..current].iter().enumerate() {
+                if sibling.parent == windows[current].parent
+                    && visible(windows, j)
+                    && sibling.ex_style & 0x20 == 0
+                {
+                    region = combine(&region, &window_region(windows, j, sibling.visible_rect), 2);
+                }
+            }
+        }
+        region = combine(
+            &region,
+            &window_region(windows, parent, windows[parent].client_rect),
+            1,
+        );
+        current = parent;
+    }
+    let top_rect = screen_rect(windows, top, windows[top].surface_rect);
+    let win_rect = screen_rect(windows, i, target);
+    let size = region.len() * 16;
+    for (j, v) in [windows[top].handle, w.paint_flags]
+        .into_iter()
+        .chain(top_rect.map(|v| v as u32))
+        .chain(win_rect.map(|v| v as u32))
+        .chain([size as u32])
+        .enumerate()
+    {
+        machine.write::<u32>(out as usize + j * 4, v);
+    }
+    if size > p[3] as usize {
+        return 0x80000005;
+    }
+    for (j, rect) in region.iter().enumerate() {
+        for (k, v) in rect.iter().enumerate() {
+            machine.write::<i32>(p[2] as usize + j * 16 + k * 4, *v);
+        }
+    }
+    0
+}

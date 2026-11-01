@@ -37,6 +37,9 @@ struct WindowRecord {
     ex_style: u32,
     rect: [i32; 4],
     client_rect: [i32; 4],
+    visible_rect: [i32; 4],
+    surface_rect: [i32; 4],
+    paint_flags: u32,
     linked: bool,
     instance: u64,
     identifier: u64,
@@ -76,6 +79,9 @@ impl WindowRecord {
             ex_style: 0,
             rect: if desktop { [0, 0, 640, 480] } else { [0; 4] },
             client_rect: if desktop { [0, 0, 640, 480] } else { [0; 4] },
+            visible_rect: if desktop { [0, 0, 640, 480] } else { [0; 4] },
+            surface_rect: if desktop { [0, 0, 640, 480] } else { [0; 4] },
+            paint_flags: 0,
             linked: true,
             instance: 0,
             identifier: 0,
@@ -565,6 +571,7 @@ pub(super) fn tree_call<A: crate::Arch>(
     let mut windows = desktop.windows.lock();
     machine.zero(out as usize, 32);
     match op {
+        16 => return paint::visible_region(machine, &windows, p, out),
         13 | 14 => return paint::call(machine, &mut windows, op, p, out),
         // No layered attributes have been set: Wine expects this error for
         // ordinary windows (and falls back to their normal opaque surface).
@@ -740,6 +747,9 @@ pub(super) fn tree_call<A: crate::Arch>(
             let old_rect = w.rect;
             w.rect = core::array::from_fn(|i| p[4 + i] as i32);
             w.client_rect = core::array::from_fn(|i| p[8 + i] as i32);
+            w.paint_flags = p[3] & 7;
+            w.visible_rect = if p[13] >= 16 { core::array::from_fn(|i| machine.read::<i32>(p[12] as usize + i * 4)) } else { w.rect };
+            w.surface_rect = if p[13] >= 32 { core::array::from_fn(|i| machine.read::<i32>(p[12] as usize + 16 + i * 4)) } else { w.visible_rect };
             if p[2] & 0x40 != 0 {
                 w.style |= 0x10000000;
             }
@@ -750,7 +760,11 @@ pub(super) fn tree_call<A: crate::Arch>(
             paint::positioned(w, old_rect, p[2]);
             machine.write::<u32>(out as usize, w.style);
             machine.write::<u32>(out as usize + 4, w.ex_style);
-            machine.write::<u32>(out as usize + 8, w.handle);
+            let top = paint::surface_window(&windows, i);
+            if paint::visible(&windows, top) && windows[top].paint_flags & 1 != 0 {
+                machine.write::<u32>(out as usize + 8, windows[top].handle);
+            }
+            let w = &windows[i];
             if p[2] & 4 == 0 && !matches_handle(w.handle, p[1]) {
                 let w = windows.remove(i);
                 let insert = match p[1] {
@@ -1047,6 +1061,32 @@ impl Default for Cursor {
         }
     }
 }
+pub(super) fn mouse_target(state:&WindowsState,tid:u32,x:i32,y:i32)->Option<(u32,u32)> {
+    let desktop=state.user_objects.desktops.iter().find(|d|d.0==tid).and_then(|d|state.user_objects.get(d.1))?;
+    let windows=desktop.windows.lock();
+    let root=windows.first()?.handle;
+    windows.iter().find(|w|w.parent==root && w.linked && w.style&0x10000000!=0
+        && w.rect[0]<=x && x<w.rect[2] && w.rect[1]<=y && y<w.rect[3]
+        && w.ex_style&0x80020!=0x80020).map(|w|(w.tid,w.handle))
+}
+
+pub(super) fn mouse_position(state: &WindowsState, tid: u32, x: i32, y: i32, now: u64) -> (i32,i32) {
+    let Some(desktop) = state.user_objects.desktops.iter().find(|d|d.0==tid).and_then(|d|state.user_objects.get(d.1)) else {return (x,y);};
+    let mut cursor=desktop.cursor.lock();
+    cursor.x=x.clamp(cursor.clip[0],cursor.clip[2]-1);
+    cursor.y=y.clamp(cursor.clip[1],cursor.clip[3]-1);
+    cursor.changed=(now/1_000_000) as u32;
+    publish_cursor(&desktop,&cursor);
+    (cursor.x,cursor.y)
+}
+fn publish_cursor(desktop:&Object,cursor:&Cursor) {
+    let mut shared = [0u8; 32];
+    for (i,n) in [cursor.x as u32,cursor.y as u32,cursor.changed].into_iter().chain(cursor.clip.map(|n|n as u32)).enumerate() {
+        shared[4+i*4..8+i*4].copy_from_slice(&n.to_le_bytes());
+    }
+    session::write_object(desktop.offset,&shared);
+}
+
 pub(super) fn cursor_call<A: crate::Arch>(
     machine: &mut A,
     state: &mut WindowsState,
@@ -1119,15 +1159,7 @@ pub(super) fn cursor_call<A: crate::Arch>(
     if cursor.x as u32 != old[2] || cursor.y as u32 != old[3] {
         cursor.changed = (machine.now() / 1_000_000) as u32;
     }
-    let mut shared = [0u8; 32];
-    for (i, n) in [cursor.x as u32, cursor.y as u32, cursor.changed]
-        .into_iter()
-        .chain(cursor.clip.map(|n| n as u32))
-        .enumerate()
-    {
-        shared[4 + i * 4..8 + i * 4].copy_from_slice(&n.to_le_bytes());
-    }
-    session::write_object(desktop.offset, &shared);
+    publish_cursor(&desktop,&cursor);
     for (i, n) in old
         .into_iter()
         .chain([cursor.x as u32, cursor.y as u32])

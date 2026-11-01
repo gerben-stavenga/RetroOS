@@ -658,11 +658,24 @@ _start:
     call NtClose
     test eax,eax
     jnz failed
+    ; Wine GetTickCount reads this page without making a syscall.
+    mov ebx,[0x7ffe0320]
+    mov esi,[0x7ffe0008]
     push delay_timeout
     push 0
     call NtDelayExecution
     test eax,eax
     jnz failed
+    mov eax,[0x7ffe0320]
+    sub eax,ebx
+    cmp eax,9
+    jb failed
+    mov eax,[0x7ffe0008]
+    sub eax,esi
+    cmp eax,90000
+    jb failed
+    cmp dword [0x7ffe0004],0x01000000
+    jne failed
 %ifdef PORTABLE_ONLY
     mov byte [failure_stage], 'p'
     push 0
@@ -2608,6 +2621,12 @@ exception_resumed:
     jnz failed
     cmp dword [previous_suspend],1
     jne failed
+    mov byte [failure_stage],'T'
+    ; Interrupt scheduling must bind our TEB even while the worker has FS=0.
+.wait_worker_fs:
+    cmp dword [worker_phase],1
+    jne .wait_worker_fs
+    mov dword [worker_phase],2
     ; The worker alerts us after yielding; this wait must park and resume.
     push worker_timeout
     push 0
@@ -2717,6 +2736,19 @@ thread_worker:
     mov dword [fs:0x34],0xfedcba98
     mov eax,[esp+4]
     mov [worker_ran],eax
+    mov byte [failure_stage],'U'
+    push fs
+    xor eax,eax
+    mov fs,ax
+    mov dword [worker_phase],1
+.wait_parent_fs:
+    cmp dword [worker_phase],2
+    jne .wait_parent_fs
+    pop fs
+    mov byte [failure_stage],'V'
+    mov eax,[fs:0x18]
+    cmp eax,[worker_teb]
+    jne failed
     ; Exercise scheduling while the new thread owns its TEB.
     push delay_timeout
     push 0
@@ -3000,7 +3032,7 @@ window_region:times 4 dd 0
 test_shape:dd 5,6,20,30
 test_title:dw 0x0043,0x00e9,0x6c34,0xffff
 graphics_screen: times 3 dd 0
-graphics_params: dd 0,10,20,2,1,graphics_pixels,0,0,2,1,1,0
+graphics_params: dd 0,10,20,2,1,graphics_pixels,0,0,2,1,1,0,0
 graphics_pixels: dd 0xff0000,0x0000ff
 
 section .data
@@ -3008,6 +3040,7 @@ worker_handle: dd 0
 parent_teb: dd 0
 parent_tid: dd 0
 alert_zero: dq 0
+worker_phase: dd 0
 worker_teb: dd 0
 worker_ran: dd 0
 previous_suspend: dd 0

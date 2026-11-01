@@ -2,7 +2,7 @@
 use super::*;
 
 #[derive(Clone)]
-pub(super) struct KeyMessage {
+pub(super) struct HardwareMessage {
     pub id: u32,
     pub hwnd: u32,
     pub message: u32,
@@ -10,6 +10,9 @@ pub(super) struct KeyMessage {
     pub flags: u32,
     pub time: u32,
     pub keys: [u8; 256],
+    pub x: i32,
+    pub y: i32,
+    pub mask: u32,
 }
 #[derive(Clone)]
 pub(super) struct Posted {
@@ -19,7 +22,7 @@ pub(super) struct Posted {
     pub lparam: u64,
 }
 
-fn update(keys: &mut [u8; 256], vk: usize, down: bool) {
+pub(super) fn update(keys: &mut [u8; 256], vk: usize, down: bool) {
     if down {
         if keys[vk] & 0x80 == 0 {
             keys[vk] ^= 1;
@@ -128,7 +131,7 @@ pub(in crate::kernel::windows) fn enqueue(
         | (u32::from(previous || !event.pressed) << 30)
         | (u32::from(!event.pressed) << 31);
     queue.next_key = queue.next_key.wrapping_add(1).max(1);
-    queue.keyboard.push(KeyMessage {
+    queue.hardware.push(HardwareMessage {
         id: queue.next_key,
         hwnd,
         message,
@@ -136,6 +139,7 @@ pub(in crate::kernel::windows) fn enqueue(
         flags,
         time: (now / 1_000_000) as u32,
         keys,
+        x: state.mouse_x, y: state.mouse_y, mask: 1,
     });
     queue.changed_bits |= 1;
     let tid = queue.tid;
@@ -175,17 +179,17 @@ pub(super) fn read<A: crate::Arch>(
             return true;
         }
     }
-    if filter != 0 && filter & (1 | 0x400) == 0 {
+    if filter != 0 && filter & (7 | 0x400) == 0 {
         return false;
     }
     let start = queue
-        .keyboard
+        .hardware
         .iter()
         .position(|m| m.id == p[4])
         .map_or(0, |i| i + 1);
-    let Some(m) = queue.keyboard[start..]
+    let Some(m) = queue.hardware[start..]
         .iter()
-        .find(|m| hwnd_matches(m.hwnd) && msg_matches(m.message))
+        .find(|m| (filter == 0 || filter & (m.mask | 0x400) != 0) && (m.mask != 1 || hwnd_matches(m.hwnd) && msg_matches(m.message)))
     else {
         return false;
     };
@@ -196,6 +200,8 @@ pub(super) fn read<A: crate::Arch>(
         (2, m.vk),
         (4, m.flags),
         (6, 7),
+        (7, m.x as u32),
+        (8, m.y as u32),
         (9, m.time),
         (10, m.id),
     ] {

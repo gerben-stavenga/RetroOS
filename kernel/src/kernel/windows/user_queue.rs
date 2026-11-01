@@ -1,6 +1,8 @@
 //! Per-thread USER timer queues and waitable queue state.
 use super::*;
 mod keyboard;
+mod mouse;
+pub(super) use mouse::enqueue as mouse_event;
 use alloc::sync::Arc;
 pub(super) use keyboard::enqueue as keyboard_event;
 // Checked against Wine headers by the RETROOS.DLL protocol adapter.
@@ -33,7 +35,7 @@ struct Queue {
     wake_bits: u32,
     changed_bits: u32,
     timers: Vec<Timer>,
-    keyboard: Vec<keyboard::KeyMessage>,
+    hardware: Vec<keyboard::HardwareMessage>,
     posted: Vec<keyboard::Posted>,
     next_key: u32,
     keys: [u8; 256],
@@ -79,7 +81,7 @@ fn refresh(queue: &mut Queue, threads: &mut threads::State, now: u64) {
         0
     };
     let bits = bits
-        | if queue.keyboard.is_empty() { 0 } else { 1 }
+        | queue.hardware.iter().fold(0, |bits, m| bits | m.mask)
         | if queue.posted.is_empty() { 0 } else { 0x108 };
     let bits = bits | if queue.paint { 0x20 } else { 0 };
     queue.changed_bits |= bits & !queue.wake_bits;
@@ -213,7 +215,7 @@ pub(super) fn call<A: crate::Arch>(
             wake_bits: 0,
             changed_bits: 0,
             timers: Vec::new(),
-            keyboard: Vec::new(),
+            hardware: Vec::new(),
             posted: Vec::new(),
             next_key: 0,
             keys: [0; 256],
@@ -316,8 +318,8 @@ pub(super) fn call<A: crate::Arch>(
     let mut status = 0;
     match op {
         14 => {
-            if let Some(i) = queue.keyboard.iter().position(|m| m.id == p[0]) {
-                let message = queue.keyboard.remove(i);
+            if let Some(i) = queue.hardware.iter().position(|m| m.id == p[0]) {
+                let message = queue.hardware.remove(i);
                 queue.keys = message.keys;
                 session::write_object_part(queue.input_offset, 52, &queue.keys);
                 session::write_object_part(queue.input_offset, 308, &1u32.to_le_bytes());
@@ -543,7 +545,7 @@ pub(super) fn call<A: crate::Arch>(
 pub(super) fn remove_windows(state: &mut State, handles: &[u32]) {
     for queue in &mut state.queues {
         queue.timers.retain(|t| !handles.contains(&t.window));
-        queue.keyboard.retain(|m| !handles.contains(&m.hwnd));
+        queue.hardware.retain(|m| !handles.contains(&m.hwnd));
         queue.posted.retain(|m| !handles.contains(&m.hwnd));
         for h in [
             &mut queue.active,

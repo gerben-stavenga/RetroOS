@@ -74,7 +74,7 @@ pub fn dispatch<A: crate::Arch>(
             for evt in guest_events {
                 match evt {
                     crate::Irq::Key(scancode) => windows.process_key(&kt.fds, scancode, machine.now()),
-                    crate::Irq::Mouse { dx, dy, buttons } => windows.process_mouse(dx, dy, buttons),
+                    crate::Irq::Mouse { dx, dy, buttons } => windows.process_mouse(dx, dy, buttons, machine.now()),
                     _ => {}
                 }
             }

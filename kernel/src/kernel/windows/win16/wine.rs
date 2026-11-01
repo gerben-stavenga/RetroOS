@@ -49,6 +49,7 @@ pub(super) fn start<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
     // Wine keeps its default debug-channel options immediately after the PEB.
     machine.write::<u8>((peb + 4096) as usize, 7);
     let teb_selector = selector(&mut windows.ldt, teb, 4096, false)?;
+    windows.teb_selector = teb_selector;
     for (offset, value) in [(0, u32::MAX), (4, super::super::STACK_TOP), (8, windows.stack_base),
         (0x18, teb), (0x20, tid as u32 + 1), (0x24, tid as u32 + 1), (0x30, peb),
         (0x10c, super::super::STACK_TOP - 128), (0x1d8, 0)] {
