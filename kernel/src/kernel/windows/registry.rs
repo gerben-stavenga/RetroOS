@@ -1,12 +1,13 @@
 //! Registry storage shared by Windows processes. NT structure marshalling is in RETROOS.DLL.
 use super::*;
+type RegistryValue = (Vec<u16>, u32, Vec<u8>, Vec<u16>);
 struct Key {
     path: Vec<u16>,
     spelling: Vec<u16>,
     deleted: bool,
     link: bool,
     modified: u64,
-    values: Vec<(Vec<u16>, u32, Vec<u8>, Vec<u16>)>,
+    values: Vec<RegistryValue>,
 }
 static KEYS: spin::Mutex<Vec<Key>> = spin::Mutex::new(Vec::new());
 #[derive(Default)]

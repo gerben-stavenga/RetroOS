@@ -19,7 +19,7 @@ runs:
         fi
       done
       sudo apt-get update
-      sudo apt-get install -y nasm qemu-system-x86 ovmf bochs bochs-sdl bochsbios vgabios grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools dosfstools e2fsprogs fdisk gcc-multilib samba samba-common-bin linux-firmware zstd
+      sudo apt-get install -y nasm qemu-system-x86 ovmf bochs bochs-sdl bochsbios vgabios grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools dosfstools e2fsprogs fdisk gcc-multilib clang-19 llvm lld bison samba samba-common-bin linux-firmware zstd
     shell: bash
   - uses: actions/setup-python@v5
     with:

@@ -93,7 +93,8 @@ int main(void) {
         if (result == 0) {
             CHECK(now.year >= 2000 && now.month >= 1 && now.month <= 12);
             CHECK(now.day >= 1 && now.day <= 31 && now.hours < 24 && now.minutes < 60 && now.seconds < 60);
-            CHECK(now.weekday < 7 && now.timezone == -1);
+            /* The fixture uses the default UTC offset of zero. */
+            CHECK(now.weekday < 7 && now.timezone == 0);
             printf("OS2CLOCK %u-%02u-%02u %02u:%02u:%02u weekday=%u\n",
                 now.year, now.month, now.day, now.hours, now.minutes, now.seconds, now.weekday);
         }

@@ -100,12 +100,11 @@ pub(super) fn call<A: crate::Arch>(
                 return 0xc0000043;
             }
         }
-        if truncate && let thread::FdKind::Vfs(handle) = kind {
-            if vfs::resize_by_handle(handle, 0) < 0 {
+        if truncate && let thread::FdKind::Vfs(handle) = kind
+            && vfs::resize_by_handle(handle, 0) < 0 {
                 kt.close_fd(slot);
                 return 0xc0000022;
             }
-        }
         machine.write::<u32>(out as usize, slot as u32);
         machine.write::<u32>(
             out as usize + 4,
@@ -180,7 +179,7 @@ pub(super) fn call<A: crate::Arch>(
         kt.close_fd(fd as usize);
         return 0;
     }
-    if matches!(op, 7 | 8 | 9 | 10) {
+    if matches!(op, 7..=10) {
         let thread::FdKind::Vfs(handle) = kind else {
             return 0xc0000008;
         };

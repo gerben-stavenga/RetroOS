@@ -106,7 +106,7 @@ pub(super) fn call<A: crate::Arch>(
             }
         }
         state.sections.handles[slot] = Some(Arc::new(Section { data, image, identity:vfs::file_ino_by_handle(file) }));
-        machine.write::<u32>(out as usize, 0x76000000 | slot as u32 * 4);
+        machine.write::<u32>(out as usize, 0x76000000 | (slot as u32 * 4));
         return 0;
     }
     if op == 3 {

@@ -291,8 +291,7 @@ pub(super) fn call<A: crate::Arch>(
         && p[7] == 0
         && (p[0] >> 16 == 0 || p[0] >> 16 & 0x20 != 0)
         && (p[2] == 0 && p[3] == 0 || (p[2]..=p[3]).contains(&0xf))
-    {
-        if let Some(&(_, hwnd)) = paints
+        && let Some(&(_, hwnd)) = paints
             .iter()
             .find(|&&(t, h)| t == tid && (p[1] == 0 || window_filter.contains(&h)))
         {
@@ -306,7 +305,6 @@ pub(super) fn call<A: crate::Arch>(
             poll(machine, state);
             return 0;
         }
-    }
     if op == 11 && caret_handle != 0 {
         user_objects::mark_active(state, current_tid, caret_handle);
     }
@@ -356,7 +354,7 @@ pub(super) fn call<A: crate::Arch>(
             queue.changed_bits |= 0x108;
         }
 
-        11 | 12 | 13 => {
+        11..=13 => {
             let previous = match op {
                 11 => queue.active,
                 12 => queue.focus,

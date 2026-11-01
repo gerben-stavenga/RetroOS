@@ -407,8 +407,8 @@ pub(super) fn event<A: crate::Arch>(
         machine.write::<u32>(out as usize, handle);
         return 0;
     }
-    if op == 3 {
-        if let Some(c) = state
+    if op == 3
+        && let Some(c) = state
             .threads
             .contexts
             .iter_mut()
@@ -417,7 +417,6 @@ pub(super) fn event<A: crate::Arch>(
             c.handle = 0;
             return 0;
         }
-    }
     let Some(index) = state.threads.events.iter().position(|e| e.handle == handle) else {
         return if op == 3 {
             sync(machine, state, [6, handle, 0, 0, 0, 0])

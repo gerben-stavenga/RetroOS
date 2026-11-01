@@ -537,11 +537,10 @@ pub(super) fn window_call<A: crate::Arch>(
     } else {
         let value = index.map_or(0, |i| window.properties[i].data);
         drop(table); // removing a Property releases its atom reference
-        if op == 2 {
-            if let Some(i) = index {
+        if op == 2
+            && let Some(i) = index {
                 window.properties.swap_remove(i);
             }
-        }
         machine.write::<u64>(data as usize, value);
     }
     0
@@ -732,36 +731,39 @@ pub(super) fn tree_call<A: crate::Arch>(
             };
             let mut list = Vec::new();
             if !(p[0] != 0 && p[3] != 0) && !windows.is_empty() {
-                if p[0] != 0 || index.is_none() {
-                    let root = windows[0].handle;
-                    list.extend(
-                        windows
-                            .iter()
-                            .filter(|w| w.linked && w.parent == root)
-                            .map(|w| w.handle),
-                    );
-                } else if p[3] != 0 {
-                    let mut pending = vec![windows[index.unwrap()].handle];
-                    while let Some(parent) = pending.pop() {
-                        let children: Vec<u32> = windows
-                            .iter()
-                            .filter(|w| w.linked && w.parent == parent)
-                            .map(|w| w.handle)
-                            .collect();
-                        if parent != windows[index.unwrap()].handle {
-                            list.push(parent);
-                        }
-                        pending.extend(children.into_iter().rev());
+                match index.filter(|_| p[0] == 0) {
+                    None => {
+                        let root = windows[0].handle;
+                        list.extend(
+                            windows
+                                .iter()
+                                .filter(|w| w.linked && w.parent == root)
+                                .map(|w| w.handle),
+                        );
                     }
-                } else {
-                    let i = index.unwrap();
-                    let parent = windows[i].parent;
-                    list.extend(
-                        windows[i..]
-                            .iter()
-                            .filter(|w| w.linked && w.parent == parent)
-                            .map(|w| w.handle),
-                    );
+                    Some(i) if p[3] != 0 => {
+                        let mut pending = vec![windows[i].handle];
+                        while let Some(parent) = pending.pop() {
+                            let children: Vec<u32> = windows
+                                .iter()
+                                .filter(|w| w.linked && w.parent == parent)
+                                .map(|w| w.handle)
+                                .collect();
+                            if parent != windows[i].handle {
+                                list.push(parent);
+                            }
+                            pending.extend(children.into_iter().rev());
+                        }
+                    }
+                    Some(i) => {
+                        let parent = windows[i].parent;
+                        list.extend(
+                            windows[i..]
+                                .iter()
+                                .filter(|w| w.linked && w.parent == parent)
+                                .map(|w| w.handle),
+                        );
+                    }
                 }
                 if p[2] != 0 {
                     list.retain(|h| windows.iter().any(|w| w.handle == *h && w.tid == p[2]));
@@ -846,7 +848,7 @@ pub(super) fn tree_call<A: crate::Arch>(
                 windows.insert(insert.max(2), w);
             }
         }
-        4 | 5 | 6 => {
+        4..=6 => {
             let Some(i) = windows.iter().position(|w| matches_handle(w.handle, p[0])) else {
                 return 0xc0010578;
             };
@@ -907,7 +909,7 @@ pub(super) fn tree_call<A: crate::Arch>(
                 if w.pid != pid {
                     return 0xc0000022;
                 }
-                if p[3] % 16 != 0 || p[3] > 16 * 1024 * 1024 {
+                if !p[3].is_multiple_of(16) || p[3] > 16 * 1024 * 1024 {
                     return 0xc000000d;
                 }
                 if w.ex_style & 0x400000 != 0 {
@@ -1068,13 +1070,12 @@ pub(super) fn tree_call<A: crate::Arch>(
                 {
                     continue;
                 }
-                if let Some(shape) = &w.shape {
-                    if !shape.iter().any(|r| {
+                if let Some(shape) = &w.shape
+                    && !shape.iter().any(|r| {
                         inside(*r, x.saturating_sub(w.rect[0]), y.saturating_sub(w.rect[1]))
                     }) {
                         continue;
                     }
-                }
                 pending.push((i, x, y, true));
                 if w.style & 0x28000000 == 0 && inside(w.client_rect, x, y) {
                     for (j, c) in windows.iter().enumerate().rev() {

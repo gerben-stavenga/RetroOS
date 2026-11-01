@@ -770,7 +770,7 @@ fn apply_imports<A: crate::Arch>(machine: &mut A, modules: &[Module], index: usi
     let image = pe::Image::parse(&modules[index].data).map_err(|_| 8)?;
     for import in image.imports().map_err(|_| 8)? {
         let target_index = find_module(modules, &import.module).ok_or(2)?;
-        let address = resolve_export(modules, target_index, &import.symbol).map_err(|error| {
+        let address = resolve_export(modules, target_index, &import.symbol).inspect_err(|_| {
             let name = match &import.symbol {
                 pe::ImportSymbol::Name(name) => name.clone(),
                 pe::ImportSymbol::Ordinal(n) => alloc::format!("#{n}").into_bytes(),
@@ -778,7 +778,6 @@ fn apply_imports<A: crate::Arch>(machine: &mut A, modules: &[Module], index: usi
             crate::compact_println!("Windows: unresolved {}!{}",
                 core::str::from_utf8(&import.module).unwrap_or("dll"),
                 core::str::from_utf8(&name).unwrap_or("symbol"));
-            error
         })?;
         machine.write::<u32>((modules[index].base + import.iat_rva) as usize, address);
     }
@@ -1526,7 +1525,7 @@ pub fn handle_event<A: crate::Arch>(
     if !A::seg_is_32(regs.code_seg()) && let Some(mut win16) = state.win16.take() {
         let action = win16::handle_event(machine, bios, kt, state, &mut win16, process.dos.as_mut().expect("NE DOS services"), regs, event);
         state.win16 = Some(win16);
-        if matches!(event, crate::KernelEvent::Irq) { if !threads::schedule(machine,state,regs) {kt.state=thread::ThreadState::Blocked;} }
+        if matches!(event, crate::KernelEvent::Irq) && !threads::schedule(machine,state,regs) {kt.state=thread::ThreadState::Blocked;}
         return action;
     }
     match event {
@@ -1615,11 +1614,10 @@ pub fn handle_event<A: crate::Arch>(
                     crate::compact_dbg_println!("[win32-path] {}",core::str::from_utf8(&path).unwrap_or("?"));
                 }
             }
-            if gate.api == Api::SetSelectors && result == 0 {
-                if let Some(dos) = &mut process.dos {
+            if gate.api == Api::SetSelectors && result == 0
+                && let Some(dos) = &mut process.dos {
                     dos.ldt[..state.ldt.len()].copy_from_slice(&state.ldt);
                 }
-            }
             finish(machine, regs, gate, result);
             if !threads::schedule(machine,state,regs) {kt.state=thread::ThreadState::Blocked;}
             thread::KernelAction::Done

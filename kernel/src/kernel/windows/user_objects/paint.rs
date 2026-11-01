@@ -134,7 +134,7 @@ fn update_flags(w: &WindowRecord, wanted: u32) -> u32 {
 }
 pub(super) fn call<A: crate::Arch>(
     machine: &mut A,
-    windows: &mut Vec<WindowRecord>,
+    windows: &mut [WindowRecord],
     op: u32,
     p: [u32; 16],
     out: u32,
@@ -147,7 +147,7 @@ pub(super) fn call<A: crate::Arch>(
     };
     if op == 14 {
         // p: window, RDW flags, input region address, byte count.
-        if p[3] % 16 != 0 || p[3] > 65536 {
+        if !p[3].is_multiple_of(16) || p[3] > 65536 {
             return 0xc000000d;
         }
         let mut input = Vec::new();

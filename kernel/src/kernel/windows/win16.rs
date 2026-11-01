@@ -358,6 +358,8 @@ fn register_gate(
     Ok(gate)
 }
 
+type PeOwner = (u32, Vec<(u32, u32)>);
+
 struct LoadedModule {
     // 0: pending, 1: running (recursive loads must not reenter), 2: ready, 3: failed.
     initialized: u8,
@@ -367,7 +369,7 @@ struct LoadedModule {
     data: Vec<u8>,
     selectors: Vec<u16>,
     references: u16,
-    pe_owner: Option<(u32, Vec<(u32, u32)>)>,
+    pe_owner: Option<PeOwner>,
 }
 
 fn wine_module_file(name: &[u8]) -> Vec<u8> {
@@ -443,7 +445,7 @@ fn load_module_file(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), 
 /// Map the owning PE first so absolute addresses in the NE thunk bytes have
 /// their PE base relocations applied before those segments are copied.
 fn embedded_module<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
-    path: &[u8], data: Vec<u8>) -> Result<(Vec<u8>, Option<(u32, Vec<(u32, u32)>)>), i32>
+    path: &[u8], data: Vec<u8>) -> Result<(Vec<u8>, Option<PeOwner>), i32>
 {
     if ne::Image::parse(&data).is_ok() { return Ok((data, None)); }
     let pe = super::pe::Image::parse(&data).map_err(|_| -8)?;
@@ -863,7 +865,7 @@ pub(super) fn exec<A: crate::Arch>(
         regs.frame.rip = u64::from(entry.1);
     }
     if wine {
-        let target = current.kernel.vcpu.regs.clone();
+        let target = current.kernel.vcpu.regs;
         current.kernel.vcpu.regs.init_user_process(0, 0);
         wine::start(machine, &mut windows, &mut current.kernel.vcpu.regs, tid, &target)?;
     }

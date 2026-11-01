@@ -77,7 +77,7 @@ fn attributes<A: crate::Arch>(machine: &A, state: &State, address: u32) -> Resul
     if name == 0 { return if root == 0 { Ok((Vec::new(), flags)) } else { Err(INVALID) }; }
     let length = machine.read::<u16>(name as usize) as usize;
     let pointer = machine.read::<u32>(name as usize + 4);
-    if length % 2 != 0 || length > 65534 || pointer == 0 && length != 0 { return Err(INVALID); }
+    if !length.is_multiple_of(2) || length > 65534 || pointer == 0 && length != 0 { return Err(INVALID); }
     let mut name: Vec<_> = (0..length/2).map(|i| machine.read::<u16>(pointer as usize + 2*i)).collect();
     if name.is_empty() { return Ok((name, flags)); }
     if root != 0 {

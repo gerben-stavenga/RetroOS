@@ -160,8 +160,8 @@ pub(super) fn read<A: crate::Arch>(
     let hwnd_matches = |h| p[1] == 0 || (p[1] == u32::MAX && h == 0) || windows.contains(&h);
     let msg_matches = |m| p[2] == 0 && p[3] == 0 || (p[2]..=p[3]).contains(&m);
     let filter = p[0] >> 16;
-    if filter == 0 || filter & 8 != 0 {
-        if let Some(i) = queue
+    if (filter == 0 || filter & 8 != 0)
+        && let Some(i) = queue
             .posted
             .iter()
             .position(|m| m.message == 0x12 || hwnd_matches(m.hwnd) && msg_matches(m.message))
@@ -178,7 +178,6 @@ pub(super) fn read<A: crate::Arch>(
             }
             return true;
         }
-    }
     if filter != 0 && filter & (7 | 0x400) == 0 {
         return false;
     }

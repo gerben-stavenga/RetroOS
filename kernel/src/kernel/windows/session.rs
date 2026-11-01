@@ -84,7 +84,7 @@ pub(super) fn call<A: crate::Arch>(
         } else {
             state.session.handles[slot] = true;
         }
-        machine.write::<u32>(out as usize, 0x73000000 | slot as u32 * 4);
+        machine.write::<u32>(out as usize, 0x73000000 | (slot as u32 * 4));
         return 0;
     }
     if op == 3 {
@@ -248,7 +248,7 @@ pub(super) fn allocate_user<A: crate::Arch>(
             Ordering::Release,
         );
     }
-    Some(0x20 + (i as u32 * 2) | ((generation as u32) << 16))
+    Some((0x20 + (i as u32 * 2)) | ((generation as u32) << 16))
 }
 pub(super) fn release_user(handle: u32) {
     use core::sync::atomic::{AtomicU32, Ordering};
