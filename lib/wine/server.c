@@ -784,6 +784,9 @@ NTSTATUS WINAPI RetroNtQueryDirectoryFile(HANDLE handle,HANDLE event,PIO_APC_ROU
 
 #include "callbacks.c"
 
+#include "process.c"
 #include "threads.c"
 
 #include "wave.c"
+
+#include "console.c"

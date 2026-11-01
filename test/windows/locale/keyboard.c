@@ -16,8 +16,10 @@ int main(void) {
     printf("KEYBOARD W ");
     for (i=0;i<n;++i) printf("%04X ",text[i]);
     printf("\n");
-    if (!SetConsoleCP(65001)) return 2;
-    printf("KEYBOARD UTF8 READY\n"); fflush(stdout);
+    /* INPUT_RECORDA contains a single CHAR. Exercise its native ANSI page;
+     * Unicode input is checked independently through INPUT_RECORDW. */
+    if (!SetConsoleCP(GetACP())) return 2;
+    printf("KEYBOARD ANSI READY\n"); fflush(stdout);
     n = 0;
     while (n < sizeof(bytes)) {
         if (!ReadConsoleInputA(GetStdHandle(STD_INPUT_HANDLE),&key,1,&count)) return 3;

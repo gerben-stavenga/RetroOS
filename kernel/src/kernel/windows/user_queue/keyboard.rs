@@ -227,7 +227,7 @@ mod tests {
     }
 }
 
-fn virtual_key(scan: u16, ascii: u8) -> u16 {
+pub(in crate::kernel::windows) fn virtual_key(scan: u16, ascii: u8) -> u16 {
     match scan {
         0x01 => 0x1b,
         0x02..=0x0b => b"1234567890"[(scan - 0x02) as usize] as u16,

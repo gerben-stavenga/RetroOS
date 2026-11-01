@@ -100,6 +100,15 @@ fn next_after<A: crate::Arch>(
         thread::KernelAction::Exit(code) => Some(Verdict::Switch(thread::exit_thread(
             threads, machine, bios_workspace, tid, code, exiting_display, sb_handoff, display,
         ))),
+        thread::KernelAction::WakeChild(child) => {
+            if let Some(target) = thread::get_thread(threads,child)
+                && target.kernel.parent_tid == tid as i32
+                && target.kernel.state == thread::ThreadState::Blocked {
+                target.kernel.state=thread::ThreadState::Ready;
+                if crate::kernel::focus::focused()==tid {crate::kernel::focus::adopt(child);}
+            }
+            None
+        }
         thread::KernelAction::Switch(next) => Some(Verdict::Switch(next)),
         thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, cwd, cwd_len, personality_name, policy, on_error, on_success } => {
             crate::kernel::startup::handle_fork_exec(

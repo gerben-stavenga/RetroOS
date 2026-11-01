@@ -3,6 +3,7 @@ use super::*;
 mod keyboard;
 mod mouse;
 pub(super) use mouse::enqueue as mouse_event;
+pub(super) use keyboard::virtual_key;
 use alloc::sync::Arc;
 pub(super) use keyboard::enqueue as keyboard_event;
 // Checked against Wine headers by the RETROOS.DLL protocol adapter.

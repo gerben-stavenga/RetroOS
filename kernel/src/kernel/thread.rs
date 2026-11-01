@@ -162,6 +162,8 @@ pub enum KernelAction {
     Fork { on_done: fn(&mut crate::Regs, i32), child_stack: usize, shared_until_exec: bool },
     /// Switch to a specific thread (already resolved by caller).
     Switch(usize),
+    /// Resume a suspended child owned by the current process.
+    WakeChild(usize),
     /// ForkExec: fork a child, exec the given path.
     /// `cmdtail` is the raw DOS-style argument string (everything after the
     /// program name in the parent's PSP cmdline) — written verbatim to the
@@ -1077,9 +1079,7 @@ pub fn exit_thread<A: crate::Arch>(
                 Personality::Os2(os2) => {
                     parent.kernel.vcpu.regs.rax = if os2.waiting_for_child().is_some() { 0 } else { thread.kernel.tid as u64 };
                 }
-                Personality::Windows(_) => {
-                    parent.kernel.vcpu.regs.rax = thread.kernel.tid as u64;
-                }
+                Personality::Windows(_) => {}
             }
             refresh_cpu_hash(parent);
             woke_parent = true;
@@ -1088,6 +1088,9 @@ pub fn exit_thread<A: crate::Arch>(
             // exit_code from the DOS personality already encodes termination
             // type in bits 8..15 and AL/vector in bits 0..7 — copy verbatim.
             dos.last_child_exit_status = exit_code as u16;
+        }
+        if let Personality::Windows(windows) = &mut parent.personality {
+            windows.child_exited(thread.kernel.tid as u32 + 1, exit_code);
         }
         if let Personality::Os2(os2) = &mut parent.personality {
             os2.child_exited(thread.kernel.tid as u32 + 1, exit_code);

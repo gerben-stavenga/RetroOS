@@ -52,6 +52,13 @@ NTSTATUS WINAPI RetroNtCreateThreadEx(HANDLE *handle,ACCESS_MASK access,OBJECT_A
 }
 NTSTATUS WINAPI RetroNtResumeThread(HANDLE handle,ULONG *previous)
 {
+    ULONG child_previous=0;
+    NTSTATUS child_status=RetroChild(1,(ULONG)handle,NULL,&child_previous);
+    if(child_status!=STATUS_INVALID_HANDLE) {
+        if(!child_status && previous) *previous=child_previous;
+        return child_status;
+    }
+
     ULONG p[6]={(ULONG)handle},out[8]={0}; NTSTATUS status=RetroThread(1,p,out);
     if(!status && previous) *previous=out[0];return status;
 }

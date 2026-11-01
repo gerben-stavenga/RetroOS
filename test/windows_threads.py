@@ -45,8 +45,9 @@ def main():
             ("lib/os2/doscalls/DOSCALLS.DLL", os2_system / "DOSCALLS.DLL"),
         ]:
             shutil.copyfile(ROOT / "bazel-bin" / source, destination)
-        # Exercise the actual CRT shipped with Win32 MC, including _chdir.
-        shutil.copyfile(ROOT / "showcase-bundle/COMMANDER/MC/MSVCRT.DLL", root / "MSVCRT.DLL")
+        # Load the actual CRT shipped with Win32 MC under a distinct name;
+        # Wine's own MSVCRT may already be loaded by its system DLLs.
+        shutil.copyfile(ROOT / "showcase-bundle/COMMANDER/MC/MSVCRT.DLL", root / "MC_CRT.DLL")
         ndn_directory = os.environ.get("NDN_DIR")
         if ndn_directory:
             for name in ("SCRRES.DLL", "DESCSS.DLL", "NDNPASS.DLL", "TETRIS.DLL"):
@@ -64,7 +65,7 @@ def main():
                              "\nWin32 thread test timed out")
         log = result.stdout + result.stderr
         if (result.returncode != 0 or "WINTHREAD PASS" not in log or
-                log.count("WINCHILD PASS") != 2 or
+                log.count("WINCHILD PASS") != 3 or
                 log.count("Hello from Open Watcom C") != 2 or
                 any(marker in log for marker in ("SEGV", "PANIC", "Stack Overflow"))):
             raise SystemExit(log)

@@ -36,7 +36,7 @@ genrule(
 
 genrule(
     name = "server_obj",
-    srcs = ["server.c", "callbacks.c", "threads.c", "wave.c", "@wine_source//:headers", "@wine_source//:include/windef.h"],
+    srcs = ["server.c", "callbacks.c", "threads.c", "wave.c", "console.c", "process.c", "@wine_source//:headers", "@wine_source//:include/windef.h"],
     outs = ["server.obj"],
     cmd = "wine_include=$$(dirname $(location @wine_source//:include/windef.h)); " +
           "clang-19 -target i686-windows -O2 -ffreestanding -fno-stack-protector " +

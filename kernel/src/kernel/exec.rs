@@ -161,17 +161,18 @@ pub fn detect_format(data: &[u8], path: &[u8]) -> BinaryFormat {
 /// image.  COMANCHE.EXE is one: its DOS half launches C1.EXE, while its PE half
 /// is a Windows launcher.  A conventional PE stub overlaps the PE headers in
 /// the file extent declared by its MZ header; a genuine dual-mode executable's
-/// declared MZ image ends before the secondary header begins.
+/// declared MZ image ends before the secondary header begins. Open Watcom's
+/// complete, message-only PE stub is excluded below.
 pub fn detect_format_for_dos(data: &[u8], path: &[u8]) -> BinaryFormat {
     let format = detect_format(data, path);
-    if format == BinaryFormat::Pe && has_complete_mz_image(data) {
+    if format == BinaryFormat::Pe && has_dos_payload(data) {
         BinaryFormat::MzExe
     } else {
         format
     }
 }
 
-fn has_complete_mz_image(data: &[u8]) -> bool {
+fn has_dos_payload(data: &[u8]) -> bool {
     if data.get(..2) != Some(b"MZ") || data.len() < 0x40 {
         return false;
     }
@@ -186,6 +187,14 @@ fn has_complete_mz_image(data: &[u8]) -> bool {
     else {
         return false;
     };
+    // Open Watcom's standard PE stub is itself a complete MZ image.
+    // Its entire entry path prints a message and exits; it is not a DOS
+    // application to prefer over the native Windows executable.
+    let entry = header_bytes + word(22) * 16 + word(20);
+    let message_and_exit = b"\x0e\x1f\xba\x0e\x00\xb4\x09\xcd\x21\xb8\x01\x4c\xcd\x21";
+    if data.get(entry..entry.saturating_add(message_and_exit.len())) == Some(message_and_exit) {
+        return false;
+    }
     header_bytes < image_bytes && image_bytes <= secondary && image_bytes <= data.len()
 }
 
@@ -283,6 +292,8 @@ mod tests {
 
         assert_eq!(detect_format(&data, b"DUAL.EXE"), BinaryFormat::Pe);
         assert_eq!(detect_format_for_dos(&data, b"DUAL.EXE"), BinaryFormat::MzExe);
+        data[64..78].copy_from_slice(b"\x0e\x1f\xba\x0e\x00\xb4\x09\xcd\x21\xb8\x01\x4c\xcd\x21");
+        assert_eq!(detect_format_for_dos(&data, b"WATCOM.EXE"), BinaryFormat::Pe);
     }
 }
 

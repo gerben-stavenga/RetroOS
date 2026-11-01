@@ -1856,8 +1856,11 @@ fn event_loop<A: crate::Arch>(
         // to unblock it (above) or the F12 window picker to move on.
         let thread = ctx.thread(threads);
         if thread.kernel.state == thread::ThreadState::Blocked {
-            let dependency_wait = matches!(&thread.personality, thread::Personality::Linux(linux)
-                if linux.waits_for_record_lock());
+            let dependency_wait = match &thread.personality {
+                thread::Personality::Linux(linux) => linux.waits_for_record_lock(),
+                thread::Personality::Windows(windows) => windows.waits_for_child(),
+                _ => false,
+            };
             let next = crate::kernel::sched::focus_request(threads, ctx.tid)
                 .or_else(|| if dependency_wait { thread::schedule(threads, ctx.tid) } else { None })
                 .or_else(|| crate::kernel::sched::linux_blocked_successor(threads, ctx.tid, clock_wakeup));
@@ -2575,6 +2578,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     // their status. Recycle them with the parent's address space active.
     let completed = match &mut thread::get_thread(threads, parent_tid).unwrap().personality {
         thread::Personality::Os2(os2) => os2.take_completed_children(),
+        thread::Personality::Windows(windows) => windows.take_completed_children(),
         _ => alloc::vec::Vec::new(),
     };
     for child in completed { thread::reap(threads, machine, child); }
@@ -2637,7 +2641,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             let cwd = windows.cwd_str();
             parent_cwd_buf[..cwd.len()].copy_from_slice(cwd);
             parent_cwd_len = cwd.len();
-            parent_env_snapshot = Some(windows.environment.clone());
+            parent_env_snapshot = Some(windows.child_environment());
         }
     }
 
@@ -2947,6 +2951,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
                 let n = cwd.len().min(windows.cwd.len());
                 windows.cwd[..n].copy_from_slice(&cwd[..n]);
                 windows.cwd_len = n;
+                windows.sync_process_cwd(machine);
             }
             let cpipe = thread::console_pipe();
             child.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
@@ -3009,6 +3014,25 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         if let thread::Personality::Os2(os2) = &mut parent.personality && os2.child_started(child_tid as u32 + 1) {
             parent.kernel.state = thread::ThreadState::Blocked;
         }
+    }
+    let suspended = {
+        let parent=thread::get_thread(threads,parent_tid).unwrap();
+        match &mut parent.personality {
+            thread::Personality::Windows(w) => w.child_started(child_tid as u32+1),
+            _ => false,
+        }
+    };
+    if suspended {
+        let space=core::mem::take(&mut thread::get_thread(threads,parent_tid).unwrap().kernel.vcpu.space);
+        let child_space=machine.activate(space,core::ptr::null_mut(),core::ptr::null_mut());
+        let child=thread::get_thread(threads,child_tid).unwrap();
+        child.kernel.vcpu.space=child_space;
+        for fd in 3..thread::MAX_FDS { child.kernel.close_fd(fd); }
+        child.kernel.state=thread::ThreadState::Blocked;
+        let parent=thread::get_thread(threads,parent_tid).unwrap();
+        parent.personality.on_resume(machine);
+        if parent_was_focused {crate::kernel::focus::adopt(parent_tid);}
+        return None;
     }
     let parent = thread::get_thread(threads, parent_tid).unwrap();
     crate::compact_dbg_println!("  child tid={}, parent tid={} {}", child_tid, parent_tid,

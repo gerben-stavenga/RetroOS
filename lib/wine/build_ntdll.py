@@ -134,8 +134,21 @@ void WINAPI RetroWineInitializeLocale(void)
     default_load_path = NtCurrentTeb()->Peb->ProcessParameters->DllPath.Buffer;
     version_init();
     locale_init();
+    /* The kernel supplies the initial block; subsequent environment edits
+     * use Wine heap ownership and may resize or free their predecessor. */
+    {
+        WCHAR *environment;
+        if (!RtlCreateEnvironment(TRUE, &environment))
+            NtCurrentTeb()->Peb->ProcessParameters->Environment = environment;
+    }
 }
 """
+    locale = source / "dlls/ntdll/locale.c"
+    locale_text = locale.read_text().replace("void locale_init(void)",
+        "extern UINT WINAPI RetroCodePage(void);\n\nvoid locale_init(void)", 1)
+    locale_text = locale_text.replace("oem_cp = get_locale_data( locale_table, entry->idx )->idefaultcodepage;",
+        "oem_cp = RetroCodePage();", 1)
+    locale.write_text(locale_text)
     # NE tasks have no PE executable modref. DLL detach still runs normally;
     # executable TLS callbacks only apply when a PE main module is registered.
     text = text[:at] + initializer + adapters + text[at:]
@@ -147,7 +160,7 @@ void WINAPI RetroWineInitializeLocale(void)
 
     contract = {"RetroDosInterrupt": 4, **NETWORK_CALLS, **{"Retro" + name: size for name, size in calls.items()}, **{name: 4 for name in HOST_CALLS.values()}, "RetroUserCallback": 20, "RetroServerSendFile": 4}
     definition = work / "retroos.def"
-    definition.write_text("LIBRARY RETROOS.DLL\nEXPORTS\n" + "".join(f"{name}@{size}\n" for name, size in contract.items()) + "RetroDosMemory@16\nRetroGraphics@12\nRetroFileKind@4\nRetroWaveInit@4\n")
+    definition.write_text("LIBRARY RETROOS.DLL\nEXPORTS\n" + "".join(f"{name}@{size}\n" for name, size in contract.items()) + "RetroDosMemory@16\nRetroGraphics@12\nRetroFileKind@4\nRetroCodePage@0\nRetroWaveInit@4\n")
     subprocess.run(["llvm-dlltool", "-m", "i386", "-k", "-d", str(definition),
                     "-l", str(work / "retroos.lib")], check=True)
     return contract

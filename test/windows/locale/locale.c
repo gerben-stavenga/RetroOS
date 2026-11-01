@@ -10,6 +10,7 @@ int main(void)
     char tag[32], value[128], converted[128];
     FILE *expected;
     WCHAR wide[128], sample;
+    DWORD locale_oem;
     DWORD lcid = 0x409, ansi = 1252, oem = 437, country = 1, number;
     const char *expected_tag = "en-US", *decimal = ".";
     int count, i;
@@ -37,6 +38,7 @@ int main(void)
             lcid = 0x413; oem = 850; country = 31; expected_tag = "nl-NL"; decimal = ",";
         }
     }
+    locale_oem = oem;
     oem = requested;
     CHECK(GetACP() == ansi && GetOEMCP() == oem);
     CHECK(GetUserDefaultLCID() == lcid && GetSystemDefaultLCID() == lcid);
@@ -52,7 +54,7 @@ int main(void)
     CHECK(GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_IDEFAULTANSICODEPAGE | LOCALE_RETURN_NUMBER,
         (char *)&number, 4) == 4 && number == ansi);
     CHECK(GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_IDEFAULTCODEPAGE | LOCALE_RETURN_NUMBER,
-        (char *)&number, 4) == 4 && number == oem);
+        (char *)&number, 4) == 4 && number == locale_oem);
     count = GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_SLANGUAGE, NULL, 0);
     CHECK(count > 1 && count < 128);
     for (i = 0; i < 128; ++i) wide[i] = 0xeeee;
@@ -64,7 +66,9 @@ int main(void)
     CHECK(WideCharToMultiByte(ansi, 0, wide, -1, converted, sizeof(converted), NULL, NULL) == count &&
         !strcmp(value, converted));
     CHECK(GetLocaleInfoA(0x409, LOCALE_ILANGUAGE | LOCALE_RETURN_NUMBER, (char *)&number, 4) == 4 && number == 0x409);
-    CHECK(GetLocaleInfoA(0x419, LOCALE_SLANGUAGE, value, sizeof(value)) && (unsigned char)value[0] == 0xd0);
+    CHECK(GetLocaleInfoW(0x419, LOCALE_SLANGUAGE, wide, 128));
+    CHECK(GetLocaleInfoA(0x419, LOCALE_SLANGUAGE, value, sizeof(value)));
+    CHECK(WideCharToMultiByte(1251, 0, wide, -1, converted, sizeof(converted), NULL, NULL) && !strcmp(value, converted));
     CHECK(GetLocaleInfoA(0x419, LOCALE_SLANGUAGE | 0x40000000, converted, sizeof(converted)));
     CHECK(GetLocaleInfoW(0x419, LOCALE_SLANGUAGE, wide, 128));
     CHECK(WideCharToMultiByte(ansi, 0, wide, -1, value, sizeof(value), NULL, NULL) && !strcmp(value, converted));

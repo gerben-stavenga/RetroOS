@@ -118,6 +118,15 @@ fn execute<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32
     let [op, handle, a, b, c, out] = args;
     let _serial = WAIT_LOCK.lock();
     let id = machine.read::<u32>((state.teb_base + 0x24) as usize);
+    if op == 24 {
+        if out == 0 { return Err(INVALID); }
+        let (name,flags)=attributes(machine,&state.threads.named,a)?;
+        if name.is_empty() {return Err(INVALID);}
+        let (object,_) = open(name,flags | 0x80,20,||Err(0xc0000034))?;
+        let handle=state.threads.named.insert(object);
+        machine.write::<u32>(out as usize,handle);
+        return Ok(0);
+    }
     if matches!(op, 0..=3 | 20) {
         if out == 0 { return Err(INVALID); }
         let (name, mut flags) = attributes(machine, &state.threads.named, a)?;

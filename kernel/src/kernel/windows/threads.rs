@@ -407,6 +407,7 @@ pub(super) fn event<A: crate::Arch>(
         machine.write::<u32>(out as usize, handle);
         return 0;
     }
+    if op == 3 { processes::close(state,handle); }
     if op == 3
         && let Some(c) = state
             .threads

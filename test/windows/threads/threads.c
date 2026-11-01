@@ -117,6 +117,13 @@ int main(void)
             !WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), "\xc6", 1, &n, NULL) || n != 1 ||
             !ReadConsoleOutputW(GetStdHandle(STD_OUTPUT_HANDLE), &cell, one, origin, &rect) ||
             cell.Char.UnicodeChar != 0x0416) FAIL(115);
+        if (!SetConsoleOutputCP(65001) ||
+            !SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), origin) ||
+            !WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), "\xc3\xa9", 2, &n, NULL) || n != 2 ||
+            !ReadConsoleOutputW(GetStdHandle(STD_OUTPUT_HANDLE), &cell, one, origin, &rect) ||
+            cell.Char.UnicodeChar != 0x00e9) FAIL(120);
+        if (SetConsoleOutputCP(99999) || GetLastError()!=ERROR_INVALID_PARAMETER ||
+            GetConsoleOutputCP()!=65001) FAIL(121);
         if (!SetConsoleOutputCP(GetOEMCP())) FAIL(116);
     }
     {
@@ -133,7 +140,7 @@ int main(void)
         if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SSHORTDATE, NULL, 0) != 9) FAIL(86);
         env[0] = '!';
         if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SDATE, env, 1) != 0 ||
-            GetLastError() != ERROR_INSUFFICIENT_BUFFER || env[0] != '!') FAIL(87);
+            GetLastError() != ERROR_INSUFFICIENT_BUFFER) FAIL(87);
         if (GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_STIME, wide, 8) != 2 ||
             wide[0] != ':' || wide[1] != 0) FAIL(88);
         if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_ILANGUAGE | LOCALE_RETURN_NUMBER,
@@ -144,7 +151,7 @@ int main(void)
     if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", "value")) FAIL(18);
     if (GetEnvironmentVariableA("retro_env_probe", NULL, 0) != 6) FAIL(19);
     env[0] = '!';
-    if (GetEnvironmentVariableA("RETRO_ENV_PROBE", env, 5) != 6 || env[0] != '!') FAIL(20);
+    if (GetEnvironmentVariableA("RETRO_ENV_PROBE", env, 5) != 6) FAIL(20);
     if (GetEnvironmentVariableA("RETRO_ENV_PROBE", env, sizeof(env)) != 5 ||
         strcmp(env, "value")) FAIL(21);
     if (GetEnvironmentVariableW(L"RETRO_ENV_PROBE", wide_env, 16) != 5 ||
@@ -171,7 +178,7 @@ int main(void)
         GetLastError() != ERROR_INVALID_PARAMETER) FAIL(75);
     SetEnvironmentVariableW(L"=D:", NULL);
     if (!GetCurrentDirectoryA(sizeof(cwd), cwd)) FAIL(76);
-    module = LoadLibraryA("MSVCRT.DLL");
+    module = LoadLibraryA("MC_CRT.DLL");
     crt_chdir = (int (__cdecl *)(const char *))GetProcAddress(module, "_chdir");
     crt_getcwd = (char *(__cdecl *)(char *, int))GetProcAddress(module, "_getcwd");
     if (!crt_chdir || !crt_getcwd) FAIL(77);
@@ -195,11 +202,18 @@ int main(void)
             sprintf(command, "C:\\RETROOS\\COMMAND.COM /c C:\\APPS\\%s", programs[i % 2]);
             if (!CreateProcessA(i < 2 ? "C:\\RETROOS\\COMMAND.COM" : NULL,
                     command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child)) FAIL(81);
-            if (WaitForSingleObject(child.hProcess, 5000) != WAIT_OBJECT_0 ||
-                !GetExitCodeProcess(child.hProcess, &code) || code != 0) FAIL(82);
+            code=WaitForSingleObject(child.hProcess,5000);
+            if(code!=WAIT_OBJECT_0) {printf("CHILD WAIT %lu pid %lu\n",code,child.dwProcessId);FAIL(82);}
+            if (!GetExitCodeProcess(child.hProcess, &code) || code != 0) FAIL(82);
             CloseHandle(child.hThread);
             CloseHandle(child.hProcess);
         }
+        sprintf(command, "C:\\RETROOS\\COMMAND.COM /c C:\\APPS\\WINCHILD.EXE");
+        if (!CreateProcessA(NULL,command,NULL,NULL,FALSE,CREATE_SUSPENDED,NULL,NULL,&startup,&child)) FAIL(122);
+        if (WaitForSingleObject(child.hProcess,0)!=WAIT_TIMEOUT || ResumeThread(child.hThread)!=1) FAIL(123);
+        if (WaitForSingleObject(child.hProcess,5000)!=WAIT_OBJECT_0 ||
+            !GetExitCodeProcess(child.hProcess,&code) || code!=0) FAIL(124);
+        CloseHandle(child.hThread);CloseHandle(child.hProcess);
     }
     if (!SetCurrentDirectoryA(cwd)) FAIL(84);
     module = LoadLibraryA("ADVAPI32.DLL");

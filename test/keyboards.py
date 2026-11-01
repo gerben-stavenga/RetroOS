@@ -2,7 +2,7 @@
 """Exercise national keyboard input through all four guest console APIs.
 
 The pure Rust tests anchor the physical positions and modifier behavior. This
-fixture checks BIOS/KBD OEM bytes, Win32 UTF-16/UTF-8 events, Linux UTF-8 input,
+fixture checks BIOS/KBD OEM bytes, Win32 UTF-16/ANSI events, Linux UTF-8 input,
 and an explicit keyboard choice independent of the regional profile.
 """
 from pathlib import Path
@@ -40,15 +40,15 @@ def main():
             shutil.copyfile(ROOT / "bazel-bin" / source, root / destination)
         shutil.copyfile(ROOT / linux, root / "LINUX.ELF")
         cases = [
-            ("LOCALE=it-IT\n", "è@éàùì\\[]{}", 850, "it"),
-            ("LOCALE=de-DE\n", "zyüäöß@[]{}\\^é", 850, "de"),
-            ("LOCALE=pl-PL\n", "ąęłŁżźćńó", 852, "pl"),
-            ("LOCALE=ru-RU\n", "фЖёЯxyz", 866, "ru"),
-            ("LOCALE=nl-NL\n", "aA@[]{}\\^", 850, "us"),
-            ("LOCALE=de-DE\nKEYBOARD=iT\nCODEPAGE=437\n", "è@é\\", 437, "it"),
-            ("LOCALE=it-IT\nKEYBOARD=unknown\n", "è@é\\", 850, "it"),
+            ("LOCALE=it-IT\n", "è@éàùì\\[]{}", 850, "it", 1252),
+            ("LOCALE=de-DE\n", "zyüäöß@[]{}\\^é", 850, "de", 1252),
+            ("LOCALE=pl-PL\n", "ąęłŁżźćńó", 852, "pl", 1250),
+            ("LOCALE=ru-RU\n", "фЖёЯxyz", 866, "ru", 1251),
+            ("LOCALE=nl-NL\n", "aA@[]{}\\^", 850, "us", 1252),
+            ("LOCALE=de-DE\nKEYBOARD=iT\nCODEPAGE=437\n", "è@é\\", 437, "it", 1252),
+            ("LOCALE=it-IT\nKEYBOARD=unknown\n", "è@é\\", 850, "it", 1252),
         ]
-        for config, text, cp, layout in cases:
+        for config, text, cp, layout, ansi in cases:
             (root / "RETROOS/RETROOS.INI").write_text("[locale]\n" + config.replace("LOCALE=", "language=").replace("KEYBOARD=", "keyboard=").replace("CODEPAGE=", "codepage="))
             encoded = text.encode(f"cp{cp}", errors="replace") + b"\r"
             markers = {
@@ -77,9 +77,9 @@ def main():
                         process.stdin.write((text + "\n").encode()); process.stdin.flush()
                         wait_for(marker)
                         if command == "/WIN.EXE":
-                            wait_for("KEYBOARD UTF8 READY")
+                            wait_for("KEYBOARD ANSI READY")
                             process.stdin.write((text + "\n").encode()); process.stdin.flush()
-                            wait_for("KEYBOARD A " + " ".join(f"{b:02X}" for b in text.encode() + b"\r"))
+                            wait_for("KEYBOARD A " + " ".join(f"{b:02X}" for b in text.encode(f"cp{ansi}") + b"\r"))
                         process.wait(timeout=10)
                         assert process.returncode == 0 and f"Keyboard: {layout}" in output(), output()
                         assert not any(bad in output() for bad in ["SEGV", "PANIC", "FAIL", "panicked"]), output()

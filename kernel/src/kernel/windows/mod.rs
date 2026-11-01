@@ -21,6 +21,7 @@ mod user_queue;
 mod graphics;
 mod classes;
 mod console;
+mod processes;
 mod environment;
 mod encoding;
 mod threads;
@@ -123,6 +124,7 @@ enum Api {
     Unsupported,
     MapFile,
     LocaleId,
+    CodePage,
     Registry,
     Clock,
     SetSelectors,
@@ -132,6 +134,9 @@ enum Api {
     FileKind,
     Pcm,
     NativeFile,
+    Spawn,
+    Child,
+    Console,
     NamedObject,
     Session,
     Section,
@@ -266,6 +271,7 @@ pub struct WindowsState {
     modules: Vec<Module>,
     allocations: Vec<(u32, u32)>,
     memory: Vec<memory::Region>,
+    processes: processes::State,
     session: session::State,
     sections: sections::State,
     user_objects: user_objects::State,
@@ -324,6 +330,7 @@ impl WindowsState {
             modules: Vec::new(),
             allocations: Vec::new(),
             memory: Vec::new(),
+            processes: Default::default(),
             session: session::State::default(),
             sections: sections::State::default(),
             user_objects: user_objects::State::default(),
@@ -388,6 +395,7 @@ impl WindowsState {
     pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8, now: u64) {
         let pressed = crate::kernel::keyboard::update_console(&mut self.console.keyboard,scancode);
         if crate::kernel::keyboard::event().scan == 0 { return; }
+        console::key(self, crate::kernel::keyboard::event(), crate::kernel::keyboard::control_state());
         user_queue::keyboard_event(self, crate::kernel::keyboard::event(), crate::kernel::keyboard::control_state(), now);
         self.wake_user();
         if !pressed {
@@ -903,6 +911,7 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
     (b"RETROOS", b"RetroWriteFile", Api::WriteFile, 20),
     (b"RETROOS", b"RetroYield", Api::Yield, 0),
     (b"RETROOS", b"RetroMapFile", Api::MapFile, 12),
+    (b"RETROOS", b"RetroCodePage", Api::CodePage, 0),
     (b"RETROOS", b"RetroLocaleId", Api::LocaleId, 0),
     (b"RETROOS", b"RetroRegistry", Api::Registry, 28),
     (b"RETROOS", b"RetroClock", Api::Clock, 4),
@@ -910,6 +919,9 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
     (b"RETROOS", b"RetroNamed", Api::NamedObject, 24),
     (b"RETROOS", b"RetroSystemInfo", Api::SystemInfo, 4),
     (b"RETROOS", b"RetroClearTls", Api::ClearTls, 4),
+    (b"RETROOS", b"RetroConsole", Api::Console, 20),
+    (b"RETROOS", b"RetroSpawnProcess", Api::Spawn, 4),
+    (b"RETROOS", b"RetroChild", Api::Child, 16),
     (b"RETROOS", b"RetroFileKind", Api::FileKind, 4),
     (b"RETROOS", b"RetroPcm", Api::Pcm, 24),
     (b"RETROOS", b"RetroFile", Api::NativeFile, 28),
@@ -1109,7 +1121,7 @@ pub fn exec_pe_into<A: crate::Arch>(
     machine.write::<u32>((TEB_BASE + 4) as usize, STACK_TOP);
     machine.write::<u32>((TEB_BASE + 8) as usize, stack_base);
     machine.write::<u32>((TEB_BASE + 0x18) as usize, TEB_BASE);
-    machine.write::<u32>((TEB_BASE + 0x20) as usize, 1);
+    machine.write::<u32>((TEB_BASE + 0x20) as usize, tid as u32 + 1);
     machine.write::<u32>((TEB_BASE + 0x24) as usize, tid as u32 + 1);
     machine.write::<u32>((TEB_BASE + 0x30) as usize, PEB_BASE);
     initialize_teb_string(machine);
@@ -1427,6 +1439,7 @@ fn dispatch<A: crate::Arch>(
         Api::NamedObject => named::call(machine, state, core::array::from_fn(|i| arg(machine, regs, i))),
         Api::NativeFile => native_file::call(machine, kt, state, core::array::from_fn(|i| arg(machine, regs, i))),
         Api::Pcm => super::sound::pcm::call(machine, &mut state.pcm, core::array::from_fn(|i| arg(machine, regs, i))),
+        Api::Console => console::call(machine, state, core::array::from_fn(|i| arg(machine,regs,i))),
         Api::FileKind => match kt.fds.get(arg(machine, regs, 0) as usize) {
             Some(thread::FdKind::Vfs(_) | thread::FdKind::Dir { .. }) => 1,
             Some(thread::FdKind::ConsoleOut) => 2,
@@ -1472,6 +1485,7 @@ fn dispatch<A: crate::Arch>(
             0
         },
         Api::Registry => registry::call(machine, &mut state.registry, core::array::from_fn(|i| arg(machine, regs, i))),
+        Api::CodePage => u32::from(lib::codepage::current_codepage().id),
         Api::LocaleId => lib::locale::current().lcid,
         Api::MapFile => {
             let name = arg(machine, regs, 0);
@@ -1507,7 +1521,7 @@ fn dispatch<A: crate::Arch>(
             arg(machine, regs, 3) as usize, state.console.output_cp,
         ),
         Api::RetroWndProcReturn => 0,
-        Api::ExitProcess | Api::Unsupported | Api::DosMemory | Api::Wait | Api::NativeThread | Api::RestoreContext => unreachable!(),
+        Api::ExitProcess | Api::Unsupported | Api::Spawn | Api::Child | Api::DosMemory | Api::Wait | Api::NativeThread | Api::RestoreContext => unreachable!(),
     }
 }
 
@@ -1582,6 +1596,8 @@ pub fn handle_event<A: crate::Arch>(
             if gate.api == Api::ExitProcess {
                 return thread::KernelAction::Exit(arg(machine, regs, 0) as i32);
             }
+            if gate.api == Api::Spawn { return processes::spawn(machine,state,regs,gate); }
+            if gate.api == Api::Child { return processes::call(machine,state,regs,gate); }
             note_api(gate.name);
             if crate::kernel::startup::trace_enabled() {
                 crate::compact_dbg_println!("[win32] {}", core::str::from_utf8(gate.name).unwrap_or("?"));
@@ -1795,6 +1811,7 @@ fn initialize_process_strings<A:crate::Arch>(machine:&mut A,state:&mut WindowsSt
     machine.write::<u32>(PROCESS_DATA as usize,4096);
     machine.write::<u32>((PROCESS_DATA+4) as usize,0x298);
     machine.write::<u32>((PROCESS_DATA+8) as usize,1);
+    machine.write::<u32>((PROCESS_DATA + 0x10) as usize, 0x7c000001);
     // Wine's GetStdHandle reads the normalized process parameters. Native
     // file handles carry the same tag as handles returned by NtCreateFile.
     for (field, fd) in [(0x18, 0), (0x1c, 1), (0x20, 2)] {

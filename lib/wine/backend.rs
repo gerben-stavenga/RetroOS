@@ -213,7 +213,16 @@ pub unsafe extern "system" fn RetroNtQueryInformationProcess(
     returned: *mut u32,
 ) -> u32 {
     if process != u32::MAX {
-        return 0xc0000008;
+        if class != 0 { return 0xc0000003; }
+        if !returned.is_null() { unsafe { *returned=24; } }
+        if length!=24 { return 0xc0000004; }
+        if output.is_null() { return 0xc0000005; }
+        unsafe extern "system" { fn RetroChild(op:u32,handle:u32,params:*const u32,out:*mut u32)->u32; }
+        let mut info=[0;2];
+        let status=unsafe {RetroChild(2,process,core::ptr::null(),info.as_mut_ptr())};
+        if status!=0 {return status;}
+        for (i,v) in [info[0],0,1,8,info[1],0].into_iter().enumerate() {unsafe{output.add(i).write_unaligned(v);}}
+        return 0;
     }
     if class == 3 { // ProcessVmCounters, with optional VM_COUNTERS_EX tail.
         if !returned.is_null() { unsafe { *returned = if length >= 48 { 48 } else { 44 }; } }
@@ -1306,19 +1315,19 @@ pub unsafe extern "system" fn RetroNtOpenSection(
         return INVALID_PARAMETER;
     }
     if attr.root != 0 {
-        return NOT_SUPPORTED;
+        return unsafe {RetroNamed(24,0,attributes as u32,access,0,out)};
     }
     let name = unsafe { &*attr.name };
     const SESSION: &[u8] = b"\\KernelObjects\\__wine_session";
     if name.length as usize != SESSION.len() * 2 || name.buffer.is_null() {
-        return 0xc0000034;
+        return unsafe {RetroNamed(24,0,attributes as u32,access,0,out)};
     }
     for (i, &c) in SESSION.iter().enumerate() {
         let unit = unsafe { *name.buffer.add(i) };
         if unit != c as u16
             && !(attr.attributes & 0x40 != 0 && unit < 128 && (unit as u8).eq_ignore_ascii_case(&c))
         {
-            return 0xc0000034;
+            return unsafe {RetroNamed(24,0,attributes as u32,access,0,out)};
         }
     }
     if access & !(4 | 1 | 0x20000) != 0 {
@@ -2303,4 +2312,11 @@ pub unsafe extern "system" fn RetroNtAlertThreadByThreadId(tid: u32) -> u32 {
     let params = [tid, 0, 0, 0, 0, 0];
     let mut out = [0u32; 8];
     unsafe { RetroThread(5, params.as_ptr(), out.as_mut_ptr()) }
+}
+
+// The VFS does not store Windows ACLs. Return the unsupported status so
+// callers can handle the missing capability without terminating the process.
+#[unsafe(no_mangle)]
+pub extern "system" fn RetroNtSetSecurityObject(_handle:u32,_info:u32,_descriptor:u32)->u32 {
+    NOT_SUPPORTED
 }
