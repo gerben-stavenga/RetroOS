@@ -2,8 +2,9 @@ load("//lib/wine:modules.bzl", "WINE_FILES")
 
 """Filesystem layout: paths are relative to their destination volume.
 
-BOOT_FILES and LINUX_FILES are rebuilt with the kernel. DATA_FILES and
-SHOWCASE_FILES ship in the showcase archive and seed writable C: files;
+CORE_FILES are the small RAM boot runtime. BOOT_FILES adds the disk-backed
+Windows runtime; LINUX_FILES supplies the Unix tools. All are rebuilt with
+the kernel. DATA_FILES and SHOWCASE_FILES ship in the showcase archive and seed writable C: files;
 editing those mappings never updates a live disk automatically.
 RETROOS/ and bin/ are kernel/runtime contracts, not arbitrary mount names.
 """
@@ -12,7 +13,7 @@ BOOT_SIZE_MB = 256
 DOS_SIZE_MB = 3072
 LINUX_SIZE_MB = 512
 
-BOOT_FILES = {
+CORE_FILES = {
     "etc/RETROOS.INI": "RETROOS/RETROOS.INI",
     "etc/BOOT.INI": "RETROOS/BOOT.INI",
     # boot-bundle/** is not listed here. BUILD.bazel globs it onto the boot
@@ -42,8 +43,9 @@ BOOT_FILES = {
     "//lib/os2/helpmgr:helpmgr_dll":     "RETROOS/OS2/DLL/HELPMGR.DLL",
 }
 
-DIAGNOSTIC_BOOT_FILES = dict(BOOT_FILES)
-BOOT_FILES.update(WINE_FILES)
+# Disk-backed installations include the Windows runtime. The RAM boot core
+# stays small; live media carry Windows in their optional application image.
+BOOT_FILES = CORE_FILES | WINE_FILES
 
 DATA_FILES = {
     # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).

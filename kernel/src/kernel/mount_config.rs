@@ -711,11 +711,29 @@ pub fn apply(
             for entry in entries {
                 let name = &entry.name[..entry.name_len];
                 if !entry.is_dir || entry.is_symlink || matches!(name, b"." | b".." | b"lost+found") { continue; }
-                let directory: &'static [u8] = Box::leak([name, b"/"].concat().into_boxed_slice());
-                if config.mounts.iter().any(|m| prefix_bytes(&m.path) == [c, directory].concat()) { continue; }
-                let source = Box::leak([target, directory].concat().into_boxed_slice());
-                vfs::bind(Box::leak([c, directory].concat().into_boxed_slice()), source);
-                if !c.is_empty() { vfs::bind(directory, source); }
+                // RETROOS belongs to the matched core. Optional application
+                // runtimes may add subdirectories without hiding COMMAND.COM,
+                // symbols, settings, or existing core personality DLLs.
+                let directories = if name == b"RETROOS" {
+                    let mut children = Vec::new();
+                    fs.readdir(name, 0, &mut children, usize::MAX);
+                    children.iter().filter_map(|child| {
+                        let child_name = &child.name[..child.name_len];
+                        if !child.is_dir || child.is_symlink || matches!(child_name, b"." | b"..") { return None; }
+                        let directory = [name, b"/", child_name, b"/"].concat();
+                        if bootfs.dir_exists(&[bundle_home, &directory].concat()) { return None; }
+                        Some(directory)
+                    }).collect::<Vec<_>>()
+                } else {
+                    alloc::vec![[name, b"/"].concat()]
+                };
+                for directory in directories {
+                    let directory: &'static [u8] = Box::leak(directory.into_boxed_slice());
+                    if config.mounts.iter().any(|m| prefix_bytes(&m.path) == [c, directory].concat()) { continue; }
+                    let source = Box::leak([target, directory].concat().into_boxed_slice());
+                    vfs::bind(Box::leak([c, directory].concat().into_boxed_slice()), source);
+                    if !c.is_empty() { vfs::bind(directory, source); }
+                }
             }
         }
         crate::compact_println!("Optional module: /{} ({} MiB)",

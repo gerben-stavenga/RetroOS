@@ -25,14 +25,14 @@ def contents(image, name, kind):
     return subprocess.check_output(['debugfs', '-R', 'cat /RETROOS/' + name, str(image)], stderr=subprocess.DEVNULL)
 
 
-def boot(work, iso, disk, expected):
+def boot(work, iso, disk, expected, command='/dos/PROBE.ELF'):
     log = work / 'guest.log'
     log.unlink(missing_ok=True)
     process = subprocess.Popen([
         'qemu-system-i386', '-m', '128', '-cdrom', str(iso), '-boot', 'order=d',
         '-drive', f'file={disk},format=raw', '-display', 'none', '-serial', 'none',
         '-debugcon', f'file:{log}', '-no-reboot',
-        '-fw_cfg', 'name=opt/cmdline,string=/dos/PROBE.ELF',
+        '-fw_cfg', 'name=opt/cmdline,string=' + command,
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         deadline = time.monotonic() + 45
@@ -49,6 +49,8 @@ def boot(work, iso, disk, expected):
     assert f'[mem] exit tid=1 code={expected}' in text, text[-5000:]
     assert '[mem] exit tid=1 code=1' not in text and 'FATAL' not in text and 'panicked' not in text, text
     assert 'Locale: it-IT' in text, text
+    assert 'Optional module:' not in text, text
+    assert f'Starting {command}' in text, text
 
 
 def exercise(kind):
@@ -108,6 +110,7 @@ fail: call(1,error,0,0); for(;;) {}
 }
 ''')
         run('gcc', '-m32', '-nostdlib', '-static', '-fno-pie', '-no-pie', source, '-o', home / 'PROBE.ELF')
+        shutil.copyfile(ROOT / 'bazel-bin/test/windows/hello/hello.exe', home / 'WINHELLO.EXE')
         disk = work / 'data.img'
         with disk.open('wb') as stream:
             stream.truncate(256 * 1024 * 1024)
@@ -115,6 +118,7 @@ fail: call(1,error,0,0); for(;;) {}
             run('mkfs.fat', '-F', '32', '-i', 'ABCD1234', disk)
             run('mcopy', '-s', '-i', disk, home / 'RETROOS', '::/')
             run('mcopy', '-i', disk, home / 'PROBE.ELF', '::/')
+            run('mcopy', '-i', disk, home / 'WINHELLO.EXE', '::/')
         else:
             run('mkfs.ext4', '-q', '-F', '-U', ident, '-E',
                 f'root_owner={os.getuid()}:{os.getgid()}', '-d', home, disk)
@@ -141,11 +145,14 @@ fail: call(1,error,0,0); for(;;) {}
         boot(work, protected, disk, 2)
         for name, data in before.items():
             assert contents(disk, name, kind) == data, name
-        print(f'PASS: {kind} disk runtime supplies BusyBox root, persists both INIs across reboot, and protects disk edits')
+        # Load the Windows app and its Wine DLLs from disk in the same 128 MiB
+        # guest. No filesystem images are supplied as Multiboot modules.
+        boot(work, iso, disk, 0, '/dos/WINHELLO.EXE')
+        print(f'PASS: {kind} disk runtime supplies BusyBox root, persists both INIs across reboot, protects disk edits, and executes Win32 from disk with 128 MiB RAM')
 
 
 def main():
-    run('bazelisk', 'build', '//:machine_boot_tar')
+    run('bazelisk', 'build', '//:machine_boot_tar', '//test/windows/hello:hello')
     for kind in ('fat', 'ext4'):
         exercise(kind)
 

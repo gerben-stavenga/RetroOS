@@ -40,7 +40,9 @@ GRUB supplies two ordinary INI files. `BOOT.INI` selects the boot bundle and
 filesystem mounts; `RETROOS.INI` holds user settings. Disk installations open
 bundle files directly from the configured filesystem, without a RAM bundle
 module. USB boots use a small GRUB bundle module because kernel USB storage
-is not supported yet. The core contains DN, BusyBox and runtime libraries;
+is not supported yet. The 16 MiB core contains DN, BusyBox and native system files. Windows DLLs
+load from disk on installed systems and accompany the optional live-media
+application image;
 VC, MC, RC, NDN (DOS/Windows/OS/2), DN/2 (DOS/Windows/OS/2), and games
 live directly under `showcase-bundle/`, which mirrors their `C:` paths and is
 packaged with one recursive glob into a single showcase image. USB loads it by default; the GRUB “Core only

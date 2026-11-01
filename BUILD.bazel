@@ -1,4 +1,5 @@
-load(":filesystem_layout.bzl", "BOOT_FILES", "DIAGNOSTIC_BOOT_FILES", "DATA_FILES", "SHOWCASE_FILES", "LINUX_FILES", "BOOT_SIZE_MB", "DOS_SIZE_MB", "LINUX_SIZE_MB")
+load("//lib/wine:modules.bzl", "WINE_FILES")
+load(":filesystem_layout.bzl", "BOOT_FILES", "CORE_FILES", "DATA_FILES", "SHOWCASE_FILES", "LINUX_FILES", "BOOT_SIZE_MB", "DOS_SIZE_MB", "LINUX_SIZE_MB")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@rules_pkg//pkg:mappings.bzl", "pkg_mklink")
 
@@ -221,7 +222,7 @@ pkg_tar(
 pkg_tar(
     name = "root_module_dos_tar",
     empty_dirs = ["TEMP"],
-    files = _BOOT_DIR_FILES,
+    files = CORE_FILES,
     deps = [":apps_boot_tar"],
 )
 
@@ -238,6 +239,14 @@ pkg_tar(
     srcs = glob(["showcase-bundle/**/*"]),
     strip_prefix = "showcase-bundle",
     modes = {"COMMANDER/RC/RC.EXE": "0755"},
+)
+
+# The optional live-media image supplies Windows alongside its sample apps.
+# Disk installations already carry the same runtime in machine_boot_tar.
+pkg_tar(
+    name = "root_module_showcase_tar",
+    files = WINE_FILES,
+    deps = [":showcase_module_tar"],
 )
 
 # Extras populated into the ext4 partition: the /bin busybox userland plus the
@@ -479,10 +488,10 @@ genrule(
 
 genrule(
     name = "root_module_showcase_image",
-    srcs = [":showcase_module_tar", "tools/build_module_image.py"],
+    srcs = [":root_module_showcase_tar", "tools/build_module_image.py"],
     outs = ["retroos-showcase.img"],
     cmd = "python3 $(location tools/build_module_image.py)" +
-          " --contents $(location :showcase_module_tar) --size-mb 256 --writable-root --out $@",
+          " --contents $(location :root_module_showcase_tar) --size-mb 256 --writable-root --out $@",
     visibility = ["//visibility:public"],
 )
 
@@ -559,7 +568,7 @@ pkg_tar(
 
 pkg_tar(
     name = "diagnostic_dos_tar",
-    files = DIAGNOSTIC_BOOT_FILES,
+    files = CORE_FILES,
     empty_dirs = ["TEMP"],
     deps = [":diagnostic_apps_boot_tar"],
 )
@@ -693,10 +702,32 @@ pkg_tar(
 )
 
 # One build target keeps the installed kernel and all runtime files matched.
+_MACHINE_BOOT_DEPS = [":apps_boot_tar", ":bin_tar"]
+
 pkg_tar(
     name = "machine_boot_tar",
     files = {src: dst for src, dst in _BOOT_DIR_FILES.items() if dst != "RETROOS/BOOT.INI"} | {"//kernel:kernel_elf": "kernel.elf"},
-    deps = [":apps_boot_tar", ":bin_tar"],
+    deps = _MACHINE_BOOT_DEPS,
+)
+
+# Release validation consumes the packaging rules' manifests, including the
+# component archives. Keep all runtime file selection in the build graph.
+filegroup(
+    name = "machine_boot_manifests",
+    srcs = [":machine_boot_tar"] + _MACHINE_BOOT_DEPS,
+    output_group = "manifest",
+)
+
+genrule(
+    name = "machine_boot_layout",
+    srcs = [":machine_boot_manifests"],
+    outs = ["machine_boot_layout.json"],
+    cmd = "python3 -c 'import json,sys; " +
+          "entries=[e for p in sys.argv[2:] for e in json.load(open(p))]; " +
+          "layout=[dict(path=e[\"dest\"], type=e[\"type\"], " +
+          "**({\"target\":e[\"src\"]} if e[\"type\"]==\"symlink\" else {})) for e in entries]; " +
+          "json.dump(sorted(layout,key=lambda e:e[\"path\"]),open(sys.argv[1],\"w\"),indent=2)' " +
+          "$@ $(locations :machine_boot_manifests)",
 )
 
 # Flat at the volume root -- a FAT volume IS C:, so there is no home/retroos
@@ -861,6 +892,7 @@ pkg_tar(
     mode = "0644",
     files = {
         ":machine_boot_tar": "machine_boot.tar",
+        ":machine_boot_layout": "machine_boot_layout.json",
         "//kernel:kernel_elf": "kernel.elf",
         ":root_module_base_gzip": "retroos-base.img.gz",
         ":showcase_module_tar": "showcase.tar",

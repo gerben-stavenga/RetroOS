@@ -15,9 +15,9 @@ def run(*args, **kwargs):
     return subprocess.run(list(map(str, args)), check=True, stdout=subprocess.DEVNULL, **kwargs)
 
 
-def boot(work, image, name, firmware, command):
+def boot(work, image, name, firmware, command, memory=768):
     log = work / (name + '.log')
-    args = ['qemu-system-x86_64', '-accel', 'tcg', '-cpu', 'max', '-m', '512',
+    args = ['qemu-system-x86_64', '-accel', 'tcg', '-cpu', 'max', '-m', str(memory),
             '-device', 'qemu-xhci,id=usb',
             '-drive', f'if=none,id=stick,file={image},format=raw,snapshot=on',
             '-device', 'usb-storage,bus=usb.0,drive=stick,bootindex=1',
@@ -51,9 +51,12 @@ def boot(work, image, name, firmware, command):
 def main():
     run('bazelisk', 'build', '//:grub_module_usb', '//:machine_boot_tar')
     with tarfile.open(ROOT / 'bazel-bin/root_module_base_tar.tar') as archive:
-        names = {m.name.removeprefix('./') for m in archive.getmembers()}
+        members = archive.getmembers()
+        names = {m.name.removeprefix('./') for m in members}
     assert 'DN/DN.COM' in names and 'bin/busybox' in names
     assert not any(n.startswith(('TC/', 'COMMANDER/', 'GAMES/', 'ULTRASND/')) for n in names)
+    # Boot itself has no dependency on the Windows runtime.
+    assert not any(n.startswith('RETROOS/WINDOWS/') for n in names)
     assert (ROOT / 'bazel-bin/retroos-base.img').stat().st_size == 16 * 1024 * 1024
     with tarfile.open(ROOT / 'bazel-bin/machine_boot_tar.tar') as archive:
         names = {m.name.removeprefix('./') for m in archive.getmembers()}
@@ -100,8 +103,8 @@ def main():
             shutil.copyfile(original, image)
             run('mcopy', '-o', '-i', str(image) + '@@1048576', settings, '::/boot/retroos/RETROOS.INI')
             text = boot(work, image, 'showcase-' + firmware, firmware,
-                        '/bin/busybox sh -c "test -d /SRC && test -d /TESTS && test -d /OS2 && test -d /WINDOWS"')
-            assert text.count('Optional module:') == 1 and '/showcase/ (256 MiB)' in text, text
+                        '/bin/busybox sh -c "test -s /RETROOS/COMMAND.COM && /WINDOWS/APPS/HELLO.EXE"')
+            assert text.count('Optional module:') == 1 and '/showcase/ (' in text, text
             assert 'Locale: it-IT' in text, text
             print('PASS: USB', firmware, 'defaults to one showcase image with games and commanders', flush=True)
             title = ('RetroOS (protected disk, native BIOS VGA)' if firmware == 'bios'
@@ -111,7 +114,7 @@ def main():
             run('grub-script-check', menu_file)
             run('mcopy', '-o', '-i', str(image) + '@@1048576', menu_file, '::/boot/grub/grub.cfg')
             text = boot(work, image, 'core-' + firmware, firmware,
-                        '/bin/busybox sh -c "test -s /bin/busybox && ! test -e /COMMANDER && ! test -e /GAMES"')
+                        '/bin/busybox sh -c "test -s /bin/busybox && ! test -e /COMMANDER && ! test -e /GAMES"', memory=128)
             assert 'Optional module:' not in text, text
             print('PASS: USB', firmware, 'core-only choice omits the showcase', flush=True)
 

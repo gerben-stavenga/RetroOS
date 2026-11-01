@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot an installed-machine layout: explicit UUID, RAM runtime, persistent C:."""
+"""Boot an installed-machine layout: explicit UUID, disk-backed runtime, persistent C:."""
 from pathlib import Path
 import shutil
 import re

@@ -20,7 +20,7 @@ run_program() {
     # must therefore terminate QEMU, and must escalate if QEMU does not
     # handle SIGTERM promptly.
     timeout --kill-after=5s 60s qemu-system-i386 \
-        -m 512 -cpu pentium3 \
+        -m 768 -cpu pentium3 \
         -device qemu-xhci,id=usb \
         -drive if=none,id=stick,file=bazel-bin/retroos_grub_module_usb.img,format=raw,snapshot=on \
         -device usb-storage,bus=usb.0,drive=stick,bootindex=1 \
@@ -29,7 +29,7 @@ run_program() {
         -debugcon "file:$log" \
         -display none -no-reboot >/dev/null 2>&1 || true
 
-    grep -q 'Optional module: /showcase/ (256 MiB)' "$log"
+    grep -q 'Optional module: /showcase/ (' "$log"
     ! grep -q 'KERNEL PANIC' "$log"
 }
 

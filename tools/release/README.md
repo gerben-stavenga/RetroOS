@@ -25,9 +25,12 @@ Windows network APIs and other NIC drivers are not yet implemented.
 `/boot/retroos/RETROOS.INI` contains locale, keyboard, sound, launch and startup
 settings. Both are ordinary editable files loaded separately by GRUB. Unlisted physical partitions remain unmounted.
 The bundled DN and system files have writable RAM views.
-The core image grows to fit its runtime (currently 128 MiB). The default also
-loads one 256 MiB showcase module containing
-games and commanders. Choose “Core only (less RAM)” to omit the showcase.
+The 16 MiB core contains DN, BusyBox and the native system files. Windows
+DLLs are ordinary runtime files: disk installations read them from disk;
+the live USB/ISO carries them in the optional showcase image alongside games
+and commanders. Allow at least 768 MiB RAM for the full live-media boot,
+including GRUB’s UEFI loading space. Choose “Core only (less RAM)” to leave
+out the application image and Windows runtime.
 
 Write the IMG to the whole USB device with a disk imaging tool. This replaces
 the device's current contents. On Linux, after identifying the device with

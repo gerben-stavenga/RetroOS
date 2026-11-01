@@ -2,6 +2,7 @@
 """Validate public release contents and boot the extracted, compiler-free launcher."""
 import hashlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import struct
@@ -14,6 +15,24 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = Path(os.environ.get('RETROOS_RELEASE_DIR', ROOT / 'bazel-bin')).resolve()
+
+
+def check_package_layout(archive, layout):
+    """Check an archive against Bazel's declared files, without a file list here."""
+    members = {m.name.removeprefix('./').rstrip('/'): m for m in archive.getmembers()}
+    expected = {entry['path'] for entry in layout if entry['type'] != 'dir'}
+    actual = {name for name, member in members.items() if not member.isdir()}
+    assert actual == expected, {'missing': sorted(expected - actual), 'unexpected': sorted(actual - expected)}
+    for entry in layout:
+        member = members[entry['path']]
+        if entry['type'] == 'file':
+            assert member.isfile(), entry
+        elif entry['type'] == 'symlink':
+            assert member.issym() and member.linkname == entry['target'], entry
+        elif entry['type'] == 'dir':
+            assert member.isdir(), entry
+        else:
+            raise AssertionError(f'Unsupported package entry: {entry}')
 
 
 def check_usb(work):
@@ -41,7 +60,7 @@ def check_usb(work):
     subprocess.run(['grub-script-check', str(cfg)], check=True)
     for firmware in ('bios', 'uefi'):
         log = work / f'usb-{firmware}.log'
-        args = ['qemu-system-x86_64', '-m', '512',
+        args = ['qemu-system-x86_64', '-m', '768',
                 '-device', 'qemu-xhci,id=usb',
                 '-drive', f'if=none,id=usbdisk,file={image},format=raw,snapshot=on',
                 '-device', 'usb-storage,bus=usb.0,drive=usbdisk,bootindex=1',
@@ -71,6 +90,7 @@ def check_usb(work):
         text = log.read_text(errors='replace')
         assert '[mem] exit tid=1 code=0' in text and 'PANIC' not in text, text
         assert 'Disk writes: volatile RAM overlay' in text, text
+        assert text.count('Optional module:') == 1, text
         expected = 'vga_passthrough=true firmware=NativeBios' if firmware == 'bios' else 'vga_passthrough=false firmware=Substitute'
         assert expected in text, text
         print(f'PASS: published USB image {firmware}, protected default, RAM C:')
@@ -81,7 +101,7 @@ def check_iso(work):
     assert image.is_file()
     for firmware in ('bios', 'uefi'):
         log = work / f'iso-{firmware}.log'
-        args = ['qemu-system-x86_64', '-m', '512', '-cdrom', str(image),
+        args = ['qemu-system-x86_64', '-m', '768', '-cdrom', str(image),
                 '-boot', 'order=d', '-display', 'none', '-no-reboot',
                 '-debugcon', 'file:' + str(log),
                 '-fw_cfg', 'name=opt/cmdline,string=/bin/busybox true']
@@ -106,6 +126,7 @@ def check_iso(work):
         text = log.read_text(errors='replace')
         assert '[mem] exit tid=1 code=0' in text and 'PANIC' not in text, text
         assert 'Disk writes: volatile RAM overlay' in text, text
+        assert text.count('Optional module:') == 1, text
         print(f'PASS: published CD ISO {firmware}, protected default, RAM C:')
 
 
@@ -159,28 +180,8 @@ def main():
         listing = subprocess.check_output(['mdir', '-i', volume, '::/'])
         for forbidden in (b'BUILD~1', b'DOS32A', b'BORLANDC'):
             assert forbidden not in listing, forbidden
-        for system_dir in ('WINDOWS/SYSTEM32', 'WINDOWS/SYSTEM', 'OS2/DLL'):
-            old_dlls = subprocess.run(
-                ['mdir', '-i', volume, f'::/{system_dir}/*.DLL'],
-                capture_output=True,
-            )
-            assert b'.DLL' not in old_dlls.stdout, system_dir
         with tarfile.open(machine / 'machine_boot.tar') as archive:
-            names = {member.name.removeprefix('./') for member in archive.getmembers()}
-            assert {
-                'kernel.elf', 'RETROOS/COMMAND.COM', 'RETROOS/KERNEL.SYM',
-                'DN/DN.COM',
-                'RETROOS/WINDOWS/SYSTEM32/ADVAPI32.DLL',
-                'RETROOS/WINDOWS/SYSTEM32/KERNEL32.DLL',
-                'RETROOS/WINDOWS/SYSTEM/KERNEL.DLL',
-                'RETROOS/OS2/DLL/DOSCALLS.DLL',
-                'RETROOS/RETROOS.INI', 'bin/busybox', 'bin/sh',
-            } <= names
-            assert not any(
-                name.endswith('.DLL') and name.startswith((
-                    'WINDOWS/SYSTEM32/', 'WINDOWS/SYSTEM/', 'OS2/DLL/',
-                )) for name in names
-            )
+            check_package_layout(archive, json.loads((machine / 'machine_boot_layout.json').read_text()))
             kernel = next(member for member in archive.getmembers()
                           if member.name.removeprefix('./') == 'kernel.elf')
             # immediate-abort removes the Rust panic handler from the linked
