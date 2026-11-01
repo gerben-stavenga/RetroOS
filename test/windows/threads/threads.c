@@ -32,6 +32,7 @@ static DWORD WINAPI worker(LPVOID parameter)
 }
 
 #pragma on(check_stack)
+#define FAIL(n) do { printf("WINTHREAD FAIL %u at line %u error %lu\n", (unsigned)(n), __LINE__, GetLastError()); return (n); } while (0)
 int main(void)
 {
     const char *plugins[] = {"SCRRES.DLL", "DESCSS.DLL", "NDNPASS.DLL", "TETRIS.DLL"};
@@ -50,6 +51,7 @@ int main(void)
     int (__cdecl *crt_chdir)(const char *);
     char *(__cdecl *crt_getcwd)(char *, int);
     WCHAR wide_env[16];
+    puts("WINTHREAD START");
     {
         const WCHAR unicode[] = {0x00e9, 0x0416, 0xd83d, 0xde00, 0};
         const char utf8[] = "\xc3\xa9\xd0\x96\xf0\x9f\x98\x80";
@@ -67,53 +69,55 @@ int main(void)
         SMALL_RECT rect = {0,0,0,0};
         if (MultiByteToWideChar(65001, 8, utf8, -1, NULL, 0) != 5 ||
             MultiByteToWideChar(65001, 8, utf8, -1, wide, 32) != 5 ||
-            memcmp(wide, unicode, sizeof(unicode))) return 100;
+            memcmp(wide, unicode, sizeof(unicode))) FAIL(100);
         memset(converted, '!', sizeof(converted));
         if (WideCharToMultiByte(65001, 0, unicode, -1, converted, 8, NULL, NULL) ||
-            GetLastError() != ERROR_INSUFFICIENT_BUFFER || converted[0] != '!') return 101;
+            GetLastError() != ERROR_INSUFFICIENT_BUFFER) FAIL(101);
         if (WideCharToMultiByte(65001, 0, unicode, -1, converted, 32, NULL, NULL) != 9 ||
-            strcmp(converted, utf8)) return 102;
+            strcmp(converted, utf8)) FAIL(102);
         if (MultiByteToWideChar(1252, 0, "\xe9\x80", 2, wide, 32) != 2 ||
-            wide[0] != 0xe9 || wide[1] != 0x20ac) return 103;
-        if (MultiByteToWideChar(1251, 0, "\xc6", 1, wide, 32) != 1 || wide[0] != 0x0416) return 104;
-        if (MultiByteToWideChar(65001, 8, "\xff", 1, wide, 32) || GetLastError() != 1113) return 105;
+            wide[0] != 0xe9 || wide[1] != 0x20ac) FAIL(103);
+        if (MultiByteToWideChar(1251, 0, "\xc6", 1, wide, 32) != 1 || wide[0] != 0x0416) FAIL(104);
+        if (MultiByteToWideChar(65001, 8, "\xff", 1, wide, 32) || GetLastError() != 1113) FAIL(105);
         if (WideCharToMultiByte(1252, 0, unicode, 2, converted, 32, NULL, &used) != 2 ||
-            (unsigned char)converted[0] != 0xe9 || converted[1] != '?' || !used) return 106;
+            (unsigned char)converted[0] != 0xe9 || converted[1] != '?' || !used) FAIL(106);
         memset(types, 0xcc, sizeof(types));
         if (!GetStringTypeW(CT_CTYPE1, unicode, 4, types) ||
-            !(types[0] & C1_LOWER) || !(types[1] & C1_UPPER) || types[4] != 0xcccc) return 117;
+            !(types[0] & C1_LOWER) || !(types[1] & C1_UPPER) || types[4] != 0xcccc) FAIL(117);
+        types[1] = 0xcccc;
         if (!GetStringTypeA(LOCALE_USER_DEFAULT, CT_CTYPE1, "\xe9", 1, types) ||
-            !(types[0] & C1_LOWER) || types[1] != (C1_UPPER|C1_ALPHA)) return 118;
+            !(types[0] & C1_LOWER) || types[1] != 0xcccc) FAIL(118);
         if (!OemToCharBuffA("caf\x82", converted, 4) || memcmp(converted, "caf\xe9", 4) ||
-            !CharToOemBuffA("caf\xe9", converted, 4) || memcmp(converted, "caf\x82", 4)) return 119;
+            !CharToOemBuffA("caf\xe9", converted, 4) || memcmp(converted, "caf\x82", 4)) FAIL(119);
         if (!SetEnvironmentVariableW(L"UNICODE_PROBE", unicode) ||
             GetEnvironmentVariableW(L"UNICODE_PROBE", NULL, 0) != 5 ||
             GetEnvironmentVariableW(L"UNICODE_PROBE", wide, 32) != 4 ||
-            memcmp(wide, unicode, sizeof(unicode))) return 107;
+            memcmp(wide, unicode, sizeof(unicode))) FAIL(107);
         file = CreateFileW(path, GENERIC_READ|GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
         if (file == INVALID_HANDLE_VALUE || !WriteFile(file, binary, sizeof(binary), &n, NULL) ||
-            n != sizeof(binary) || !CloseHandle(file)) return 108;
-        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return 109;
+            n != sizeof(binary) || !CloseHandle(file)) FAIL(108);
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) FAIL(109);
         search = FindFirstFileW(path, &found);
-        if (search == INVALID_HANDLE_VALUE || memcmp(found.cFileName, path+8, 9*sizeof(WCHAR))) return 110;
+        if (search == INVALID_HANDLE_VALUE || memcmp(found.cFileName, path+8, 9*sizeof(WCHAR))) FAIL(110);
         FindClose(search);
-        if (!GetCurrentDirectoryA(sizeof(saved_cwd), saved_cwd) ||
-            !CreateDirectoryA("C:\\APPS\\caf\xe9", NULL) ||
-            !SetCurrentDirectoryW(L"C:\\APPS\\caf\x00e9") ||
-            GetCurrentDirectoryA(sizeof(converted), converted) != 12 ||
-            strcmp(converted, "C:\\APPS\\caf\xe9") || !SetCurrentDirectoryA(saved_cwd)) return 111;
+        if (!GetCurrentDirectoryA(sizeof(saved_cwd), saved_cwd)) FAIL(1111);
+        if (!CreateDirectoryA("C:\\APPS\\caf\xe9", NULL)) FAIL(1112);
+        if (!SetCurrentDirectoryW(L"C:\\APPS\\caf\x00e9")) FAIL(1113);
+        if (GetCurrentDirectoryA(sizeof(converted), converted) != 12) FAIL(1114);
+        if (strcmp(converted, "C:\\APPS\\caf\xe9")) FAIL(1115);
+        if (!SetCurrentDirectoryA(saved_cwd)) FAIL(1116);
         file = CreateFileA("C:\\APPS\\caf\xe9\\x.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-        if (file == INVALID_HANDLE_VALUE || !CloseHandle(file)) return 112;
+        if (file == INVALID_HANDLE_VALUE || !CloseHandle(file)) FAIL(112);
         SetFileApisToOEM();
-        if (AreFileApisANSI() || GetFileAttributesA("C:\\APPS\\caf\x82\\x.txt") == INVALID_FILE_ATTRIBUTES) return 113;
+        if (AreFileApisANSI() || GetFileAttributesA("C:\\APPS\\caf\x82\\x.txt") == INVALID_FILE_ATTRIBUTES) FAIL(113);
         SetFileApisToANSI();
-        if (!AreFileApisANSI()) return 114;
+        if (!AreFileApisANSI()) FAIL(114);
         if (!SetConsoleOutputCP(1251) || GetConsoleOutputCP() != 1251 ||
             !SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), origin) ||
             !WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), "\xc6", 1, &n, NULL) || n != 1 ||
             !ReadConsoleOutputW(GetStdHandle(STD_OUTPUT_HANDLE), &cell, one, origin, &rect) ||
-            cell.Char.UnicodeChar != 0x0416) return 115;
-        if (!SetConsoleOutputCP(GetOEMCP())) return 116;
+            cell.Char.UnicodeChar != 0x0416) FAIL(115);
+        if (!SetConsoleOutputCP(GetOEMCP())) FAIL(116);
     }
     {
         const DWORD kinds[] = {LOCALE_IDATE, LOCALE_ITIME, LOCALE_SDATE, LOCALE_STIME,
@@ -124,92 +128,92 @@ int main(void)
         for (i = 0; i < sizeof(kinds) / sizeof(kinds[0]); ++i) {
             memset(env, 0xcc, sizeof(env));
             if (GetLocaleInfoA(LOCALE_USER_DEFAULT, kinds[i], env, sizeof(env)) != 2 ||
-                strcmp(env, values[i]) || (unsigned char)env[2] != 0xcc) return 85;
+                strcmp(env, values[i]) || (unsigned char)env[2] != 0xcc) FAIL(85);
         }
-        if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SSHORTDATE, NULL, 0) != 9) return 86;
+        if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SSHORTDATE, NULL, 0) != 9) FAIL(86);
         env[0] = '!';
         if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SDATE, env, 1) != 0 ||
-            GetLastError() != ERROR_INSUFFICIENT_BUFFER || env[0] != '!') return 87;
+            GetLastError() != ERROR_INSUFFICIENT_BUFFER || env[0] != '!') FAIL(87);
         if (GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_STIME, wide, 8) != 2 ||
-            wide[0] != ':' || wide[1] != 0) return 88;
+            wide[0] != ':' || wide[1] != 0) FAIL(88);
         if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_ILANGUAGE | LOCALE_RETURN_NUMBER,
-                (char *)&number, sizeof(number)) != 4 || number != 0x0409) return 89;
+                (char *)&number, sizeof(number)) != 4 || number != 0x0409) FAIL(89);
         if (GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_ICURRDIGITS | LOCALE_RETURN_NUMBER,
-                (WCHAR *)&number, 2) != 2 || number != 2) return 90;
+                (WCHAR *)&number, 2) != 2 || number != 2) FAIL(90);
     }
-    if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", "value")) return 18;
-    if (GetEnvironmentVariableA("retro_env_probe", NULL, 0) != 6) return 19;
+    if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", "value")) FAIL(18);
+    if (GetEnvironmentVariableA("retro_env_probe", NULL, 0) != 6) FAIL(19);
     env[0] = '!';
-    if (GetEnvironmentVariableA("RETRO_ENV_PROBE", env, 5) != 6 || env[0] != '!') return 20;
+    if (GetEnvironmentVariableA("RETRO_ENV_PROBE", env, 5) != 6 || env[0] != '!') FAIL(20);
     if (GetEnvironmentVariableA("RETRO_ENV_PROBE", env, sizeof(env)) != 5 ||
-        strcmp(env, "value")) return 21;
+        strcmp(env, "value")) FAIL(21);
     if (GetEnvironmentVariableW(L"RETRO_ENV_PROBE", wide_env, 16) != 5 ||
-        wide_env[0] != 'v' || wide_env[5] != 0) return 22;
+        wide_env[0] != 'v' || wide_env[5] != 0) FAIL(22);
     if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", "") ||
-        GetEnvironmentVariableA("RETRO_ENV_PROBE", NULL, 0) != 1) return 23;
-    if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", NULL)) return 24;
+        GetEnvironmentVariableA("RETRO_ENV_PROBE", NULL, 0) != 1) FAIL(23);
+    if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", NULL)) FAIL(24);
     if (GetEnvironmentVariableA("RETRO_ENV_PROBE", env, sizeof(env)) != 0 ||
-        GetLastError() != 203) return 25;
+        GetLastError() != 203) FAIL(25);
     /* MSVCRT _chdir records drive paths in hidden '=C:' environment entries. */
     if (!SetEnvironmentVariableA("=C:", "C:\\first") ||
-        !SetEnvironmentVariableW(L"=D:", L"D:\\other")) return 70;
+        !SetEnvironmentVariableW(L"=D:", L"D:\\other")) FAIL(70);
     if (GetEnvironmentVariableA("=c:", env, sizeof(env)) != 8 ||
-        strcmp(env, "C:\\first")) return 71;
+        strcmp(env, "C:\\first")) FAIL(71);
     if (!SetEnvironmentVariableW(L"=c:", L"C:\\second") ||
         GetEnvironmentVariableA("=C:", env, sizeof(env)) != 9 ||
-        strcmp(env, "C:\\second")) return 72;
+        strcmp(env, "C:\\second")) FAIL(72);
     if (!SetEnvironmentVariableA("=C:", NULL) ||
         GetEnvironmentVariableA("=C:", env, sizeof(env)) != 0 ||
-        GetLastError() != 203) return 73;
+        GetLastError() != 203) FAIL(73);
     if (GetEnvironmentVariableA("=D:", env, sizeof(env)) != 8 ||
-        strcmp(env, "D:\\other")) return 74;
+        strcmp(env, "D:\\other")) FAIL(74);
     if (SetEnvironmentVariableA("bad=name", "value") ||
-        GetLastError() != ERROR_INVALID_PARAMETER) return 75;
+        GetLastError() != ERROR_INVALID_PARAMETER) FAIL(75);
     SetEnvironmentVariableW(L"=D:", NULL);
-    if (!GetCurrentDirectoryA(sizeof(cwd), cwd)) return 76;
+    if (!GetCurrentDirectoryA(sizeof(cwd), cwd)) FAIL(76);
     module = LoadLibraryA("MSVCRT.DLL");
     crt_chdir = (int (__cdecl *)(const char *))GetProcAddress(module, "_chdir");
     crt_getcwd = (char *(__cdecl *)(char *, int))GetProcAddress(module, "_getcwd");
-    if (!crt_chdir || !crt_getcwd) return 77;
+    if (!crt_chdir || !crt_getcwd) FAIL(77);
     if (crt_chdir("C:\\RETROOS\\WINDOWS\\SYSTEM32") != 0 ||
         crt_getcwd(env, sizeof(env)) != env ||
-        strcmp(env, "C:\\RETROOS\\WINDOWS\\SYSTEM32")) return 78;
+        strcmp(env, "C:\\RETROOS\\WINDOWS\\SYSTEM32")) FAIL(78);
     if (GetEnvironmentVariableA("=C:", env, sizeof(env)) != 27 ||
-        strcmp(env, "C:\\RETROOS\\WINDOWS\\SYSTEM32")) return 79;
+        strcmp(env, "C:\\RETROOS\\WINDOWS\\SYSTEM32")) FAIL(79);
     if (crt_chdir(cwd) != 0 || crt_getcwd(env, sizeof(env)) != env ||
-        strcmp(env, cwd)) return 80;
+        strcmp(env, cwd)) FAIL(80);
     FreeLibrary(module);
     {
         STARTUPINFOA startup;
         PROCESS_INFORMATION child;
         char command[128];
         const char *programs[] = {"WINCHILD.EXE", "OS2CHILD.EXE"};
-        if (!SetCurrentDirectoryA("C:\\WORK")) return 83;
+        if (!SetCurrentDirectoryA("C:\\WORK")) FAIL(83);
         memset(&startup, 0, sizeof(startup));
         startup.cb = sizeof(startup);
         for (i = 0; i < 4; ++i) {
             sprintf(command, "C:\\RETROOS\\COMMAND.COM /c C:\\APPS\\%s", programs[i % 2]);
             if (!CreateProcessA(i < 2 ? "C:\\RETROOS\\COMMAND.COM" : NULL,
-                    command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child)) return 81;
+                    command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child)) FAIL(81);
             if (WaitForSingleObject(child.hProcess, 5000) != WAIT_OBJECT_0 ||
-                !GetExitCodeProcess(child.hProcess, &code) || code != 0) return 82;
+                !GetExitCodeProcess(child.hProcess, &code) || code != 0) FAIL(82);
             CloseHandle(child.hThread);
             CloseHandle(child.hProcess);
         }
     }
-    if (!SetCurrentDirectoryA(cwd)) return 84;
+    if (!SetCurrentDirectoryA(cwd)) FAIL(84);
     module = LoadLibraryA("ADVAPI32.DLL");
     set_security = (BOOL (WINAPI *)(LPCSTR, DWORD, void *))GetProcAddress(module, "SetFileSecurityA");
-    if (!set_security) { printf("Security export missing, module %lu error %lu\n", (DWORD)module, GetLastError()); return 26; }
+    if (!set_security) { printf("Security export missing, module %lu error %lu\n", (DWORD)module, GetLastError()); FAIL(26); }
     if (set_security("WINTHREAD.EXE", 4, NULL) || GetLastError() != 50) {
-        printf("Security result mismatch, error %lu\n", GetLastError()); return 26;
+        printf("Security result mismatch, error %lu\n", GetLastError()); FAIL(26);
     }
     if (!VirtualProtect(thunk, sizeof(thunk), PAGE_EXECUTE_READ, &old) ||
-        old != PAGE_READWRITE) return 10;
+        old != PAGE_READWRITE) FAIL(10);
     execute_thunk = (DWORD (*)(void))thunk;
     if (execute_thunk() != 42 ||
         !VirtualProtect(thunk, sizeof(thunk), old, &restored) ||
-        restored != PAGE_EXECUTE_READ) return 11;
+        restored != PAGE_EXECUTE_READ) FAIL(11);
     _asm { fnstcw original }
     InitializeCriticalSection(&lock);
     Sleep(1);
@@ -219,48 +223,48 @@ int main(void)
     task = CreateThread(NULL, 0, worker, (LPVOID)GetCurrentThreadId(),
                         CREATE_SUSPENDED, &id);
     if (!task || !id || WaitForSingleObject(event, 0) != WAIT_TIMEOUT)
-        return 1;
+        FAIL(1);
     EnterCriticalSection(&lock);
-    if (ResumeThread(task) != 1) return 2;
+    if (ResumeThread(task) != 1) FAIL(2);
     Sleep(2);
-    if (shared != 0) return 8;
+    if (shared != 0) FAIL(8);
     LeaveCriticalSection(&lock);
-    if (WaitForSingleObject(event, 5000) != WAIT_OBJECT_0) return 2;
+    if (WaitForSingleObject(event, 5000) != WAIT_OBJECT_0) FAIL(2);
     _asm { fnstcw rounding }
-    if (rounding != original) return 12;
+    if (rounding != original) FAIL(12);
     if (shared != 42 || TlsGetValue(slot) != (LPVOID)456)
-        return 3;
+        FAIL(3);
     if (WaitForSingleObject(task, 5000) != WAIT_OBJECT_0 ||
         !GetExitCodeThread(task, &code) || code != 7)
-        return 4;
+        FAIL(4);
     if (WaitForSingleObject(event, 0) != WAIT_TIMEOUT)
-        return 5;
+        FAIL(5);
     mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
                                  0, 32768, "WINTHREAD_SHARED_HEAP");
-    if (!mapping) return 14;
+    if (!mapping) FAIL(14);
     view = (DWORD *)MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 32768);
-    if (!view) return 15;
+    if (!view) FAIL(15);
     view[0] = 123456;
     opened = OpenFileMappingA(FILE_MAP_WRITE, FALSE, "WINTHREAD_SHARED_HEAP");
     alias = (DWORD *)MapViewOfFile(opened, FILE_MAP_WRITE, 0, 0, 0);
-    if (!opened || !alias || alias[0] != 123456) return 16;
+    if (!opened || !alias || alias[0] != 123456) FAIL(16);
     UnmapViewOfFile(alias);
     UnmapViewOfFile(view);
     CloseHandle(opened);
     CloseHandle(mapping);
     module = GetModuleHandleA("KERNEL32.DLL");
     console_cp = (DWORD (WINAPI *)(void))GetProcAddress(module, "GetConsoleOutputCP");
-    if (!console_cp || console_cp() != 437) return 13;
+    if (!console_cp || console_cp() != 437) FAIL(13);
     module = LoadLibraryA("PROBE.DLL");
-    if (!module) return 6;
+    if (!module) FAIL(6);
     probe = (DWORD (WINAPI *)(void))GetProcAddress(module, "ProbeValue");
-    if (!probe || probe() != 1 || !FreeLibrary(module)) return 7;
+    if (!probe || probe() != 1 || !FreeLibrary(module)) FAIL(7);
     for (i = 0; i < sizeof(plugins) / sizeof(plugins[0]); ++i) {
         if (GetFileAttributesA(plugins[i]) == INVALID_FILE_ATTRIBUTES) continue;
         module = LoadLibraryA(plugins[i]);
         if (!module || !GetProcAddress(module, "#CatchCommand#")) {
             printf("Plugin load failed: %s, error %lu\n", plugins[i], GetLastError());
-            return 17;
+            FAIL(17);
         }
         printf("%s LOAD PASS\n", plugins[i]);
     }

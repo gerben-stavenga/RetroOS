@@ -34,6 +34,19 @@ mod statistics_tests {
     use super::*;
 
     #[test]
+    fn initial_stack_queries_keep_the_reservation_base() {
+        let mut state = WindowsState::new();
+        state.stack_base = 0x7fe0_0000;
+        state.stack_size = 0x10_0000;
+        for offset in [0, 4096, state.stack_size - 4096] {
+            let info = query(&state, state.stack_base + offset + 32).unwrap();
+            assert_eq!(info[1], state.stack_base);
+            assert_eq!(info[0] + info[3], state.stack_base + state.stack_size);
+            assert_eq!(info[4..], [0x1000, 4, 0x20000]);
+        }
+    }
+
+    #[test]
     fn reservations_are_not_resident_and_protected_pages_are_not_counted_twice() {
         let mut state = WindowsState::new();
         state.memory.push(Region { base: START, pages: vec![Some(1), None, None],
@@ -245,7 +258,9 @@ pub(super) fn query(state: &WindowsState, address: u32) -> Option<[u32; 7]> {
             (base >= m.base && base < m.base + size)
                 .then_some((m.base, (m.base + size + 4095) & !4095))
         });
-        let (allocation, limit) = image.unwrap_or((base, base + 4096));
+        let stack = (base >= state.stack_base && base < state.stack_base + state.stack_size)
+            .then_some((state.stack_base, state.stack_base + state.stack_size));
+        let (allocation, limit) = image.or(stack).unwrap_or((base, base + 4096));
         let mut end = base + 4096;
         while end < limit && super::memory_protection(state, end) == Some(protection) {
             end += 4096;

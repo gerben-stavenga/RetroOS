@@ -1795,6 +1795,11 @@ fn initialize_process_strings<A:crate::Arch>(machine:&mut A,state:&mut WindowsSt
     machine.write::<u32>(PROCESS_DATA as usize,4096);
     machine.write::<u32>((PROCESS_DATA+4) as usize,0x298);
     machine.write::<u32>((PROCESS_DATA+8) as usize,1);
+    // Wine's GetStdHandle reads the normalized process parameters. Native
+    // file handles carry the same tag as handles returned by NtCreateFile.
+    for (field, fd) in [(0x18, 0), (0x1c, 1), (0x20, 2)] {
+        machine.write::<u32>((PROCESS_DATA + field) as usize, 0x40000000 | fd);
+    }
     let image=guest_windows_path(state.exec_path_str());
     let cwd=process_cwd(state.cwd_str());
     for (field,buffer,value) in [(0x24u32,0x400u32,cwd.as_slice()),

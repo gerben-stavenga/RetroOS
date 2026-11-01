@@ -63,6 +63,11 @@ def main():
                              (error.stderr or b"").decode(errors="replace") +
                              "\nWin32 thread test timed out")
         log = result.stdout + result.stderr
+        if (result.returncode != 0 or "WINTHREAD PASS" not in log or
+                log.count("WINCHILD PASS") != 2 or
+                log.count("Hello from Open Watcom C") != 2 or
+                any(marker in log for marker in ("SEGV", "PANIC", "Stack Overflow"))):
+            raise SystemExit(log)
         if (root / "APPS/éЖ😀.txt").read_bytes() != bytes([0, 255, 130, 195, 40]):
             raise SystemExit("Win32 UTF-16 path or raw file contents did not cross the UTF-8 VFS boundary")
         if not (root / "APPS/café/x.txt").is_file():
@@ -72,11 +77,6 @@ def main():
                 if f"{name} LOAD PASS" not in log:
                     raise SystemExit(log)
             print("PASS: NDN plugin import resolution")
-        if (result.returncode != 0 or "WINTHREAD PASS" not in log or
-                log.count("WINCHILD PASS") != 2 or
-                log.count("Hello from Open Watcom C") != 2 or
-                any(marker in log for marker in ("SEGV", "PANIC", "Stack Overflow"))):
-            raise SystemExit(log)
     print(f"PASS: Win32 protection, threads, events, TLS, FPU, LoadLibrary, MC CRT chdir and Win32/OS2 child launches ({engine})")
 
 

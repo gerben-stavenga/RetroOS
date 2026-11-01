@@ -1082,7 +1082,7 @@ unsafe fn open_native(
         return 0xc0000033;
     }
     // Reject options requiring semantics the synchronous VFS does not provide.
-    if options & !(1 | 2 | 0x10 | 0x20 | 0x40 | 0x800 | 0x4000) != 0 {
+    if options & !(1 | 2 | 0x10 | 0x20 | 0x40 | 0x800 | 0x4000 | 0x200000) != 0 {
         return NOT_SUPPORTED;
     }
     if disposition > 5 {

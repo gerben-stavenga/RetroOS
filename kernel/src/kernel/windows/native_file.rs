@@ -27,6 +27,9 @@ pub(super) fn call<A: crate::Arch>(
         let Ok(path) = windows_path(state, path.as_bytes(), can_create) else {
             return 0xc0000034;
         };
+        if flags & 0x200000 != 0 && vfs::stat(&path, false).is_some_and(|s| s.is_symlink) {
+            return 0xc00000bb;
+        }
         let stat = vfs::stat(&path, true);
         if op == 6 {
             let Some(stat) = stat else {
@@ -45,12 +48,23 @@ pub(super) fn call<A: crate::Arch>(
             return 0;
         }
         let existed = stat.is_some();
-        let directory = stat.as_ref().is_some_and(|s| s.is_dir);
+        let mut directory = stat.as_ref().is_some_and(|s| s.is_dir);
         if !existed && !can_create {
             return 0xc0000034;
         }
         if existed && disposition == 2 {
             return 0xc0000035;
+        }
+        if !existed && can_create && flags & 1 != 0 {
+            let result = vfs::mkdir(&path);
+            if result < 0 {
+                return match result {
+                    -17 => 0xc0000035,
+                    -2 | -20 => 0xc000003a,
+                    _ => 0xc0000022,
+                };
+            }
+            directory = true;
         }
         if flags & 1 != 0 && !directory {
             return if existed { 0xc0000103 } else { 0xc00000bb };
@@ -121,6 +135,11 @@ pub(super) fn call<A: crate::Arch>(
     let Some(kind) = kt.fds.get(fd as usize).copied().filter(|f| !f.is_none()) else {
         return 0xc0000008;
     };
+    if op == 8 && matches!(kind, thread::FdKind::ConsoleOut | thread::FdKind::PipeWrite(_)) {
+        if length > 16 * 1024 * 1024 { return 0xc000000d; }
+        return if io_write(machine, kt, fd as usize, data as usize, length as usize,
+            out as usize, state.console.output_cp) != 0 { 0 } else { 0xc0000022 };
+    }
     // Stateless enumeration: userspace owns the NT mask and cursor.
     if op == 5 {
         let thread::FdKind::Dir { handle, .. } = kind else {
