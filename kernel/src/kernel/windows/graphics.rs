@@ -5,7 +5,7 @@ use super::*;
 pub(super) fn call<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32; 3]) -> u32 {
     let [op, params, out] = args;
     if op == 0 {
-        for (i, n) in [640u32, 480, 32].into_iter().enumerate() {
+        for (i, n) in [screen_size().0 as u32, screen_size().1 as u32, 32].into_iter().enumerate() {
             machine.write::<u32>(out as usize + i * 4, n);
         }
         return 0;
@@ -19,7 +19,9 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, ar
     if pid != machine.read::<u32>((state.teb_base + 0x20) as usize) { return 0xc0000022; }
     let mut p = p;
     p[0] = hwnd;
-    transport(state, op, p, |address, bytes| machine.copy_from(address, bytes))
+    let status = transport(state, op, p, |address, bytes| machine.copy_from(address, bytes));
+    if status == 0 { user_objects::order_surfaces(state, tid); }
+    status
 }
 
 fn transport(state: &mut WindowsState, op: u32, p: [u32; 13], mut copy: impl FnMut(usize, &mut [u8])) -> u32 {
@@ -33,12 +35,8 @@ fn transport(state: &mut WindowsState, op: u32, p: [u32; 13], mut copy: impl FnM
         if let Some(i) = index {
             let w = &mut state.windows[i];
             w.x = p[1] as i32; w.y = p[2] as i32; w.visible = p[10] != 0;
-            // The compositor stores back-to-front order; HWND_BOTTOM is 1.
-            let w = state.windows.remove(i);
-            let at = if p[11] == 1 { 0 } else {
-                state.windows.iter().position(|w| w.hwnd == p[11]).unwrap_or(state.windows.len())
-            };
-            state.windows.insert(at, w);
+            // Z-order comes from the window server, including NOZORDER and
+            // positioning before a surface has received its first pixels.
             state.dirty = true;
         }
         return 0;
@@ -75,6 +73,20 @@ fn transport(state: &mut WindowsState, op: u32, p: [u32; 13], mut copy: impl FnM
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn geometry_publication_does_not_raise_a_background_window() {
+        let mut state = WindowsState::new();
+        for hwnd in [7, 8] {
+            let p = [hwnd, 0, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0];
+            assert_eq!(transport(&mut state, 1, p, |_, pixels| pixels.fill(0)), 0);
+        }
+        // A background window can move/repaint after its owned popup appears.
+        // Surface transport must not independently make it the front window.
+        let p = [7, 10, 20, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+        assert_eq!(transport(&mut state, 3, p, |_, _| unreachable!()), 0);
+        assert_eq!(state.windows.iter().map(|w| w.hwnd).collect::<Vec<_>>(), [7, 8]);
+        assert_eq!((state.windows[0].x, state.windows[0].y), (10, 20));
+    }
     #[test]
     fn padded_surface_rows_are_not_presented() {
         let mut state = WindowsState::new();

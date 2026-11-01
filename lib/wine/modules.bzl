@@ -7,14 +7,19 @@ Display and session-service integration is still in progress.
 
 WINE_DLLS = [
     "advapi32", "combase", "comctl32", "comdlg32", "coml2", "gdi32",
-    "imm32", "kernel32", "kernelbase", "msacm32", "msvcrt", "ole32",
+    "imm32", "msacm32", "msvcrt", "ole32",
     "oleaut32", "rpcrt4", "sechost", "shcore", "shell32", "shlwapi",
-    "ucrtbase", "user32", "version", "winmm", "mpr", "cryptbase",
+    "ucrtbase", "user32", "version", "winmm", "mpr", "cryptbase", "msvfw32",
+    "wsock32", "dplayx", "iphlpapi", "ws2_32", "dnsapi", "nsi",
+    "avifil32",
+    "ddraw",
+    "wined3d",
+    "opengl32", "uxtheme",
 ]
 
 # These are PE modules containing Wine's Win16 adapters, not standalone NE
 # DLLs. Preserve their names; the WOW loader must bind their 16-bit exports.
-WINE_WIN16 = [ "user.exe16", "gdi.exe16", "mmsystem.dll16", "commdlg.dll16", "win87em.dll16", "system.drv16", "comm.drv16"]
+WINE_WIN16 = [ "user.exe16", "gdi.exe16", "mmsystem.dll16", "commdlg.dll16", "win87em.dll16", "system.drv16", "comm.drv16", "sound.drv16", "keyboard.drv16", "msvideo.dll16", "shell.dll16", "mouse.drv16", "display.drv16"]
 
 WINE_FILES = {
     "//lib/wine:" + name + "_dll": "RETROOS/WINDOWS/SYSTEM32/" + name.upper() + ".DLL"
@@ -27,6 +32,8 @@ WINE_FILES.update({
 WINE_FILES.update({
     "//lib/wine/ntdll:KRNL386.EXE16": "RETROOS/WINDOWS/SYSTEM/KRNL386.EXE16",
     "//lib/wine/ntdll:WIN32U.DLL": "RETROOS/WINDOWS/SYSTEM32/WIN32U.DLL",
+    "//lib/wine/ntdll:KERNEL32.DLL": "RETROOS/WINDOWS/SYSTEM32/KERNEL32.DLL",
+    "//lib/wine/ntdll:KERNELBASE.DLL": "RETROOS/WINDOWS/SYSTEM32/KERNELBASE.DLL",
     "//lib/wine/ntdll:NTDLL.DLL": "RETROOS/WINDOWS/SYSTEM32/NTDLL.DLL",
     "//lib/wine:retroos_dll": "RETROOS/WINDOWS/SYSTEM32/RETROOS.DLL",
     "@wine_source//:COPYING.LIB": "RETROOS/WINDOWS/WINE-LICENSE.TXT",
@@ -54,3 +61,11 @@ WINE_FONTS = ["courier", "fixedsys", "fixedsys_jp", "marlett", "ms_sans_serif",
               "tahomabd", "webdings", "wingding"]
 WINE_FILES.update({"@wine_source//:fonts/" + name + ".ttf": "RETROOS/WINDOWS/fonts/" + name + ".ttf" for name in WINE_FONTS})
 WINE_FILES["//lib/wine:freetype_license"] = "RETROOS/WINDOWS/FREETYPE-LICENSE.TXT"
+
+# Wine common dialogs activate the v6 Common Controls assembly. Keep the
+# system COMCTL32 (v5) and the side-by-side v6 DLL distinct.
+_COMMON_CONTROLS = "x86_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef"
+WINE_FILES.update({
+    "//lib/wine:common_controls_manifest": "RETROOS/WINDOWS/winsxs/manifests/" + _COMMON_CONTROLS + ".manifest",
+    "@wine_pe//:pe/comctl32_v6.dll": "RETROOS/WINDOWS/winsxs/" + _COMMON_CONTROLS + "/comctl32.dll",
+})

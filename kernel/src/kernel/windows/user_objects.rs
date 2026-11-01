@@ -77,10 +77,10 @@ impl WindowRecord {
             pid: owner[1],
             style: if desktop { 0x96000000 } else { 0x86000000 },
             ex_style: 0,
-            rect: if desktop { [0, 0, 640, 480] } else { [0; 4] },
-            client_rect: if desktop { [0, 0, 640, 480] } else { [0; 4] },
-            visible_rect: if desktop { [0, 0, 640, 480] } else { [0; 4] },
-            surface_rect: if desktop { [0, 0, 640, 480] } else { [0; 4] },
+            rect: if desktop { [0, 0, screen_size().0, screen_size().1] } else { [0; 4] },
+            client_rect: if desktop { [0, 0, screen_size().0, screen_size().1] } else { [0; 4] },
+            visible_rect: if desktop { [0, 0, screen_size().0, screen_size().1] } else { [0; 4] },
+            surface_rect: if desktop { [0, 0, screen_size().0, screen_size().1] } else { [0; 4] },
             paint_flags: 0,
             linked: true,
             instance: 0,
@@ -279,8 +279,8 @@ pub(super) fn call<A: crate::Arch>(
             let offset = if kind == 2 {
                 let offset = session::allocate_object(machine, id);
                 let mut shared = [0u8; 304];
-                shared[24..28].copy_from_slice(&640i32.to_le_bytes());
-                shared[28..32].copy_from_slice(&480i32.to_le_bytes());
+                shared[24..28].copy_from_slice(&screen_size().0.to_le_bytes());
+                shared[28..32].copy_from_slice(&screen_size().1.to_le_bytes());
                 shared[288..296]
                     .copy_from_slice(&parent.as_ref().unwrap().monitors.lock().0.to_le_bytes());
                 session::write_object(offset, &shared);
@@ -604,8 +604,24 @@ pub(super) fn tree_call<A: crate::Arch>(
             };
             let owner = if p[1] == 0 {
                 0
-            } else if let Some(w) = windows.iter().find(|w| matches_handle(w.handle, p[1])) {
-                w.handle
+            } else if let Some(mut i) = windows.iter().position(|w| matches_handle(w.handle, p[1])) {
+                if i == 0 {
+                    0 // The desktop cannot own an application window.
+                } else {
+                    if parent != windows[0].handle { return 0xc0000022; }
+                    // Wine's server promotes child owners to their top-level
+                    // ancestor. Modal teardown must re-enable the same frame
+                    // that USER disabled when entering the dialog.
+                    while windows[i].style & 0xc0000000 == 0x40000000
+                        && windows[i].parent != windows[0].handle
+                    {
+                        let Some(next) = windows.iter().position(|w| w.handle == windows[i].parent) else {
+                            return 0xc0010578;
+                        };
+                        i = next;
+                    }
+                    windows[i].handle
+                }
             } else {
                 return 0xc0010578;
             };
@@ -760,6 +776,14 @@ pub(super) fn tree_call<A: crate::Arch>(
             paint::positioned(w, old_rect, p[2]);
             machine.write::<u32>(out as usize, w.style);
             machine.write::<u32>(out as usize + 4, w.ex_style);
+            if p[2] & (0x40 | 8) == 0x40 {
+                // Exposing a parent exposes its visible descendants as well.
+                // Controls created under a hidden dialog have no update region.
+                let mut redraw = [0; 16];
+                redraw[0] = windows[i].handle;
+                redraw[1] = 0x485; // INVALIDATE | ERASE | FRAME | ALLCHILDREN
+                paint::call(machine, &mut windows, 14, redraw, 0);
+            }
             let top = paint::surface_window(&windows, i);
             if paint::visible(&windows, top) && windows[top].paint_flags & 1 != 0 {
                 machine.write::<u32>(out as usize + 8, windows[top].handle);
@@ -1056,11 +1080,22 @@ impl Default for Cursor {
         Self {
             x: 0,
             y: 0,
-            clip: [0, 0, 640, 480],
+            clip: [0, 0, screen_size().0, screen_size().1],
             changed: 0,
         }
     }
 }
+/// Use the same window order for pixels and input. Surface publication can
+/// occur long after SetWindowPos, and NOZORDER updates must preserve stacking.
+pub(super) fn order_surfaces(state: &mut WindowsState, tid: u32) {
+    let Some(desktop) = state.user_objects.desktops.iter().find(|d| d.0 == tid)
+        .and_then(|d| state.user_objects.get(d.1)) else { return; };
+    let windows = desktop.windows.lock();
+    state.windows.sort_unstable_by_key(|surface| core::cmp::Reverse(
+        windows.iter().position(|w| w.handle == surface.hwnd && w.parent != 0)
+            .unwrap_or(usize::MAX)));
+}
+
 pub(super) fn mouse_target(state:&WindowsState,tid:u32,x:i32,y:i32)->Option<(u32,u32)> {
     let desktop=state.user_objects.desktops.iter().find(|d|d.0==tid).and_then(|d|state.user_objects.get(d.1))?;
     let windows=desktop.windows.lock();
@@ -1120,8 +1155,8 @@ pub(super) fn cursor_call<A: crate::Arch>(
     let requested_clip = [
         (p[5] as i32).max(0),
         (p[6] as i32).max(0),
-        (p[7] as i32).min(640),
-        (p[8] as i32).min(480),
+        (p[7] as i32).min(screen_size().0),
+        (p[8] as i32).min(screen_size().1),
     ];
     if p[0] & 8 != 0
         && (requested_clip[0] >= requested_clip[2] || requested_clip[1] >= requested_clip[3])
@@ -1148,7 +1183,7 @@ pub(super) fn cursor_call<A: crate::Arch>(
         cursor.clip = requested_clip;
     }
     if p[0] & 16 != 0 {
-        cursor.clip = [0, 0, 640, 480];
+        cursor.clip = [0, 0, screen_size().0, screen_size().1];
     }
     if p[0] & 4 != 0 {
         cursor.x = p[3] as i32;

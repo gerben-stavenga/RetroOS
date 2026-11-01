@@ -249,11 +249,6 @@ impl<T: Send + 'static> Graphics<T> {
             core::hint::spin_loop();
         }
     }
-    #[cfg(test)]
-    pub fn get(&self) -> &T {
-        self.wait();
-        unsafe { &*self.state.value.get() }
-    }
     pub fn get_mut(&mut self) -> &mut T {
         self.wait();
         unsafe { &mut *self.state.value.get() }

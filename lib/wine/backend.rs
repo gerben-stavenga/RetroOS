@@ -192,6 +192,19 @@ pub unsafe extern "system" fn RetroNtQueryInformationProcess(
     if process != u32::MAX {
         return 0xc0000008;
     }
+    if class == 3 { // ProcessVmCounters, with optional VM_COUNTERS_EX tail.
+        if !returned.is_null() { unsafe { *returned = if length >= 48 { 48 } else { 44 }; } }
+        if length != 44 && length != 48 { return 0xc0000004; }
+        if output.is_null() { return 0xc0000005; }
+        let mut memory = [0u32; 4];
+        let status = unsafe { RetroSystemInfo(memory.as_mut_ptr()) };
+        if status != 0 { return status; }
+        // Peak counters currently report the current tracked usage.
+        let words = [memory[2], memory[2], 0, memory[3], memory[3], 0, 0, 0, 0,
+            memory[3], memory[3], memory[3]];
+        for i in 0..(length / 4) as usize { unsafe { output.add(i).write_unaligned(words[i]); } }
+        return 0;
+    }
     let teb: u32;
     unsafe {
         core::arch::asm!("mov {0:e}, fs:[0x18]", out(reg) teb, options(nostack, readonly));
@@ -654,6 +667,7 @@ pub unsafe extern "system" fn RetroNtQuerySystemInformation(
 ) -> u32 {
     let required = match class {
         0 => 44,
+        2 => 312,
         3 => 48,
         44 => 172,
         102 => 432,
@@ -670,11 +684,20 @@ pub unsafe extern "system" fn RetroNtQuerySystemInformation(
     if out.is_null() {
         return INVALID_PARAMETER;
     }
-    if class == 0 {
-        let mut memory = [0u32; 2];
+    if class == 0 || class == 2 {
+        let mut memory = [0u32; 4];
         let status = unsafe { RetroSystemInfo(memory.as_mut_ptr()) };
         if status != 0 {
             return status;
+        }
+        if class == 2 { // SYSTEM_PERFORMANCE_INFORMATION, counters in pages.
+            unsafe { core::ptr::write_bytes(out, 0, required as usize); }
+            let available = memory[1].min(memory[0]);
+            for (offset, value) in [(44, available), (48, memory[0] - available),
+                (52, memory[0]), (56, memory[0] - available)] {
+                unsafe { (out.add(offset) as *mut u32).write_unaligned(value); }
+            }
+            return 0;
         }
         let values = [
             0,
@@ -1184,7 +1207,7 @@ pub unsafe extern "system" fn RetroNtQueryInformationFile(
     }
     let required = match class {
         5 => 24,
-        14 => 8,
+        14 | 20 => 8,
         _ => return 0xc0000003,
     };
     if size < required {
@@ -1206,7 +1229,9 @@ pub unsafe extern "system" fn RetroNtQueryInformationFile(
             core::ptr::write_unaligned(out.add(16) as *mut u32, 1);
             *out.add(21) = info[2] as u8;
         } else {
-            core::ptr::write_unaligned(out as *mut u64, u64::from(info[1]));
+            // FilePositionInformation uses the cursor; FileEndOfFileInformation
+            // reports the logical byte length, including for section manifests.
+            core::ptr::write_unaligned(out as *mut u64, u64::from(info[if class == 20 { 0 } else { 1 }]));
         }
         (*io).status = 0;
         (*io).information = required;

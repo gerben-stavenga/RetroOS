@@ -22,7 +22,7 @@ pub(super) fn initialize<A: crate::Arch>(machine: &mut A) {
             core::ptr::write_bytes(page.as_ptr(), 0, 4096);
             // TickCount is milliseconds, so its fixed-point multiplier is one.
             put(page.as_ptr(), 4, 1 << 24);
-            for (i, c) in "C:\\WINDOWS\0".encode_utf16().enumerate() {
+            for (i, c) in "C:\\RETROOS\\WINDOWS\0".encode_utf16().enumerate() {
                 page.as_ptr().add(0x30 + i * 2).cast::<u16>().write(c);
             }
             page.as_ptr().add(0x300).cast::<u64>().write(10_000_000);

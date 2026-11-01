@@ -316,7 +316,7 @@ http_archive(
     strip_prefix = "wine-11.0",
     build_file_content = '''
 package(default_visibility = ["//visibility:public"])
-exports_files(["COPYING.LIB", "include/windef.h"] + glob(["nls/*.nls", "fonts/*.ttf"]))
+exports_files(["COPYING.LIB", "include/windef.h", "dlls/comctl32_v6/comctl32.manifest"] + glob(["nls/*.nls", "fonts/*.ttf"]))
 filegroup(name="headers", srcs=glob(["include/**"]))
 ''',
 )

@@ -8,7 +8,7 @@ editing those mappings never updates a live disk automatically.
 RETROOS/ and bin/ are kernel/runtime contracts, not arbitrary mount names.
 """
 
-BOOT_SIZE_MB = 128
+BOOT_SIZE_MB = 256
 DOS_SIZE_MB = 3072
 LINUX_SIZE_MB = 512
 

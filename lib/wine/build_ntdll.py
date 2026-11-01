@@ -166,6 +166,8 @@ def main():
     parser.add_argument("--flex", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--abi", type=Path, required=True)
+    parser.add_argument("--kernel32", type=Path, required=True)
+    parser.add_argument("--kernelbase", type=Path, required=True)
     parser.add_argument("--kernel16", type=Path, required=True)
     parser.add_argument("--graphics", type=Path, required=True)
     parser.add_argument("--graphics-patch", type=Path, required=True)
@@ -183,6 +185,21 @@ def main():
         with tarfile.open(args.source) as archive:
             archive.extractall(work, filter="data")
         source = work / "wine-11.0"
+        # Wine's PE loader has compiled-in system paths. Match the runtime
+        # installed by our boot bundle, including later LoadLibrary calls.
+        loader = source / "dlls/ntdll/loader.c"
+        text = loader.read_text()
+        old_root = r"C:\\windows"
+        assert text.count(old_root) >= 3
+        loader.write_text(text.replace(old_root, r"C:\\RETROOS\\WINDOWS"))
+        base_file = source / "dlls/kernelbase/file.c"
+        text = base_file.read_text()
+        assert text.count(old_root) >= 2
+        base_file.write_text(text.replace(old_root, r"C:\\RETROOS\\WINDOWS"))
+        kernel_path = source / "dlls/kernel32/path.c"
+        text = kernel_path.read_text()
+        assert old_root in text
+        kernel_path.write_text(text.replace(old_root, r"C:\\RETROOS\\WINDOWS"))
         subprocess.run(["patch", "-p1", "-i", str(args.graphics_patch.resolve())], cwd=source, check=True, stdout=subprocess.DEVNULL)
         shutil.copyfile(args.graphics_driver, source / "dlls/win32u/retro_graphics.c")
         spec32 = source / "dlls/win32u/win32u.spec"
@@ -305,11 +322,13 @@ DWORD WINAPI RetroWineStartTask(const char *path, const char *command)
                 makefile.write(f"\ndlls/win32u/i386-windows/freetype.o: i386_CFLAGS += -I{ft / 'include'}\n")
                 makefile.write(f"dlls/win32u/i386-windows/win32u.dll: i386_LDFLAGS += {ftlib}\n")
                 makefile.write(f"\ni386_LDFLAGS += {work / 'retroos.lib'}\n")
-            run(["make", "-j8", "dlls/ntdll/i386-windows/ntdll.dll",
+            run(["make", "-j8", "dlls/ntdll/i386-windows/ntdll.dll", "dlls/kernelbase/i386-windows/kernelbase.dll", "dlls/kernel32/i386-windows/kernel32.dll",
                  "dlls/krnl386.exe16/i386-windows/krnl386.exe16", "dlls/win32u/i386-windows/win32u.dll"], build, env, log)
         shutil.copyfile(build / "dlls/ntdll/i386-windows/ntdll.dll", output)
         shutil.copyfile(build / "dlls/krnl386.exe16/i386-windows/krnl386.exe16", kernel16)
         shutil.copyfile(build / "dlls/win32u/i386-windows/win32u.dll", args.graphics.resolve())
+        shutil.copyfile(build / "dlls/kernelbase/i386-windows/kernelbase.dll", args.kernelbase.resolve())
+        shutil.copyfile(build / "dlls/kernel32/i386-windows/kernel32.dll", args.kernel32.resolve())
         abi.write_text(json.dumps(contract, indent=2, sort_keys=True) + "\n")
 
 

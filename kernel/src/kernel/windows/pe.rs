@@ -58,6 +58,29 @@ mod tests {
     }
 
     #[test]
+    fn named_export_search_handles_edges_holes_and_invalid_ordinals() {
+        let mut data = export_test_image(None);
+        put32(&mut data, 0x114, 3);
+        put32(&mut data, 0x118, 3);
+        put32(&mut data, 0x120, 0x200);
+        put32(&mut data, 0x124, 0x210);
+        for (i, name) in [b"Alpha\0".as_slice(), b"Middle\0", b"Zulu\0"].iter().enumerate() {
+            put32(&mut data, 0x200 + i * 4, 0x220 + i as u32 * 16);
+            put16(&mut data, 0x210 + i * 2, i as u16);
+            let at = 0x220 + i * 16;
+            data[at..at + name.len()].copy_from_slice(name);
+        }
+        put32(&mut data, 0x148, 0x320);
+        let image = Image::parse(&data).unwrap();
+        for (name, expected) in [(b"Alpha".as_slice(), Some(0x300)), (b"Middle", None),
+            (b"Zulu", Some(0x320)), (b"A", None), (b"Beta", None), (b"zz", None)] {
+            assert_eq!(image.export_rva(&ImportSymbol::Name(name.to_vec())), Ok(expected));
+        }
+        put16(&mut data, 0x214, 3);
+        assert_eq!(Image::parse(&data).unwrap().export_rva(&ImportSymbol::Name(b"Zulu".to_vec())), Err(Error::BadTable));
+    }
+
+    #[test]
     fn forwarder_names_ordinals_and_bounds() {
         for (target, expected) in [
             (&b"NTDLL.RtlMoveMemory"[..], (b"NTDLL".to_vec(), ImportSymbol::Name(b"RtlMoveMemory".to_vec()))),
@@ -220,7 +243,8 @@ impl<'a> Image<'a> {
             return self.data.get(at..at.checked_add(size).ok_or(Error::BadTable)?)
                 .map(|_| at).ok_or(Error::Truncated);
         }
-        for section in self.sections()? {
+        for n in 0..self.header.sections as usize {
+            let section = self.section(n)?;
             let extent = section.virtual_size.max(section.raw_size);
             if rva >= section.rva && rva.checked_add(size as u32).is_some_and(|end| end <= section.rva.saturating_add(extent)) {
                 let within = rva - section.rva;
@@ -259,11 +283,15 @@ impl<'a> Image<'a> {
     }
 
     pub fn c_string(&self, rva: u32) -> Result<Vec<u8>, Error> {
+        Ok(self.c_string_bytes(rva)?.to_vec())
+    }
+
+    fn c_string_bytes(&self, rva: u32) -> Result<&'a [u8], Error> {
         let at = self.rva_offset(rva, 1)?;
         let tail = &self.data[at..];
         let n = tail.iter().position(|&b| b == 0).ok_or(Error::Truncated)?;
         if n > 1024 { return Err(Error::BadTable); }
-        Ok(tail[..n].to_vec())
+        Ok(&tail[..n])
     }
 
     /// Read an RT_STRING entry from its length-prefixed UTF-16 bundle.
@@ -355,8 +383,34 @@ impl<'a> Image<'a> {
     pub fn export_rva(&self, symbol: &ImportSymbol) -> Result<Option<u32>, Error> {
         if self.header.export.rva == 0 { return Ok(None); }
         let rva = match symbol {
-            ImportSymbol::Name(name) => self.exports()?.into_iter()
-                .find(|export| export.name == *name).map(|export| export.rva),
+            ImportSymbol::Name(name) => {
+                // PE name pointers are sorted lexically. Resolve directly in
+                // the image: rebuilding every export (and every section table)
+                // for each import floods the freestanding heap with temporaries.
+                let d = self.bytes_at_rva(self.header.export.rva, 40)?;
+                let count = u32_at(d, 24)?;
+                let names = self.bytes_at_rva(u32_at(d, 32)?,
+                    (count as usize).checked_mul(4).ok_or(Error::BadTable)?)?;
+                let mut low = 0;
+                let mut high = count as usize;
+                let mut found = None;
+                while low < high {
+                    let mid = low + (high - low) / 2;
+                    match self.c_string_bytes(u32_at(names, mid * 4)?)?.cmp(name.as_slice()) {
+                        core::cmp::Ordering::Less => low = mid + 1,
+                        core::cmp::Ordering::Greater => high = mid,
+                        core::cmp::Ordering::Equal => { found = Some(mid); break; }
+                    }
+                }
+                let Some(index) = found else { return Ok(None); };
+                let ordinals = u32_at(d, 36)?.checked_add(
+                    (index as u32).checked_mul(2).ok_or(Error::BadTable)?).ok_or(Error::BadTable)?;
+                let ordinal = u16_at(self.bytes_at_rva(ordinals, 2)?, 0)? as u32;
+                if ordinal >= u32_at(d, 20)? { return Err(Error::BadTable); }
+                let at = u32_at(d, 28)?.checked_add(
+                    ordinal.checked_mul(4).ok_or(Error::BadTable)?).ok_or(Error::BadTable)?;
+                Some(u32_at(self.bytes_at_rva(at, 4)?, 0)?)
+            },
             ImportSymbol::Ordinal(ordinal) => {
                 let directory = self.bytes_at_rva(self.header.export.rva, 40)?;
                 let base = u32_at(directory, 16)?;

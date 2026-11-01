@@ -49,7 +49,7 @@ pub(in crate::kernel::windows) fn enqueue(
     control: u32,
     now: u64,
 ) {
-    let mut vk = extra::virtual_key(event.scan as u16, 0) as usize;
+    let mut vk = virtual_key(event.scan as u16, 0) as usize;
     vk = match event.scan {
         0x2a => 0xa0,
         0x36 => 0xa1,
@@ -225,5 +225,71 @@ mod tests {
         assert_eq!(keys[0x10]&0x40,0);
         update(&mut keys,0xa1,false);
         assert_eq!(keys[0x10]&0x80,0);
+    }
+}
+
+fn virtual_key(scan: u16, ascii: u8) -> u16 {
+    match scan {
+        0x01 => 0x1b,
+        0x02..=0x0b => b"1234567890"[(scan - 0x02) as usize] as u16,
+        // OEM keys describe the physical key, independently of its current
+        // character. ASCII '.' (0x2e) would collide with VK_DELETE.
+        0x0c => 0xbd,
+        0x0d => 0xbb,
+        0x1a => 0xdb,
+        0x1b => 0xdd,
+        0x27 => 0xba,
+        0x28 => 0xde,
+        0x29 => 0xc0,
+        0x2b => 0xdc,
+        0x33 => 0xbc,
+        0x34 => 0xbe,
+        0x35 => 0xbf,
+        0x37 => 0x6a,
+        0x3a => 0x14,
+        0x45 => 0x90,
+        0x46 => 0x91,
+        0x56 => 0xe2,
+        0x39 => 0x20,
+        0x4a => 0x6d,
+        0x4e => 0x6b,
+        0x0e => 8,
+        0x0f => 9,
+        0x1d => 0x11,
+        0x2a | 0x36 => 0x10,
+        0x38 => 0x12,
+        0x1c => 0x0d,
+        0x48 => 0x26,
+        0x50 => 0x28,
+        0x4b => 0x25,
+        0x4d => 0x27,
+        0x47 => 0x24,
+        0x4f => 0x23,
+        0x49 => 0x21,
+        0x51 => 0x22,
+        0x53 => 0x2e,
+        0x52 => 0x2d,
+        0x3b..=0x44 => 0x70 + (scan - 0x3b),
+        0x10..=0x19 => b"QWERTYUIOP"[(scan - 0x10) as usize] as u16,
+        0x1e..=0x26 => b"ASDFGHJKL"[(scan - 0x1e) as usize] as u16,
+        0x2c..=0x32 => b"ZXCVBNM"[(scan - 0x2c) as usize] as u16,
+        _ if ascii.is_ascii_alphabetic() => u16::from(ascii.to_ascii_uppercase()),
+        _ if ascii != 0 => u16::from(ascii),
+        _ => 0,
+    }
+}
+
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::virtual_key;
+
+    #[test]
+    fn shifted_punctuation_keeps_the_same_virtual_key() {
+        for (scan, plain, shifted) in [(0x34, b'.', b'>'), (0x33, b',', b'<'),
+            (0x0c, b'-', b'_'), (0x0d, b'=', b'+'), (0x02, b'1', b'!')] {
+            assert_eq!(virtual_key(scan, plain), virtual_key(scan, shifted));
+            assert_eq!(virtual_key(scan, plain), virtual_key(scan, 0));
+        }
     }
 }

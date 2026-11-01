@@ -50,3 +50,10 @@ genrule(
     outs = ["FREETYPE-LICENSE.TXT"],
     cmd = "tar -xOf $(location @wine_freetype_tar//file) freetype-2.13.3/docs/FTL.TXT > $@",
 )
+
+genrule(
+    name = "common_controls_manifest",
+    srcs = ["@wine_source//:dlls/comctl32_v6/comctl32.manifest"],
+    outs = ["common-controls.manifest"],
+    cmd = "sed 's/processorArchitecture=\"\"/processorArchitecture=\"x86\"/' $< > $@",
+)

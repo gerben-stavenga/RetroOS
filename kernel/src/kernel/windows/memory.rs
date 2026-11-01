@@ -15,6 +15,36 @@ pub(super) struct Region {
 const START: u32 = 0x0100_0000;
 const END: u32 = 0x1000_0000;
 
+/// Reserved and committed bytes tracked by the Windows address-space manager.
+pub(super) fn statistics(state: &WindowsState) -> [u32; 2] {
+    let images = state.modules.iter().filter_map(|m| super::pe::Image::parse(&m.data).ok()
+        .map(|image| (m.base, image.header.size_image.div_ceil(4096) as usize)));
+    let fixed_images = images.clone().filter(|&(base, _)| !state.memory.iter().any(|r|
+        base >= r.base && base < r.base + r.pages.len() as u32 * 4096)).map(|(_, pages)| pages).sum::<usize>();
+    let fixed = fixed_images + state.protections.iter().filter(|&&(page, _)|
+        !state.memory.iter().any(|r| page >= r.base && page < r.base + r.pages.len() as u32 * 4096)
+        && !images.clone().any(|(base, pages)| page >= base && page < base + pages as u32 * 4096)).count();
+    let reserved = fixed + state.memory.iter().map(|r| r.pages.len()).sum::<usize>();
+    let committed = fixed + state.memory.iter().map(|r| r.pages.iter().filter(|p| p.is_some()).count()).sum::<usize>();
+    [(reserved * 4096) as u32, (committed * 4096) as u32]
+}
+
+#[cfg(test)]
+mod statistics_tests {
+    use super::*;
+
+    #[test]
+    fn reservations_are_not_resident_and_protected_pages_are_not_counted_twice() {
+        let mut state = WindowsState::new();
+        state.memory.push(Region { base: START, pages: vec![Some(1), None, None],
+            shared: false, mapped: false, image: false });
+        state.protections.extend([(START, 4), (0x7000_0000, 4)]);
+        assert_eq!(statistics(&state), [4 * 4096, 2 * 4096]);
+        state.memory[0].pages[1] = Some(1);
+        assert_eq!(statistics(&state), [4 * 4096, 3 * 4096]);
+    }
+}
+
 pub(super) fn call<A: crate::Arch>(
     machine: &mut A,
     state: &mut WindowsState,

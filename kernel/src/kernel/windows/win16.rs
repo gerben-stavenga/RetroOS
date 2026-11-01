@@ -273,7 +273,7 @@ fn selector_slots(windows: &mut WindowsState, state: &State, count: usize) -> Op
 fn global_alloc<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, state: &mut State, size: u32, flags: u16) -> u32 {
     let count = size.max(1).div_ceil(65536) as usize;
     let Some(index) = selector_slots(windows,state,count) else { return 0 };
-    let address = super::extra::heap_alloc(machine,windows,if flags & 0x40 != 0 {8} else {0},size);
+    let address = heap_alloc(machine,windows,if flags & 0x40 != 0 {8} else {0},size);
     if address == 0 { return 0; }
     let first = index as u16 * 8 + 7;
     for i in 0..count {
@@ -287,7 +287,7 @@ fn global_alloc<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
 fn global_free(windows: &mut WindowsState, state: &mut State, index: usize) {
     let block = state.global_blocks.remove(index);
     for i in 0..block.count { windows.ldt[usize::from(block.selector>>3)+i] = 0; }
-    super::extra::heap_free(windows,block.address);
+    heap_free(windows,block.address);
 }
 fn sync_selectors<A: crate::Arch>(machine: &mut A, windows: &WindowsState, old_len: usize) {
     const TABLE: usize = 0x7ff8_0000;
@@ -375,6 +375,11 @@ fn wine_module_file(name: &[u8]) -> Vec<u8> {
         b"KERNEL" | b"KRNL386" => b"KRNL386.EXE16".to_vec(),
         b"USER" => b"USER.EXE16".to_vec(),
         b"GDI" => b"GDI.EXE16".to_vec(),
+        b"SYSTEM" | b"COMM" | b"SOUND" | b"KEYBOARD" => {
+            let mut file = name.to_vec();
+            file.extend_from_slice(b".DRV16");
+            file
+        }
         _ => { let mut file = module_file(name); file.extend_from_slice(b"16"); file }
     }
 }
@@ -416,8 +421,8 @@ fn load_module_file(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), 
     let candidates = [local, runtime];
     let paths = if module(name).is_some() { &candidates[1..] } else { &candidates[..] };
     for path in paths {
-        if let Ok(data) = crate::kernel::exec::load_file_resolved(path) {
-            return Ok((path.clone(), data));
+        if let Ok(loaded) = super::load_windows_file(path) {
+            return Ok(loaded);
         }
         let rooted = [crate::kernel::dos::c_root(), path.as_slice()].concat();
         if let Ok(data) = crate::kernel::exec::load_file_resolved(&rooted) {
@@ -774,7 +779,7 @@ pub(super) fn exec<A: crate::Arch>(
     // could collide with a subsequently allocated real bitmap/window context.
     windows.paint_dc = 0;
     windows.ldt = ldt;
-    windows.environment=super::extra::windows_environment(parent_env);
+    windows.environment=super::environment::windows_environment(parent_env);
     windows.exec_path_len = main_path.len().min(windows.exec_path.len());
     windows.exec_path[..windows.exec_path_len]
         .copy_from_slice(&main_path[..windows.exec_path_len]);
@@ -1879,8 +1884,54 @@ mod embedded_ne_tests {
     fn wine_container_names_and_pe_module_identity() {
         assert_eq!(wine_module_file(b"KERNEL"), b"KRNL386.EXE16");
         assert_eq!(wine_module_file(b"USER"), b"USER.EXE16");
+        for name in [b"SYSTEM".as_slice(), b"COMM", b"SOUND", b"KEYBOARD"] {
+            let mut expected = name.to_vec(); expected.extend_from_slice(b".DRV16");
+            assert_eq!(wine_module_file(name), expected);
+        }
+        assert_eq!(wine_module_file(b"MSVIDEO"), b"MSVIDEO.DLL16");
         assert_eq!(wine_module_file(b"WIN87EM"), b"WIN87EM.DLL16");
         assert_eq!(super::super::module_name(b"krnl386.exe16"), b"KRNL386.EXE16");
         assert_eq!(super::super::module_name(b"ntdll"), b"NTDLL.DLL");
+    }
+}
+
+pub(super) struct Block {
+    addr: u32,
+    size: u32,
+    used: bool,
+}
+
+pub(super) fn heap_alloc<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, flags: u32, bytes: u32) -> u32 {
+    let size = bytes.max(1).next_multiple_of(8);
+    if let Some(block) = state.blocks.iter_mut().find(|block| !block.used && block.size >= size) {
+        block.used = true;
+        if flags & 8 != 0 {
+            machine.zero(block.addr as usize, block.size as usize);
+        }
+        return block.addr;
+    }
+    let addr = state.heap_next;
+    let Some(end) = addr.checked_add(size) else {
+        return 0;
+    };
+    if end >= super::USER_LIMIT {
+        return 0;
+    }
+    state.heap_next = end;
+    machine.zero(addr as usize, size as usize);
+    // Initialize permissions only on newly committed pages. The partially
+    // filled last page may already contain executable Win16 selector aliases.
+    let first_page = (addr as usize).div_ceil(4096);
+    let end_page = (end as usize).div_ceil(4096);
+    if end_page > first_page {
+        machine.set_page_flags(first_page, end_page - first_page, true, false);
+    }
+    state.blocks.push(Block { addr, size, used: true });
+    addr
+}
+
+pub(super) fn heap_free(state: &mut WindowsState, addr: u32) {
+    if let Some(block) = state.blocks.iter_mut().find(|block| block.addr == addr) {
+        block.used = false;
     }
 }

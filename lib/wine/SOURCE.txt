@@ -7,10 +7,12 @@ Upstream source: https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz
 SHA256: c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701
 Repository: https://gitlab.winehq.org/wine/wine/-/tree/wine-11.0
 Wine sources retain their original copyright and LGPL notices.
-The WineHQ PE DLLs are unmodified except NTDLL, KRNL386.EXE16 and WIN32U, built
+The WineHQ PE DLLs are unmodified except NTDLL, KERNEL32, KERNELBASE, KRNL386.EXE16 and WIN32U, built
 from complete Wine 11.0 PE-side sources. lib/wine/build_ntdll.py adapts its i386
 system-call veneers and Unix host-call connections to named RETROOS.DLL
-imports. No Unix implementation is linked into NTDLL. The Wine source and
+imports. Its PE loader defaults to C:\RETROOS\WINDOWS, matching the bundled
+runtime and the shared system-root page. KERNEL32 and KERNELBASE use the same directory
+defaults for its Windows directory APIs. No Unix implementation is linked into NTDLL. The Wine source and
 adapter/build scripts together describe the modified DLL's complete build.
 KRNL386.EXE16 exposes its existing Wine relays and selector setup through
 small added exports, including initial NE task entry through Wine's own
@@ -29,7 +31,7 @@ font selection, metrics and rasterization remain in Wine userspace. Server reque
 imports, not Unix host calls. User callbacks call Wine's own NTDLL dispatcher
 through a userspace wrapper; NtCallbackReturn restores that wrapper without
 a kernel transition. Nested callbacks keep separate return-data buffers in FLS.
-All three source-built DLLs retain Wine's LGPL
+All five source-built DLLs retain Wine's LGPL
 terms. RETROOS.DLL is separate; server.c includes Wine's directory-mask matcher
 from dlls/ntdll/unix/file.c under LGPL-2.1-or-later, with its notices retained.
 The adapter marshals Wine server requests to native object primitives and NT

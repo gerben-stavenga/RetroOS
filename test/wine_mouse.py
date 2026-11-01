@@ -30,6 +30,8 @@ def main():
             m.command("mouse 157 136 1");m.run(100)
             m.command("mouse 0 0 0");until("MOUSE PASS")
             assert "MOUSE FAIL" not in m.log_path.read_text(),m.log_path.read_text()
+        except Exception as error:
+            raise AssertionError(m.log_path.read_text()) from error
         finally:m.close()
     print(f"PASS: Wine mouse child hit-testing, capture, coordinates and button state ({engine})")
 

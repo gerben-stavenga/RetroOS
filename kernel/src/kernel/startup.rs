@@ -444,6 +444,8 @@ fn select_display<A: crate::Arch>(
         ),
         Err(display) => display,
     };
+    let (width, height) = display.composition_size(640, 480);
+    crate::kernel::windows::set_screen_size(width, height);
     crate::kernel::console::Console::new(display)
 }
 
@@ -2998,11 +3000,6 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     }
 
     on_success(vcpu, child_tid as i32);
-    if let thread::Personality::Windows(windows) =
-        &mut thread::get_thread(threads, parent_tid).unwrap().personality
-    {
-        windows.process_started(child_tid as u32 + 1);
-    }
     {
         let parent = thread::get_thread(threads, parent_tid).unwrap();
         if let thread::Personality::Os2(os2) = &mut parent.personality && os2.child_started(child_tid as u32 + 1) {

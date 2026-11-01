@@ -19,7 +19,8 @@ mod user_objects;
 mod user_queue;
 mod graphics;
 mod classes;
-mod extra;
+mod console;
+mod environment;
 mod encoding;
 mod threads;
 mod exceptions;
@@ -100,24 +101,23 @@ pub fn print_recent_apis() {
     }
 }
 
-const INVALID_HANDLE_VALUE: u32 = 0xffff_ffff;
+static SCREEN_SIZE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new((480u32 << 16) | 640);
+
+pub(crate) fn set_screen_size(width: usize, height: usize) {
+    SCREEN_SIZE.store(((height.clamp(1, 65535) as u32) << 16) | width.clamp(1, 65535) as u32, core::sync::atomic::Ordering::Relaxed);
+}
+fn screen_size() -> (i32, i32) {
+    let size = SCREEN_SIZE.load(core::sync::atomic::Ordering::Relaxed);
+    ((size & 65535) as i32, (size >> 16) as i32)
+}
+
 const ERROR_FILE_NOT_FOUND: u32 = 2;
-const ERROR_INVALID_HANDLE: u32 = 6;
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Api {
-    BitBlt,
-    DeleteDC,
-    DeleteObject,
-    EndPaint,
     ExitProcess,
-    Extension,
-    FillRect,
-    InvalidateRect,
     RetroWndProcReturn,
-    SelectObject,
-    TextOutW,
     WriteFile,
     Yield,
     Unsupported,
@@ -171,14 +171,6 @@ struct Module {
     base: u32,
 }
 
-#[derive(Clone, Copy)]
-struct Message {
-    hwnd: u32,
-    message: u32,
-    wparam: u32,
-    lparam: u32,
-}
-
 pub(super) struct Window {
     hwnd: u32,
     parent: u32,
@@ -204,13 +196,6 @@ struct DeviceContext {
     handle: u32,
     window: Option<u32>,
     bitmap: Option<u32>,
-    x: i32,
-    y: i32,
-    pen: u32,
-    brush: u32,
-    font: u32,
-    bk: u32,
-    text: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -250,7 +235,6 @@ type GdiClipRect = (i32, i32, i32, i32);
 
 pub struct WindowsState {
     pub(crate) environment: Vec<u8>,
-    file_oem: bool,
     gates: Vec<Gate>,
     threads: threads::State,
     exceptions: exceptions::State,
@@ -266,16 +250,9 @@ pub struct WindowsState {
     classes: classes::State,
     protections: Vec<(u32, u32)>,
     heap_next: u32,
-    blocks: Vec<extra::Block>,
-    mappings: Vec<extra::Mapping>,
+    blocks: Vec<win16::Block>,
     tls: [u32; 64],
-    tls_mask: u64,
-    finds: Vec<extra::Find>,
-    next_find: u32,
-    console: extra::Console,
-    /// Last `SetConsoleMode` value for the three standard handles. S-Lang
-    /// refuses to start the screen if the input handle still has processed
-    /// mode (bit 0) set, which is what a constant mode of 3 reported.
+    console: console::Console,
     last_error: u32,
     error_mode: u32,
     pub cwd: [u8; 128],
@@ -285,19 +262,13 @@ pub struct WindowsState {
     command_line_a: u32,
     command_line_w: u32,
     next_object: u32,
-    process_info_out: usize,
-    process_handle: u32,
-    process_tid: u32,
-    process_exit_code: Option<u32>,
     teb_base: u32,
     teb_selector: u16,
     stack_base: u32,
     stack_size: u32,
     windows: Vec<Window>,
     presentations: Vec<(u32, crate::kernel::gui::NodeId)>,
-    messages: Vec<Message>,
     user_events: Vec<u32>,
-    registered_messages: Vec<(Vec<u8>,u32)>,
     // DLL initialization only; USER32 window callbacks use ordinary guest calls.
     callback: Option<Callback>,
     callback_stack: Vec<Callback>,
@@ -307,7 +278,6 @@ pub struct WindowsState {
     cursor_dirty: bool,
     cursor_visible: bool,
     paint_hwnd: u32,
-    focus_hwnd: u32,
     gdi_objects: Vec<(u32, GdiObject)>,
     dcs: Vec<DeviceContext>,
     gdi_rops: Vec<(u32,i32)>,
@@ -321,8 +291,7 @@ pub struct WindowsState {
 impl WindowsState {
     fn new() -> Self {
         Self {
-            environment: extra::windows_environment(&[]),
-            file_oem: false,
+            environment: environment::windows_environment(&[]),
             gates: Vec::new(),
             threads: threads::State::default(),
             exceptions: exceptions::State::default(),
@@ -339,12 +308,8 @@ impl WindowsState {
             protections: Vec::new(),
             heap_next: HEAP_BASE,
             blocks: Vec::new(),
-            mappings: Vec::new(),
             tls: [0; 64],
-            tls_mask: 0,
-            finds: Vec::new(),
-            next_find: 0x30000,
-            console: extra::Console::new(),
+            console: console::Console::new(),
             last_error: 0,
             error_mode: 0,
             cwd: [0; 128],
@@ -354,19 +319,13 @@ impl WindowsState {
             command_line_a: 0,
             command_line_w: 0,
             next_object: 0x10000,
-            process_info_out: 0,
-            process_handle: 0,
-            process_tid: 0,
-            process_exit_code: None,
             teb_base: TEB_BASE,
             teb_selector: 0x0f,
             stack_base: 0,
             stack_size: 0,
             windows: Vec::new(),
             presentations: Vec::new(),
-            messages: Vec::new(),
             user_events: Vec::new(),
-            registered_messages: Vec::new(),
             callback: None,
             callback_stack: Vec::new(),
             callback_return: 0,
@@ -375,7 +334,6 @@ impl WindowsState {
             cursor_dirty: true,
             cursor_visible: true,
             paint_hwnd: 0,
-            focus_hwnd: 0,
             gdi_objects: Vec::new(),
             dcs: Vec::new(),
             gdi_rops: Vec::new(),
@@ -394,34 +352,6 @@ impl WindowsState {
     }
     pub fn on_resume<A: crate::Arch>(&mut self, machine: &mut A) {
         machine.load_ldt(&self.ldt);
-        if self.process_info_out != 0 && self.process_tid != 0 {
-            let out = self.process_info_out;
-            machine.write::<u32>(out, self.process_handle);
-            machine.write::<u32>(out + 4, 0);
-            machine.write::<u32>(out + 8, self.process_tid);
-            machine.write::<u32>(out + 12, self.process_tid);
-            self.process_info_out = 0;
-        }
-    }
-    pub(crate) fn prepare_process(&mut self, process_info_out: usize) -> u32 {
-        let handle = self.next_object;
-        self.next_object = self.next_object.wrapping_add(4);
-        self.process_info_out = process_info_out;
-        self.process_handle = handle;
-        self.process_tid = 0;
-        self.process_exit_code = None;
-        handle
-    }
-    pub(crate) fn process_started(&mut self, tid: u32) {
-        self.process_tid = tid;
-    }
-    pub(crate) fn process_exited(&mut self, tid: u32, code: u32) {
-        if self.process_tid == tid {
-            self.process_exit_code = Some(code);
-        }
-    }
-    pub(crate) fn process_exit_code(&self, handle: u32) -> Option<u32> {
-        (handle == self.process_handle).then_some(self.process_exit_code).flatten()
     }
     pub fn repaint_osd(&mut self) {
         self.cursor_dirty = true;
@@ -436,7 +366,6 @@ impl WindowsState {
         if crate::kernel::keyboard::event().scan == 0 { return; }
         user_queue::keyboard_event(self, crate::kernel::keyboard::event(), crate::kernel::keyboard::control_state(), now);
         self.wake_user();
-        extra::push_key(&mut self.console, scancode, crate::kernel::keyboard::event(), crate::kernel::keyboard::control_state());
         if !pressed {
             return;
         }
@@ -452,8 +381,8 @@ impl WindowsState {
     }
 
     pub fn process_mouse(&mut self, dx: i16, dy: i16, buttons: u8, now: u64) {
-        self.mouse_x = self.mouse_x.saturating_add(i32::from(dx)).clamp(0, 639);
-        self.mouse_y = self.mouse_y.saturating_add(i32::from(dy)).clamp(0, 479);
+        self.mouse_x = self.mouse_x.saturating_add(i32::from(dx)).clamp(0, screen_size().0 - 1);
+        self.mouse_y = self.mouse_y.saturating_add(i32::from(dy)).clamp(0, screen_size().1 - 1);
         user_queue::mouse_event(self, buttons, now);
         self.mouse_buttons = buttons;
         self.cursor_dirty = true;
@@ -611,12 +540,22 @@ fn find_module(modules: &[Module], name: &[u8]) -> Option<usize> {
         .position(|m| m.name.eq_ignore_ascii_case(&name))
 }
 
+// DLL names are case-insensitive even when the backing filesystem is not.
+fn load_windows_file(path: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
+    if let Ok(data) = crate::kernel::exec::load_file_resolved(path) {
+        return Ok((path.to_vec(), data));
+    }
+    let resolved = crate::kernel::dos::windows_abs_to_vfs(&guest_windows_path(path), false).ok_or(2)?;
+    let data = crate::kernel::exec::load_file_resolved(&resolved)?;
+    Ok((resolved, data))
+}
+
 fn load_dependency(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
     let file = module_name(name);
     let system = join(crate::kernel::dos::c_root(), b"RETROOS/WINDOWS/SYSTEM32");
     for path in [join(dirname(importer), &file), join(&system, &file)] {
-        if let Ok(data) = crate::kernel::exec::load_file_resolved(&path) {
-            return Ok((path, data));
+        if let Ok(loaded) = load_windows_file(&path) {
+            return Ok(loaded);
         }
     }
     crate::compact_println!(
@@ -980,6 +919,8 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
 /// Real DLL functions execute as guest code. Only explicit INT 83h exports
 /// register kernel gates, identically for startup imports and LoadLibrary.
 fn register_module_gates<A: crate::Arch>(machine: &A, module: &Module, gates: &mut Vec<Gate>) -> Result<(), i32> {
+    // Only RETROOS.DLL defines kernel gates; other DLL exports are guest code.
+    if !module.name.eq_ignore_ascii_case(b"RETROOS.DLL") { return Ok(()); }
     let image = pe::Image::parse(&module.data).map_err(|_| 8)?;
     let dll_name = module.name.strip_suffix(b".DLL").unwrap_or(&module.name);
     for export in image.exports().map_err(|_| 8)? {
@@ -1185,7 +1126,7 @@ pub fn exec_pe_into<A: crate::Arch>(
     thread::init_process_thread(current, entry, stack);
 
     let mut state = WindowsState::new();
-    state.environment = extra::windows_environment(parent_env);
+    state.environment = environment::windows_environment(parent_env);
     state.ldt.push(descriptor(TEB_BASE, 4095));
     current.kernel.vcpu.regs.fs = 0x0f;
     state.command_line_a = cmd_a;
@@ -1210,7 +1151,7 @@ pub fn exec_pe_into<A: crate::Arch>(
         state.gates.push(Gate{return_ip:state.callback_return+2,api:Api::RetroWndProcReturn,arg_bytes:0,name:b"RetroWndProcReturn"});
     }
     if main_header.subsystem == 3 {
-        extra::open_console(&mut state);
+        console::open_console(&mut state);
     }
     state.modules = modules;
     initialize_process_strings(machine,&mut state)?;
@@ -1241,15 +1182,6 @@ pub(super) fn raw_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Ve
         out.push(b);
     }
     Err(ERROR_INVALID_PARAMETER)
-}
-
-pub(super) fn w_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
-    if address == 0 {
-        return Err(ERROR_INVALID_PARAMETER);
-    }
-    let mut units = encoding::units(machine, address, -1)?;
-    units.pop();
-    crate::kernel::text::from_utf16(&units, true).map(|s| s.into_bytes()).map_err(|_| 1113)
 }
 
 fn finish<A: crate::Arch>(machine: &A, regs: &mut Regs, gate: Gate, result: u32) {
@@ -1292,40 +1224,6 @@ fn finish<A: crate::Arch>(machine: &A, regs: &mut Regs, gate: Gate, result: u32)
     regs.frame.rsp += 4 + gate.arg_bytes as u64;
 }
 
-pub(super) fn create_file<A: crate::Arch>(
-    _machine: &mut A,
-    kt: &mut thread::KernelThread<A>,
-    state: &mut WindowsState,
-    raw: &[u8],
-    disposition: u32,
-) -> u32 {
-    let create = matches!(disposition, 1 | 2 | 4 | 5);
-    let path = match windows_path(state, raw, create) {
-        Ok(v) => v,
-        Err(e) => return fail(state, e, INVALID_HANDLE_VALUE),
-    };
-    let existed = crate::kernel::vfs::path_exists(&path);
-    let vh = match disposition {
-        1 if existed => return fail(state, 80, INVALID_HANDLE_VALUE),
-        1 | 2 => crate::kernel::vfs::create_to_handle(&path),
-        3 if existed => crate::kernel::vfs::open_to_handle(&path),
-        4 if existed => crate::kernel::vfs::open_to_handle(&path),
-        4 => crate::kernel::vfs::create_to_handle(&path),
-        5 if existed => crate::kernel::vfs::create_to_handle(&path),
-        _ => return fail(state, ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE),
-    };
-    if vh < 0 {
-        return fail(state, ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE);
-    }
-    let Some(fd) = kt.alloc_fd(3) else {
-        crate::kernel::vfs::close_vfs_handle(vh);
-        return fail(state, 4, INVALID_HANDLE_VALUE);
-    };
-    kt.fds[fd] = thread::FdKind::Vfs(vh);
-    state.last_error = if existed { 183 } else { 0 };
-    fd as u32
-}
-
 fn fail(state: &mut WindowsState, error: u32, result: u32) -> u32 {
     state.last_error = error;
     result
@@ -1363,72 +1261,6 @@ fn io_write<A: crate::Arch>(
         machine.write::<u32>(actual, n as u32);
     }
     1
-}
-
-pub(super) fn copy_ascii<A: crate::Arch>(machine: &mut A, out: usize, cap: usize, text: &[u8]) -> u32 {
-    if cap == 0 {
-        return 0;
-    }
-    let encoded = encoding::ansi().encode(&alloc::string::String::from_utf8_lossy(text), b'?').0;
-    let n = encoded.len().min(cap - 1);
-    machine.copy_to(out, &encoded[..n]);
-    machine.write::<u8>(out + n, 0);
-    n as u32
-}
-
-fn write_message<A: crate::Arch>(machine: &mut A, out: usize, message: Message) {
-    machine.write::<u32>(out, message.hwnd);
-    machine.write::<u32>(out + 4, message.message);
-    machine.write::<u32>(out + 8, message.wparam);
-    machine.write::<u32>(out + 12, message.lparam);
-    machine.write::<u32>(out + 16, (machine.now() / 1_000_000) as u32);
-    machine.write::<u32>(out + 20, 0);
-    machine.write::<u32>(out + 24, 0);
-}
-
-fn queue_paint(state: &mut WindowsState, hwnd: u32) {
-    if !state.windows.iter().any(|window| window.hwnd == hwnd && window.visible) {
-        return;
-    }
-    if !state
-        .messages
-        .iter()
-        .any(|m| m.hwnd == hwnd && m.message == 0x000f)
-    {
-        state.messages.push(Message {
-            hwnd,
-            message: 0x000f,
-            wparam: 0,
-            lparam: 0,
-        });
-    }
-    state.wake_user();
-    state.dirty = true;
-}
-
-fn system_color(index: u32) -> u32 {
-    match index {
-        0 | 4 | 5 | 15 => 0x00c0_c0c0,
-        6 | 8 | 9 => 0x0000_0000,
-        13 => 0x0080_0000,
-        14 => 0x00ff_ffff,
-        16 => 0x0080_8080,
-        20 => 0x00ff_ffff,
-        _ => 0x00c0_c0c0,
-    }
-}
-
-fn object_color(_state: &WindowsState, handle: u32, default: u32) -> u32 {
-    if (0x40000..=0x40008).contains(&handle) {
-        return match handle - 0x40000 {
-            0 | 6 => 0x00ff_ffff, 1 => 0x00c0_c0c0, 2 => 0x0080_8080,
-            3 => 0x0040_4040, 4 | 7 => 0, _ => default,
-        };
-    }
-    if (0x30000..0x30100).contains(&handle) {
-        return system_color(handle - 0x30000);
-    }
-    default
 }
 
 fn dc_bitmap(state: &WindowsState, dc: u32) -> Option<u32> {
@@ -1540,53 +1372,6 @@ fn put_pixel(state: &mut WindowsState, dc: u32, x: i32, y: i32, color: u32) {
     }
 }
 
-fn fill_pixels(state: &mut WindowsState, dc: u32, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
-    if let Some((_,rects)) = state.gdi_clips.iter().find(|(h,_)| *h==dc) {
-        let rects = rects.clone();
-        for (l,t,r,b) in rects { fill_pixels_unclipped(state,dc,left.max(l),top.max(t),right.min(r),bottom.min(b),color); }
-    } else { fill_pixels_unclipped(state,dc,left,top,right,bottom,color); }
-}
-
-fn fill_pixels_unclipped(
-    state: &mut WindowsState,
-    dc: u32,
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-    color: u32,
-) {
-    let Some(target) = target_mut(state, dc) else {
-        return;
-    };
-    let left = left.clamp(0, target.clip_width as i32).saturating_add(target.origin_x)
-        .clamp(0, target.width as i32) as usize;
-    let right = right.clamp(0, target.clip_width as i32).saturating_add(target.origin_x)
-        .clamp(0, target.width as i32) as usize;
-    let top = top.clamp(0, target.clip_height as i32).saturating_add(target.origin_y)
-        .clamp(0, target.height as i32) as usize;
-    let bottom = bottom.clamp(0, target.clip_height as i32).saturating_add(target.origin_y)
-        .clamp(0, target.height as i32) as usize;
-    if left >= right || top >= bottom { return; }
-    if let Some(dirty) = target.dirty { *dirty = true; }
-    let bytes = color.to_le_bytes();
-    for y in top..bottom {
-        for x in left..right {
-            let at = (y * target.width as usize + x) * 4;
-            target.pixels[at..at + 4].copy_from_slice(&bytes);
-        }
-    }
-}
-
-fn rect_from_guest<A: crate::Arch>(machine: &A, address: usize) -> (i32, i32, i32, i32) {
-    (
-        machine.read::<u32>(address) as i32,
-        machine.read::<u32>(address + 4) as i32,
-        machine.read::<u32>(address + 8) as i32,
-        machine.read::<u32>(address + 12) as i32,
-    )
-}
-
 fn dispatch<A: crate::Arch>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
@@ -1627,6 +1412,9 @@ fn dispatch<A: crate::Arch>(
             let out = arg(machine, regs, 0) as usize;
             machine.write::<u32>(out, machine.total_page_count().unwrap_or(machine.free_page_count()) as u32);
             machine.write::<u32>(out + 4, machine.free_page_count() as u32);
+            let [reserved, committed] = memory::statistics(state);
+            machine.write::<u32>(out + 8, reserved);
+            machine.write::<u32>(out + 12, committed);
             0
         },
         Api::MemoryProtect => change_protection(machine, state, arg(machine, regs, 0),
@@ -1692,186 +1480,7 @@ fn dispatch<A: crate::Arch>(
             arg(machine, regs, 1) as usize, arg(machine, regs, 2) as usize,
             arg(machine, regs, 3) as usize, state.console.output_cp,
         ),
-        Api::InvalidateRect => {
-            let hwnd = arg(machine, regs, 0);
-            if state.windows.iter().any(|w| w.hwnd == hwnd) {
-                queue_paint(state, hwnd);
-                1
-            } else {
-                0
-            }
-        }
         Api::RetroWndProcReturn => 0,
-        Api::EndPaint => {
-            state.dirty = true;
-            1
-        }
-        Api::SelectObject => {
-            let dc = arg(machine, regs, 0);
-            let object = arg(machine, regs, 1);
-            let kind = if (0x40006..=0x40008).contains(&object) { Some(2) }
-            else if (0x40000..=0x40005).contains(&object) || (0x30000..0x30100).contains(&object) { Some(1) } else { state
-                .gdi_objects
-                .iter()
-                .find(|(h, _)| *h == object)
-                .map(|(_, o)| match o {
-                    GdiObject::Bitmap { .. } => 0,
-                    GdiObject::Font => 3,
-                }) };
-            let Some(context) = state.dcs.iter_mut().find(|d| d.handle == dc) else {
-                return 0;
-            };
-            match kind {
-                Some(0) => context.bitmap.replace(object).unwrap_or(1),
-                Some(1) => {
-                    let old = context.brush;
-                    context.brush = object;
-                    old
-                }
-                Some(2) => {
-                    let old = context.pen;
-                    context.pen = object;
-                    old
-                }
-                Some(3) => {
-                    let old = context.font;
-                    context.font = object;
-                    old
-                }
-                _ => 1,
-            }
-        }
-        Api::DeleteObject => {
-            let object = arg(machine, regs, 0);
-            if let Some(index) = state.gdi_objects.iter().position(|(h, _)| *h == object) {
-                state.gdi_objects.swap_remove(index);
-                1
-            } else {
-                1
-            }
-        }
-        Api::DeleteDC => {
-            let dc = arg(machine, regs, 0);
-            state.gdi_clips.retain(|(h,_)| *h!=dc);
-            state.gdi_rops.retain(|(h,_)| *h!=dc);
-            if let Some(index) = state.dcs.iter().position(|d| d.handle == dc) {
-                state.dcs.swap_remove(index);
-                1
-            } else {
-                0
-            }
-        }
-        Api::FillRect => {
-            let dc = arg(machine, regs, 0);
-            let rect = arg(machine, regs, 1) as usize;
-            let brush = arg(machine, regs, 2);
-            let brush = if brush == 0 { state.dcs.iter().find(|d| d.handle == dc).map_or(0, |d| d.brush) } else { brush };
-            if brush == 0x40005 { return 1; }
-            let color = object_color(state, brush, 0x00c0_c0c0);
-            let (l, t, r, b) = rect_from_guest(machine, rect);
-            fill_pixels(state, dc, l, t, r, b, color);
-            1
-        }
-        Api::TextOutW => {
-            let dc = arg(machine, regs, 0);
-            let x = arg(machine, regs, 1) as i32;
-            let y = arg(machine, regs, 2) as i32;
-            let text = arg(machine, regs, 3) as usize;
-            let count = (arg(machine, regs, 4) as usize).min(4096);
-            let color = state
-                .dcs
-                .iter()
-                .find(|d| d.handle == dc)
-                .map_or(0, |d| d.text);
-            let units: Vec<u16> = (0..count).map(|n| machine.read::<u16>(text + n * 2)).collect();
-            let text = crate::kernel::text::from_utf16(&units, false).unwrap();
-            for (n, ch) in text.chars().enumerate() {
-                let glyph = crate::kernel::text::glyph16(ch);
-                for (gy, &bits) in glyph.iter().enumerate() {
-                    for gx in 0..8 {
-                        if bits & (0x80 >> gx) != 0 {
-                            put_pixel(state, dc, x + (n * 8 + gx) as i32, y + gy as i32, color);
-                        }
-                    }
-                }
-            }
-            1
-        }
-        Api::BitBlt => {
-            let dst = arg(machine, regs, 0);
-            let dx = arg(machine, regs, 1) as i32;
-            let dy = arg(machine, regs, 2) as i32;
-            let width = arg(machine, regs, 3) as usize;
-            let height = arg(machine, regs, 4) as usize;
-            if width == 0 || height == 0 || width > i32::MAX as usize || height > i32::MAX as usize { return 0; }
-            let src = arg(machine, regs, 5);
-            let sx = arg(machine, regs, 6) as i32;
-            let sy = arg(machine, regs, 7) as i32;
-            // Snapshot the requested source view, including window DCs, so
-            // overlapping scroll/copy operations do not consume changed pixels.
-            let Some(source) = target_mut(state, src) else { return 0; };
-            let left = i64::from(sx).max(0).max(-i64::from(source.origin_x));
-            let top = i64::from(sy).max(0).max(-i64::from(source.origin_y));
-            let right = (i64::from(sx)+width as i64).min(i64::from(source.clip_width)).min(i64::from(source.width)-i64::from(source.origin_x));
-            let bottom = (i64::from(sy)+height as i64).min(i64::from(source.clip_height)).min(i64::from(source.height)-i64::from(source.origin_y));
-            if right <= left || bottom <= top { return 1; }
-            let (copy_width,copy_height)=((right-left) as usize,(bottom-top) as usize);
-            let mut pixels=Vec::with_capacity(copy_width*copy_height*4);
-            for y in top..bottom {
-                let start=((y+i64::from(source.origin_y)) as usize*source.width as usize+(left+i64::from(source.origin_x)) as usize)*4;
-                pixels.extend_from_slice(&source.pixels[start..start+copy_width*4]);
-            }
-            let (left,top,source)=(left as i32,top as i32,pixels);
-            let dx = dx.saturating_add(left.saturating_sub(sx));
-            let dy = dy.saturating_add(top.saturating_sub(sy));
-            {
-                // BitBlt uses the ternary raster operation, never the pen ROP2.
-                let rop = (arg(machine, regs, 8) >> 16) as u8;
-                let brush = state.dcs.iter().find(|d| d.handle == dst).map_or(0, |d| d.brush);
-                let pattern = object_color(state, brush, 0xffffff);
-                // Resolve destination and clip once; SRCCOPY still copies rows.
-                let clips = state.gdi_clips.iter().find(|(h,_)| *h == dst).map(|(_,r)| r.clone());
-                let Some(target) = target_mut(state, dst) else { return 0; };
-                let bounds = [(0, 0, target.clip_width as i32, target.clip_height as i32)];
-                let mut changed = false;
-                for &(cl, ct, cr, cb) in clips.as_deref().unwrap_or(&bounds) {
-                    let l = i64::from(dx).max(i64::from(cl)).max(0).max(-i64::from(target.origin_x));
-                    let t = i64::from(dy).max(i64::from(ct)).max(0).max(-i64::from(target.origin_y));
-                    let r = (i64::from(dx) + copy_width as i64).min(i64::from(cr))
-                        .min(i64::from(target.clip_width)).min(i64::from(target.width) - i64::from(target.origin_x));
-                    let b = (i64::from(dy) + copy_height as i64).min(i64::from(cb))
-                        .min(i64::from(target.clip_height)).min(i64::from(target.height) - i64::from(target.origin_y));
-                    if l >= r || t >= b { continue; }
-                    let count = (r-l) as usize * 4;
-                    for y in t..b {
-                        let from = ((y - i64::from(dy)) as usize * copy_width + (l - i64::from(dx)) as usize) * 4;
-                        let to = ((y + i64::from(target.origin_y)) as usize * target.width as usize
-                            + (l + i64::from(target.origin_x)) as usize) * 4;
-                        if rop == 0xcc {
-                            target.pixels[to..to+count].copy_from_slice(&source[from..from+count]);
-                        } else {
-                            for x in (0..count).step_by(4) {
-                                let src = u32::from_le_bytes(source[from+x..from+x+4].try_into().unwrap());
-                                let dst = u32::from_le_bytes(target.pixels[to+x..to+x+4].try_into().unwrap());
-                                let mut color = 0;
-                                for term in 0..8 {
-                                    if rop & (1 << term) != 0 {
-                                        color |= (if term & 4 != 0 { pattern } else { !pattern })
-                                            & (if term & 2 != 0 { src } else { !src })
-                                            & (if term & 1 != 0 { dst } else { !dst });
-                                    }
-                                }
-                                target.pixels[to+x..to+x+4].copy_from_slice(&(color & 0xffffff).to_le_bytes());
-                            }
-                        }
-                    }
-                    changed = true;
-                }
-                if changed && let Some(dirty) = target.dirty { *dirty = true; }
-            }
-            1
-        }
-        Api::Extension => 0,
         Api::ExitProcess | Api::Unsupported | Api::DosMemory | Api::Wait | Api::NativeThread | Api::RestoreContext => unreachable!(),
     }
 }
@@ -1974,13 +1583,6 @@ pub fn handle_event<A: crate::Arch>(
                     crate::compact_dbg_println!("[win32-path] {}",core::str::from_utf8(&path).unwrap_or("?"));
                 }
             }
-            if extra::take_hold(&mut state.console) {
-                // INT advances EIP past its two-byte gate before the handler
-                // runs. Retry the same call once input becomes available.
-                regs.frame.rip -= 2;
-                if !threads::schedule(machine,state,regs) {kt.state=thread::ThreadState::Blocked;}
-                return thread::KernelAction::Done;
-            }
             if gate.api == Api::SetSelectors && result == 0 {
                 if let Some(dos) = &mut process.dos {
                     dos.ldt[..state.ldt.len()].copy_from_slice(&state.ldt);
@@ -1990,7 +1592,10 @@ pub fn handle_event<A: crate::Arch>(
             if !threads::schedule(machine,state,regs) {kt.state=thread::ThreadState::Blocked;}
             thread::KernelAction::Done
         }
-        crate::KernelEvent::Exception(13) if exceptions::deliver(machine,state,regs,0xc0000005) => thread::KernelAction::Done,
+        // Metal reports an unhandled #GP from its instruction monitor as
+        // Fault. Wine must receive it too (e.g. restoring a freed selector).
+        crate::KernelEvent::Exception(13) | crate::KernelEvent::Fault
+            if exceptions::deliver(machine,state,regs,0xc0000005) => thread::KernelAction::Done,
         crate::KernelEvent::PageFault { .. } => {
             unreachable!("page faults are handled by the event loop")
         }
@@ -2101,67 +1706,6 @@ mod damage_tests {
         assert!(surface_buffer(&state, SurfaceKey(11)).is_none());
     }
 
-    #[test]
-    fn window_writes_damage_scanout_but_offscreen_work_and_reads_do_not() {
-        let mut state = WindowsState::new();
-        state.windows.push(Window {
-            hwnd: 7,
-            parent: 0,
-            x: 0,
-            y: 0,
-            width: 8,
-            height: 8,
-            visible: true,
-            pixels: vec![0; 8 * 8 * 4],
-        });
-        state.paint_hwnd = 7;
-        let dc = state.paint_dc;
-        state.dirty = false;
-        assert!(target_mut(&mut state, dc).is_some());
-        assert!(!state.dirty, "querying a target must not damage it");
-        fill_pixels(&mut state, dc, 0, 0, 4, 4, 0xff);
-        assert!(
-            state.dirty,
-            "GetDC fills must present without EndPaint/input"
-        );
-        state.dirty = false;
-        put_pixel(&mut state, dc, 5, 5, 0xff00);
-        assert!(
-            state.dirty,
-            "text/line/pixel writes must damage their surface"
-        );
-        state.dirty = false;
-        put_pixel(&mut state, dc, 99, 99, 0);
-        fill_pixels(&mut state, dc, 99, 99, 100, 100, 0);
-        assert!(!state.dirty, "clipped writes must not damage a surface");
-        state.gdi_objects.push((
-            9,
-            GdiObject::Bitmap {
-                width: 8,
-                height: 8,
-                pixels: vec![0; 8 * 8 * 4],
-            },
-        ));
-        state.dcs.push(DeviceContext {
-            viewport: None,
-            handle: 8,
-            window: None,
-            bitmap: Some(9),
-            x: 0,
-            y: 0,
-            pen: 0,
-            brush: 0,
-            font: 0,
-            bk: 0,
-            text: 0,
-        });
-        fill_pixels(&mut state, 8, 0, 0, 8, 8, 0xff);
-        put_pixel(&mut state, 8, 0, 0, 0xff00);
-        assert!(
-            !state.dirty,
-            "offscreen menu composition must stay invisible"
-        );
-    }
 }
 
 pub(crate) fn poll_threads<A: crate::Arch>(machine:&mut A,kt:&mut thread::KernelThread<A>,process:&mut WindowsProcess<A>,regs:&mut Regs) {

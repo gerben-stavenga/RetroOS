@@ -1092,9 +1092,6 @@ pub fn exit_thread<A: crate::Arch>(
         if let Personality::Os2(os2) = &mut parent.personality {
             os2.child_exited(thread.kernel.tid as u32 + 1, exit_code);
         }
-        if let Personality::Windows(windows) = &mut parent.personality {
-            windows.process_exited(thread.kernel.tid as u32 + 1, exit_code as u32);
-        }
     }
 
     machine.free_user_pages();

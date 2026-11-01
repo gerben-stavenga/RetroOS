@@ -1937,6 +1937,21 @@ _start:
     jnz failed
     cmp dword [file_buffer+8],2
     jne failed
+    ; SxS activation manifests query the logical EOF separately from position.
+    push 20
+    push 8
+    push file_buffer
+    push file_io
+    push dword [write_handle]
+    call NtQueryInformationFile
+    test eax,eax
+    jnz failed
+    cmp dword [file_buffer],2
+    jne failed
+    cmp dword [file_buffer+4],0
+    jne failed
+    cmp dword [file_io+4],8
+    jne failed
     push file_io
     push dword [write_handle]
     call NtFlushBuffersFile

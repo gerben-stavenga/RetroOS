@@ -6,43 +6,12 @@ use crate::kernel::text::from_utf16;
 
 pub(super) fn ansi() -> Encoding { Encoding::for_codepage(u32::from(lib::locale::current().ansi)).unwrap() }
 
-pub(super) fn file_page(state: &WindowsState) -> Encoding {
-    if state.file_oem { Encoding::oem() } else { ansi() }
-}
-
-pub(super) fn file_string<A: crate::Arch>(m: &A, state: &WindowsState, address: u32, wide: bool) -> Result<Vec<u8>, u32> {
-    if wide { w_string(m, address) }
-    else { Ok(file_page(state).decode(&raw_string(m, address)?, false).unwrap().into_bytes()) }
-}
-
 pub(super) fn page(id: u32) -> Option<Encoding> {
     match id {
         0 | 3 => Some(ansi()),
         1 => Some(Encoding::oem()),
         _ => Encoding::for_codepage(id),
     }
-}
-
-pub(super) fn bytes<A: crate::Arch>(m: &A, address: u32, count: i32) -> Result<Vec<u8>, u32> {
-    if address == 0 || count == 0 || count < -1 { return Err(ERROR_INVALID_PARAMETER); }
-    if count == -1 {
-        let mut value = raw_string(m, address)?;
-        value.push(0);
-        Ok(value)
-    } else {
-        Ok((0..count as usize).map(|i| m.read::<u8>(address as usize + i)).collect())
-    }
-}
-
-pub(super) fn units<A: crate::Arch>(m: &A, address: u32, count: i32) -> Result<Vec<u16>, u32> {
-    if address == 0 || count == 0 || count < -1 { return Err(ERROR_INVALID_PARAMETER); }
-    let mut value = Vec::new();
-    for i in 0..if count == -1 { 32768 } else { count as usize } {
-        let unit = m.read::<u16>(address as usize + i * 2);
-        value.push(unit);
-        if count == -1 && unit == 0 { return Ok(value); }
-    }
-    if count == -1 { Err(ERROR_INVALID_PARAMETER) } else { Ok(value) }
 }
 
 pub(super) fn encode(text: &[u8], wide: bool) -> Vec<u16> {

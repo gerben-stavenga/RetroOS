@@ -94,7 +94,7 @@ fn two_core_priority_handoff_and_drop_fences() {
     unsafe {
         inline.start(|value| *value *= 2);
     }
-    assert_eq!(*inline.get(), 6);
+    assert_eq!(*inline.get_mut(), 6);
     let expected_pixels = voodoo_frame();
 
     std::thread::spawn(|| {
@@ -236,7 +236,7 @@ fn two_core_priority_handoff_and_drop_fences() {
     drop(reader);
     assert!(!resumed_before_read, "audio cancelled its request before acquiring guest memory");
     assert!(COPIED.load(Ordering::Acquire));
-    assert_eq!(*drawing.get(), 42);
+    assert_eq!(*drawing.get_mut(), 42);
     assert_eq!(*queued.get_mut(), 91);
 
     let mut pixels = vec![0usize; 4096];
