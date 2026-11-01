@@ -5,6 +5,57 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-31
+
+### Multicore audio and graphics
+
+- Bare-metal SMP discovers secondary CPUs and initializes CPU-local state,
+  stacks and TLS through the shared architecture library.
+- On multicore systems, a dedicated media core handles display presentation,
+  audio mixing and Voodoo rendering. Single-core systems use the same VGA
+  scanout implementation synchronously.
+- VGA scanout follows display phases for scrolling, panning and page flips.
+  Planar VGA stores run through a ring-0 assembly path with static MOV decode
+  tables for VM86, 16-bit and 32-bit programs.
+- Audio fixes cover Sound Blaster single-cycle DMA gaps and media-service
+  starvation. Logs include the core number and serialize complete lines.
+
+### Experimental Windows support
+
+- Windows applications use Wine DLLs in userspace, backed by RetroOS services
+  for files, memory, threads, synchronization, input, windows and graphics.
+  Win16 adapters and Win32 DLLs share the same backend.
+- Win16 DOS calls use the existing protected-mode DOS implementation and
+  shared file handles rather than a separate DOS filesystem implementation.
+- Add font rendering, keyboard and mouse delivery, window stacking, menus,
+  controls and multimedia services. Windows PCM playback uses the common
+  audio mixer alongside DOS sound.
+- Civilization for Windows reaches gameplay. Its installer now expands its
+  payload, runs the helper task and completes installation. Win16 Civilization
+  II was verified through world generation and founding a city, including HDA
+  playback under QEMU/KVM with two cores.
+- Windows support remains incomplete. Civilization II Multiplayer Gold reaches
+  its CD check; gameplay without the required disc has not been verified.
+
+### Hardware, networking and configuration
+
+- xHCI enumerates devices behind USB hubs and handles keyboard and mouse
+  endpoints on multiple retained devices.
+- Add shared networking, SMB mounts, Intel Ethernet support and native
+  WCN7850 Wi-Fi with WPA2. DOS IPX uses DOSBox-compatible UDP networking;
+  the OSD manages IPX LANs and null-modem connections.
+- Improve experimental Linux compatibility for native tools, including
+  terminals, file mappings, networking and process handling.
+- Per-program DOS launch policies reload on each launch without an entry cap.
+  `RETROOS.INI` configures DOS display scaling and CPU pacing. Boot and user
+  settings use a shared INI parsing library.
+- Fix leaked file handles across nested DOS EXEC calls and reduce stalls in
+  OSD, display and network processing.
+
+### Installation and verification
+
+- Release downloads include a zipped 512 MiB USB image. DOS game regression
+  suites cover bundled games and compare rendering and audio behavior.
 - Disk and module installers share GRUB regeneration, supporting distributions
   that provide `grub-mkconfig` or `grub2-mkconfig` instead of `update-grub`.
 
