@@ -110,7 +110,7 @@ fail: call(1,error,0,0); for(;;) {}
         run('gcc', '-m32', '-nostdlib', '-static', '-fno-pie', '-no-pie', source, '-o', home / 'PROBE.ELF')
         disk = work / 'data.img'
         with disk.open('wb') as stream:
-            stream.truncate(64 * 1024 * 1024)
+            stream.truncate(256 * 1024 * 1024)
         if kind == 'fat':
             run('mkfs.fat', '-F', '32', '-i', 'ABCD1234', disk)
             run('mcopy', '-s', '-i', disk, home / 'RETROOS', '::/')

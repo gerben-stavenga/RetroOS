@@ -42,6 +42,7 @@ BOOT_FILES = {
     "//lib/os2/helpmgr:helpmgr_dll":     "RETROOS/OS2/DLL/HELPMGR.DLL",
 }
 
+DIAGNOSTIC_BOOT_FILES = dict(BOOT_FILES)
 BOOT_FILES.update(WINE_FILES)
 
 DATA_FILES = {

@@ -25,7 +25,8 @@ Windows network APIs and other NIC drivers are not yet implemented.
 `/boot/retroos/RETROOS.INI` contains locale, keyboard, sound, launch and startup
 settings. Both are ordinary editable files loaded separately by GRUB. Unlisted physical partitions remain unmounted.
 The bundled DN and system files have writable RAM views.
-The default loads the 16 MiB core plus one 256 MiB showcase module containing
+The core image grows to fit its runtime (currently 128 MiB). The default also
+loads one 256 MiB showcase module containing
 games and commanders. Choose “Core only (less RAM)” to omit the showcase.
 
 Write the IMG to the whole USB device with a disk imaging tool. This replaces
@@ -85,7 +86,8 @@ writes to RAM.
 `retroos-usb-diagnostic.zip` contains `retroos-usb-diagnostic.img`, a base-only
 USB image for forum troubleshooting. Extract it and write the IMG to the whole
 stick. It uses the same fixed MBR and editable GRUB menu as the full image;
-the ZIP stays below the 5 MB attachment limit.
+the ZIP stays below the 5 MB attachment limit. It omits Wine and the optional
+showcase; use the full image to test Windows applications.
 
 ## Machine installation alongside Linux
 

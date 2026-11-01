@@ -1,4 +1,4 @@
-load(":filesystem_layout.bzl", "BOOT_FILES", "DATA_FILES", "SHOWCASE_FILES", "LINUX_FILES", "BOOT_SIZE_MB", "DOS_SIZE_MB", "LINUX_SIZE_MB")
+load(":filesystem_layout.bzl", "BOOT_FILES", "DIAGNOSTIC_BOOT_FILES", "DATA_FILES", "SHOWCASE_FILES", "LINUX_FILES", "BOOT_SIZE_MB", "DOS_SIZE_MB", "LINUX_SIZE_MB")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@rules_pkg//pkg:mappings.bzl", "pkg_mklink")
 
@@ -559,7 +559,7 @@ pkg_tar(
 
 pkg_tar(
     name = "diagnostic_dos_tar",
-    files = _BOOT_DIR_FILES,
+    files = DIAGNOSTIC_BOOT_FILES,
     empty_dirs = ["TEMP"],
     deps = [":diagnostic_apps_boot_tar"],
 )
