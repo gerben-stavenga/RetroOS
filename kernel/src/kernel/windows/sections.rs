@@ -5,11 +5,12 @@ use alloc::sync::Arc;
 struct Section {
     data: Vec<u8>,
     image: bool,
+    identity: u64,
 }
 #[derive(Default)]
 pub(super) struct State {
     handles: Vec<Option<Arc<Section>>>,
-    views: Vec<u32>,
+    views: Vec<(u32, u32, Arc<Section>)>,
 }
 pub(super) fn call<A: crate::Arch>(
     machine: &mut A,
@@ -18,6 +19,19 @@ pub(super) fn call<A: crate::Arch>(
     args: [u32; 6],
 ) -> u32 {
     let [op, handle, offset, size, flags, out] = args;
+    if op == 5 {
+        let Some(first) = memory::query(state, handle).filter(|m|m[4] != 0x10000) else {return 0xc0000141;};
+        let Some(second) = memory::query(state, offset).filter(|m|m[4] != 0x10000) else {return 0xc0000141;};
+        if first[6] == 0x20000 || second[6] == 0x20000 {return 0xc0000018;}
+        if first[1] == second[1] {return 0;}
+        let identity = |address| {
+            state.sections.views.iter().find(|(base,size,_)|address >= *base && address - *base < *size)
+                .map(|(_,_,section)|section.identity)
+                .or_else(||state.modules.iter().find(|m|m.contains(address))
+                    .and_then(|m|vfs::stat(&m.path,true).map(|s|s.ino)))
+        };
+        return if identity(handle).filter(|&id|id != 0).is_some_and(|id|Some(id) == identity(offset)) {0}else{0xc00000d4};
+    }
     if op == 0 {
         let Some(thread::FdKind::Vfs(file)) = kt.fds.get(handle as usize).copied() else {
             return 0xc0000008;
@@ -91,12 +105,12 @@ pub(super) fn call<A: crate::Arch>(
                 }
             }
         }
-        state.sections.handles[slot] = Some(Arc::new(Section { data, image }));
+        state.sections.handles[slot] = Some(Arc::new(Section { data, image, identity:vfs::file_ino_by_handle(file) }));
         machine.write::<u32>(out as usize, 0x76000000 | slot as u32 * 4);
         return 0;
     }
     if op == 3 {
-        let Some(index) = state.sections.views.iter().position(|&base| base == handle) else {
+        let Some(index) = state.sections.views.iter().position(|&(base,_,_)| base == handle) else {
             return 0xc0000019;
         };
         memory::call(machine, state, Api::MemoryRelease, handle, 0, 1);
@@ -205,7 +219,7 @@ pub(super) fn call<A: crate::Arch>(
             let _ = super::change_protection(machine, state, base + part.rva, count, access);
         }
         memory::mark_image(state, base);
-        state.sections.views.push(base);
+        state.sections.views.push((base,length,section.clone()));
         machine.write::<u32>(out as usize, base);
         machine.write::<u32>(out as usize + 4, length);
         return if base == image.header.image_base {
@@ -250,7 +264,7 @@ pub(super) fn call<A: crate::Arch>(
     );
     let _ = super::change_protection(machine, state, base, length, if flags == 8 { 4 } else { 2 });
     memory::mark_mapped(state, base);
-    state.sections.views.push(base);
+    state.sections.views.push((base,length,section.clone()));
     machine.write::<u32>(out as usize, base);
     machine.write::<u32>(out as usize + 4, length);
     0

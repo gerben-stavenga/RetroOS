@@ -28,6 +28,9 @@ HOST_CALLS = {
 }
 
 
+NETWORK_CALLS = {"RetroNet" + name: 4 for name in
+    ("GetAddrInfo", "GetHostByAddr", "GetHostByName", "GetHostName", "GetNameInfo")}
+
 def prepare(source, work):
     header = (source / "dlls/ntdll/ntsyscalls.h").read_text()
     section = header.split("#define ALL_SYSCALLS32", 1)[1].split("#define ALL_SYSCALLS ", 1)[0]
@@ -142,9 +145,9 @@ void WINAPI RetroWineInitializeLocale(void)
     with (source / "dlls/ntdll/ntdll.spec").open("a") as stream:
         stream.write("\n@ stdcall RetroWineDispatchException(ptr ptr)\n@ stdcall RetroWineThreadStart(ptr ptr)\n@ stdcall RetroWineDispatchCallback(ptr long long)\n@ stdcall RetroWineInitializePeb()\n@ stdcall RetroWineInitializeLocale()\n@ stdcall RetroWineRegisterModule(long wstr)\n@ stdcall RetroWineAttachModule(long long ptr)\n")
 
-    contract = {**{"Retro" + name: size for name, size in calls.items()}, **{name: 4 for name in HOST_CALLS.values()}, "RetroUserCallback": 20, "RetroServerSendFile": 4}
+    contract = {"RetroDosInterrupt": 4, **NETWORK_CALLS, **{"Retro" + name: size for name, size in calls.items()}, **{name: 4 for name in HOST_CALLS.values()}, "RetroUserCallback": 20, "RetroServerSendFile": 4}
     definition = work / "retroos.def"
-    definition.write_text("LIBRARY RETROOS.DLL\nEXPORTS\n" + "".join(f"{name}@{size}\n" for name, size in contract.items()) + "RetroDosMemory@16\nRetroGraphics@12\n")
+    definition.write_text("LIBRARY RETROOS.DLL\nEXPORTS\n" + "".join(f"{name}@{size}\n" for name, size in contract.items()) + "RetroDosMemory@16\nRetroGraphics@12\nRetroFileKind@4\nRetroWaveInit@4\n")
     subprocess.run(["llvm-dlltool", "-m", "i386", "-k", "-d", str(definition),
                     "-l", str(work / "retroos.lib")], check=True)
     return contract
@@ -155,7 +158,7 @@ def run(command, cwd, env, log):
     if result.returncode:
         log.flush()
         details = Path(log.name).read_text()
-        errors = "\n".join(line for line in details.splitlines() if "error:" in line or "undefined" in line or "Error " in line)
+        errors = "\n".join(line for line in details.splitlines() if "error:" in line or "undefined" in line or "Error " in line or "not supported" in line or "winebuild:" in line)
         raise RuntimeError(f"Command failed: {' '.join(map(str, command))}\n" + errors + "\n" + details[-8000:])
 
 
@@ -166,6 +169,11 @@ def main():
     parser.add_argument("--flex", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--abi", type=Path, required=True)
+    parser.add_argument("--wave-driver", type=Path, required=True)
+    parser.add_argument("--mmsystem", type=Path, required=True)
+    parser.add_argument("--winmm", type=Path, required=True)
+    parser.add_argument("--wined3d", type=Path, required=True)
+    parser.add_argument("--winsock", type=Path, required=True)
     parser.add_argument("--kernel32", type=Path, required=True)
     parser.add_argument("--kernelbase", type=Path, required=True)
     parser.add_argument("--kernel16", type=Path, required=True)
@@ -204,6 +212,24 @@ def main():
         shutil.copyfile(args.graphics_driver, source / "dlls/win32u/retro_graphics.c")
         spec32 = source / "dlls/win32u/win32u.spec"
         spec32.write_text(spec32.read_text().replace(" -syscall", ""))
+        # Keep Wine's socket implementation, replacing its five Unix name
+        # service calls with the RetroOS backend. Socket I/O already uses NT.
+        sockets = source / "dlls/ws2_32/socket.c"
+        text = sockets.read_text()
+        marker = "return !__wine_init_unix_call();"
+        assert text.count(marker) == 1
+        sockets.write_text(text.replace(marker, "return TRUE; /* RetroOS backend has no Unix library to initialize. */"))
+        protocol = source / "dlls/ws2_32/protocol.c"
+        text = protocol.read_text()
+        marker = "#define WS_CALL(func, params) WINE_UNIX_CALL( ws_unix_ ## func, params )"
+        declarations = ""
+        for token, name in [("getaddrinfo", "GetAddrInfo"), ("gethostbyaddr", "GetHostByAddr"),
+                            ("gethostbyname", "GetHostByName"), ("gethostname", "GetHostName"),
+                            ("getnameinfo", "GetNameInfo")]:
+            declarations += f"__declspec(dllimport) int WINAPI RetroNet{name}(struct {token}_params *);\n"
+            declarations += f"#define retroos_{token} RetroNet{name}\n"
+        assert marker in text
+        protocol.write_text(text.replace(marker, declarations + "#define WS_CALL(func, params) retroos_ ## func(params)"))
         ft = prepare_fonts(source, args.freetype, work)
         contract = prepare(source, work)
         # The portable PE backend has no Unix syscall dispatcher to clear DF.
@@ -275,6 +301,98 @@ DWORD WINAPI RetroWineStartTask(const char *path, const char *command)
     return result;
 }
 """)
+        # DOS and Wine share the native file-descriptor space. The DLL only
+        # translates the Windows handle tag; it has no separate DOS handle table.
+        file16 = source / "dlls/krnl386.exe16/file.c"
+        text = file16.read_text()
+        begin = text.index("#define DOS_TABLE_SIZE")
+        end = text.index("HANDLE WINAPI DosFileHandleToWin32Handle", begin)
+        text = text[:begin] + "__declspec(dllimport) DWORD WINAPI RetroFileKind(DWORD);\n\n" + text[end:]
+        def body(text, signature, replacement):
+            begin = text.index("{", text.index(signature)); end = begin + 1; depth = 1
+            while depth:
+                depth += (text[end] == "{") - (text[end] == "}"); end += 1
+            return text[:begin] + "{\n" + replacement + "\n}" + text[end:]
+        text = body(text, "HANDLE WINAPI DosFileHandleToWin32Handle", r"""
+    WORD fd = (WORD)handle;
+    if (!RetroFileKind(fd)) { SetLastError(ERROR_INVALID_HANDLE); return INVALID_HANDLE_VALUE; }
+    return ULongToHandle(0x40000000 | fd);
+""")
+        text = body(text, "HFILE WINAPI Win32HandleToDosFileHandle", r"""
+    DWORD value = HandleToULong(handle), fd = value & 0xffff;
+    if ((value & 0xffff0000) == 0x40000000 && RetroFileKind(fd)) return fd;
+    SetLastError(ERROR_INVALID_HANDLE); return HFILE_ERROR;
+""")
+        text = body(text, "void WINAPI DisposeLZ32Handle", "    if (handle && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);")
+        text = body(text, "HFILE16 WINAPI _lclose16", r"""
+    HANDLE handle = DosFileHandleToWin32Handle(hFile);
+    return handle != INVALID_HANDLE_VALUE && CloseHandle(handle) ? 0 : HFILE_ERROR16;
+""")
+        assert "dos_handles" not in text
+        file16.write_text(text)
+        # Replace Wine's DOS dispatcher with a small function bridge. Actual
+        # INT 21h services run through RetroOS's existing protected-mode DOS.
+        (source / "dlls/krnl386.exe16/int21.c").write_text(r"""
+#include <stdarg.h>
+#include "windef.h"
+#include "winbase.h"
+__declspec(dllimport) void WINAPI RetroDosInterrupt(CONTEXT *);
+void WINAPI DOSVM_Int21Handler(CONTEXT *context) { RetroDosInterrupt(context); }
+""")
+        # Wine retains its wave API and Win16 thunking. Install RetroOS's PCM
+        # driver in its normal multimedia-driver slots, including WAVE_MAPPER.
+        wave = source / "dlls/winmm/lolvldrv.c"
+        text = wave.read_text().replace('MMDRV_Install("mmdevapi", "mmdevapi.dll", FALSE);',
+            'RetroWaveInit(DriverCallback);\n    MMDRV_Install("retroos", "retroos.dll", FALSE);')
+        text = text.replace('MMDRV_Install("wavemapper", "msacm32.drv", TRUE);',
+            'MMDRV_Install("wavemapper", "retroos.dll", TRUE);')
+        text = text.replace('static void MMDRV_Init(void);',
+            '__declspec(dllimport) void WINAPI RetroWaveInit(void *);\nstatic void MMDRV_Init(void);')
+        wave.write_text(text)
+        # Reuse Wine's waveform-to-driver wrappers. The current WASAPI
+        # implementation remains available internally for its mixer APIs.
+        waveform = source / "dlls/winmm/waveform.c"
+        text = waveform.read_text()
+        functions = sorted(set(re.findall(r"^\w+ WINAPI (wave(?:Out|In)\w+)\(", text, re.M)))
+        waveform.write_text("".join(f"#define {name} wasapi_{name}\n" for name in functions) + text)
+        shutil.copyfile(args.wave_driver, source / "dlls/winmm/retro_waveform.c")
+        makefile = source / "dlls/winmm/Makefile.in"
+        makefile.write_text(makefile.read_text().replace("SOURCES = \\\n", "SOURCES = \\\n\tretro_waveform.c \\\n"))
+        # A full Win16 MMIO buffer cannot use MapLS's sliding 64 KiB
+        # window: a nonzero offset leaves part of a 64 KiB buffer unmapped.
+        mmio16 = source / "dlls/mmsystem.dll16/mmio16.c"
+        text = mmio16.read_text().replace("    SEGPTR      segbuffer;", "    WORD        buffer_selectors;\n    SEGPTR      segbuffer;")
+        text = text.replace("            thunk->segbuffer = (SEGPTR)segbuf;", "            thunk->buffer_selectors = 0;\n            thunk->segbuffer = (SEGPTR)segbuf;")
+        text = text.replace("    if (release) UnMapLS(thunk->segbuffer);", r"""
+    if (release && thunk->buffer_selectors) {
+        WORD i, selector = SELECTOROF(thunk->segbuffer);
+        for (i = 0; i < thunk->buffer_selectors; i++) FreeSelector16(selector + 8 * i);
+    } else if (release) UnMapLS(thunk->segbuffer);
+    thunk->buffer_selectors = 0;
+""")
+        text = text.replace("            thunk->segbuffer = MapLS(m.pchBuffer);", r"""
+            WORD i, count = (m.cchBuffer + 0xffff) / 0x10000;
+            WORD selector = count ? AllocSelectorArray16(count) : 0;
+            if (count && !selector) {
+                mmioClose(ret, 0); ret = 0; thunk->hMmio = NULL;
+                mmioinfo.wErrorRet = MMSYSERR_NOMEM;
+            } else {
+                for (i = 0; i < count; i++) {
+                    SetSelectorBase(selector + 8 * i, (DWORD)m.pchBuffer + 0x10000 * i);
+                    SetSelectorLimit16(selector + 8 * i, m.cchBuffer - 0x10000 * i - 1);
+                }
+                thunk->segbuffer = MAKESEGPTR(selector, 0);
+                thunk->buffer_selectors = count;
+            }
+""")
+        mmio16.write_text(text)
+        # DirectDraw has a real software backend. Use it without eagerly loading
+        # the Unix OpenGL driver on hosts that have no OpenGL implementation.
+        makefile3d = source / "dlls/wined3d/Makefile.in"
+        text = makefile3d.read_text().replace("dxguid opengl32 user32", "dxguid user32")
+        makefile3d.write_text("DELAYIMPORTS = opengl32\n" + text)
+        settings3d = source / "dlls/wined3d/wined3d_main.c"
+        settings3d.write_text(settings3d.read_text().replace(".renderer = WINED3D_RENDERER_AUTO,", ".renderer = WINED3D_RENDERER_NO3D,"))
         selectors = source / "dlls/krnl386.exe16/selector.c"
         selectors.write_text(selectors.read_text().replace("void init_selectors(void)\n{",
             "static BOOL retroos_imported_selectors;\nvoid init_selectors(void)\n{\n"
@@ -323,12 +441,17 @@ DWORD WINAPI RetroWineStartTask(const char *path, const char *command)
                 makefile.write(f"dlls/win32u/i386-windows/win32u.dll: i386_LDFLAGS += {ftlib}\n")
                 makefile.write(f"\ni386_LDFLAGS += {work / 'retroos.lib'}\n")
             run(["make", "-j8", "dlls/ntdll/i386-windows/ntdll.dll", "dlls/kernelbase/i386-windows/kernelbase.dll", "dlls/kernel32/i386-windows/kernel32.dll",
-                 "dlls/krnl386.exe16/i386-windows/krnl386.exe16", "dlls/win32u/i386-windows/win32u.dll"], build, env, log)
+                 "dlls/krnl386.exe16/i386-windows/krnl386.exe16", "dlls/win32u/i386-windows/win32u.dll",
+                 "dlls/mmsystem.dll16/i386-windows/mmsystem.dll16", "dlls/winmm/i386-windows/winmm.dll", "dlls/ws2_32/i386-windows/ws2_32.dll", "dlls/wined3d/i386-windows/wined3d.dll"], build, env, log)
         shutil.copyfile(build / "dlls/ntdll/i386-windows/ntdll.dll", output)
         shutil.copyfile(build / "dlls/krnl386.exe16/i386-windows/krnl386.exe16", kernel16)
         shutil.copyfile(build / "dlls/win32u/i386-windows/win32u.dll", args.graphics.resolve())
         shutil.copyfile(build / "dlls/kernelbase/i386-windows/kernelbase.dll", args.kernelbase.resolve())
         shutil.copyfile(build / "dlls/kernel32/i386-windows/kernel32.dll", args.kernel32.resolve())
+        shutil.copyfile(build / "dlls/mmsystem.dll16/i386-windows/mmsystem.dll16", args.mmsystem.resolve())
+        shutil.copyfile(build / "dlls/winmm/i386-windows/winmm.dll", args.winmm.resolve())
+        shutil.copyfile(build / "dlls/ws2_32/i386-windows/ws2_32.dll", args.winsock.resolve())
+        shutil.copyfile(build / "dlls/wined3d/i386-windows/wined3d.dll", args.wined3d.resolve())
         abi.write_text(json.dumps(contract, indent=2, sort_keys=True) + "\n")
 
 

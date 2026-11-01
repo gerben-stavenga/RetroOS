@@ -99,13 +99,19 @@ pub(super) fn start<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
     let start_task = super::super::export_address(&windows.modules, b"KRNL386.EXE16", b"RetroWineStartTask")?;
     let image_path=super::super::guest_windows_path(windows.exec_path_str());
     const TASK_PATH: u32 = ENTER16 + 2048;
+    let tail_size = machine.read::<u8>((super::PSP_BASE + 0x80) as usize).min(126) as usize;
+    let mut tail = vec![0; tail_size];
+    machine.copy_from((super::PSP_BASE + 0x81) as usize, &mut tail);
+    let task_tail = TASK_PATH + image_path.len() as u32 + 1;
     let mut enter = Vec::new();
-    emit_call(&mut enter, start_task, &[TASK_PATH, TASK_PATH + image_path.len() as u32]);
+    emit_call(&mut enter, start_task, &[TASK_PATH, task_tail]);
     enter.extend_from_slice(&[0x50, 0xb8]);
     enter.extend_from_slice(&abort.to_le_bytes());
     enter.extend_from_slice(&[0xff, 0xd0, 0x0f, 0x0b]);
     enter.resize(2048, 0);
     enter.extend_from_slice(&image_path);
+    enter.push(0);
+    enter.extend_from_slice(&tail);
     enter.push(0);
     map_code(machine, ENTER16, &enter)?;
 

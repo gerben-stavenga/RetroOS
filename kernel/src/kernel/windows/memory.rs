@@ -68,7 +68,11 @@ pub(super) fn call<A: crate::Arch>(
             let Some(end) = candidate.checked_add(size) else {
                 return 0;
             };
-            if candidate < start || end > END {
+            // Win32 has no legacy selector heap. Explicit shared-section
+            // addresses can use that range below the runtime control pages.
+            let high = base != 0 && state.win16.is_none()
+                && candidate >= super::HEAP_BASE && end <= 0x7ff0_0000;
+            if !high && (candidate < start || end > END) {
                 return 0;
             }
             let regions = state
@@ -185,7 +189,8 @@ pub(super) fn can_protect(state: &WindowsState, address: u32, write: bool, execu
         r.shared
             && address >= r.base
             && address < r.base + r.pages.len() as u32 * 4096
-            && (write || execute)
+            && (execute || write && r.pages[((address-r.base)/4096) as usize]
+                .is_none_or(|flags| flags & 1 == 0))
     })
 }
 

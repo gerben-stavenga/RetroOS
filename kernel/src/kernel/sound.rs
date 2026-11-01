@@ -18,6 +18,7 @@
 //! where one was found, the port window where a backend installed a sink,
 //! nowhere otherwise — `play` just matches the type.
 
+pub(crate) mod pcm;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 // RetroOS canonical audio device — a kernel-private ISA port window. It is
@@ -41,27 +42,33 @@ pub(crate) fn diagnostic_counts() -> (u32, u32) {
     (UNDERRUNS.load(Ordering::Relaxed), RATE_SPIKES.load(Ordering::Relaxed))
 }
 
-static FRONTIER_SEQ: AtomicU32 = AtomicU32::new(0);
-static FRONTIER_LO: AtomicU32 = AtomicU32::new(0);
-static FRONTIER_HI: AtomicU32 = AtomicU32::new(0);
-
-/// Lock-free observation of the single audio producer's frame frontier.
-pub fn produced_frames() -> u64 {
-    loop {
-        let seq = FRONTIER_SEQ.load(Ordering::Acquire);
-        if seq & 1 != 0 { core::hint::spin_loop(); continue; }
-        let lo = FRONTIER_LO.load(Ordering::Relaxed);
-        let hi = FRONTIER_HI.load(Ordering::Relaxed);
-        core::sync::atomic::fence(Ordering::Acquire);
-        if FRONTIER_SEQ.load(Ordering::Relaxed) == seq { return (u64::from(hi) << 32) | u64::from(lo); }
+// One audio producer publishes 64-bit cursors to readers on 32-bit CPUs.
+struct FrameCounter { sequence: AtomicU32, low: AtomicU32, high: AtomicU32 }
+impl FrameCounter {
+    const fn new() -> Self {Self {sequence:AtomicU32::new(0),low:AtomicU32::new(0),high:AtomicU32::new(0)}}
+    fn load(&self) -> u64 {
+        loop {
+            let seq = self.sequence.load(Ordering::Acquire);
+            if seq & 1 != 0 {core::hint::spin_loop();continue;}
+            let lo = self.low.load(Ordering::Relaxed);
+            let hi = self.high.load(Ordering::Relaxed);
+            core::sync::atomic::fence(Ordering::Acquire);
+            if self.sequence.load(Ordering::Relaxed) == seq {return u64::from(hi)<<32 | u64::from(lo);}
+        }
+    }
+    fn store(&self, value: u64) {
+        self.sequence.fetch_add(1,Ordering::AcqRel);
+        self.low.store(value as u32,Ordering::Relaxed);
+        self.high.store((value>>32) as u32,Ordering::Relaxed);
+        self.sequence.fetch_add(1,Ordering::Release);
     }
 }
-fn publish_frontier(value: u64) {
-    FRONTIER_SEQ.fetch_add(1, Ordering::AcqRel);
-    FRONTIER_LO.store(value as u32, Ordering::Relaxed);
-    FRONTIER_HI.store((value >> 32) as u32, Ordering::Relaxed);
-    FRONTIER_SEQ.fetch_add(1, Ordering::Release);
-}
+static PRODUCED: FrameCounter = FrameCounter::new();
+static PLAYED: FrameCounter = FrameCounter::new();
+/// Lock-free observation of the single audio producer's frame frontier.
+pub fn produced_frames() -> u64 { PRODUCED.load() }
+fn publish_frontier(value: u64) { PRODUCED.store(value); }
+pub(crate) fn played_frames() -> u64 { PLAYED.load() }
 
 /// One real-time window's worth of pump accounting, for when the mix rate
 /// wanders and the sampled spike log cannot say why. Reported per ~3s of TSC;
@@ -575,6 +582,8 @@ fn advance_resident(
     publish_mixing_rate_q16(pitch_rate_q16);
     publish_frontier(clock.produced_frames());
 
+    let queued = sink.as_ref().map_or(0, |s| s.inner.written_frames().saturating_sub(s.inner.consumed_frames()));
+    PLAYED.store(clock.produced_frames().saturating_sub(queued));
     let Some(output) = sink else { return };
 
     // Census over a fixed TSC window. `tsc_hz` is not known here, so the
@@ -697,7 +706,12 @@ impl Engine {
         self.last_ns = now;
         LAST_AUDIO_MS.store((now / 1_000_000) as u32, Ordering::Relaxed);
         advance_resident(&mut self.clock, self.sink.as_mut(), elapsed, stamp, |span| {
-            if let Some(source) = source.as_mut() { mix(source, now, span) } else { span.frames.len() }
+            let AudioSpan { rate, base_frame, physical_sb, frames } = span;
+            let n = if let Some(source) = source.as_mut() {
+                mix(source, now, AudioSpan {rate,base_frame,physical_sb,frames:&mut *frames})
+            } else { frames.len() };
+            pcm::mix(&mut frames[..n],rate,base_frame);
+            n
         });
     }
 }

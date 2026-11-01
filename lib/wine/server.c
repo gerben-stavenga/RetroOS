@@ -39,6 +39,7 @@ struct object_info { ULONG handle, kind, flags, name_bytes; struct obj_locator l
 extern NTSTATUS WINAPI RetroUserObject(ULONG,ULONG,const WCHAR *,ULONG,ULONG,struct object_info *);
 extern NTSTATUS WINAPI RetroQueue(ULONG,const ULONG *,ULONG *);
 extern NTSTATUS WINAPI RetroCursor(const ULONG *,ULONG *);
+extern NTSTATUS WINAPI RetroNamed(ULONG,ULONG,ULONG,ULONG,ULONG,ULONG *);
 extern NTSTATUS WINAPI RetroAtom(ULONG,ULONG,const WCHAR *,ULONG,ULONG *);
 extern NTSTATUS WINAPI RetroWindowTree(ULONG,const ULONG *,ULONG *);
 extern NTSTATUS WINAPI RetroWindow(ULONG,ULONG,const WCHAR *,ULONG,ULONG,ULONGLONG *);
@@ -53,6 +54,25 @@ NTSTATUS WINAPI RetroNtOpenDirectoryObject(HANDLE *out, ACCESS_MASK access, cons
     unsigned int i;
     if (!out || !attr || attr->Length != sizeof(*attr) || !attr->ObjectName) return STATUS_INVALID_PARAMETER;
     if (attr->RootDirectory) return STATUS_NOT_SUPPORTED;
+    {
+        static const WCHAR session[] = L"\\Sessions\\0\\BaseNamedObjects";
+        static const WCHAR global[] = L"\\BaseNamedObjects";
+        const WCHAR *paths[] = {session, global};
+        const unsigned lengths[] = {sizeof(session)-2, sizeof(global)-2};
+        unsigned j;
+        for (j=0; j<ARRAY_SIZE(paths); j++)
+        {
+            if (attr->ObjectName->Length != lengths[j] || !attr->ObjectName->Buffer) continue;
+            for (i=0; i<lengths[j]/2; i++)
+            {
+                WCHAR a=attr->ObjectName->Buffer[i], b=paths[j][i];
+                if (attr->Attributes & OBJ_CASE_INSENSITIVE) { if(a>='A'&&a<='Z') a+=32; if(b>='A'&&b<='Z') b+=32; }
+                if(a!=b) break;
+            }
+            if (i==lengths[j]/2) return RetroNamed(0,0,(ULONG)attr,0,0,(ULONG *)out);
+        }
+    }
+
     if (attr->ObjectName->Length != sizeof(path)-sizeof(WCHAR) || !attr->ObjectName->Buffer) return STATUS_OBJECT_NAME_NOT_FOUND;
     for (i=0;i<ARRAY_SIZE(path)-1;i++)
     {
@@ -751,3 +771,5 @@ NTSTATUS WINAPI RetroNtQueryDirectoryFile(HANDLE handle,HANDLE event,PIO_APC_ROU
 #include "callbacks.c"
 
 #include "threads.c"
+
+#include "wave.c"

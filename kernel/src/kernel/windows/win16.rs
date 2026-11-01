@@ -670,7 +670,7 @@ pub(super) fn exec<A: crate::Arch>(
     pending.push((b"USER".to_vec(), main_path.clone()));
     let mut windows = WindowsState::new();
     windows.modules.push(super::Module {
-        name: super::module_name(&main_path), path: main_path.clone(), data: Vec::new(), base: SEGMENT_BASE,
+        name: super::module_name(&main_path), path: main_path.clone(), data: Vec::new(), base: SEGMENT_BASE, size: 0,
     });
     let mut modules = Vec::new();
     let mut next = 0;
@@ -906,6 +906,7 @@ fn init_bridge<A: crate::Arch>(
         path: windows.exec_path_str().to_vec(),
         data: Vec::new(),
         base: SEGMENT_BASE,
+        size: 0,
     });
     let (_, initializers) = super::load_library(machine, windows, b"USER32.DLL").map_err(|_| -8)?;
     // Our replacement DLLs have no DllMain. Do not silently skip a real DLL's.
@@ -1719,12 +1720,29 @@ pub(super) fn handle_event<A: crate::Arch>(
             crate::compact_dbg_println!("[win16] unhandled {:?} at {:04x}:{:04x}",
                 event, regs.code_seg(), regs.ip32() as u16);
             crate::compact_dbg_println!("[win16] ax={:04x} bx={:04x} cx={:04x} dx={:04x} ds={:04x} es={:04x} di={:04x}", regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.ds, regs.es, regs.rdi);
+            crate::compact_dbg_println!("[win16] si={:#x} dsdesc={:#x} esdesc={:#x}", regs.rsi,
+                windows.ldt.get(regs.ds as usize >> 3).copied().unwrap_or(0),
+                windows.ldt.get(regs.es as usize >> 3).copied().unwrap_or(0));
+            if let Some(address) = far_linear(windows, (u32::from(regs.code_seg()) << 16) | regs.ip32() as u16 as u32) {
+                crate::compact_dbg_println!("[win16] code at {:#x}: {:08x} {:08x}", address,
+                    machine.read::<u32>(address), machine.read::<u32>(address + 4));
+            }
+            let mut frame = regs.rbp as u16 & !1;
+            for _ in 0..12 {
+                let Some(bp) = far_linear(windows, ((regs.frame.ss as u32) << 16) | u32::from(frame)) else { break; };
+                crate::compact_dbg_println!("[win16] frame {:04x} caller {:04x}:{:04x} args {:08x} {:08x} {:08x}",
+                    frame, machine.read::<u16>(bp + 4), machine.read::<u16>(bp + 2),
+                    machine.read::<u32>(bp + 6), machine.read::<u32>(bp + 10), machine.read::<u32>(bp + 14));
+                let next = machine.read::<u16>(bp) & !1;
+                if next <= frame { break; }
+                frame = next;
+            }
             thread::KernelAction::Exit(-1)
         }
     }
 }
 
-fn dos_call<A: crate::Arch>(
+pub(super) fn dos_call<A: crate::Arch>(
     machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>, windows: &mut WindowsState,
     dos: &mut crate::kernel::dos::DosState<A>, regs: &mut Regs,

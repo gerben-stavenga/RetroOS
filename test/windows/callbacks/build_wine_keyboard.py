@@ -7,7 +7,8 @@ source,header,output=map(lambda p:Path(p).resolve(),sys.argv[1:])
 imports={
  'USER32':{'RegisterClassA':4,'CreateWindowExA':48,'DefWindowProcA':16,'SetForegroundWindow':4,'SetActiveWindow':4,'SetFocus':4,'PeekMessageA':20,'GetMessageA':16,'GetKeyState':4,'GetAsyncKeyState':4,'TranslateMessage':4,'PostQuitMessage':4,'GetClassLongA':8,'GetDC':4,'ReleaseDC':8,'DestroyWindow':4,'SetCapture':4,'ReleaseCapture':0,'GetCursorPos':4,'DispatchMessageA':4,'ShowWindow':8,'BeginPaint':8,'EndPaint':8,'GetWindow':8,'GetParent':4},
  'GDI32':{'SetPixel':16,'GetPixel':12,'GetClipBox':8},
- 'KERNEL32':{'GetModuleHandleA':4,'GetLastError':0,'lstrlenA':4,'ExitProcess':4,'GetWindowsDirectoryA':8,'GetSystemDirectoryA':8,'lstrcmpiA':8,'LoadLibraryA':4,'FreeLibrary':4},
+ 'KERNEL32':{'Sleep':4,'GetModuleHandleA':4,'GetLastError':0,'lstrlenA':4,'ExitProcess':4,'GetWindowsDirectoryA':8,'GetSystemDirectoryA':8,'lstrcmpiA':8,'LoadLibraryA':4,'FreeLibrary':4},
+ 'WINMM':{'waveOutGetNumDevs':0,'waveOutOpen':24,'waveOutPrepareHeader':12,'waveOutPause':4,'waveOutWrite':12,'waveOutRestart':4,'waveOutGetPosition':12,'waveOutUnprepareHeader':12,'waveOutClose':4},
  'RETROOS':{'RetroWriteFile':20},
 }
 imports['KERNEL32'].update({'GlobalMemoryStatusEx':4,'GlobalMemoryStatus':4})

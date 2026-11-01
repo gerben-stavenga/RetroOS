@@ -2280,7 +2280,8 @@ pub(crate) fn win16_int21<A: crate::Arch>(
         return thread::KernelAction::Done;
     }
     dos::sync_win16_handles(machine, kt, dos);
-    mode_transitions::push_iret_frame(machine, &dos.ldt[..], regs, false,
+    // Direct NE calls and Wine's flat DLL adapter use their own return width.
+    mode_transitions::push_iret_frame(machine, &dos.ldt[..], regs, A::seg_is_32(regs.code_seg()),
         regs.ip32(), regs.code_seg(), machine::guest_flags(regs));
     dos::pmdos_int21_handler(machine, bios, kt, dos, regs)
 }

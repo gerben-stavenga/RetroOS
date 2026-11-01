@@ -7,7 +7,7 @@ Upstream source: https://dl.winehq.org/wine/source/11.0/wine-11.0.tar.xz
 SHA256: c07a6857933c1fc60dff5448d79f39c92481c1e9db5aa628db9d0358446e0701
 Repository: https://gitlab.winehq.org/wine/wine/-/tree/wine-11.0
 Wine sources retain their original copyright and LGPL notices.
-The WineHQ PE DLLs are unmodified except NTDLL, KERNEL32, KERNELBASE, KRNL386.EXE16 and WIN32U, built
+The WineHQ PE DLLs are unmodified except NTDLL, KERNEL32, KERNELBASE, KRNL386.EXE16, WIN32U, WS2_32, WINED3D, WINMM and MMSYSTEM.DLL16, built
 from complete Wine 11.0 PE-side sources. lib/wine/build_ntdll.py adapts its i386
 system-call veneers and Unix host-call connections to named RETROOS.DLL
 imports. Its PE loader defaults to C:\RETROOS\WINDOWS, matching the bundled
@@ -19,7 +19,11 @@ small added exports, including initial NE task entry through Wine's own
 module loader and TDB/TIB setup, the initial task event, and winevdm's
 GDI/USER/MMSYSTEM initialization order. Its selector initialization preserves descriptors already
 allocated by the RetroOS NE loader. DOS memory allocation uses RetroOS's
-existing DOS allocator and preserves the installed BIOS/IVT. The Win16-to-32-bit
+existing DOS allocator and preserves the installed BIOS/IVT. Wine's INT 21h
+dispatcher is replaced by a RETROOS.DLL register adapter to the same protected-mode
+DOS services used by direct guest interrupts. Wine's private DOS file-handle
+table is removed: DOS handles are native file descriptors, and Windows file
+handles wrap those descriptors with the normal RetroOS handle tag. The Win16-to-32-bit
 relay clears DF before entering compiled PE code, after saving caller flags for
 register-entry APIs.
 
@@ -31,7 +35,7 @@ font selection, metrics and rasterization remain in Wine userspace. Server reque
 imports, not Unix host calls. User callbacks call Wine's own NTDLL dispatcher
 through a userspace wrapper; NtCallbackReturn restores that wrapper without
 a kernel transition. Nested callbacks keep separate return-data buffers in FLS.
-All five source-built DLLs retain Wine's LGPL
+All source-built Wine DLLs retain Wine's LGPL
 terms. RETROOS.DLL is separate; server.c includes Wine's directory-mask matcher
 from dlls/ntdll/unix/file.c under LGPL-2.1-or-later, with its notices retained.
 The adapter marshals Wine server requests to native object primitives and NT
@@ -39,6 +43,23 @@ directory queries to the VFS. NLS data is shipped from the same Wine source.
 graphics.c is compiled into WIN32U as its RetroOS USER display driver. It uses
 RetroGraphics in RETROOS.DLL for virtual-screen discovery and software-surface
 transport to the native compositor; it does not call a Unix graphics backend.
+
+WS2_32 replaces Unix name-service calls with named RetroNet imports. Hostname
+queries work; DNS name/address lookup currently returns an explicit offline error.
+WINED3D defaults to Wine's software (NO3D) adapter and delay-loads OpenGL instead
+of requiring a Unix OpenGL driver for DirectDraw startup.
+
+WINMM uses Wine's driver-based waveform wrappers from Wine 1.2
+(dlls/winmm/winmm.c, retained in waveform-driver.c with LGPL notices):
+https://github.com/wine-mirror/wine/blob/wine-1.2/dlls/winmm/winmm.c
+Original source SHA256: ce27cd9dd18fe0e1dfbe0e7db6b3e32b909846ab5473a68f1305137b573451e2
+These wrappers target Wine 11's existing multimedia-driver interface and the
+RETROOS.DLL PCM driver in wave.c. PCM sources use the canonical RetroOS audio
+mixer; buffer completion follows its playback cursor. The current backend
+supports mono/stereo 8/16-bit PCM, pause/reset, volume and completion callbacks.
+Looped headers and compressed formats are not implemented. MMSYSTEM's Win16
+MMIO buffer aliases cover the complete buffer at offset zero, and are released
+on close/replacement; 64 KiB buffers no longer overrun a sliding MapLS window.
 
 Build prerequisites: Linux x86-64, Clang 19/LLD (i386 Windows target), llvm-dlltool,
 llvm-ar, GCC, make, patch, bison, dpkg-deb and Python 3. Flex is fetched at a pinned version.

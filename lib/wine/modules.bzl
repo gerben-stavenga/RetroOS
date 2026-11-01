@@ -9,17 +9,16 @@ WINE_DLLS = [
     "advapi32", "combase", "comctl32", "comdlg32", "coml2", "gdi32",
     "imm32", "msacm32", "msvcrt", "ole32",
     "oleaut32", "rpcrt4", "sechost", "shcore", "shell32", "shlwapi",
-    "ucrtbase", "user32", "version", "winmm", "mpr", "cryptbase", "msvfw32",
-    "wsock32", "dplayx", "iphlpapi", "ws2_32", "dnsapi", "nsi",
+    "ucrtbase", "user32", "version", "mpr", "cryptbase", "msvfw32",
+    "wsock32", "dplayx", "iphlpapi", "dnsapi", "nsi",
     "avifil32",
     "ddraw",
-    "wined3d",
     "opengl32", "uxtheme",
 ]
 
 # These are PE modules containing Wine's Win16 adapters, not standalone NE
 # DLLs. Preserve their names; the WOW loader must bind their 16-bit exports.
-WINE_WIN16 = [ "user.exe16", "gdi.exe16", "mmsystem.dll16", "commdlg.dll16", "win87em.dll16", "system.drv16", "comm.drv16", "sound.drv16", "keyboard.drv16", "msvideo.dll16", "shell.dll16", "mouse.drv16", "display.drv16"]
+WINE_WIN16 = [ "user.exe16", "gdi.exe16", "commdlg.dll16", "win87em.dll16", "system.drv16", "comm.drv16", "sound.drv16", "keyboard.drv16", "msvideo.dll16", "avifile.dll16", "toolhelp.dll16", "wing.dll16", "shell.dll16", "mouse.drv16", "display.drv16"]
 
 WINE_FILES = {
     "//lib/wine:" + name + "_dll": "RETROOS/WINDOWS/SYSTEM32/" + name.upper() + ".DLL"
@@ -33,6 +32,10 @@ WINE_FILES.update({
     "//lib/wine/ntdll:KRNL386.EXE16": "RETROOS/WINDOWS/SYSTEM/KRNL386.EXE16",
     "//lib/wine/ntdll:WIN32U.DLL": "RETROOS/WINDOWS/SYSTEM32/WIN32U.DLL",
     "//lib/wine/ntdll:KERNEL32.DLL": "RETROOS/WINDOWS/SYSTEM32/KERNEL32.DLL",
+    "//lib/wine/ntdll:MMSYSTEM.DLL16": "RETROOS/WINDOWS/SYSTEM/MMSYSTEM.DLL16",
+    "//lib/wine/ntdll:WINMM.DLL": "RETROOS/WINDOWS/SYSTEM32/WINMM.DLL",
+    "//lib/wine/ntdll:WINED3D.DLL": "RETROOS/WINDOWS/SYSTEM32/WINED3D.DLL",
+    "//lib/wine/ntdll:WS2_32.DLL": "RETROOS/WINDOWS/SYSTEM32/WS2_32.DLL",
     "//lib/wine/ntdll:KERNELBASE.DLL": "RETROOS/WINDOWS/SYSTEM32/KERNELBASE.DLL",
     "//lib/wine/ntdll:NTDLL.DLL": "RETROOS/WINDOWS/SYSTEM32/NTDLL.DLL",
     "//lib/wine:retroos_dll": "RETROOS/WINDOWS/SYSTEM32/RETROOS.DLL",

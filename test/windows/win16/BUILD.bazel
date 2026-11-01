@@ -151,3 +151,15 @@ windows16_binary(name="keyboard", obj=":keyboard_obj", imports={
     "SetActiveWindow":"USER.59", "SetFocus":"USER.22", "GetMessage":"USER.108",
     "TranslateMessage":"USER.113", "DispatchMessage":"USER.114",
 }, visibility=["//visibility:public"])
+
+nasm_library(name="dos_files_obj", srcs=["dos_files.asm"], copts=["-fobj"])
+windows16_binary(name="dos_files", obj=":dos_files_obj", imports={
+    "InitTask":"KERNEL.91", "DOS3Call":"KERNEL.102",
+    "_lcreat":"KERNEL.83", "_lwrite":"KERNEL.86", "_lread":"KERNEL.82", "_lclose":"KERNEL.81",
+}, visibility=["//visibility:public"])
+
+nasm_library(name="mmio_buffer_obj", srcs=["mmio_buffer.asm"], copts=["-fobj"])
+windows16_binary(name="mmio_buffer", obj=":mmio_buffer_obj", imports={
+    "mmioOpen":"MMSYSTEM.1210", "mmioClose":"MMSYSTEM.1211", "mmioGetInfo":"MMSYSTEM.1215",
+    "GetSelectorLimit":"KERNEL.188",
+}, visibility=["//visibility:public"])

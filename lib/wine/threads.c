@@ -82,6 +82,13 @@ NTSTATUS WINAPI RetroNtQueryInformationThread(HANDLE handle,THREADINFOCLASS clas
 
 extern NTSTATUS WINAPI RetroRestoreContext(const ULONG *);
 extern NTSTATUS WINAPI RetroWineDispatchException(EXCEPTION_RECORD *,CONTEXT *);
+extern NTSTATUS WINAPI RetroNtTerminateProcess(HANDLE,NTSTATUS);
+NTSTATUS WINAPI RetroNtRaiseException(EXCEPTION_RECORD *record,CONTEXT *context,BOOLEAN first_chance)
+{
+    if (!record || !context) return STATUS_INVALID_PARAMETER;
+    if (first_chance) return RetroWineDispatchException(record,context);
+    return RetroNtTerminateProcess(GetCurrentProcess(),record->ExceptionCode);
+}
 NTSTATUS WINAPI RetroNtContinue(CONTEXT *context,BOOLEAN alertable)
 {
     ULONG p[16];

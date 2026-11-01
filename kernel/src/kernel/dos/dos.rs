@@ -144,7 +144,7 @@ fn suspend_dos_call<A: crate::Arch>(
         finish_dos_call(machine, dos, regs);
         super::DosReturnFrame::Vm86 { ip, cs, flags }
     } else {
-        let use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
+        let use32 = dos.dpmi.as_ref().map_or(dos.pm_dos && A::seg_is_32(regs.code_seg()), |d| d.client_use32);
         let (eip, cs, eflags) = super::mode_transitions::pop_iret_frame(
             machine, &dos.ldt[..], regs, use32,
         );
@@ -604,7 +604,7 @@ fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A
         machine::vm86_iret(machine, regs);
     } else {
         let post_handler_status = regs.flags32() & DOS_STATUS_MASK;
-        let client_use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
+        let client_use32 = dos.dpmi.as_ref().map_or(dos.pm_dos && A::seg_is_32(regs.code_seg()), |d| d.client_use32);
         let (ret_eip, ret_cs, ret_flags) =
             super::mode_transitions::pop_iret_frame(machine, &dos.ldt[..], regs, client_use32);
         regs.set_ip32(ret_eip);

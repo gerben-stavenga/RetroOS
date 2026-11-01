@@ -10,6 +10,7 @@ pub mod pe;
 pub mod ne;
 mod atoms;
 mod memory;
+mod named;
 mod registry;
 mod native_file;
 mod session;
@@ -33,7 +34,6 @@ use alloc::{vec, vec::Vec};
 
 const GATE_VECTOR: u8 = 0x83;
 const DLL_BASE_FIRST: u32 = 0x1000_0000;
-const DLL_BASE_STRIDE: u32 = 0x0100_0000;
 const STACK_TOP: u32 = 0xbff0_0000;
 pub(super) const USER_LIMIT: u32 = 0xc000_0000;
 // Wine places 0x800 bytes of per-thread debug storage after the TEB.
@@ -130,7 +130,9 @@ enum Api {
     SystemInfo,
     ClearTls,
     FileKind,
+    Pcm,
     NativeFile,
+    NamedObject,
     Session,
     Section,
     MemoryQuery,
@@ -169,7 +171,25 @@ struct Module {
     path: Vec<u8>,
     data: Vec<u8>,
     base: u32,
+    size: u32,
 }
+impl Module {
+    fn contains(&self, address: u32) -> bool {
+        address >= self.base && address - self.base < self.size
+    }
+}
+
+// DLLs share the image arena, aligned to Windows allocation granularity.
+// Reserve the actual image extent rather than an arbitrary fixed DLL slot.
+fn dll_base(modules: &[Module], size: u32) -> Result<u32, i32> {
+    if size == 0 { return Err(8); }
+    let end = modules.iter().try_fold(DLL_BASE_FIRST, |end, module|
+        module.base.checked_add(module.size).map(|next| end.max(next)).ok_or(8))?;
+    let base = end.checked_add(65535).ok_or(8)? & !65535;
+    if base.checked_add(size).is_none_or(|end| end > HEAP_BASE) { return Err(8); }
+    Ok(base)
+}
+
 
 pub(super) struct Window {
     hwnd: u32,
@@ -217,6 +237,8 @@ impl<A: crate::Arch> WindowsProcess<A> {
         }
     }
     pub fn on_exit(&mut self, machine: &mut A, regs: &mut Regs) {
+        self.state.pcm.clear();
+        named::release(machine, &mut self.state);
         if let Some(dos) = &mut self.dos { dos.on_exit(machine, regs, false); }
     }
 }
@@ -237,6 +259,7 @@ pub struct WindowsState {
     pub(crate) environment: Vec<u8>,
     gates: Vec<Gate>,
     threads: threads::State,
+    pcm: super::sound::pcm::Handles,
     exceptions: exceptions::State,
     registry: registry::Handles,
     ldt: Vec<u64>,
@@ -294,6 +317,7 @@ impl WindowsState {
             environment: environment::windows_environment(&[]),
             gates: Vec::new(),
             threads: threads::State::default(),
+            pcm: Default::default(),
             exceptions: exceptions::State::default(),
             registry: registry::Handles::default(),
             ldt: vec![0],
@@ -696,11 +720,9 @@ fn ensure_dependency(modules: &mut Vec<Module>, name: &[u8], importer: usize) ->
     let image = pe::Image::parse(&data).map_err(|_| 8)?;
     if !image.is_dll() { return Err(8); }
     let index = modules.len();
-    let base = DLL_BASE_FIRST.checked_add((index as u32 - 1).checked_mul(DLL_BASE_STRIDE).ok_or(8)?).ok_or(8)?;
-    if image.header.size_image > DLL_BASE_STRIDE || base.checked_add(image.header.size_image).is_none_or(|end| end > HEAP_BASE) {
-        return Err(8);
-    }
-    modules.push(Module { name: module_name(name), path, data, base });
+    let size = image.header.size_image;
+    let base = dll_base(modules, size)?;
+    modules.push(Module { name: module_name(name), path, data, base, size });
     Ok(index)
 }
 
@@ -772,7 +794,7 @@ fn dll_initializers(modules: &[Module], start: usize) -> Result<Vec<(u32, u32)>,
             let dependency = find_module(modules, &import.module).ok_or(2)?;
             visit(modules, dependency, start, seen, output)?;
             let address = resolve_export(modules, dependency, &import.symbol)?;
-            if let Some(target) = modules.iter().position(|m| address >= m.base && address - m.base < DLL_BASE_STRIDE) {
+            if let Some(target) = modules.iter().position(|m| m.contains(address)) {
                 visit(modules, target, start, seen, output)?;
             }
         }
@@ -794,7 +816,7 @@ fn rollback_modules<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, s
         }
     }
     state.gates.retain(|gate| !state.modules[start..].iter().any(|module|
-        gate.return_ip >= module.base && gate.return_ip - module.base < DLL_BASE_STRIDE));
+        module.contains(gate.return_ip)));
     state.modules.truncate(start);
 }
 
@@ -813,12 +835,12 @@ fn load_library<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, name:
     let image=pe::Image::parse(&data).map_err(|_|193u32)?;
     if !image.is_dll() {return Err(193);}
     let start=state.modules.len();
-    let base=DLL_BASE_FIRST.checked_add((start as u32-1).checked_mul(DLL_BASE_STRIDE).ok_or(8u32)?).ok_or(8u32)?;
-    if image.header.size_image > DLL_BASE_STRIDE || base.checked_add(image.header.size_image).is_none_or(|end| end > HEAP_BASE) { return Err(8); }
+    let size = image.header.size_image;
+    let base = dll_base(&state.modules, size).map_err(|e| e as u32)?;
     if crate::kernel::startup::trace_enabled() {
         crate::compact_dbg_println!("[win32-load] {} base={:08x}",core::str::from_utf8(&path).unwrap_or("?"),base);
     }
-    state.modules.push(Module{name:module_name(file),path,data,base});
+    state.modules.push(Module{name:module_name(file),path,data,base,size});
     let result=(|| {
         load_import_dependencies(&mut state.modules, start).map_err(|e| e as u32)?;
         for module in &state.modules[start..] {map_module(machine,module).map_err(|_|8u32)?;}
@@ -886,9 +908,11 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
     (b"RETROOS", b"RetroRegistry", Api::Registry, 28),
     (b"RETROOS", b"RetroClock", Api::Clock, 4),
     (b"RETROOS", b"RetroMemoryProtect", Api::MemoryProtect, 12),
+    (b"RETROOS", b"RetroNamed", Api::NamedObject, 24),
     (b"RETROOS", b"RetroSystemInfo", Api::SystemInfo, 4),
     (b"RETROOS", b"RetroClearTls", Api::ClearTls, 4),
     (b"RETROOS", b"RetroFileKind", Api::FileKind, 4),
+    (b"RETROOS", b"RetroPcm", Api::Pcm, 24),
     (b"RETROOS", b"RetroFile", Api::NativeFile, 28),
     (b"RETROOS", b"RetroSession", Api::Session, 24),
     (b"RETROOS", b"RetroSection", Api::Section, 24),
@@ -1053,6 +1077,7 @@ pub fn exec_pe_into<A: crate::Arch>(
         path: main_path.clone(),
         data,
         base: main_header.image_base,
+        size: main_header.size_image,
     }];
     load_import_dependencies(&mut modules, 0)?;
     for module in &modules {
@@ -1400,7 +1425,9 @@ fn dispatch<A: crate::Arch>(
         },
         Api::Section => sections::call(machine, kt, state, core::array::from_fn(|i| arg(machine, regs, i))),
         Api::Session => session::call(machine, state, core::array::from_fn(|i| arg(machine, regs, i))),
+        Api::NamedObject => named::call(machine, state, core::array::from_fn(|i| arg(machine, regs, i))),
         Api::NativeFile => native_file::call(machine, kt, state, core::array::from_fn(|i| arg(machine, regs, i))),
+        Api::Pcm => super::sound::pcm::call(machine, &mut state.pcm, core::array::from_fn(|i| arg(machine, regs, i))),
         Api::FileKind => match kt.fds.get(arg(machine, regs, 0) as usize) {
             Some(thread::FdKind::Vfs(_) | thread::FdKind::Dir { .. }) => 1,
             Some(thread::FdKind::ConsoleOut) => 2,
@@ -1503,6 +1530,11 @@ pub fn handle_event<A: crate::Arch>(
         return action;
     }
     match event {
+        crate::KernelEvent::SoftInt(0x21) if process.dos.is_some() =>
+            win16::dos_call(machine, bios, kt, state, process.dos.as_mut().unwrap(), regs),
+        crate::KernelEvent::Hlt if process.dos.is_some() =>
+            crate::kernel::dos::win16_resume(machine, kt, process.dos.as_mut().unwrap(), regs)
+                .unwrap_or(thread::KernelAction::Done),
         crate::KernelEvent::Irq => {
             if !threads::schedule(machine,state,regs) {kt.state=thread::ThreadState::Blocked;} thread::KernelAction::Done },
         crate::KernelEvent::SoftInt(GATE_VECTOR) => {
@@ -1529,7 +1561,7 @@ pub fn handle_event<A: crate::Arch>(
                 }
                 let caller = machine.read::<u32>(regs.sp32() as usize + 8);
                 for module in &state.modules {
-                    if caller >= module.base && caller - module.base < DLL_BASE_STRIDE {
+                    if module.contains(caller) {
                         crate::compact_println!("Wine backend caller: {}+{:#x}", core::str::from_utf8(&module.name).unwrap_or("?"), caller - module.base);
                     }
                 }
@@ -1538,7 +1570,7 @@ pub fn handle_event<A: crate::Arch>(
                     if frame < state.stack_base || frame.checked_add(8).is_none_or(|end| end > state.stack_base + state.stack_size) { break; }
                     let caller = machine.read::<u32>(frame as usize + 4);
                     for module in &state.modules {
-                        if caller >= module.base && caller - module.base < DLL_BASE_STRIDE {
+                        if module.contains(caller) {
                             crate::compact_println!("Wine backend frame: {}+{:#x}", core::str::from_utf8(&module.name).unwrap_or("?"), caller - module.base);
                         }
                     }
@@ -1603,7 +1635,7 @@ pub fn handle_event<A: crate::Arch>(
             crate::compact_println!("Windows: unhandled event {:?} at {:#x}", event, regs.ip32());
             crate::compact_println!("Windows fault: cs={:#x} ss={:#x} fs={:#x} ds={:#x} es={:#x} sp={:#x} ax={:#x} bx={:#x} cx={:#x} dx={:#x}",regs.frame.cs,regs.frame.ss,regs.fs,regs.ds,regs.es,regs.sp32(),regs.rax,regs.rbx,regs.rcx,regs.rdx);
             for module in &state.modules {
-                if regs.ip32()>=module.base && regs.ip32()-module.base<DLL_BASE_STRIDE {
+                if module.contains(regs.ip32()) {
                     crate::compact_println!("Windows fault in {}+{:#x}",core::str::from_utf8(&module.name).unwrap_or("?"),regs.ip32()-module.base);
                 }
             }
@@ -1618,7 +1650,31 @@ mod forwarder_tests {
     use super::*;
 
     fn module(name: &[u8], base: u32, forward: Option<&[u8]>) -> Module {
-        Module { name: name.to_vec(), path: name.to_vec(), base, data: pe::export_test_image(forward) }
+        let data = pe::export_test_image(forward);
+        let size = pe::Image::parse(&data).unwrap().header.size_image;
+        Module { name: name.to_vec(), path: name.to_vec(), base, data, size }
+    }
+
+    #[test]
+    fn large_dlls_reserve_their_full_image_and_keep_next_load_aligned() {
+        let mut large = module(b"LARGE.DLL", DLL_BASE_FIRST, None);
+        large.size = 0x0175_f000; // Wine's WINED3D exceeds the former 16 MiB slot.
+        assert_eq!(dll_base(core::slice::from_ref(&large), 0x2000), Ok(0x1176_0000));
+        assert!(large.contains(large.base + large.size - 1));
+        assert!(!large.contains(large.base + large.size));
+        assert!(!large.contains(0x1176_0000));
+        let next = module(b"NEXT.DLL", 0x1176_0000, None);
+        assert_eq!(dll_base(&[large, next], 0x1000), Ok(0x1177_0000));
+    }
+
+    #[test]
+    fn dll_arena_rejects_overflow_and_exhaustion() {
+        let mut full = module(b"FULL.DLL", HEAP_BASE - 65536, None);
+        full.size = 65536;
+        assert_eq!(dll_base(core::slice::from_ref(&full), 1), Err(8));
+        full.base = u32::MAX;
+        assert_eq!(dll_base(&[full], 1), Err(8));
+        assert_eq!(dll_base(&[], 0), Err(8));
     }
 
     #[test]

@@ -35,6 +35,29 @@ pub extern "system" fn RetroNtYieldExecution() -> u32 {
     0
 }
 
+// Name service is optional: starting Winsock must work on an offline host.
+// Report a resolver failure until the native DNS service is connected, rather
+// than refusing to load every application that imports Winsock.
+macro_rules! unavailable_name_service {
+    ($($name:ident),*) => {$(
+        #[unsafe(no_mangle)]
+        pub extern "system" fn $name(_parameters: *mut u8) -> u32 { 11003 } // WSANO_RECOVERY
+    )*};
+}
+unavailable_name_service!(RetroNetGetAddrInfo, RetroNetGetHostByAddr,
+    RetroNetGetHostByName, RetroNetGetNameInfo);
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn RetroNetGetHostName(parameters: *const u32) -> u32 {
+    if parameters.is_null() { return 10014; } // WSAEFAULT
+    let address = unsafe { parameters.read_unaligned() } as *mut u8;
+    let size = unsafe { parameters.add(1).read_unaligned() };
+    let name = b"RetroOS\0";
+    if address.is_null() || size < name.len() as u32 { return 10014; }
+    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), address, name.len()); }
+    0
+}
+
 #[repr(C)]
 pub struct DebugWrite {
     bytes: *const u8,
@@ -443,6 +466,8 @@ pub unsafe extern "system" fn RetroNtOpenKeyEx(
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn RetroNtClose(handle: u32) -> u32 {
+    if named_handle(handle) {return unsafe { RetroNamed(9,handle,0,0,0,core::ptr::null_mut()) };}
+
     if handle & 0xff000000 == 0x74000000 {
         return unsafe { RetroUserObject(4, handle, 0, 0, 0, core::ptr::null_mut()) };
     }
@@ -891,6 +916,10 @@ pub struct IoStatus {
     information: u32,
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "system" fn RetroNtAreMappedFilesTheSame(first: u32, second: u32) -> u32 {
+    unsafe { RetroSection(5, first, second, 0, 0, core::ptr::null_mut()) }
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "system" fn RetroNtQueryVolumeInformationFile(
     handle: u32,
     io: *mut IoStatus,
@@ -941,6 +970,9 @@ pub unsafe extern "system" fn RetroNtCreateEvent(
     if out.is_null() || kind > 1 {
         return INVALID_PARAMETER;
     }
+    if unsafe { has_object_name(attr) } {
+        return unsafe { RetroNamed(3, 0, attr as u32, kind, initial as u32, out) };
+    }
     if !attr.is_null() {
         let a = unsafe { &*attr };
         if a.length != 24 {
@@ -961,14 +993,20 @@ pub unsafe extern "system" fn RetroNtCreateEvent(
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn RetroNtSetEvent(handle: u32, previous: *mut u32) -> u32 {
+    if named_handle(handle) {return unsafe {RetroNamed(6,handle,0,0,0,previous)};}
+
     unsafe { RetroEvent(1, handle, 0, previous) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn RetroNtResetEvent(handle: u32, previous: *mut u32) -> u32 {
+    if named_handle(handle) {return unsafe {RetroNamed(7,handle,0,0,0,previous)};}
+
     unsafe { RetroEvent(2, handle, 0, previous) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn RetroNtClearEvent(handle: u32) -> u32 {
+    if named_handle(handle) {return unsafe {RetroNamed(7,handle,0,0,0,core::ptr::null_mut())};}
+
     unsafe { RetroEvent(2, handle, 0, core::ptr::null_mut()) }
 }
 #[unsafe(no_mangle)]
@@ -993,6 +1031,7 @@ pub unsafe extern "system" fn RetroNtQueryEvent(
     if out.is_null() {
         return INVALID_PARAMETER;
     }
+    if named_handle(handle) { return unsafe {RetroNamed(12,handle,0,0,0,out)}; }
     let mut flags = 0;
     let status = unsafe { RetroEvent(4, handle, 0, &mut flags) };
     if status == 0 {
@@ -1319,7 +1358,9 @@ pub unsafe extern "system" fn RetroNtMapViewOfSection(
     }
     let mut info = [unsafe { *base }, 0];
     let status = unsafe {
-        if handle & 0xff000000 == 0x76000000 {
+        if named_handle(handle) {
+            RetroNamed(21, handle, start as u32, *size, protection, info.as_mut_ptr())
+        } else if handle & 0xff000000 == 0x76000000 {
             RetroSection(
                 1,
                 handle,
@@ -1352,6 +1393,8 @@ pub unsafe extern "system" fn RetroNtUnmapViewOfSection(process: u32, base: u32)
     if process != u32::MAX {
         return 0xc0000008;
     }
+    let status = unsafe {RetroNamed(22,base,0,0,0,core::ptr::null_mut())};
+    if status != 0xc0000019 {return status;}
     let status = unsafe { RetroSection(3, base, 0, 0, 0, core::ptr::null_mut()) };
     if status == 0xc0000019 {
         unsafe { RetroSession(3, base, 0, 0, 0, core::ptr::null_mut()) }
@@ -1600,6 +1643,13 @@ pub unsafe extern "system" fn RetroNtCreateSection(
     if out.is_null() {
         return INVALID_PARAMETER;
     }
+    if file == 0 || file == u32::MAX {
+        if maximum.is_null() {return INVALID_PARAMETER;}
+        let size = unsafe { maximum.read_unaligned() };
+        if !(1..=u32::MAX as i64).contains(&size) {return INVALID_PARAMETER;}
+        if attributes & !0x08000000 != 0 {return NOT_SUPPORTED;}
+        return unsafe {RetroNamed(20,0,attr as u32,size as u32,protection,out)};
+    }
     if file & 0xffff0000 != 0x40000000 {
         return NOT_SUPPORTED;
     }
@@ -1667,6 +1717,29 @@ pub unsafe extern "system" fn RetroNtQueryVirtualMemory(
         return INVALID_PARAMETER;
     }
     unsafe { RetroMemoryQuery(address, out) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn RetroNtFlushVirtualMemory(
+    process: u32, address: *mut u32, size: *mut u32, _unknown: u32,
+) -> u32 {
+    if process != u32::MAX {return 0xc0000008;}
+    if address.is_null() || size.is_null() {return INVALID_PARAMETER;}
+    let start = unsafe {*address} & !4095;
+    let mut info = [0u32; 7];
+    let status = unsafe {RetroNtQueryVirtualMemory(process,start,0,info.as_mut_ptr() as *mut u8,28,core::ptr::null_mut())};
+    if status != 0 {return status;}
+    if info[4] != 0x1000 {return INVALID_PARAMETER;}
+    let length = unsafe {*size};
+    let length = if length == 0 {info[3]} else {
+        let Some(length) = length.checked_add(unsafe {*address} - start)
+            .and_then(|n|n.checked_add(4095)).map(|n|n & !4095) else {return INVALID_PARAMETER;};
+        if length > info[3] {return INVALID_PARAMETER;} length
+    };
+    // Anonymous shared sections already expose the same physical RAM to every
+    // view. Existing file-backed views are read-only and have nothing to write.
+    unsafe {*address = start; *size = length;}
+    0
 }
 
 unsafe fn wait_milliseconds(timeout: *const i64) -> Result<u64, u32> {
@@ -1862,6 +1935,13 @@ unsafe extern "system" {
         reserved: u32,
     ) -> u32;
 }
+unsafe extern "system" {
+    fn RetroNamed(op: u32, handle: u32, a: u32, b: u32, c: u32, out: *mut u32) -> u32;
+}
+fn named_handle(handle: u32) -> bool { handle & 0xff000000 == 0x77000000 }
+unsafe fn has_object_name(attr: *const ObjectAttributes) -> bool {
+    !attr.is_null() && unsafe { (*attr).root != 0 || !(*attr).name.is_null() && (*(*attr).name).length != 0 }
+}
 unsafe fn unnamed_attributes(attr: *const ObjectAttributes) -> u32 {
     if !attr.is_null() {
         let a = unsafe { &*attr };
@@ -1885,6 +1965,9 @@ pub unsafe extern "system" fn RetroNtCreateSemaphore(
     if out.is_null() || initial < 0 || maximum <= 0 || initial > maximum {
         return INVALID_PARAMETER;
     }
+    if unsafe { has_object_name(attr) } {
+        return unsafe { RetroNamed(1, 0, attr as u32, initial as u32, maximum as u32, out) };
+    }
     let status = unsafe { unnamed_attributes(attr) };
     if status != 0 {
         return status;
@@ -1901,6 +1984,9 @@ pub unsafe extern "system" fn RetroNtCreateMutant(
     if out.is_null() {
         return INVALID_PARAMETER;
     }
+    if unsafe { has_object_name(attr) } {
+        return unsafe { RetroNamed(2, 0, attr as u32, initial as u32, 0, out) };
+    }
     let status = unsafe { unnamed_attributes(attr) };
     if status != 0 {
         return status;
@@ -1916,10 +2002,13 @@ pub unsafe extern "system" fn RetroNtReleaseSemaphore(
     if count <= 0 {
         return INVALID_PARAMETER;
     }
+    if named_handle(handle) {return unsafe {RetroNamed(4,handle,count as u32,0,0,previous)};}
     unsafe { RetroSync(2, handle, count as u32, 0, previous, 0) }
 }
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn RetroNtReleaseMutant(handle: u32, previous: *mut u32) -> u32 {
+    if named_handle(handle) {return unsafe {RetroNamed(5,handle,0,0,0,previous)};}
+
     unsafe { RetroSync(3, handle, 0, 0, previous, 0) }
 }
 unsafe fn query_sync(
@@ -1944,6 +2033,7 @@ unsafe fn query_sync(
     if out.is_null() {
         return INVALID_PARAMETER;
     }
+    if named_handle(handle) {return unsafe {RetroNamed(if op == 4 {10}else{11},handle,0,0,0,out)};}
     unsafe { RetroSync(op, handle, 0, 0, out, 0) }
 }
 #[unsafe(no_mangle)]

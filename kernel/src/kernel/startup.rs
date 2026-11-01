@@ -1875,6 +1875,10 @@ fn event_loop<A: crate::Arch>(
                 ),
                 None => machine.idle(),
             }
+            // Hosted timers normally wake us by returning from a guest slice.
+            // With every guest thread asleep there is no slice; sample time
+            // after idle too, so audio and other timed services keep advancing.
+            irq_clock_wakeup = true;
             continue;
         }
 

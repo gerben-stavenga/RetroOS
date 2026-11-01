@@ -44,6 +44,7 @@ struct Mutant {
 }
 #[derive(Default)]
 pub(super) struct State {
+    pub(super) named: named::State,
     contexts: Vec<Context>,
     events: Vec<Event>,
     semaphores: Vec<Semaphore>,
@@ -85,6 +86,7 @@ pub(super) fn signal(t: &mut State, handle: u32) -> bool {
 }
 
 fn signaled(t: &mut State, handle: u32, id: u32) -> Option<bool> {
+    if named::is_handle(handle) { return named::ready(&t.named,handle,id,true); }
     if let Some(s) = t.semaphores.iter_mut().find(|s| s.handle == handle) {
         if s.count == 0 {
             return Some(false);
@@ -120,6 +122,7 @@ fn signaled(t: &mut State, handle: u32, id: u32) -> Option<bool> {
 
 // Test readiness without consuming auto-reset events or acquiring mutexes.
 fn ready(t: &State, handle: u32, id: u32) -> Option<bool> {
+    if named::is_handle(handle) { return named::ready(&t.named,handle,id,false); }
     if let Some(s) = t.semaphores.iter().find(|s| s.handle == handle) {
         return Some(s.count != 0);
     }
@@ -140,6 +143,7 @@ fn ready(t: &State, handle: u32, id: u32) -> Option<bool> {
     None
 }
 fn multiple(t: &mut State, handles: &[u32], all: bool, id: u32) -> Result<Option<u32>, ()> {
+    let _serial = handles.iter().any(|&h| named::is_handle(h)).then(|| named::WAIT_LOCK.lock());
     let mut first = None;
     let mut every = true;
     for (i, &h) in handles.iter().enumerate() {
