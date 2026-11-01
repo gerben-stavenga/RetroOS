@@ -111,7 +111,7 @@ def main():
     smbd=os.environ.get('SMB_TEST_SMBD') or shutil.which('smbd')
     pdbedit=os.environ.get('SMB_TEST_PDBEDIT') or shutil.which('pdbedit')
     if not smbd or not pdbedit:
-        print('SKIP: Samba smbd and pdbedit required');return
+        raise SystemExit('Samba smbd and pdbedit are required for the SMB test')
     work=Path(tempfile.mkdtemp(prefix='retroos-smb-'));print('Artifacts:',work,flush=True)
     for directory in ['private','lock','cache','state','run','share']:(work/directory).mkdir()
     (work/'share/seed.txt').write_bytes(b'SMB seed!\n')
@@ -187,6 +187,14 @@ valid users = {username}
                     subprocess.run(service_prefix + ['kill', '-TERM', '--', '-' + str(server.pid)], check=False)
                 else:
                     os.killpg(server.pid,signal.SIGTERM)
-            server.wait(timeout=5)
+            try:
+                server.wait(timeout=5)
+            finally:
+                if service_prefix:
+                    # smbd creates root-owned private state (notably ncalrpc).
+                    # Return this fixture to its owner before Bazel removes it.
+                    # Do not follow any symlinks in the exported test share.
+                    run(*service_prefix, 'chown', '-hR', '--',
+                        f'{os.getuid()}:{os.getgid()}', work)
 
 if __name__=='__main__':main()
