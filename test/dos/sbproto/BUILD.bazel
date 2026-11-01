@@ -1,3 +1,5 @@
+
+package(default_visibility = ["//tests:__pkg__"])
 # Sound Blaster completion-protocol probes (see the .asm headers). SBTEST
 # runs in CI (test/hosted_games.sh); SBDOOR is a manual stream-continuity
 # tool whose real-time phases are too slow for the TCG engine.

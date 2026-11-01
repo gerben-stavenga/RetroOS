@@ -6,7 +6,6 @@ from virtio_net import run, session
 
 
 def main():
-    run('bazelisk', 'build', '//:boot_disk')
     work = Path(tempfile.mkdtemp(prefix='retroos-intel-net-'))
     print('Artifacts:', work, flush=True)
     for device, controller in [('e1000', '82540EM'), ('e1000e', '82574L')]:

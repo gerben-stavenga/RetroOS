@@ -14,10 +14,6 @@ def main():
     if engine not in ("tcg", "kvm"):
         raise SystemExit(f"Unknown ENGINE: {engine}")
     target = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
-    subprocess.run([
-        "bazelisk", "build", "//test/dos/rmexception:rmexception_com",
-        f"//kernel:{target}", "--platforms=@platforms//host",
-    ], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-rmexception-") as directory:
         shutil.copyfile(ROOT / "bazel-bin/test/dos/rmexception/RMEXCEPT.COM",
                         Path(directory) / "RMEXCEPT.COM")

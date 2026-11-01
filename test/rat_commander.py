@@ -12,7 +12,6 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def main():
-    subprocess.run(["bazelisk", "build", "//kernel:retroos-host-kvm", "--platforms=@platforms//host"], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-rat-") as directory:
         root = Path(directory)
         (root / "bin").mkdir()

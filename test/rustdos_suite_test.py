@@ -17,7 +17,7 @@ spec.loader.exec_module(exporter)
 class CatalogTest(unittest.TestCase):
     def test_generated_catalog_exactly_matches_upstream_source(self):
         catalog = json.loads(suite.CATALOG.read_text())
-        self.assertEqual(exporter.export(), catalog)
+        self.assertEqual(exporter.export(suite.ROOT / "bazel-bin/export_rustdos_suite"), catalog)
         self.assertEqual(len(catalog["scenarios"]), 72)
         self.assertEqual(len(catalog["games"]), 16)
         self.assertEqual({g["id"] for g in catalog["games"]}, {

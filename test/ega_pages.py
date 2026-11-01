@@ -23,9 +23,6 @@ def main():
     parser.add_argument('--boot-image', type=Path,
                         help='Test a saved kernel image, for throughput comparisons')
     args = parser.parse_args()
-    if not args.no_build:
-        subprocess.run(['bazelisk', 'build', '//:boot_disk',
-                        '//test/dos/egapages:egapages_com'], cwd=ROOT, check=True)
     output = ROOT / 'build/ci'
     output.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix='ega-pages-', dir=output))

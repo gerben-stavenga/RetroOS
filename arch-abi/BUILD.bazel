@@ -18,6 +18,7 @@ rust_library(
 
 rust_test(
     name = "arch_abi_test_host",
+    tags = ["manual"],
     crate = ":arch-abi",
     rustc_flags = [
         "-Cpanic=abort",

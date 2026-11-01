@@ -29,6 +29,7 @@ rust_library(
 
 rust_test(
     name = "compact_fmt_test",
+    tags = ["manual"],
     srcs = ["compact_fmt/tests/format.rs"],
     crate_name = "compact_fmt_test",
     edition = "2024",
@@ -54,6 +55,7 @@ rust_library(
 
 rust_test(
     name = "vga_test",
+    tags = ["manual"],
     srcs = ["tests/vga.rs"],
     crate_name = "vga_test",
     edition = "2024",
@@ -67,6 +69,7 @@ rust_test(
 
 rust_test(
     name = "heap_test",
+    tags = ["manual"],
     srcs = ["tests/heap.rs"],
     crate_name = "heap_test",
     edition = "2024",
@@ -113,6 +116,7 @@ rust_library(
 # the harness; abort matches the rlib (arch-interp test pattern).
 rust_test(
     name = "sound_test",
+    tags = ["manual"],
     crate = ":sound",
     # One real .PAT is compiled into the test: the synthetic fixtures only
     # prove the parser agrees with our own idea of the layout.
@@ -126,6 +130,7 @@ rust_test(
 
 rust_test(
     name = "term_test",
+    tags = ["manual"],
     srcs = ["tests/term.rs"],
     crate_name = "term_test",
     edition = "2024",
@@ -135,6 +140,7 @@ rust_test(
 
 rust_test(
     name = "unicode_font_test",
+    tags = ["manual"],
     srcs = ["tests/unicode_font.rs"],
     edition = "2024",
     rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests", "-Crelocation-model=static"],
@@ -143,6 +149,7 @@ rust_test(
 
 rust_test(
     name = "log_test",
+    tags = ["manual"],
     srcs = ["tests/log.rs"],
     edition = "2024",
     rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
@@ -151,6 +158,7 @@ rust_test(
 
 rust_test(
     name = "ini_test",
+    tags = ["manual"],
     srcs = ["src/ini.rs"],
     crate_name = "ini_test",
     rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests", "-Crelocation-model=static"],

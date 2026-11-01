@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check console echo/editing with the system shell and BusyBox's line editor."""
+from artifacts import artifact_path
 from pathlib import Path
 import re
 import shutil
@@ -13,10 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
-    subprocess.run(["bazelisk", "build", "//kernel:retroos-host-kvm", "//shell:shell_elf",
-                    "--platforms=@platforms//host"], cwd=ROOT, check=True)
-    launcher = subprocess.check_output(["bazelisk", "cquery", "//shell:shell_elf",
-        "--platforms=@platforms//host", "--output=files"], cwd=ROOT, text=True).strip()
+    launcher = artifact_path("//shell:shell_elf")
     for shell in ("/bin/dash", str(ROOT / "boot-bundle/bin/busybox")):
         with tempfile.TemporaryDirectory(prefix="retroos-shell-echo-") as directory:
             root = Path(directory)

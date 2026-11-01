@@ -112,7 +112,6 @@ def main():
     pdbedit=os.environ.get('SMB_TEST_PDBEDIT') or shutil.which('pdbedit')
     if not smbd or not pdbedit:
         print('SKIP: Samba smbd and pdbedit required');return
-    run('bazelisk','build','//:boot_disk')
     work=Path(tempfile.mkdtemp(prefix='retroos-smb-'));print('Artifacts:',work,flush=True)
     for directory in ['private','lock','cache','state','run','share']:(work/directory).mkdir()
     (work/'share/seed.txt').write_bytes(b'SMB seed!\n')

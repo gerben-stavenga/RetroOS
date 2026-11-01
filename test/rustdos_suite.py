@@ -434,12 +434,6 @@ def main():
         fetch(catalog, args.cache, args.reference_checkout)
         if args.fetch_only:
             return 0
-    if not args.no_build:
-        bazel = shutil.which("bazelisk") or shutil.which("bazel")
-        if not bazel:
-            parser.error("Bazel required")
-        subprocess.run([bazel, "build", "//kernel:retroos-host", "--platforms=@platforms//host"], cwd=ROOT, check=True)
-        subprocess.run([bazel, "build", "//tools/command:command_com"], cwd=ROOT, check=True)
     args.output.mkdir(parents=True, exist_ok=True)
     args.output = Path(tempfile.mkdtemp(prefix="run-", dir=args.output))
     if args.host_bin.is_file():

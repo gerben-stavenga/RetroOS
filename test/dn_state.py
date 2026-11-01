@@ -93,7 +93,6 @@ def session(work, disk, save_config):
 
 
 def main():
-    run("bazelisk", "build", "//:boot_disk")
     with tempfile.TemporaryDirectory(prefix="retroos-dn-test-") as temp:
         work = Path(temp)
         disk = work / "data.img"

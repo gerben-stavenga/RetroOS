@@ -1,5 +1,7 @@
 load("//toolchain:os2_watcom.bzl", "os2_watcom_binary")
 
+package(default_visibility = ["//tests:__pkg__"])
+
 os2_watcom_binary(
     name = "hello_lx",
     src = "hello.c",

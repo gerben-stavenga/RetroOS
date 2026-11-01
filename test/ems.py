@@ -25,12 +25,10 @@ def main():
     engine = os.environ.get('ENGINE', 'tcg')
     if engine not in ('tcg', 'kvm'):
         parser.error('ENGINE must be tcg or kvm')
-    subprocess.run(['bazelisk', 'build', '//test/dos/emsprobe:emsprobe_com'], check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-ems-') as tmp:
         work = Path(tmp)
         probe = ROOT / 'bazel-bin/test/dos/emsprobe/EMSPROBE.COM'
         if args.qemu:
-            subprocess.run(['bazelisk', 'build', '//:data_disk'], check=True)
             disk = work / 'data.bin'
             subprocess.run(['python3', 'test/private_data_disk.py',
                             'bazel-bin/data_disk.bin', str(disk)], check=True)
@@ -44,8 +42,6 @@ def main():
                 command.append('--kvm')
         else:
             target = 'retroos-host' + ('-kvm' if args.kvm or engine == 'kvm' else '')
-            subprocess.run(['bazelisk', 'build', f'//kernel:{target}',
-                            '--platforms=@platforms//host'], check=True)
             root = work / 'home/retroos'
             root.mkdir(parents=True)
             shutil.copyfile(probe, root / 'EMSPROBE.COM')

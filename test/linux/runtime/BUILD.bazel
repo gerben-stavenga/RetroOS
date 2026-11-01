@@ -1,6 +1,8 @@
 load("@rules_rust//rust:defs.bzl", "rust_binary")
 load("//toolchain:musl_transition.bzl", "musl64_binary")
 
+package(default_visibility = ["//tests:__pkg__"])
+
 rust_binary(
     name = "runtime_bin",
     srcs = ["src/main.rs"],

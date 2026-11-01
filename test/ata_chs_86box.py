@@ -37,7 +37,6 @@ def main():
     template = args.vm or (Path.home() / ".var/app" / flatpak / "data/86Box/RetroOS"
                           if flatpak else Path.home() / ".local/share/86Box/RetroOS")
     assert (template / "86box.cfg").exists(), "Pass --vm with a configured TX97 VM"
-    run(os.environ.get("BAZEL", "bazelisk"), "build", "//:boot_disk")
     with tempfile.TemporaryDirectory(prefix="retroos-ata-chs-") as temp:
         work = Path(temp)
         vm = work / "CHS-Test"

@@ -10,18 +10,22 @@ _host_transition = transition(
 )
 
 def _host_platform_test_impl(ctx):
-    test = ctx.attr.test[0][DefaultInfo]
+    target = ctx.attr.test[0]
+    test = target[DefaultInfo]
     launcher = ctx.actions.declare_file(ctx.label.name)
     ctx.actions.symlink(
         output = launcher,
         target_file = test.files_to_run.executable,
         is_executable = True,
     )
-    return [DefaultInfo(
+    providers = [DefaultInfo(
         executable = launcher,
         files = depset([launcher], transitive = [test.files]),
         runfiles = test.default_runfiles,
     )]
+    if RunEnvironmentInfo in target:
+        providers.append(target[RunEnvironmentInfo])
+    return providers
 
 host_platform_test = rule(
     implementation = _host_platform_test_impl,

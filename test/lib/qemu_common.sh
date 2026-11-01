@@ -1,17 +1,6 @@
 #!/bin/bash
 # Common helpers for bounded QEMU shell tests.
 
-qemu_bazel() {
-    if command -v bazelisk >/dev/null 2>&1; then
-        bazelisk "$@"
-    elif command -v bazel >/dev/null 2>&1; then
-        bazel "$@"
-    else
-        echo 'QEMU test requires bazelisk or bazel' >&2
-        return 127
-    fi
-}
-
 # Guest DOS output may arrive one character at a time. A rate-limited
 # kernel stall diagnostic can split a verdict; keep the raw log for errors.
 qemu_guest_log() {

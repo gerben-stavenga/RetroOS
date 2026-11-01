@@ -108,7 +108,6 @@ def session(work, data, firmware):
 
 
 def main():
-    run('bazelisk', 'build', '//:boot_disk')
     # Retain logs and screenshots for inspection.
     work = Path(tempfile.mkdtemp(prefix='retroos-cursor-'))
     print('Artifacts:', work, flush=True)

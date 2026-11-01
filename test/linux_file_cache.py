@@ -11,7 +11,6 @@ from boot_fixture import prepare_boot
 
 
 def main():
-    subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-file-cache-') as directory:
         work = Path(directory)
         home = work / 'root/home/retroos'
@@ -67,8 +66,6 @@ def main():
 
         # The interpreter's shared frames are distinct from ordinary heap
         # allocations, so exercise promotion and release there as well.
-        subprocess.run(['bazelisk', 'build', '//kernel:retroos-host-kvm',
-                        '--platforms=@platforms//host'], cwd=ROOT, check=True)
         log = ROOT / 'build/ci/file-cache-hosted.log'
         with log.open('w') as output:
             result = subprocess.run(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', str(work / 'root'), '--', str(ROOT / 'bazel-bin/kernel/retroos-host-kvm'), '--cmd', '/home/retroos/probe', '--cwd', '/home/retroos'], stdin=subprocess.DEVNULL,

@@ -49,7 +49,6 @@ def run_case(work, bits, smb):
 
 
 def main():
-    subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-linux-script-') as directory:
         for bits, smb in [(64, True), (32, True), (64, False), (32, False)]:
             run_case(Path(directory) / f'{bits}-{smb}', bits, smb)

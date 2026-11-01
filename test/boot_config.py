@@ -41,7 +41,6 @@ def qemu(log):
 
 
 def main():
-    subprocess.run(['bazelisk', 'build', '//:boot_disk', '//:root_module_base_image'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-boot-config-') as folder:
         work = Path(folder)
         tree = work/'iso'

@@ -101,7 +101,6 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False, st
 
 
 def main():
-    run("bazelisk", "build", "//:machine_boot_tar")
     with tempfile.TemporaryDirectory(prefix="retroos-machine-test-") as temp:
         work = Path(temp)
         root = work / "root"

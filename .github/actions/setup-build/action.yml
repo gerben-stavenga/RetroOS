@@ -21,12 +21,6 @@ runs:
       sudo apt-get update
       sudo apt-get install -y nasm qemu-system-x86 ovmf bochs bochs-sdl bochsbios vgabios grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools dosfstools e2fsprogs fdisk gcc-multilib clang-19 llvm lld bison samba samba-common-bin linux-firmware zstd
     shell: bash
-  - uses: actions/setup-python@v5
-    with:
-      python-version: '3.12'
-  - name: Install Python test dependencies
-    shell: bash
-    run: python3 -m pip install -r test/requirements.txt
   - name: Detect hardware virtualization
     run: |
       # Record the host so vendor-specific KVM failures can be compared.
@@ -34,7 +28,7 @@ runs:
       lscpu
       if [ -c /dev/kvm ] && sudo chown "$(id -u)" /dev/kvm; then
         echo "KVM available; hosted-engine KVM tests are required"
-        echo "(qemu -accel kvm is probed separately: nested virt here cannot boot a firmware guest)"
+        echo "(firmware KVM tests are separate: nested virt here cannot boot a firmware guest)"
         echo "RETRO_REQUIRE_KVM=1" >> "$GITHUB_ENV"
       else
         echo "::warning::no /dev/kvm on this runner; KVM backend tests will be skipped"

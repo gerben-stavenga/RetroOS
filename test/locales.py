@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check RETROOS.INI locale policy through DOS, Win32, OS/2 and Linux guest APIs."""
+from artifacts import artifact_path
 from pathlib import Path
 from wine_runtime import install as install_windows_runtime
 import shutil
@@ -10,16 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def main():
-    targets = [
-        "//kernel:retroos-host-kvm", "//test/dos/locale:locale",
-        "//test/windows/locale:locale", "//test/os2/locale:locale",
-        "//test/linux/runtime:runtime", "//lib/wine:runtime", "//lib/os2/doscalls:doscalls_dll", "//lib/os2/nls:nls_dll",
-        "//lib/os2/kbdcalls:kbdcalls_dll", "//lib/os2/viocalls:viocalls_dll",
-    ]
-    subprocess.run(["bazelisk", "build", *targets, "--platforms=@platforms//host"], cwd=ROOT, check=True)
-    linux = subprocess.check_output([
-        "bazelisk", "cquery", "//test/linux/runtime:runtime", "--platforms=@platforms//host", "--output=files",
-    ], cwd=ROOT, text=True).strip()
+    linux = artifact_path("//test/linux/runtime:runtime")
     with tempfile.TemporaryDirectory(prefix="retroos-locale-") as directory:
         root = Path(directory)
         install_windows_runtime(root)

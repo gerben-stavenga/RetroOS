@@ -152,7 +152,6 @@ fail: call(1,error,0,0); for(;;) {}
 
 
 def main():
-    run('bazelisk', 'build', '//:machine_boot_tar', '//test/windows/hello:hello')
     for kind in ('fat', 'ext4'):
         exercise(kind)
 

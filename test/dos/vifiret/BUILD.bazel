@@ -1,3 +1,5 @@
+
+package(default_visibility = ["//tests:__pkg__"])
 genrule(
     name = "vifiret_com",
     srcs = ["vifiret.asm"],

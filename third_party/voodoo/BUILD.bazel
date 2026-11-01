@@ -22,6 +22,7 @@ rust_library(
 # bazelisk test //third_party/voodoo:voodoo_test --platforms=@platforms//host
 rust_test(
     name = "voodoo_test",
+    tags = ["manual"],
     crate = ":voodoo",
     rustc_flags = [
         "-Cpanic=abort",

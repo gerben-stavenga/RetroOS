@@ -15,18 +15,7 @@ def main():
         raise SystemExit(f"Unknown ENGINE: {engine}")
     target = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
     modules = ("doscalls", "kbdcalls", "viocalls", "nls", "uconv", "moucalls", "msg", "pmwin", "pmshapi", "pmwp")
-    # COMMAND.COM depends on the native boot image, which needs the default
-    # target platform. Save it before changing Bazel's output configuration.
-    subprocess.run(["bazelisk", "build", "//tools/command:command_com"], cwd=ROOT, check=True)
     command_image = (ROOT / "bazel-bin/tools/command/COMMAND.COM").read_bytes()
-    subprocess.run([
-        "bazelisk", "build", f"//kernel:{target}",
-        "//test/os2/runtime:runtime", "//test/os2/runtime:probe_dll",
-        "//test/os2/runtime:exec_child", "//test/os2/runtime:uconv",
-        "//test/os2/hello:hello_lx", "//test/os2/watcom_io:watcom_io",
-        *(f"//lib/os2/{name}:{name}_dll" for name in modules),
-        "--platforms=@platforms//host",
-    ], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-os2-runtime-") as directory:
         host_root = Path(directory)
         for prefix in ("", "home/retroos/"):

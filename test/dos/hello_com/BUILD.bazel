@@ -1,3 +1,5 @@
+
+package(default_visibility = ["//tests:__pkg__"])
 genrule(
     name = "hello_com",
     srcs = ["hello.asm"],

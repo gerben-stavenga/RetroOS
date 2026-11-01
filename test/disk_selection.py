@@ -41,7 +41,6 @@ bad db 'COMPOSITION-FAIL',13,10,'$'
 
 
 def main():
-    run('bazelisk', 'build', '//kernel:kernel_elf')
     with tempfile.TemporaryDirectory(prefix='retroos-selection-') as temp:
         work = pathlib.Path(temp)
         source = work / 'probe.asm'

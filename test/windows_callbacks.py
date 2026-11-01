@@ -15,11 +15,6 @@ def main():
     if engine not in ("tcg", "kvm"):
         raise SystemExit(f"Unknown ENGINE: {engine}")
     target = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
-    subprocess.run([
-        "bazelisk", "build", f"//kernel:{target}",
-        "//test/windows/callbacks:callbacks", "//test/windows/callbacks:dynamic", "//test/windows/callbacks:lifecycle", "//test/windows/callbacks:messages", "//test/windows/callbacks:events", "//test/windows/callbacks:regions", "//test/windows/callbacks:bitmap_profile", "//test/windows/callbacks:frame", "//test/windows/callbacks:popup", "//test/windows/callbacks:multimedia", "//test/windows/callbacks:mmio", "//test/windows/callbacks:text", "//lib/wine:runtime",
-        "--platforms=@platforms//host",
-    ], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-wincallbacks-") as directory:
         root = Path(directory)
         system = root / "RETROOS/WINDOWS/SYSTEM32"

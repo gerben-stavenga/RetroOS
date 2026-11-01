@@ -88,7 +88,6 @@ def run(*args, **kwargs):
 
 
 def main():
-    subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
     boot_source = (ROOT / 'bazel-bin/boot_disk.bin').resolve()
     with tempfile.TemporaryDirectory(prefix='retroos-file-mount-') as directory:
         work = Path(directory)

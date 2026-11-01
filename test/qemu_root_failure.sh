@@ -9,7 +9,6 @@ tmp_dir=$(mktemp -d -t retroos-qemu-root.XXXXXX)
 log="$tmp_dir/debugcon.log"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-qemu_bazel build //kernel:kernel_elf >/dev/null
 mkdir -p "$tmp_dir/iso/boot/grub"
 cp bazel-bin/kernel/kernel.elf "$tmp_dir/iso/boot/kernel.elf"
 printf '%s\n' \

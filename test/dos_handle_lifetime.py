@@ -136,10 +136,6 @@ def main():
     args = parser.parse_args()
     os.chdir(ROOT)
     target = 'retroos-host-kvm' if args.engine == 'kvm' else 'retroos-host'
-    if not args.no_build:
-        subprocess.run(['bazelisk', 'build', '//tools/command:command_com'], check=True)
-        subprocess.run(['bazelisk', 'build', '--platforms=@platforms//host',
-                        '//kernel:' + target], check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-handle-lifetime-') as raw:
         root = Path(raw)
         (root / 'RETROOS').mkdir()

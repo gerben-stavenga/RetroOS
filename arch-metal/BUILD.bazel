@@ -30,6 +30,7 @@ rust_library(
 # Exercise xHCI enumeration helpers and input rings without privileged code.
 rust_test(
     name = "xhci_dma_test_host",
+    tags = ["manual"],
     srcs = ["xhci_test.rs", "src/xhci.rs"] + glob(["src/xhci/*.rs"]),
     crate_root = "xhci_test.rs",
     deps = ["//lib", "//lib:compact_fmt"],
@@ -44,6 +45,7 @@ host_platform_test(
 
 rust_test(
     name = "phys_mm_test_host",
+    tags = ["manual"],
     srcs = ["phys_mm_test.rs", "src/phys_mm.rs", "src/phys_mm/pool.rs"],
     crate_root = "phys_mm_test.rs",
     edition = "2024",
@@ -73,6 +75,7 @@ rust_binary(
 
 rust_test(
     name = "boot_mem_test_host",
+    tags = ["manual"],
     srcs = ["boot_mem_test.rs", "src/boot_mem.rs"],
     crate_root = "boot_mem_test.rs",
     edition = "2024",
@@ -86,6 +89,7 @@ host_platform_test(
 
 rust_test(
     name = "acpi_test_host",
+    tags = ["manual"],
     srcs = ["acpi_test.rs", "src/acpi.rs"],
     crate_root = "acpi_test.rs",
     edition = "2024",

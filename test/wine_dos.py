@@ -13,9 +13,6 @@ def main():
     if engine not in ('kvm', 'tcg'):
         raise SystemExit('ENGINE must be kvm or tcg')
     host = 'retroos-host-kvm' if engine == 'kvm' else 'retroos-host'
-    subprocess.run(['bazelisk', 'build', f'//kernel:{host}', '//lib/wine:runtime',
-        '//test/windows/win16:dos_files', '//test/windows/win16:mmio_buffer',
-        '--platforms=@platforms//host'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-wine-dos-') as directory:
         root = Path(directory)
         install(root)

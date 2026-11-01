@@ -24,7 +24,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-bazelisk build //:image >"$stage/build.log" 2>&1
 
 qemu_run() {
     local serial_target="$1"

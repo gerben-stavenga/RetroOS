@@ -54,7 +54,6 @@ def main():
     log = work / "guest.log"
     recording = work / "hda.wav"
     env = dict(os.environ, QEMU_DISPLAY="none", AUDIO_BACKEND=f"wav,path={recording}")
-    subprocess.run(["bazelisk", "build", "//:data_disk"], check=True)
     data = work / "data.bin"
     subprocess.run([sys.executable, "test/private_data_disk.py", "bazel-bin/data_disk.bin", str(data)], check=True)
     game = "GAMES/DOOMS/DOOM.EXE" + (" -nomusic -playdemo demo1" if args.effects_only else " -nosfx -playdemo demo1" if args.music_only else "")

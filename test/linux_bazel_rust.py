@@ -45,16 +45,10 @@ def main():
     parser.add_argument("--compiler-timings", action="store_true",
                         help="Use nightly rustc -Ztime-passes and glibc loader statistics")
     args = parser.parse_args()
-    install = args.install_base or Path(subprocess.check_output(
-        ["bazelisk", "info", "install_base"], cwd=ROOT, text=True).strip())
+    if args.install_base is None or args.toolchain is None:
+        parser.error('--install-base and --toolchain are required')
+    install = args.install_base
     toolchain = args.toolchain
-    if toolchain is None:
-        output = Path(subprocess.check_output(
-            ["bazelisk", "info", "output_base"], cwd=ROOT, text=True).strip())
-        candidates = list((output / "external").glob("*rust_toolchain_x86_64_linux"))
-        if len(candidates) != 1:
-            parser.error("Specify --toolchain: expected one extracted Linux Rust distribution")
-        toolchain = candidates[0]
     install = install.resolve(strict=True)
     toolchain = toolchain.resolve(strict=True)
     work = args.work_dir.resolve()

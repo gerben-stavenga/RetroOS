@@ -1,5 +1,7 @@
 load("//toolchain:os2_watcom.bzl", "os2_c_binary")
 
+package(default_visibility = ["//tests:__pkg__"])
+
 os2_c_binary(
     name = "pm_smoke",
     src = "pm_smoke.c",

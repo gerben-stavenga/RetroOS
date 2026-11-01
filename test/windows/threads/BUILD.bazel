@@ -7,6 +7,8 @@ windows_watcom_binary(
 
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:windows_watcom.bzl", "windows_dll")
+
+package(default_visibility = ["//tests:__pkg__"])
 nasm_library(name = "probe_obj", srcs = ["probe.asm"], copts = ["-fwin32"])
 windows_dll(
     name = "probe_dll",

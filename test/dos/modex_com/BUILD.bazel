@@ -1,3 +1,5 @@
+
+package(default_visibility = ["//tests:__pkg__"])
 genrule(
     name = "modex_com",
     srcs = ["modex.asm"],

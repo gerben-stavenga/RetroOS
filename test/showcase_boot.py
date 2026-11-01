@@ -49,7 +49,6 @@ def boot(work, image, name, firmware, command, memory=768):
 
 
 def main():
-    run('bazelisk', 'build', '//:grub_module_usb', '//:machine_boot_tar')
     with tarfile.open(ROOT / 'bazel-bin/root_module_base_tar.tar') as archive:
         members = archive.getmembers()
         names = {m.name.removeprefix('./') for m in members}

@@ -3,7 +3,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-bazelisk build //:root_module_base_image >/dev/null
 
 base=bazel-bin/retroos-base.img
 tmp_dir=$(mktemp -d)

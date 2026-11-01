@@ -8,6 +8,8 @@ load(":build_info.bzl", "retroos_build_info")
 
 # Bare-metal (os:none) vs host build selector. The one kernel library and the
 # metal ELF binary use this to pick platform-specific deps / linker flags.
+package(default_visibility = ["//tests:__pkg__"])
+
 config_setting(
     name = "metal",
     constraint_values = ["@platforms//os:none"],
@@ -99,6 +101,7 @@ rust_library(
 # One BSP producer and one worker; integration tests share that worker.
 rust_test(
     name = "media_test",
+    tags = ["manual"],
     srcs = ["tests/media.rs", "src/kernel/media.rs", "src/kernel/dos/machine/vvoodoo.rs"],
     crate_root = "tests/media.rs",
     edition = "2024",
@@ -111,6 +114,7 @@ rust_test(
 # tests. The metal-only boot entry remains cfg-gated out of this test.
 rust_test(
     name = "kernel_unit_test_host",
+    tags = ["manual"],
     compile_data = ["//:etc/RETROOS.INI"],
     crate = ":kernel",
     data = [
@@ -242,6 +246,7 @@ rust_binary(
 
 rust_test(
     name = "wine_ne_test",
+    tags = ["manual"],
     crate_root = "tests/wine_ne.rs",
     srcs = ["tests/wine_ne.rs", "src/kernel/windows/pe.rs", "src/kernel/windows/ne.rs"],
     edition = "2024",

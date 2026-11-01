@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise UTF-8 locale/files, 64-bit musl threads, epoll/eventfd and timed poll."""
+from artifacts import artifact_path
 from pathlib import Path
 import shutil
 import subprocess
@@ -8,10 +9,9 @@ import tempfile
 ROOT = Path(__file__).resolve().parent.parent
 
 def main():
-    subprocess.run(["bazelisk", "build", "//kernel:retroos-host-kvm", "//test/linux/runtime:runtime", "--platforms=@platforms//host"], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-linux-runtime-") as directory:
         root = Path(directory)
-        artifact = subprocess.check_output(["bazelisk", "cquery", "//test/linux/runtime:runtime", "--platforms=@platforms//host", "--output=files"], cwd=ROOT, text=True).strip()
+        artifact = artifact_path("//test/linux/runtime:runtime")
         shutil.copyfile(ROOT / artifact, root / "probe.elf")
         # Check the Linux argv -> DOS PSP command tail, then exit with 37.
         # cmp byte [0080h],13; jne fail; cmp byte [0081h],'"'; jne fail

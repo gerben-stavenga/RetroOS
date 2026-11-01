@@ -1,10 +1,23 @@
 module(name = "retro_os", version = "0.1.0")
 
 bazel_dep(name = "rules_rust", version = "0.70.0")
-bazel_dep(name = "rules_cc", version = "0.1.1")
+bazel_dep(name = "rules_cc", version = "0.2.8")
 bazel_dep(name = "rules_nasm", version = "0.4.0")
 bazel_dep(name = "rules_pkg", version = "1.0.1")
-bazel_dep(name = "platforms", version = "0.0.10")
+bazel_dep(name = "platforms", version = "1.0.0")
+
+# The test interpreter and its terminal dependencies are Bazel inputs, not pip
+# packages installed into the CI runner's Python environment.
+bazel_dep(name = "rules_python", version = "1.2.0")
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(python_version = "3.12", is_default = True)
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "test_pip",
+    python_version = "3.12",
+    requirements_lock = "//:test/requirements.txt",
+)
+use_repo(pip, "test_pip")
 
 # Configure rust toolchain - only register for host (exec), our custom ones handle target
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
@@ -327,4 +340,12 @@ wine_http_file(
     urls = ["https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.xz"],
     sha256 = "0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289",
     downloaded_file_path = "freetype-2.13.3.tar.xz",
+)
+
+# Workflow validation is a declared test tool, not a curl step in CI.
+http_archive(
+    name = "actionlint",
+    urls = ["https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"],
+    sha256 = "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8",
+    build_file_content = 'exports_files(["actionlint"])',
 )

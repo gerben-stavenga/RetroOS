@@ -109,7 +109,6 @@ def session(work, uefi=False):
 
 
 def main():
-    run('bazelisk', 'build', '//:boot_disk')
     work = Path(tempfile.mkdtemp(prefix='retroos-random-irqs-'))
     print('Artifacts:', work, flush=True)
     session(work / '486-pit')

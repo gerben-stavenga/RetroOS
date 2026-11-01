@@ -13,7 +13,6 @@ def main():
     engine=os.environ.get("ENGINE","kvm")
     if engine not in ("kvm","tcg"):raise SystemExit("ENGINE must be kvm or tcg")
     host="retroos-host-kvm" if engine=="kvm" else "retroos-host"
-    subprocess.run(["bazelisk","build",f"//kernel:{host}","//lib/wine:runtime","//test/windows/callbacks:wine_mouse","--platforms=@platforms//host"],cwd=ROOT,check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-wine-mouse-") as directory:
         work=Path(directory);root=work/"root";root.mkdir();install(root)
         shutil.copyfile(ROOT/"bazel-bin/test/windows/callbacks/wine_mouse.exe",root/"MOUSE.EXE")

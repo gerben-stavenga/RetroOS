@@ -69,7 +69,6 @@ def run(work, bits, smb=False):
 
 def main():
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
-    subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-timestamps-') as directory:
         for bits, smb in [(32, False), (64, False), (64, True)]:
             run(Path(directory) / f'{bits}-{smb}', bits, smb)

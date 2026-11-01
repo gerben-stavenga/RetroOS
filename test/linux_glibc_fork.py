@@ -12,7 +12,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def native():
-    subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-glibc-fork-') as directory:
         work = Path(directory)
         tree = work / 'root'

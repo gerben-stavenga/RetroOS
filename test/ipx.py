@@ -227,7 +227,6 @@ dw packet,0,34
 packet times 34 db 0
 '''
 def main():
-    run('bazelisk','build','//:boot_disk')
     with tempfile.TemporaryDirectory(prefix='retroos-ipx-') as folder:
         work = Path(folder)
         for name,code in [('PROBE',PROBE),('ECHO',ECHO)]:

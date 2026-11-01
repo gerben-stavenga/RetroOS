@@ -1,5 +1,7 @@
 load("//toolchain:windows_watcom.bzl", "windows_watcom_binary")
 
+package(default_visibility = ["//tests:__pkg__"])
+
 windows_watcom_binary(
     name = "hello",
     src = "hello.c",

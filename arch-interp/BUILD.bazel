@@ -6,6 +6,8 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 #  * :arch-interp     — the TCG engine (Unicorn, the patched fork pinned in
 #                       MODULE.bazel, via the crate_universe repo @crates).
 #  * :arch-interp-kvm — the KVM engine (/dev/kvm); no Unicorn C core at all.
+package(default_visibility = ["//tests:__pkg__"])
+
 rust_library(
     name = "arch-interp",
     srcs = glob(["src/**/*.rs"]),
@@ -52,6 +54,7 @@ rust_library(
 # ---- tests (bazelisk test //arch-interp:all --platforms=@platforms//host) ----
 rust_test(
     name = "suite-control-test",
+    tags = ["manual"],
     srcs = ["tests/suite_control.rs", "src/suite_control.rs"],
     crate_root = "tests/suite_control.rs",
     crate_features = ["tcg"],
@@ -63,6 +66,7 @@ rust_test(
 # --test_env=RETRO_REQUIRE_KVM=1.
 rust_test(
     name = "arch-interp-test",
+    tags = ["manual"],
     crate = ":arch-interp",
     crate_features = ["tcg"],
     # abort matches the rlibs; a failing assert aborts the test binary, which
@@ -76,6 +80,8 @@ rust_test(
 
 rust_test(
     name = "arch-interp-kvm-test",
+    tags = ["manual"],
+    env = {"RETRO_REQUIRE_KVM": "1"},
     crate = ":arch-interp-kvm",
     crate_features = ["kvm"],
     rustc_flags = [
@@ -88,6 +94,7 @@ rust_test(
 # Software-MMU integration test over the public arch surface.
 rust_test(
     name = "mmu-test",
+    tags = ["manual"],
     srcs = ["tests/mmu.rs"],
     edition = "2021",
     rustc_flags = [

@@ -18,8 +18,6 @@ set -e -o pipefail
 cd "$(dirname "$0")/.."
 source test/lib/hosted_common.sh
 
-bazelisk build //:image 2>&1 | tail -1
-bazelisk build "//kernel:$HOST_TARGET" --platforms=@platforms//host 2>&1 | tail -1
 
 LOG=/tmp/dpmi-hx.log
 # Hosted backend routes the DOS program's INT 21h console output to stdout,

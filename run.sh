@@ -116,10 +116,16 @@ if [ "$LIVE" = 1 ]; then
     [ -f "$LIVE_PROFILE" ] || fail "run python3 tools/qemu_live.py setup first"
 fi
 
-BAZEL="${BAZEL:-$(command -v bazelisk || command -v bazel || true)}"
-[ -n "$BAZEL" ] || BAZEL="$HOME/bin/bazelisk"
-BAZEL=$(command -v "$BAZEL" || true)
-[ -n "$BAZEL" ] || fail "install bazelisk or set BAZEL"
+if [ "${RETROOS_PREBUILT:-0}" != 1 ]; then
+    BAZEL="${BAZEL:-$(command -v bazelisk || command -v bazel || true)}"
+    [ -n "$BAZEL" ] || BAZEL="$HOME/bin/bazelisk"
+    BAZEL=$(command -v "$BAZEL" || true)
+    [ -n "$BAZEL" ] || fail "install bazelisk or set BAZEL"
+fi
+build_artifacts() {
+    # Bazel tests supply declared outputs; development launches build them.
+    [ "${RETROOS_PREBUILT:-0}" = 1 ] || "$BAZEL" build "$@"
+}
 WORK=$(mktemp -d -t retroos-run.XXXXXX)
 VM_PID= SMB_PID= STAGED= RUST_DOS_IMAGE_LINK=
 cleanup() {
@@ -144,12 +150,12 @@ run_vm() { "$@" <&0 & VM_PID=$!; local status=0; wait "$VM_PID" || status=$?; VM
 if [ "$BACKEND" = rust-dos-games ]; then
     GAMES_TARGET=rust_dos_games_disk
     [ ! -d apps-proprietary ] || GAMES_TARGET=rust_dos_games_disk_proprietary
-    "$BAZEL" build "//:$GAMES_TARGET"
+    build_artifacts "//:$GAMES_TARGET"
     GAMES_IMAGE="$WORK/games.img"
     cp --reflink=auto "bazel-bin/$GAMES_TARGET.img" "$GAMES_IMAGE"
     chmod u+rw "$GAMES_IMAGE"
 elif [ "$LIVE" = 1 ]; then
-    "$BAZEL" build //:boot_disk
+    build_artifacts //:boot_disk
     BOOT_IMAGE="$WORK/boot.img"
     cp --reflink=auto bazel-bin/boot_disk.bin "$BOOT_IMAGE"
     chmod 600 "$BOOT_IMAGE"
@@ -171,7 +177,7 @@ else
         SEED=data_disk
         [ ! -d apps-proprietary ] || SEED=data_disk_proprietary
         # The persistent Bazel server must not inherit the data-image lock.
-        "$BAZEL" build "//:$SEED" 9>&-
+        build_artifacts "//:$SEED" 9>&-
         # Hard-link publication is atomic and never replaces an existing image.
         STAGED=$(mktemp "$(dirname "$DATA_IMAGE")/.data-seed.XXXXXX")
         cp --reflink=auto "bazel-bin/$SEED.bin" "$STAGED"
@@ -183,7 +189,7 @@ else
     [ -f "$DATA_IMAGE" ] && [ -w "$DATA_IMAGE" ] || fail "data image is not writable: $DATA_IMAGE"
     BOOT_TARGET=boot_disk
     [ "$BACKEND" != rust-dos ] || BOOT_TARGET=native_boot_disk
-    "$BAZEL" build "//:$BOOT_TARGET" 9>&-
+    build_artifacts "//:$BOOT_TARGET" 9>&-
     BOOT_IMAGE="$WORK/boot.img"
     cp --reflink=auto "bazel-bin/$BOOT_TARGET.bin" "$BOOT_IMAGE"
     chmod u+rw "$BOOT_IMAGE"

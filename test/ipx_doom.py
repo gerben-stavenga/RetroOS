@@ -36,7 +36,6 @@ def traffic(pair,serial):
 
 def main():
     serial = '--serial' in sys.argv
-    run('bazelisk','build','//:boot_disk')
     with tempfile.TemporaryDirectory(prefix='retroos-lan-doom-') as folder:
         work = Path(folder)
         data = work/'doom.img'

@@ -174,9 +174,6 @@ def main():
     out = args.output.resolve() / args.engine
     out.mkdir(parents=True, exist_ok=True)
     target = "retroos-host-kvm" if args.engine == "kvm" else "retroos-host"
-    subprocess.run(["bazelisk", "build", f"//kernel:{target}",
-                    "//lib/wine:runtime",
-                    "--platforms=@platforms//host"], cwd=ROOT, check=True)
     exports = {name: exported_names(ROOT / "bazel-bin" / folder / f"{name.upper()}.DLL")
                for name, folder in DLLS.items()}
     flags = ["-O1", "-march=i486", "-w", "-D__USE_MINGW_ANSI_STDIO=0", "-D__NO_CTYPE_INLINES"]

@@ -15,14 +15,15 @@
 # (FAIL-RST), which is itself unexplained.
 #
 # Usage: test/dosbox_probe.sh [SBDISC|SBTEST]
-set -u
+set -euo pipefail
 cd "$(dirname "$0")/.."
 PROBE="${1:-SBDISC}"
 D="${DOSBOX_PROBE_DIR:-$HOME/dosbox-probe}"
 mkdir -p "$D"
-SRC="bazel-out/k8-opt/bin/test/dos/sbproto/$PROBE.COM"
+D=$(realpath "$D")
+SRC="bazel-bin/test/dos/sbproto/$PROBE.COM"
 if [ ! -f "$SRC" ]; then
-    echo "no $SRC — build it: bazelisk build //test/dos/sbproto:all" >&2
+    echo "missing declared probe $SRC; run bazelisk test //tests:dosbox_probe" >&2
     exit 1
 fi
 # Bazel outputs are read-only, so a plain cp onto a previous copy fails with
@@ -30,11 +31,17 @@ fi
 install -m 0644 "$SRC" "$D/$PROBE.COM" || exit 1
 rm -f "$D/$PROBE.LOG"
 
-flatpak run --filesystem=home com.dosbox_x.DOSBox-X \
+flatpak run --filesystem="$D" com.dosbox_x.DOSBox-X \
     -nopromptfolder \
     -set "sblaster sbtype=sb16" -set "sblaster sbbase=220" \
     -set "sblaster irq=7" -set "sblaster dma=1" -set "sblaster hdma=5" \
     -c "mount c $D" -c "c:" -c "$PROBE.COM"
 
 echo "--- $PROBE.LOG ---"
-cat "$D/$PROBE.LOG" 2>/dev/null || echo "(no verdict written)"
+cat "$D/$PROBE.LOG"
+! grep -q 'FAIL' "$D/$PROBE.LOG"
+case "$PROBE" in
+    SBDISC) grep -q 'AUTOINIT-OK' "$D/$PROBE.LOG" ;;
+    SBTEST) grep -q 'TC-OK' "$D/$PROBE.LOG" ;;
+    *) echo "Unknown SB reference probe: $PROBE" >&2; exit 2 ;;
+esac

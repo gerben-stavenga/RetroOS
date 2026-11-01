@@ -20,9 +20,6 @@ def main():
     if engine not in ("kvm", "tcg"):
         raise SystemExit("ENGINE must be kvm or tcg")
     host = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
-    subprocess.run(["bazelisk", "build", f"//kernel:{host}", "//lib/wine:runtime",
-        "//test/windows/ntdll:portable", "//test/windows/ntdll:forwarders", "--platforms=@platforms//host"],
-        cwd=ROOT, check=True)
     dll = ROOT / "bazel-bin/lib/wine/ntdll/NTDLL.DLL"
     headers = subprocess.check_output(["objdump", "-p", str(dll)], text=True)
     assert re.findall(r"DLL Name: (\S+)", headers) == ["RETROOS.DLL"]

@@ -13,7 +13,6 @@
 set -e -o pipefail
 cd "$(dirname "$0")/.."
 
-bazelisk build //:image_proprietary 2>&1 | tail -3
 
 cp bazel-bin/image_proprietary.bin /tmp/dark-test.img
 chmod +w /tmp/dark-test.img

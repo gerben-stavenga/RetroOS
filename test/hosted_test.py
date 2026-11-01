@@ -99,7 +99,7 @@ def main():
     host_bin = args.host_bin
     if not os.path.exists(host_bin):
         sys.exit(f"hosted_test: {host_bin} not built — "
-                 f"run: bazelisk build //kernel:{os.path.basename(host_bin)} --platforms=@platforms//host")
+                 "declare the hosted binary on the Bazel test target")
 
     # IMPORTANT: retroos-host treats the FIRST positional as the disk image and
     # slurps every following arg into the guest program's argv — so all flags

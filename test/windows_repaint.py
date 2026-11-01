@@ -16,11 +16,6 @@ def main():
     if engine not in ("kvm", "tcg"):
         raise SystemExit(f"Unknown engine: {engine}")
     target = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
-    subprocess.run([
-        "bazelisk", "build", f"//kernel:{target}",
-        "//test/windows/callbacks:repaint",
-        "//lib/wine:runtime", "--platforms=@platforms//host",
-    ], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-repaint-") as directory:
         work = Path(directory)
         root = work / "drive"

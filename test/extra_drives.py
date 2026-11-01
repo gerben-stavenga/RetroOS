@@ -134,7 +134,6 @@ bad db 'COMPOSITION-FAIL',13,10,'$'
 '''
 
 def main():
-    run('bazelisk', 'build', '//kernel:kernel_elf')
     with tempfile.TemporaryDirectory(prefix='retroos-extra-drives-') as tmp:
         work = pathlib.Path(tmp)
         source = work / 'probe.asm'

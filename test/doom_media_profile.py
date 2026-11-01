@@ -42,8 +42,6 @@ def main():
     label = re.sub('[^A-Za-z0-9_-]', '_', options.label)
     cpus = options.cpus
     mode = options.mode
-    if not options.no_build:
-        subprocess.run(['bazelisk', 'build', '//:boot_disk', '//:data_disk'], cwd=ROOT, check=True)
     work = Path(tempfile.mkdtemp(prefix='retroos-perf-' + label + '-'))
     print(work, flush=True)
     data = work / 'data.img'

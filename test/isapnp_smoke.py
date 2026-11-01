@@ -19,7 +19,6 @@ message db 'COMPOSITION-OK',13,10,'$'
 
 
 def main():
-    run('bazelisk', 'build', '//kernel:kernel_elf')
     with tempfile.TemporaryDirectory(prefix='retroos-isapnp-') as temp:
         work = pathlib.Path(temp)
         asm = work / 'probe.asm'

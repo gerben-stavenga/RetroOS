@@ -11,10 +11,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     os.chdir(ROOT)
-    subprocess.run(['bazelisk', 'build', '//tools/command:command_com',
-                    '//test/dos/xmsprobe:xmsprobe_com'], check=True)
-    subprocess.run(['bazelisk', 'build', '//kernel:retroos-host',
-                    '--platforms=@platforms//host'], check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-xms-loadfix-') as tmp:
         root = Path(tmp) / 'home/retroos'
         (root / 'RETROOS').mkdir(parents=True)

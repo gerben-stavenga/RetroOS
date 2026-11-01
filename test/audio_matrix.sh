@@ -26,7 +26,6 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 source test/lib/qemu_common.sh
-qemu_bazel build //:data_disk || exit 1
 LOG_DIR=$(mktemp -d -t retroos-audio-matrix.XXXXXX)
 python3 test/private_data_disk.py bazel-bin/data_disk.bin "$LOG_DIR/data.bin" || exit 1
 # Advance TCG device time with guest instructions, not host scheduling delays.

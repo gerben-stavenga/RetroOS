@@ -18,8 +18,6 @@ def main():
     if engine not in ("tcg", "kvm"):
         raise SystemExit(f"Unknown ENGINE: {engine}")
     target = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
-    run("bazelisk", "build", "//:image")
-    run("bazelisk", "build", "--platforms=@platforms//host", f"//kernel:{target}")
     with tempfile.TemporaryDirectory(prefix="retroos-lfn-") as directory:
         image = pathlib.Path(directory) / "disk.img"
         # Bazel artifacts are read-only. Never ask a mutation test to open

@@ -1,3 +1,5 @@
 load("//toolchain:windows_watcom.bzl", "windows_watcom_binary")
+
+package(default_visibility = ["//tests:__pkg__"])
 windows_watcom_binary(name = "locale", src = "locale.c", visibility = ["//visibility:public"])
 windows_watcom_binary(name = "keyboard", src = "keyboard.c", visibility = ["//visibility:public"])

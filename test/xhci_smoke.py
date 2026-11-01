@@ -267,8 +267,6 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
 
 
 def main():
-    subprocess.run([shutil.which('bazelisk') or 'bazel', 'build', '//:boot_disk'],
-                   cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-xhci-') as temp:
         work = Path(temp)
         source = work / 'input.asm'

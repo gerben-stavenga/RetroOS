@@ -10,7 +10,6 @@ cd "$(dirname "$0")/.."
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
-bazelisk build //:grub_module_usb >/dev/null
 
 run_program() {
     local name="$1" command="$2" log="$tmp_dir/$1.log"

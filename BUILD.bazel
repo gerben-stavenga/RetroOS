@@ -1,7 +1,10 @@
 load("//lib/wine:modules.bzl", "WINE_FILES")
 load(":filesystem_layout.bzl", "BOOT_FILES", "CORE_FILES", "DATA_FILES", "SHOWCASE_FILES", "LINUX_FILES", "BOOT_SIZE_MB", "DOS_SIZE_MB", "LINUX_SIZE_MB")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+load("@rules_rust//rust:defs.bzl", "rust_binary")
 load("@rules_pkg//pkg:mappings.bzl", "pkg_mklink")
+
+package(default_visibility = ["//tests:__pkg__"])
 
 exports_files(["i686-retro-none.json"])
 
@@ -924,3 +927,35 @@ filegroup(
 )
 
 exports_files(["etc/RETROOS.INI"], visibility = ["//kernel:__pkg__"])
+
+# Sources and fixtures consumed by integration harnesses. Compiled outputs
+# are declared separately on each //tests target, with their own platform.
+filegroup(
+    name = "integration_sources",
+    srcs = glob([
+        "*.sh", "*.py", "*.md", "*.json", ".bazelversion", ".github/**/*.yml", "etc/**", "test/**", "tools/**",
+        "boot-bundle/**", "showcase-bundle/**", "freedos/**", "third_party/rustdos_suite/**",
+    ], exclude = ["**/__pycache__/**", "**/*.pyc", "freedos/*.img", "freedos/*.IMG", "freedos/*.iso", "freedos/*.ISO", "freedos/ROM/**"]),
+    visibility = ["//tests:__pkg__"],
+)
+
+# Evaluate the pinned reference catalog with the declared Rust toolchain.
+rust_binary(
+    name = "export_rustdos_suite",
+    srcs = ["tools/export_rustdos_suite.rs", "third_party/rustdos_suite/catalog.rs"],
+    crate_root = "tools/export_rustdos_suite.rs",
+    edition = "2024",
+)
+
+filegroup(
+    name = "freedos_reference_data",
+    srcs = glob(["freedos/*.img", "freedos/*.IMG", "freedos/.installed"], allow_empty = True),
+    visibility = ["//tests:__pkg__"],
+)
+
+genrule(
+    name = "actionlint_for_tests",
+    srcs = ["@actionlint//:actionlint"],
+    outs = ["test-tools/actionlint"],
+    cmd = "cp $< $@ && chmod +x $@",
+)

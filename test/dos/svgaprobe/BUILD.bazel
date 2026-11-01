@@ -1,3 +1,5 @@
+
+package(default_visibility = ["//tests:__pkg__"])
 genrule(
     name = "svgaprobe_com",
     srcs = ["svgaprobe.asm"],

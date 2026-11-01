@@ -9,7 +9,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
-    subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-record-lock-') as directory:
         for bits, legacy in [(32, False), (64, False), (32, True)]:
             label = 'legacy-486' if legacy else str(bits)

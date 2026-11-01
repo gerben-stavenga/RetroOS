@@ -1,3 +1,5 @@
 load("//toolchain:os2_watcom.bzl", "os2_watcom_binary")
+
+package(default_visibility = ["//tests:__pkg__"])
 os2_watcom_binary(name = "locale", src = "locale.c", visibility = ["//visibility:public"])
 os2_watcom_binary(name = "keyboard", src = "keyboard.c", visibility = ["//visibility:public"])

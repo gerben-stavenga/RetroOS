@@ -17,9 +17,6 @@ if ! { : <> /dev/kvm; } 2>/dev/null; then
     echo "FAIL: /dev/kvm unavailable — differential engine test not run" >&2
     exit 1
 fi
-bazelisk build //:image >/dev/null
-bazelisk build //kernel:retroos-host //kernel:retroos-host-kvm \
-    --platforms=@platforms//host >/dev/null
 
 shot_tcg=$(mktemp /tmp/retroos-diff-tcg.XXXX.txt)
 shot_kvm=$(mktemp /tmp/retroos-diff-kvm.XXXX.txt)

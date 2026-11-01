@@ -125,7 +125,6 @@ def test_transport(work, disk, payload, pio):
 
 
 def main():
-    run(os.environ.get("BAZEL", "bazelisk"), "build", "//:boot_disk")
     for pio in (False, True):
         with tempfile.TemporaryDirectory(prefix="retroos-lba48-") as folder:
             work = Path(folder)

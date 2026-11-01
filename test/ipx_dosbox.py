@@ -153,7 +153,6 @@ def main():
     binary = os.environ.get('DOSBOX_BIN') or shutil.which('dosbox')
     if not binary:
         parser.error('Install DOSBox or set DOSBOX_BIN to its executable')
-    run('bazelisk', 'build', '//:boot_disk')
     work = Path(tempfile.mkdtemp(prefix='retroos-dosbox-doom-'))
     print('Artifacts:', work, flush=True)
     session = DoomSession.__new__(DoomSession)

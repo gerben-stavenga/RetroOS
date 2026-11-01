@@ -21,6 +21,7 @@ rust_library(
 
 rust_test(
     name = "ext4_test",
+    tags = ["manual"],
     crate = ":ext4",
     rustc_flags = [
         "-Cpanic=abort",
@@ -198,6 +199,7 @@ truncate -s 32M "$@"
 
 rust_test(
     name = "modern_image_test",
+    tags = ["manual"],
     srcs = ["tests/modern_image.rs"],
     crate_name = "modern_image_test",
     data = [

@@ -25,7 +25,6 @@ def main():
     win16=os.environ.get('WIN16')=='1'
     target='win16:keyboard' if win16 else 'callbacks:wine_keyboard'
     host='retroos-host-kvm' if engine=='kvm' else 'retroos-host'
-    subprocess.run(['bazelisk','build',f'//kernel:{host}','//lib/wine:runtime','//test/windows/'+target,'--platforms=@platforms//host'],cwd=ROOT,check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-wine-keyboard-') as directory:
         work=Path(directory);root=work/'root';root.mkdir();install(root)
         shutil.copyfile(ROOT/('bazel-bin/test/windows/'+target.replace(':','/')+'.exe'),root/'KEY.EXE')

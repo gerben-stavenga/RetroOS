@@ -47,7 +47,6 @@ def session(work, disk, name, cpu, machine, accel):
 
 
 def main():
-    run('bazelisk', 'build', '//:boot_disk')
     work = Path(tempfile.mkdtemp(prefix='retroos-physical-memory-'))
     print('Artifacts:', work, flush=True)
     run('nasm', '-f', 'elf32', ROOT / 'test/physical_memory_probe.asm', '-o', work / 'probe.o')

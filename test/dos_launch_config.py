@@ -15,10 +15,7 @@ def main():
     if not os.access('/dev/kvm', os.R_OK | os.W_OK):
         raise SystemExit('KVM access is required for CPU-policy checks')
     host = 'retroos-host-kvm'
-    subprocess.run(['bazelisk', 'build', '//tools/command:command_com'], cwd=ROOT, check=True)
     command = (ROOT / 'bazel-bin/tools/command/COMMAND.COM').resolve()
-    subprocess.run(['bazelisk', 'build', f'//kernel:{host}', '--platforms=@platforms//host'],
-                   cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-launch-config-') as directory:
         root = Path(directory)
         (root / 'RETROOS').mkdir()

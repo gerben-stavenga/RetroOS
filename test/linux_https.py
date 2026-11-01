@@ -105,7 +105,6 @@ def session(work, ca, certificate, key, name, version, trusted=True, hostname=Tr
 
 
 def main():
-    run('bazelisk', 'build', '//:boot_disk')
     work = Path(tempfile.mkdtemp(prefix='retroos-https-'))
     print('Artifacts:', work, flush=True)
     ca, ca_key = work / 'ca.pem', work / 'ca.key'

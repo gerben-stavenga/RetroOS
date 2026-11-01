@@ -18,7 +18,6 @@ def run(*args):
 
 
 def main():
-    run("bazelisk", "build", "//kernel:kernel.elf")
     with tempfile.TemporaryDirectory(prefix="retroos-rat-ext4-") as directory:
         work = Path(directory)
         root = work / "root"

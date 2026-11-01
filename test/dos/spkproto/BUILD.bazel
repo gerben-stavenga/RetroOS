@@ -1,3 +1,5 @@
+
+package(default_visibility = ["//tests:__pkg__"])
 # PC speaker probe (see the .asm header): asserts PIT channel 2's OUT line at
 # port 61h bit 5 from inside the guest, then plays three tones of known pitch
 # and duration for a host-side WAV capture to measure. Runs in CI

@@ -4,7 +4,6 @@ import ast
 import json
 from pathlib import Path
 import subprocess
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 VARIANTS = {"Cycles", "Focus", "Wait", "Key", "Keys", "Hold", "Type", "PressUntil",
@@ -28,12 +27,10 @@ def debug_value(text):
     return parse(ast.parse(text, mode="eval").body)
 
 
-def export():
-    with tempfile.TemporaryDirectory(prefix="retroos-catalog-") as work:
-        binary = Path(work) / "export"
-        subprocess.run(["rustc", "--edition=2024", str(ROOT / "tools/export_rustdos_suite.rs"),
-                        "-o", str(binary)], check=True)
-        lines = subprocess.check_output([str(binary)], text=True).splitlines()
+def export(binary=None):
+    if binary is None:
+        raise ValueError("Pass the //:export_rustdos_suite Bazel artifact")
+    lines = subprocess.check_output([str(binary)], text=True).splitlines()
     games, scenarios = [], []
     for line in lines:
         kind, *fields = line.split("\t")
@@ -62,6 +59,6 @@ def export():
 
 if __name__ == "__main__":
     output = ROOT / "test/games/rustdos.json"
-    catalog = export()
+    catalog = export(ROOT / "bazel-bin/export_rustdos_suite")
     output.write_text(json.dumps(catalog, indent=2) + "\n")
     print(f"{len(catalog['games'])} installations, {len(catalog['scenarios'])} scenarios -> {output}")

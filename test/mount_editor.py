@@ -99,7 +99,6 @@ def testcase(shared):
 
 
 def main():
-    subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
     testcase(False)
     testcase(True)
 

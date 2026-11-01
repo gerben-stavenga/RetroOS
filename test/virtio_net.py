@@ -166,7 +166,6 @@ def session(work, name, device, uefi=False, bits=32, driver_ready="virtio-net: r
 
 
 def main():
-    run('bazelisk', 'build', '//:boot_disk')
     work = Path(tempfile.mkdtemp(prefix='retroos-virtio-net-'))
     print('Artifacts:', work, flush=True)
     session(work / 'transitional', 'BIOS transitional VirtIO', 'virtio-net-pci')

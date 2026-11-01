@@ -15,17 +15,7 @@ def main():
     if engine not in ("tcg", "kvm"):
         raise SystemExit(f"Unknown ENGINE: {engine}")
     target = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
-    # Save the native shell before switching Bazel to the host platform.
-    subprocess.run(["bazelisk", "build", "//tools/command:command_com"], cwd=ROOT, check=True)
     command_image = (ROOT / "bazel-bin/tools/command/COMMAND.COM").read_bytes()
-    subprocess.run([
-        "bazelisk", "build", f"//kernel:{target}",
-        "//test/windows/threads:threads", "//test/windows/threads:probe_dll",
-        "//test/windows/threads:spawn_child", "//test/os2/hello:hello_lx",
-        "//lib/os2/doscalls:doscalls_dll",
-        "//lib/wine:runtime",
-        "--platforms=@platforms//host",
-    ], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-winthreads-") as directory:
         root = Path(directory)
         install_windows_runtime(root)

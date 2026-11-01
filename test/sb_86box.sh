@@ -66,7 +66,6 @@ fi
 export VM_DIR
 # A dedicated test image preserves the user's normal shared disk.
 IMG="${IMG:-$VM_DIR/test-data.bin}"
-bazelisk build //:data_disk || exit 1
 
 # Only one probe may use this VM directory at a time.  This also prevents a
 # second test runner from copying a new disk image underneath an active 86Box.

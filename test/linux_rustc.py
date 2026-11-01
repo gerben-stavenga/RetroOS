@@ -16,11 +16,7 @@ def main():
     args = parser.parse_args()
     toolchain = args.toolchain
     if toolchain is None:
-        output_base = Path(subprocess.check_output(
-            ['bazelisk', 'info', 'output_base'], cwd=ROOT, text=True).strip())
-        candidates = list((output_base / 'external').glob('*rust_toolchain_x86_64_linux'))
-        assert len(candidates) == 1, candidates
-        toolchain = candidates[0]
+        parser.error('--toolchain is required')
     toolchain = toolchain.resolve(strict=True)
     work = ROOT / 'build/ci/rustc-native'
     home = work / 'c'

@@ -26,12 +26,6 @@ jobs:
         fetch-depth: 0
         persist-credentials: false
     - uses: ./.github/actions/setup-build
-    - name: Validate workflow syntax
-      run: |
-        curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz -o "$RUNNER_TEMP/actionlint.tar.gz"
-        tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
-        "$RUNNER_TEMP/actionlint" -shellcheck="" -color
-        bash -n test/run_all.sh tools/workspace_status.sh
     - name: Clippy (metal crates)
       run: |
         bazel build --config=clippy \
@@ -44,15 +38,10 @@ jobs:
           //kernel:retroos-host-kvm //arch-interp:arch-interp-kvm \
           //arch-interp:arch-interp //lib:lib //lib:sound //arch-abi:arch-abi
     - name: Unit tests
-      env:
-        RETRO_TEST_ONLY: unit
-      run: test/run_all.sh
-    - name: Release tooling tests
       run: |
-        python3 -m unittest discover -s test -p release_notes_test.py
-        python3 test/grub_module_install.py
-        python3 test/machine_install.py
-        python3 test/usb_install.py
+        filters=-requires-qemu-kvm
+        if [ "$RETRO_REQUIRE_KVM" != 1 ]; then filters="$filters,-requires-kvm"; fi
+        bazel test //tests:unit --test_tag_filters="$filters" --test_output=errors
     - name: Trim build cache
       if: always()
       uses: ./.github/actions/trim-cache
@@ -71,57 +60,24 @@ jobs:
         fetch-depth: 0
         persist-credentials: false
     - uses: ./.github/actions/setup-build
-    - name: Build hosted runners
-      run: bazel build //kernel:retroos-host //kernel:retroos-host-kvm --platforms=@platforms//host
-    - name: Hosted ELF smoke
-      if: matrix.suite == 'dos'
+    - name: Integration tests
       env:
-        RUST_BACKTRACE: '1'
+        SUITE: ${{ matrix.suite }}
       run: |
-        guest_root=$(mktemp -d)
-        for src in hello outlive_composite; do
-          gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start \
-            -o "$guest_root/$src.elf" "test/hosted/$src.c"
-        done
-        # The program prints its greeting then exit(0)s; cap with timeout.
-        runners=retroos-host
-        [ "$RETRO_REQUIRE_KVM" = 1 ] && runners="$runners retroos-host-kvm"
-        for runner in $runners; do
-         for guest in hello outlive_composite; do
-          echo "== $runner $guest"
-          # Print what the runner said BEFORE asserting on it. Under `bash -e`
-          # a failing command substitution ends the step with the output still
-          # inside $out, which is how a SIGABRT here first showed up as a bare
-          # "exit code 134" with no message to diagnose.
-          set +e
-          out=$(timeout 30 python3 test/disk_fixture.py --root "$guest_root" -- \
-            "bazel-bin/kernel/$runner" --cmd "/$guest.elf" --cwd / 2>&1)
-          rc=$?
-          set -e
-          echo "$out"
-          if [ "$rc" != 0 ]; then
-            echo "$runner exited $rc on $guest"
-            exit 1
-          fi
-          echo "$out" | grep -q "Hello from an interpreted 32-bit Linux ELF!"
-          if echo "$out" | grep -q "panicked"; then echo "kernel panicked on the hosted ELF path"; exit 1; fi
-         done
-        done
-    - name: Personality and hardware integration tests
-      env:
-        SMB_TEST_SUDO: '1'
-        RETRO_REQUIRE_PUBLIC: '1'
-        RETRO_TEST_EXCLUDE: unit
-        RETRO_TEST_GROUP: ${{ matrix.suite }}
-      run: |-
-        mkdir -p build/ci
-        test/run_all.sh 2>&1 | tee build/ci/integration.log
-    - name: Preserve integration log
+        # Hosted KVM runs whenever /dev/kvm is available. Firmware KVM tests
+        # require a capable local runner; hosted nested KVM cannot boot them.
+        filters=-requires-qemu-kvm
+        if [ "$RETRO_REQUIRE_KVM" != 1 ]; then filters="$filters,-requires-kvm"; fi
+        bazel test "//tests:$SUITE" --test_tag_filters="$filters" \
+          --test_output=errors
+    - name: Preserve test results
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: integration-log-${{ inputs.commit }}-${{ matrix.suite }}-${{ github.run_attempt }}
-        path: build/ci/*.log
+        name: test-results-${{ inputs.commit }}-${{ matrix.suite }}-${{ github.run_attempt }}
+        path: |
+          bazel-testlogs/tests/**/test.log
+          bazel-testlogs/tests/**/test.xml
         if-no-files-found: ignore
         retention-days: 14
     - name: Trim build cache
@@ -139,12 +95,9 @@ jobs:
         fetch-depth: 0
         persist-credentials: false
     - uses: ./.github/actions/setup-build
-    - name: Build public release bundles
-      run: bazel build //:release
-    - name: Validate release packaging and launcher
+    - name: Build and validate release artifacts
       run: |
-        python3 test/release.py
-        # Later host-platform builds change the bazel-bin symlink.
+        bazel test //tests:release --test_output=errors
         mkdir -p build/release
         cp bazel-bin/retroos-vm.tar.gz bazel-bin/retroos-machine.tar.gz bazel-bin/retroos_grub_module_usb.zip bazel-bin/retroos_grub_module.iso bazel-bin/retroos-usb-diagnostic.zip bazel-bin/SHA256SUMS build/release/
     - name: Upload tested public releases

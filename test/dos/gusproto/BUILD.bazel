@@ -7,6 +7,8 @@
 load("@rules_rust//rust:defs.bzl", "rust_static_library")
 load("//tools/dosrt:retro.bzl", "retro_lib")
 
+package(default_visibility = ["//tests:__pkg__"])
+
 rust_static_library(
     name = "gustest_lib",
     srcs = ["src/main.rs"],

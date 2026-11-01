@@ -5,6 +5,7 @@ The firmware is loaded into RAM by GRUB, so bring-up does not depend on USB
 mass-storage support or on access to the laptop's internal filesystem.
 This creates an image file only; it never writes a physical USB device.
 """
+import os
 import argparse
 import gzip
 from pathlib import Path
@@ -28,7 +29,8 @@ def main():
     args = parser.parse_args()
     output = args.out.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    run('bazelisk', 'build', '//kernel:kernel_elf', '//:root_module_base_tar')
+    if os.environ.get('RETROOS_PREBUILT') != '1':
+        run('bazelisk', 'build', '//kernel:kernel_elf', '//:root_module_base_tar')
     with tempfile.TemporaryDirectory(prefix='retroos-wifi-image-') as directory:
         work = Path(directory)
         firmware = work / 'firmware'

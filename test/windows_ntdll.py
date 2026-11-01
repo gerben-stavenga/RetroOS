@@ -15,10 +15,6 @@ def main():
     if engine not in ("kvm", "tcg"):
         raise SystemExit("ENGINE must be kvm or tcg")
     host = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
-    subprocess.run(["bazelisk", "build", f"//kernel:{host}", "//lib/wine:runtime",
-                    "//test/windows/ntdll:probe", "//test/windows/ntdll:forwarders",
-                    "//test/windows/ntdll:lazy", "//test/windows/ntdll:initdep", "//test/windows/ntdll:reject",
-                    "--platforms=@platforms//host"], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix="retroos-ntdll-") as directory:
         root = Path(directory)
         install(root)

@@ -11,7 +11,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--kvm', action='store_true')
     options = parser.parse_args()
-    subprocess.run(['bazelisk', 'build', '//arch-metal:smp_example'], cwd=ROOT, check=True)
     cases = [('legacy', 'tcg', 'pentium3,-pae', ''), ('pae', 'tcg', 'max', ''), ('timeout', 'tcg', 'max', 'missing')]
     if options.kvm:
         cases = [('xapic', 'kvm', 'host', ''), ('x2apic', 'kvm', 'host', 'x2apic'), ('timeout', 'kvm', 'host', 'missing')]

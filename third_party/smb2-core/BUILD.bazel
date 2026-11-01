@@ -1,6 +1,8 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_binary", "rust_test")
 load("//toolchain:host_transition.bzl", "host_platform_test")
 load("//toolchain:panic.bzl", "panic_strategy")
+package(default_visibility = ["//tests:__pkg__"])
+
 rust_library(
     name = "smb2-core",
     crate_name = "smb2_core",
@@ -23,6 +25,7 @@ rust_binary(
 
 rust_test(
     name = "protocol_test_host",
+    tags = ["manual"],
     srcs = ["protocol_test.rs"],
     target_compatible_with = ["@platforms//os:linux"],
     edition = "2024",

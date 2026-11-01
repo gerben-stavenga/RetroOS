@@ -56,10 +56,6 @@ def main():
     os.chdir(ROOT)
     if not os.access('/dev/kvm', os.R_OK | os.W_OK):
         raise SystemExit('KVM access is required')
-    if not args.no_build:
-        subprocess.run(['bazelisk', 'build', '//tools/command:command_com'], check=True)
-        subprocess.run(['bazelisk', 'build', '//kernel:retroos-host-kvm',
-                        '--platforms=@platforms//host'], check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-cpu-pacing-') as raw:
         root = Path(raw)
         (root / 'RETROOS').mkdir()

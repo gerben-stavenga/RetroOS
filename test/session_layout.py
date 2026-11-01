@@ -83,7 +83,6 @@ test -s /tmp/TEMP.TXT
 
 
 if __name__ == '__main__':
-    run('bazelisk', 'build', '//:boot_disk')
     with tempfile.TemporaryDirectory(prefix='retroos-session-layout-') as folder:
         for kind in ('fat', 'ext4'):
             check(Path(folder), kind)

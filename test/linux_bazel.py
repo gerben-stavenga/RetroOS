@@ -16,7 +16,7 @@ def main():
     args = parser.parse_args()
     install = args.install_base
     if install is None:
-        install = Path(subprocess.check_output(['bazelisk', 'info', 'install_base'], cwd=ROOT, text=True).strip())
+        parser.error('--install-base is required')
     work = ROOT / 'build/ci/bazel-smoke'
     workspace = ROOT / 'build/ci/bazel-smoke-workspace'
     workspace.mkdir(parents=True, exist_ok=True)

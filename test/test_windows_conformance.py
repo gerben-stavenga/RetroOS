@@ -41,7 +41,7 @@ class Results(unittest.TestCase):
                '[mem] exit tid=2 code=0\n')
         self.assertEqual(observe(log, -15, True)['status'], 'timeout')
 
-    def test_import_inventory_excludes_descriptor_rows_and_known_gates(self):
+    def test_import_inventory_excludes_descriptor_rows_and_requires_actual_exports(self):
         output = """
  DLL Name: USER32.dll
  vma: Hint/Ord Member-Name Bound-To
@@ -52,12 +52,12 @@ class Results(unittest.TestCase):
 The Function Table
 """
         with patch('windows_conformance.command', return_value=output):
-            self.assertEqual(import_audit('test.exe', {'user32': {'knownexport'}},
-                                          {('user32', 'knowngate')}), ['USER32.DLL!Missing'])
+            self.assertEqual(import_audit('test.exe', {'user32': {'knownexport'}}),
+                             ['USER32.DLL!KnownGate', 'USER32.DLL!Missing'])
 
     def test_bound_imports_are_audited(self):
         with patch('windows_conformance.command',return_value="DLL Name: KERNEL32.dll\n 4522 616 OutputDebugStringA 77e9bd34\n"):
-            self.assertEqual(import_audit('test.exe',{},set()),['KERNEL32.DLL!OutputDebugStringA'])
+            self.assertEqual(import_audit('test.exe',{}),['KERNEL32.DLL!OutputDebugStringA'])
 
     def test_singular_failure_summary(self):
         result=observe('dce: 136 tests executed (0 marked as todo, 1 failure), 0 skipped.\n[mem] exit tid=1 code=1\n',0,False)

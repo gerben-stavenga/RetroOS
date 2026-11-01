@@ -11,10 +11,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     os.chdir(ROOT)
-    subprocess.run(['bazelisk', 'build', '//tools/command:command_com',
-                    '//test/dos/tsrsession:tsrsession_com'], check=True)
-    subprocess.run(['bazelisk', 'build', '//kernel:retroos-host',
-                    '--platforms=@platforms//host'], check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-tsr-session-') as tmp:
         root = Path(tmp) / 'home/retroos'
         root.mkdir(parents=True)

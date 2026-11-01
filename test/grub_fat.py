@@ -60,7 +60,9 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
     iso = work / (name + ".iso")
     run("grub-mkrescue", "-o", iso, tree)
     log = work / (name + ".log")
-    args = ["qemu-system-i386", "-m", str(memory), "-cpu", cpu, "-cdrom", str(iso),
+    # This checks filesystem and DOS APIs, not scanout. A VGA device makes
+    # slow TCG text presentation compete with the batch probe's time budget.
+    args = ["qemu-system-i386", "-vga", "none", "-m", str(memory), "-cpu", cpu, "-cdrom", str(iso),
             "-boot", "order=d", "-display", "none", "-serial", "none", "-no-reboot",
             "-debugcon", "file:" + str(log), "-fw_cfg", "name=opt/cmdline,string=" + command]
     if not module:
@@ -91,7 +93,6 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
 
 
 def main():
-    run("bazelisk", "build", "//kernel:kernel_elf", "//test/dos/lfnprobe:lfnprobe_com", "//tools/command:command_com")
     with tempfile.TemporaryDirectory(prefix="retroos-fat-") as scratch:
         work = pathlib.Path(scratch)
         run("gcc", "-m32", "-static", "-nostdlib", "-no-pie", "-fno-pic", "-fno-stack-protector",

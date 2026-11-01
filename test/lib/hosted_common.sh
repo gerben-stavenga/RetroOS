@@ -1,6 +1,6 @@
 #!/bin/bash
 # Shared engine selection for every hosted integration suite. Missing KVM is
-# a failure here; run_all.sh owns optional prerequisite skips.
+# a failure here; Bazel tags select tests requiring that capability.
 case "${ENGINE:-tcg}" in
     tcg) HOST_TARGET=retroos-host ;;
     kvm)

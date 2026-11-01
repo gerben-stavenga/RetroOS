@@ -113,7 +113,7 @@ class ShowcaseTests(unittest.TestCase):
             with tarfile.open(showcase, 'w') as tar:
                 tar.add(optional / 'GAMES', arcname='GAMES')
             with patch.object(installer, 'STAGE', root / 'stage'), \
-                 patch.object(installer, 'filesystem', return_value={'uuid': 'test-uuid', 'fstype': 'ext4', 'fsroot': '/', 'target': '/'}):
+                 patch.object(installer, 'filesystem', return_value={'uuid': 'test-uuid', 'fstype': 'ext4', 'fsroot': '/', 'target': str(root)}):
                 installer.prepare(root / 'C', root / 'boot', archive, True, showcase)
                 stage = Path((root / 'stage/selected').read_text().strip())
                 self.assertTrue((stage / 'showcase/GAMES/OWN.DAT').is_file())

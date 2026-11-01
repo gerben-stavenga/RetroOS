@@ -384,12 +384,6 @@ def main():
     target = "retroos-host" + ("-kvm" if args.engine == "kvm" else "")
     if args.host_bin is None:
         args.host_bin = ROOT / "bazel-bin/kernel" / target
-        if not args.no_build:
-            bazel = shutil.which("bazelisk") or shutil.which("bazel")
-            if not bazel:
-                parser.error("Bazel required; use --no-build with an existing binary")
-            subprocess.run([bazel, "build", f"//kernel:{target}", "--platforms=@platforms//host"],
-                           cwd=ROOT, check=True)
     for key in ("source", "host_bin", "output", "golden"):
         setattr(args, key, getattr(args, key).resolve())
     if not args.host_bin.is_file():

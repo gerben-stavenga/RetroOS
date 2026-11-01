@@ -14,8 +14,6 @@ cd "$(dirname "$0")/.."
 
 IMG=bazel-bin/image.bin          # the open-source image carries the committed games
 source test/lib/hosted_common.sh
-bazelisk build //:image >/dev/null || exit 1
-bazelisk build "//kernel:$HOST_TARGET" --platforms=@platforms//host >/dev/null || exit 1
 
 PY="python3 test/hosted_test.py --host-bin $HOST_BIN --image $IMG"
 fail=0

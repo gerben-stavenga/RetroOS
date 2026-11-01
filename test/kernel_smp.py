@@ -10,7 +10,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--kvm', action='store_true')
     options = parser.parse_args()
-    run('bazelisk', 'build', '//:boot_disk')
     work = Path(tempfile.mkdtemp(prefix='retroos-kernel-smp-'))
     print('Artifacts:', work, flush=True)
     disk = work / 'data.img'

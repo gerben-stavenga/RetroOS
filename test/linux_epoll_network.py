@@ -11,7 +11,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
-    subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-epoll-net-') as directory, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
         server.bind(('127.0.0.1', 0))
         server.settimeout(40)

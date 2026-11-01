@@ -15,12 +15,7 @@ def main():
     if engine not in ('kvm', 'tcg'):
         raise SystemExit('ENGINE must be kvm or tcg')
     host = 'retroos-host-kvm' if engine == 'kvm' else 'retroos-host'
-    subprocess.run(['bazelisk', 'build', '//tools/command:command_com'], cwd=ROOT, check=True)
     command_binary = (ROOT / 'bazel-bin/tools/command/COMMAND.COM').resolve()
-    targets = [f'//kernel:{host}', '//test/windows/win16:bridge', '//test/windows/win16:fpmath', '//test/windows/win16:civ_apis', '//test/windows/win16:window', '//test/windows/win16:legacy_user',
-               '//lib/wine:runtime', '//test/windows/win16:multimedia', '//test/windows/win16:mmio', '//test/windows/win16:text', '//test/windows/win16:clipping']
-    targets += [f'//test/windows/win16:{name}' for name in ('dos_files','initializers','init_dependency','init_nested','init_large','init_failure')]
-    subprocess.run(['bazelisk', 'build', *targets, '--platforms=@platforms//host'], cwd=ROOT, check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-win16-') as directory:
         root = Path(directory)
         (root / "INSTALL.INI").write_text("[Installer]\nTarget=C:\\CIV\n", encoding="ascii")

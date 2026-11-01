@@ -1,5 +1,7 @@
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:windows_watcom.bzl", "windows16_binary", "windows16_dll")
+
+package(default_visibility = ["//tests:__pkg__"])
 nasm_library(name="bridge_obj", srcs=["bridge.asm"], copts=["-fobj"])
 windows16_binary(name="bridge", obj=":bridge_obj", imports={
     "Exit": "KERNEL.1", "CallWindowProc": "USER.122", "Debug": "KERNEL.115",

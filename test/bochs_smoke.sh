@@ -4,7 +4,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source test/lib/qemu_common.sh
-qemu_bazel build //:data_disk
 
 work=$(mktemp -d -t retroos-bochs-test.XXXXXX)
 pid=""

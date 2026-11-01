@@ -53,7 +53,6 @@ def main():
     parser.add_argument('--cpus', type=int, default=1)
     parser.add_argument('--kvm', action='store_true')
     options = parser.parse_args()
-    run('bazelisk', 'build', '//:boot_disk')
     work = Path(tempfile.mkdtemp(prefix='retroos-display-scaling-'))
     print('Artifacts:', work, flush=True)
     data = work / 'data.img'

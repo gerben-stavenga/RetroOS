@@ -47,8 +47,6 @@ newline db 13, 10, '$'
 cp850 db 'CP850', 13, 10, '$'
 ''')
         subprocess.run(['nasm', '-f', 'bin', source, '-o', root / 'BOOT.COM'], check=True)
-        subprocess.run(['bazelisk', 'build', '//kernel:retroos-host',
-                        '--platforms=@platforms//host'], cwd=ROOT, check=True)
 
         def boot(label, extra=(), repeated=True):
             log = work / (label + '.log')

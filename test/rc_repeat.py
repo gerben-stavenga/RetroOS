@@ -5,7 +5,6 @@ from pathlib import Path
 from boot_fixture import prepare_boot
 
 root=Path(__file__).resolve().parents[1]
-subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=root, check=True)
 work=Path(tempfile.mkdtemp(prefix='retroos-rc-repeat-'))
 print(work,flush=True)
 disk=work/'data.img'; disk.write_bytes(b''); disk.open('r+b').truncate(32*1024*1024)

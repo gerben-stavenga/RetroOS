@@ -39,7 +39,6 @@ def run_case(failure):
 
 
 def main():
-    subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
     for failure in (None, 'BAD_MXCSR', 'BAD_PC'):
         run_case(failure)
 

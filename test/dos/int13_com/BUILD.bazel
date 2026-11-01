@@ -1,3 +1,5 @@
+
+package(default_visibility = ["//tests:__pkg__"])
 # INT 13h floppy probe: AH=08h drive parameters, AH=02h CHS boot-sector read
 # (checks the 55AA signature), AH=16h change-line report-once, AH=03h
 # write-back. Run with an image inserted in A: via the F12 Disk tab;
