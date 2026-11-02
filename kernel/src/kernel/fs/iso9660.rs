@@ -774,6 +774,26 @@ mod tests {
     }
 
     #[test]
+    fn legacy_identifier_padding_does_not_hide_directory_contents() {
+        let mut iso = minimal_iso();
+        let record = &mut iso[20 * 2048 + 68..21 * 2048];
+        let length = directory_record(record, 21, 5, 0, b"TEST.TXT;1");
+        // Death Rally's CD contains leftover identifier bytes here, rather
+        // than zero padding. The byte carries no filename or file data.
+        record[length - 1] = b'X';
+        let filesystem = Iso9660Fs::open(Box::new(Bytes(iso)), DiscFormat::Iso).unwrap();
+        let mut entries = Vec::new();
+        Filesystem::readdir(&filesystem, b"", 0, &mut entries, 8);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, b"TEST.TXT");
+        let file = Filesystem::open(&filesystem, b"TEST.TXT").unwrap();
+        let mut contents = [0; 5];
+        assert_eq!(Filesystem::read(&filesystem, file.handle, 0, &mut contents, file.size), 5);
+        assert_eq!(&contents, b"hello");
+        Filesystem::clunk(&filesystem, file.handle);
+    }
+
+    #[test]
     fn hadris_iso_stream_serves_the_vfs() {
         let filesystem = Iso9660Fs::open(Box::new(Bytes(minimal_iso())), DiscFormat::Iso).unwrap();
 

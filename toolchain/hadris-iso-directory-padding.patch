@@ -1,0 +1,14 @@
+--- a/src/directory.rs
++++ b/src/directory.rs
+@@ -287,7 +287,10 @@
+         }
+         if name_len.is_multiple_of(2) {
+             let padding = Self::DATA_START + name_len;
+-            if padding >= size || sel.data[padding] != 0 {
++            // Some older pressed CDs (including Death Rally) leave nonzero
++            // identifier padding. Ignore its value, but still require that
++            // the byte exists within the directory record.
++            if padding >= size {
+                 return Err(io::Error::new(
+                     io::ErrorKind::InvalidData,
+                     "invalid ISO directory-record identifier padding",

@@ -1,5 +1,5 @@
 {
-  "checksum": "dbcaa6d37a84953675f43e453188de176ee7c8eb3902208f4f9da21de7035d86",
+  "checksum": "c05f20baf35e1d563dd7fecdcc335e2695477e553b64acd5880182b027767afa",
   "crates": {
     "aes 0.9.3": {
       "name": "aes",
@@ -2079,7 +2079,13 @@
       "repository": {
         "Http": {
           "url": "https://static.crates.io/crates/hadris-iso/2.0.0/download",
-          "sha256": "f8233e70bc5d15be8b73fbc425dc5930aeeaa74990cee00d86d36e87f2673154"
+          "sha256": "f8233e70bc5d15be8b73fbc425dc5930aeeaa74990cee00d86d36e87f2673154",
+          "patch_args": [
+            "-p1"
+          ],
+          "patches": [
+            "@@//toolchain:hadris-iso-directory-padding.patch"
+          ]
         }
       },
       "targets": [

@@ -276,6 +276,12 @@ crate.from_specs(
     lockfile = "//:cargo-bazel-lock.json",
 )
 crate.annotation(
+    crate = "hadris-iso",
+    # Older pressed CDs can leave nonzero bytes in identifier padding.
+    patch_args = ["-p1"],
+    patches = ["//toolchain:hadris-iso-directory-padding.patch"],
+)
+crate.annotation(
     crate = "unicorn-engine-sys",
     gen_build_script = "off",
     deps = ["@@//third_party/unicorn"],
