@@ -224,8 +224,11 @@ pub struct EmulatedSb {
     core: sound::sb::Sb,
     /// Guest address belongs to the machine, never the card model.
     dma_base: u32,
-    dma_image: alloc::vec::Vec<u8>,
-    worker_dma: bool,
+    dma_channel: usize,
+    dma_count_gen: u32,
+    #[cfg(test)]
+    test_dma_image: alloc::vec::Vec<u8>,
+    dma_binding: Option<crate::kernel::drivers::isa_dma::Binding>,
     /// Incremental DSP source position in Q32.32 frames. The output mix rate
     /// may change to regulate physical pipe depth, so reconstructing this from
     /// an absolute output frame and the latest rate would warp its history.
@@ -280,8 +283,10 @@ impl EmulatedSb {
         Box::new(Self {
             core: sound::sb::Sb::new(),
             dma_base: 0,
-            dma_image: alloc::vec::Vec::new(),
-            worker_dma: false,
+            dma_channel: usize::MAX, dma_count_gen: 0,
+            #[cfg(test)]
+            test_dma_image: alloc::vec::Vec::new(),
+            dma_binding: None,
             mix_pos_q32: 0,
             est_frames: 0, est_ns: 0, est_cap: 0, est_slope: 0, est_served: 0,
             probe_steps: 0, refill_until: 0, refill_phase: 0, refill_rate: 0,
@@ -352,10 +357,7 @@ impl SoundBlaster {
         let Self { blaster, device } = self;
         match device {
             SbDevice::Emulated(emu) => {
-                // No real card / no buffer alias in emulation: just stop the
-                // card so the next program sees a clean, idle one. The output
-                // sink belongs to the event loop and keeps carrying the other
-                // sources (or silence) across this program boundary.
+                emu.unbind_dma(machine);
                 emu.core.reset_for_exit();
             }
             SbDevice::Native { pt, .. } => pt.release(machine, blaster),
@@ -473,9 +475,30 @@ impl SoundBlaster {
             };
         };
         match device {
-            SbDevice::Emulated(emu) => emu.dma_read(machine, dma, blaster, is_cnt, chan, hi_ctrl),
+            SbDevice::Emulated(emu) => emu.dma_read(machine.now(), dma, blaster, is_cnt, chan, hi_ctrl),
             SbDevice::Native { pt, .. } => native_dma_read(pt, machine, dma, blaster, port, is_cnt, chan, hi_ctrl),
         }
+    }
+
+    /// Nonblocking port handlers may use the same emulated DMA counter and
+    /// byte-pointer state as ordinary I/O. Native cards and other channels
+    /// retain the normal path; only count reads and flip-flop clears qualify.
+    pub fn dma_poll(&mut self, dma: &mut Dma8237, port: u16, write: Option<u8>, now: u64) -> Option<u8> {
+        let SbDevice::Emulated(emu) = &mut self.device else { return None };
+        if let Some(value) = write {
+            if !matches!(port, 0x0c | 0xd8) { return None; }
+            dma.io_write(port, value);
+            return Some(0);
+        }
+        let (channel, high) = match port {
+            1 | 3 | 5 | 7 => ((port / 2) as usize, false),
+            0xc2 | 0xc6 | 0xca | 0xce => (4 + ((port - 0xc0) / 4) as usize, true),
+            _ => return None,
+        };
+        if channel != self.blaster.dma8 as usize && channel != self.blaster.dma16 as usize {
+            return None;
+        }
+        Some(emu.dma_read(now, dma, &self.blaster, true, channel, high))
     }
 
     /// Called after every virtual-8237 write. Only a real card needs anything
@@ -519,16 +542,24 @@ impl SoundBlaster {
         }
     }
 
-    /// Task switched to the background. Emulated has nothing to detach — its
-    /// "DMA" is a read of guest memory that happens only while we run it.
-    pub fn sb_suspend<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
-        if let SbDevice::Native { pt, .. } = &mut self.device {
-            pt.suspend(machine);
+    /// Release this task's channel binding before another task uses the pool.
+    pub fn sb_suspend<A: crate::Arch>(&mut self, machine: &mut A) {
+        match &mut self.device {
+            SbDevice::Emulated(emu) => emu.unbind_dma(machine),
+            SbDevice::Native { pt, .. } => pt.suspend(machine),
         }
     }
 
     /// Task switched back to the foreground: re-materialize the binding.
-    pub fn sb_resume<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs, dma: &mut Dma8237) {
+    pub fn sb_resume<A: crate::Arch>(&mut self, machine: &mut A, dma: &mut Dma8237) {
+        if let SbDevice::Emulated(emu) = &mut self.device {
+            let channel = emu.dma_channel;
+            if emu.core.playing() && channel < 8 {
+                let (gpa, len) = chan_gpa_len(&dma.ch[channel].prog, channel >= 4);
+                if !emu.core.short_probe_active() && gpa >= 0x1000 { emu.bind_dma(machine, channel, gpa, len); }
+            }
+            return;
+        }
         let SbDevice::Native { pt, .. } = &mut self.device else { return };
         if !pt.suspended() { return; }
         pt.clear_suspended();
@@ -604,12 +635,23 @@ impl EmulatedSb {
         }
         let prog = dma.ch[chan].prog;
         let (gpa, len) = chan_gpa_len(&prog, is16);
+        // A DSP restart does not reload the 8237. Its pointer survives until
+        // the guest actually reprograms that DMA channel.
+        let same_dma = self.dma_channel == chan && self.dma_count_gen == dma.count_gen[chan]
+            && self.dma_base == gpa;
+        let offset_bytes = if same_dma {
+            u32::from(self.core.dma_cursor().1) * if is16 { 2 } else { 1 }
+        } else { 0 };
+        let frame_bytes = u32::from(start.bits / 8) * if start.stereo { 2 } else { 1 };
         self.dma_base = gpa;
-        self.core.begin(start, len);
-        if crate::kernel::media::enabled() {
-            self.dma_image.resize(len as usize, 0);
-            self.worker_dma = machine.guest_read_view().is_some();
-            if !self.worker_dma { machine.copy_from(self.dma_base as usize, &mut self.dma_image); }
+        self.dma_channel = chan;
+        self.dma_count_gen = dma.count_gen[chan];
+        self.core.begin(start, len, prog.mode & 0x10 != 0, offset_bytes / frame_bytes.max(1));
+        // Count reads in the IRQ handler can precede the next mixer pass.
+        // Reset their estimator with the new DSP epoch immediately.
+        self.take_restart();
+        if !self.core.short_probe_active() && gpa >= 0x1000 {
+            self.bind_dma(machine, chan, gpa, len);
         }
         self.probe_steps = if self.core.short_probe_active() {
             PROBE_DELAY_STEPS
@@ -663,24 +705,21 @@ impl EmulatedSb {
         true
     }
 
-    pub(super) fn capture_dma<A: crate::Arch>(&mut self, machine: &A) {
-        if self.worker_dma { return; }
-        let _ = self.capture_dma_with(&mut |addr, bytes| { machine.copy_from(addr, bytes); true });
+    fn bind_dma<A: crate::Arch>(&mut self, machine: &mut A, channel: usize, gpa: u32, len: u32) {
+        if self.dma_binding.as_ref().is_some_and(|binding| binding.matches(channel, gpa as usize, len as usize)) {
+            return;
+        }
+        self.unbind_dma(machine);
+        self.dma_binding = crate::kernel::drivers::isa_dma::Binding::new(machine, channel, gpa as usize, len as usize);
     }
-    pub(super) fn needs_worker_dma(&self) -> bool {
-        self.worker_dma && self.core.playing() && !self.dma_image.is_empty()
-    }
-    pub(super) fn capture_dma_with(&mut self, copy: &mut dyn FnMut(usize, &mut [u8]) -> bool) -> bool {
-        if !self.core.playing() || self.dma_image.is_empty() { return true; }
-        // The worker owns this copy. Sample a complete ring so a delayed
-        // mixer quantum can wrap or catch up without reading stale bytes.
-        copy(self.dma_base as usize, &mut self.dma_image)
+    fn unbind_dma<A: crate::Arch>(&mut self, machine: &mut A) {
+        if let Some(binding) = self.dma_binding.take() { binding.unbind(machine); }
     }
 
-    pub(super) fn mix_limit(&mut self, now: u64, rate: u32, requested: usize) -> usize {
+    pub(super) fn mix_limit(&mut self, now: u64, rate: u32, requested: usize, can_defer: bool) -> usize {
         self.take_restart();
         if self.refill_until != 0 {
-            if now < self.refill_until { return 0; }
+            if now < self.refill_until || can_defer { return 0; }
             self.refill_until = 0;
         }
         let Some(end) = self.core.single_boundary() else { return requested };
@@ -715,10 +754,17 @@ impl EmulatedSb {
             while copied < bytes {
                 let pos = (offset + copied) % ring;
                 let run = (bytes - copied).min(ring - pos);
-                if let Some(copy) = copy.as_mut() {
-                    copy(self.dma_base as usize + pos, &mut scratch[copied..copied + run]);
+                let destination = &mut scratch[copied..copied + run];
+                if let Some(binding) = self.dma_binding.as_ref() {
+                    binding.read(pos, destination);
+                } else if let Some(copy) = copy.as_mut() {
+                    copy(self.dma_base as usize + pos, destination);
                 } else {
-                    scratch[copied..copied + run].copy_from_slice(&self.dma_image[pos..pos + run]);
+                    destination.fill(0);
+                    #[cfg(test)]
+                    if let Some(image) = self.test_dma_image.get(pos..pos + run) {
+                        destination.copy_from_slice(image);
+                    }
                 }
                 copied += run;
             }
@@ -779,8 +825,8 @@ impl EmulatedSb {
     /// the last reconciled position plus elapsed nanoseconds × measured slope,
     /// capped and monotonic (see the `est_*` field docs). With no slope
     /// measured yet this degrades to the pump-quantized cursor.
-    fn dma_pos_estimate<A: crate::Arch>(&mut self, machine: &mut A) -> u64 {
-        let dt = machine.now().wrapping_sub(self.est_ns);
+    fn dma_pos_estimate(&mut self, now: u64) -> u64 {
+        let dt = now.wrapping_sub(self.est_ns);
         let adv = if dt < 1 << 40 {
             ((dt as u128 * self.est_slope as u128) >> 32) as u64
         } else {
@@ -798,9 +844,9 @@ impl EmulatedSb {
     /// live state from the card's play cursor (auto-init down-count), other
     /// channels from the captured base programming. The flip-flop and the
     /// programmed base are the controller's — ours; the cursor is the card's.
-    fn dma_read<A: crate::Arch>(
+    fn dma_read(
         &mut self,
-        machine: &mut A,
+        now: u64,
         dma: &mut Dma8237,
         b: &Blaster,
         is_cnt: bool,
@@ -823,7 +869,7 @@ impl EmulatedSb {
             // for). Estimated, not pump-quantized: a poll loop watching for
             // the cursor to enter a window needs it to move smoothly.
             if low {
-                let pos = self.dma_pos_estimate(machine);
+                let pos = self.dma_pos_estimate(now);
                 let (count, consumed) = self.core.dma_cursor_at(pos);
                 dma.read_latch = if is_cnt {
                     count
@@ -835,6 +881,13 @@ impl EmulatedSb {
             return if low { v as u8 } else { (v >> 8) as u8 };
         }
         let p = dma.ch[chan].prog;
+        if is_active && self.dma_channel == chan && self.dma_count_gen == dma.count_gen[chan]
+            && p.mode & 0x10 != 0 && self.core.dma_progress().0 != 0
+        {
+            let (count, consumed) = self.core.dma_cursor();
+            let value = if is_cnt { count } else { p.addr.wrapping_add(consumed) };
+            return if low { value as u8 } else { (value >> 8) as u8 };
+        }
         // Post-terminal-count state: a finished single-cycle transfer reads
         // count 0xFFFF (underflow) and the address one past the end, until the
         // channel is restarted — not the base programming.
@@ -904,9 +957,49 @@ machine: &mut A,
 mod single_cycle_tests {
     use super::*;
 
+    #[test]
+    fn fast_and_normal_dma_reads_share_a_latched_word() {
+        let mut card = SoundBlaster::new();
+        let mut dma = Dma8237::new();
+        if let SbDevice::Emulated(sb) = &mut card.device {
+            sb.core.begin(sound::sb::Start { bits: 16, stereo: true, signed: true,
+                single: false, block_override: Some(65535) }, 1024, true, 0);
+        }
+        assert_eq!(card.dma_poll(&mut dma, 0xd8, Some(0), 0), Some(0));
+        assert_eq!(card.dma_poll(&mut dma, 0xc6, None, 0), Some(0xff));
+        // The worker consumes half the ring between low and high reads.
+        let SbDevice::Emulated(sb) = &mut card.device else { unreachable!() };
+        sb.mix_pos_q32 = 128 << 32;
+        sb.clock_tick(1_000_000, &mut VirtualPic::new(), 7);
+        assert_eq!(sb.dma_read(1_000_000, &mut dma, &card.blaster, true, 5, true), 1);
+        // A new pair now observes the new cursor, even if the normal path
+        // consumes its first byte and the shortcut consumes its second.
+        dma.io_write(0xd8, 0);
+        assert_eq!(sb.dma_read(1_000_000, &mut dma, &card.blaster, true, 5, true), 0xff);
+        assert_eq!(card.dma_poll(&mut dma, 0xc6, None, 2_000_000), Some(0));
+    }
+
+    #[test]
+    fn dma_shortcut_preserves_other_controller_and_rejects_programming() {
+        let mut card = SoundBlaster::new();
+        let mut dma = Dma8237::new();
+        dma.ch[1].prog.count = 0x1234;
+        dma.ch[5].prog.count = 0x5678;
+        assert_eq!(card.dma_poll(&mut dma, 3, None, 0), Some(0x34));
+        assert_eq!(card.dma_poll(&mut dma, 0xc6, None, 0), Some(0x78));
+        assert_eq!(card.dma_poll(&mut dma, 0xd8, Some(0xff), 0), Some(0));
+        assert_eq!(card.dma_poll(&mut dma, 3, None, 0), Some(0x12));
+        assert_eq!(card.dma_poll(&mut dma, 0xc6, None, 0), Some(0x78));
+        let before = (dma.ff_lo, dma.ff_hi, dma.read_latch, dma.ch[5].prog.count);
+        for (port, write) in [(0xc6, Some(0)), (0xc4, None), (0xca, None), (0xd0, None)] {
+            assert_eq!(card.dma_poll(&mut dma, port, write, 0), None);
+        }
+        assert_eq!((dma.ff_lo, dma.ff_hi, dma.read_latch, dma.ch[5].prog.count), before);
+    }
+
     fn start(sb: &mut EmulatedSb) {
         sb.core.begin(sound::sb::Start { bits: 8, stereo: false, signed: false,
-            single: true, block_override: Some(879) }, 880);
+            single: true, block_override: Some(879) }, 880, false, 0);
     }
 
     #[test]
@@ -914,13 +1007,13 @@ mod single_cycle_tests {
         let mut sb = EmulatedSb::new();
         sb.core.port_write(0x22c, 0x40, 0);
         sb.core.port_write(0x22c, 0xe9, 0);
-        sb.dma_image.resize(880, 255);
+        sb.test_dma_image.resize(880, 255);
         start(&mut sb);
         let mut irq = VirtualPic::new();
         let mut played = 0;
         for tick in 1..=21 {
             let now = tick * 1_000_000;
-            let n = sb.mix_limit(now, 48_000, 48);
+            let n = sb.mix_limit(now, 48_000, 48, false);
             let mut samples = [(0, 0); 48];
             sb.mix_resident(48_000, &mut samples[..n], false, None);
             assert!(samples[..n].iter().all(|&(l, r)| l > 0 && r > 0));
@@ -929,13 +1022,28 @@ mod single_cycle_tests {
         }
         assert_eq!(played, 972); // ceil(880 * 48000 / 43478)
         assert!(irq.is_requested(7));
-        assert_eq!(sb.mix_limit(21_500_000, 48_000, 48), 0);
+        assert_eq!(sb.mix_limit(21_500_000, 48_000, 48, false), 0);
         let carry = sb.refill_phase;
         assert!(carry > 0);
         sb.core.port_read(0x22e);
         start(&mut sb);
-        assert_eq!(sb.mix_limit(21_600_000, 48_000, 36), 36);
+        assert_eq!(sb.mix_limit(21_600_000, 48_000, 36, false), 36);
         assert_eq!(sb.mix_pos_q32, carry);
+    }
+
+    #[test]
+    fn queued_output_absorbs_a_late_chained_refill_without_padding() {
+        let mut sb = EmulatedSb::new();
+        start(&mut sb);
+        sb.take_restart();
+        sb.mix_pos_q32 = (880 << 32) + 1234;
+        sb.clock_tick(100_000_000, &mut VirtualPic::new(), 7);
+        // The guest can be delayed beyond two milliseconds by a disk read.
+        // While the sink still has a reserve, no silence should be committed.
+        assert_eq!(sb.mix_limit(115_000_000, 48_000, 48, true), 0);
+        start(&mut sb);
+        assert_eq!(sb.mix_limit(116_000_000, 48_000, 48, true), 48);
+        assert_eq!(sb.mix_pos_q32, 1234);
     }
 
     #[test]
@@ -945,8 +1053,8 @@ mod single_cycle_tests {
         sb.take_restart();
         sb.mix_pos_q32 = 880 << 32;
         sb.clock_tick(100_000_000, &mut VirtualPic::new(), 7);
-        assert_eq!(sb.mix_limit(101_000_000, 48_000, 48), 0);
-        assert_eq!(sb.mix_limit(102_000_000, 48_000, 48), 48);
+        assert_eq!(sb.mix_limit(101_000_000, 48_000, 48, false), 0);
+        assert_eq!(sb.mix_limit(102_000_000, 48_000, 48, false), 48);
         assert!(!sb.core.playing());
     }
 }

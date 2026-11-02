@@ -18,7 +18,7 @@
 #![no_std]
 
 mod arch;
-pub use arch::{Arch, GuestBytes, GuestReadView, Vcpu};
+pub use arch::{Arch, GuestBytes, Vcpu};
 
 /// Native interrupt entries for protected mode and long mode.
 #[repr(C)]

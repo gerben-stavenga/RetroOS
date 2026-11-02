@@ -101,7 +101,7 @@ impl Dma8237 {
         if hi { &mut self.ff_hi } else { &mut self.ff_lo }
     }
 
-    pub fn io_write<A: crate::Arch>(&mut self, _machine: &mut A, port: u16, val: u8) {
+    pub fn io_write(&mut self, port: u16, val: u8) {
         // Page registers.
         if let Some(&(_, chan)) = DMA_PAGE_PORT.iter().find(|&&(p, _)| p == port) {
             self.ch[chan].prog.page = val;

@@ -327,13 +327,14 @@ pub struct Sb {
     signed: bool,     // SB16 DMA sample encoding
     block_param: u16, // DSP block size set by 0x48 (transfers − 1)
     /// Single-cycle DMA (DSP 0x14/0x91/0xC0/0xB0 without the auto-init bit):
-    /// play the buffer ONCE, raise the IRQ at the end, then stop — vs auto-init
-    /// (0x1C/0xC6/0xB6) which loops the ring and IRQs per block. Dune 2 speech
-    /// uses single-cycle.
+    /// play one DSP block, raise the IRQ at the end, then stop. DSP auto-init
+    /// repeats that block; the DMA controller's own auto-init is independent.
     single: bool,
 
     /// Ring geometry, as the host reported it at `begin`.
     buf_frames: u32,   // ring length in frames
+    dma_auto_init: bool,
+    dma_start_frame: u32,
     block_frames: u32, // frames between SB IRQs (one DMA block)
     /// Guest-visible frames produced since playback start (monotonic). The DMA
     /// down-count derives from this, and block IRQs fire as the CPU-clocked
@@ -392,7 +393,7 @@ impl Sb {
             playing: false, paused: false,
             rate: 22050, bits: 8, stereo: false, signed: false, block_param: 0,
             single: false,
-            buf_frames: 0, block_frames: 0,
+            buf_frames: 0, dma_auto_init: false, dma_start_frame: 0, block_frames: 0,
             cursor: 0, next_irq: 0,
             restarted: false,
             blocks_done: 0, blocks_acked: 0,
@@ -660,7 +661,9 @@ impl Sb {
     /// of the guest's DMA controller.
     ///
     /// `len_bytes` bounds the source geometry; only the host knows its address.
-    pub fn begin(&mut self, s: Start, len_bytes: u32) {
+    /// `dma_auto_init` is the controller's loop bit. `dma_start_frame` is its
+    /// current position, which survives a DSP restart without DMA reprogramming.
+    pub fn begin(&mut self, s: Start, len_bytes: u32, dma_auto_init: bool, dma_start_frame: u32) {
         self.bits = s.bits;
         self.stereo = s.stereo;
         self.signed = s.signed;
@@ -672,14 +675,17 @@ impl Sb {
         let channels = if s.stereo { 2u32 } else { 1 };
         let frame_bytes = (s.bits as u32 / 8) * channels;
         self.buf_frames = len_bytes.checked_div(frame_bytes).unwrap_or(0);
-        // The DSP command's length is authoritative when it supplied one;
-        // the 8237 count remains the physical ceiling (terminal count).
+        self.dma_auto_init = dma_auto_init;
+        self.dma_start_frame = dma_start_frame % self.buf_frames.max(1);
+        // The DSP command and the DMA controller have independent counters.
+        // A looping DMA buffer can wrap many times before a single DSP block
+        // ends (Death Rally uses 1,332 frames against a 32,768-frame block).
         // Auto-init raises an IRQ for each programmed DSP block.
         self.block_frames = if s.single {
             s.block_override
                 .map(|n| ((n as u32 + 1) / channels).max(1))
                 .unwrap_or(self.buf_frames.max(1))
-                .min(self.buf_frames.max(1))
+                .min(if dma_auto_init { u32::MAX } else { self.buf_frames.max(1) })
         } else {
             // Block size is "transfers − 1"; a transfer is one sample/channel.
             ((self.block_param as u32 + 1) / channels).max(1)
@@ -719,7 +725,7 @@ impl Sb {
                     if let Some(mut window) = self.source_window(position_q32 >> 32, last) {
                         match completion {
                             None => return Effects { irq: false, dma: Some(crate::dma::Request::Read {
-                                offset: (window.first % u64::from(window.buf_frames)) as usize * window.frame_bytes as usize,
+                                offset: ((window.first + u64::from(self.dma_start_frame)) % u64::from(window.buf_frames)) as usize * window.frame_bytes as usize,
                                 bytes: window.source_frames * window.frame_bytes as usize,
                                 wrap_bytes: Some(window.buf_frames as usize * window.frame_bytes as usize),
                             }) },
@@ -774,6 +780,8 @@ impl Sb {
             return raise;
         }
         let guest_now = produced;
+        self.latch_cyclic_dma_wrap(self.cursor,
+            if self.single { guest_now.min(self.next_irq) } else { guest_now });
         while self.playing && guest_now >= self.next_irq {
             raise |= self.block_irq();
             if self.single {
@@ -800,19 +808,29 @@ impl Sb {
         let irq_bit = if self.bits == 16 { 0x02 } else { 0x01 };
         let raise = self.irq_status & irq_bit == 0;
         self.irq_status |= irq_bit;
-        // ...and the 8237's terminal-count bit for the channel. A real chip
-        // asserts TC at the end of EVERY block — in auto-init the count
-        // underflows and reloads, and the status bit latches each time —
-        // which `finish_single` did but this path did not, so an auto-init
-        // driver identifying its interrupt by `in al, 0x08` was told
-        // "not mine" forever. Auto-init is the mode Quake/Dune2/ROTT play
-        // in; the identify idiom is PoP's digi.drv.
-        let chan = if self.bits == 16 { self.dma16 } else { self.dma8 };
-        self.tc_status |= 1 << (chan & 7);
+        // A non-looping DMA controller reaches TC only at its own end.
+        // Cyclic DMA wraps are latched independently in advance_clock.
+        if !self.dma_auto_init
+            && self.cursor + u64::from(self.dma_start_frame) >= u64::from(self.buf_frames)
+        {
+            let chan = if self.bits == 16 { self.dma16 } else { self.dma8 };
+            self.tc_status |= 1 << (chan & 7);
+        }
         raise
     }
 
-    /// Single-cycle: one pass and stop (no loop). The stream stays held open
+    fn latch_cyclic_dma_wrap(&mut self, before: u64, after: u64) {
+        if self.dma_auto_init && self.buf_frames != 0 {
+            let ring = u64::from(self.buf_frames);
+            let offset = u64::from(self.dma_start_frame);
+            if (after + offset) / ring > (before + offset) / ring {
+                let chan = if self.bits == 16 { self.dma16 } else { self.dma8 };
+                self.tc_status |= 1 << (chan & 7);
+            }
+        }
+    }
+
+    /// Single DSP block completed. The stream stays held open
     /// through the hangover.
     ///
     /// Terminal count belongs to the 8237, NOT to us. The controller asserts
@@ -830,14 +848,14 @@ impl Sb {
     /// program that programs the two differently, whether deliberately or by
     /// bug, saw a completion here that real hardware never gives it.
     ///
-    /// When the two agree — which is the normal case, and what every real
-    /// driver does — `block_frames` is clamped to `buf_frames` in `begin`, so
-    /// the cursor lands exactly on the count and TC latches as before.
+    /// A looping DMA controller instead reloads its own count on each lap,
+    /// independently of the DSP's interrupt count.
     fn finish_single(&mut self, now: u64) {
         self.playing = false;
         self.paused = false;
         self.done_ns = now;
-        if self.cursor < self.buf_frames as u64 {
+        if self.dma_auto_init { return; }
+        if self.cursor + u64::from(self.dma_start_frame) < u64::from(self.buf_frames) {
             return; // DSP stopped short; the controller is still counting
         }
         self.dma_tc = true;
@@ -872,7 +890,9 @@ impl Sb {
         if !self.short_probe_active() {
             return false;
         }
+        let before = self.cursor;
         let raise = self.block_irq();
+        self.latch_cyclic_dma_wrap(before, self.cursor);
         self.finish_single(now);
         raise
     }
@@ -945,7 +965,7 @@ impl Sb {
     /// buffer up front.
     fn committed_end(&self) -> u64 {
         if self.single {
-            self.buf_frames as u64
+            if self.dma_auto_init { self.next_irq } else { self.buf_frames as u64 }
         } else {
             (self.blocks_acked * self.block_frames as u64 + self.buf_frames as u64)
                 .max(self.next_irq)
@@ -1104,7 +1124,7 @@ impl Sb {
     pub fn dma_cursor_at(&self, cursor: u64) -> (u16, u16) {
         let channels = if self.stereo { 2u64 } else { 1 };
         let total = (self.buf_frames as u64 * channels).max(1); // transfers
-        let consumed = (cursor * channels) % total;
+        let consumed = ((cursor + u64::from(self.dma_start_frame)) * channels) % total;
         let count = total.wrapping_sub(1).wrapping_sub(consumed) as u16;
         (count, consumed as u16)
     }
@@ -1113,6 +1133,11 @@ impl Sb {
     /// reset by a DSP (re)start. The basis the host's estimator anchors on.
     pub fn cursor_frames(&self) -> u64 {
         self.cursor
+    }
+
+    /// Read-only DMA diagnostics: ring frames, completed blocks, serviced blocks.
+    pub fn dma_progress(&self) -> (u32, u64, u64) {
+        (self.buf_frames, self.blocks_done, self.blocks_acked)
     }
 
     /// A finite transfer must yield at this boundary before mixing its successor.
@@ -1160,7 +1185,7 @@ mod tests {
         use crate::dma::{Completion, Request};
         let mut sb = Sb::new();
         sb.begin(Start { bits: 16, stereo: false, signed: true, single: false,
-                         block_override: Some(3) }, 8);
+                         block_override: Some(3) }, 8, false, 0);
         sb.blocks_acked = 1; // the driver has made the next ring lap available
         let mut block = [(0, 0); 3];
         // Start at the ring's final source frame and request three frames.
@@ -1186,10 +1211,56 @@ mod tests {
     }
 
     #[test]
+    fn cyclic_dma_wraps_without_completing_a_long_single_dsp_block() {
+        use crate::dma::Request;
+        let mut sb = Sb::new();
+        let start = Start { bits: 16, stereo: true, signed: true,
+            single: true, block_override: Some(0xffff) };
+        sb.begin(start, 1332 * 4, true, 0);
+        assert_eq!(sb.single_boundary(), Some(32768));
+        assert!(!sb.advance(Step::Clock { now: 60_000_000, produced: 1332 }, None).irq);
+        assert!(sb.playing());
+        assert_eq!(sb.take_tc_status(true), 1 << 1);
+        assert!(!sb.advance(Step::Clock { now: 1_470_000_000, produced: 32767 }, None).irq);
+        sb.take_tc_status(true);
+        assert!(sb.advance(Step::Clock { now: 1_475_000_000, produced: 32768 }, None).irq);
+        assert_eq!(sb.take_tc_status(true), 0, "DSP completion is not a DMA wrap");
+        assert!(!sb.playing());
+        assert!(!sb.at_terminal_count(), "looping DMA has already reloaded its count");
+        assert_eq!(sb.dma_cursor(), (1063, 1600));
+        // Restarting only the DSP retains the controller's 800-frame offset.
+        sb.begin(start, 1332 * 4, true, 800);
+        assert_eq!(sb.dma_cursor(), (1063, 1600));
+        let mut block = [(0, 0); 1];
+        assert_eq!(sb.advance(Step::Mix { rate: 44100, position_q32: 0,
+            step_q32: 1 << 32, block: &mut block, physical: false }, None).dma,
+            Some(Request::Read { offset: 3200, bytes: 4, wrap_bytes: Some(5328) }));
+    }
+
+    #[test]
+    fn cyclic_short_probe_latches_dma_wrap_without_a_stopped_controller() {
+        let mut sb = Sb::new();
+        sb.begin(Start { bits: 8, stereo: false, signed: false,
+            single: true, block_override: Some(0) }, 1, true, 0);
+        assert!(sb.take_probe(1));
+        assert_eq!(sb.take_tc_status(false), 1 << 1);
+        assert!(!sb.at_terminal_count());
+    }
+
+    #[test]
+    fn dsp_block_irq_does_not_imply_cyclic_dma_terminal_count() {
+        let mut sb = Sb::new();
+        sb.begin(Start { bits: 8, stereo: false, signed: false,
+            single: false, block_override: Some(9) }, 100, true, 0);
+        assert!(sb.advance(Step::Clock { now: 1, produced: 10 }, None).irq);
+        assert_eq!(sb.take_tc_status(false), 0);
+    }
+
+    #[test]
     fn finite_dma_completes_from_consumed_samples_not_pump_time() {
         let mut sb = Sb::new();
         sb.begin(Start { bits: 8, stereo: false, signed: false, single: true,
-            block_override: Some(879) }, 880);
+            block_override: Some(879) }, 880, false, 0);
         assert!(!sb.advance(Step::Clock { now: 1_000_000_000, produced: 879 }, None).irq);
         assert!(sb.playing());
         assert!(sb.advance(Step::Clock { now: 1_000_000_000, produced: 880 }, None).irq);
@@ -1214,7 +1285,7 @@ mod tests {
         let mut sb = Sb::new();
         let unsigned16 = sb16_command_mode(&mut sb, 0xB0, 0x00);
         assert!(!unsigned16.signed);
-        sb.begin(unsigned16, 8);
+        sb.begin(unsigned16, 8, false, 0);
         assert_eq!(sb.frame(&[0x00, 0x80], 0), (0, 0));
         assert_eq!(sb.frame(&[0x00, 0x00], 0), (i16::MIN, i16::MIN));
         assert_eq!(sb.frame(&[0xFF, 0xFF], 0), (i16::MAX, i16::MAX));
@@ -1222,17 +1293,17 @@ mod tests {
 
         let signed16 = sb16_command_mode(&mut sb, 0xB0, 0x10);
         assert!(signed16.signed);
-        sb.begin(signed16, 8);
+        sb.begin(signed16, 8, false, 0);
         assert_eq!(sb.frame(&[0x00, 0x00], 0), (0, 0));
         assert_eq!(sb.frame(&[0x00, 0x80], 0), (i16::MIN, i16::MIN));
 
         let signed8 = sb16_command_mode(&mut sb, 0xC0, 0x10);
-        sb.begin(signed8, 8);
+        sb.begin(signed8, 8, false, 0);
         assert_eq!(sb.frame(&[0x00], 0), (0, 0));
         assert_eq!(sb.frame(&[0x80], 0), (i16::MIN, i16::MIN));
 
         let unsigned8 = sb16_command_mode(&mut sb, 0xC0, 0x00);
-        sb.begin(unsigned8, 8);
+        sb.begin(unsigned8, 8, false, 0);
         assert_eq!(sb.frame(&[0x80], 0), (0, 0));
         assert_eq!(sb.frame(&[0x00], 0), (i16::MIN, i16::MIN));
     }
@@ -1256,7 +1327,7 @@ mod tests {
     fn hmi_16_bit_pause_and_continue_preserve_the_stream() {
         let mut sb = Sb::new();
         let start = sb16_command(&mut sb, 0xB4);
-        sb.begin(start, 4096);
+        sb.begin(start, 4096, false, 0);
         assert!(sb.playing());
 
         let dsp = sb.io_base + 0x0C;
@@ -1302,19 +1373,20 @@ mod tests {
             let mut sb = Sb::new();
             // 8237 armed for 256 bytes; DSP command carries length-1 = 0.
             sb.begin(Start { bits: 8, stereo: false, signed: false, single: true,
-                             block_override: Some(0) }, 256);
-            sb.cursor = sb.block_frames as u64; // the DSP's one transfer
-            sb.finish_single(1);
+                             block_override: Some(0) }, 256, false, 0);
+            assert!(sb.advance(Step::Clock { now: 1, produced: 1 }, None).irq);
             sb
         };
         assert!(!short.at_terminal_count(),
                 "DSP stopped at {} of {} transfers; the 8237 has not underflowed",
                 short.cursor, short.buf_frames);
+        let mut short = short;
+        assert_eq!(short.take_tc_status(false), 0);
 
         // The agreeing case — every real driver — still latches TC.
         let mut whole = Sb::new();
         whole.begin(Start { bits: 8, stereo: false, signed: false, single: true,
-                            block_override: Some(255) }, 256);
+                            block_override: Some(255) }, 256, false, 0);
         whole.cursor = whole.block_frames as u64;
         whole.finish_single(1);
         assert!(whole.at_terminal_count(), "a full-length transfer must reach TC");

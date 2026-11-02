@@ -591,8 +591,10 @@ impl Gf1 {
         for slot in block.iter_mut() {
             let mut ev = crate::Events::default();
             let (l, r) = c.engine.mix_frame(&c.dram, native, rate, &mut ev);
-            slot.0 += (l * gain.0) >> 16;
-            slot.1 += (r * gain.1) >> 16;
+            // The voice sum is wider than i16; retain that headroom through
+            // the Q16 multiply and leave clipping to the final sink.
+            slot.0 += ((i64::from(l) * i64::from(gain.0)) >> 16) as i32;
+            slot.1 += ((i64::from(r) * i64::from(gain.1)) >> 16) as i32;
             c.wave_pending |= ev.wave_irq;
             c.ramp_pending |= ev.ramp_irq;
         }
@@ -908,6 +910,35 @@ impl Core {
 mod dma_tests {
     use super::*;
     use crate::dma::{Completion, Request};
+
+    #[test]
+    fn overlapping_voices_keep_headroom_through_output_gain() {
+        for sample in [0x7f, 0x80] {
+            let mut card = Gf1::new(0x240);
+            card.core = Some(Core::new_boxed());
+            let c = card.core.as_mut().unwrap();
+            c.reset_reg = 0x02;
+            c.dram[..32].fill(sample);
+            c.engine.active = 2;
+            for voice in &mut c.engine.voices[..2] {
+                *voice = crate::engine::Voice {
+                    running: true,
+                    inc: 1 << 32,
+                    end: 16 << 32,
+                    loop_mode: crate::engine::LoopMode::Forward,
+                    vol: 0xffff << crate::engine::volume::RAMP_FRACT,
+                    pan_l: 4096, pan_r: 4096,
+                    ..Default::default()
+                };
+            }
+            let rate = c.native_rate();
+            let (left, right) = c.engine.mix_frame(&c.dram, rate, rate, &mut crate::Events::default());
+            assert!(left.abs() > i32::from(i16::MAX));
+            let mut output = [(123, -456); 4];
+            card.mix_into(rate, (65_536, 32_768), &mut output);
+            assert_eq!(output, [(123 + left, -456 + (right >> 1)); 4]);
+        }
+    }
 
     fn armed(control: u8) -> Gf1 {
         let mut card = Gf1::new(0x240);

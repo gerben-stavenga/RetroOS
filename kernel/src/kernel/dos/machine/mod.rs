@@ -268,20 +268,9 @@ impl AudioDevices {
 }
 
 impl AudioDevices {
-    pub fn needs_dma(&self) -> bool {
-        matches!(&self.sb.device, SbDevice::Emulated(sb) if sb.needs_worker_dma())
-    }
-    /// Caller holds the guest-memory gate and has verified the active owner.
-    pub fn capture_dma(&mut self, reader: arch_abi::GuestReadView) -> bool {
-        match &mut self.sb.device {
-            SbDevice::Emulated(sb) => sb.capture_dma_with(&mut |addr, bytes|
-                unsafe { reader.copy_from(addr, bytes) }),
-            _ => true,
-        }
-    }
     /// Media-core mixer: resident sample storage only; IRQ delivery is deferred
     /// to the guest core. The surrounding Shared guard excludes port accesses.
-    /// Returns the rendered prefix; the engine retains the rest across DMA handoff.
+    /// Returns the rendered prefix; the engine retains unfilled output for retry.
     pub fn mix(&mut self, now_ns: u64, span: crate::kernel::sound::AudioSpan<'_>) -> usize {
         self.mix_with(now_ns, span, None)
     }
@@ -292,7 +281,7 @@ impl AudioDevices {
     fn mix_with(&mut self, now_ns: u64, span: crate::kernel::sound::AudioSpan<'_>,
         copy: Option<vsb::DmaCopy<'_>>) -> usize {
         let count = match &mut self.sb.device {
-            SbDevice::Emulated(sb) => sb.mix_limit(now_ns, span.rate, span.frames.len()),
+            SbDevice::Emulated(sb) => sb.mix_limit(now_ns, span.rate, span.frames.len(), span.can_defer),
             _ => span.frames.len(),
         };
         if count == 0 { return 0; }
@@ -635,7 +624,7 @@ fn emulated_mpu(pc: &PcMachine, p: u16) -> bool {
 /// raises IRQ0. Quake combines this counter with the BIOS tick count and
 /// discards backward jumps, turning that delay into extra elapsed game time.
 /// Advance before writes too, so reprogramming cannot erase an elapsed edge.
-fn pit_io<R>(
+pub(super) fn pit_io<R>(
     pit: &mut VirtualPit,
     pic: &mut VirtualPic,
     now_ns: u64,
@@ -816,7 +805,9 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         0x01CE..=0x01D0 => {}
         // Master PIC command
         0x20 => {
-            if let Some(retired_irq) = pc.vpic.master_ocw2(val) {
+            if let Some(retired_irq) = pc.vpic.master_ocw2(val)
+                && crate::kernel::platform::sound_blaster_present()
+            {
                 pc.audio.lock().sb.acknowledge_irq(machine, retired_irq);
             }
         }
@@ -872,7 +863,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // write, re-check whether the BLASTER channel just armed and, if
         // so, remap the guest buffer contiguous + program the real 8237.
         p if Dma8237::owns(p) => {
-            pc.dma.io_write(machine, p, val);
+            pc.dma.io_write(p, val);
             pc.audio.lock().sb.maybe_remap(machine, regs, &mut pc.dma);
         }
         // Unknown port writes are dropped and logged for missing-device coverage.
@@ -1199,7 +1190,6 @@ pub fn audio_service<A: crate::Arch>(
     // raises its own line and the relay carries it.
     let SoundBlaster { blaster, device } = sb;
     if let SbDevice::Emulated(emu) = device {
-        if dt_ns != 0 && crate::kernel::media::enabled() { emu.capture_dma(machine); }
         emu.deliver_trigger_irq(vpic, blaster.irq);
         emu.deliver_probe_irq(now_ns, vpic, blaster.irq);
     }

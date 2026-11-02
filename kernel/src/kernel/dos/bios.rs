@@ -315,14 +315,18 @@ pub(super) fn dispatch<A: crate::Arch>(
             }
         }
         0x0A..=0x0F => {
-            if let Some(irq) = dos.pc.vpic.master_ocw2(0x20) {
+            if let Some(irq) = dos.pc.vpic.master_ocw2(0x20)
+                && crate::kernel::platform::sound_blaster_present()
+            {
                 dos.pc.audio.lock().sb.acknowledge_irq(machine, irq);
             }
         }
         0x70..=0x77 => {
             // Slave-PIC IRQ default: EOI both.
             dos.pc.vpic.slave_ocw2(0x20);
-            if let Some(irq) = dos.pc.vpic.master_ocw2(0x20) {
+            if let Some(irq) = dos.pc.vpic.master_ocw2(0x20)
+                && crate::kernel::platform::sound_blaster_present()
+            {
                 dos.pc.audio.lock().sb.acknowledge_irq(machine, irq);
             }
         }

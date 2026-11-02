@@ -61,7 +61,7 @@ pub use machine::vsb::SbDevice;
 pub use machine::vga::physical_vga_present;
 pub(crate) use machine::vga::release_fullscreen;
 pub(crate) use machine::vga::reserve_live_vram;
-pub(crate) use machine::vga::{LiveRegion, sample_live, scanout_revision, scanout_epoch, live_access, try_live_access};
+pub(crate) use machine::vga::{LiveRegion, sample_live, scanout_revision, scanout_epoch, live_access};
 use crate::kernel::bios_display::{DosVideo, EmulatedVga};
 pub(crate) use dos::dos_to_unix_datetime;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
@@ -376,6 +376,9 @@ impl<A: crate::Arch> DosState<A> {
             // skips this readback path.
             self.pc.vga.capture_address_space_vram(machine);
         }
+        // Hand the single global ISA-DMA pool back; a dying thread that
+        // armed SB DMA must not poison it for the next program.
+        self.pc.audio.lock().sb.release_dma_pool(machine, regs);
         if let Some(ref mut dpmi) = self.dpmi {
             dpmi.unmap_all_physical(machine);
             self.memory.release_owner(machine, dpmi.memory_owner());
@@ -387,9 +390,6 @@ impl<A: crate::Arch> DosState<A> {
         self.memory.release_owner(machine, memory::XMS_OWNER);
         self.ems = None;
         self.xms = None;
-        // Hand the single global ISA-DMA pool back; a dying thread that
-        // armed SB DMA must not poison it for the next program.
-        self.pc.audio.lock().sb.release_dma_pool(machine, regs);
         let pc = &mut self.pc;
         pc.audio.lock().gus.reset(machine, &mut pc.vpic);
         pc.audio.lock().mpu.reset();
@@ -401,6 +401,7 @@ impl<A: crate::Arch> DosState<A> {
     /// Keeps the LDT layout private to the dos
     /// module — external code never touches `self.ldt`.
     pub fn on_resume(&mut self, machine: &mut A) {
+        self.pc.audio.lock().sb.sb_resume(machine, &mut self.pc.dma);
         self.pc.vga.resume_vram(machine);
         machine.load_ldt(&self.ldt[..]);
     }
@@ -1763,6 +1764,10 @@ pub fn audio_service<A: crate::Arch>(
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
 pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+    // The host tick only wakes the event loop. A guest-programmed one-shot
+    // may expire between ticks, including while an I/O handler runs. Latch
+    // that edge before deciding which interrupt the next guest entry sees.
+    machine::pit_io(&mut dos.pc.vpit, &mut dos.pc.vpic, machine.now(), |_| ());
     dos.ipx.poll(machine);
     // Keep timer/keyboard delivery from spending the DSP delay inside an IRQ
     // handler. The short step sequence models time passing in the interrupted

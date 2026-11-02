@@ -1,9 +1,10 @@
-; Dedicated planar MOV entry. Save only GPRs and the selectors needed by
-; Rust on unsupported forms only. Static recipes work on the first fault.
+; Dedicated device entries: planar MOV, VGA ports and DMA polling. Save only
+; GPRs and selectors, without converting the native interrupt frame.
 section .note.GNU-stack noalloc noexec nowrite progbits
 section .text
 extern PLANAR_FAST_CONTEXT
 extern planar_fault
+extern device_io
 extern entry_wrapper_32
 extern entry_wrapper_64
 
@@ -29,6 +30,9 @@ extern entry_wrapper_64
     je %%rust
     cmp dword [PTR ebx + 60], 0
     jne %%rust               ; synchronous scanout needs a phase check first
+    mov eax, [PTR ebx + 64]
+    cmp byte [PTR eax], 0
+    jne %%rust               ; release the guest gate for a pending media read
     cmp dword [ss:esp + 4], 0
     jne %%cs64
     movzx ecx, word [ss:ebp + 76]
@@ -269,6 +273,11 @@ bits 32
 global planar_page_fault_32
 planar_page_fault_32:
     push dword 14
+    jmp planar_save32
+global device_io_32
+device_io_32:
+    push dword 13
+planar_save32:
     save32 edi
     save32 esi
     save32 ebp
@@ -277,6 +286,8 @@ planar_page_fault_32:
     save32 edx
     save32 ecx
     save32 eax
+    cmp dword [esp + 64], 13
+    je .input
     mov eax, [esp + 68]     ; page-fault error
     and eax, ~3
     cmp eax, 4
@@ -292,6 +303,36 @@ planar_page_fault_32:
     mov ebp, esp
     xor ebx, ebx
     jmp planar_common
+.input:
+    movzx eax, word [esp + 16]
+    cmp eax, 0x0f
+    jbe .port
+    cmp eax, 0xd8
+    je .port
+    cmp eax, 0xc0
+    jb .vga
+    cmp eax, 0xcf
+    jbe .port
+.vga:
+    cmp eax, 0x3da
+    je .port
+    sub eax, 0x3c4
+    cmp eax, 1
+    ja planar_slow32
+.port:
+    cmp dword [esp + 68], 0
+    jne planar_slow32
+    test dword [esp + 80], 1 << 17
+    jnz .guest
+    mov eax, [esp + 76]
+    and eax, 3
+    cmp eax, 3
+    jne planar_slow32
+.guest:
+    mov eax, [esp + 84]
+    mov [esp + 32], eax
+    mov edx, 4
+    jmp .ready
 planar_slow32:
     restore_gprs32
     jmp entry_wrapper_32
@@ -300,6 +341,11 @@ bits 64
 global planar_page_fault_64
 planar_page_fault_64:
     push qword 14
+    jmp planar_save64
+global device_io_64
+device_io_64:
+    push qword 13
+planar_save64:
     push rdi
     push rsi
     push rbp
@@ -308,6 +354,8 @@ planar_page_fault_64:
     push rdx
     push rcx
     push rax
+    cmp qword [rsp + 64], 13
+    je .input
     mov eax, [rsp + 72]
     and eax, ~3
     cmp eax, 4
@@ -328,6 +376,35 @@ planar_page_fault_64:
     mov ebp, esp
     mov ebx, 1
     jmp far dword [rel call32]
+.input:
+    movzx eax, word [rsp + 16]
+    cmp eax, 0x0f
+    jbe .port
+    cmp eax, 0xd8
+    je .port
+    cmp eax, 0xc0
+    jb .vga
+    cmp eax, 0xcf
+    jbe .port
+.vga:
+    cmp eax, 0x3da
+    je .port
+    sub eax, 0x3c4
+    cmp eax, 1
+    ja planar_slow64
+.port:
+    cmp qword [rsp + 72], 0
+    jne planar_slow64
+    cmp word [rsp + 88], 0x33
+    je planar_slow64
+    mov eax, [rsp + 88]
+    and eax, 3
+    cmp eax, 3
+    jne planar_slow64
+    mov rax, [rsp + 104]
+    mov [rsp + 32], rax
+    mov edx, 4
+    jmp .ready
 %macro restore_gprs64 0
     pop rax
     pop rcx
@@ -362,6 +439,8 @@ planar_common:
     mov [ss:ebx + 52], eax
     mov [ss:ebx + 56], edx
 .timed:
+    cmp ecx, 4
+    je planar_call
     test ecx, ecx
     jz planar_call
     fast_store
@@ -378,7 +457,13 @@ planar_call:
     push eax
     push ebx
     push ebp
+    cmp dword [ebp + 64], 13
+    je .input
     call planar_fault
+    jmp .called
+.input:
+    call device_io
+.called:
     add esp, 12
 planar_return:
     push eax

@@ -1,7 +1,7 @@
 //! One media worker, shared by audio and graphics. The BSP remains the only
-//! allocator and owner of guest mappings. Guarded DMA reads borrow an arch
-//! read view; jobs otherwise operate on resident kernel
-//! buffers; an ownership handoff refreshes the worker's mappings and TLB.
+//! allocator and owner of guest mappings. Audio reads permanent ISA channel
+//! buffers directly; graphics also operates on resident kernel storage.
+//! Publishing storage refreshes the worker's kernel mappings and TLB.
 //! Audio runs as an independent service, including at graphics checkpoints.
 
 use alloc::boxed::Box;
@@ -51,10 +51,6 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 static mut ON_WORKER: bool = false;
 #[thread_local]
 static mut IN_CHECKPOINT: bool = false;
-#[thread_local]
-static mut READ_DEFERRED: bool = false;
-#[thread_local]
-static mut AUDIO_READ_PENDING: bool = false;
 static REFRESH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// Guest execution and brief media reads share this gate. The guest yields
@@ -77,6 +73,11 @@ impl GuestMemoryGate {
         }
     }
     pub(crate) fn leave(&self) { self.held.store(false, Ordering::Release); }
+    pub(crate) fn reader_requested(&self) -> bool { self.requested.load(Ordering::Acquire) }
+    /// Native device entries perform the same acquire load on x86 before
+    /// retiring an instruction without an event-loop handoff.
+    #[cfg(target_arch = "x86")]
+    pub(crate) fn request_flag(&self) -> *const AtomicBool { &raw const self.requested }
     pub(crate) fn try_read(&self) -> Option<GuestMemoryRead<'_>> {
         if self.held.load(Ordering::Relaxed)
             || self.held.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err()
@@ -85,7 +86,6 @@ impl GuestMemoryGate {
             // must not leave the guest waiting for the next row batch.
             if !unsafe { IN_CHECKPOINT } {
                 self.requested.store(true, Ordering::Release);
-                unsafe { READ_DEFERRED = true; }
             }
             return None;
         }
@@ -93,16 +93,15 @@ impl GuestMemoryGate {
     }
     fn cancel_request(&self) {
         self.requested.store(false, Ordering::Release);
-        unsafe { AUDIO_READ_PENDING = false; }
     }
     /// Guest core only, outside all guest-memory and device/service guards.
     pub(crate) fn yield_to_reader(&self) {
-        while self.requested.load(Ordering::Acquire) { core::hint::spin_loop(); }
+        while self.reader_requested() { core::hint::spin_loop(); }
     }
     /// A service may be deactivated after requesting a read. A completed
     /// worker pass must also acknowledge that cancelled request.
     fn finish_turn(&self) {
-        if !self.held.load(Ordering::Acquire) && !unsafe { AUDIO_READ_PENDING } {
+        if !self.held.load(Ordering::Acquire) {
             self.cancel_request();
         }
     }
@@ -130,9 +129,8 @@ pub unsafe fn worker(refresh: fn()) -> ! {
     REFRESH.store(refresh as usize, Ordering::Relaxed);
     ENABLED.store(true, Ordering::Release);
     loop {
-        // Retry a DMA read deferred by this poll before starting a frame.
-        // A video read requested last pass must still get its own retry.
-        if !audio_checkpoint() { video_checkpoint(); }
+        audio_checkpoint();
+        video_checkpoint();
         device_checkpoint();
         GUEST_MEMORY.finish_turn();
         if let Some(command) = GRAPHICS.take() {
@@ -159,25 +157,18 @@ unsafe fn execute(command: Command) {
 
 /// Graphics callbacks invoke this between bounded row batches. Worker only.
 /// Inline fallback never consumes the worker mailbox.
-fn audio_checkpoint() -> bool {
+fn audio_checkpoint() {
     if let Some(service) = AUDIO_SERVICE.try_lock()
         && let Some(command) = *service
     {
         let due: fn() -> bool = unsafe { core::mem::transmute(AUDIO_DUE.load(Ordering::Relaxed)) };
         if due() {
-            // A video sample may have requested the guest at the end of the
-            // previous pass. Do not hold it there while this poll mixes.
-            // Preserve an audio request across retries: cancelling it before
-            // try_read lets the guest reclaim memory ahead of the DMA copy.
-            if !unsafe { AUDIO_READ_PENDING } { GUEST_MEMORY.cancel_request(); }
-            unsafe { READ_DEFERRED = false; execute(command); }
-            unsafe { AUDIO_READ_PENDING = READ_DEFERRED; }
-            return unsafe { READ_DEFERRED };
+            // Audio reads mappings independently; a previous VBE request must
+            // not hold the guest at a boundary while this poll mixes.
+            GUEST_MEMORY.cancel_request();
+            unsafe { execute(command); }
         }
     }
-    // Deactivation or a deadline change cancels an outstanding audio read.
-    if unsafe { AUDIO_READ_PENDING } { GUEST_MEMORY.cancel_request(); }
-    false
 }
 
 struct Scoped<F, R> {
@@ -603,13 +594,14 @@ mod guest_memory_tests {
         gate.enter();
         assert!(gate.try_read().is_none());
         gate.finish_turn();
-        assert!(gate.requested.load(Ordering::Acquire));
+        assert!(gate.reader_requested());
         gate.leave();
         // The next guest slice must yield; the worker owns the next read.
         assert!(gate.requested.load(Ordering::Acquire));
         let read = gate.try_read().unwrap();
         assert!(gate.held.load(Ordering::Acquire));
         drop(read);
+        assert!(!gate.reader_requested());
         // Rendering/mixing after the copy cannot keep the guest waiting.
         gate.yield_to_reader();
         gate.enter();

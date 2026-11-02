@@ -413,6 +413,8 @@ pub struct AudioSpan<'a> {
     /// The active output is a physical SB sink, so SB source rendering must
     /// omit software-only DAC normalization and preserve native OPL balance.
     pub physical_sb: bool,
+    /// The sink has enough queued audio to defer an incomplete source span.
+    pub can_defer: bool,
     pub frames: &'a mut [(i32, i32)],
 }
 
@@ -560,6 +562,13 @@ fn advance_resident(
             rate: mix_rate,
             base_frame: base,
             physical_sb: sink.as_ref().is_some_and(|output| output.is_sb()),
+            // Keep one hardware block for its unreported cursor progress and
+            // another for the next poll/mix. The rest can absorb guest refill
+            // latency without committing an artificial silent gap.
+            can_defer: sink.as_ref().is_some_and(|output| {
+                output.inner.written_frames().saturating_sub(output.inner.consumed_frames())
+                    > 2 * output.inner.block_frames() as u64
+            }),
             frames: &mut frames[..run],
         });
         if let (Some(output), Some(gain_q16)) = (sink.as_deref_mut(), gain_q16) {
@@ -637,10 +646,6 @@ fn advance_resident(
 
 
 static LAST_AUDIO_MS: AtomicU32 = AtomicU32::new(u32::MAX);
-static ACTIVE_DMA_OWNER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-/// Called while the guest-memory gate excludes worker DMA reads.
-pub(crate) fn dma_owner(owner: usize) { ACTIVE_DMA_OWNER.store(owner, Ordering::Release); }
-
 /// Owned by the media service for an event-loop session. Core 0 only changes
 /// routing/controls and publishes the active resident device set.
 pub struct Engine {
@@ -648,12 +653,11 @@ pub struct Engine {
     pub clock: Clock,
     source: Option<alloc::sync::Arc<crate::kernel::media::Shared<super::dos::AudioDevices>>>,
     last_ns: u64,
-    reader: Option<arch_abi::GuestReadView>,
 }
 impl Engine {
-    pub fn new(sink: Option<Sink>, now_ns: u64, reader: Option<arch_abi::GuestReadView>) -> Self {
+    pub fn new(sink: Option<Sink>, now_ns: u64) -> Self {
         publish_frontier(0);
-        Self { sink, clock: Clock::new(), source: None, last_ns: now_ns, reader }
+        Self { sink, clock: Clock::new(), source: None, last_ns: now_ns }
     }
     pub fn source(&mut self, source: Option<&alloc::sync::Arc<crate::kernel::media::Shared<super::dos::AudioDevices>>>) {
         let same = match (&self.source, source) {
@@ -662,7 +666,6 @@ impl Engine {
             _ => false,
         };
         if !same { self.source = source.cloned(); }
-        dma_owner(source.map_or(0, |source| alloc::sync::Arc::as_ptr(source) as usize));
     }
     pub fn due() -> bool {
         let now = (super::portio::now_ns() / 1_000_000) as u32;
@@ -670,45 +673,30 @@ impl Engine {
     }
     pub fn poll(&mut self) {
         let now = super::portio::now_ns();
-        self.advance(now, now, self.reader, |source, now, span| source.mix(now, span));
+        self.advance(now, now, |source, now, span| source.mix(now, span));
     }
-    /// The same mixer and device clocks, with direct DMA reads when no worker
-    /// exists. This entry borrows Arch directly; the worker uses its guarded
-    /// read view instead.
+    /// The same mixer, device clocks and permanent DMA buffer on one core.
+    /// Hosted backends without an ISA pool read their active guest directly.
     pub fn poll_inline<A: crate::Arch>(&mut self, machine: &mut A, now: u64) {
-        self.advance(now, machine.rdtsc(), None, |source, now, span| source.mix_guest(machine, now, span));
+        self.advance(now, machine.rdtsc(), |source, now, span| source.mix_guest(machine, now, span));
     }
-    fn advance(&mut self, now: u64, stamp: u64, reader: Option<arch_abi::GuestReadView>,
+    fn advance(&mut self, now: u64, stamp: u64,
         mut mix: impl FnMut(&mut super::dos::AudioDevices, u64, AudioSpan<'_>) -> usize) {
         let elapsed = now.saturating_sub(self.last_ns);
         if elapsed == 0 { return; }
         let _stall = super::portio::StallWatch::new("audio service");
-        // Don't stall the media core behind a guest DMA copy or port access.
+        // Don't stall the media core behind DMA rebinding or port access.
         let mut source = match self.source.as_ref() {
             Some(source) => match source.try_lock() { Some(source) => Some(source), None => return },
             None => None,
         };
-        if let (Some(reader), Some(devices)) = (reader, source.as_mut())
-            && devices.needs_dma()
-        {
-            // Never wait for the guest gate while holding a sound-device
-            // lock: the guest may be waiting to write a device register.
-            let Some(_guest) = super::dos::try_live_access() else {
-                super::voodoo_profile::dma_deferred();
-                return;
-            };
-            if ACTIVE_DMA_OWNER.load(Ordering::Acquire)
-                != self.source.as_ref().map_or(0, |source| alloc::sync::Arc::as_ptr(source) as usize)
-                || !devices.capture_dma(reader)
-            { return; }
-        }
         super::voodoo_profile::audio_gap(elapsed);
         self.last_ns = now;
         LAST_AUDIO_MS.store((now / 1_000_000) as u32, Ordering::Relaxed);
         advance_resident(&mut self.clock, self.sink.as_mut(), elapsed, stamp, |span| {
-            let AudioSpan { rate, base_frame, physical_sb, frames } = span;
+            let AudioSpan { rate, base_frame, physical_sb, can_defer, frames } = span;
             let n = if let Some(source) = source.as_mut() {
-                mix(source, now, AudioSpan {rate,base_frame,physical_sb,frames:&mut *frames})
+                mix(source, now, AudioSpan {rate,base_frame,physical_sb,can_defer,frames:&mut *frames})
             } else { frames.len() };
             pcm::mix(&mut frames[..n],rate,base_frame);
             n

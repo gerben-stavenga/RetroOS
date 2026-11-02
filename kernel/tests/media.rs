@@ -202,40 +202,23 @@ fn two_core_priority_handoff_and_drop_fences() {
     let stopped = POLLS.load(Ordering::Acquire);
     for _ in 0..100 { std::thread::yield_now(); }
     assert_eq!(POLLS.load(Ordering::Acquire), stopped);
-    // Once the guest yields for a deferred audio read, keep that offer until
-    // the reader actually acquires memory, including across worker retries.
+    // Audio no longer borrows the guest-memory gate: a held guest slice
+    // must not defer its poll or request a future guest handoff.
     static READ_DUE: AtomicBool = AtomicBool::new(true);
-    static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
-    static RETRY_STARTED: AtomicBool = AtomicBool::new(false);
-    static ALLOW_READ: AtomicBool = AtomicBool::new(false);
     static COPIED: AtomicBool = AtomicBool::new(false);
     media::GUEST_MEMORY.enter();
     let reader = unsafe { media::AudioService::new((), || READ_DUE.load(Ordering::Acquire), |_| {
-        if ATTEMPTS.fetch_add(1, Ordering::Relaxed) == 0 {
-            assert!(media::GUEST_MEMORY.try_read().is_none());
-            return;
-        }
-        RETRY_STARTED.store(true, Ordering::Release);
-        while !ALLOW_READ.load(Ordering::Acquire) { core::hint::spin_loop(); }
-        let _read = media::GUEST_MEMORY.try_read().expect("guest offered memory for audio");
         COPIED.store(true, Ordering::Release);
         READ_DUE.store(false, Ordering::Release);
     }) };
-    while !RETRY_STARTED.load(Ordering::Acquire) { std::thread::yield_now(); }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !COPIED.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
     media::GUEST_MEMORY.leave();
-    let resumed = std::sync::Arc::new(AtomicBool::new(false));
-    let guest_resumed = resumed.clone();
-    let guest = std::thread::spawn(move || {
-        media::GUEST_MEMORY.yield_to_reader();
-        guest_resumed.store(true, Ordering::Release);
-    });
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let resumed_before_read = resumed.load(Ordering::Acquire);
-    ALLOW_READ.store(true, Ordering::Release);
-    guest.join().unwrap();
+    media::GUEST_MEMORY.yield_to_reader();
     drop(reader);
-    assert!(!resumed_before_read, "audio cancelled its request before acquiring guest memory");
-    assert!(COPIED.load(Ordering::Acquire));
+    assert!(COPIED.load(Ordering::Acquire), "audio waited for the guest-memory gate");
     assert_eq!(*drawing.get_mut(), 42);
     assert_eq!(*queued.get_mut(), 91);
 

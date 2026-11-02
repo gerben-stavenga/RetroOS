@@ -1448,7 +1448,7 @@ fn event_loop<A: crate::Arch>(
     let mut irq_clock_wakeup = false;
     let mut exiting_display = None;
     let audio = unsafe { crate::kernel::media::AudioService::new(
-        crate::kernel::sound::Engine::new(sink.take(), machine.now(), machine.guest_read_view()),
+        crate::kernel::sound::Engine::new(sink.take(), machine.now()),
         crate::kernel::sound::Engine::due,
         crate::kernel::sound::Engine::poll,
     ) };
@@ -1497,8 +1497,8 @@ fn event_loop<A: crate::Arch>(
 
     loop {
         // Service synchronous VGA before handling queued kernel events.
-        // Audio DMA and the linear VBE fallback still use the guest-memory
-        // handoff; legacy VGA reads its atomic device memory independently.
+        // The linear VBE fallback still uses the guest-memory handoff.
+        // Audio DMA and legacy VGA read resident device storage independently.
         super::media::kernel_entry();
         let handoff_stall = crate::kernel::portio::StallWatch::new("guest/media handoff");
         crate::kernel::media::GUEST_MEMORY.yield_to_reader();

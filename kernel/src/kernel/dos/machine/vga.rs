@@ -562,8 +562,8 @@ fn rebind_scanout() {
     MEMORY_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-// Audio DMA and the linear VBE fallback still use this gate. Legacy VGA
-// scanout uses atomic memory directly and never acquires this gate.
+// Only the linear VBE fallback uses this gate. Audio DMA uses permanent
+// channel buffers; legacy VGA reads atomic device memory directly.
 use crate::kernel::media::GUEST_MEMORY;
 #[thread_local]
 static mut LIVE_ACCESS_DEPTH: usize = 0;

@@ -76,7 +76,13 @@ def main():
     cmdline = 'GAMES/DOOMS/DOOM.EXE -' + ('timedemo' if mode == 'timedemo' else 'playdemo') + (' perf' if mode == 'timedemo' else ' demo1')
     args = ['qemu-system-x86_64', '-accel', 'kvm', '-cpu', 'host', '-smp', str(cpus), '-M', 'q35', '-m', '512', '-nodefaults', '-device', 'bochs-display', '-device', 'qemu-xhci', '-display', 'none', '-nic', 'none', '-serial', 'none', '-chardev', f'socket,id=mcp,path={work}/mcp.sock,server=on,wait=off', '-serial', 'chardev:mcp', '-fw_cfg', 'name=opt/mcp,string=com2', '-fw_cfg', 'name=opt/cmdline,string=' + cmdline, '-fw_cfg', 'name=opt/cwd,string=GAMES/DOOMS', '-drive', 'if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd', '-drive', f'if=pflash,format=raw,file={work}/vars.fd', '-drive', f'file={boot},if=none,id=boot,format=raw,snapshot=on', '-device', 'piix3-ide,id=boot-ide', '-device', 'ide-hd,drive=boot,bus=boot-ide.0,unit=0,bootindex=1', '-drive', f'file={data},if=none,id=data,format=raw,snapshot=on', '-device', 'ide-hd,drive=data,bus=ide.0', '-audiodev', f'wav,id=snd0,path={work}/audio.wav', '-device', 'intel-hda', '-device', 'hda-duplex,audiodev=snd0', '-debugcon', f'file:{work}/guest.log', '-no-reboot']
     log = work / 'guest.log'
-    results = {'label': label, 'cpus': cpus, 'mode': mode, 'work': str(work), 'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(), 'diff_sha256': hashlib.sha256(subprocess.check_output(['git', 'diff', 'HEAD'], cwd=ROOT)).hexdigest(), 'boot_sha256': hashlib.sha256(boot.read_bytes()).hexdigest()}
+    # Bazel stages declared sources and artifacts without a Git checkout.
+    # The boot hash identifies the measured image in either environment.
+    checkout = (ROOT / '.git').exists()
+    results = {'label': label, 'cpus': cpus, 'mode': mode, 'work': str(work),
+               'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip() if checkout else None,
+               'diff_sha256': hashlib.sha256(subprocess.check_output(['git', 'diff', 'HEAD'], cwd=ROOT)).hexdigest() if checkout else None,
+               'boot_sha256': hashlib.sha256(boot.read_bytes()).hexdigest()}
     if mode == 'timedemo':
         results['demo_sha256'] = hashlib.sha256(short.read_bytes()).hexdigest()
     with (work / 'stderr').open('w') as err:

@@ -60,7 +60,10 @@ impl VirtualPitChannel {
                 if remaining == div { div } else { remaining }
             }
             _ => {
-                div.saturating_sub(elapsed)
+                // Terminal count raises OUT but does not stop the counter.
+                // IRQ handlers latch this wrapped negative count to measure
+                // how late they ran before programming the next one-shot.
+                div.wrapping_sub(elapsed) & 0xffff
             }
         };
         raw as u16
@@ -138,6 +141,11 @@ impl VirtualPitChannel {
         };
         self.write_lsb = None;
         self.read_lsb_next = true;
+        self.latched = None;
+        // A new mode/control word invalidates the old count. No old timer
+        // may expire between the control write and the new count bytes.
+        self.enabled = false;
+        self.next_irq_cycle = u64::MAX;
     }
 
     /// The channel's OUT line. Only channel 2's is guest-visible (port 61h
@@ -171,9 +179,9 @@ impl VirtualPitChannel {
                 }
             }
             _ => {
-                if now >= self.next_irq_cycle {
+                if self.next_irq_cycle != u64::MAX && now >= self.next_irq_cycle {
                     count = 1;
-                    self.enabled = false;
+                    self.next_irq_cycle = u64::MAX;
                 }
             }
         }
@@ -271,6 +279,17 @@ impl VirtualPit {
         self.ch0.take_irqs(self.input_cycles)
     }
 
+    /// Next IRQ edge in the host clock, without consuming it. Direct device
+    /// handlers must return to the event loop here, rather than postponing a
+    /// guest timer until the next periodic host wakeup.
+    pub fn irq_deadline_ns(&self) -> u64 {
+        if !self.ch0.enabled || self.ch0.next_irq_cycle == u64::MAX { return u64::MAX; }
+        let cycles = self.ch0.next_irq_cycle.saturating_sub(self.input_cycles);
+        let ns = cycles.saturating_mul(NANOS_PER_SECOND)
+            .saturating_sub(self.frac_accum).div_ceil(PIT_INPUT_HZ);
+        self.last_host_ns.saturating_add(ns)
+    }
+
     /// Debug summary: (enabled, mode, reload, now, next_irq_cycle)
     pub fn debug_state(&self) -> (bool, u8, u16, u64, u64) {
         (
@@ -287,6 +306,61 @@ impl VirtualPit {
 mod tests {
     use super::*;
     use super::super::{pit_io, VirtualPic};
+
+    #[test]
+    fn expired_one_shot_keeps_counting_for_latency_measurement() {
+        let mut channel = VirtualPitChannel::new();
+        channel.set_command(3, 0);
+        channel.load_count(100, 0);
+        assert_eq!(channel.take_irqs(100), 1);
+        assert!(channel.output(100));
+        assert_eq!(channel.current_count(100), 0);
+        channel.latch_count(125);
+        assert_eq!(channel.read_byte(126), 0xe7);
+        assert_eq!(channel.read_byte(200), 0xff);
+        assert_eq!(channel.current_count(65_636), 0);
+        assert_eq!(channel.take_irqs(65_636), 0);
+        channel.load_count(50, 65_636);
+        assert!(!channel.output(65_636));
+        assert_eq!(channel.take_irqs(65_686), 1);
+    }
+
+    #[test]
+    fn new_control_word_stops_old_count_until_both_bytes_arrive() {
+        let mut channel = VirtualPitChannel::new();
+        channel.load_count(100, 0);
+        channel.set_command(3, 0);
+        assert_eq!(channel.take_irqs(101), 0);
+        channel.write_byte(50, 101);
+        assert_eq!(channel.take_irqs(200), 0);
+        channel.write_byte(0, 200);
+        assert_eq!(channel.current_count(200), 50);
+        assert_eq!(channel.take_irqs(249), 0);
+        assert_eq!(channel.take_irqs(250), 1);
+    }
+
+    #[test]
+    fn direct_io_deadline_keeps_fractional_cycles_and_does_not_consume_irq() {
+        let mut timer = pit();
+        assert_eq!(timer.irq_deadline_ns(), (65536 * NANOS_PER_SECOND).div_ceil(PIT_INPUT_HZ));
+        timer.write_command(0x34);
+        timer.write_counter(0, 0xa9);
+        timer.write_counter(0, 4); // 1193 input cycles, nearly one millisecond
+        let edge = timer.irq_deadline_ns();
+        assert_eq!(edge, (1193 * NANOS_PER_SECOND).div_ceil(PIT_INPUT_HZ));
+        timer.sync_at(edge / 3);
+        assert_eq!(timer.irq_deadline_ns(), edge);
+        assert_eq!(timer.take_pending_irqs(edge - 1), 0);
+        assert_eq!(timer.irq_deadline_ns(), edge);
+        assert_eq!(timer.take_pending_irqs(edge), 1);
+        assert!(timer.irq_deadline_ns() > edge);
+        timer.write_command(0x30);
+        timer.write_counter(0, 1);
+        timer.write_counter(0, 0);
+        let edge = timer.irq_deadline_ns();
+        assert_eq!(timer.take_pending_irqs(edge), 1);
+        assert_eq!(timer.irq_deadline_ns(), u64::MAX);
+    }
 
     fn pit() -> VirtualPit {
         VirtualPit {

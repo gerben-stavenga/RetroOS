@@ -168,6 +168,8 @@ rust_binary(
         "-Clink-arg=$(location :planar_entry)",
         "-Clink-arg=-nostdlib",
         "-Clink-arg=-no-pie",
+        # Fold identical function bodies to retain the boot footprint limit.
+        "-Clink-arg=--icf=all",
     ],
     deps = [
         ":kernel",

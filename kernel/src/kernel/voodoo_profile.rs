@@ -3,11 +3,9 @@
 //! The injected monotonic clock keeps this independent of the arch backend.
 use core::sync::atomic::{AtomicU32, Ordering};
 static SWAPS: AtomicU32 = AtomicU32::new(0);
-static DMA_DEFERRED: AtomicU32 = AtomicU32::new(0);
 static AUDIO_GAP_US: AtomicU32 = AtomicU32::new(0);
 static mut AUDIO_BASE: (u32, u32) = (0, 0);
 pub(crate) fn swap() { SWAPS.fetch_add(1, Ordering::Relaxed); }
-pub(crate) fn dma_deferred() { DMA_DEFERRED.fetch_add(1, Ordering::Relaxed); }
 pub(crate) fn audio_gap(ns: u64) {
     AUDIO_GAP_US.fetch_max((ns / 1000).min(u32::MAX as u64) as u32, Ordering::Relaxed);
 }
@@ -38,7 +36,6 @@ impl Drop for Sample {
 }
 pub(crate) fn reset() {
     SWAPS.store(0, Ordering::Relaxed);
-    DMA_DEFERRED.store(0, Ordering::Relaxed);
     AUDIO_GAP_US.store(0, Ordering::Relaxed);
     unsafe { AUDIO_BASE = super::sound::diagnostic_counts(); }
     unsafe { core::ptr::write(core::ptr::addr_of_mut!(COUNTERS), [EMPTY; 5]); }
@@ -46,8 +43,8 @@ pub(crate) fn reset() {
 pub(crate) fn print() {
     let (underruns, spikes) = super::sound::diagnostic_counts();
     let (old_underruns, old_spikes) = unsafe { AUDIO_BASE };
-    crate::compact_println!("[voodoo-prof] swaps={} dma_deferred={} audio_gap_us={} underruns={} rate_spikes={}",
-        SWAPS.load(Ordering::Relaxed), DMA_DEFERRED.load(Ordering::Relaxed), AUDIO_GAP_US.load(Ordering::Relaxed),
+    crate::compact_println!("[voodoo-prof] swaps={} audio_gap_us={} underruns={} rate_spikes={}",
+        SWAPS.load(Ordering::Relaxed), AUDIO_GAP_US.load(Ordering::Relaxed),
         underruns.wrapping_sub(old_underruns), spikes.wrapping_sub(old_spikes));
     let counters = unsafe { core::ptr::read(core::ptr::addr_of!(COUNTERS)) };
     for (name, counter) in ["mmio", "read", "status-fence", "other-fence", "queue-full"].into_iter().zip(counters) {

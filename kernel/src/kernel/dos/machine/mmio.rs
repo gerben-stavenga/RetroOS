@@ -455,10 +455,14 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
         gprs[2 * i].write(value as u32);
         gprs[2 * i + 1].write((value >> 32) as u32);
     }
+    let segments = [es_base, cs_base,
+        super::seg_base_for::<A>(regs, regs.stack_seg()), ds_base,
+        super::seg_base_for::<A>(regs, regs.fs as u16),
+        super::seg_base_for::<A>(regs, regs.gs as u16)];
     let (mut ip, mut flags) = (regs.ip32(), regs.flags32());
     let handled = emulate(&mut BackendBus { machine, target },
         &mut Operands { gprs: &mut gprs, ip: &mut ip, flags: &mut flags },
-        cs_base, def32, ds_base, es_base, off);
+        cs_base, def32, &segments, off);
     for (i, slot) in [&mut regs.rax, &mut regs.rcx, &mut regs.rdx, &mut regs.rbx,
         &mut regs.frame.rsp, &mut regs.rbp, &mut regs.rsi, &mut regs.rdi].into_iter().enumerate() {
         *slot = u64::from(unsafe { gprs[2 * i].assume_init() })
@@ -471,7 +475,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::kernel::dos) fn emulate(bus: &mut dyn FaultBus, regs: &mut Operands<'_>, cs_base: u32, def32: bool,
-    ds_base: u32, es_base: u32, off: u32) -> bool {
+    segments: &[u32; 6], off: u32) -> bool {
     let vm86 = *regs.flags & (1 << 17) != 0;
     let ip0 = if def32 { *regs.ip } else { *regs.ip & 0xFFFF };
     // Pre-read the instruction (max 15 bytes) into a buffer so decoding doesn't
@@ -508,16 +512,23 @@ pub(in crate::kernel::dos) fn emulate(bus: &mut dyn FaultBus, regs: &mut Operand
     // `repne` (F2) vs `repe` (F3) only matters for scas/cmps, which terminate on
     // ZF; for the unconditional string ops (movs/stos/lods) both just mean rep.
     let mut repne = false;
+    let mut source_segment = 3usize; // DS, overridden only for string sources
     loop {
         match peek(i) {
             0x66 => { p66 = true; i += 1; }
             0x67 => { p67 = true; i += 1; }
             0xF3 => { rep = true; i += 1; }
             0xF2 => { rep = true; repne = true; i += 1; }
-            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 => { i += 1; } // seg override (base already in CR2)
+            prefix @ (0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65) => {
+                source_segment = match prefix { 0x26 => 0, 0x2e => 1, 0x36 => 2,
+                    0x3e => 3, 0x64 => 4, _ => 5 };
+                i += 1;
+            }
             _ => break,
         }
     }
+    let ds_base = segments[source_segment];
+    let es_base = segments[0];
     let op32 = def32 ^ p66;
     let addr32 = def32 ^ p67;
     let opcode = peek(i);
@@ -950,6 +961,54 @@ mod tests {
     use super::inc_dec;
     use super::super::{set_string_index, step_string_index, string_index};
     use super::{Operands, MaybeUninit};
+
+    struct StringBus { ram: [u8; 4096], vram: [u8; 32] }
+    impl super::FaultBus for StringBus {
+        fn read8(&mut self, off: u32) -> u8 { self.vram[off as usize] }
+        fn write8(&mut self, off: u32, value: u8) { self.vram[off as usize] = value; }
+        fn offset(&self, address: u32) -> Option<u32> {
+            (0x800..0x820).contains(&address).then(|| address - 0x800)
+        }
+        fn guest_read(&self, address: u32) -> u8 { self.ram[address as usize] }
+        fn guest_write(&mut self, address: u32, value: u8) { self.ram[address as usize] = value; }
+        fn fpu_st0(&self) -> [u8; 10] { unreachable!() }
+        fn fpu_pop(&mut self) { unreachable!() }
+    }
+    #[test]
+    fn string_font_reads_honour_each_source_segment_override() {
+        for (index, prefix) in [0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65].into_iter().enumerate() {
+            let bases = [0x400u32, 0, 0x600, 0x700, 0x800, 0x900];
+            let mut bus = StringBus { ram: [0; 4096], vram: [0; 32] };
+            bus.ram[..3].copy_from_slice(&[prefix, 0xf3, 0xa4]);
+            bus.vram[..4].copy_from_slice(&[0x18, 0x3c, 0x66, 0x7e]);
+            let mut words = [MaybeUninit::new(0); 16];
+            let (mut ip, mut flags) = (0, 0);
+            let mut regs = Operands { gprs: &mut words, ip: &mut ip, flags: &mut flags };
+            regs.set(6, 4, 0x800u32.wrapping_sub(bases[index]));
+            regs.set(7, 4, 16);
+            regs.set(1, 4, 4);
+            assert!(super::emulate(&mut bus, &mut regs, 0, true, &bases, 0));
+            assert_eq!(&bus.ram[0x410..0x414], &[0x18, 0x3c, 0x66, 0x7e], "prefix={prefix:02x}");
+            assert_eq!(regs.get(1, 4), 0);
+            assert_eq!(*regs.ip, 3);
+        }
+    }
+    #[test]
+    fn repeated_lods_uses_the_last_segment_override() {
+        let bases = [0x400u32, 0, 0x600, 0x700, 0x900, 0x800];
+        let mut bus = StringBus { ram: [0; 4096], vram: [0; 32] };
+        bus.ram[..4].copy_from_slice(&[0x64, 0x65, 0xf3, 0xac]);
+        bus.vram[..4].copy_from_slice(&[1, 2, 3, 0x5a]);
+        let mut words = [MaybeUninit::new(0); 16];
+        let (mut ip, mut flags) = (0, 0);
+        let mut regs = Operands { gprs: &mut words, ip: &mut ip, flags: &mut flags };
+        regs.set(1, 4, 4);
+        assert!(super::emulate(&mut bus, &mut regs, 0, true, &bases, 0));
+        assert_eq!(regs.get(0, 1), 0x5a);
+        assert_eq!(regs.get(6, 4), 4);
+        assert_eq!(regs.get(1, 4), 0);
+        assert_eq!(*regs.ip, 4);
+    }
 
     #[test]
     fn scalar_mov_fetches_opcode_and_modrm_without_reading_displacement() {

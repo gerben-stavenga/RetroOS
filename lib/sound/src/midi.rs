@@ -696,8 +696,8 @@ impl Synth {
             }
             let mut ev = Events::default();
             let (l, r) = self.engine.mix_frame(&self.bank.pool, self.out_rate, self.out_rate, &mut ev);
-            slot.0 += (l * gain.0) >> 16;
-            slot.1 += (r * gain.1) >> 16;
+            slot.0 += ((i64::from(l) * i64::from(gain.0)) >> 16) as i32;
+            slot.1 += ((i64::from(r) * i64::from(gain.1)) >> 16) as i32;
             if ev.ramp_irq != 0 {
                 self.advance_envelopes(ev.ramp_irq);
             }

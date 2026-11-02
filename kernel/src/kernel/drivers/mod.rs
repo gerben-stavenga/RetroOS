@@ -15,6 +15,7 @@ pub mod hda;
 pub mod sb16;
 pub mod isapnp;
 pub mod sb_guest;
+pub(crate) mod isa_dma;
 pub mod vga_hw;
 pub mod nvidia_vga;
 pub mod hdd;

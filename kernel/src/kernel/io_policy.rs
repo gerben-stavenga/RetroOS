@@ -48,6 +48,10 @@ pub(super) fn key<A: crate::Arch>(
     if let Personality::Dos(dos) = personality {
         key.dos = true;
         key.native_vga = dos.pc.vga.native_legacy_vga(bios);
+        // Without physical SB hardware, mixing can never change the I/O
+        // grants. In particular, do not wait for the audio worker on every
+        // timer/PIT/VGA exit merely to rediscover an emulated Sound Blaster.
+        if !crate::kernel::platform::sound_blaster_present() { return key; }
         let audio = dos.pc.audio.lock();
         if let crate::kernel::dos::SbDevice::Native { pt, .. } = &audio.sb.device {
             key.native_sb = true;

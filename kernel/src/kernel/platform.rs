@@ -617,6 +617,12 @@ pub fn set_voodoo_vbe_mode(modes: Option<&[VbeMode]>, surface_available: bool) {
     }
 }
 
+/// Whether boot discovery found a physical SB. No guest may own one before
+/// discovery. HDA/AC'97-only systems need no shared mixer state to answer this.
+pub(crate) fn sound_blaster_present() -> bool {
+    unsafe { (&*(&raw const PLATFORM)).as_ref().is_some_and(|p| p.audio_hw == AudioHw::Sb) }
+}
+
 pub fn get() -> &'static Platform {
     unsafe {
         (&raw const PLATFORM)
