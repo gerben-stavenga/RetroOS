@@ -162,8 +162,10 @@ pub fn arch_free_phys_contig(start_page: u64, num_pages: usize) {
 }
 
 /// Physical page of DMA channel `ch`'s permanent ISA-DMA buffer (0 = none).
-pub fn arch_dma_channel_buf(ch: usize) -> u64 {
-    unimplemented!("interp DMA channel buffer")
+pub fn arch_dma_channel_buf(_ch: usize) -> u64 {
+    // Hosted execution has no physical ISA DMA pool. Return the Arch
+    // contract's "unavailable" value; inline mixing reads active guest RAM.
+    0
 }
 
 /// Re-arm a deferred-ack IRQ line. (M2 virtual device layer)
