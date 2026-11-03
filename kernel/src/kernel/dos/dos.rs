@@ -52,7 +52,7 @@ pub(super) use self::lowmem::{
     boot_parent_with_env, boot_psp_seg, font_8x14_addr, font_8x16_addr, font_8x8_addr,
     heap_start, host_stack_base, host_stack_empty_sp, host_stack_size, rm_stack_align_offset,
     rm_stack_base, rm_stack_seg, rm_stack_size, set_first_mcb_seg, setup_ivt,
-    vbe_mode_list_addr, video_static_info_addr,
+    vbe_mode_list_addr, vbe_pm_interface_addr, video_static_info_addr,
 };
 #[allow(unused_imports)]
 pub(super) use self::mouse::{deliver_mouse_callback, mouse_callback_return};
@@ -569,6 +569,11 @@ pub(super) fn pmdos_int10_handler<A: crate::Arch>(
         let (es, bp) = translate_rm_low_pointer(regs.es as u16, regs.rbp as u16);
         regs.es = u64::from(es);
         regs.rbp = (regs.rbp & !0xFFFF) | u64::from(bp);
+    }
+    if ax == 0x4F0A && regs.rax as u16 == 0x004F {
+        let (es, di) = translate_rm_low_pointer(regs.es as u16, regs.rdi as u16);
+        regs.es = u64::from(es);
+        regs.rdi = u64::from(di);
     }
     // INT 10h itself never blocks; see the nested-call ownership note above.
     finish_dos_call(machine, dos, regs);

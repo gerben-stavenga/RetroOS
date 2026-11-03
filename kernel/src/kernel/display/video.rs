@@ -26,18 +26,21 @@ fn due() -> bool {
     LAST_FRAME.load(Ordering::Relaxed) != frame
 }
 
-// VBE has no legacy CRTC row/latch engine. Keep its existing linear capture
-// path distinct from the shared VGA device consumer.
+// VBE uses linear capture, including its optional CRTC status-bar split,
+// rather than the legacy VGA device's row/latch engine.
 struct LinearSource {
     live: (crate::kernel::dos::LiveRegion, crate::kernel::dos::LiveRegion),
     mode: vga::VgaMode,
     vram: Vec<u8>, planes: Vec<u8>,
     palette: [u8; 768], dac_mask: u8,
+    start_offset: usize,
+    line_compare: usize,
 }
 impl LinearSource {
     fn new(frame: &vga::Frame<'_>, live: (crate::kernel::dos::LiveRegion, crate::kernel::dos::LiveRegion)) -> Self {
         let mut result = Self { live, mode: frame.mode, vram: Vec::new(), planes: Vec::new(),
-            palette: frame.palette, dac_mask: frame.dac_mask };
+            palette: frame.palette, dac_mask: frame.dac_mask,
+            start_offset: frame.start_offset, line_compare: frame.line_compare };
         result.configure(frame, live);
         result
     }
@@ -47,6 +50,8 @@ impl LinearSource {
         self.vram.resize(frame.vram.len(), 0);
         self.palette = frame.palette;
         self.dac_mask = frame.dac_mask;
+        self.start_offset = frame.start_offset;
+        self.line_compare = frame.line_compare;
     }
     fn frame(&self) -> vga::Frame<'_> {
         vga::Frame {
@@ -54,8 +59,8 @@ impl LinearSource {
             font: &[], font_b: &[], plane_layout: vga::VramLayout::PlaneMinor,
             ac: [0; 21], palette: self.palette, dac_mask: self.dac_mask,
             cga_palette: [0; 4], font_maps: None, blink: false, text_cursor: None,
-            start_offset: 0, pixel_pan: 0, split_pixel_pan: 0,
-            line_compare: usize::MAX, blank_start: usize::MAX,
+            start_offset: self.start_offset, pixel_pan: 0, split_pixel_pan: 0,
+            line_compare: self.line_compare, blank_start: usize::MAX,
         }
     }
 }

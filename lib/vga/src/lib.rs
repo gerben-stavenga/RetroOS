@@ -781,11 +781,19 @@ pub struct SvgaState {
     pub display_start: (u16, u16),
     pub logical_pitch: u16,
     pub palette: VbePalette,
+    // Legacy scanout registers remain useful in packed VBE modes: games
+    // program Line Compare to keep a status bar at VRAM zero while scrolling.
+    crtc_index: u8,
+    crtc: [u8; 25],
 }
 
 impl SvgaState {
     pub fn new(mode_number: u16, access: SvgaAccess, mode: SvgaConfig) -> Self {
         let linear = matches!(access, SvgaAccess::Linear);
+        let mut crtc = [0; 25];
+        crtc[7] = 0x10;
+        crtc[9] = 0x40 | if mode.width <= 360 && mode.height <= 240 { 1 } else { 0 };
+        crtc[0x18] = 0xFF; // disabled Line Compare (1023 physical scanlines)
         Self {
             config: mode,
             mode_number,
@@ -793,7 +801,43 @@ impl SvgaState {
             display_start: (0, 0),
             logical_pitch: if linear { mode.linear_pitch } else { mode.banked_pitch },
             palette: VbePalette::new(),
+            crtc_index: 0,
+            crtc,
         }
+    }
+
+    pub fn port_read(&mut self, port: u16) -> u8 {
+        match port {
+            0x3D4 => self.crtc_index,
+            0x3D5 => self.crtc.get(usize::from(self.crtc_index)).copied().unwrap_or(0xFF),
+            0x3C6..=0x3C9 => self.palette.port_read(port),
+            _ => 0xFF,
+        }
+    }
+
+    pub fn port_write(&mut self, port: u16, value: u8) {
+        match port {
+            0x3D4 => self.crtc_index = value,
+            0x3D5 => {
+                if let Some(register) = self.crtc.get_mut(usize::from(self.crtc_index)) {
+                    *register = value;
+                }
+            }
+            0x3C6..=0x3C9 => self.palette.port_write(port, value),
+            _ => {}
+        }
+    }
+
+    /// First logical row whose address counter restarts at zero. Low VGA
+    /// resolutions repeat physical scanlines, just as Mode X does.
+    pub fn line_compare(&self) -> usize {
+        let compare = usize::from(self.crtc[0x18])
+            | (usize::from(self.crtc[7] & 0x10) << 4)
+            | (usize::from(self.crtc[9] & 0x40) << 3);
+        let repeat = usize::from(self.crtc[9] & 0x1F) + 1;
+        let repeat = repeat * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
+        let row = (compare + 1).div_ceil(repeat);
+        if row < usize::from(self.config.height) { row } else { usize::MAX }
     }
 
     pub fn window(&mut self, set: Option<u16>) -> Option<u16> {
@@ -1494,7 +1538,8 @@ fn row_svga(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usiz
     let vram = frame.linear();
     let rd16 = |p: usize| (vram.get(p).unwrap_or(0) as u16)
         | ((vram.get(p + 1).unwrap_or(0) as u16) << 8);
-    let base = sy * pitch;
+    let (start, _, row) = row_origin(frame, sy);
+    let base = start + row * pitch;
     if bpp == 8 {
         row_indexed(vram, base, pal, st, w);
         return;
@@ -1578,7 +1623,8 @@ fn render_svga(frame: &Frame, out: &mut [u32], w: usize, h: usize, bpp: u8, pitc
     let rd16 = |p: usize| (vram.get(p).copied().unwrap_or(0) as u16)
         | ((vram.get(p + 1).copied().unwrap_or(0) as u16) << 8);
     for y in 0..h {
-        let base = y * pitch;
+        let (start, _, row_index) = row_origin(frame, y);
+        let base = start + row_index * pitch;
         let row = &mut out[y * w..y * w + w];
         for (x, px) in row.iter_mut().enumerate() {
             let p = base + x * bpp8;

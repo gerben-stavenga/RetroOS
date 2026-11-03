@@ -678,9 +678,7 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
             match pc.vga.legacy_vga_io() {
                 LegacyVgaIo::Emulated(state) => state.port_read(port),
                 LegacyVgaIo::Native => machine.inb(port),
-                LegacyVgaIo::Vbe(palette) if (0x3C6..=0x3C9).contains(&port) =>
-                    palette.port_read(port),
-                LegacyVgaIo::Vbe(_) => 0xFF,
+                LegacyVgaIo::Vbe(state) => state.port_read(port),
             }
         }
         // Chipset VBE ports remain private to firmware backends.
@@ -784,10 +782,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                     crate::kernel::drivers::vga_hw::track_ac_write(val);
                     machine.outb(port, val);
                 }
-                LegacyVgaIo::Vbe(palette) if (0x3C6..=0x3C9).contains(&port) => {
-                    palette.port_write(port, val);
-                }
-                LegacyVgaIo::Vbe(_) => {}
+                LegacyVgaIo::Vbe(state) => state.port_write(port, val),
             }
         }
         0x3C1..=0x3DF => {
@@ -795,10 +790,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             match pc.vga.legacy_vga_io() {
                 LegacyVgaIo::Emulated(state) => vga::port_write(machine, state, port, val),
                 LegacyVgaIo::Native => machine.outb(port, val),
-                LegacyVgaIo::Vbe(palette) if (0x3C6..=0x3C9).contains(&port) => {
-                    palette.port_write(port, val);
-                }
-                LegacyVgaIo::Vbe(_) => {}
+                LegacyVgaIo::Vbe(state) => state.port_write(port, val),
             }
         }
         // Chipset VBE ports remain private to firmware backends.

@@ -321,6 +321,15 @@ integration_test(
 )
 
 integration_test(
+    name = "vbe_pm",
+    command = ["python3", "test/vbe_pm.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk", "//test/dos/svgaprobe:vbe_pm_com"],
+    host = ["//kernel:retroos-host-kvm"],
+    tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
+)
+
+integration_test(
     name = "dos_launch_config",
     command = ["python3", "test/dos_launch_config.py"],
     sources = ["//:integration_sources"],

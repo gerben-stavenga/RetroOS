@@ -311,6 +311,9 @@ pub(super) struct LowMem {
     /// this list, so the list cannot live inside the caller's output buffer.
     vbe_mode_list: [u16; VBE_MODE_LIST_CAPACITY],
 
+    /// Copyable 32-bit VBE entry points published by INT 10h AX=4F0Ah.
+    vbe_pm_interface: [u8; super::super::bios::vbe::VBE_PM_INTERFACE.len()],
+
     /// Guest-readable copies of the standard VGA ROM fonts. The substitute
     /// BIOS publishes these through INT 10h AX=1130h and points INT 43h at the
     /// font selected by the current mode. The low half of 8x8 is additionally
@@ -386,6 +389,12 @@ pub(in crate::kernel::dos) fn video_static_info_addr() -> u32 {
 pub(in crate::kernel::dos) fn vbe_mode_list_addr() -> u32 {
     let address = LOW_MEM_BASE + core::mem::offset_of!(LowMem, vbe_mode_list) as u32;
     debug_assert!(address + (VBE_MODE_LIST_CAPACITY * 2) as u32 <= 0x1_0000);
+    address
+}
+
+pub(in crate::kernel::dos) fn vbe_pm_interface_addr() -> u32 {
+    let address = LOW_MEM_BASE + core::mem::offset_of!(LowMem, vbe_pm_interface) as u32;
+    debug_assert!(address + super::super::bios::vbe::VBE_PM_INTERFACE.len() as u32 <= 0x1_0000);
     address
 }
 

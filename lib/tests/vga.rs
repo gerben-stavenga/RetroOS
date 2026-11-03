@@ -7,6 +7,52 @@ use vga::{self as vga_render, Frame, PixelFormat, VgaMode, VramLayout, VramTrans
 const TEXT80: VgaMode = VgaMode::Text { cols: 80, rows: 25, cell_w: 9, cell_h: 16 };
 const TEXT40: VgaMode = VgaMode::Text { cols: 40, rows: 25, cell_w: 18, cell_h: 16 };
 
+#[test]
+fn vbe_status_bar_restarts_at_zero_below_scrolled_playfield() {
+    let mut state = vga::SvgaState::new(0x140, vga::SvgaAccess::Linear, vga::SvgaConfig {
+        width: 320, height: 240, bits_per_pixel: 8, banked_pitch: 336,
+        linear_pitch: 336, framebuffer_bytes: 1024 * 1024, palette_capable: true,
+    });
+    assert_eq!(state.line_compare(), usize::MAX);
+    // Stargunner's 200-line playfield uses 400 physical VGA scanlines.
+    for (index, value) in [(0x18, 0x8F), (7, 0x10), (9, 1)] {
+        state.port_write(0x3D4, index);
+        state.port_write(0x3D5, value);
+        assert_eq!(state.port_read(0x3D5), value);
+    }
+    assert_eq!(state.line_compare(), 200);
+
+    // Distinct rows at the viewport and status-bar origins, with padding
+    // between scanlines. Exercise both complete-frame and packed-row paths.
+    let mut memory = vec![99; 96];
+    memory[64..68].fill(20);
+    memory[72..76].fill(21);
+    memory[..4].fill(40);
+    memory[8..12].fill(41);
+    let mut palette = [0; 768];
+    for i in 0..256 { palette[i * 3] = i as u8; }
+    let frame = Frame {
+        memory: None, plane_layout: VramLayout::PlaneMinor,
+        mode: VgaMode::LinearSvga { w: 4, h: 4, bpp: 8, pitch: 8 },
+        vram: &memory, planes: &[], ac: [0; 21], palette, dac_mask: 255,
+        font: &[], font_b: &[], font_maps: None, blink: false, text_cursor: None,
+        cga_palette: [0; 4], start_offset: 64, pixel_pan: 0, split_pixel_pan: 0,
+        line_compare: 2, blank_start: usize::MAX,
+    };
+    let mut words = [0; 16];
+    vga::render(&frame, &mut words);
+    let mut pal = vga::Pal::new();
+    pal.sync_vbe(&palette, 255, PixelFormat::NATIVE, &mut [0; 768]);
+    for (row, index) in [20u32, 21, 40, 41].into_iter().enumerate() {
+        assert_eq!(&words[row * 4..row * 4 + 4], &[index << 16; 4]);
+        let mut packed = [0; 16 + vga::PACKED_ROW_PADDING];
+        vga::render_row_packed(&frame, row, &pal, &mut packed);
+        for pixel in packed[..16].chunks_exact(4) {
+            assert_eq!(u32::from_le_bytes(pixel.try_into().unwrap()), index << 16);
+        }
+    }
+}
+
 /// 6-bit DAC component → 8-bit, matching the renderer's expansion.
 fn c6to8(v: u8) -> u32 {
     let v = (v & 0x3F) as u32;
@@ -624,7 +670,7 @@ fn packed_indexed_spans_preserve_short_source_and_palette_zero() {
                     let base = match mode {
                         VgaMode::Mode13h => start + ry * w + pan,
                         VgaMode::ModeX { .. } => (start + ry * 5) * 4 + pan,
-                        _ => y * 17,
+                        _ => start + ry * 17,
                     };
                     let mut output = vec![0xEE; w * step + vga::PACKED_ROW_PADDING];
                     vga::render_row_packed(&frame, y, &pal, &mut output);

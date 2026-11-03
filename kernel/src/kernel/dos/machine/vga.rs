@@ -1165,6 +1165,19 @@ fn svga_leave<A: crate::Arch>(machine: &mut A, dev: &mut EmulatedVga) {
     dev.svga_vram.clear();
 }
 
+fn program_bios_mode_registers(vga: &mut ::vga::LegacyVgaState, mode: u8) {
+    if let Some(r) = ::vga::bios_mode_regs(mode) {
+        vga.misc_output.set(r.misc);
+        vga.seq.write(r.seq);
+        vga.gc.write(r.gc);
+        vga.crtc.write(r.crtc);
+        // A mode-13h BIOS set resets fine scrolling even when VRAM is
+        // preserved. Games such as Dark Forces unchain this mode into Mode X
+        // without touching AC13, so an inherited pan shifts every scanline.
+        if mode == 0x13 { vga.ac.set(0x13, 0); }
+    }
+}
+
 /// Set an emulated VGA mode, replacing its registers, palette, font and CPU
 /// aperture. Clearing mode sets also zero the backing planes.
 pub fn set_emulated_mode<A: crate::Arch>(
@@ -1187,12 +1200,7 @@ pub fn set_emulated_mode<A: crate::Arch>(
     // unchained level mode can't leak into its menu's mode 13h (stale
     // display-start showed the menu at the wrong offset; stale shift/chain
     // bits later misclassified the menu as the level's Mode X entirely).
-    if let Some(r) = ::vga::bios_mode_regs(mode) {
-        vga.misc_output.set(r.misc);
-        vga.seq.write(r.seq);
-        vga.gc.write(r.gc);
-        vga.crtc.write(r.crtc);
-    }
+    program_bios_mode_registers(vga, mode);
     let new_layout = vga.layout();
     if old_layout != new_layout {
         planes.transition(::vga::VramTransition::between(old_layout, new_layout));
@@ -1562,6 +1570,7 @@ pub fn bios_draw_glyph<A: arch_abi::GuestBytes>(
             // this software plane store exists only for the emulated card.
             let Some(dev) = device.emulated_mut() else { return false };
             let Some(vga) = dev.state.legacy_mut() else { return false };
+            let layout = vga.layout();
             let width: u32 = if mode == 0x0D { 320 } else { 640 };
             let rb = if vga.crtc.get(0x13) != 0 { vga.crtc.get(0x13) as u32 * 2 } else { width / 8 };
             for gy in 0..cell_h {
@@ -1573,7 +1582,7 @@ pub fn bios_draw_glyph<A: arch_abi::GuestBytes>(
                     let byte_off = (py * rb + px / 8) as usize;
                     let mask = 0x80u8 >> (px & 7);
                     for p in 0..4usize {
-                        let addr = VGA_VRAM_BASE + p * 0x10000 + byte_off;
+                        let addr = VGA_VRAM_BASE + layout.index(p, byte_off);
                         let mut byte: u8 = machine.read(addr);
                         if (color >> p) & 1 != 0 { byte |= mask; } else { byte &= !mask; }
                         machine.write::<u8>(addr, byte);
@@ -1595,6 +1604,61 @@ mod bios_memory_tests {
     use super::*;
     use alloc::vec::Vec;
     use arch_abi::GuestBytes;
+
+    #[test]
+    fn planar_bios_glyph_uses_the_live_vram_layout_without_stray_writes() {
+        for mode in [0x0D, 0x12] {
+            let (mut memory, mut device) = setup(mode);
+            let state = device.emulated().unwrap().state.legacy().unwrap();
+            let layout = state.layout();
+            let stride = usize::from(state.crtc.get(0x13)) * 2;
+            let (col, row, height) = if mode == 0x12 { (52, 21, 16) } else { (3, 4, 8) };
+            let ch = b'2';
+            let fg = 0x0E;
+            let page = lib::codepage::current_codepage();
+            let glyph = if height == 16 {
+                lib::unicode_font::glyph16(page.decode_glyph(ch))
+            } else {
+                &page.font8()[usize::from(ch) * 8..usize::from(ch) * 8 + 8]
+            };
+            let mut expected = memory.planes.clone();
+            for (gy, &bits) in glyph.iter().enumerate() {
+                let offset = (row * height + gy) * stride + col;
+                for plane in 0..4 {
+                    expected[layout.index(plane, offset)] = if fg & (1 << plane) != 0 { bits } else { 0 };
+                }
+            }
+            assert!(bios_draw_glyph(&mut memory, &mut device, mode, ch, col as u32, row as u32, fg));
+            for (index, (&actual, &want)) in memory.planes.iter().zip(&expected).enumerate() {
+                assert_eq!(actual, want, "mode {mode:#x} VRAM byte {index:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn mode13_to_dark_forces_modex_discards_inherited_scrolling() {
+        let mut state = ::vga::LegacyVgaState::new();
+        for inherited_pan in [2, 4, 6] {
+            state.ac.set(0x13, inherited_pan);
+            state.crtc.set(0x0C, 0xC0);
+            state.crtc.set(0x0D, 1);
+            program_bios_mode_registers(&mut state, 0x13);
+            // Dark Forces unchains mode 13h and uses four 16 KiB pages.
+            // It only writes the high start byte when flipping pages; it
+            // relies on the BIOS to have cleared the low byte and fine pan.
+            state.seq.set(4, (state.seq.get(4) & !8) | 4);
+            state.crtc.set(0x14, state.crtc.get(0x14) & !0x40);
+            state.crtc.set(0x17, state.crtc.get(0x17) | 0x40);
+            for page in [0, 0x40, 0x80, 0xC0] {
+                state.crtc.set(0x0C, page);
+                assert_eq!(state.display_start(), u16::from(page) << 8);
+                assert_eq!(state.pixel_pan(), 0);
+            }
+            assert_eq!(state.classify_mode(), Some(::vga::VgaMode::ModeX {
+                w: 320, h: 200, row_bytes: 80,
+            }));
+        }
+    }
 
     #[test]
     fn shared_vram_owner_switch_and_fork_preserve_independent_images() {

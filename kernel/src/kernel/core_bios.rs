@@ -67,11 +67,11 @@ pub enum DosVideo {
 }
 
 /// Target visible through the VGA register window. VBE remains a BIOS API,
-/// but exposes a deliberately small compatibility surface for programs which
-/// incorrectly poll 3DAh or program the DAC in an SVGA mode.
+/// but exposes DAC and CRTC split-screen compatibility for programs which
+/// continue using those VGA services in a packed SVGA mode.
 pub(crate) enum LegacyVgaIo<'a> {
     Emulated(&'a mut vga::LegacyVgaState),
-    Vbe(&'a mut vga::VbePalette),
+    Vbe(&'a mut vga::SvgaState),
     Native,
 }
 
@@ -118,7 +118,7 @@ impl DosVideo {
             Self::Vga(dev) | Self::Fullscreen(FullscreenVga::Emulated(dev, _)) => {
                 match &mut dev.state {
                     vga::VgaState::Legacy(state) => LegacyVgaIo::Emulated(state),
-                    vga::VgaState::Vbe(state) => LegacyVgaIo::Vbe(&mut state.palette),
+                    vga::VgaState::Vbe(state) => LegacyVgaIo::Vbe(state),
                 }
             }
             Self::Fullscreen(FullscreenVga::Native(_)) => LegacyVgaIo::Native,

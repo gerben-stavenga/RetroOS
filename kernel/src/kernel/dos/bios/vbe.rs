@@ -11,11 +11,24 @@ use crate::kernel::dos::{dos, dpmi, machine, seg_offset, DosState};
 /// 8bpp goes through the DAC palette; 15/16/24 are direct colour. Substitute
 /// path only — the native/SeaBIOS path has the card's own VBE.
 const VBE_MODES: &[(u16, u16, u16, u8)] = &[
+    (0x140, 320, 240, 8), // OEM mode number; clients discover it through 4F00h.
     (0x101, 640, 480, 8),
     (0x103, 800, 600, 8),
     (0x110, 640, 480, 15),
     (0x111, 640, 480, 16),
     (0x112, 640, 480, 24),
+];
+
+// Relocatable 32-bit near-call entry points. Bank/palette use the usual
+// INT 10h ABI. Display-start has a different CX:DX ABI, so its wrapper tags
+// EAX for our INT 10h translator rather than relying on its execution address.
+const PM_DISPLAY_START: u32 = 0x5256_4F07;
+pub(in crate::kernel::dos) const VBE_PM_INTERFACE: [u8; 36] = [
+    8, 0, 16, 0, 24, 0, 32, 0, // offsets: bank, display start, palette, I/O list
+    0xB8, 0x05, 0x4F, 0, 0, 0xCD, 0x10, 0xC3, // mov eax,4F05h; int 10h; ret
+    0xB8, 0x07, 0x4F, 0x56, 0x52, 0xCD, 0x10, 0xC3,
+    0xB8, 0x09, 0x4F, 0, 0, 0xCD, 0x10, 0xC3, // mov eax,4F09h; int 10h; ret
+    0xFF, 0xFF, 0xFF, 0xFF, // no ports or MMIO required by these wrappers
 ];
 
 fn substitute_vbe_mode(number: u16) -> Option<crate::kernel::platform::VbeMode> {
@@ -107,13 +120,20 @@ pub(super) fn vbe<A: crate::Arch>(
             done(regs, ok);
         }
         0x07 => {
-            let ok = if let Some(display) = dos.pc.vga.native_mut() {
+            let saved = (regs.rcx, regs.rdx);
+            let protected_start = regs.rax as u32 == PM_DISPLAY_START;
+            let translated = !protected_start
+                || translate_pm_display_start(bios_display, dos, regs);
+            let ok = translated && if let Some(display) = dos.pc.vga.native_mut() {
                 display.cap_mut().guest_bios_display_start(
                     machine, bios_display, regs,
                 ).is_ok()
             } else {
                 emulated_vbe_display_start(&mut dos.pc, regs)
             };
+            if protected_start {
+                (regs.rcx, regs.rdx) = saved;
+            }
             done(regs, ok);
         }
         0x08 => {
@@ -124,12 +144,67 @@ pub(super) fn vbe<A: crate::Arch>(
             let ok = vbe_palette(machine, bios_display, dos, regs);
             done(regs, ok);
         }
-        // The native 4F0Ah result is executable code in the isolated BIOS
-        // workspace. Returning its ES:DI would hand the guest a pointer into a
-        // different address space. Report the standard failure so clients use
-        // their INT 10h fallback (including Build's 4F05h/4F07h paths).
-        0x0A => done(regs, false),
+        0x0A => {
+            if regs.rbx as u8 != 0 { done(regs, false); return; }
+            // Personality-owned code, never a pointer into the isolated
+            // native firmware workspace. Clients may copy the complete block.
+            let address = dos::vbe_pm_interface_addr();
+            machine.copy_to(address as usize, &VBE_PM_INTERFACE);
+            regs.es = u64::from(address >> 4);
+            regs.rdi = (regs.rdi & !0xFFFF) | u64::from(address & 15);
+            regs.rcx = (regs.rcx & !0xFFFF) | VBE_PM_INTERFACE.len() as u64;
+            done(regs, true);
+        }
         _ => done(regs, false),
+    }
+}
+
+/// Direct PM display-start uses a dword address in DX:CX, whereas INT 10h
+/// uses pixel/scanline coordinates. Resolve it using the active logical pitch.
+fn translate_pm_display_start<A: crate::Arch>(
+    bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    dos: &DosState<A>,
+    regs: &mut Regs,
+) -> bool {
+    if !matches!(regs.rbx as u16, 0 | 0x80) { return false; }
+    let svga = if dos.pc.vga.native().is_some() {
+        bios.vbe_state().map(|state| &state.svga)
+    } else {
+        dos.pc.vga.emulated().and_then(|dev| dev.state.svga())
+    };
+    let Some(svga) = svga else { return false };
+    let address = (u32::from(regs.rdx as u16) << 16) | u32::from(regs.rcx as u16);
+    let Some((x, y)) = pm_display_coordinates(address, svga.logical_pitch, svga.config.bits_per_pixel) else {
+        return false;
+    };
+    regs.rcx = u64::from(x);
+    regs.rdx = u64::from(y);
+    true
+}
+
+fn pm_display_coordinates(dwords: u32, pitch: u16, bpp: u8) -> Option<(u16, u16)> {
+    let bytes = dwords.checked_mul(4)?;
+    let step = u32::from(bpp.div_ceil(8));
+    if pitch == 0 || step == 0 { return None; }
+    let remainder = bytes % u32::from(pitch);
+    if !remainder.is_multiple_of(step) { return None; }
+    Some((u16::try_from(remainder / step).ok()?,
+        u16::try_from(bytes / u32::from(pitch)).ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pm_display_coordinates;
+
+    #[test]
+    fn protected_display_addresses_use_dwords_and_the_active_pitch() {
+        assert_eq!(pm_display_coordinates((336 * 1024 + 4) / 4, 336, 8), Some((4, 1024)));
+        assert_eq!(pm_display_coordinates((1280 * 480 + 8) / 4, 1280, 16), Some((4, 480)));
+        assert_eq!(pm_display_coordinates((1920 * 480 + 12) / 4, 1920, 24), Some((4, 480)));
+        assert_eq!(pm_display_coordinates(1, 1920, 24), None); // fractional pixel
+        assert_eq!(pm_display_coordinates(u32::MAX, 320, 8), None);
+        assert_eq!(pm_display_coordinates(0, 0, 8), None);
+        assert_eq!(pm_display_coordinates(0, 320, 0), None);
     }
 }
 

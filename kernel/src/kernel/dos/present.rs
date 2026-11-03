@@ -94,7 +94,9 @@ fn scanout<'a, A: crate::Arch>(
         let size = svga.visible_frame_bytes();
         let live = super::machine::vga::live_vram(machine);
         let end = svga_start.checked_add(size)?;
-        let vram = live.get(svga_start..end)?;
+        // The status-bar split restarts at VRAM zero, independently of the
+        // scrolled viewport. Keep both origins available to the row decoder.
+        let vram = live.get(..end)?;
         return Some(Frame {
             memory: None,
             plane_layout: ::vga::VramLayout::PlaneMinor,
@@ -114,10 +116,10 @@ fn scanout<'a, A: crate::Arch>(
             font_maps: None,
             blink: false, text_cursor: None,
             cga_palette: [0; 4],
-            start_offset: 0,
+            start_offset: svga_start,
             pixel_pan: 0,
             split_pixel_pan: 0,
-            line_compare: usize::MAX,
+            line_compare: svga.line_compare(),
             blank_start: usize::MAX,
         });
     }
