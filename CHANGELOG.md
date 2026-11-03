@@ -5,7 +5,7 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 
 ## [Unreleased]
 
-## [0.10.0] - 2026-10-31
+## [0.10.0] - 2026-11-02
 
 ### Multicore audio and graphics
 
@@ -19,6 +19,10 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
   tables for VM86, 16-bit and 32-bit programs.
 - Audio fixes cover Sound Blaster single-cycle DMA gaps and media-service
   starvation. Logs include the core number and serialize complete lines.
+- Emulated audio reads permanent ISA DMA buffers without pausing the guest.
+  Frequently polled VGA and sound DMA ports use a ring-0 path.
+- Preserve VGA font data across DOS setup programs using segment-overridden
+  string instructions.
 
 ### Experimental Windows support
 
@@ -51,6 +55,7 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
   settings use a shared INI parsing library.
 - Fix leaked file handles across nested DOS EXEC calls and reduce stalls in
   OSD, display and network processing.
+- Accept legacy ISO directory padding used by some game CDs.
 
 ### Installation and verification
 
