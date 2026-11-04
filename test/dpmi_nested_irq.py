@@ -23,7 +23,7 @@ def main():
             assert f'{marker} PASS' in log and '[mem] exit tid=1 code=0' in log, log
             assert not any(error in log for error in
                            (f'{marker} FAIL', 'FATAL', 'panicked at')), log
-    print('PASS: DPMI IRQ stack selection and legacy ISR register preservation')
+    print('PASS: DPMI IRQ stack selection and RM/PM ISR register results')
 
 
 if __name__ == '__main__':

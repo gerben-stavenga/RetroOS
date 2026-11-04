@@ -80,9 +80,6 @@ pub(super) struct HostContinuation {
     stacks: StackCursors,
     pub rm_call_struct_addr: Option<u32>,
     vif: Option<super::dpmi::vif::SuspendedVif>,
-    /// The default hardware-IRQ service protects the interrupted registers
-    /// while running a legacy RM ISR. Software interrupt results pass through.
-    preserved_gp: Option<[u64; 7]>,
 }
 
 impl HostContinuation {
@@ -93,7 +90,6 @@ impl HostContinuation {
             stacks,
             rm_call_struct_addr,
             vif: None,
-            preserved_gp: None,
         }
     }
 
@@ -228,9 +224,6 @@ pub(super) fn resume_continuation<A: crate::Arch>(machine: &mut A, dos: &mut thr
         saved
     });
 
-    if let Some(gp) = save.preserved_gp {
-        [regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi, regs.rbp] = gp;
-    }
     save.restore(regs);
     dos.pc.locked_stack.stacks = save.stacks;
     if let Some(saved) = save.vif
@@ -585,14 +578,6 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::
     let delivery_tag = if nested_on_pm && default_vector { IF_PM_IRQ_NESTED_DEF }
                        else if nested_on_pm { IF_PM_IRQ_NESTED }
                        else { IF_PM_IRQ_FIRST };
-    // The host's default hardware-IRQ service brackets a legacy RM ISR.
-    // Such an ISR may save only 16-bit registers yet use 32-bit buffer ops
-    // (VChess's SB ISR loads EAX=80808080h). Keep the interrupted context
-    // intact. Software INT reflection and PM handlers chaining to the default
-    // vector still return their RM register results through the ordinary path.
-    let preserved_gp = default_vector.then_some([
-        regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi, regs.rbp,
-    ]);
     let interrupted_segs = (regs.ds, regs.es, regs.fs, regs.gs);
     if nested_on_pm {
         // A handler may have switched SS:ESP; grow its live stack and unwind
@@ -607,8 +592,6 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::
         regs.fs = 0;
         regs.gs = 0;
     }
-    dos.pc.locked_stack.continuations.last_mut()
-        .expect("IRQ entry without a host continuation").preserved_gp = preserved_gp;
     let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME_CONTINUATION) as u32;
     push_iret_frame(machine, &dos.ldt[..], regs, handler_use32,
         stub_eip, SPECIAL_STUB_SEL, machine::guest_flags(regs));
