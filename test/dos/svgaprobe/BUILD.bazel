@@ -15,3 +15,11 @@ genrule(
     cmd = "nasm -f bin -o $@ $<",
     visibility = ["//visibility:public"],
 )
+
+genrule(
+    name = "vbe_pm_visual_com",
+    srcs = ["vbe_pm.asm"],
+    outs = ["VBEVIS.COM"],
+    cmd = "nasm -D VBE_VISUAL=1 -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

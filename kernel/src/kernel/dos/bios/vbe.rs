@@ -96,7 +96,7 @@ fn substitute_vbe_mode(number: u16) -> Option<crate::kernel::platform::VbeMode> 
     })
 }
 
-pub(in crate::kernel::dos) fn vbe<A: crate::Arch>(
+pub(super) fn vbe<A: crate::Arch>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut DosState<A>,

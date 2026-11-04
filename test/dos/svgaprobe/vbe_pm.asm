@@ -156,6 +156,89 @@ protected:
     cmp byte [hook_calls], 0
     jne pm_fail
 
+%ifdef VBE_VISUAL
+    ; Initialize two solid-colour pages, then exercise PM palette and page
+    ; changes without any INT 10h readback that could invalidate scanout.
+    xor esi, esi
+.fill_bank:
+    xor ebx, ebx
+    mov edx, esi
+    call [bank_entry]
+    cmp ax, 004fh
+    jne pm_fail
+    xor edi, edi
+    mov ecx, 65536
+    mov al, 7
+    cmp esi, 2
+    jb .fill
+    inc al
+.fill:
+    cld
+    rep stosb
+    inc esi
+    cmp esi, 4
+    jb .fill_bank
+    push ds
+    pop es
+    mov eax, 4f09h
+    xor ebx, ebx
+    mov ecx, 2
+    mov edx, 7
+    mov edi, visual_palette
+    int 10h
+    mov eax, 4f07h
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+    int 10h
+    mov edx, visual_red
+    call visual_wait
+
+    mov eax, 4f09h
+    xor ebx, ebx
+    mov ecx, 1
+    mov edx, 7
+    mov edi, visual_green_palette
+    call [palette_entry]
+    cmp ax, 004fh
+    jne pm_fail
+    xor edx, edx ; console output would itself invalidate scanout
+    call visual_wait
+
+    mov ebx, 80h
+    mov ecx, 32768 ; byte offset 131072, in dwords
+    xor edx, edx
+    call [start_entry]
+    cmp ax, 004fh
+    jne pm_fail
+    xor edx, edx
+    call visual_wait
+    mov edx, success
+    xor ebx, ebx
+    jmp finish
+visual_wait:
+    test edx, edx
+    jz .wait_key
+    mov [rmcs+20], edx
+    mov dword [rmcs+28], 0900h
+    mov ax, [rm_segment]
+    mov [rmcs+36], ax
+    push ds
+    pop es
+    mov edi, rmcs
+    xor ecx, ecx
+    mov ebx, 21h
+    mov eax, 0300h
+    int 31h
+.wait_key:
+    xor eax, eax
+    int 16h
+    ret
+visual_palette db 0,0,63,0, 63,0,0,0
+visual_green_palette db 0,63,0,0
+visual_red db 'VBE-VISUAL-RED',13,10,'$'
+%endif
+
     stage '6'
     push ds
     pop es

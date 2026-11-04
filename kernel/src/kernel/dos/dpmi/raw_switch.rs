@@ -97,7 +97,10 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(
         }
         dos::SLOT_SAVE_RESTORE | dos::SLOT_VBE_PM => {
             if slot == dos::SLOT_VBE_PM {
-                super::super::bios::vbe::vbe(machine, bios_display, dos, regs);
+                // Keep the normal video handler's memory gate and scanout
+                // invalidation: the PM API changes the displayed palette
+                // and page just like an INT 10h call does.
+                super::super::bios::video::int10(machine, bios_display, dos, regs);
             }
             // Save/restore is a NOP (AX=0305 announces size zero). Both it
             // and the direct VBE service resume through a far-call frame.
