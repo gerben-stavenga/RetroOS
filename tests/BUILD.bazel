@@ -346,7 +346,7 @@ integration_test(
     command = ["python3", "test/vga_bios_text.py"],
     sources = ["//:integration_sources"],
     metal = ["//:boot_disk", "//test/dos/svgaprobe:vga_text_com"],
-    tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
+    tags = ["dos", "requires-qemu-kvm", "no-sandbox", "no-cache"],
 )
 
 integration_test(
@@ -354,7 +354,7 @@ integration_test(
     command = ["python3", "test/vbe_pm_video.py"],
     sources = ["//:integration_sources"],
     metal = ["//:boot_disk", "//test/dos/svgaprobe:vbe_pm_visual_com"],
-    tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
+    tags = ["dos", "requires-qemu-kvm", "no-sandbox", "no-cache"],
 )
 
 integration_test(
