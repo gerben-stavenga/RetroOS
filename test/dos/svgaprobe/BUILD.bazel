@@ -1,6 +1,13 @@
 
 package(default_visibility = ["//tests:__pkg__"])
 genrule(
+    name = "vga_text_com",
+    srcs = ["vga_text.asm"],
+    outs = ["VGATEXT.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
+genrule(
     name = "svgaprobe_com",
     srcs = ["svgaprobe.asm"],
     outs = ["SVGAPROBE.COM"],

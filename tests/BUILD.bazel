@@ -285,6 +285,18 @@ integration_test(
 )
 
 integration_test(
+    name = "dpmi_nested_irq",
+    command = ["python3", "test/dpmi_nested_irq.py"],
+    sources = ["//:integration_sources"],
+    host = ["//kernel:retroos-host-kvm"],
+    metal = [
+        "//test/dos/rmexception:nested_irq_com",
+        "//test/dos/rmexception:irq_regs_com",
+    ],
+    tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
+)
+
+integration_test(
     name = "dpmi_rm_exception",
     command = ["python3", "test/dpmi_rm_exception.py"],
     sources = ["//:integration_sources"],
@@ -326,6 +338,14 @@ integration_test(
     sources = ["//:integration_sources"],
     metal = ["//:boot_disk", "//test/dos/svgaprobe:vbe_pm_com"],
     host = ["//kernel:retroos-host-kvm"],
+    tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
+)
+
+integration_test(
+    name = "vga_bios_text",
+    command = ["python3", "test/vga_bios_text.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk", "//test/dos/svgaprobe:vga_text_com"],
     tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
 )
 

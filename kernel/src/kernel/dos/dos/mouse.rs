@@ -27,14 +27,14 @@ pub(super) fn int_33h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
         // AX=0000h — reset / installation check.
         // Returns: AX=0xFFFF (driver installed), BX=number of buttons (2).
         0x0000 => {
-            m.erase_cursor(machine);
+            m.erase_cursor(machine, &mut dos.pc.vga);
             *m = crate::kernel::dos::machine::MouseState::new();
             regs.rax = (regs.rax & !0xFFFF) | 0xFFFF;
             regs.rbx = (regs.rbx & !0xFFFF) | 2;
         }
         // AX=0001h — show cursor. AX=0002h — hide cursor.
-        0x0001 => m.show(machine, regs),
-        0x0002 => m.hide(machine, regs),
+        0x0001 => m.show(machine, &mut dos.pc.vga, regs),
+        0x0002 => m.hide(machine, &mut dos.pc.vga, regs),
         // AX=0003h — get position and button status.
         // BX=button mask, CX=x, DX=y.
         0x0003 => {
@@ -46,7 +46,7 @@ pub(super) fn int_33h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
         0x0004 => {
             m.x = (regs.rcx as i16).clamp(m.min_x, m.max_x);
             m.y = (regs.rdx as i16).clamp(m.min_y, m.max_y);
-            m.render_if_visible(machine, regs);
+            m.render_if_visible(machine, &mut dos.pc.vga, regs);
         }
         // AX=0005h — get button press info. BX=button (0=left, 1=right, 2=mid).
         // Returns AX=button mask, BX=transition count since the last query for

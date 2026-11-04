@@ -2806,12 +2806,20 @@ impl LegacyVgaState {
         }
     }
 
-    /// Odd/even selects planes with A0 independently of the CRTC's byte/word
-    /// addressing. Word-mode scanout uses compact offsets in our backing;
-    /// byte-mode scanout (Jazz's scrolling playfield) uses the full offset.
-    fn odd_even_offset(&self, address: usize) -> usize {
-        let address = if self.gc.get(6) & 0x02 != 0 { address & !1 } else { address };
-        let address = if self.crtc.get(0x17) & 0x40 == 0 { address >> 1 } else { address };
+    /// Shared CPU address translation for reads and writes. Plane selection
+    /// is separate: it must never change the byte offset within a plane.
+    /// Chain-4 consumes A1:A0 to select the plane. Otherwise,
+    /// GC6 controls address pairing independently of the read/write plane
+    /// selectors. Normalize paired word-mode addresses to our compact text
+    /// backing on both paths, even when only one side selects odd/even planes.
+    /// Byte-mode scanout (Jazz's scrolling playfield) uses the full offset.
+    fn cpu_offset(&self, address: usize) -> usize {
+        if self.seq.get(4) & 0x08 != 0 {
+            return (address >> 2) & 0xFFFF;
+        }
+        let paired = self.gc.get(6) & 0x02 != 0;
+        let address = if paired { address & !1 } else { address };
+        let address = if paired && self.crtc.get(0x17) & 0x40 == 0 { address >> 1 } else { address };
         address & 0xFFFF
     }
 
@@ -2820,13 +2828,14 @@ impl LegacyVgaState {
     /// The returned offset is always an offset *within a plane*; callers then
     /// use `layout()` to locate that byte in the physical backing.
     pub fn cpu_read_address(&self, address: usize) -> (usize, usize) {
+        let offset = self.cpu_offset(address);
         if self.seq.get(4) & 0x08 != 0 {
-            return ((address >> 2) & 0xFFFF, address & 3);
+            return (offset, address & 3);
         }
         if self.gc.get(5) & 0x10 != 0 {
-            return (self.odd_even_offset(address), usize::from(self.gc.get(4) & 2) | (address & 1));
+            return (offset, usize::from(self.gc.get(4) & 2) | (address & 1));
         }
-        (address & 0xFFFF, usize::from(self.gc.get(4) & 3))
+        (offset, usize::from(self.gc.get(4) & 3))
     }
 
     /// Resolve one CPU write to its logical per-plane offset and effective map
@@ -2834,16 +2843,17 @@ impl LegacyVgaState {
     /// each pair with A0; sequential addressing leaves the sequencer map mask
     /// untouched.
     pub fn cpu_write_address(&self, address: usize) -> (usize, u8) {
+        let offset = self.cpu_offset(address);
         let map_mask = self.seq.get(2) & 0x0F;
         if self.seq.get(4) & 0x08 != 0 {
             let plane = address & 3;
-            return ((address >> 2) & 0xFFFF, map_mask & (1 << plane));
+            return (offset, map_mask & (1 << plane));
         }
         if self.seq.get(4) & 0x04 == 0 {
             let parity_mask = if address & 1 == 0 { 0x05 } else { 0x0A };
-            return (self.odd_even_offset(address), map_mask & parity_mask);
+            return (offset, map_mask & parity_mask);
         }
-        (address & 0xFFFF, map_mask)
+        (offset, map_mask)
     }
 
     fn simple_alu(&self) -> bool {
@@ -2869,6 +2879,7 @@ impl LegacyVgaState {
         let read_oe = self.gc.get(5) & 0x10 != 0;
         if write_oe && read_oe
             && self.crtc.get(0x17) & 0x40 == 0
+            && self.gc.get(6) & 0x02 != 0
             && self.seq.get(2) & 0x0F == 0x03
             && self.gc.get(4) & 0x02 == 0
         {

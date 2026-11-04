@@ -252,7 +252,10 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
     // `from_vm86` was already captured above for the handler-table lookup.
     let f_eip    = regs.ip32();
     let f_cs     = regs.code_seg();
-    let f_eflags = regs.flags32();
+    // This is a guest-visible frame: expose virtual IF in bit 9 and exclude
+    // the host's internal single-step TF. Raw flags would turn a fault inside
+    // CLI-protected code into an unintended STI when the handler returns.
+    let f_eflags = machine::guest_flags(regs);
     let f_esp    = regs.sp32();
     let f_ss     = regs.stack_seg();
     let f_ds     = regs.ds as u16;

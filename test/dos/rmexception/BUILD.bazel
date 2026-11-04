@@ -1,6 +1,22 @@
 
 package(default_visibility = ["//tests:__pkg__"])
 genrule(
+    name = "irq_regs_com",
+    srcs = ["irq_regs.asm"],
+    outs = ["IRQREGS.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "nested_irq_com",
+    srcs = ["nested_irq.asm"],
+    outs = ["NESTIRQ.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
+
+genrule(
     name = "rmexception_com",
     srcs = ["rmexception.asm"],
     outs = ["RMEXCEPT.COM"],

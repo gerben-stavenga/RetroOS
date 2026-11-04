@@ -247,10 +247,8 @@ pub struct PcMachine {
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
 
-    /// PM/RM transition state. The pm-side cursor isn't a separate
-    /// field — it's `regs.SS:SP` when user is on pm side, or
-    /// `locked_stack.other_stack` (an `(SS, SP)` pair) when user is on
-    /// rm side. See `mode_transitions::stack_for`.
+    /// Host-mediated PM/RM stack entries and their suspended cursors.
+    /// Live SS:SP remains authoritative while an active side executes.
     pub locked_stack: super::mode_transitions::LockedStackState,
 }
 
@@ -398,7 +396,7 @@ impl MouseState {
     ///   0x10 = right button released
     ///   0x20 = middle button pressed
     ///   0x40 = middle button released
-    pub fn apply_packet<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, dx: i16, dy: i16, buttons: u8) -> u16 {
+    pub fn apply_packet<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo, regs: &mut Regs, dx: i16, dy: i16, buttons: u8) -> u16 {
         self.accum_dx = self.accum_dx.saturating_add(dx as i32);
         self.accum_dy = self.accum_dy.saturating_add(dy as i32);
         self.x = (self.x as i32 + dx as i32).clamp(self.min_x as i32, self.max_x as i32) as i16;
@@ -406,7 +404,7 @@ impl MouseState {
         let prev = self.buttons;
         let cur = buttons;
         self.buttons = cur;
-        self.render_if_visible(machine, regs);
+        self.render_if_visible(machine, vga, regs);
 
         let mut cond: u16 = 0;
         if dx != 0 || dy != 0 { cond |= 0x01; }
@@ -454,36 +452,44 @@ impl MouseState {
     /// already drawn at this cell. Real Microsoft Mouse drivers also do this
     /// in graphics modes via a sprite — we don't (yet); games that go to
     /// mode 13h hide the driver cursor and draw their own anyway.
-    pub fn render_if_visible<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
+    pub fn render_if_visible<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo, _regs: &mut Regs) {
         if self.show_count > 0 { return; }
+        let _live_access = vga::live_access();
+        if !matches!(super::bios::Bda::video_mode(machine), 0..=3 | 7) {
+            self.drawn_at = None;
+            return;
+        }
         let col = (self.x >> 3) as u32;
         let row = (self.y >> 3) as u32;
         if col >= 80 || row >= 25 { return; }
         let offset = (row * 80 + col) as u16;
         if Some(offset) == self.drawn_at { return; }
-        self.erase_cursor(machine);
-        let attr = (VGA_TEXT_BASE + offset as u32 * 2 + 1) as usize;
-        self.saved_attr = machine.read::<u8>(attr);
-        machine.write::<u8>(attr, self.saved_attr ^ 0x77);
+        self.erase_cursor(machine, vga);
+        vga::scanout_changed();
+        let cell = (VGA_TEXT_BASE + offset as u32 * 2) as usize;
+        self.saved_attr = (vga::read_video_word(machine, vga, cell) >> 8) as u8;
+        vga::copy_to_guest(machine, vga, cell + 1, &[self.saved_attr ^ 0x77]);
         self.drawn_at = Some(offset);
     }
 
     /// Restore the original attribute under the current cursor cell.
-    pub fn erase_cursor<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn erase_cursor<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo) {
         if let Some(old) = self.drawn_at.take() {
-            machine.write::<u8>((VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, self.saved_attr);
+            let _live_access = vga::live_access();
+            vga::scanout_changed();
+            vga::copy_to_guest(machine, vga, (VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, &[self.saved_attr]);
         }
     }
 
     /// AX=01h — show cursor: decrement counter; if it just reached 0, draw.
-    pub fn show<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs) {
+    pub fn show<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo, regs: &mut Regs) {
         self.show_count -= 1;
-        self.render_if_visible(machine, regs);
+        self.render_if_visible(machine, vga, regs);
     }
 
     /// AX=02h — hide cursor: increment counter; if it was 0, erase.
-    pub fn hide<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
-        if self.show_count <= 0 { self.erase_cursor(machine); }
+    pub fn hide<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo, _regs: &mut Regs) {
+        if self.show_count <= 0 { self.erase_cursor(machine, vga); }
         self.show_count += 1;
     }
 }
@@ -1223,7 +1229,7 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
             // vpic at all — `apply_packet` updates `pending_cond` and
             // `raise_pending` dispatches the AX=0Ch callback directly when
             // the mask matches and the user's IF=1.
-            let _ = pc.mouse.apply_packet(machine, regs, dx, dy, buttons);
+            let _ = pc.mouse.apply_packet(machine, &mut pc.vga, regs, dx, dy, buttons);
         }
         Irq::Hw(line) => {
             // Only the card this guest actually holds has a line to relay.

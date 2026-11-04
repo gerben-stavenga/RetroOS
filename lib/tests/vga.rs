@@ -396,7 +396,9 @@ fn trapped_addressing_is_independent_of_backing_layout() {
         VramLayout::PlaneMinor,
     )));
     write.vram_transition.unwrap().apply(&mut vram);
-    assert_eq!(state.cpu_write_address(7), (7, 0x03));
+    // Disabling odd/even plane selection does not disable GC6's paired
+    // addressing. Both directions still use the same compact word offset.
+    assert_eq!(state.cpu_write_address(7), (3, 0x03));
     assert_eq!(state.cpu_read_address(7), (3, 1));
 
     // Chain-4 uses A1:A0 as the plane and the upper address bits as offset.
@@ -407,6 +409,55 @@ fn trapped_addressing_is_independent_of_backing_layout() {
     assert_eq!(state.cpu_read_address(7), (1, 3));
     assert_eq!(state.cpu_write_address(7), (1, 0x08));
     assert!(write.vram_transition.is_none());
+}
+
+#[test]
+fn cpu_reads_and_writes_translate_to_the_same_plane_offset() {
+    let state = *vga::LegacyVgaState::new_mode3_boxed();
+    for seq_mode in (0..16).step_by(2) {
+        state.seq.set(4, seq_mode);
+        for read_mode in [0, 8, 0x10, 0x18] {
+            state.gc.set(5, read_mode);
+            for paired in [0, 2] {
+                state.gc.set(6, 0x0C | paired);
+                for byte_mode in [0, 0x40] {
+                    state.crtc.set(0x17, byte_mode);
+                    for read_plane in 0..4 {
+                        state.gc.set(4, read_plane);
+                        for write_mask in [1, 3, 5, 15] {
+                            state.seq.set(2, write_mask);
+                            for address in [0, 1, 2, 3, 6, 7, 0x1FFF, 0x2000, 0xFFFF, 0x10000, 0x1FFFF] {
+                                assert_eq!(state.cpu_read_address(address).0,
+                                    state.cpu_write_address(address).0,
+                                    "address={address:#x} seq4={seq_mode:#x} gc5={read_mode:#x} gc6={:#x} crtc17={byte_mode:#x}",
+                                    state.gc.get(6));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn paired_addressing_survives_independent_read_and_write_plane_selection() {
+    let state = *vga::LegacyVgaState::new_mode3_boxed();
+    state.seq.set(2, 1);
+    state.gc.set(5, 0); // VChess reads plane 0 while writes remain odd/even.
+    assert_eq!(state.cpu_write_address(0x2000), (0x1000, 1));
+    assert_eq!(state.cpu_read_address(0x2000), (0x1000, 0));
+    state.seq.set(4, 4); // Sequential writes still share GC6's address wiring.
+    assert_eq!(state.cpu_write_address(0x2001), (0x1000, 1));
+    assert_eq!(state.cpu_read_address(0x2001), (0x1000, 0));
+
+    state.gc.set(6, state.gc.get(6) & !2);
+    assert_eq!(state.cpu_write_address(0x2001), (0x2001, 1));
+    assert_eq!(state.cpu_read_address(0x2001), (0x2001, 0));
+    state.seq.set(4, 2);
+    state.seq.set(2, 3);
+    state.gc.set(5, 0x10);
+    assert!(matches!(state.cpu_aperture(), vga::CpuAperture::Trapped { .. }));
 }
 
 #[test]

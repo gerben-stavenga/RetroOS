@@ -360,13 +360,13 @@ fn scroll_text_page<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, page
     // Move rows 1..rows up one, then blank the last with the current attribute.
     for r in 1..rows {
         for c in 0..cols {
-            let v: u16 = machine.read(base + (r * cols + c) * 2);
+            let v = machine::vga::read_video_word(machine, &mut dos.pc.vga, base + (r * cols + c) * 2);
             machine::vga::copy_to_guest(machine, &mut dos.pc.vga, base + ((r - 1) * cols + c) * 2, &v.to_le_bytes());
         }
     }
     // Blank with the attribute the vacated line already carried, so a coloured
     // screen scrolls in its own colour rather than reverting to grey-on-black.
-    let attr = machine.read::<u16>(base + ((rows - 1) * cols) * 2) & 0xFF00;
+    let attr = machine::vga::read_video_word(machine, &mut dos.pc.vga, base + ((rows - 1) * cols) * 2) & 0xFF00;
     for c in 0..cols {
         machine::vga::copy_to_guest(machine, &mut dos.pc.vga, base + ((rows - 1) * cols + c) * 2, &(attr | b' ' as u16).to_le_bytes());
     }
@@ -501,7 +501,7 @@ fn scroll_window<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &
             let val = match src {
                 Some(s) => {
                     let from = text_cell(machine, page, s, c);
-                    machine.read::<u16>(from)
+                    machine::vga::read_video_word(machine, &mut dos.pc.vga, from)
                 }
                 None => blank,
             };
@@ -621,7 +621,7 @@ pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
             let mode = Bda::video_mode(machine);
             let cell = if is_text_mode(mode) {
                 let at = text_cell(machine, page, row, col);
-                machine.read::<u16>(at)
+                machine::vga::read_video_word(machine, &mut dos.pc.vga, at)
             } else {
                 0x0720 // graphics modes: no cell to read back
             };

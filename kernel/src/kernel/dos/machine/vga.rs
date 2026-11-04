@@ -1428,19 +1428,29 @@ fn finish_read(vga: &mut LegacyVgaState, read_plane: usize, cur: [u8; 4]) -> u8 
     data
 }
 
-/// Read a CPU-visible video byte, including latch effects on a trapped aperture.
+/// Read video memory through its kernel backing, including VGA latch effects.
 fn read_guest_byte<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVideo, addr: usize) -> u8 {
     if let Some(dev) = device.emulated_mut()
         && let Some(vga) = dev.state.legacy_mut()
-        && let Some(pages) = trapped_aperture(vga)
+        && let Some(range) = aperture_range(vga.cpu_aperture())
     {
-        let base = usize::from(pages.start) << 12;
-        let end = usize::from(pages.end) << 12;
+        let base = usize::from(range.start_page) << 12;
+        let end = usize::from(range.end_page) << 12;
         if (base..end).contains(&addr) {
             return vram_read(machine, vga, (addr - base) as u32);
         }
     }
     machine.read(addr)
+}
+
+/// BIOS text reads must use the VGA CPU view too: a program can leave the
+/// text aperture trapped by changing GC registers without updating the BDA.
+pub(in crate::kernel::dos) fn read_video_word<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVideo, addr: usize) -> u16 {
+    let _live_access = live_access();
+    u16::from_le_bytes([
+        read_guest_byte(machine, device, addr),
+        read_guest_byte(machine, device, addr + 1),
+    ])
 }
 
 /// BIOS mode-set clearing after the new aperture has been installed. EGA/VGA

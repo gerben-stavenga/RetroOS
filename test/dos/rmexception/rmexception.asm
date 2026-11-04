@@ -48,9 +48,27 @@ org 100h
     jne fail_pm
 
     mov byte [stage], '2'
+    cli
     ud2
     cmp byte [pm_seen], 1
     jne fail_pm
+    test dword [pm_flags], 0300h
+    jnz fail_pm
+
+    mov byte [stage], '3'
+    ud2                    ; returning from the first fault must keep IF clear
+    cmp byte [pm_seen], 2
+    jne fail_pm
+    test dword [pm_flags], 0300h
+    jnz fail_pm
+
+    mov byte [stage], '4'
+    sti
+    ud2
+    cmp byte [pm_seen], 3
+    jne fail_pm
+    test dword [pm_flags], 0200h
+    jz fail_pm
 
     mov dx, pass_msg
     call emit_pm
@@ -85,8 +103,12 @@ rm_ud:
     iret
 
 pm_ud:
+    push eax
+    mov eax, [ss:esp+24] ; guest-visible faulting EFLAGS, not the host IF
+    mov [pm_flags], eax
     inc byte [pm_seen]
-    add dword [ss:esp+12], 2 ; faulting EIP in the 32-bit 0203h frame
+    add dword [ss:esp+16], 2 ; faulting EIP, adjusted for saved EAX
+    pop eax
     o32 retf
 
 fail_pm:
@@ -126,6 +148,7 @@ rm_segment dw 0
 stage db '0'
 rm_seen db 0
 pm_seen db 0
+pm_flags dd 0
 rmcs times 50 db 0
 pass_msg db 'RMEXCEPT PASS', 13, 10, '$'
 fail_msg db 'RMEXCEPT FAIL stage '
