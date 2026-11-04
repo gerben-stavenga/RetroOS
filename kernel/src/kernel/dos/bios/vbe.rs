@@ -19,17 +19,38 @@ const VBE_MODES: &[(u16, u16, u16, u8)] = &[
     (0x112, 640, 480, 24),
 ];
 
-// Relocatable 32-bit near-call entry points. Bank/palette use the usual
-// INT 10h ABI. Display-start has a different CX:DX ABI, so its wrapper tags
-// EAX for our INT 10h translator rather than relying on its execution address.
+// Relocatable 32-bit near-call entry points. Call our PM service directly:
+// DOS extenders can hook INT 10h and reflect it to real mode, losing the PM
+// palette pointer and display-start ABI. The fixed host selector/offset is
+// independent of where the client copies this block.
 const PM_DISPLAY_START: u32 = 0x5256_4F07;
-pub(in crate::kernel::dos) const VBE_PM_INTERFACE: [u8; 36] = [
-    8, 0, 16, 0, 24, 0, 32, 0, // offsets: bank, display start, palette, I/O list
-    0xB8, 0x05, 0x4F, 0, 0, 0xCD, 0x10, 0xC3, // mov eax,4F05h; int 10h; ret
-    0xB8, 0x07, 0x4F, 0x56, 0x52, 0xCD, 0x10, 0xC3,
-    0xB8, 0x09, 0x4F, 0, 0, 0xCD, 0x10, 0xC3, // mov eax,4F09h; int 10h; ret
-    0xFF, 0xFF, 0xFF, 0xFF, // no ports or MMIO required by these wrappers
-];
+pub(in crate::kernel::dos) const VBE_PM_INTERFACE: [u8; 51] = {
+    let mut code = [0; 51];
+    let target = (dos::STUB_BASE + dos::slot_offset(dos::SLOT_VBE_PM) as u32).to_le_bytes();
+    let selector = super::super::mode_transitions::SPECIAL_STUB_SEL.to_le_bytes();
+    let functions = [0x4F05u32, PM_DISPLAY_START, 0x4F09];
+    let mut i = 0;
+    while i < 3 {
+        let offset = 8 + i * 13;
+        code[i * 2] = offset as u8;
+        code[offset] = 0xB8; // mov eax, function
+        let function = functions[i].to_le_bytes();
+        let mut j = 0;
+        while j < 4 {
+            code[offset + 1 + j] = function[j];
+            code[offset + 6 + j] = target[j];
+            j += 1;
+        }
+        code[offset + 5] = 0x9A; // call far host_selector:host_offset
+        code[offset + 10] = selector[0];
+        code[offset + 11] = selector[1];
+        code[offset + 12] = 0xC3; // ret (client's near call)
+        i += 1;
+    }
+    code[6] = 47; // I/O list: no ports or MMIO required
+    code[47] = 0xFF; code[48] = 0xFF; code[49] = 0xFF; code[50] = 0xFF;
+    code
+};
 
 fn substitute_vbe_mode(number: u16) -> Option<crate::kernel::platform::VbeMode> {
     let &(_, width, height, bits_per_pixel) =
@@ -75,7 +96,7 @@ fn substitute_vbe_mode(number: u16) -> Option<crate::kernel::platform::VbeMode> 
     })
 }
 
-pub(super) fn vbe<A: crate::Arch>(
+pub(in crate::kernel::dos) fn vbe<A: crate::Arch>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut DosState<A>,

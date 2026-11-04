@@ -95,16 +95,20 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(
             super::super::dosabi::mouse_callback_return(machine, dos, regs);
             thread::KernelAction::Done
         }
-        dos::SLOT_SAVE_RESTORE => {
-            // No state to save: AX=0305 announces buffer size = 0, so the
-            // procedure is a NOP per the spec (matches CWSDPMI's STUB_NOP).
-            // We only need to pop the far-call return frame and resume.
+        dos::SLOT_SAVE_RESTORE | dos::SLOT_VBE_PM => {
+            if slot == dos::SLOT_VBE_PM {
+                super::super::bios::vbe::vbe(machine, bios_display, dos, regs);
+            }
+            // Save/restore is a NOP (AX=0305 announces size zero). Both it
+            // and the direct VBE service resume through a far-call frame.
             //
             // Frame size depends on the client's operand size: 16-bit CALL
             // FAR pushed IP+CS as 4 bytes; 32-bit CALL FAR pushed EIP+CS
             // as 8 bytes.
             let dpmi = dos.dpmi.as_ref().unwrap();
-            let use32 = dpmi.client_use32;
+            // VBE entry points are always 32-bit, even when an extender
+            // uses a 16-bit DPMI host client and raw-switches into 32-bit code.
+            let use32 = slot == dos::SLOT_VBE_PM || dpmi.client_use32;
             let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
             let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
             let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };

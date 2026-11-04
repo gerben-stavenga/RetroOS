@@ -568,6 +568,8 @@ pub(crate) const SLOT_PMDOS_INT21: u8 = 0xFC;
 pub(crate) const SLOT_PMDOS_INT33: u8 = 0xFA;
 /// PM INT 10h direct service; see [`pmdos_int10_handler`].
 pub(crate) const SLOT_PMDOS_INT10: u8 = 0xF9;
+/// Direct 32-bit far-call service for the relocatable VBE PM interface.
+pub(crate) const SLOT_VBE_PM: u8 = 0xF8;
 /// Single continuation return target. Reflected INTs, explicit DPMI RM calls,
 /// PM callback returns, and PM IRQ unwind all land here after their far return
 /// or IRET. `mode_transitions::resume_continuation_from_stub` pops the captured

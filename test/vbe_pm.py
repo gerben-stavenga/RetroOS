@@ -29,7 +29,7 @@ def main():
         text = result.stdout.decode(errors='replace')
         assert result.returncode == 0 and 'VBE-PM PASS' in text and 'VBE-PM FAIL' not in text, text
         assert '[mem] exit tid=1 code=0' in text, text
-        print('PASS: 320x240 banked mode, 336-byte pitch, relocated PM bank/palette/display-start calls')
+        print('PASS: 320x240 banked mode, 336-byte pitch, relocated PM calls bypass hooked INT 10h')
 
 
 if __name__ == '__main__':

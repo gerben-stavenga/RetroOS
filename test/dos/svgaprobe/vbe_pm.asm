@@ -1,4 +1,4 @@
-; Copy and execute all three VBE 2.0 PM entry points through INT 10h.
+; Copy and execute all three VBE 2.0 PM entry points with INT 10h hooked.
 bits 16
 org 100h
 %macro stage 1
@@ -113,6 +113,21 @@ protected:
     add eax, copied
     mov [palette_entry], eax
 
+    ; DOS extenders may hook INT 10h to translate pointers and reflect calls
+    ; to real mode. PM entry points must bypass that path entirely.
+    mov eax, 0204h
+    mov ebx, 10h
+    int 31h
+    jc pm_fail
+    mov [int10_original], edx
+    mov [int10_original+4], cx
+    mov eax, 0205h
+    xor ecx, ecx
+    mov cx, cs
+    mov edx, int10_hook
+    int 31h
+    jc pm_fail
+
     stage '5'
 
     mov eax, 4f05h
@@ -138,6 +153,8 @@ protected:
     jne pm_fail
     cmp byte [es:0], 5ah
     jne pm_fail
+    cmp byte [hook_calls], 0
+    jne pm_fail
 
     stage '6'
     push ds
@@ -150,6 +167,8 @@ protected:
     call [palette_entry]
     cmp ax, 004fh
     jne pm_fail
+    cmp byte [hook_calls], 0
+    jne pm_fail
     mov eax, 4f09h
     mov ebx, 1
     mov edi, readback
@@ -158,8 +177,11 @@ protected:
     jne pm_fail
     cmp dword [readback], 001d1103h
     jne pm_fail
+    cmp byte [hook_calls], 1
+    jne pm_fail
 
     stage '7'
+    mov byte [hook_calls], 0
     ; DX:CX holds a dword address, including a nonzero high word and x.
     mov eax, 4f07h
     xor ebx, ebx
@@ -167,6 +189,8 @@ protected:
     mov edx, (336*1024+4)/4 >> 16
     call [start_entry]
     cmp ax, 004fh
+    jne pm_fail
+    cmp byte [hook_calls], 0
     jne pm_fail
     mov eax, 4f07h
     mov ebx, 1
@@ -176,6 +200,8 @@ protected:
     cmp cx, 4
     jne pm_fail
     cmp dx, 1024
+    jne pm_fail
+    cmp byte [hook_calls], 1
     jne pm_fail
     mov edx, success
     mov ebx, 0
@@ -199,6 +225,12 @@ finish:
     pop eax
     or eax, 4c00h
     int 21h
+int10_hook:
+    inc byte [hook_calls]
+    jmp far [int10_original]
+int10_original dd 0
+               dw 0
+hook_calls db 0
 dpmi_entry dw 0, 0
 pm_entry dd protected
          dw 0
