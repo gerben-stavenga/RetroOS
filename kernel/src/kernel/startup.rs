@@ -3264,6 +3264,7 @@ fn dump_virtual_hw<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>) {
 
     crate::kernel::dos::dump_if_ring();
     let audio = dos.pc.audio.lock();
+    audio.sb.dump_state();
     audio.gus.dump_state();
     if audio.gus.present && audio.gus.irq < 16 {
         let vector = if audio.gus.irq < 8 {

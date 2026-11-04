@@ -240,6 +240,9 @@ pub struct PcMachine {
     /// lives here rather than inside any one card.
     pub dma: Dma8237,
     pub audio: alloc::sync::Arc<crate::kernel::media::Shared<AudioDevices>>,
+    /// Probe-delay update emitted by an SB write, consumed by the guest's
+    /// OUT handler. Unrelated I/O must not acquire the media-core audio lock.
+    pub(super) sb_probe_delay: Option<bool>,
     /// Last value written to CMOS index port 0x70 (NMI bit masked off).
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
@@ -579,6 +582,7 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).dma).write(Dma8237::new());
             core::ptr::addr_of_mut!((*p).audio).write(alloc::sync::Arc::new(
                 crate::kernel::media::Shared::new(AudioDevices::new())));
+            core::ptr::addr_of_mut!((*p).sb_probe_delay).write(None);
             core::ptr::addr_of_mut!((*p).cmos_index).write(0);
             core::ptr::addr_of_mut!((*p).locked_stack)
                 .write(super::mode_transitions::LockedStackState::new());
@@ -845,7 +849,9 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         0x71 => {}
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.audio.with(|audio| audio.sb.owns(p)) => {
-            pc.audio.lock().sb.sb_write(machine, &pc.dma, p, val);
+            let mut audio = pc.audio.lock();
+            audio.sb.sb_write(machine, &pc.dma, p, val);
+            pc.sb_probe_delay = Some(audio.sb.probe_is_stepping());
         }
         // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
         p if pc.audio.with(|audio| audio.gus.owns(p)) => pc.audio.lock().gus.io_write(machine, &pc.dma, &mut pc.vpic, p, val),

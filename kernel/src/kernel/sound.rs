@@ -685,18 +685,18 @@ impl Engine {
         let elapsed = now.saturating_sub(self.last_ns);
         if elapsed == 0 { return; }
         let _stall = super::portio::StallWatch::new("audio service");
-        // Don't stall the media core behind DMA rebinding or port access.
-        let mut source = match self.source.as_ref() {
-            Some(source) => match source.try_lock() { Some(source) => Some(source), None => return },
-            None => None,
-        };
         super::voodoo_profile::audio_gap(elapsed);
         self.last_ns = now;
         LAST_AUDIO_MS.store((now / 1_000_000) as u32, Ordering::Relaxed);
         advance_resident(&mut self.clock, self.sink.as_mut(), elapsed, stamp, |span| {
             let AudioSpan { rate, base_frame, physical_sb, can_defer, frames } = span;
-            let n = if let Some(source) = source.as_mut() {
-                mix(source, now, AudioSpan {rate,base_frame,physical_sb,can_defer,frames:&mut *frames})
+            let n = if let Some(source) = self.source.as_ref() {
+                // Guest DSP/DMA writes and IRQ handlers need this same lock.
+                // Hold it for one bounded mix block, not for sink polling,
+                // PCM clients, output submission, or an entire catch-up batch.
+                // A busy guest leaves this span pending for the next pump.
+                let Some(mut source) = source.try_lock() else { return 0 };
+                mix(&mut source, now, AudioSpan {rate,base_frame,physical_sb,can_defer,frames:&mut *frames})
             } else { frames.len() };
             pcm::mix(&mut frames[..n],rate,base_frame);
             n
@@ -707,6 +707,26 @@ impl Engine {
 #[cfg(test)]
 mod span_tests {
     use super::*;
+
+    #[test]
+    fn a_busy_source_keeps_its_unmixed_time_for_retry() {
+        let mut clock = Clock::new();
+        let interval = 1_005_000; // retain a fractional frame as well
+        advance_resident(&mut clock, None, interval, 0, |_| 0);
+        assert_eq!(clock.produced_frames(), 0);
+        assert!(clock.pending_frames > 0);
+        let mut resumed = 0;
+        advance_resident(&mut clock, None, interval, 0, |span| {
+            assert_eq!(span.base_frame, resumed);
+            resumed += span.frames.len() as u64;
+            span.frames.len()
+        });
+        let mut uninterrupted = Clock::new();
+        advance_resident(&mut uninterrupted, None, interval * 2, 0, |span| span.frames.len());
+        assert_eq!(clock.pending_frames, 0);
+        assert_eq!(clock.produced_q16, uninterrupted.produced_q16);
+        assert_eq!(resumed, uninterrupted.produced_frames());
+    }
 
     #[test]
     fn a_partial_source_span_is_retried_without_skipping_or_replaying_frames() {

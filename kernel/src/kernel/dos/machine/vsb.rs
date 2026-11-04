@@ -323,6 +323,20 @@ impl SoundBlaster {
         }
     }
 
+    pub(crate) fn dump_state(&self) {
+        if let SbDevice::Emulated(sb) = &self.device {
+            let state = sb.core.dsp_state();
+            let (ring, done, serviced) = sb.core.dma_progress();
+            crate::compact_dbg_println!(
+                "[SBSTATE] rate={} bits={} stereo={} single={} block={} playing={} ring={} cursor={} produced={} next_irq={} done={} serviced={} dma={:08X} channel={} gen={} refill_until={}",
+                state.rate, state.bits, state.stereo, state.single, state.block, state.playing,
+                ring, sb.core.cursor_frames(), sb.mix_pos_q32 >> 32,
+                sb.core.next_irq_frames(), done, serviced, sb.dma_base,
+                sb.dma_channel, sb.dma_count_gen, sb.refill_until,
+            );
+        }
+    }
+
     pub fn set_physical_master<A: crate::Arch>(&self, machine: &mut A, raw: u8) -> bool {
         match &self.device {
             SbDevice::Native { pt, .. } => {

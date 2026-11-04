@@ -1048,8 +1048,9 @@ fn handle_event_inner<A: crate::Arch>(
         }
         KE::Out { port, size } => {
             machine::handle_out_event(machine, bios_display, &mut dos.pc, regs, port, size.bytes());
-            let delay = dos.pc.audio.lock().sb.probe_is_stepping();
-            set_tf_source(dos, TF_DELAY, delay);
+            if let Some(delay) = dos.pc.sb_probe_delay.take() {
+                set_tf_source(dos, TF_DELAY, delay);
+            }
             regs.project_tf();
             thread::KernelAction::Done
         }
@@ -1059,8 +1060,9 @@ fn handle_event_inner<A: crate::Arch>(
         }
         KE::Outs { size, rep, addr32 } => {
             machine::handle_outs_event(machine, bios_display, &mut dos.pc, regs, size.bytes(), rep, addr32);
-            let delay = dos.pc.audio.lock().sb.probe_is_stepping();
-            set_tf_source(dos, TF_DELAY, delay);
+            if let Some(delay) = dos.pc.sb_probe_delay.take() {
+                set_tf_source(dos, TF_DELAY, delay);
+            }
             regs.project_tf();
             thread::KernelAction::Done
         }
