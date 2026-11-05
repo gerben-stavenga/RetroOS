@@ -39,8 +39,11 @@ jobs:
           release/SHA256SUMS THIRD_PARTY_LICENSES.md --clobber
     - name: Point rolling tag at tested commit
       run: |
-        gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/retroos" \
-          -f sha="$TARGET_SHA" -F force=true
+        current_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/retroos" --jq .object.sha)
+        if [ "$current_sha" != "$TARGET_SHA" ]; then
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/retroos" \
+            -f sha="$TARGET_SHA" -F force=true
+        fi
     - name: Update rolling release details
       run: |
         cat > release/rolling-notes.md <<EOF
