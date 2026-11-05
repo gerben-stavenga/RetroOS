@@ -15,7 +15,7 @@ def run(*args, **kwargs):
     return subprocess.run(list(map(str, args)), check=True, stdout=subprocess.DEVNULL, **kwargs)
 
 
-def boot(work, image, name, firmware, command, memory=768):
+def boot(work, image, name, firmware, command, memory=768, timeout=180):
     log = work / (name + '.log')
     args = ['qemu-system-x86_64', '-accel', 'tcg', '-cpu', 'max', '-m', str(memory),
             '-device', 'qemu-xhci,id=usb',
@@ -32,14 +32,21 @@ def boot(work, image, name, firmware, command, memory=768):
     errors = stderr.open('w')
     process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=errors)
     try:
-        deadline = time.monotonic() + 45
+        # Showcase boots load the USB module and start Wine cold under TCG.
+        # Shared CI CPUs can take longer than 45 seconds without a guest hang.
+        started = time.monotonic()
+        deadline = started + timeout
         while time.monotonic() < deadline:
             text = log.read_text(errors='replace') if log.exists() else ''
             if '[mem] exit tid=1 code=' in text or 'PANIC' in text or process.poll() is not None:
                 break
             time.sleep(.1)
+        elapsed = time.monotonic() - started
+        text = log.read_text(errors='replace') if log.exists() else ''
         assert '[mem] exit tid=1 code=0' in text and 'PANIC' not in text, (
-            text[-8000:] + '\nQEMU stderr:\n' + stderr.read_text(errors='replace'))
+            f'{name}: elapsed={elapsed:.1f}s limit={timeout}s QEMU status={process.poll()}\n'
+            + text[-8000:] + '\nQEMU stderr:\n' + stderr.read_text(errors='replace'))
+        print(f'{name}: completed in {elapsed:.1f}s', flush=True)
         return text
     finally:
         if process.poll() is None:
@@ -105,6 +112,7 @@ def main():
                         '/bin/busybox sh -c "test -s /RETROOS/COMMAND.COM && /WINDOWS/APPS/HELLO.EXE"')
             assert text.count('Optional module:') == 1 and '/showcase/ (' in text, text
             assert 'Locale: it-IT' in text, text
+            assert 'Hello from Open Watcom Win32' in text, text
             print('PASS: USB', firmware, 'defaults to one showcase image with games and commanders', flush=True)
             title = ('RetroOS (protected disk, native BIOS VGA)' if firmware == 'bios'
                      else 'RetroOS (protected disk, GOP framebuffer)')
@@ -113,7 +121,7 @@ def main():
             run('grub-script-check', menu_file)
             run('mcopy', '-o', '-i', str(image) + '@@1048576', menu_file, '::/boot/grub/grub.cfg')
             text = boot(work, image, 'core-' + firmware, firmware,
-                        '/bin/busybox sh -c "test -s /bin/busybox && ! test -e /COMMANDER && ! test -e /GAMES"', memory=128)
+                        '/bin/busybox sh -c "test -s /bin/busybox && ! test -e /COMMANDER && ! test -e /GAMES"', memory=128, timeout=45)
             assert 'Optional module:' not in text, text
             print('PASS: USB', firmware, 'core-only choice omits the showcase', flush=True)
 
