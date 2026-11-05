@@ -91,7 +91,11 @@ static void trace(int on) {
  *     follows DPMI 0.9 more strictly.
  *
  * RETROOS.INI [launch] format: BASENAME=keyword [keyword...]. Keywords:
- *   loadfix (default if none), dos32a, iopl3, repair, xms32k, cpu5..cpu100 (steps of 5).
+ *   loadfix (default if none), dos32a, iopl3, repair, xms32k, ivt0,
+ *   cpu5..cpu100 (steps of 5).
+ *   ivt0: give INT 0 a callable alias whose offset is outside the screen.
+ *     Stargunner reads a deleted object's NULL pointer as IVT coordinates;
+ *     this makes its 16-bit clipper reject the resulting particle.
  *
  * COMMAND.COM reads the config; kernel policies travel in synth syscall CX.
  * CL selects virtual IOPL, CH bit 0 caps classic XMS reports at 32767 KiB.
@@ -103,6 +107,9 @@ static void trace(int on) {
 #define LF_F_IOPL3   0x04
 #define LF_F_REPAIR  0x08
 #define LF_F_XMS32K  0x10
+#define LF_F_IVT0    0x20
+
+static int ivt0_active = 0;
 
 /* Last component of a DOS path: skip past any '\\', '/', or ':'. */
 static const char *basename_of(const char *path) {
@@ -124,6 +131,7 @@ static unsigned int parse_flag(const char *tok) {
     if (stricmp(tok, "iopl3")   == 0) return LF_F_IOPL3;
     if (stricmp(tok, "repair")  == 0) return LF_F_REPAIR;
     if (stricmp(tok, "xms32k")  == 0) return LF_F_XMS32K;
+    if (stricmp(tok, "ivt0")    == 0) return LF_F_IVT0;
     if (strnicmp(tok, "cpu", 3) == 0 && tok[3]) {
         unsigned int n = 0;
         const char *p = tok + 3;
@@ -441,6 +449,49 @@ static int dos_exec_inplace(const char *name, const char *args) {
     return (int)(get_child_exit_status() & 0xFF);
 }
 
+/* Keep INT 0 callable, but choose an offset that NULL-reading graphics code
+ * clips offscreen. A far JMP leaves the exception's stack and registers intact.
+ * The shell remains resident during in-process EXEC, so its trampoline lives
+ * until we restore the original vector, including after a failed EXEC. */
+static unsigned long install_ivt0(void) {
+    static unsigned char stub[5];
+    void far *address = stub;
+    unsigned off, seg;
+    unsigned long previous;
+    r.x.ax = 0x3500;
+    int86x(0x21, &r, &r, &s);
+    off = r.x.bx;
+    seg = s.es;
+    previous = ((unsigned long)seg << 16) | off;
+    stub[0] = 0xEA;
+    memcpy(stub + 1, &off, 2);
+    memcpy(stub + 3, &seg, 2);
+    /* Equivalent far pointer with offset 2000h..200Fh or 2200h..220Fh.
+     * COMMAND.COM's code/data already extend beyond physical 2000h. */
+    off = FP_OFF(address);
+    seg = FP_SEG(address) + (off >> 4);
+    assert(seg >= 0x0200);
+    s.ds = seg - 0x0200;
+    r.x.dx = 0x2000 | (off & 15);
+    /* Stargunner shifts its bogus coordinate left and right by ten. Clear
+     * bit 21 of the encoded pointer so that conversion stays positive;
+     * otherwise a positive low word could also fool its left-edge clip. */
+    if (s.ds & 0x0020) {
+        s.ds -= 0x0020;
+        r.x.dx += 0x0200;
+    }
+    r.x.ax = 0x2500;
+    int86x(0x21, &r, &r, &s);
+    return previous;
+}
+
+static void restore_ivt0(unsigned long previous) {
+    r.x.ax = 0x2500;
+    r.x.dx = (unsigned)previous;
+    s.ds = (unsigned)(previous >> 16);
+    int86x(0x21, &r, &r, &s);
+}
+
 /* Resize our own memory block to `paras` paragraphs (INT 21h AH=4Ah).
  *
  * The startup shrinks us to roughly _heaplen+_stklen so a batch line EXEC'd
@@ -650,7 +701,13 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
     policy = (flags & LF_F_IOPL3) ? 3 : (flags & LF_F_REPAIR) ? 2 : 1;
     policy |= flags & 0xFC00; /* CPU duty / 5 in CX bits 10..15. */
     if (flags & LF_F_XMS32K) policy |= 0x0100; /* CH bit 0: signed XMS report */
-    if (flags & LF_F_DOS32A) {
+    if ((flags & LF_F_IVT0) && !in_session) {
+        /* The child owns its IVT. Keep this shell's vector unchanged, and
+         * install the alias in a resident shell around in-process EXEC. */
+        prog_idx -= 2;
+        argv[prog_idx] = command_com_path;
+        argv[prog_idx + 1] = "/V";
+    } else if (flags & LF_F_DOS32A) {
         /* Spawn DOS/32A.EXE with prog + args as its tail. DOS/32A loads
          * the target itself and provides a stricter DPMI 0.9 environment
          * than DOS/4GW's embedded one.
@@ -698,7 +755,7 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
      * DOS/32A prefixing above still applies — that is just a different
      * program to exec, and it works in-process unchanged.
      */
-    if (replace_self && !in_session && !(flags & LF_F_LOADFIX)) {
+    if (replace_self && !in_session && !(flags & (LF_F_LOADFIX | LF_F_IVT0))) {
         char tail[128];
         join_args(tail, sizeof(tail), argv, prog_idx + 1, argc);
         /* CH bit 1 selects the existing in-place Exec action. Success does
@@ -711,10 +768,15 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
     if (in_session) {
         char tail[128];
         int rc;
+        unsigned long previous = 0;
+        int scoped_ivt0 = (flags & LF_F_IVT0) && !ivt0_active;
         int start = (flags & LF_F_LOADFIX) ? prog_idx + 2 : prog_idx;
+        if (flags & LF_F_DOS32A) start = prog_idx;
         join_args(tail, sizeof(tail), argv, start + 1, argc);
         synth_set_policy(policy);
+        if (scoped_ivt0) previous = install_ivt0();
         rc = dos_exec_inplace(argv[start], tail);
+        if (scoped_ivt0) restore_ivt0(previous);
         synth_set_policy(1);      /* back to the shell's own spec-strict mode */
         refresh_bda_clock();
         return rc;
@@ -1348,8 +1410,8 @@ int main(int argc, char *argv[]) {
      * inject trampoline prefixes in place without an extra buffer. */
     if (argc < 2 || (!is_flag(argv[1], 'L') && !is_flag(argv[1], 'C')
                      && !is_flag(argv[1], 'E')
-                     && !is_flag(argv[1], 'B'))) {
-        printf("Usage: COMMAND.COM /C cmdline   (/E replace, /L LOADFIX, /B batch)\r\n");
+                     && !is_flag(argv[1], 'B') && !is_flag(argv[1], 'V'))) {
+        printf("Usage: COMMAND.COM /C cmdline   (/E replace, /L LOADFIX, /B batch, /V IVT0)\r\n");
         return 1;
     }
 
@@ -1373,6 +1435,22 @@ int main(int argc, char *argv[]) {
         }
         synth_tsr_session(1);
         return run_bat_file(argv[2]);
+    }
+
+    if (is_flag(argv[1], 'V')) {
+        unsigned long previous;
+        int rc;
+        if (argc < 3) {
+            printf("/V requires program name\r\n");
+            return 1;
+        }
+        if (lookup_flags(argv[2]) & LF_F_LOADFIX) set_block_size(0x1000);
+        previous = install_ivt0();
+        ivt0_active = 1;
+        in_session = 1;
+        rc = run_command(argv, 2, argc, 0);
+        restore_ivt0(previous);
+        return rc;
     }
 
     /* /L progname [args] -- LOADFIX trampoline entry. The interactive

@@ -123,7 +123,7 @@ impl Config {
                         return Err("launch entry too long");
                     }
                     if value.split_ascii_whitespace().any(|flag|
-                        !["loadfix", "dos32a", "repair", "iopl3", "xms32k"]
+                        !["loadfix", "dos32a", "repair", "iopl3", "xms32k", "ivt0"]
                             .iter().any(|known| flag.eq_ignore_ascii_case(known))
                         && !(flag.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("cpu"))
                             && flag[3..].bytes().all(|b| b.is_ascii_digit())
@@ -325,12 +325,13 @@ mod tests {
     #[test]
     fn launch_overrides_are_preserved_separately_from_environment() {
         let c = Config::parse(
-            b"[environment]\nHOME=C:\\MC\n[launch]\nDOOM.EXE=repair\nALADDIN.EXE=xms32k\nCHESS.EXE=\n[locale]\nlanguage=en-US\n",
+            b"[environment]\nHOME=C:\\MC\n[launch]\nDOOM.EXE=repair\nALADDIN.EXE=xms32k\nSTARGUN.EXE=ivt0\nCHESS.EXE=\n[locale]\nlanguage=en-US\n",
         ).unwrap();
         assert_eq!(c.environment, b"HOME=C:\\MC\0LOCALE=en-US\0\0");
         assert_eq!(c.launch, alloc::vec![
             ("DOOM.EXE".to_string(), "repair".to_string()),
             ("ALADDIN.EXE".to_string(), "xms32k".to_string()),
+            ("STARGUN.EXE".to_string(), "ivt0".to_string()),
             ("CHESS.EXE".to_string(), "".to_string()),
         ]);
         assert!(Config::parse(b"[launch]\nDOOM.EXE=typo\n").is_err());

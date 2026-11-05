@@ -180,6 +180,15 @@ integration_test(
 )
 
 integration_test(
+    name = "dos_ivt0",
+    command = ["python3", "test/dos_ivt0.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//test/dos/ivt0:ivt0_com", "//tools/command:command_com"],
+    host = ["//kernel:retroos-host"],
+    tags = ["dos"],
+)
+
+integration_test(
     name = "dos_handle_lifetime",
     command = ["python3", "test/dos_handle_lifetime.py", "--engine", "interp"],
     sources = ["//:integration_sources"],
