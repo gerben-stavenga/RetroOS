@@ -262,6 +262,13 @@ ISO images use `source=file:/path/game.iso`, `format=iso9660`, `path=/cdrom`,
 normally G:, without merging physical game directories. Explicit mount paths
 and drive assignments win over the optional module defaults.
 
+The CD image catalogue supports cooked ISO files and single-file BINARY
+CUE/BIN images with `MODE1/2048`, `MODE1/2352`, or `MODE2/2352` data tracks.
+`MODE2/2352` exposes the 2048-byte XA Form 1 payload for ISO filesystem reads.
+Raw images may also contain AUDIO tracks; CD music playback and XA Form 2
+streaming are not implemented. Multi-file CUE sheets and tracks with differing
+stored sector sizes in one BIN are not supported.
+
 F12 **Disk → Mnt** stages physical partition mappings. On a partition row,
 left/right changes its drive; on its access row it selects ro/rw/ram. Choose an
 export destination and **Export BOOT.INI** to save the proposed configuration.

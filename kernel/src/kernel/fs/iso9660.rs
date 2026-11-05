@@ -19,6 +19,8 @@ use crate::kernel::vfs::{self, DirEntry, Filesystem, Vnode};
 const COOKED_SECTOR: u64 = 2048;
 const RAW_SECTOR: u64 = 2352;
 const MODE1_PAYLOAD_OFFSET: u64 = 16;
+// Mode 2 XA adds an eight-byte subheader before its Form 1 ISO payload.
+const MODE2_PAYLOAD_OFFSET: u64 = 24;
 
 /// A byte-addressable image source.  Device and hosted implementations can
 /// satisfy this without copying an entire CD image into RAM.
@@ -68,13 +70,14 @@ pub enum TrackMode {
     Audio,
     Mode1_2048,
     Mode1_2352,
+    Mode2_2352,
 }
 
 impl TrackMode {
     fn stored_sector_size(self) -> u64 {
         match self {
             Self::Mode1_2048 => COOKED_SECTOR,
-            Self::Audio | Self::Mode1_2352 => RAW_SECTOR,
+            Self::Audio | Self::Mode1_2352 | Self::Mode2_2352 => RAW_SECTOR,
         }
     }
 
@@ -101,7 +104,8 @@ pub struct CueSheet {
 
 impl CueSheet {
     /// Parse the useful subset of CDRWIN CUE syntax.  Metadata commands are
-    /// ignored; one `FILE ... BINARY` and AUDIO/MODE1 tracks are supported.
+    /// ignored; one `FILE ... BINARY` and AUDIO, MODE1/2048, MODE1/2352,
+    /// or MODE2/2352 tracks are supported.
     pub fn parse(bytes: &[u8]) -> Result<Self, MediaError> {
         let text = core::str::from_utf8(bytes).map_err(|_| MediaError::InvalidCue)?;
         let mut bin_file = None;
@@ -134,6 +138,7 @@ impl CueSheet {
                     Some(word) if word.eq_ignore_ascii_case("AUDIO") => TrackMode::Audio,
                     Some(word) if word.eq_ignore_ascii_case("MODE1/2048") => TrackMode::Mode1_2048,
                     Some(word) if word.eq_ignore_ascii_case("MODE1/2352") => TrackMode::Mode1_2352,
+                    Some(word) if word.eq_ignore_ascii_case("MODE2/2352") => TrackMode::Mode2_2352,
                     _ => return Err(MediaError::UnsupportedCue),
                 };
                 tracks.push(PartialTrack {
@@ -285,7 +290,7 @@ impl DataTrackReader {
 
         // A single BIN whose tracks use different stored sector sizes needs a
         // per-span byte map.  Reject that uncommon layout explicitly; mixed
-        // mode AUDIO + MODE1/2352 (the usual raw BIN) is fully supported.
+        // mode AUDIO + MODE1/2352 or MODE2/2352 uses uniform raw sectors.
         if cue
             .tracks
             .iter()
@@ -322,10 +327,10 @@ impl DataTrackReader {
             file_offset,
             sectors,
             stored_sector,
-            payload_offset: if track.mode == TrackMode::Mode1_2352 {
-                MODE1_PAYLOAD_OFFSET
-            } else {
-                0
+            payload_offset: match track.mode {
+                TrackMode::Mode1_2352 => MODE1_PAYLOAD_OFFSET,
+                TrackMode::Mode2_2352 => MODE2_PAYLOAD_OFFSET,
+                _ => 0,
             },
             position: 0,
         })
@@ -684,6 +689,39 @@ mod tests {
     }
 
     #[test]
+    fn raw_mode2_skips_subheaders_and_stops_before_audio_pregap() {
+        let cue = br#"FILE "disc.bin" BINARY
+TRACK 01 AUDIO
+INDEX 01 00:00:00
+TRACK 02 mode2/2352
+INDEX 00 00:00:01
+INDEX 01 00:00:02
+TRACK 03 AUDIO
+INDEX 00 00:00:04
+INDEX 01 00:00:05
+"#;
+        let sheet = CueSheet::parse(cue).unwrap();
+        assert_eq!(sheet.tracks[1].mode, TrackMode::Mode2_2352);
+        let mut bin = vec![0xee; RAW_SECTOR as usize * 6];
+        for (frame, value) in [(2, 0x11), (3, 0x22)] {
+            let sector = &mut bin[frame * 2352..(frame + 1) * 2352];
+            sector[15] = 2;
+            sector[16..24].copy_from_slice(&[1, 2, 8, 0, 1, 2, 8, 0]);
+            sector[24..24 + 2048].fill(value);
+        }
+        let mut reader = DataTrackReader::open(Box::new(Bytes(bin)), DiscFormat::Cue(cue)).unwrap();
+        assert_eq!(reader.len(), 4096);
+        let mut crossing = [0; 4];
+        reader.seek(SeekFrom::Start(2046)).unwrap();
+        assert_eq!(reader.read(&mut crossing).unwrap(), 4);
+        assert_eq!(crossing, [0x11, 0x11, 0x22, 0x22]);
+        reader.seek(SeekFrom::End(-2)).unwrap();
+        assert_eq!(reader.read(&mut crossing).unwrap(), 2);
+        assert_eq!(&crossing[..2], &[0x22, 0x22]);
+        assert_eq!(reader.read(&mut crossing).unwrap(), 0);
+    }
+
+    #[test]
     fn audio_only_cue_has_no_iso_track() {
         let cue = b"FILE \"music.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n";
         let error = DataTrackReader::open(
@@ -813,6 +851,29 @@ mod tests {
         );
         assert_eq!(entries.len(), 1);
         assert_eq!(&entries[0].name[..entries[0].name_len], b"HELLO.TXT");
+        Filesystem::clunk(&filesystem, vnode.handle);
+    }
+
+    #[test]
+    fn mode2_xa_image_serves_the_vfs() {
+        let iso = minimal_iso();
+        let mut bin = vec![0; iso.len() / 2048 * 2352];
+        for (payload, sector) in iso.chunks_exact(2048).zip(bin.chunks_exact_mut(2352)) {
+            sector[1..11].fill(0xff);
+            sector[15] = 2;
+            sector[16..24].copy_from_slice(&[1, 0, 8, 0, 1, 0, 8, 0]);
+            sector[24..24 + 2048].copy_from_slice(payload);
+        }
+        let cue = b"FILE \"disc.bin\" BINARY\nTRACK 01 MODE2/2352\nINDEX 01 00:00:00\n";
+        let filesystem = Iso9660Fs::open(Box::new(Bytes(bin)), DiscFormat::Cue(cue)).unwrap();
+        let vnode = Filesystem::open(&filesystem, b"hello.txt").unwrap();
+        let mut contents = [0; 5];
+        assert_eq!(Filesystem::read(&filesystem, vnode.handle, 0, &mut contents, vnode.size), 5);
+        assert_eq!(&contents, b"hello");
+        let mut entries = Vec::new();
+        Filesystem::readdir(&filesystem, b"", 0, &mut entries, 8);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, b"HELLO.TXT");
         Filesystem::clunk(&filesystem, vnode.handle);
     }
 }
