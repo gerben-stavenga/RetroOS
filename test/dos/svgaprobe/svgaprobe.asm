@@ -246,6 +246,8 @@ newline:      db 13, 10, '$'
 align 4
 ; mode, width, height, bpp, memory model
 modes:
+        dw 0x0141, 320, 200
+        db 8, 4
         dw 0x101, 640, 480
         db 8, 4
         dw 0x103, 800, 600

@@ -12,6 +12,7 @@ use crate::kernel::dos::{dos, dpmi, machine, seg_offset, DosState};
 /// path only — the native/SeaBIOS path has the card's own VBE.
 const VBE_MODES: &[(u16, u16, u16, u8)] = &[
     (0x140, 320, 240, 8), // OEM mode number; clients discover it through 4F00h.
+    (0x141, 320, 200, 8), // Packed 8-bit mode, available banked and linear.
     (0x101, 640, 480, 8),
     (0x103, 800, 600, 8),
     (0x110, 640, 480, 15),
