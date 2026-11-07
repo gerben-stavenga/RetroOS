@@ -19,14 +19,16 @@ def session(work, disk, name, cpu, machine, accel):
     log = work / (name + '.log')
     process = subprocess.Popen([
         'qemu-system-x86_64', '-accel', accel, '-cpu', cpu, '-machine', machine,
+        '-icount', 'shift=0,sleep=off',
         '-m', '512', '-display', 'none', '-serial', 'none', '-no-reboot',
         '-drive', f'file={boot},format=raw,snapshot=on',
         '-drive', f'file={disk},format=raw,snapshot=on',
         '-debugcon', f'file:{log}'],
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
-        # Each mode touches and verifies 300 MiB twice under TCG. Shared
-        # CI runners can spend nearly 90 seconds on a successful variant.
+        # Clock TCG by executed instructions so host load does not create
+        # extra timer/display work between page faults. The same 300 MiB is
+        # touched, verified and released twice; retain a wall-clock watchdog.
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
             text = log.read_text(errors='replace') if log.exists() else ''

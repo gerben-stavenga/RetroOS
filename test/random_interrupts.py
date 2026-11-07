@@ -65,7 +65,7 @@ def session(work, uefi=False):
                 assert 'Clock: PIT channel 2' in text, text[-5000:]
                 assert 'IRQ: PIT' in text, text[-5000:]
             else:
-                assert 'IRQ: LAPIC timer tick' in text, text[-5000:]
+                assert 'IRQ: LAPIC alarm (' in text, text[-5000:]
             # Timer traffic by itself must never seed the generator.
             time.sleep(.5)
             assert SEEDED not in log.read_text(errors='replace')
