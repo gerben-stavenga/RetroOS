@@ -65,11 +65,11 @@ impl EmulatedVga {
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         native: &mut crate::kernel::platform::NativeVga,
     ) -> Self {
-        let current = bios.vbe_state().copied();
+        let current = bios.vbe_state().cloned();
         if let Some(active) = current {
             let mode = active.mode;
             let pages = capture_native_vbe(
-                machine, bios, native.cap_mut(), mode, active.svga);
+                machine, bios, native.cap_mut(), mode, active.svga.clone());
             let mut emulated = Self {
                 state: VgaState::Vbe(alloc::boxed::Box::new(active.svga)),
                 svga_pages: pages,
@@ -127,10 +127,10 @@ impl EmulatedVga {
         machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
         match &mut self.state {
             VgaState::Vbe(svga) => {
-                let svga = **svga;
+                let svga = (**svga).clone();
                 native.bios_set_mode_request(machine, &mut *bios, svga.mode_value());
                 if let Some(mode) = bios.vbe_state().map(|state| state.mode) {
-                    restore_native_vbe(machine, bios, &mut native, mode, svga);
+                    restore_native_vbe(machine, bios, &mut native, mode, svga.clone());
                 }
                 discard_emulated_svga(machine, &mut self);
                 if let Some(mode) = bios.vbe_state().map(|state| state.mode) {
@@ -444,7 +444,6 @@ pub fn is_standard_text(device: &DosVideo) -> bool {
 /// and fill it from suspended state, or mark it trapped when writes must
 /// go through the planar ALU. Needs an address space, so it is not the card's.
 fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine: &mut A) {
-    let _live_access = live_access();
     rebind_scanout();
     match &mut dev.state {
         VgaState::Legacy(state) => {
@@ -527,7 +526,6 @@ fn initialize_live_vram<A: crate::Arch>(
     machine: &mut A,
     required_pages: usize,
 ) -> core::ptr::NonNull<u8> {
-    let _live_access = live_access();
     use core::sync::atomic::Ordering;
     let pages = LIVE_VRAM_PAGES.load(Ordering::Relaxed);
     if pages >= required_pages
@@ -546,93 +544,12 @@ fn initialize_live_vram<A: crate::Arch>(
     base
 }
 
-static REGISTER_REVISION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 static MEMORY_EPOCH: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 pub(crate) fn scanout_epoch() -> u32 {
     MEMORY_EPOCH.load(core::sync::atomic::Ordering::Relaxed)
 }
-pub(crate) fn scanout_revision() -> u32 {
-    REGISTER_REVISION.load(core::sync::atomic::Ordering::Relaxed)
-}
-pub(crate) fn scanout_changed() {
-    REGISTER_REVISION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
 fn rebind_scanout() {
-    scanout_changed();
     MEMORY_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
-
-// Only the linear VBE fallback uses this gate. Audio DMA uses permanent
-// channel buffers; legacy VGA reads atomic device memory directly.
-use crate::kernel::media::GUEST_MEMORY;
-#[thread_local]
-static mut LIVE_ACCESS_DEPTH: usize = 0;
-pub(crate) struct LiveAccess {
-    _local: core::marker::PhantomData<*mut ()>,
-}
-pub(crate) fn live_access() -> LiveAccess {
-    unsafe {
-        if LIVE_ACCESS_DEPTH == 0 { GUEST_MEMORY.enter(); }
-        LIVE_ACCESS_DEPTH += 1;
-    }
-    LiveAccess { _local: core::marker::PhantomData }
-}
-impl Drop for LiveAccess {
-    fn drop(&mut self) {
-        unsafe {
-            LIVE_ACCESS_DEPTH -= 1;
-            if LIVE_ACCESS_DEPTH == 0 { GUEST_MEMORY.leave(); }
-        }
-    }
-}
-type LiveRead = crate::kernel::media::GuestMemoryRead<'static>;
-
-/// A range of the permanent device store. It owns no guest-address-space
-/// pointer, and cannot outlive its backing: LiveVram pages are never freed.
-#[derive(Clone, Copy)]
-pub(crate) struct LiveRegion { address: usize, len: usize, epoch: u32 }
-impl LiveRegion {
-    #[cfg(test)]
-    pub(crate) unsafe fn for_test(bytes: &[u8]) -> Self {
-        Self { address: bytes.as_ptr() as usize, len: bytes.len(),
-            epoch: MEMORY_EPOCH.load(core::sync::atomic::Ordering::Relaxed) }
-    }
-
-    pub(crate) fn from_slice(bytes: &[u8]) -> Option<Self> {
-        let epoch = MEMORY_EPOCH.load(core::sync::atomic::Ordering::Relaxed);
-        if bytes.is_empty() { return Some(Self { address: 0, len: 0, epoch }); }
-        let base = LIVE_VRAM.load(core::sync::atomic::Ordering::Relaxed) as usize;
-        let len = LIVE_VRAM_PAGES.load(core::sync::atomic::Ordering::Relaxed) * crate::PAGE_SIZE;
-        let address = bytes.as_ptr() as usize;
-        (base != 0 && address >= base && address.checked_add(bytes.len())? <= base.checked_add(len)?)
-            .then_some(Self { address, len: bytes.len(), epoch })
-    }
-    /// Caller holds the guest-memory gate. No shared or exclusive slice aliases VRAM.
-    fn sample(self, destination: &mut [u8]) {
-        assert_eq!(destination.len(), self.len);
-        if self.len != 0 {
-            unsafe { core::ptr::copy_nonoverlapping(self.address as *const u8,
-                destination.as_mut_ptr(), self.len); }
-        }
-    }
-}
-pub(crate) fn try_live_access() -> Option<LiveRead> { GUEST_MEMORY.try_read() }
-pub(crate) fn sample_live(vram: LiveRegion, destination: &mut [u8],
-    planes: LiveRegion, plane_destination: &mut [u8], revision: u32) -> bool {
-    let inline = !crate::kernel::media::enabled() && unsafe { LIVE_ACCESS_DEPTH != 0 };
-    let _guard = if inline { None } else {
-        let Some(guard) = try_live_access() else { return false };
-        Some(guard)
-    };
-    let epoch = MEMORY_EPOCH.load(core::sync::atomic::Ordering::Relaxed);
-    if vram.epoch != epoch || planes.epoch != epoch { return false; }
-    // The producer publishes registers separately from this VRAM copy. A
-    // guest scroll/page-flip since that publication invalidates the pair.
-    // Check while holding the guest gate, so no port write can race the copy.
-    if revision != scanout_revision() { return false; }
-    vram.sample(destination);
-    planes.sample(plane_destination);
-    true
 }
 
 fn live_vram_ptr() -> *mut u8 {
@@ -684,7 +601,6 @@ pub(crate) fn live_memory() -> ::vga::memory::Memory<'static> {
 fn live_vram_mut<A>(_machine: &mut A) -> ::vga::memory::Memory<'static> { live_memory() }
 
 fn write_live_planes<A: crate::Arch>(machine: &mut A, planes: &[u8]) {
-    let _live_access = live_access();
     assert_eq!(planes.len(), PLANES_LEN);
     live_planes_mut(machine).copy_from(planes);
 }
@@ -752,7 +668,6 @@ pub fn port_write<A: crate::Arch>(
     port: u16,
     value: u8,
 ) {
-    let _live_access = live_access();
     let write = state.port_write(port, value);
     if let Some(transition) = write.vram_transition {
         rebind_scanout();
@@ -772,7 +687,6 @@ pub fn bios_load_font<A: crate::Arch>(
     font: &[u8],
     glyph_h: usize,
 ) {
-    let _live_access = live_access();
     let Some(dev) = device.emulated_mut() else { return };
     let Some(vga) = dev.state.legacy_mut() else { return };
     live_planes_mut(machine).load_font(
@@ -924,7 +838,7 @@ fn restore_native_vbe<A: crate::Arch>(
     mode: crate::kernel::platform::VbeMode,
     svga: ::vga::SvgaState,
 ) {
-    let (display_start, logical_pitch) = (svga.display_start, svga.logical_pitch);
+    let (display_start, logical_pitch) = (svga.start(), svga.logical_pitch.get());
     let banked = matches!(svga.access, ::vga::SvgaAccess::Banked { .. });
     let native_pitch = if banked { mode.banked_pitch } else { mode.linear_pitch };
     if logical_pitch != native_pitch {
@@ -1097,7 +1011,6 @@ pub fn svga_set_curated_mode<A: crate::Arch>(
     mode: crate::kernel::platform::VbeMode,
     request: u16,
 ) {
-    let _live_access = live_access();
     rebind_scanout();
     let Some(dev) = pc.vga.emulated_mut() else { return };
     svga_leave(machine, dev);
@@ -1186,7 +1099,6 @@ pub fn set_emulated_mode<A: crate::Arch>(
     mode: u8,
     clear: bool,
 ) {
-    let _live_access = live_access();
     rebind_scanout();
     svga_leave(machine, dev);
     let Some(vga) = dev.state.legacy_mut() else { return };
@@ -1284,7 +1196,6 @@ pub fn set_emulated_mode<A: crate::Arch>(
 /// write mode 1 (Mode X latched copy), write modes 2/3, or a multi-plane EGA
 /// write. Latches must have been loaded by a prior `vram_read`.
 pub fn vram_write<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaState, off: u32, byte: u8) {
-    let _live_access = live_access();
     if let Some(base) = live_vram_ptr_if_initialized() {
         let planes = unsafe { ::vga::memory::Memory::mapped(base.as_ptr(), PLANES_LEN) };
         vram_write_live(planes, vga, off, byte);
@@ -1348,7 +1259,6 @@ pub(in crate::kernel::dos) fn vram_write_live(planes: ::vga::memory::Memory<'_>,
 /// still honour map mask/write-mode/latches, while the emulated path has the aperture
 /// unmapped so raw `machine.copy_to` would fault in the kernel.
 pub fn copy_to_guest<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut DosVideo, addr: usize, src: &[u8]) {
-    let _live_access = live_access();
     let Some(vga) = vga.emulated_mut() else {
         machine.copy_to(addr, src);
         return;
@@ -1446,7 +1356,6 @@ fn read_guest_byte<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVid
 /// BIOS text reads must use the VGA CPU view too: a program can leave the
 /// text aperture trapped by changing GC registers without updating the BDA.
 pub(in crate::kernel::dos) fn read_video_word<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVideo, addr: usize) -> u16 {
-    let _live_access = live_access();
     u16::from_le_bytes([
         read_guest_byte(machine, device, addr),
         read_guest_byte(machine, device, addr + 1),

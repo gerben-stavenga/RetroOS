@@ -235,6 +235,14 @@ pub struct WindowsProcess<A: crate::Arch> {
     dos: Option<alloc::boxed::Box<crate::kernel::dos::DosState<A>>>,
 }
 impl<A: crate::Arch> WindowsProcess<A> {
+    pub(crate) fn next_deadline(&self, now: u64) -> Option<u64> {
+        [threads::next_deadline(&self.state.threads).filter(|&end| end > now),
+            user_queue::next_deadline(&self.state.user_queues, now),
+            self.dos.as_ref().map(|dos| dos.pc.vpit.irq_deadline_ns()).filter(|&end| end > now && end != u64::MAX)]
+            .into_iter().flatten().min()
+    }
+    pub(crate) fn needs_io_poll(&self) -> bool { threads::needs_io_poll(&self.state.threads) }
+
     pub fn on_resume(&mut self, machine: &mut A) {
         self.state.on_resume(machine);
         if let Some(dos) = &mut self.dos {

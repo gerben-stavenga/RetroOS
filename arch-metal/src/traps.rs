@@ -127,6 +127,9 @@ pub mod arch_call {
     pub const REMAP_PHYSICAL_APERTURE: u64 = 0x121; // EDX/ECX=physical base low/high
     pub const RELEASE_HEAP: u64 = 0x122; // EDX=heap address, ECX=byte length
     pub const MAP_SHARED_PAGES: u64 = 0x123; // EDX=guest vpage, ECX=kernel address, EBX=count
+    pub const ARM_ALARM: u64 = 0x125; // EDX=pointer to Option<u64> absolute deadline
+    pub const IDLE: u64 = 0x126; // atomically check pending events and wait
+    pub const POLL_TIMED_DEVICES: u64 = 0x127; // EDX=pointer to now/next deadline
     pub const REPLACE_INTERRUPT_HANDLERS: u64 = 0x124; // EDX=in/out handler pair, ECX=vector
 }
 
@@ -224,7 +227,13 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
 #[inline(never)]
 fn arch_dispatch(regs: &mut Regs) {
     match regs.rax {
-        arch_call::EXECUTE => swap_regs(regs),
+        arch_call::EXECUTE => {
+            if super::irq::wake_pending() {
+                let (event, extra) = arch_abi::KernelEvent::Irq.encode();
+                regs.rax = u64::from(event);
+                regs.rdx = u64::from(extra);
+            } else { swap_regs(regs); }
+        },
         arch_call::SWITCH_TO => arch_switch_to(regs),
         arch_call::SWITCH_FX => {
             let fx = regs.rdx as u32 as *mut crate::x86::FxState;
@@ -310,6 +319,15 @@ fn arch_dispatch(regs: &mut Regs) {
         }
         // HALT: the ring-1 kernel cannot `hlt` (CPL-0-only, #GPs); panic and
         // shutdown funnel here to die quietly at ring 0.
+        arch_call::ARM_ALARM => {
+            let deadline = unsafe { *(regs.rdx as *const Option<u64>) };
+            super::irq::arm_alarm(deadline);
+        }
+        arch_call::IDLE => super::irq::idle(),
+        arch_call::POLL_TIMED_DEVICES => {
+            let value = unsafe { &mut *(regs.rdx as *mut Option<u64>) };
+            *value = super::irq::poll_timed_devices(value.unwrap());
+        }
         arch_call::HALT => {
             x86::cli();
             loop { x86::hlt(); }

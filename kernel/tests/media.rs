@@ -166,59 +166,10 @@ fn two_core_priority_handoff_and_drop_fences() {
     assert!(service.try_lock().is_none(), "UI status must not wait for the mixer");
     HOLD_AUDIO.store(false, Ordering::Release);
 
-    // A video read deferred by the guest must not strand that guest while
-    // the next worker pass starts an unrelated audio mix.
-    DUE.store(false, Ordering::Release);
-    unsafe { media::graphics(|| ()); }
-    AUDIO_HELD.store(false, Ordering::Release);
-    HOLD_AUDIO.store(true, Ordering::Release);
-    static SAMPLE_REQUESTED: AtomicBool = AtomicBool::new(false);
-    media::GUEST_MEMORY.enter();
-    let pending_video = unsafe { media::VideoService::new((),
-        || !SAMPLE_REQUESTED.load(Ordering::Acquire), |_| {
-            assert!(media::GUEST_MEMORY.try_read().is_none());
-            SAMPLE_REQUESTED.store(true, Ordering::Release);
-            DUE.store(true, Ordering::Release);
-        }) };
-    pending_video.activate();
-    while !AUDIO_HELD.load(Ordering::Acquire) { std::thread::yield_now(); }
-    media::GUEST_MEMORY.leave();
-    let guest_released = std::sync::Arc::new(AtomicBool::new(false));
-    let released = guest_released.clone();
-    let guest = std::thread::spawn(move || {
-        media::GUEST_MEMORY.yield_to_reader();
-        released.store(true, Ordering::Release);
-    });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while !guest_released.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    let released_during_mix = guest_released.load(Ordering::Acquire);
-    HOLD_AUDIO.store(false, Ordering::Release);
-    guest.join().unwrap();
-    drop(pending_video);
-    assert!(released_during_mix, "guest waited for audio after a deferred video sample");
     drop(service);
     let stopped = POLLS.load(Ordering::Acquire);
     for _ in 0..100 { std::thread::yield_now(); }
     assert_eq!(POLLS.load(Ordering::Acquire), stopped);
-    // Audio no longer borrows the guest-memory gate: a held guest slice
-    // must not defer its poll or request a future guest handoff.
-    static READ_DUE: AtomicBool = AtomicBool::new(true);
-    static COPIED: AtomicBool = AtomicBool::new(false);
-    media::GUEST_MEMORY.enter();
-    let reader = unsafe { media::AudioService::new((), || READ_DUE.load(Ordering::Acquire), |_| {
-        COPIED.store(true, Ordering::Release);
-        READ_DUE.store(false, Ordering::Release);
-    }) };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while !COPIED.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    media::GUEST_MEMORY.leave();
-    media::GUEST_MEMORY.yield_to_reader();
-    drop(reader);
-    assert!(COPIED.load(Ordering::Acquire), "audio waited for the guest-memory gate");
     assert_eq!(*drawing.get_mut(), 42);
     assert_eq!(*queued.get_mut(), 91);
 

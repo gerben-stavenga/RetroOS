@@ -316,6 +316,12 @@ impl SoundBlaster {
         }
     }
 
+    pub(super) fn clock_deadline(&self) -> Option<u64> {
+        match &self.device { SbDevice::Emulated(sb) => sb.core.clock_deadline(), _ => None }
+    }
+    pub(super) fn needs_irq_service(&self) -> bool {
+        matches!(&self.device, SbDevice::Emulated(sb) if sb.core.playing())
+    }
     pub fn physical(&self) -> Option<&Sb16> {
         match &self.device {
             SbDevice::Native { pt, .. } => Some(pt.card()),
@@ -698,7 +704,9 @@ impl EmulatedSb {
         vpic: &mut super::vpic::VirtualPic,
         irq: u8,
     ) {
-        if self.probe_steps == 0 && self.core.take_probe(now_ns) && !vpic.is_requested(irq) {
+        let timed = self.core.poll_timed_irq(now_ns);
+        let probe = self.probe_steps == 0 && self.core.take_probe(now_ns);
+        if (timed || probe) && !vpic.is_requested(irq) {
             vpic.raise(irq);
         }
     }

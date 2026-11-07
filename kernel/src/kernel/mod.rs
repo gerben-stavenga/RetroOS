@@ -16,6 +16,7 @@ pub mod exec_ctx;
 #[path = "core_bios.rs"]
 pub mod bios_display;
 pub mod sched;
+pub(crate) mod alarm;
 pub mod serial_control;
 pub mod serial_log;
 pub mod startup;

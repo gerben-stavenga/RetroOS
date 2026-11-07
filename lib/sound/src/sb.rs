@@ -764,12 +764,7 @@ impl Sb {
     /// has no bearing on this DMA cursor. Also ends the hangover hold and
     /// completes single-cycle transfers at their exact source-frame boundary.
     fn advance_clock(&mut self, now: u64, produced: u64) -> bool {
-        let mut raise = false;
-        if self.silence_until_ns != 0 && now >= self.silence_until_ns {
-            self.silence_until_ns = 0;
-            raise = self.irq_status & 0x01 == 0;
-            self.irq_status |= 0x01;
-        }
+        let mut raise = self.poll_timed_irq(now);
         if !self.playing {
             // Hangover: the host keeps the stream fed (silence + synths) while
             // `stream_hold` keeps `owns_sink` true; effect chains re-trigger
@@ -792,6 +787,21 @@ impl Sb {
         }
         if self.playing {
             self.cursor = guest_now;
+        }
+        raise
+    }
+
+    /// The DSP silence command has an absolute completion time and needs no
+    /// PCM producer wakeups while its DAC is idle.
+    pub fn clock_deadline(&self) -> Option<u64> {
+        (self.silence_until_ns != 0).then_some(self.silence_until_ns)
+    }
+    pub fn poll_timed_irq(&mut self, now: u64) -> bool {
+        let mut raise = false;
+        if self.silence_until_ns != 0 && now >= self.silence_until_ns {
+            self.silence_until_ns = 0;
+            raise = self.irq_status & 0x01 == 0;
+            self.irq_status |= 0x01;
         }
         raise
     }
@@ -1446,6 +1456,16 @@ mod tests {
         sb.port_write(dsp, 0x80, start);
         sb.port_write(dsp, 0x10, start);
         sb.port_write(dsp, 0x00, start); // 17 silent samples
+        let deadline = sb.clock_deadline().expect("silence completion alarm");
+        assert!(deadline > start);
+        assert!(!sb.poll_timed_irq(deadline - 1));
+        assert!(sb.poll_timed_irq(deadline));
+        assert_eq!(sb.clock_deadline(), None);
+        sb.port_read(sb.io_base + 0x0E);
+        // Reissue it to also exercise the ordinary mixer clock path.
+        sb.port_write(dsp, 0x80, start);
+        sb.port_write(dsp, 0x10, start);
+        sb.port_write(dsp, 0x00, start);
         assert!(!sb.advance(Step::Clock { now: start + 500_000, produced: 0 }, None).irq);
         assert!(sb.advance(Step::Clock { now: start + 2_000_000, produced: 0 }, None).irq);
         assert_eq!(sb.irq_status & 1, 1);

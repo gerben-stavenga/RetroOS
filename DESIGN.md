@@ -189,6 +189,28 @@ The `kernel` is an event loop:
 `arch` does not own scheduler policy. It only resumes execution and
 reports why execution stopped.
 
+Each event-loop iteration samples one fixed monotonic nanosecond `now`.
+Logical timers belong to the kernel and devices: the loop consumes due work,
+then selects the earliest remaining absolute deadline. New scheduling cannot
+precede that iteration's `now`; work scheduled at `now` stays in the loop.
+Only the exit to guest execution or idle calls `Arch::arm_alarm(deadline)`.
+The alarm IRQ returns execution to the kernel with no logical timer identity
+and is never put in the input/device event queue. If physical time passes the
+deadline during processing or arming, arch wakes promptly.
+Idle checks pending events atomically with waiting, so input cannot be lost
+between the final queue check and sleep.
+
+Metal uses TSC-deadline alarms with a suitable stable TSC, calibrated LAPIC
+one-shots otherwise, and PIT channel 0 one-shots on legacy machines. Bootstrap
+uses one delivery-test alarm, followed only by maintenance alarms if the
+selected clock source wraps. Hosted KVM uses a one-shot POSIX timer and a KVM
+immediate-exit signal; deterministic execution
+budgets retired instructions to the alarm and jumps idle time to its deadline.
+CPU loan budgets, audio production, USB polling, network polling, timed waits,
+UI publication and wrapping-clock maintenance supply their own deadlines.
+There is no unconditional runtime heartbeat. The resident media worker retains
+its independent service loop.
+
 Threads are a kernel concept, not an `arch` concept. From the `arch`
 point of view, there are only:
 
@@ -437,8 +459,10 @@ the right return path (IRET for 32-bit/VM86, far jump + IRETQ for 64-bit).
 
 ## Typed IRQ event queue
 
-Hardware interrupts push typed events (`enum Irq { Tick, Key(u8) }`) into
-a global queue. The queue is drained when returning to the kernel:
+Hardware interrupts push typed events (`Irq::Hw`, `Irq::Key`, `Irq::Msi`,
+and mouse reports) into a CPU-local queue. Timer alarms return directly to
+the kernel and are never queued. The queue is drained when returning to the
+kernel:
 
 - **VM86 threads**: events are reflected through the IVT as real-mode
   interrupts, with per-thread virtual PIC and keyboard
@@ -475,19 +499,27 @@ sufficient to run DJGPP/Watcom/Borland clients (Quake, Hexen, Borland C++).
 
 ## One emulated VGA, presented through a sink
 
-There is exactly one VGA model in the kernel (`kernel/src/vga.rs` and
-`lib/vga_render`). When no real card is present (interp, or a UEFI machine with
-only a framebuffer), `VgaState` is the live register file the guest reads and
-writes; the kernel renders it through `lib::vga_render` at a divided tick
-cadence and hands finished frames to a **present sink**:
+The emulated video device lives in `kernel/src/kernel/dos/machine/vga.rs`;
+its registers, memory interpretation, and scanout live in `lib/vga`. Its
+`VgaState` selects exactly one programming model: legacy VGA or VBE. Each
+variant owns its own register storage. Guest execution writes those registers;
+the presentation core reads the same storage, using atomic register cells and
+atomic accesses to the permanent device VRAM. Forking a process copies device
+state independently; binding scanout retains references to the original device.
 
-- on metal it blits into the GOP framebuffer (`fbcon`);
-- hosted parks the frame in a mailbox for the `retroos-play` window.
+Both variants use the same beam sequencer, row-fetch loop, complete-frame
+buffers, and presentation sink. VBE interprets its own geometry, pitch, page
+address, palette, and line-compare registers in that loop. Input Status #1 uses
+the same device timing as scanout. There is no VBE configuration snapshot,
+periodic register publication, guest-memory handoff, or stale-revision rejection.
+On SMP the media core consumes phases independently of guest execution; on one
+CPU the same consumer runs at kernel entry. Mode/owner changes rebind device
+lifetime and storage, rather than publishing per-frame register copies.
 
-Backends supply only a framebuffer; they never emulate VGA themselves. Planar
-EGA and Mode X are handled uniformly by trapping the unmapped `A0000` window as
-a page fault and decoding the faulting instruction against the VGA's planar
-logic — the same code on both backends, with no arch-specific path.
+Backends supply only a framebuffer or host window; they never emulate VGA.
+Finished images are scaled/composited and passed to the output sink. Planar EGA
+and Mode X trap the unmapped `A0000` window and decode CPU accesses against the
+VGA's planar logic on both backends.
 
 ## Devices: passthrough when present, emulate when absent
 

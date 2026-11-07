@@ -109,6 +109,8 @@ def main():
     text = log.read_text(errors="replace")
     if re.search(r"KERNEL PANIC|panicked|SEGV|Segmentation", text):
         dump(log, "kernel/guest crash")
+    if args.cpus > 1 and "core 1: Video service:" not in text:
+        dump(log, "fullscreen video never activated on the media core")
     if initial_underruns is None:
         raise AssertionError("steady-state measurement never started")
     if text.count("WARNING: sound underrun") - initial_underruns > 2:

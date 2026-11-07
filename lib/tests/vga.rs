@@ -1427,3 +1427,122 @@ fn stalled_scanout_discards_partial_frame_and_recovers() {
     for clock in [630, 660, 690] { scanout.advance(timing.time_at(clock), &mut front, || {}); }
     assert_packed_colour(&front, 0, 4, 0x00ff0000);
 }
+
+
+#[test]
+fn vbe_scanout_fetches_live_registers_and_pixels_without_publication() {
+    use std::sync::atomic::AtomicU8;
+    let mut device = vga::SvgaState::new(0x140, vga::SvgaAccess::Linear, vga::SvgaConfig {
+        width: 8, height: 4, bits_per_pixel: 8, banked_pitch: 8,
+        linear_pitch: 8, framebuffer_bytes: 256, palette_capable: true,
+    });
+    device.palette.write(1, &[0, 0, 63, 0, 0, 63, 0, 0]);
+    let bytes = Box::leak((0..256).map(|_| AtomicU8::new(0)).collect::<Vec<_>>().into_boxed_slice());
+    let memory = vga::memory::Memory::from_bytes(bytes);
+    memory.range(0, 32).fill(1);
+    memory.range(64, 64).fill(2);
+    let mut scanout = vga::scanout::Scanout::new(&device, memory, PixelFormat::NATIVE, 0);
+    let mut front = Vec::new();
+    scanout.reserve(32, &mut front);
+    let mut advance = |start: u64, end: u64| {
+        for us in (start..end).step_by(50) { scanout.advance(us * 1000, &mut front, || {}); }
+        front.clone()
+    };
+    assert_packed_colour(&advance(0, 20_000), 0, 4, 0x00ff0000);
+    device.display_start(Some((0, 8))).unwrap();
+    assert_packed_colour(&advance(20_000, 40_000), 0, 4, 0x0000ff00);
+    device.palette.write(2, &[63, 0, 0, 0]);
+    assert_packed_colour(&advance(40_000, 60_000), 0, 4, 0x000000ff);
+    memory.range(64, 32).fill(1);
+    assert_packed_colour(&advance(60_000, 80_000), 0, 4, 0x00ff0000);
+    // A pitch change and page flip require no consumer rebind either.
+    device.scan_line(Some((16, true))).unwrap();
+    device.display_start(Some((0, 4))).unwrap();
+    for row in 0..4 { memory.range(64 + row * 16, 8).fill(2); }
+    assert_packed_colour(&advance(80_000, 100_000), 0, 4, 0x000000ff);
+    // CRTC Line Compare resets the address generator below row two.
+    for (index, value) in [(0x18, 1), (7, 0), (9, 0)] {
+        device.port_write(0x3d4, index);
+        device.port_write(0x3d5, value);
+    }
+    let image = advance(100_000, 120_000);
+    assert_packed_colour(&image, 0, 2, 0x000000ff);
+    assert_packed_colour(&image, 2, 4, 0x00ff0000);
+}
+
+#[test]
+fn vbe_scanout_reference_and_process_clone_have_distinct_ownership() {
+    let mut original = vga::SvgaState::new(0x140, vga::SvgaAccess::Linear, vga::SvgaConfig {
+        width: 8, height: 4, bits_per_pixel: 8, banked_pitch: 8,
+        linear_pitch: 8, framebuffer_bytes: 256, palette_capable: true,
+    });
+    original.palette.write(7, &[0, 0, 0, 0]);
+    let consumer = original.scanout_view();
+    let child = original.clone();
+    original.display_start(Some((0, 8))).unwrap();
+    original.scan_line(Some((16, true))).unwrap();
+    original.palette.write(7, &[0, 0, 63, 0]);
+    assert_eq!(consumer.start(), (0, 8));
+    assert_eq!(consumer.logical_pitch.get(), 16);
+    assert_eq!(consumer.palette.rgb.get(21), 255);
+    assert_eq!(child.start(), (0, 0));
+    assert_eq!(child.logical_pitch.get(), 8);
+    assert_ne!(child.palette.rgb.get(21), 255);
+    drop(original);
+    assert_eq!(consumer.start(), (0, 8));
+}
+
+
+#[test]
+fn sequential_write_span_matches_vga_alu_for_every_plane_mask_and_wrap() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let state = vga::LegacyVgaState::new();
+    state.seq.set(4, 4);
+    state.gc.set(6, 1);
+    state.gc.set(8, 255);
+    let source: Vec<u8> = (0..257).map(|i| (i as u8).wrapping_mul(37)).collect();
+    for mask in 0..16 {
+        state.seq.set(2, mask);
+        for address in [17, 65530] {
+            let initial: Vec<u8> = (0..4 * 65536).map(|i| (i as u8).wrapping_mul(13)).collect();
+            let storage: Vec<_> = initial.iter().map(|v| AtomicU8::new(*v)).collect();
+            let memory = vga::memory::Memory::from_bytes(&storage);
+            let mut expected = initial;
+            for (i, value) in source.iter().enumerate() {
+                let (off, maps) = state.cpu_write_address(address + i);
+                let cur = core::array::from_fn(|plane| expected[state.layout().index(plane, off)]);
+                let out = vga::planar_write(cur, state.latches, &state.gc.read(), maps, *value);
+                for plane in 0..4 { expected[state.layout().index(plane, off)] = out[plane]; }
+            }
+            let mut reads = 0;
+            assert!(state.write_sequential_span(memory, address, source.len(), |i| {
+                reads += 1;
+                source[i]
+            }));
+            assert_eq!(reads, source.len(), "mask zero must still read the source");
+            assert!(storage.iter().zip(&expected).all(|(actual, expected)| actual.load(Ordering::Relaxed) == *expected),
+                "mask={mask} address={address}");
+        }
+    }
+}
+
+#[test]
+fn sequential_write_span_declines_other_addressing_and_alu_modes_without_accesses() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let state = vga::LegacyVgaState::new();
+    state.seq.set(4, 4);
+    state.gc.set(6, 1);
+    state.gc.set(8, 255);
+    let storage: Vec<_> = (0..4 * 65536).map(|_| AtomicU8::new(0xA5)).collect();
+    let memory = vga::memory::Memory::from_bytes(&storage);
+    for (seq4, gc6, index, value) in [(0, 1, 5, 0), (12, 1, 5, 0), (4, 3, 5, 0),
+        (4, 1, 5, 1), (4, 1, 5, 2), (4, 1, 5, 3), (4, 1, 3, 1),
+        (4, 1, 3, 8), (4, 1, 1, 1), (4, 1, 8, 127)] {
+        state.seq.set(4, seq4);
+        state.gc.set(6, gc6);
+        state.gc.set(1, 0); state.gc.set(3, 0); state.gc.set(5, 0); state.gc.set(8, 255);
+        state.gc.set(index, value);
+        assert!(!state.write_sequential_span(memory, 0, 32, |_| panic!("declined copy read RAM")));
+    }
+    assert!(storage.iter().all(|byte| byte.load(Ordering::Relaxed) == 0xA5));
+}

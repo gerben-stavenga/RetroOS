@@ -358,14 +358,13 @@ impl VbeModeInfo {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct PhysicalVbeState {
     pub mode: crate::kernel::platform::VbeMode,
     pub svga: vga::SvgaState,
 }
 
-#[derive(Clone, Copy, Debug)]
-#[allow(clippy::large_enum_variant)] // Inline, Copy snapshot of the physical video state.
+#[derive(Clone, Debug)]
 enum PhysicalVideoState { Legacy, Vbe(PhysicalVbeState) }
 
 struct NativeBiosWorkspace<A: Arch> {
@@ -702,7 +701,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             return Err(BiosError::Rejected(0x014F));
         }
         let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
-        let mut next = state.svga;
+        let mut next = state.svga.clone();
         next.display_start(Some((input[2] as u16, input[3] as u16)))
             .ok_or(BiosError::InvalidFrame)?;
         let mut regs = Regs::empty();
@@ -731,11 +730,11 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         caller: &mut Regs,
     ) -> Result<(), BiosError> {
         if self.nvidia_workarounds {
-            let (next, result) = nvidia_scan_line(state.svga, caller.rbx as u8, caller.rcx as u16)
+            let (next, result) = nvidia_scan_line(state.svga.clone(), caller.rbx as u8, caller.rcx as u16)
                 .ok_or(BiosError::InvalidFrame)?;
             if matches!(caller.rbx as u8, 0 | 2) {
                 use crate::kernel::drivers::nvidia_vga as nv;
-                nv::set_pitch(display, next.logical_pitch);
+                nv::set_pitch(display, next.logical_pitch.get());
                 // Our shadow retains X/Y across pitch changes, so the byte
                 // address must move with the pitch as well (including OSD restore).
                 if !nv::set_start(display, next.display_byte_offset() as u32, false) {
@@ -762,7 +761,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             return Err(BiosError::Rejected(0x014F));
         }
         let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
-        let mut next = state.svga;
+        let mut next = state.svga.clone();
         next.scan_line(Some((input[2] as u16, caller.rbx as u8 == 2)))
             .ok_or(BiosError::InvalidFrame)?;
         let mut regs = Regs::empty();
@@ -875,10 +874,10 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             _ => return Err(BiosError::Rejected(0x014F)),
         }
         if entries.is_empty() { return Ok(()); }
-        let mut next = *palette;
+        let mut next = palette.clone();
         if !next.write(start, entries) { return Err(BiosError::InvalidFrame); }
         let mut physical = alloc::vec![0; entries.len()];
-        let mut six = next;
+        let mut six = next.clone();
         six.width = 6;
         if !six.read(start, &mut physical) { return Err(BiosError::InvalidFrame); }
         if physical_dac {
@@ -1705,7 +1704,7 @@ fn run_bios<A: Arch>(
     returned: impl Fn(&Regs, &crate::KernelEvent) -> bool,
 ) -> Result<(), BiosError> {
     loop {
-        let event = machine.execute(regs, io);
+        let event = machine.execute_firmware(regs, io);
         if returned(regs, &event) {
             return Ok(());
         }
@@ -1751,7 +1750,7 @@ fn call_bank<A: Arch>(
 fn nvidia_scan_line(mut next: vga::SvgaState, subfn: u8, value: u16)
     -> Option<(vga::SvgaState, vga::SvgaScanLine)>
 {
-    let mut query = next;
+    let mut query = next.clone();
     match subfn {
         0 | 2 => {
             let requested = next.scan_line(Some((value, subfn == 2)))?.bytes;
@@ -1760,8 +1759,9 @@ fn nvidia_scan_line(mut next: vga::SvgaState, subfn: u8, value: u16)
             if u32::from(pitch) * u32::from(next.config.height) > next.config.framebuffer_bytes {
                 return None;
             }
-            next = nvidia_start(next, next.display_start.0, next.display_start.1)?;
-            query = next;
+            let (x, y) = next.start();
+            next = nvidia_start(next, x, y)?;
+            query = next.clone();
         }
         1 => {}
         3 => {
@@ -1777,13 +1777,13 @@ fn nvidia_scan_line(mut next: vga::SvgaState, subfn: u8, value: u16)
 /// Check the entire viewport with wide arithmetic before writing hardware.
 /// A malicious 16-bit X/Y request can overflow the generic u32 calculation.
 fn nvidia_start(mut next: vga::SvgaState, x: u16, y: u16) -> Option<vga::SvgaState> {
-    let pitch = u64::from(next.logical_pitch);
+    let pitch = u64::from(next.logical_pitch.get());
     let step = u64::from(next.config.bits_per_pixel.div_ceil(8));
     let start = u64::from(y) * pitch + u64::from(x) * step;
     let visible = u64::from(next.config.height.saturating_sub(1)) * pitch
         + u64::from(next.config.width) * step;
     if start + visible > u64::from(next.config.framebuffer_bytes) { return None; }
-    next.display_start = (x, y);
+    next.display_start(Some((x, y)))?;
     Some(next)
 }
 
@@ -1796,10 +1796,10 @@ fn nvidia_display_start(
 ) -> Result<(), BiosError> {
     use crate::kernel::drivers::nvidia_vga as nv;
     let subfn = caller.rbx as u8;
-    let mut next = state.svga;
+    let mut next = state.svga.clone();
     match subfn {
         1 => {
-            let (x, y) = next.display_start;
+            let (x, y) = next.start();
             caller.rcx = (caller.rcx & !0xFFFF) | u64::from(x);
             caller.rdx = (caller.rdx & !0xFFFF) | u64::from(y);
         }
@@ -1807,7 +1807,7 @@ fn nvidia_display_start(
         0 | 0x80 | 2 | 0x82 => {
             let (x, y) = if matches!(subfn, 2 | 0x82) {
                 let offset = caller.rcx as u32;
-                let pitch = u32::from(next.logical_pitch);
+                let pitch = u32::from(next.logical_pitch.get());
                 let step = u32::from(next.config.bits_per_pixel.div_ceil(8));
                 if pitch == 0 || step == 0 || !(offset % pitch).is_multiple_of(step) {
                     return Err(BiosError::InvalidFrame);
@@ -1932,22 +1932,22 @@ mod nvidia_tests {
     #[test]
     fn pitch_is_aligned_and_bounded_by_complete_visible_frame() {
         let original = surface();
-        let (next, result) = nvidia_scan_line(original, 2, 641).unwrap();
-        assert_eq!(next.logical_pitch, 648);
+        let (next, result) = nvidia_scan_line(original.clone(), 2, 641).unwrap();
+        assert_eq!(next.logical_pitch.get(), 648);
         assert_eq!(result.bytes, 648);
         assert_eq!(result.lines, 948);
-        assert!(nvidia_scan_line(original, 2, 639).is_none());
-        assert!(nvidia_scan_line(original, 2, 1281).is_none());
-        assert!(nvidia_scan_line(original, 2, 65535).is_none());
-        let mut flipped = original;
-        flipped.display_start = (0, 480);
+        assert!(nvidia_scan_line(original.clone(), 2, 639).is_none());
+        assert!(nvidia_scan_line(original.clone(), 2, 1281).is_none());
+        assert!(nvidia_scan_line(original.clone(), 2, 65535).is_none());
+        let mut flipped = original.clone();
+        flipped.display_start(Some((0, 480))).unwrap();
         assert!(nvidia_scan_line(flipped, 2, 648).is_none());
     }
 
     #[test]
     fn max_pitch_query_does_not_change_current_pitch() {
         let (next, result) = nvidia_scan_line(surface(), 3, 0).unwrap();
-        assert_eq!(next.logical_pitch, 640);
+        assert_eq!(next.logical_pitch.get(), 640);
         assert_eq!(result.bytes, 1280);
         assert_eq!(result.lines, 480);
         let (_, current) = nvidia_scan_line(next, 1, 0).unwrap();
@@ -1955,7 +1955,7 @@ mod nvidia_tests {
         let mut rgb = surface();
         rgb.config.bits_per_pixel = 32;
         rgb.config.framebuffer_bytes *= 4;
-        rgb.logical_pitch = 2560;
+        rgb.logical_pitch.set(2560);
         let (_, result) = nvidia_scan_line(rgb, 0, 641).unwrap();
         assert_eq!((result.bytes, result.pixels), (2568, 642));
     }
@@ -1963,15 +1963,15 @@ mod nvidia_tests {
     #[test]
     fn page_flip_rejects_offscreen_and_overflow_without_changing_state() {
         let original = surface();
-        let flipped = nvidia_start(original, 0, 480).unwrap();
+        let flipped = nvidia_start(original.clone(), 0, 480).unwrap();
         assert_eq!(flipped.display_byte_offset(), 640 * 480);
-        assert!(nvidia_start(original, 1, 480).is_none());
-        assert!(nvidia_start(original, 0, 481).is_none());
-        let mut huge = original;
-        huge.logical_pitch = 65528;
+        assert!(nvidia_start(original.clone(), 1, 480).is_none());
+        assert!(nvidia_start(original.clone(), 0, 481).is_none());
+        let mut huge = original.clone();
+        huge.logical_pitch.set(65528);
         huge.config.bits_per_pixel = 32;
         huge.config.framebuffer_bytes = u32::MAX;
         assert!(nvidia_start(huge, u16::MAX, u16::MAX).is_none());
-        assert_eq!(original.display_start, (0, 0));
+        assert_eq!(original.start(), (0, 0));
     }
 }

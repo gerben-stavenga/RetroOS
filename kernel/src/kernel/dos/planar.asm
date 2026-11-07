@@ -18,6 +18,12 @@ extern entry_wrapper_64
     sbb edx, [PTR ebx + 56]
     add [PTR ebx + 44], eax
     adc [PTR ebx + 48], edx
+    mov ecx, [PTR ebx + 64]
+    shl ecx, 4
+    add dword [PTR ebx + ecx + 68], 1
+    adc dword [PTR ebx + ecx + 72], 0
+    add [PTR ebx + ecx + 76], eax
+    adc [PTR ebx + ecx + 80], edx
 %%done:
 %endmacro
 
@@ -30,9 +36,6 @@ extern entry_wrapper_64
     je %%rust
     cmp dword [PTR ebx + 60], 0
     jne %%rust               ; synchronous scanout needs a phase check first
-    mov eax, [PTR ebx + 64]
-    cmp byte [PTR eax], 0
-    jne %%rust               ; release the guest gate for a pending media read
     cmp dword [ss:esp + 4], 0
     jne %%cs64
     movzx ecx, word [ss:ebp + 76]
@@ -435,6 +438,22 @@ planar_common:
     mov ebx, [ss:PLANAR_FAST_CONTEXT]
     cmp dword [ss:ebx + 40], 0
     je .timed
+    mov dword [ss:ebx + 64], 0 ; assembly VGA memory write
+    cmp ecx, 4
+    jne .stamp
+    movzx eax, word [ss:ebp + 16] ; guest DX
+    mov dword [ss:ebx + 64], 4 ; DMA polling
+    cmp eax, 0x3da
+    jne .mask
+    mov dword [ss:ebx + 64], 2 ; Input Status #1
+    jmp .stamp
+.mask:
+    cmp eax, 0x3c4
+    jb .stamp
+    cmp eax, 0x3c5
+    ja .stamp
+    mov dword [ss:ebx + 64], 3 ; sequencer plane mask
+.stamp:
     rdtsc
     mov [ss:ebx + 52], eax
     mov [ss:ebx + 56], edx
@@ -459,6 +478,8 @@ planar_call:
     push ebp
     cmp dword [ebp + 64], 13
     je .input
+    mov edx, [ss:PLANAR_FAST_CONTEXT]
+    mov dword [ss:edx + 64], 1 ; generic VGA memory instruction
     call planar_fault
     jmp .called
 .input:

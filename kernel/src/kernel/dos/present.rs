@@ -2,7 +2,7 @@
 //!
 //! The emulated VGA and Voodoo produce process-owned pictures; `platform`
 //! describes the sink. Linear output binds a resident renderer to the device:
-//! legacy VGA shares its device with scanout; VBE publishes linear configuration.
+//! VGA and VBE share their device registers and memory with the same scanout.
 //! Hosted and banked sinks retain their synchronous presentation paths.
 //!
 //! Kernel work, not machine work, which is why it is here and not beside the
@@ -104,12 +104,12 @@ fn scanout<'a, A: crate::Arch>(
                 w: svga.config.width,
                 h: svga.config.height,
                 bpp: svga.config.bits_per_pixel,
-                pitch: svga.logical_pitch,
+                pitch: svga.logical_pitch.get(),
             },
             vram,
             planes: &[],
             ac: [0; 21],
-            palette: svga.palette.rgb,
+            palette: svga.palette.rgb.read(),
             dac_mask: svga.palette.mask(),
             font: &lib::vga_fonts::FONT_8X16,
             font_b: &lib::vga_fonts::FONT_8X16,
@@ -450,33 +450,13 @@ pub fn display_tick<A: crate::Arch>(
     if display.is_headless() { return; }
     if display.resident_video() {
         let owner = presentation.as_ref().map(|(_, endpoint)| *endpoint);
-        if let Some(state) = vga.legacy()
-            && display.bind_legacy(state, super::machine::vga::live_memory(),
-                super::machine::vga::scanout_epoch(), owner) {
-            if let Some(mode) = state.classify_mode() {
+        if display.bind_vga(vga, super::machine::vga::live_memory(),
+            super::machine::vga::scanout_epoch(), owner) {
+            if let Some(mode) = vga.current_mode() {
                 let (w, h) = ::vga::dimensions(mode);
                 if let Some((desktop, endpoint)) = presentation.as_mut() {
                     publish_vga_surface(w, h, desktop, *endpoint);
                 }
-            }
-            return;
-        }
-        if !display.linear_needs_publication(super::machine::vga::scanout_revision(), owner) {
-            display.poll_video();
-            return;
-        }
-        let capture_sample = crate::kernel::osd_profile::Sample::start(machine);
-        let Some(frame) = scanout(vga, machine, regs, svga_start, true) else { return };
-        if display.publish_linear(&frame, owner) {
-            capture_sample.finish(machine, crate::kernel::osd_profile::Stage::Capture, 0);
-            // Guest beam/retained geometry stay cheap and local. Pixel work is
-            // owned by the persistent renderer, not joined by the guest loop.
-            let (w, h) = ::vga::dimensions(frame.mode);
-            // Retrace remains the same 70 Hz device clock, read on demand.
-            // Only the renderer allocates pixels or advances presentation.
-            crate::kernel::display::bind_autonomous_beam(&mut pc.scanout, frame.mode, 70);
-            if let Some((desktop, endpoint)) = presentation.as_mut() {
-                publish_vga_surface(w, h, desktop, *endpoint);
             }
             return;
         }

@@ -87,9 +87,16 @@ impl Arch for Interp {
         crate::desc::mark_ldt_dirty();
     }
 
+    fn execute_firmware(&mut self, regs: &mut Regs, io: &arch_abi::IoPolicy) -> KernelEvent {
+        let previous = crate::machine::firmware_loan(true);
+        let event = self.execute(regs, io);
+        crate::machine::firmware_loan(previous);
+        event
+    }
     // ── Timer ──
     fn now(&self) -> u64 { crate::machine::now() }
     fn idle(&mut self) { crate::machine::idle(); }
+    fn arm_alarm(&mut self, deadline: Option<u64>) { crate::machine::arm_alarm(deadline) }
     fn drain(&mut self, f: &mut dyn FnMut(Irq, u64)) { crate::machine::drain(f) }
     fn rdtsc(&self) -> u64 { crate::machine::rdtsc() }
 

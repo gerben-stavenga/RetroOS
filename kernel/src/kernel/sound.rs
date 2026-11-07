@@ -653,11 +653,12 @@ pub struct Engine {
     pub clock: Clock,
     source: Option<alloc::sync::Arc<crate::kernel::media::Shared<super::dos::AudioDevices>>>,
     last_ns: u64,
+    inline_clock_active: bool,
 }
 impl Engine {
     pub fn new(sink: Option<Sink>, now_ns: u64) -> Self {
         publish_frontier(0);
-        Self { sink, clock: Clock::new(), source: None, last_ns: now_ns }
+        Self { sink, clock: Clock::new(), source: None, last_ns: now_ns, inline_clock_active: false }
     }
     pub fn source(&mut self, source: Option<&alloc::sync::Arc<crate::kernel::media::Shared<super::dos::AudioDevices>>>) {
         let same = match (&self.source, source) {
@@ -666,6 +667,21 @@ impl Engine {
             _ => false,
         };
         if !same { self.source = source.cloned(); }
+    }
+    fn needs_inline_clock(&self) -> bool {
+        self.sink.is_some() || pcm::needs_clock() || self.source.as_ref().is_some_and(|source|
+            source.try_lock().is_none_or(|source| source.needs_clock()))
+    }
+    pub(crate) fn poll_inline_due<A: crate::Arch>(&mut self, machine: &mut A, now: u64) {
+        let active = self.needs_inline_clock();
+        if !active || !self.inline_clock_active { self.last_ns = now; }
+        self.inline_clock_active = active;
+        if active && now >= self.last_ns.saturating_add(1_000_000) {
+            self.poll_inline(machine, now);
+        }
+    }
+    pub(crate) fn next_deadline(&self) -> Option<u64> {
+        self.needs_inline_clock().then(|| self.last_ns.saturating_add(1_000_000))
     }
     pub fn due() -> bool {
         let now = (super::portio::now_ns() / 1_000_000) as u32;

@@ -297,6 +297,13 @@ impl Os2State {
         self.cursor_dirty = true;
     }
 
+    pub(crate) fn next_deadline(&self) -> Option<u64> {
+        let sleep = self.sleep_deadline.filter(|_| !self.sleep_ready);
+        let timer = (self.timer_hwnd != 0 && !self.pm_messages.iter().any(|message|
+            message.hwnd == self.timer_hwnd && message.message == 0x0024 && message.mp1 == self.timer_id))
+            .then_some(self.timer_deadline_ns);
+        sleep.into_iter().chain(timer).min()
+    }
     pub fn advance_timers(&mut self, now: u64) {
         if self.sleep_deadline.is_some_and(|deadline|now>=deadline) {self.sleep_ready=true;}
         if self.timer_hwnd == 0

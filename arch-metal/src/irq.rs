@@ -31,32 +31,13 @@ pub use arch_abi::Irq;
 pub const MSI_VECTOR_BASE: u8 = 0xF8;
 pub const MSI_SOURCE_COUNT: u8 = 8;
 
-/// Global IRQ event queue for discrete events (keyboard and device IRQs).
-/// Timer wakeups are coalesced; all entries retain their arrival timestamp.
+/// CPU-local queue for discrete events (keyboard and device IRQs).
+/// Entries retain their arrival timestamp; timer alarms never enter the queue.
 /// Hashing and entropy estimation happen later in the kernel event loop.
 #[thread_local]
 static mut QUEUE: Pipe<(Irq, u64), 256> = Pipe::new((Irq::Hw(0), 0));
-/// Coalesce periodic wakeups: IRQ0 says only that the kernel should resample
-/// its clock, never how many milliseconds elapsed.
-#[thread_local]
-static mut IRQ0_QUEUED: bool = false;
 #[thread_local]
 static IRQ0_HANDLED: AtomicU32 = AtomicU32::new(0);
-#[thread_local]
-static mut DRAIN_PROBE_PASSES: u32 = 0;
-#[thread_local]
-static mut IRQ0_GAP_PROBE: Irq0GapProbe = Irq0GapProbe {
-    count: 0,
-    last_ns: 0,
-    warned: false,
-};
-
-struct Irq0GapProbe {
-    count: u32,
-    last_ns: u64,
-    warned: bool,
-}
-
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const PIT_CHANNEL2: u16 = 0x42;
 const PIT_COMMAND: u16 = 0x43;
@@ -111,10 +92,6 @@ pub fn drain(mut f: impl FnMut(Irq, u64)) {
     let q = &raw mut QUEUE;
     let mut n = 0;
     unsafe {
-        // A full ring may have discarded the queued IRQ0. Either way this
-        // drain consumes the current wakeup epoch and permits the next IRQ0
-        // to enqueue another one.
-        IRQ0_QUEUED = false;
         while n < events.len() {
             let Some(event) = (*q).pop() else { break };
             events[n].write(event);
@@ -128,15 +105,6 @@ pub fn drain(mut f: impl FnMut(Irq, u64)) {
         // Every element below `n` was initialized by the pop loop above.
         let (irq, timestamp_ns) = unsafe { event.assume_init_read() };
         f(irq, timestamp_ns);
-    }
-    // Observe a missing hardware tick independently of the kernel's clock
-    // gate. This reports the PIC/IF state; it does not synthesize a wakeup.
-    let probe = unsafe {
-        DRAIN_PROBE_PASSES = DRAIN_PROBE_PASSES.wrapping_add(1);
-        DRAIN_PROBE_PASSES.is_multiple_of(1024)
-    };
-    if probe {
-        diagnose_irq0_gap();
     }
 }
 
@@ -153,44 +121,6 @@ fn master_pic_state() -> (u8, u8, u8) {
     let imr = inb(MASTER_DATA);
     if restore_if { crate::x86::sti(); }
     (irr, isr, imr)
-}
-
-fn diagnose_irq0_gap() {
-    // PIT2 needs frequent IRQ-side extension and can itself stop reporting
-    // elapsed time when IRQ0 disappears. Only an independent clock can time
-    // this diagnostic reliably.
-    if !matches!(unsafe { CLOCK.source }, ClockSource::Tsc | ClockSource::Hpet) {
-        return;
-    }
-    let now_ns = now(false);
-    let count = IRQ0_HANDLED.load(Ordering::Relaxed);
-    let probe = unsafe { &mut *core::ptr::addr_of_mut!(IRQ0_GAP_PROBE) };
-    if probe.last_ns == 0 || probe.count != count {
-        if probe.warned {
-            lib::compact_println!("IRQ0 delivery resumed: handler_count={}", count);
-        }
-        probe.count = count;
-        probe.last_ns = now_ns;
-        probe.warned = false;
-    } else if !probe.warned && now_ns.saturating_sub(probe.last_ns) >= 250_000_000 {
-        let if_on = crate::x86::interrupts_enabled();
-        let (irr, isr, imr) = master_pic_state();
-        lib::compact_println!(
-            "IRQ0 delivery stalled: count={} IF={} PIC IRR={:02X} ISR={:02X} IMR={:02X}",
-            count, if_on as u8, irr, isr, imr,
-        );
-        probe.warned = true;
-    }
-}
-
-/// Queue one coalesced clock-resample request from IRQ0.
-unsafe fn queue_irq0_wakeup(timestamp_ns: u64) {
-    if !unsafe { core::ptr::read_volatile(&raw const IRQ0_QUEUED) } {
-        unsafe {
-            (&raw mut QUEUE).as_mut().unwrap().push((Irq::Hw(0), timestamp_ns));
-            core::ptr::write_volatile(&raw mut IRQ0_QUEUED, true);
-        }
-    }
 }
 
 /// Push a keyboard scancode into the queue from a non-IRQ source — the xHCI
@@ -238,18 +168,11 @@ pub fn remap_pic() {
     init_pic(SLAVE_CMD, SLAVE_DATA, IRQ_OFFSET + 8, CASCADE_IRQ);
 }
 
-/// Initialize PIT (Programmable Interval Timer) for timer interrupts
-pub fn init_pit(frequency: u32) {
-    const PIT_CHANNEL0: u16 = 0x40;
-    const PIT_CMD: u16 = 0x43;
-    const PIT_FREQUENCY: u32 = 1193182;
-
-    outb(PIT_CMD, 0x36);
-    let divisor = PIT_FREQUENCY
-        .checked_div(frequency)
-        .map_or(0, |d| d.clamp(1, 65535) as u16);
-    outb(PIT_CHANNEL0, (divisor & 0xFF) as u8);
-    outb(PIT_CHANNEL0, (divisor >> 8) as u8);
+/// Program channel 0 as a one-shot interrupt source.
+fn pit_alarm_count(count: u16) {
+    outb(PIT_COMMAND, 0x30);
+    outb(0x40, count as u8);
+    outb(0x40, (count >> 8) as u8);
 }
 
 /// Reserve physical PIT channel 2 as a free-running 16-bit clock. DOS sees a
@@ -281,14 +204,14 @@ fn unmask_irq(irq: u8) {
 }
 
 // ============================================================================
-// LAPIC timer — PIT-independent system tick for modern (PIT-less) hardware
+// LAPIC alarm — PIT-independent wakeups for modern (PIT-less) hardware
 // ============================================================================
 //
 // Modern UEFI laptops frequently have no usable legacy 8254 PIT, so IRQ0 never
-// fires and the event loop's first hlt-on-tick freezes the boot (reproduced as
+// fires and the event loop's first idle wait freezes the boot (reproduced as
 // the "hangs at Starting DN" symptom on an AMD Razer laptop; locally with QEMU
 // `-M q35,pit=off`). The local APIC timer is always present; we run it as the
-// periodic wakeup, returning control to the event loop without manufacturing
+// alarm source, returning control to the event loop without manufacturing
 // elapsed time. Calibrate it against HPET where available, or poll PIT channel
 // 2 on machines whose firmware omits HPET but has a working legacy PIT.
 
@@ -302,7 +225,6 @@ const LAPIC_INIT_COUNT: u32 = 0x380;
 const LAPIC_CUR_COUNT: u32 = 0x390;
 
 const LAPIC_SW_ENABLE: u32 = 1 << 8;       // SVR bit 8: software-enable the LAPIC
-const LVT_TIMER_PERIODIC: u32 = 1 << 17;   // LVT timer: periodic mode
 const LVT_MASKED: u32 = 1 << 16;
 const LVT_DELIVERY_EXTINT: u32 = 7 << 8;   // LVT delivery mode = ExtINT
 const LAPIC_DIV_1: u32 = 0b1011;           // divide-config: bus clock / 1
@@ -332,7 +254,7 @@ const TIMER_POLL_LIMIT: u32 = 1_000_000;
 // false => x2APIC (MSR access); true after we map MMIO for the xAPIC path.
 #[thread_local]
 static mut LAPIC_X2: bool = false;
-/// Set once the LAPIC timer is the live tick source (so handle_irq routes the
+/// Set once the LAPIC timer is the live alarm source (so handle_irq routes the
 /// vector-0x20 EOI to the LAPIC instead of running the PIC ack dance).
 #[thread_local]
 static mut LAPIC_TIMER_ACTIVE: bool = false;
@@ -530,18 +452,11 @@ fn init_monotonic_clock(hpet_base: Option<u64>) {
     }, hz);
 }
 
-// A one-millisecond wakeup can miss a DOS timer handler's lead-in to VGA
-// retrace. Death Rally arms its one-shot about 0.6 ms before retrace; missing
-// that edge delays its DMA refill by another video frame and replays audio.
-// Use 250 us wakeup resolution on modern machines. The nanosecond clock, rather
-// than the number of wakeups, still drives guest timers and device services.
-const LAPIC_TICK_HZ: u64 = 4_000;
-
 /// Measure the LAPIC timer input frequency against the HPET (a fixed,
-/// self-describing clock) and return the periodic initial-count.
+/// self-describing clock) and return its frequency in Hz.
 /// Returns None when no usable HPET is present (then there is no fixed
 /// reference and the caller falls back to the PIT).
-fn calibrate_lapic_via_hpet() -> Option<u32> {
+fn calibrate_lapic_via_hpet() -> Option<u64> {
     let clock = unsafe { CLOCK };
     let hpet_hz = clock.hpet_hz;
     let counter_mask = clock.hpet_mask;
@@ -576,14 +491,14 @@ fn calibrate_lapic_via_hpet() -> Option<u32> {
     // slow. This was visible as a 44.1 kHz sink requiring a ~56 kHz numerical
     // mix rate to stay full on intermittent KVM boots.
     let lapic_hz = (elapsed as u128 * hpet_hz as u128 / hpet_elapsed as u128) as u64;
-    Some(((lapic_hz / LAPIC_TICK_HZ).max(1)) as u32)
+    Some(lapic_hz)
 }
 
 /// Calibrate the LAPIC timer against PIT channel 2 when firmware has no HPET
 /// table. Channel 2 is polled, so this works even if PIC IRQ0 cannot reach the
 /// CPU. Keeping the LAPIC timer active avoids disabling a firmware-enabled
 /// APIC and assuming the chipset will reconnect the PIC to direct INTR.
-fn calibrate_lapic_via_pit2() -> Option<u32> {
+fn calibrate_lapic_via_pit2() -> Option<u64> {
     let target = (PIT_INPUT_HZ / 100) as u16; // about 10 ms
     lapic_write(LAPIC_DIV_CONF, LAPIC_DIV_1);
     lapic_write(LAPIC_LVT_TIMER, LVT_MASKED);
@@ -606,10 +521,10 @@ fn calibrate_lapic_via_pit2() -> Option<u32> {
     }
     let lapic_hz = (u128::from(lapic_elapsed) * u128::from(PIT_INPUT_HZ)
         / u128::from(pit_elapsed)) as u64;
-    Some(((lapic_hz / LAPIC_TICK_HZ).max(1)) as u32)
+    Some(lapic_hz)
 }
 
-/// Bring up the LAPIC timer as the system tick. Returns true on success; false
+/// Bring up the LAPIC timer as the alarm source. Returns true on success; false
 /// (no APIC, LAPIC globally disabled, or no usable reference clock) leaves
 /// the caller on the legacy PIT path.
 fn setup_lapic_timer() -> bool {
@@ -640,7 +555,7 @@ fn setup_lapic_timer() -> bool {
     lapic_write(LAPIC_SVR, LAPIC_SW_ENABLE | LAPIC_SPURIOUS_VECTOR);
     lapic_write(LAPIC_LVT_LINT0, LVT_DELIVERY_EXTINT);
 
-    let (init_count, reference) = if let Some(c) = calibrate_lapic_via_hpet() {
+    let (frequency, reference) = if let Some(c) = calibrate_lapic_via_hpet() {
         (c, "HPET")
     } else if let Some(c) = calibrate_lapic_via_pit2() {
         (c, "PIT2")
@@ -648,17 +563,23 @@ fn setup_lapic_timer() -> bool {
         return false;
     };
 
-    // Start the periodic timer on vector 0x20.
+    unsafe {
+        LAPIC_HZ = frequency;
+        TSC_DEADLINE = matches!(CLOCK.source, ClockSource::Tsc)
+            && crate::x86::cpuid(1).2 & (1 << 24) != 0;
+    }
+    // One interrupt checks delivery after IF is enabled. There is no boot heartbeat.
+    let init_count = (frequency / 1000).max(1).min(u32::MAX as u64) as u32;
     lapic_write(LAPIC_DIV_CONF, LAPIC_DIV_1);
-    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LVT_TIMER_PERIODIC);
+    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR);
     lapic_write(LAPIC_INIT_COUNT, init_count);
     unsafe { core::ptr::write_volatile(&raw mut LAPIC_TIMER_ACTIVE, true); }
-    lib::compact_println!("IRQ: LAPIC timer tick (hz={} init_count={} ref={})", LAPIC_TICK_HZ, init_count, reference);
+    lib::compact_println!("IRQ: LAPIC alarm (hz={} ref={} tsc_deadline={})", frequency, reference, unsafe { TSC_DEADLINE });
     true
 }
 
 /// Legacy fallback: ensure the 8259 INTR reaches the CPU (the old APIC-routing
-/// logic) and drive the tick from the PIT. Used when the LAPIC timer can't be
+/// logic) and drive alarms from the PIT. Used when the LAPIC timer can't be
 /// brought up (no APIC / no HPET reference).
 fn legacy_intr_and_pit() {
     const X2APIC_SVR: u32 = 0x80F;
@@ -683,7 +604,7 @@ fn legacy_intr_and_pit() {
         }
     }
     lib::compact_println!("IRQ: PIT");
-    init_pit(1000); // 1000 Hz timer
+    pit_alarm_count((PIT_INPUT_HZ / 1000) as u16); // one delivery-test alarm
     unmask_irq(0);  // timer
 }
 
@@ -750,7 +671,7 @@ fn bsp_apic_id() -> u32 {
 /// Route ISA IRQ line `gsi` to `vector` on the BSP: fixed delivery, physical
 /// destination, edge-triggered, active-high, unmasked. ISA IRQs map 1:1 to GSIs
 /// for the keyboard (1) and mouse (12); the timer (often overridden to GSI2) is
-/// not routed here — the LAPIC timer owns the tick.
+/// not routed here — the LAPIC timer owns alarm delivery.
 fn ioapic_route(gsi: u8, vector: u8, level_low: bool) {
     let restore_if = crate::x86::interrupts_enabled();
     crate::x86::cli();
@@ -780,7 +701,7 @@ fn i8042_present() -> bool {
     inb(0x64) != 0xFF
 }
 
-/// Initialize interrupts (PIC + tick source + keyboard/mouse)
+/// Initialize interrupts (PIC + alarm source + keyboard/mouse)
 pub fn init_interrupts(hpet_base: Option<u64>, mut progress: impl FnMut(&str)) {
     progress("PIC setup");
     lib::compact_println!("IRQ: PIC");
@@ -789,10 +710,10 @@ pub fn init_interrupts(hpet_base: Option<u64>, mut progress: impl FnMut(&str)) {
     init_monotonic_clock(hpet_base);
 
     // Pick the interrupt mode ONCE: LAPIC timer succeeds ⇒ APIC mode (IOAPIC
-    // routes device IRQs, LAPIC EOI); else the legacy 8259 path (PIT tick, PIC
+    // routes device IRQs, LAPIC EOI); else the legacy 8259 path (PIT alarm, PIC
     // delivery). The keyboard and mouse below follow that same decision — the
     // half-state (LAPIC timer but PIC keyboard) is what left modern boxes with
-    // a dead keyboard: the tick survived on the LAPIC while IRQ1 rode the PIC
+    // a dead keyboard: the timer worked on the LAPIC while IRQ1 rode the PIC
     // whose INTR the firmware had cut.
     // Record the firmware APIC state before our fallback can disable xAPIC.
     // CPUID's APIC bit may itself clear after that transition, so the later
@@ -1089,9 +1010,21 @@ pub fn handle_irq(regs: &mut Regs) {
     let irq = vector - IRQ_OFFSET;
     if irq == 0 {
         IRQ0_HANDLED.fetch_add(1, Ordering::Relaxed);
+        unsafe { ALARM_FIRED = true; }
+        // Before the event loop owns alarms, only a wrapping clock needs
+        // another interrupt. The initial delivery-test alarm otherwise ends.
+        if !unsafe { ALARM_MODE } && let Some(interval) = clock_maintenance_interval() {
+            if lapic_timer_active() {
+                let count = (u128::from(interval) * u128::from(unsafe { LAPIC_HZ }))
+                    .div_ceil(1_000_000_000).clamp(1, u128::from(u32::MAX)) as u32;
+                lapic_write(LAPIC_INIT_COUNT, count);
+            } else {
+                pit_alarm_count((interval * PIT_INPUT_HZ / 1_000_000_000).clamp(1, 65535) as u16);
+            }
+        }
     }
 
-    // APIC mode: the tick is the LAPIC timer (vector 0x20 from the local APIC)
+    // APIC mode: alarms use the LAPIC timer (vector 0x20 from the local APIC)
     // and keyboard/mouse arrive through the I/O APIC — the 8259 is bypassed
     // entirely. Read the device inline and ack with a single LAPIC EOI; none of
     // the PIC mask/ack dance below applies. (`lapic_timer_active()` is the
@@ -1106,12 +1039,7 @@ pub fn handle_irq(regs: &mut Regs) {
             ioapic_mask(irq, true);
         }
         match irq {
-            0 => {
-                // Entry sampling already extended the fallback PIT clock.
-                unsafe { queue_irq0_wakeup(timestamp_ns); }
-                // Poll the USB-HID keyboard (if any) into the same key queue.
-                crate::xhci::poll(timestamp_ns);
-            }
+            0 => {}, // pure wakeup; the execution trap returns to the kernel
             1 => unsafe { let q = &raw mut QUEUE; (*q).push((Irq::Key(inb(0x60)), timestamp_ns)); },
             12 => {
                 if let Some(e) = mouse_packet_byte(inb(0x60)) {
@@ -1149,15 +1077,7 @@ pub fn handle_irq(regs: &mut Regs) {
     // not acknowledged here remain masked until the guest-visible device ack
     // path re-arms the line.
     let event = match irq {
-        0 => {
-            // Entry sampling already extended the fallback PIT clock.
-            unsafe { queue_irq0_wakeup(timestamp_ns); }
-            // USB HID reports need polling on PIC-only machines too. The
-            // APIC timer path does this above; without it the devices can
-            // enumerate but never deliver keys or mouse movement.
-            crate::xhci::poll(timestamp_ns);
-            None // the IRQ merely returns control to the event loop
-        }
+        0 => None, // pure wakeup; no event is enqueued
         1 => Some(Irq::Key(inb(0x60))),
         12 => mouse_packet_byte(inb(0x60)),
         _ => Some(Irq::Hw(irq)),
@@ -1359,5 +1279,105 @@ fn mouse_packet_byte(byte: u8) -> Option<Irq> {
             core::ptr::write_volatile(&raw mut MOUSE_PACKET_IDX, idx + 1);
             None
         }
+    }
+}
+
+// Alarm state belongs to this CPU. Programming and sleep run in ring 0 with
+// interrupts masked; input and elapsed alarms survive the return through ring 1.
+#[thread_local]
+static mut LAPIC_HZ: u64 = 0;
+#[thread_local]
+static mut TSC_DEADLINE: bool = false;
+#[thread_local]
+static mut ALARM_MODE: bool = false;
+#[thread_local]
+static mut ALARM_DEADLINE: Option<u64> = None;
+#[thread_local]
+static mut ALARM_FIRED: bool = false;
+const IA32_TSC_DEADLINE: u32 = 0x6e0;
+
+pub fn wake_pending() -> bool {
+    let queue = &raw const QUEUE;
+    unsafe { ALARM_MODE && !FIRMWARE_LOAN && (!(*queue).is_empty()
+        || ALARM_DEADLINE.is_some_and(|end| now(false) >= end)) }
+}
+
+#[inline(never)]
+pub fn arm_alarm(deadline: Option<u64>) {
+    // Do not restart an unchanged countdown on every guest I/O exit.
+    unsafe {
+        if ALARM_MODE && ALARM_DEADLINE == deadline && !ALARM_FIRED { return; }
+        ALARM_MODE = true;
+        ALARM_DEADLINE = deadline;
+        ALARM_FIRED = false;
+    }
+    let current = now(false);
+    if lapic_timer_active() {
+        if unsafe { TSC_DEADLINE } {
+            lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | (2 << 17));
+            unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)); }
+            let cycles = deadline.map_or(0, |end| {
+                let clock = unsafe { CLOCK };
+                let offset = ((u128::from(end) << 32).div_ceil(u128::from(clock.ns_mult)))
+                    .min(u128::from(u64::MAX)) as u64;
+                clock.epoch.saturating_add(offset).max(crate::x86::rdtsc().saturating_add(1))
+            });
+            unsafe { crate::x86::wrmsr(IA32_TSC_DEADLINE, cycles); }
+        } else {
+            lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR);
+            let count = deadline.map_or(0, |end| {
+                (u128::from(end.saturating_sub(current)) * u128::from(unsafe { LAPIC_HZ }))
+                    .div_ceil(1_000_000_000).clamp(1, u128::from(u32::MAX)) as u32
+            });
+            lapic_write(LAPIC_INIT_COUNT, count);
+        }
+    } else {
+        // Channel 0 has no gate pin. Mask its IRQ when disarmed; the next
+        // programming replaces its one-shot count before unmasking it.
+        outb(MASTER_DATA, inb(MASTER_DATA) | 1);
+        if let Some(end) = deadline {
+            let count = (u128::from(end.saturating_sub(current)) * u128::from(PIT_INPUT_HZ))
+                .div_ceil(1_000_000_000).clamp(1, 65535) as u16;
+            pit_alarm_count(count);
+            unmask_irq(0);
+        }
+    }
+}
+
+pub fn idle() {
+    // INT 80 entered with IF clear. STI's interrupt shadow makes check/wait
+    // atomic: a pending interrupt is delivered at HLT instead of being lost.
+    if !wake_pending() {
+        unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)); }
+    }
+}
+
+#[inline(never)]
+pub fn poll_timed_devices(current: u64) -> Option<u64> {
+    let mut next = crate::xhci::poll_deadline(current);
+    // Every iteration samples now(), extending the wrapping clock. When the
+    // CPU becomes idle it still needs an alarm before an ambiguous wrap.
+    let maintenance = clock_maintenance_interval();
+    if let Some(interval) = maintenance {
+        let end = current.saturating_add(interval);
+        next = Some(next.map_or(end, |old| old.min(end)));
+    }
+    next
+}
+
+#[thread_local]
+static mut FIRMWARE_LOAN: bool = false;
+pub(crate) fn firmware_loan(value: bool) -> bool {
+    unsafe { let previous = FIRMWARE_LOAN; FIRMWARE_LOAN = value; previous }
+}
+
+fn clock_maintenance_interval() -> Option<u64> {
+    let clock = unsafe { CLOCK };
+    match clock.source {
+        ClockSource::Pit2 => Some(20_000_000),
+        ClockSource::Hpet if clock.hpet_mask != u64::MAX =>
+            Some((u128::from(clock.hpet_mask) * 1_000_000_000
+                / u128::from(clock.hpet_hz.max(1)) / 2).clamp(1, u128::from(u64::MAX)) as u64),
+        _ => None,
     }
 }

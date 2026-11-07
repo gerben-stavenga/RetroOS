@@ -17,9 +17,7 @@ fn kvm_available() -> bool {
     kvm_ioctls::Kvm::new().is_ok()
 }
 
-/// Run `execute()` until a non-Irq event (the 1 ms timer kick can interleave
-/// anywhere), with a bound so a wedged guest fails the test instead of
-/// hanging it.
+/// Run until a non-Irq event, allowing unrelated wakeups to interleave.
 fn run_to_event() -> KernelEvent {
     for _ in 0..10_000 {
         match execute() {
@@ -76,6 +74,54 @@ fn kvm_engine_proofs() {
     assert_eq!(r.rax as u16, 0x1234, "mov ax retired before the INT");
     assert_eq!(r.ip32(), 0x7C05, "monitor advanced IP past the INT");
     assert!(r.flags32() & (VM_FLAG as u32) != 0, "still VM86 after the trap");
+
+    // Absolute one-shot alarms must preempt guest-only computation. An
+    // elapsed alarm before KVM_RUN must also return without retiring code.
+    mem.copy_to(0x7E00, &[0xeb, 0xfe]);
+    let mut spinning = r;
+    spinning.set_ip32(0x7E00);
+    set_regs(spinning);
+    let end = mem.now() + 3_000_000;
+    mem.arm_alarm(Some(end + 100_000_000));
+    mem.arm_alarm(None);
+    mem.arm_alarm(Some(end));
+    let mut wakes = 0;
+    loop {
+        assert!(matches!(execute(), KernelEvent::Irq));
+        wakes += 1;
+        if mem.now() >= end { break; }
+        assert!(wakes < 3, "an unrequested periodic heartbeat is still running");
+    }
+    assert!(mem.now() - end < 200_000_000, "one-shot alarm was excessively late");
+    mem.arm_alarm(Some(mem.now()));
+    set_regs(spinning);
+    assert!(matches!(execute(), KernelEvent::Irq));
+    assert_eq!(regs().ip32(), spinning.ip32());
+    // A synchronous firmware loan can finish while the kernel's alarm is
+    // pending. Its ignored IRQ exit must not turn into an endless re-entry loop.
+    mem.copy_to(0x7E10, &[0xcd, 0x31]);
+    let mut firmware = r;
+    firmware.set_ip32(0x7E10);
+    let mut finished = false;
+    for _ in 0..4 {
+        match mem.execute_firmware(&mut firmware, &arch_abi::IoPolicy::deny_all()) {
+            KernelEvent::Irq => {},
+            KernelEvent::SoftInt(0x31) => { finished = true; break; },
+            event => panic!("firmware loan: {event:?}"),
+        }
+    }
+    assert!(finished, "pending alarm starved a synchronous firmware loan");
+    mem.arm_alarm(None);
+    // Input must wake an idle CPU even with the timer completely disarmed.
+    let poster = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        crate::machine::post_irq(arch_abi::Irq::Key(0x1e));
+    });
+    mem.idle();
+    poster.join().unwrap();
+    let mut input = false;
+    mem.drain(&mut |event, _| input |= matches!(event, arch_abi::Irq::Key(0x1e)));
+    assert!(input, "input was lost during the idle transition");
 
     // A VM86 POPF with reserved bit 15 set must behave like a hardware
     // flags load, not feed an invalid VMCS to Intel KVM (DN's CPU probe).

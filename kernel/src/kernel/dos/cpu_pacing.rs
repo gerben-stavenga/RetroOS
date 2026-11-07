@@ -38,6 +38,9 @@ impl CpuPacer {
     pub fn percent(&self) -> u8 { self.percent }
     pub fn limited(&self) -> bool { self.percent < 100 }
     pub fn ready(&self, now: u64) -> bool { now >= self.next_ns }
+    pub fn deadline(&self, now: u64) -> Option<u64> {
+        (self.limited() && !self.ready(now)).then_some(self.next_ns)
+    }
 
     pub fn charge(&mut self, start: u64, end: u64) {
         let delay = end.saturating_sub(start)

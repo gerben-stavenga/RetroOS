@@ -35,6 +35,9 @@ def main():
         session(work, disk, name, cpu, accel, extra, expected)
     if not options.kvm:
         session(work, disk, 'legacy', 'pentium3,-pae', 'tcg', ('-smp', '4'), 4)
+        # No LAPIC or TSC: one-shot PIC/PIT alarms must preserve the wrapping
+        # PIT2 clock and preempt the same guest workload.
+        session(work, disk, 'pic', '486', 'tcg', (), 1)
 
 
 if __name__ == '__main__':

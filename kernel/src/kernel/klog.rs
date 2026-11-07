@@ -278,3 +278,9 @@ impl Filesystem for KLogFs {
         -1
     }
 }
+
+/// An idle, clean log contributes no housekeeping alarm.
+pub(crate) fn needs_sync() -> bool {
+    LIVE_HANDLE.load(Ordering::Acquire) >= 0 &&
+        (LIVE_DIRTY.load(Ordering::Acquire) || SAVED_THROUGH.load(Ordering::Acquire) < klog::total_bytes())
+}

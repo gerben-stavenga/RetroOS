@@ -14,7 +14,7 @@
 //!   incoming space re-faults its own pages in.
 //! * A run ends at the first sensitive event (software `INT`, port `IN`/`OUT`,
 //!   an illegal access → `PageFault`) or after `SLICE` instructions retire
-//!   (a deterministic timer tick → `Irq`).
+//!   (an absolute deterministic alarm → `Irq`).
 
 use crate::sysdesc::{
     ensure_sys_window, if_to_vif, sys_phys, sys_ptr, vif_to_if, ensure_tables, GDT_ADDR, GDT_BYTES,
@@ -29,19 +29,10 @@ use core::ffi::c_void;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Prot};
 use unicorn_engine::{RegisterX86, Unicorn};
 
-/// Instructions between forced returns to the kernel — the timer-IRQ delivery
-/// grid. A trap returns before this is spent and the *remainder* carries over
-/// ([`BUDGET`]); delivering the timer wakeup resets it. So IRQ0 lands on a
-/// fixed cumulative-instruction grid regardless of how the guest's I/O chopped
-/// the run up — like real hardware where `IN`/`INT` don't restart the PIT. Must
-/// be <= the shortest timer period a guest programs (Doom's 140 Hz ~= 14k instr).
-const IRQ_PERIOD: usize = 2_000;
-
+// A run budget is derived from the absolute alarm at every entry. I/O traps
+// do not reset the alarm; instruction retirement advances deterministic time.
 thread_local! {
-    /// Instructions left until the next forced kernel return (IRQ0 grid point):
-    /// decremented by every run, carried across traps, reset only when the
-    /// elapsed boundary is delivered as an IRQ exit.
-    static BUDGET: Cell<usize> = const { Cell::new(IRQ_PERIOD) };
+    static BUDGET: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
 /// Per-run hook scratch.
@@ -243,7 +234,7 @@ fn build() -> Unicorn<'static, Ctx> {
         uc.get_data_mut().slice_instr += (size as u64 / 3).max(1);
         if crate::machine::irq_line() {
             let flags = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0);
-            if flags & 0x200 != 0 {
+            if crate::machine::host_input_pending() || flags & 0x200 != 0 {
                 uc.get_data_mut().stopped = true;
                 let _ = uc.emu_stop();
             }
@@ -398,6 +389,7 @@ pub fn fx_switch(fx: &mut crate::machine::FxState) {
 // `static_mut_refs` reference; clippy's `deref_addrof` rewrite would reintroduce it.
 #[allow(clippy::deref_addrof)]
 pub fn execute() -> KernelEvent {
+    BUDGET.with(|budget| budget.set(crate::machine::instructions_to_alarm()));
     io_with(|uc| loop {
         // Service an off-thread VGA-screen snapshot request, and paint the live
         // terminal view if enabled (both read the active guest space here, where
@@ -413,11 +405,10 @@ pub fn execute() -> KernelEvent {
         // The projected TF in `regs` requests one hardware step. The resulting
         // `#DB` is reflected below as `KernelEvent::DebugTrap`; DOS owns source
         // attribution, so the interpreter only needs to let it run.
-        // A trap can consume the last instructions of a timer period. Deliver
-        // that trap first, then its timer wakeup on this entry. Silently resetting
-        // the budget here starves the event-loop clock in tight INT loops.
+        // A trap can consume the last instructions before an alarm. Deliver
+        // the trap first, then the alarm on re-entry; I/O must never postpone
+        // an absolute deadline.
         if budget_spent() {
-            BUDGET.with(|b| b.set(IRQ_PERIOD));
             return KernelEvent::Irq;
         }
         let begin = configure(uc, vcpu, mode);
@@ -579,7 +570,6 @@ pub fn execute() -> KernelEvent {
             // or a block-hook IRQ stop — both just hand control to the kernel.
             Ok(()) => {
                 // This return already delivers the elapsed timer boundary.
-                if budget_spent() { BUDGET.with(|b| b.set(IRQ_PERIOD)); }
                 KernelEvent::Irq
             },
             // Unicorn can reject an invalid encoding before the interrupt
@@ -634,7 +624,7 @@ fn run_slice(uc: &mut Unicorn<'static, Ctx>, begin: u64, max: usize) -> Result<(
     r
 }
 
-/// Whether the IRQ0 grid boundary was reached (budget spent).
+/// Whether the selected alarm boundary was reached.
 fn budget_spent() -> bool {
     BUDGET.with(|b| b.get()) == 0
 }

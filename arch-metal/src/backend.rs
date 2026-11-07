@@ -44,6 +44,9 @@ impl Arch for Metal {
 
     #[allow(clippy::deref_addrof)]
     fn execute(&mut self, regs: &mut Regs, io: &arch_abi::IoPolicy) -> KernelEvent {
+        // An alarm or input IRQ may have arrived after arming but before
+        // EXECUTE. Its queued wakeup must survive this transition.
+        if super::irq::wake_pending() { return KernelEvent::Irq; }
         super::descriptors::install_io_policy(io);
         super::exec_profile::time(ExecutionProfileStage::PolicyInstall);
         // The ring transitions exchange their physical frames directly with
@@ -57,6 +60,12 @@ impl Arch for Metal {
         let ev = KernelEvent::decode(event, extra);
         super::exec_profile::time(ExecutionProfileStage::Decode);
         ev
+    }
+    fn execute_firmware(&mut self, regs: &mut Regs, io: &arch_abi::IoPolicy) -> KernelEvent {
+        let previous = super::irq::firmware_loan(true);
+        let event = self.execute(regs, io);
+        super::irq::firmware_loan(previous);
+        event
     }
     unsafe fn replace_interrupt_handlers(&mut self, vector: u8, handlers: arch_abi::InterruptHandlers) -> arch_abi::InterruptHandlers {
         super::calls::arch_replace_interrupt_handlers(vector, handlers)
@@ -80,6 +89,9 @@ impl Arch for Metal {
 
     // ── Timer ──
     fn now(&self) -> u64 { super::irq::now(false) }
+    fn arm_alarm(&mut self, deadline: Option<u64>) { super::calls::arch_arm_alarm(deadline) }
+    fn idle(&mut self) { super::calls::arch_idle() }
+    fn poll_timed_devices(&mut self, now: u64) -> Option<u64> { super::calls::arch_poll_timed_devices(now) }
     fn drain(&mut self, f: &mut dyn FnMut(Irq, u64)) { super::irq::drain(f) }
     fn rdtsc(&self) -> u64 { super::x86::rdtsc() }
     fn execution_profile_set(&mut self, enabled: bool) { super::exec_profile::set(enabled) }

@@ -2,10 +2,38 @@
 //! by a media core. Only the consumer owns latches and the partial image.
 use alloc::vec::Vec;
 use crate::{beam::{Phase, Sequencer, Timing}, memory::Memory, Frame, LegacyVgaState,
-    Pal, PixelFormat, VgaMode, dimensions, render_row_packed, PACKED_ROW_PADDING};
+    Pal, PixelFormat, VgaMode, VgaState, SvgaState, dimensions, render_row_packed, PACKED_ROW_PADDING};
+
+pub enum Device { Legacy(LegacyVgaState), Vbe(SvgaState) }
+impl From<&LegacyVgaState> for Device {
+    fn from(value: &LegacyVgaState) -> Self { Self::Legacy(value.scanout_view()) }
+}
+impl From<&SvgaState> for Device {
+    fn from(value: &SvgaState) -> Self { Self::Vbe(value.scanout_view()) }
+}
+impl From<&VgaState> for Device {
+    fn from(value: &VgaState) -> Self {
+        match value { VgaState::Legacy(v) => Self::from(&**v), VgaState::Vbe(v) => Self::from(&**v) }
+    }
+}
+impl Device {
+    fn timing(&self) -> Timing {
+        match self {
+            Self::Legacy(v) => Timing::from_registers(v.misc_output.get(), &v.seq.read(), &v.crtc.read()),
+            Self::Vbe(v) => v.timing(),
+        }
+    }
+    fn mode(&self) -> Option<VgaMode> {
+        match self {
+            Self::Legacy(v) => v.classify_mode(),
+            Self::Vbe(v) => Some(VgaMode::LinearSvga { w: v.config.width, h: v.config.height,
+                bpp: v.config.bits_per_pixel, pitch: v.logical_pitch.get() }),
+        }
+    }
+}
 
 pub struct Scanout {
-    device: LegacyVgaState,
+    device: Device,
     beam: Sequencer,
     memory: Memory<'static>,
     back: Vec<u8>,
@@ -19,14 +47,19 @@ pub struct Scanout {
     last_ns: u64,
 }
 impl Scanout {
-    pub fn new(device: &LegacyVgaState, memory: Memory<'static>, format: PixelFormat, now: u64) -> Self {
-        let timing = Timing::from_registers(device.misc_output.get(), &device.seq.read(), &device.crtc.read());
-        Self { device: device.scanout_view(), beam: Sequencer::new(timing, now), memory,
+    pub fn new(device: impl Into<Device>, memory: Memory<'static>, format: PixelFormat, now: u64) -> Self {
+        let device = device.into();
+        let timing = device.timing();
+        Self { device, beam: Sequencer::new(timing, now), memory,
             back: Vec::new(), mode: None, pal: Pal::new(), palette: [0; 768], format,
             collecting: false, rows: 0, split: usize::MAX, last_ns: now }
     }
-    pub fn same_device(&self, device: &LegacyVgaState) -> bool {
-        self.device.registers.same_device(&device.registers)
+    pub fn same_device(&self, device: &VgaState) -> bool {
+        match (&self.device, device) {
+            (Device::Legacy(a), VgaState::Legacy(b)) => a.registers.same_device(&b.registers),
+            (Device::Vbe(a), VgaState::Vbe(b)) => a.same_device(b),
+            _ => false,
+        }
     }
     /// Allocation is done by the owner before/while binding, never by advance.
     /// Rebinding an unchanged device only reserves capacity, not register state.
@@ -49,8 +82,7 @@ impl Scanout {
     /// Process all phases through `now`, swapping only a completed active image
     /// into front. Registers are read at their hardware latch/fetch phases.
     pub fn advance(&mut self, now: u64, front: &mut Vec<u8>, mut checkpoint: impl FnMut()) -> Option<VgaMode> {
-        let timing = Timing::from_registers(self.device.misc_output.get(),
-            &self.device.seq.read(), &self.device.crtc.read());
+        let timing = self.device.timing();
         if timing != self.beam.timing() {
             self.beam.reprogram(timing, now);
             self.collecting = false;
@@ -67,10 +99,10 @@ impl Scanout {
         let mut completed = None;
         while let Some(event) = self.beam.next(now) {
             match event.phase {
-                Phase::RetraceStart => { self.device.latch_display_start(event.frame + 1); }
-                Phase::RetraceEnd => { self.device.latch_pixel_pan(event.frame + 1); }
+                Phase::RetraceStart => { if let Device::Legacy(v) = &mut self.device { v.latch_display_start(event.frame + 1); } }
+                Phase::RetraceEnd => { if let Device::Legacy(v) = &mut self.device { v.latch_pixel_pan(event.frame + 1); } }
                 Phase::FrameStart => {
-                    self.mode = self.device.classify_mode();
+                    self.mode = self.device.mode();
                     self.rows = 0;
                     self.split = usize::MAX;
                     self.collecting = false;
@@ -89,16 +121,26 @@ impl Scanout {
                     let (w, h) = dimensions(mode);
                     let line = usize::from(event.line);
                     let repeat = (usize::from(timing.vertical_display) / h).max(1);
-                    let compare = usize::from(self.device.crtc.get(0x18))
-                        | (usize::from(self.device.crtc.get(7) & 0x10) << 4)
-                        | (usize::from(self.device.crtc.get(9) & 0x40) << 3);
-                    if line == compare + 1 { self.split = line.div_ceil(repeat); }
+                    let split = match &self.device {
+                        Device::Legacy(v) => (usize::from(v.crtc.get(0x18))
+                            | (usize::from(v.crtc.get(7) & 0x10) << 4)
+                            | (usize::from(v.crtc.get(9) & 0x40) << 3)) + 1,
+                        Device::Vbe(v) => v.line_compare(),
+                    };
+                    if line == split { self.split = line.div_ceil(repeat); }
                     if line >= usize::from(timing.vertical_display) || !line.is_multiple_of(repeat) { continue; }
                     let row = line / repeat;
                     if row >= h || row != self.rows { continue; }
-                    let mut frame = device_frame(&self.device, self.memory, mode, now);
+                    let mut frame = match &self.device {
+                        Device::Legacy(v) => device_frame(v, self.memory, mode, now),
+                        Device::Vbe(v) => v.frame(self.memory),
+                    };
                     frame.line_compare = self.split;
-                    self.pal.sync(&frame.palette, frame.dac_mask, self.format, &mut self.palette);
+                    if matches!(frame.mode, VgaMode::LinearSvga { .. }) {
+                        self.pal.sync_vbe(&frame.palette, frame.dac_mask, self.format, &mut self.palette);
+                    } else {
+                        self.pal.sync(&frame.palette, frame.dac_mask, self.format, &mut self.palette);
+                    }
                     self.pal.sync_planar(&frame.ac);
                     let stride = w * usize::from(self.format.bytes_per_pixel);
                     render_row_packed(&frame, row, &self.pal,

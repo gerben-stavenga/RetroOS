@@ -203,7 +203,25 @@ fn execution_profile<A: crate::Arch>(machine: &A) {
         send(b"\":");
         send_u64(cycles);
     }
-    send(b"}\n");
+    send(b",\"devices\":{");
+    for (index, (name, [calls, cycles])) in super::event_profile::DEVICE_NAMES.into_iter()
+        .zip(super::event_profile::device_entries()).enumerate() {
+        if index != 0 { send(b","); }
+        send(b"\""); send(name.as_bytes()); send(b"\":{\"calls\":");
+        send_u64(calls); send(b",\"cycles\":"); send_u64(cycles); send(b"}");
+    }
+    send(b"},\"vga_instructions\":[");
+    let mut first = true;
+    for entry in super::event_profile::vga_instructions().into_iter().filter(|entry| entry.calls != 0) {
+        if !first { send(b","); }
+        first = false;
+        send(b"{\"cs\":"); send_u64(u64::from(entry.cs));
+        send(b",\"ip\":"); send_u64(u64::from(entry.ip));
+        send(b",\"bytes\":"); send_u64(u64::from(entry.bytes));
+        send(b",\"max_count\":"); send_u64(u64::from(entry.max_count));
+        send(b",\"calls\":"); send_u64(entry.calls); send(b"}");
+    }
+    send(b"]}\n");
 }
 
 fn trim(mut bytes: &[u8]) -> &[u8] {
@@ -462,4 +480,10 @@ mod tests {
     fn command_whitespace_is_not_semantic() {
         assert_eq!(trim(b"  profile on\r "), b"profile on");
     }
+}
+
+/// Injected keyboard bytes have their own serial cadence; RX is IRQ-driven.
+pub(crate) fn next_deadline(now: u64) -> Option<u64> {
+    if RX_PENDING.load(Ordering::Relaxed) { return Some(now); }
+    unsafe { (INJECT_HEAD != INJECT_TAIL).then(|| now.saturating_add(1_000_000)) }
 }

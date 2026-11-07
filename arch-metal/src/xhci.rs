@@ -1469,3 +1469,19 @@ pub fn poll(now: u64) {
         }
     }
 }
+
+/// HID endpoints require bounded polling even without new reports (repeat).
+/// Called by the event loop with interrupts masked, independently of IRQ0.
+pub fn poll_deadline(now: u64) -> Option<u64> {
+    static mut NEXT: u64 = 0;
+    unsafe {
+        let active = (0..CONTROLLER_COUNT).any(|i|
+            (*CONTROLLERS[i]).pipes.iter().any(|pipe| pipe.ready));
+        if !active { NEXT = 0; return None; }
+        if now >= NEXT {
+            poll(now);
+            NEXT = now.saturating_add(1_000_000);
+        }
+        Some(NEXT)
+    }
+}

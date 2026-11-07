@@ -9,6 +9,7 @@ pub(super) struct Request {
     deadline: u64,
 }
 impl Request {
+    pub(super) fn deadline(&self) -> Option<u64> { (self.deadline != u64::MAX).then_some(self.deadline) }
     pub(super) fn read<A: crate::Arch>(
         machine: &mut A,
         args: &Args,

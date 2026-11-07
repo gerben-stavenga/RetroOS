@@ -144,3 +144,8 @@ mod tests {
         assert_eq!(s.played(50),25);
     }
 }
+
+pub(super) fn needs_clock() -> bool {
+    STREAMS.try_lock().is_none_or(|streams| streams.iter().any(|stream|
+        stream.try_lock().is_none_or(|stream| !stream.paused && !stream.frames.is_empty())))
+}

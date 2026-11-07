@@ -374,3 +374,5 @@ impl Filesystem for Status {
         None
     }
 }
+
+pub(crate) fn present() -> bool { DEVICE.lock().is_some() }

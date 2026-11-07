@@ -557,6 +557,14 @@ pub fn execute() -> KernelEvent {
             Shutdown,
         }
         let ev = loop {
+            // Clear a previous kick before checking time/input. A signal after
+            // this check sets immediate_exit, covering the check-to-KVM_RUN race.
+            k.vcpu.set_kvm_immediate_exit(0);
+            if !in_shim(k) && (crate::machine::alarm_due() || crate::machine::host_input_pending()
+                || (crate::machine::irq_line() && vcpu.flags32() & VIF_FLAG != 0)) {
+                sync_out(k, vcpu, mode);
+                return KernelEvent::Irq;
+            }
             let kind = match k.vcpu.run() {
                 // Timer kick (or any host signal).
                 Err(e) if e.errno() == libc::EINTR => Kind::Intr,

@@ -768,3 +768,5 @@ mod tests {
         }
     }
 }
+
+pub(super) fn needs_poll() -> bool { let lan = LAN.lock(); lan.fd.is_some() || lan.server.is_some() }

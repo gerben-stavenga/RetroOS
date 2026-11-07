@@ -407,7 +407,7 @@ pub fn load_font_glyphs(
 ) {
     assert!(map < 8 && glyph_h <= 32);
     assert!(vram.len() >= 4 * VGA_PLANE_BYTES);
-    assert!(first <= 256 && font.len() % glyph_h == 0);
+    assert!(first <= 256 && font.len().is_multiple_of(glyph_h));
     let count = font.len() / glyph_h;
     assert!(first + count <= 256);
     let map_base = map * 0x2000;
@@ -606,11 +606,15 @@ pub fn fill_vga_palette(p: &mut [u8; 768]) {
 /// Complete palette/ramp and compatibility-DAC state for one SVGA device.
 /// Components are canonical eight-bit values; six-bit VBE/DAC interfaces
 /// convert only while entering or leaving this object.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
+pub struct PaletteRegisters {
+    pub rgb: registers::Bytes<768>,
+    mask: registers::Byte,
+}
+#[derive(Debug)]
 pub struct VbePalette {
-    pub rgb: [u8; 768],
+    registers: alloc::sync::Arc<PaletteRegisters>,
     pub width: u8,
-    mask: u8,
     write_index: u8,
     read_index: u8,
     write_sub: u8,
@@ -618,6 +622,28 @@ pub struct VbePalette {
     read_mode: bool,
     dirty_lo: u16,
     dirty_hi: u16,
+}
+
+impl core::ops::Deref for VbePalette {
+    type Target = PaletteRegisters;
+    fn deref(&self) -> &PaletteRegisters { &self.registers }
+}
+impl Clone for VbePalette {
+    fn clone(&self) -> Self {
+        let mut result = self.share();
+        result.registers = alloc::sync::Arc::new(PaletteRegisters {
+            rgb: registers::Bytes::new(self.rgb.read()), mask: registers::Byte::new(self.mask()),
+        });
+        result
+    }
+}
+impl VbePalette {
+    fn share(&self) -> Self {
+        Self { registers: self.registers.clone(), width: self.width,
+            write_index: self.write_index, read_index: self.read_index,
+            write_sub: self.write_sub, read_sub: self.read_sub, read_mode: self.read_mode,
+            dirty_lo: self.dirty_lo, dirty_hi: self.dirty_hi }
+    }
 }
 
 impl Default for VbePalette {
@@ -628,13 +654,15 @@ impl VbePalette {
     pub fn new() -> Self {
         let mut six = [0; 768];
         fill_vga_palette(&mut six);
-        let mut palette = Self {
-            rgb: [0; 768], width: 6, mask: 0xFF,
+        let palette = Self {
+            registers: alloc::sync::Arc::new(PaletteRegisters {
+                rgb: registers::Bytes::new([0; 768]), mask: registers::Byte::new(255),
+            }), width: 6,
             write_index: 0, read_index: 0, write_sub: 0, read_sub: 0,
             read_mode: false, dirty_lo: 256, dirty_hi: 0,
         };
-        for (dst, src) in palette.rgb.iter_mut().zip(six) {
-            *dst = Self::six_to_eight(src);
+        for (i, src) in six.into_iter().enumerate() {
+            palette.rgb.set(i, Self::six_to_eight(src));
         }
         palette
     }
@@ -670,7 +698,7 @@ impl VbePalette {
     /// Read VBE B,G,R,align entries in the currently exposed component width.
     pub fn read(&self, start: u16, entries: &mut [u8]) -> bool {
         let Some(range) = Self::range(start, entries.len()) else { return false };
-        for (entry, rgb) in entries.chunks_exact_mut(4).zip(self.rgb[range].chunks_exact(3)) {
+        for (entry, rgb) in entries.chunks_exact_mut(4).zip(self.rgb.read()[range].chunks_exact(3)) {
             entry.copy_from_slice(&[
                 self.output(rgb[2]), self.output(rgb[1]), self.output(rgb[0]), 0,
             ]);
@@ -682,9 +710,9 @@ impl VbePalette {
     pub fn write(&mut self, start: u16, entries: &[u8]) -> bool {
         let Some(range) = Self::range(start, entries.len()) else { return false };
         let width = self.width;
-        for (rgb, entry) in self.rgb[range].chunks_exact_mut(3).zip(entries.chunks_exact(4)) {
+        for (index, entry) in (range.start..range.end).step_by(3).zip(entries.chunks_exact(4)) {
             let cvt = |v| if width == 6 { Self::six_to_eight(v) } else { v };
-            rgb.copy_from_slice(&[cvt(entry[2]), cvt(entry[1]), cvt(entry[0])]);
+            self.rgb.write_range(index, &[cvt(entry[2]), cvt(entry[1]), cvt(entry[0])]);
         }
         true
     }
@@ -693,7 +721,7 @@ impl VbePalette {
         if matches!(width, 6 | 8) { self.width = width; true } else { false }
     }
 
-    pub fn mask(&self) -> u8 { self.mask }
+    pub fn mask(&self) -> u8 { self.mask.get() }
 
     pub fn clear_dirty(&mut self) {
         self.dirty_lo = 256;
@@ -706,12 +734,12 @@ impl VbePalette {
 
     pub fn port_read(&mut self, port: u16) -> u8 {
         match port {
-            0x3C6 => self.mask,
+            0x3C6 => self.mask.get(),
             0x3C7 => if self.read_mode { 3 } else { 0 },
             0x3C8 => self.write_index,
             0x3C9 => {
                 let at = usize::from(self.read_index) * 3 + usize::from(self.read_sub);
-                let value = self.output(self.rgb[at]);
+                let value = self.output(self.rgb.get(at));
                 self.read_sub += 1;
                 if self.read_sub == 3 {
                     self.read_sub = 0;
@@ -725,12 +753,12 @@ impl VbePalette {
 
     pub fn port_write(&mut self, port: u16, value: u8) {
         match port {
-            0x3C6 => self.mask = value,
+            0x3C6 => self.mask.set(value),
             0x3C7 => { self.read_index = value; self.read_sub = 0; self.read_mode = true; }
             0x3C8 => { self.write_index = value; self.write_sub = 0; self.read_mode = false; }
             0x3C9 => {
                 let at = usize::from(self.write_index) * 3 + usize::from(self.write_sub);
-                self.rgb[at] = self.input(value);
+                self.rgb.set(at, self.input(value));
                 self.write_sub += 1;
                 if self.write_sub == 3 {
                     self.write_sub = 0;
@@ -773,21 +801,78 @@ pub enum SvgaAccess {
 /// Complete DOS-visible control state for one SVGA device. Framebuffer pages
 /// are supplied by the owner (physical display or private DOS address space);
 /// all VBE-visible state transitions are shared here.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
+pub struct SvgaRegisters {
+    pub logical_pitch: registers::Word,
+    display_start: registers::Dword,
+    crtc: registers::Bytes<25>,
+}
+#[derive(Clone, Debug)]
 pub struct SvgaState {
     pub config: SvgaConfig,
     pub mode_number: u16,
     pub access: SvgaAccess,
-    pub display_start: (u16, u16),
-    pub logical_pitch: u16,
+    registers: SvgaRegisterFile,
     pub palette: VbePalette,
     // Legacy scanout registers remain useful in packed VBE modes: games
     // program Line Compare to keep a status bar at VRAM zero while scrolling.
     crtc_index: u8,
-    crtc: [u8; 25],
+}
+
+#[derive(Debug)]
+struct SvgaRegisterFile(alloc::sync::Arc<SvgaRegisters>);
+impl Clone for SvgaRegisterFile {
+    fn clone(&self) -> Self {
+        Self(alloc::sync::Arc::new(SvgaRegisters {
+            logical_pitch: registers::Word::new(self.0.logical_pitch.get()),
+            display_start: registers::Dword::new(self.0.display_start.get()),
+            crtc: registers::Bytes::new(self.0.crtc.read()),
+        }))
+    }
+}
+impl core::ops::Deref for SvgaState {
+    type Target = SvgaRegisters;
+    fn deref(&self) -> &SvgaRegisters { &self.registers.0 }
 }
 
 impl SvgaState {
+    /// The mode's beam clock is used by both scanout and Input Status #1.
+    pub fn timing(&self) -> beam::Timing {
+        let w = self.config.width;
+        let h = self.config.height;
+        let horizontal = w + 80;
+        let vertical = h + 20;
+        beam::Timing { dot_hz: u32::from(horizontal) * u32::from(vertical) * 70,
+            dots_per_clock: 1, horizontal_total: horizontal, horizontal_display: w,
+            horizontal_blank_start: w, horizontal_blank_end: horizontal,
+            vertical_total: vertical, vertical_display: h,
+            blank_start: h, blank_end: vertical,
+            retrace_start: h + 1, retrace_end: h + 4 }
+    }
+
+    /// Fetch current device registers and atomic VRAM, just like legacy VGA.
+    pub fn frame<'a>(&self, memory: memory::Memory<'a>) -> Frame<'a> {
+        Frame { memory: Some(memory), mode: VgaMode::LinearSvga {
+            w: self.config.width, h: self.config.height, bpp: self.config.bits_per_pixel,
+            pitch: self.logical_pitch.get() }, vram: &[], planes: &[],
+            plane_layout: VramLayout::PlaneMinor, ac: [0; 21], palette: self.palette.rgb.read(),
+            dac_mask: self.palette.mask(), cga_palette: [0; 4], font: &[], font_b: &[],
+            font_maps: None, blink: false, text_cursor: None,
+            start_offset: self.display_byte_offset(), pixel_pan: 0, split_pixel_pan: 0,
+            line_compare: self.line_compare(), blank_start: usize::MAX }
+    }
+    pub fn scanout_view(&self) -> Self {
+        Self { config: self.config, mode_number: self.mode_number, access: self.access,
+            registers: SvgaRegisterFile(self.registers.0.clone()),
+            palette: self.palette.share(), crtc_index: self.crtc_index }
+    }
+    pub fn same_device(&self, other: &Self) -> bool {
+        alloc::sync::Arc::ptr_eq(&self.registers.0, &other.registers.0)
+    }
+    pub fn start(&self) -> (u16, u16) {
+        let value = self.registers.0.display_start.get();
+        (value as u16, (value >> 16) as u16)
+    }
     pub fn new(mode_number: u16, access: SvgaAccess, mode: SvgaConfig) -> Self {
         let linear = matches!(access, SvgaAccess::Linear);
         let mut crtc = [0; 25];
@@ -798,18 +883,20 @@ impl SvgaState {
             config: mode,
             mode_number,
             access,
-            display_start: (0, 0),
-            logical_pitch: if linear { mode.linear_pitch } else { mode.banked_pitch },
+            registers: SvgaRegisterFile(alloc::sync::Arc::new(SvgaRegisters {
+                display_start: registers::Dword::new(0),
+                logical_pitch: registers::Word::new(if linear { mode.linear_pitch } else { mode.banked_pitch }),
+                crtc: registers::Bytes::new(crtc),
+            })),
             palette: VbePalette::new(),
             crtc_index: 0,
-            crtc,
         }
     }
 
     pub fn port_read(&mut self, port: u16) -> u8 {
         match port {
             0x3D4 => self.crtc_index,
-            0x3D5 => self.crtc.get(usize::from(self.crtc_index)).copied().unwrap_or(0xFF),
+            0x3D5 => if self.crtc_index < 25 { self.crtc.get(usize::from(self.crtc_index)) } else { 255 },
             0x3C6..=0x3C9 => self.palette.port_read(port),
             _ => 0xFF,
         }
@@ -819,8 +906,8 @@ impl SvgaState {
         match port {
             0x3D4 => self.crtc_index = value,
             0x3D5 => {
-                if let Some(register) = self.crtc.get_mut(usize::from(self.crtc_index)) {
-                    *register = value;
+                if self.crtc_index < 25 {
+                    self.crtc.set(usize::from(self.crtc_index), value);
                 }
             }
             0x3C6..=0x3C9 => self.palette.port_write(port, value),
@@ -831,11 +918,11 @@ impl SvgaState {
     /// First logical row whose address counter restarts at zero. Low VGA
     /// resolutions repeat physical scanlines, just as Mode X does.
     pub fn line_compare(&self) -> usize {
-        let compare = usize::from(self.crtc[0x18])
-            | (usize::from(self.crtc[7] & 0x10) << 4)
-            | (usize::from(self.crtc[9] & 0x40) << 3);
-        let repeat = usize::from(self.crtc[9] & 0x1F) + 1;
-        let repeat = repeat * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
+        let compare = usize::from(self.crtc.get(0x18))
+            | (usize::from(self.crtc.get(7) & 0x10) << 4)
+            | (usize::from(self.crtc.get(9) & 0x40) << 3);
+        let repeat = usize::from(self.crtc.get(9) & 0x1F) + 1;
+        let repeat = repeat * if self.crtc.get(9) & 0x80 != 0 { 2 } else { 1 };
         let row = (compare + 1).div_ceil(repeat);
         if row < usize::from(self.config.height) { row } else { usize::MAX }
     }
@@ -859,29 +946,30 @@ impl SvgaState {
 
     #[inline]
     pub fn display_byte_offset(&self) -> usize {
-        usize::from(self.display_start.1) * usize::from(self.logical_pitch)
-            + usize::from(self.display_start.0)
+        let (x, y) = self.start();
+        usize::from(y) * usize::from(self.logical_pitch.get())
+            + usize::from(x)
                 * usize::from(self.config.bits_per_pixel.div_ceil(8))
     }
 
     #[inline]
     pub fn visible_frame_bytes(&self) -> usize {
-        usize::from(self.logical_pitch) * usize::from(self.config.height)
+        usize::from(self.logical_pitch.get()) * usize::from(self.config.height)
     }
 
     pub fn display_start(
         &mut self,
         set: Option<(u16, u16)>,
     ) -> Option<(u16, u16)> {
-        let Some((x, y)) = set else { return Some(self.display_start) };
+        let Some((x, y)) = set else { return Some(self.start()) };
         let mode = self.config;
         let step = u32::from(mode.bits_per_pixel.div_ceil(8));
-        let start = u32::from(y) * u32::from(self.logical_pitch) + u32::from(x) * step;
+        let start = u32::from(y) * u32::from(self.logical_pitch.get()) + u32::from(x) * step;
         let visible = u32::from(mode.height.saturating_sub(1))
-            * u32::from(self.logical_pitch)
+            * u32::from(self.logical_pitch.get())
             + u32::from(mode.width) * step;
         if start.saturating_add(visible) > mode.framebuffer_bytes { return None; }
-        self.display_start = (x, y);
+        self.registers.0.display_start.set(u32::from(x) | (u32::from(y) << 16));
         Some((x, y))
     }
 
@@ -896,12 +984,12 @@ impl SvgaState {
         if let Some((value, in_bytes)) = set {
             let pitch = if in_bytes { value } else { value.checked_mul(step)? };
             if pitch < mode.width.saturating_mul(step) { return None; }
-            self.logical_pitch = pitch;
+            self.logical_pitch.set(pitch);
         }
         Some(SvgaScanLine {
-            bytes: self.logical_pitch,
-            pixels: self.logical_pitch / step,
-            lines: (mode.framebuffer_bytes / u32::from(self.logical_pitch.max(1)))
+            bytes: self.logical_pitch.get(),
+            pixels: self.logical_pitch.get() / step,
+            lines: (mode.framebuffer_bytes / u32::from(self.logical_pitch.get().max(1)))
                 .min(u32::from(u16::MAX)) as u16,
         })
     }
@@ -1462,6 +1550,7 @@ fn row_cga2(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usiz
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Decoded text geometry and the row destination.
 fn row_text(
     frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usize,
     cols: usize, rows: usize, cell_w: usize, cell_h: usize,
@@ -1473,7 +1562,7 @@ fn row_text(
         return;
     }
     let bg_mask = if frame.blink { 0x07 } else { 0x0F };
-    let dot_w = if cell_w % 9 == 0 { 9 } else { 8 };
+    let dot_w = if cell_w.is_multiple_of(9) { 9 } else { 8 };
     let repeat = cell_w / dot_w;
     for col in 0..cols {
         let cell = ((frame.start_offset + trow * cols + col) & 0xFFFF) * 2;
@@ -1939,7 +2028,7 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
             compact_font.get(ch * cell_h + gy).copied().unwrap_or(0)
         };
         let py = row * cell_h + gy;
-        let dot_w = if cell_w % 9 == 0 { 9 } else { 8 };
+        let dot_w = if cell_w.is_multiple_of(9) { 9 } else { 8 };
         let repeat = cell_w / dot_w;
         for gx in 0..cell_w {
             let dot = gx / repeat;
@@ -2125,7 +2214,7 @@ mod tests {
     fn vbe_palette_width_is_an_interface_conversion() {
         let mut palette = VbePalette::new();
         assert!(palette.write(7, &[1, 17, 63, 0]));
-        assert_eq!(&palette.rgb[7 * 3..8 * 3], &[255, 69, 4]);
+        assert_eq!(&palette.rgb.read()[7 * 3..8 * 3], &[255, 69, 4]);
         assert!(palette.set_width(8));
         let mut entry = [0; 4];
         assert!(palette.read(7, &mut entry));
@@ -2511,6 +2600,9 @@ pub struct AcState {
     pub pending_data: bool,
 }
 
+impl Default for AcState {
+    fn default() -> Self { Self::new() }
+}
 impl AcState {
     // PAS=1 (bit 5 of index) matches BIOS-default boot state where the
     // display is enabled. The tracker is needed because the AC flip-flop
@@ -2863,6 +2955,32 @@ impl LegacyVgaState {
             && self.gc.get(8) == 0xFF
     }
 
+    /// Consecutive CPU writes with fixed, sequential planar addressing. The
+    /// guest cannot change registers during this instruction chunk; scanout
+    /// reads these atomic bytes independently. Declining performs no accesses.
+    pub fn write_sequential_span(&self, memory: memory::Memory<'_>, address: usize,
+        len: usize, mut read: impl FnMut(usize) -> u8) -> bool {
+        if self.seq.get(4) & 0x0c != 4 || self.gc.get(6) & 2 != 0 || !self.simple_alu()
+            || memory.len() < 4 * 65536 { return false; }
+        let memory = memory.range(0, 4 * 65536);
+        let mask = self.seq.get(2) & 15;
+        if mask.count_ones() == 1 {
+            let plane = mask.trailing_zeros() as usize;
+            for i in 0..len {
+                memory.put(((address.wrapping_add(i) & 65535) * 4) + plane, read(i));
+            }
+        } else {
+            for i in 0..len {
+                let value = read(i);
+                let offset = (address.wrapping_add(i) & 65535) * 4;
+                for plane in 0..4 {
+                    if mask & (1 << plane) != 0 { memory.put(offset + plane, value); }
+                }
+            }
+        }
+        true
+    }
+
     fn direct_layout(&self) -> Option<VramLayout> {
         if !self.simple_alu() {
             return None;
@@ -3143,7 +3261,7 @@ impl VgaState {
                 w: svga.config.width,
                 h: svga.config.height,
                 bpp: svga.config.bits_per_pixel,
-                pitch: svga.logical_pitch,
+                pitch: svga.logical_pitch.get(),
             }),
         }
     }

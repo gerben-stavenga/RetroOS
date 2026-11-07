@@ -19,6 +19,7 @@ struct VirtualPitChannel {
     start_cycle: u64,
     next_irq_cycle: u64,
     enabled: bool,
+    stopped_count: u16,
 }
 
 impl VirtualPitChannel {
@@ -35,6 +36,7 @@ impl VirtualPitChannel {
             // The default divisor must elapse before the first IRQ edge.
             next_irq_cycle: 65_536,
             enabled: true,
+            stopped_count: 0,
         }
     }
 
@@ -49,15 +51,23 @@ impl VirtualPitChannel {
     #[inline]
     fn current_count(&self, now: u64) -> u16 {
         if !self.enabled {
-            return self.reload;
+            return self.stopped_count;
         }
         let div = self.divisor();
         let elapsed = now.saturating_sub(self.start_cycle);
         let raw = match self.mode {
-            2 | 3 => {
+            2 => {
                 let pos = elapsed % div;
                 let remaining = div - pos;
                 if remaining == div { div } else { remaining }
+            }
+            3 => {
+                // Square-wave mode counts by two and reloads at each half
+                // period. Odd divisors hold the high half for one extra clock.
+                let pos = elapsed % div;
+                let high = div.div_ceil(2);
+                let half_pos = if pos < high { pos } else { pos - high };
+                (div & !1).saturating_sub(half_pos * 2)
             }
             _ => {
                 // Terminal count raises OUT but does not stop the counter.
@@ -132,7 +142,11 @@ impl VirtualPitChannel {
         }
     }
 
-    fn set_command(&mut self, rw_mode: u8, mode: u8) {
+    fn set_command(&mut self, rw_mode: u8, mode: u8, now: u64) {
+        // Programming the control register stops the old sequence, but does
+        // not replace the counting element with the reload register. Software
+        // can still read the stopped count before writing a new initial count.
+        self.stopped_count = self.current_count(now);
         self.rw_mode = rw_mode;
         self.mode = match mode {
             6 => 2,
@@ -160,7 +174,7 @@ impl VirtualPitChannel {
         let elapsed = now.saturating_sub(self.start_cycle);
         match self.mode {
             2 => elapsed % div != div - 1, // low for one input cycle at count 1
-            3 => elapsed % div < div / 2,  // square: high for the first half
+            3 => elapsed % div < div.div_ceil(2), // odd counts have a longer high half
             _ => elapsed >= div,           // one-shot: low until terminal count
         }
     }
@@ -260,7 +274,7 @@ impl VirtualPit {
             c.latch_count(now);
             return;
         }
-        c.set_command(rw_mode, (val >> 1) & 0x07);
+        c.set_command(rw_mode, (val >> 1) & 0x07, now);
     }
 
     /// Channel 2's reload, for the speaker's pitch (0 means 65536, which the
@@ -310,7 +324,7 @@ mod tests {
     #[test]
     fn expired_one_shot_keeps_counting_for_latency_measurement() {
         let mut channel = VirtualPitChannel::new();
-        channel.set_command(3, 0);
+        channel.set_command(3, 0, 0);
         channel.load_count(100, 0);
         assert_eq!(channel.take_irqs(100), 1);
         assert!(channel.output(100));
@@ -329,7 +343,7 @@ mod tests {
     fn new_control_word_stops_old_count_until_both_bytes_arrive() {
         let mut channel = VirtualPitChannel::new();
         channel.load_count(100, 0);
-        channel.set_command(3, 0);
+        channel.set_command(3, 0, 101);
         assert_eq!(channel.take_irqs(101), 0);
         channel.write_byte(50, 101);
         assert_eq!(channel.take_irqs(200), 0);
@@ -337,6 +351,53 @@ mod tests {
         assert_eq!(channel.current_count(200), 50);
         assert_eq!(channel.take_irqs(249), 0);
         assert_eq!(channel.take_irqs(250), 1);
+    }
+
+    #[test]
+    fn square_wave_count_and_output_follow_both_half_periods() {
+        let mut channel = VirtualPitChannel::new();
+        channel.load_count(6, 0);
+        for (now, count, output) in [
+            (0, 6, true), (1, 4, true), (2, 2, true),
+            (3, 6, false), (4, 4, false), (5, 2, false), (6, 6, true),
+        ] {
+            assert_eq!(channel.current_count(now), count);
+            assert_eq!(channel.output(now), output);
+        }
+        channel.load_count(5, 0);
+        for (now, count, output) in [
+            (0, 4, true), (1, 2, true), (2, 0, true),
+            (3, 4, false), (4, 2, false), (5, 4, true),
+        ] {
+            assert_eq!(channel.current_count(now), count);
+            assert_eq!(channel.output(now), output);
+        }
+    }
+
+    #[test]
+    fn control_word_preserves_count_for_retrace_period_measurement() {
+        let mut timer = pit();
+        timer.write_command(0x36);
+        timer.write_counter(0, 0xff);
+        timer.write_counter(0, 0xff);
+        // One VGA frame, as measured by games that stop mode 3 then read
+        // its counter directly, negate it, and divide by two.
+        timer.input_cycles = 17_045;
+        timer.write_command(0x36);
+        assert_eq!(timer.irq_deadline_ns(), u64::MAX);
+        let lo = timer.read_counter(0);
+        timer.input_cycles += 100;
+        let hi = timer.read_counter(0);
+        let count = u16::from_le_bytes([lo, hi]);
+        assert_eq!(count, 31_444);
+        assert_eq!(count.wrapping_neg() / 2, 17_046);
+        // Neither a repeated control word nor the first new byte replaces CE.
+        timer.write_command(0x30);
+        timer.write_counter(0, 100);
+        assert_eq!(timer.ch0.current_count(timer.input_cycles), count);
+        assert_eq!(timer.ch0.take_irqs(timer.input_cycles), 0);
+        timer.write_counter(0, 0);
+        assert_eq!(timer.ch0.current_count(timer.input_cycles), 100);
     }
 
     #[test]

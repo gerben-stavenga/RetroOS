@@ -9,7 +9,8 @@ pub(super) struct Timer {
     pending: bool,
 }
 impl Timer {
-    fn expire(&mut self, now: u64) {
+    pub(super) fn deadline(&self) -> Option<u64> { self.deadline }
+    pub(super) fn expire(&mut self, now: u64) {
         if let Some(deadline) = self.deadline.filter(|&deadline| now >= deadline) {
             self.pending = true;
             self.deadline = (now - deadline)

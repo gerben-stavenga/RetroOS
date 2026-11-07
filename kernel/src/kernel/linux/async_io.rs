@@ -1050,3 +1050,18 @@ mod tests {
 pub(super) fn exec_state(s: &State) -> State {
     fork_state(s)
 }
+
+/// Timed waits retain their absolute expiry while other contexts run.
+pub(super) fn next_deadline(state: &State) -> Option<u64> {
+    state.contexts.iter().filter_map(|context| match context.wait {
+        Wait::Sleep(end) | Wait::Futex(_, _, end) | Wait::Epoll(_, _, _, end) | Wait::Poll(_, _, end) =>
+            (end != u64::MAX).then_some(end),
+        Wait::Select(request) => request.deadline(),
+        _ => None,
+    }).min()
+}
+pub(super) fn needs_poll(state: &State) -> bool {
+    state.contexts.iter().any(|context| matches!(context.wait,
+        Wait::Epoll(..) | Wait::Poll(..) | Wait::Select(..) | Wait::Random(..)
+        | Wait::Flock(..) | Wait::RecordLock(..) | Wait::Read(..) | Wait::ReadV | Wait::Socket(..)))
+}

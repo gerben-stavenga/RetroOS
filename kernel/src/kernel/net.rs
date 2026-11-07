@@ -170,3 +170,7 @@ pub fn close(h: i32) {
         (b.close)(h);
     }
 }
+
+pub(crate) fn needs_poll() -> bool {
+    native_backend() || crate::kernel::wifi::present() || lan::needs_poll()
+}

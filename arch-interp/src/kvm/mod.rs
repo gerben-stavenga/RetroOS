@@ -2,7 +2,7 @@
 //! `/dev/kvm`, with the kernel staying a normal host process.
 //!
 //! Layering (everything above the engine seam is shared with the TCG engine):
-//! * `setup.rs` — VM/vcpu/memory-slot/CPUID bring-up + the 1 ms timer kick.
+//! * `setup.rs` — VM/vcpu/memory-slot/CPUID bring-up + one-shot wakeup alarms.
 //! * `shim.rs`  — the in-guest ring-0 trap shim (IDT + stubs + TSS) that turns
 //!   guest faults into `KVM_EXIT_IO` on a magic port.
 //! * `run.rs`   — the execute loop: `Regs` ↔ KVM register mapping, the
@@ -15,6 +15,7 @@ mod shim;
 mod tests;
 
 pub use run::execute;
+pub(crate) use setup::{arm_alarm, kick};
 
 std::thread_local! {
     static TLB_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };

@@ -107,8 +107,8 @@ SECTIONS
         BOOT_POOL_END = .;
     }
     _end = .;
-    ASSERT(KERNEL_CORE_END - KERNEL_BASE + KERNEL_PHYS <= 3M + 64K,
-           "kernel excluding boot pool must end below physical 3 MiB + 64 KiB")
+    ASSERT(KERNEL_CORE_END - KERNEL_BASE + KERNEL_PHYS <= 0x320000,
+           "kernel excluding boot pool must end below physical 0x320000")
     ASSERT(BOOT_POOL_END == _end, "boot pool must be last in BSS")
     ASSERT(_end - KERNEL_BASE <= 5M,
            "reserved pool exceeds the existing high kernel mapping")

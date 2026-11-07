@@ -430,6 +430,9 @@ pub(in crate::kernel::dos) trait FaultBus {
     fn offset(&self, address: u32) -> Option<u32>;
     fn guest_read(&self, address: u32) -> u8;
     fn guest_write(&mut self, address: u32, value: u8);
+    /// Forward contiguous RAM-to-device copy. A decline must not read or write
+    /// anything. The caller has already limited the string instruction chunk.
+    fn copy_from_ram(&mut self, _source: u32, _destination: u32, _len: u32) -> bool { false }
     fn fpu_st0(&self) -> [u8; 10];
     fn fpu_pop(&mut self);
     fn end_instruction(&mut self) {}
@@ -681,28 +684,40 @@ pub(in crate::kernel::dos) fn emulate(bus: &mut dyn FaultBus, regs: &mut Operand
             let df = *regs.flags & (1 << 10) != 0;
             let mut si = regs.get(6, if addr32 { 4 } else { 2 });
             let mut di = regs.get(7, if addr32 { 4 } else { 2 });
-            for _ in 0..chunk {
-                for b in 0..sz {
-                    let src = ds_base.wrapping_add(si).wrapping_add(b);
-                    let dst = es_base.wrapping_add(di).wrapping_add(b);
-                    // A VRAM source is the planar trap window (present=0): reading
-                    // it with a raw `regs.read` page-faults in the kernel. Route it
-                    // through `vram_read` — which also loads the GC latches, so a
-                    // VRAM→VRAM `rep movs` (Keen's Galaxy engine composites screens
-                    // from off-screen VRAM) is the correct EGA latch copy.
-                    let byte = if let Some(o) = bus.offset(src) {
-                        bus.read8(o)
-                    } else {
-                        bus.guest_read(src)
-                    };
-                    if let Some(o) = bus.offset(dst) {
-                        bus.write8(o, byte);
-                    } else {
-                        bus.guest_write(dst, byte);
+            let bytes = chunk * sz;
+            let source = ds_base.wrapping_add(si);
+            let destination = es_base.wrapping_add(di);
+            let copied = chunk != 0 && !df
+                && (addr32 || (si + bytes <= 0x10000 && di + bytes <= 0x10000))
+                && source.checked_add(bytes).is_some() && destination.checked_add(bytes).is_some()
+                && bus.copy_from_ram(source, destination, bytes);
+            if copied {
+                si = step_string_index(si, bytes, addr32, false);
+                di = step_string_index(di, bytes, addr32, false);
+            } else {
+                for _ in 0..chunk {
+                    for b in 0..sz {
+                        let src = ds_base.wrapping_add(si).wrapping_add(b);
+                        let dst = es_base.wrapping_add(di).wrapping_add(b);
+                        // A VRAM source is the planar trap window (present=0): reading
+                        // it with a raw `regs.read` page-faults in the kernel. Route it
+                        // through `vram_read` — which also loads the GC latches, so a
+                        // VRAM→VRAM `rep movs` (Keen's Galaxy engine composites screens
+                        // from off-screen VRAM) is the correct EGA latch copy.
+                        let byte = if let Some(o) = bus.offset(src) {
+                            bus.read8(o)
+                        } else {
+                            bus.guest_read(src)
+                        };
+                        if let Some(o) = bus.offset(dst) {
+                            bus.write8(o, byte);
+                        } else {
+                            bus.guest_write(dst, byte);
+                        }
                     }
+                    si = step_string_index(si, sz, addr32, df);
+                    di = step_string_index(di, sz, addr32, df);
                 }
-                si = step_string_index(si, sz, addr32, df);
-                di = step_string_index(di, sz, addr32, df);
             }
             regs.set(6, if addr32 { 4 } else { 2 }, si);
             regs.set(7, if addr32 { 4 } else { 2 }, di);
@@ -974,6 +989,97 @@ mod tests {
         fn fpu_st0(&self) -> [u8; 10] { unreachable!() }
         fn fpu_pop(&mut self) { unreachable!() }
     }
+    struct CopyBus {
+        ram: alloc::vec::Vec<u8>, vram: alloc::vec::Vec<u8>,
+        bulk: bool, copied: alloc::vec::Vec<u32>,
+    }
+    impl super::FaultBus for CopyBus {
+        fn read8(&mut self, off: u32) -> u8 { self.vram[off as usize] }
+        fn write8(&mut self, off: u32, value: u8) { self.vram[off as usize] = value; }
+        fn offset(&self, address: u32) -> Option<u32> {
+            (0x40000..0x50000).contains(&address).then(|| address - 0x40000)
+        }
+        fn guest_read(&self, address: u32) -> u8 { self.ram[address as usize] }
+        fn guest_write(&mut self, address: u32, value: u8) { self.ram[address as usize] = value; }
+        fn copy_from_ram(&mut self, source: u32, destination: u32, len: u32) -> bool {
+            if !self.bulk || source as usize + len as usize > self.ram.len()
+                || destination < 0x40000 || destination + len > 0x50000 { return false; }
+            self.vram[(destination - 0x40000) as usize..(destination - 0x40000 + len) as usize]
+                .copy_from_slice(&self.ram[source as usize..(source + len) as usize]);
+            self.copied.push(len);
+            true
+        }
+        fn fpu_st0(&self) -> [u8; 10] { unreachable!() }
+        fn fpu_pop(&mut self) { unreachable!() }
+    }
+
+    #[test]
+    fn bulk_movs_matches_scalar_registers_data_and_interruptible_chunks() {
+        for default32 in [false, true] {
+            for addr32 in [false, true] {
+                for size in [1u32, 2, 4] {
+                    let mut code = alloc::vec![0xf3];
+                    if size != 1 && (size == 4) != default32 { code.push(0x66); }
+                    if addr32 != default32 { code.push(0x67); }
+                    code.push(if size == 1 { 0xa4 } else { 0xa5 });
+                    let mut results = alloc::vec::Vec::new();
+                    for bulk in [false, true] {
+                        let mut bus = CopyBus { ram: (0..0x20000).map(|i| (i as u8).wrapping_mul(37)).collect(),
+                            vram: alloc::vec![0xA5; 65536], bulk, copied: alloc::vec::Vec::new() };
+                        bus.ram[..code.len()].copy_from_slice(&code);
+                        let mut words = [MaybeUninit::new(0); 16];
+                        let (mut ip, mut flags) = (0, 0xA03);
+                        let mut regs = Operands { gprs: &mut words, ip: &mut ip, flags: &mut flags };
+                        let high = if addr32 { 0 } else { 0xAAAA0000 };
+                        regs.set(6, 4, high | 0x1000);
+                        regs.set(7, 4, high | 17);
+                        regs.set(1, 4, high | 2053);
+                        let bases = [0x40000, 0, 0, 0, 0, 0];
+                        assert!(super::emulate(&mut bus, &mut regs, 0, default32, &bases, 17));
+                        assert_eq!(*regs.ip, 0, "REP must remain interruptible after 2048 iterations");
+                        assert_eq!(regs.get(1, 4), high | 5);
+                        assert!(super::emulate(&mut bus, &mut regs, 0, default32, &bases, 17 + 2048 * size));
+                        assert_eq!(*regs.ip, code.len() as u32);
+                        assert_eq!(*regs.flags, 0xA03);
+                        assert_eq!(regs.get(1, 4), high);
+                        assert_eq!(regs.get(6, 4), high | (0x1000 + 2053 * size));
+                        assert_eq!(regs.get(7, 4), high | (17 + 2053 * size));
+                        if bulk { assert_eq!(bus.copied, [2048 * size, 5 * size]); }
+                        else { assert!(bus.copied.is_empty()); }
+                        results.push(bus.vram);
+                    }
+                    assert_eq!(results[0], results[1]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_movs_falls_back_for_backward_wrap_and_device_source() {
+        for (addr32, source, destination, count, flags) in [
+            (true, 0x1010, 20, 4, 0x602), // DF: individual elements descend.
+            (false, 0xfffc, 20, 4, 0x202), // SI wraps within its 16-bit segment.
+            (true, 0x40004, 8, 4, 0x202), // VRAM source, including overlapping MOVS.
+            (true, 0x1000, 20, 0, 0x202), // No reads or writes for zero REP count.
+        ] {
+            let mut results = alloc::vec::Vec::new();
+            for bulk in [false, true] {
+                let mut bus = CopyBus { ram: (0..0x20000).map(|i| (i as u8).wrapping_mul(37)).collect(),
+                    vram: (0..65536).map(|i| i as u8).collect(), bulk, copied: alloc::vec::Vec::new() };
+                let code: &[u8] = if addr32 { &[0xf3, 0xa5] } else { &[0x67, 0xf3, 0xa5] };
+                bus.ram[..code.len()].copy_from_slice(code);
+                let mut words = [MaybeUninit::new(0); 16];
+                let (mut ip, mut fl) = (0, flags);
+                let mut regs = Operands { gprs: &mut words, ip: &mut ip, flags: &mut fl };
+                regs.set(6, 4, source); regs.set(7, 4, destination); regs.set(1, 4, count);
+                assert!(super::emulate(&mut bus, &mut regs, 0, true, &[0x40000, 0, 0, 0, 0, 0], destination));
+                assert!(bus.copied.is_empty());
+                results.push((bus.vram, regs.get(6, 4), regs.get(7, 4), regs.get(1, 4), *regs.ip, *regs.flags));
+            }
+            assert_eq!(results[0], results[1]);
+        }
+    }
+
     #[test]
     fn string_font_reads_honour_each_source_segment_override() {
         for (index, prefix) in [0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65].into_iter().enumerate() {

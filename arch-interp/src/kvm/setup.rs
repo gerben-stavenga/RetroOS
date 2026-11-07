@@ -55,7 +55,7 @@ fn init() -> KvmCpu {
     };
     unsafe { vm.set_user_memory_region(region) }.expect("KVM_SET_USER_MEMORY_REGION");
 
-    let vcpu = vm.create_vcpu(0).expect("KVM_CREATE_VCPU");
+    let mut vcpu = vm.create_vcpu(0).expect("KVM_CREATE_VCPU");
 
     // Host-supported CPUID, minus the paravirt tells: the guest is meant to see
     // a plain (fast) PC, exactly like metal. Zero the hypervisor leaves and the
@@ -79,36 +79,72 @@ fn init() -> KvmCpu {
     // the first per-entry I/O policy installation).
     super::shim::ensure_shim();
 
-    arm_timer_kick();
+    install_alarm(&mut vcpu);
 
     let sregs0 = vcpu.get_sregs().expect("KVM_GET_SREGS");
     KvmCpu { _vm: vm, vcpu, dbg_control: 0, sregs0 }
 }
 
-/// Program the real-time preemption kick: a 1 ms CLOCK_MONOTONIC timer signals
-/// THIS thread (SIGEV_THREAD_ID) with SIGURG. The handler is a no-op installed
-/// WITHOUT SA_RESTART, so a signal landing during `KVM_RUN` bounces the ioctl
-/// out with EINTR — the engine returns `KernelEvent::Irq` and the kernel pumps
-/// its timer from monotonic `now()` deltas. A signal landing while host code runs
-/// is consumed harmlessly (nothing is lost: ticks are derived from elapsed
-/// time, not from counting kicks). 1 ms matches metal's 1 kHz PIT grid.
-fn arm_timer_kick() {
+use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+// One hosted execution CPU. The signal handler only writes KVM's documented
+// immediate_exit byte; no allocation, locks, or guest-state borrowing.
+static CPU_TID: AtomicI32 = AtomicI32::new(0);
+static IMMEDIATE_EXIT: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+thread_local! {
+    static TIMER: std::cell::Cell<Option<libc::timer_t>> = const { std::cell::Cell::new(None) };
+}
+extern "C" fn alarm_signal(_: libc::c_int) {
+    let pointer = IMMEDIATE_EXIT.load(Ordering::Acquire);
+    if !pointer.is_null() { unsafe { pointer.write_volatile(1); } }
+}
+fn install_alarm(vcpu: &mut VcpuFd) {
     unsafe {
-        extern "C" fn noop(_: libc::c_int) {}
         let mut sa: libc::sigaction = core::mem::zeroed();
-        sa.sa_sigaction = noop as *const () as usize;
-        sa.sa_flags = 0; // no SA_RESTART: KVM_RUN must EINTR
+        sa.sa_sigaction = alarm_signal as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         assert_eq!(libc::sigaction(libc::SIGURG, &sa, core::ptr::null_mut()), 0);
-
+        CPU_TID.store(libc::gettid(), Ordering::Release);
+        IMMEDIATE_EXIT.store(&raw mut vcpu.get_kvm_run().immediate_exit, Ordering::Release);
         let mut sev: libc::sigevent = core::mem::zeroed();
         sev.sigev_notify = libc::SIGEV_THREAD_ID;
         sev.sigev_signo = libc::SIGURG;
         sev.sigev_notify_thread_id = libc::gettid();
         let mut timer: libc::timer_t = core::mem::zeroed();
         assert_eq!(libc::timer_create(libc::CLOCK_MONOTONIC, &mut sev, &mut timer), 0);
-        let period = libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 };
-        let spec = libc::itimerspec { it_interval: period, it_value: period };
-        assert_eq!(libc::timer_settime(timer, 0, &spec, core::ptr::null_mut()), 0);
+        TIMER.with(|slot| slot.set(Some(timer)));
+    }
+    arm_alarm(crate::machine::alarm_deadline());
+}
+pub(crate) fn arm_alarm(deadline: Option<u64>) {
+    TIMER.with(|slot| {
+        if let Some(timer) = slot.get() {
+            // Convert between clock epochs once, then ask POSIX for a one-shot
+            // absolute alarm. A zero it_value means cancellation, never "now".
+            let mut clock: libc::timespec = unsafe { core::mem::zeroed() };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock); }
+            let remaining = deadline.map(|end| end.saturating_sub(crate::machine::now()));
+            let nanos = remaining.map_or(0, |delta|
+                (clock.tv_sec as u64).saturating_mul(1_000_000_000)
+                    .saturating_add(clock.tv_nsec as u64).saturating_add(delta.max(1)));
+            let value = libc::timespec { tv_sec: (nanos / 1_000_000_000) as _, tv_nsec: (nanos % 1_000_000_000) as _ };
+            let spec = libc::itimerspec { it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 }, it_value: value };
+            assert_eq!(unsafe { libc::timer_settime(timer, libc::TIMER_ABSTIME, &spec, core::ptr::null_mut()) }, 0);
+        }
+    });
+}
+pub(crate) fn kick() {
+    let tid = CPU_TID.load(Ordering::Acquire);
+    if tid != 0 { unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, libc::SIGURG); } }
+}
+
+impl Drop for KvmCpu {
+    fn drop(&mut self) {
+        // Revoke the signal target before VcpuFd unmaps kvm_run. A final alarm
+        // during TLS teardown must never write through a dangling pointer.
+        IMMEDIATE_EXIT.store(core::ptr::null_mut(), Ordering::Release);
+        CPU_TID.store(0, Ordering::Release);
+        let _ = TIMER.try_with(|slot| {
+            if let Some(timer) = slot.take() { unsafe { libc::timer_delete(timer); } }
+        });
     }
 }

@@ -94,6 +94,9 @@ impl VirtualKeyboard {
     /// Returns true when a byte surfaced — the caller raises the IRQ1 edge:
     /// exactly one edge per byte, blind to whatever the guest's handler is
     /// doing (the PIC's IRR/ISR takes it from there, as on real hardware).
+    pub fn next_deadline(&self) -> Option<u64> {
+        (!self.obf && self.head != self.tail).then(|| self.last_surface_ns.saturating_add(1_000_000))
+    }
     pub fn try_surface(&mut self, now_ns: u64) -> bool {
         if self.obf || self.head == self.tail
             || now_ns.saturating_sub(self.last_surface_ns) < 1_000_000

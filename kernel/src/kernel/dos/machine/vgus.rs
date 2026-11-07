@@ -34,6 +34,9 @@ pub struct Gus {
 
 impl Gus {
     /// Absent until the program's env declares it (ULTRASND).
+    pub(super) fn needs_clock(&self) -> bool { self.card.mixing() || self.card.wants_service() }
+    pub(super) fn next_event_ns(&self) -> Option<u64> { self.card.next_event_ns() }
+
     pub fn new() -> Self {
         Gus {
             base: 0x240,

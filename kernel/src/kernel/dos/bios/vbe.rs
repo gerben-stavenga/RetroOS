@@ -292,7 +292,7 @@ fn translate_pm_display_start<A: crate::Arch>(
     };
     let Some(svga) = svga else { return false };
     let address = (u32::from(regs.rdx as u16) << 16) | u32::from(regs.rcx as u16);
-    let Some((x, y)) = pm_display_coordinates(address, svga.logical_pitch, svga.config.bits_per_pixel) else {
+    let Some((x, y)) = pm_display_coordinates(address, svga.logical_pitch.get(), svga.config.bits_per_pixel) else {
         return false;
     };
     regs.rcx = u64::from(x);
@@ -662,7 +662,7 @@ fn vbe_set_mode<A: crate::Arch>(
             }
         };
         if success
-            && let Some(state) = bios_display.vbe_state().copied()
+            && let Some(state) = bios_display.vbe_state().cloned()
         {
             machine::vga::select_native_svga_aperture(
                 machine, state.mode, state.svga.access);

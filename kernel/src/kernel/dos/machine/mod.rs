@@ -272,6 +272,16 @@ impl AudioDevices {
     /// Media-core mixer: resident sample storage only; IRQ delivery is deferred
     /// to the guest core. The surrounding Shared guard excludes port accesses.
     /// Returns the rendered prefix; the engine retains unfilled output for retry.
+    pub(crate) fn needs_clock(&self) -> bool {
+        self.sb.needs_irq_service() || self.gus.needs_clock()
+    }
+    pub(crate) fn next_deadline(&self, now: u64) -> Option<u64> {
+        if self.pending_irqs != 0 { return Some(now); }
+        let last = self.service_ns.unwrap_or(now);
+        let sb = self.sb.needs_irq_service().then(|| last.saturating_add(1_000_000));
+        let gus = self.gus.next_event_ns().map(|delta| last.saturating_add(delta));
+        sb.into_iter().chain(gus).chain(self.sb.clock_deadline()).min()
+    }
     pub fn mix(&mut self, now_ns: u64, span: crate::kernel::sound::AudioSpan<'_>) -> usize {
         self.mix_with(now_ns, span, None)
     }
@@ -454,7 +464,7 @@ impl MouseState {
     /// mode 13h hide the driver cursor and draw their own anyway.
     pub fn render_if_visible<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo, _regs: &mut Regs) {
         if self.show_count > 0 { return; }
-        let _live_access = vga::live_access();
+
         if !matches!(super::bios::Bda::video_mode(machine), 0..=3 | 7) {
             self.drawn_at = None;
             return;
@@ -465,7 +475,6 @@ impl MouseState {
         let offset = (row * 80 + col) as u16;
         if Some(offset) == self.drawn_at { return; }
         self.erase_cursor(machine, vga);
-        vga::scanout_changed();
         let cell = (VGA_TEXT_BASE + offset as u32 * 2) as usize;
         self.saved_attr = (vga::read_video_word(machine, vga, cell) >> 8) as u8;
         vga::copy_to_guest(machine, vga, cell + 1, &[self.saved_attr ^ 0x77]);
@@ -475,8 +484,6 @@ impl MouseState {
     /// Restore the original attribute under the current cursor cell.
     pub fn erase_cursor<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo) {
         if let Some(old) = self.drawn_at.take() {
-            let _live_access = vga::live_access();
-            vga::scanout_changed();
             vga::copy_to_guest(machine, vga, (VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, &[self.saved_attr]);
         }
     }
@@ -678,7 +685,7 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
                     crate::kernel::drivers::vga_hw::track_ac_reset();
                     machine.inb(0x3DA)
                 }
-                LegacyVgaIo::Vbe(_) => input_status1(machine, &pc.scanout),
+                LegacyVgaIo::Vbe(state) => state.timing().status(machine.now()),
             }
         }
         // VGA ports — pass through to legacy hardware, use the emulated VGA
@@ -776,7 +783,6 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
 
 /// Emulate OUT to a port.
 pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, val: u8) {
-    if (0x3C0..=0x3DF).contains(&port) { vga::scanout_changed(); }
     match port {
         0x3f8..=0x3ff => { pc.uart.write(port - 0x3f8, val); if pc.uart.poll_irq() { pc.vpic.raise(4); } },
         // VGA ports — pass through to hardware (tracking the AC flip-flop +
@@ -891,33 +897,6 @@ fn seg_base_for<A: crate::Arch>(regs: &Regs, sel: u16) -> u32 {
     } else {
         A::seg_base(sel)
     }
-}
-
-/// VGA Input Status #1 for the emulated card (see the `emulate_inb` 0x3DA
-/// arm): bit 3 = vertical retrace, bit 0 = blanking, vsync forcing blanking.
-///
-/// Bit 3 is the direct scanout clock's retrace phase. Its trailing edge
-/// captures VRAM/register/DAC state into one complete shadow, so updates made
-/// while this bit is set enter the next rendered frame. Displays without a
-/// live direct scanout clock (window sink, unfocused thread) fall back to a
-/// fabricated free-running 70 Hz phase, asserted 8/32 steps ≈ 3.6 ms/frame.
-///
-/// Bit 0 (display-disabled / blanking) — per-read counter toggling every 8
-/// reads. Models *horizontal* blanking, which on real VGA pulses at
-/// ~31.5 kHz (every scanline); frame-scale blanking makes Build engine's
-/// per-DAC-entry snow-avoidance wait too slow. Runs of 8 ones/zeros also
-/// satisfy "6+ consecutive bit0=X" idioms (Wolf3D's VL_SetScreen
-/// pre-CRTC-write wait, etc.)
-fn input_status1<A: crate::Arch>(machine: &mut A, beam: &crate::kernel::display::Scanout) -> u8 {
-    let ticks = machine.get_ticks();
-    let vr = crate::kernel::display::beam_vretrace(beam, ticks).unwrap_or_else(|| {
-        let phase = ((ticks.wrapping_mul(70 * 32)) / 1000) as u32 & 31;
-        phase >= 24
-    });
-    use core::sync::atomic::{AtomicU32, Ordering};
-    static DA_READ_COUNT: AtomicU32 = AtomicU32::new(0);
-    let hbl = (DA_READ_COUNT.fetch_add(1, Ordering::Relaxed) >> 3) & 1 != 0;
-    (if vr { 0x08 } else { 0 }) | (if vr || hbl { 0x01 } else { 0 })
 }
 
 /// Bus/device/function the emulated Voodoo answers at. Nothing else responds,
@@ -1055,7 +1034,7 @@ fn guest_inb<A: crate::Arch>(
 ) -> u8 {
     if pc.vga.native().is_some() && !bios.native_legacy_active() {
         return match port {
-            0x3DA => input_status1(machine, &pc.scanout),
+            0x3DA => bios.vbe_state().map_or(0xFF, |state| state.svga.timing().status(machine.now())),
             0x3C6..=0x3C9 => bios.vbe_port_read(port).map_or(0xFF, |value| value),
             0x3C0..=0x3DF => 0xFF,
             _ => emulate_inb(machine, pc, port),

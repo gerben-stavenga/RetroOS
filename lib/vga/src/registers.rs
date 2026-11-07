@@ -1,8 +1,24 @@
 //! The device's register storage. The guest and scanout access the same cells;
 //! no renderer publication, spinlock, or mutable slice aliases these bytes.
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
 
+#[derive(Debug)]
+pub struct Word(AtomicU16);
+impl Word {
+    pub fn new(value: u16) -> Self { Self(AtomicU16::new(value)) }
+    pub fn get(&self) -> u16 { self.0.load(Ordering::Relaxed) }
+    pub fn set(&self, value: u16) { self.0.store(value, Ordering::Relaxed); }
+}
+#[derive(Debug)]
+pub struct Dword(AtomicU32);
+impl Dword {
+    pub fn new(value: u32) -> Self { Self(AtomicU32::new(value)) }
+    pub fn get(&self) -> u32 { self.0.load(Ordering::Relaxed) }
+    pub fn set(&self, value: u32) { self.0.store(value, Ordering::Relaxed); }
+}
+
+#[derive(Debug)]
 pub struct Byte(AtomicU8);
 impl Byte {
     pub fn new(value: u8) -> Self { Self(AtomicU8::new(value)) }
@@ -10,6 +26,7 @@ impl Byte {
     #[inline] pub fn set(&self, value: u8) { self.0.store(value, Ordering::Relaxed); }
 }
 #[repr(transparent)]
+#[derive(Debug)]
 pub struct Bytes<const N: usize>([AtomicU8; N]);
 impl<const N: usize> Bytes<N> {
     pub fn new(values: [u8; N]) -> Self { Self(values.map(AtomicU8::new)) }

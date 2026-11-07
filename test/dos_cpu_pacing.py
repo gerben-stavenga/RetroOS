@@ -79,7 +79,7 @@ def main():
             text = result.stdout.decode(errors='replace')
             ticks = [int(n, 16) for n in re.findall(r'PACING TICKS=([0-9A-F]{4})', text)]
             if result.returncode or not ticks or 'panicked' in text:
-                raise AssertionError(command + '\n' + text)
+                raise AssertionError(command + f' (exit={result.returncode})\n' + text)
             print(command, ticks, flush=True)
             return ticks, text
 

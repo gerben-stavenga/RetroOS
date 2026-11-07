@@ -179,6 +179,12 @@ pub trait Arch: Sized + GuestBytes {
     /// Resume the active space with `regs` and return the next kernel-visible
     /// event, leaving `regs` holding the post-run register state.
     fn execute(&mut self, regs: &mut Regs, io: &crate::IoPolicy) -> KernelEvent;
+    /// Execute a bounded, synchronous firmware transaction. Kernel alarms and
+    /// queued input are deferred until its owner returns to the event loop;
+    /// they must not prevent a BIOS helper from finishing after an IRQ exit.
+    fn execute_firmware(&mut self, regs: &mut Regs, io: &crate::IoPolicy) -> KernelEvent {
+        self.execute(regs, io)
+    }
 
     /// Replace both native IDT entries, returning the previous handler pair.
     /// Backends without a native IDT leave this operation unused.
@@ -219,10 +225,18 @@ pub trait Arch: Sized + GuestBytes {
 
     // ── Timer ──────────────────────────────────────────────────────────────
 
-    /// Monotonic time in nanoseconds. The periodic timer is only a wakeup: it
+    /// Monotonic time in nanoseconds. A timer alarm is only a wakeup: it
     /// forces `execute` to return, while this clock remains the sole authority
     /// for how much time elapsed.
     fn now(&self) -> u64;
+    /// Arm one wakeup at an absolute `now()` timestamp, or cancel with None.
+    /// An elapsed deadline must wake promptly, including when it passes during
+    /// programming. The interrupt identifies no logical timer. Called only at
+    /// the event loop's exit; repeated I/O exits must not postpone the deadline.
+    fn arm_alarm(&mut self, _deadline_ns: Option<u64>) {}
+    /// Service architecture-owned polling devices and return their next alarm.
+    /// Also exposes maintenance required by wrapping clock sources.
+    fn poll_timed_devices(&mut self, _now_ns: u64) -> Option<u64> { None }
     /// No guest thread can run this iteration. Hardware clocks keep ticking;
     /// deterministic interpreters must also advance idle time without retiring
     /// synthetic guest instructions. Return promptly to service input/devices.

@@ -58,10 +58,9 @@ pub fn execute<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>,
                 profile: u32::from(crate::kernel::startup::profile_enabled()),
                 cycles_lo: 0, cycles_hi: 0, start_lo: 0, start_hi: 0,
                 inline_scanout: u32::from(!crate::kernel::media::enabled()),
-                handoff_request: crate::kernel::media::GUEST_MEMORY.request_flag() as u32,
+                profile_kind: 0, profile_details: [[0; 4]; 5],
             };
-            // The event loop holds live_access across guest execution. The
-            // callback only touches resident device state and atomic VRAM.
+            // The callback only touches resident device state and atomic VRAM.
             let mut context = Context {
                 fast, state, ldt: &dos.ldt[..], planes: base.as_ptr(),
                 dma: &mut dos.pc.dma, audio: &dos.pc.audio,
@@ -90,6 +89,9 @@ pub fn execute<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>,
                 if context.stepped { event = crate::KernelEvent::EmulatedStep { user_was: context.user_tf }; }
                 else if context.yielded { event = crate::KernelEvent::Irq; }
                 let fast_cycles = (u64::from(context.fast.cycles_hi) << 32) | u64::from(context.fast.cycles_lo);
+                if context.fast.profile != 0 {
+                    crate::kernel::event_profile::record_device_entries(context.fast.profile_details);
+                }
                 return (event, fast_cycles);
             }
         }
@@ -108,12 +110,14 @@ struct Fast {
     end: u32, plane_mask: u32, profile: u32,
     cycles_lo: u32, cycles_hi: u32, start_lo: u32, start_hi: u32,
     inline_scanout: u32, // synchronous scanout requires a Rust deadline check
-    handoff_request: u32,
+    profile_kind: u32,
+    // Per kind: calls low/high, cycles low/high. All offsets stay u32-aligned.
+    profile_details: [[u32; 4]; 5],
 }
 
 #[cfg(target_arch = "x86")]
 const _: () = {
-    assert!(core::mem::size_of::<Fast>() == 68);
+    assert!(core::mem::size_of::<Fast>() == 148);
     assert!(core::mem::offset_of!(Fast, decode) == 4);
     assert!(core::mem::offset_of!(Fast, code_base) == 16);
     assert!(core::mem::offset_of!(Fast, planes) == 24);
@@ -122,7 +126,8 @@ const _: () = {
     assert!(core::mem::offset_of!(Fast, cycles_lo) == 44);
     assert!(core::mem::offset_of!(Fast, start_lo) == 52);
     assert!(core::mem::offset_of!(Fast, inline_scanout) == 60);
-    assert!(core::mem::offset_of!(Fast, handoff_request) == 64);
+    assert!(core::mem::offset_of!(Fast, profile_kind) == 64);
+    assert!(core::mem::offset_of!(Fast, profile_details) == 68);
 };
 
 #[cfg(target_arch = "x86")]
@@ -231,8 +236,7 @@ unsafe extern "C" fn planar_fault(pointer: *mut u8, wide: u32, address: u32) -> 
     let context = unsafe { &mut *ACTIVE.cast::<Context<'_>>() };
     let mut frame = Frame { pointer, wide: wide != 0 };
     let handled = if !(context.base..context.end).contains(&address) { 0 }
-        else if crate::kernel::media::GUEST_MEMORY.reader_requested()
-            || crate::kernel::media::inline_video_due()
+        else if crate::kernel::media::inline_video_due()
         {
             // Scheduling point only: ring 1 services scanout, then retries
             // this still-unexecuted instruction in the ring-0 handler.
@@ -279,7 +283,6 @@ unsafe extern "C" fn device_io(pointer: *mut u8, wide: u32, _: u32) -> u32 {
         context.pit_deadline = context.pit.irq_deadline_ns();
         return 0;
     }
-    if crate::kernel::media::GUEST_MEMORY.reader_requested() { return 0; }
     if crate::kernel::media::inline_video_due() { return 0; }
     let port = if matches!(opcode, 0xe4 | 0xe6) {
         if ip.checked_add(length).is_none_or(|end| end > context.fast.code_limit) { return 0; }
@@ -310,7 +313,6 @@ unsafe extern "C" fn device_io(pointer: *mut u8, wide: u32, _: u32) -> u32 {
             if opcode == 0xef && operand32 { return 0; }
             if !mask_out(context.state, port, frame.read(0) as u16, opcode == 0xef) { return 0; }
             context.fast.plane_mask = u32::from(context.state.seq.get(2) & 15);
-            super::machine::vga::scanout_changed();
         }
         _ => return 0,
     }
@@ -354,6 +356,16 @@ impl Context<'_> {
         let ds = if vm86 { u32::from(ds) << 4 } else { segments::seg_base(self.ldt, ds) };
         let es = if vm86 { u32::from(es) << 4 } else { segments::seg_base(self.ldt, es) };
         let (base, cs, default32) = (self.base, self.fast.code_base, self.fast.default32 != 0);
+        if self.fast.profile != 0 {
+            let address = cs.wrapping_add(frame.ip()) as usize;
+            let available = (crate::PAGE_SIZE - (address & (crate::PAGE_SIZE - 1))).min(4);
+            let mut bytes = [0; 4];
+            for (index, byte) in bytes[..available].iter_mut().enumerate() {
+                *byte = unsafe { core::ptr::with_exposed_provenance::<u8>(address + index).read_volatile() };
+            }
+            let count = if default32 { frame.read(8) } else { frame.read(8) & 0xffff };
+            crate::kernel::event_profile::record_vga_instruction(frame.cs(), frame.ip(), u32::from_le_bytes(bytes), count);
+        }
         let (ss, fs, gs) = frame.other_selectors();
         let segment = |sel| if vm86 { u32::from(sel) << 4 } else { segments::seg_base(self.ldt, sel) };
         let bases = [es, cs, segment(ss), ds, segment(fs), segment(gs)];
@@ -377,6 +389,15 @@ impl super::machine::mmio::FaultBus for Context<'_> {
     }
     fn guest_read(&self, address: u32) -> u8 { unsafe { core::ptr::with_exposed_provenance::<u8>(address as usize).read_volatile() } }
     fn guest_write(&mut self, address: u32, value: u8) { unsafe { core::ptr::with_exposed_provenance_mut::<u8>(address as usize).write_volatile(value); } }
+    fn copy_from_ram(&mut self, source: u32, destination: u32, len: u32) -> bool {
+        let Some(source_end) = source.checked_add(len) else { return false };
+        let Some(destination_end) = destination.checked_add(len) else { return false };
+        if destination < self.base || destination_end > self.end
+            || source < self.end && source_end > self.base { return false; }
+        let planes = unsafe { ::vga::memory::Memory::mapped(self.planes, super::machine::vga::PLANES_LEN) };
+        self.state.write_sequential_span(planes, (destination - self.base) as usize, len as usize,
+            |i| unsafe { core::ptr::with_exposed_provenance::<u8>(source as usize + i).read_volatile() })
+    }
     fn fpu_st0(&self) -> [u8; 10] {
         let mut value = [0; 10];
         unsafe { core::arch::asm!("fstp tbyte ptr [{p}]", "fld tbyte ptr [{p}]", p = in(reg) value.as_mut_ptr(), options(nostack)); }

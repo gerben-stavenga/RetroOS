@@ -1442,10 +1442,6 @@ fn event_loop<A: crate::Arch>(
     let mut last_osd_refresh_tick = u64::MAX;
     let mut last_osd_composite_period = u64::MAX;
     let mut last_world_ns = machine.now();
-    // Metal IRQ0 queues Irq::Hw(0); execute() can also return
-    // KernelEvent::Irq (including other physical or virtual interrupts).
-    // Either is only permission to resample the real clock.
-    let mut irq_clock_wakeup = false;
     let mut exiting_display = None;
     let audio = unsafe { crate::kernel::media::AudioService::new(
         crate::kernel::sound::Engine::new(sink.take(), machine.now()),
@@ -1457,14 +1453,6 @@ fn event_loop<A: crate::Arch>(
     let mut sound_view_tick = u64::MAX;
     let mut execution_profile_on = false;
     let mut pending_events = crate::kernel::irq_dispatch::PendingEvents::default();
-    // Diagnose a running guest whose display/audio never advance because the
-    // event loop stops sampling time. The independent
-    // clock sample is sparse, so port-polling DOS programs keep their usual
-    // fast exit path. A single warning is enough for the persistent klog.
-    let mut clock_diag_last_sample_ns = last_world_ns;
-    let mut clock_diag_passes_since_sample = 0u64;
-    let mut clock_diag_seen_sample = false;
-    let mut clock_diag_warned = false;
     // The event loop is the execution engine and sole owner of window policy.
     // A missing display means the initial DOS window holds the fullscreen
     // direct-scanout lease; otherwise the compositor starts on the desktop.
@@ -1493,17 +1481,34 @@ fn event_loop<A: crate::Arch>(
     // at a bounded interval instead.
     const KLOG_SYNC_NS: u64 = 500_000_000;
     let mut next_klog_sync_ns = last_world_ns.saturating_add(KLOG_SYNC_NS);
-    let mut klog_check_passes = 0u32;
+    use super::alarm::{Deadlines, Periodic};
+    let mut network_service = Periodic::new(last_world_ns, 1_000_000);
+    let mut display_service = Periodic::new(last_world_ns, 16_666_667);
+    let mut blocked_io_service = Periodic::new(last_world_ns, 1_000_000);
+    let mut injected_keys = Periodic::new(last_world_ns, 1_000_000);
+    let mut quantum = Periodic::new(last_world_ns, 10_000_000);
+    let mut hardware_deadline = None;
+    let mut hardware_initialized = false;
 
     loop {
+        let world_now_ns = machine.now();
+        if !hardware_initialized || hardware_deadline.is_some_and(|end| end <= world_now_ns) {
+            hardware_deadline = machine.poll_timed_devices(world_now_ns);
+            hardware_initialized = true;
+        }
+        let network_active = crate::kernel::net::needs_poll();
+        let network_due = network_active && network_service.consume(world_now_ns);
+        let fullscreen = matches!(&threads[ctx.tid].personality,
+            thread::Personality::Dos(dos) if dos.pc.vga.is_fullscreen());
+        let display_active = display.is_some() || fullscreen || !crate::kernel::media::enabled();
+        let display_due = display_active && display_service.consume(world_now_ns);
+        let blocked_io_due = blocked_io_service.consume(world_now_ns);
+        let injected_due = injected_keys.consume(world_now_ns);
+        quantum.consume(world_now_ns);
         // Service synchronous VGA before handling queued kernel events.
         // The linear VBE fallback still uses the guest-memory handoff.
         // Audio DMA and legacy VGA read resident device storage independently.
         super::media::kernel_entry();
-        let handoff_stall = crate::kernel::portio::StallWatch::new("guest/media handoff");
-        crate::kernel::media::GUEST_MEMORY.yield_to_reader();
-        let _live_access = crate::kernel::dos::live_access();
-        drop(handoff_stall);
         crate::kernel::linux::reap_waited_child(machine, threads, ctx.tid);
         crate::kernel::linux::refresh_system_tasks(threads);
         if display.is_none() {
@@ -1517,10 +1522,9 @@ fn event_loop<A: crate::Arch>(
         stats.slice_begin(machine);
         pending_events.drain(machine);
         stats.part(machine, PROFILE_IRQ);
-        let tick_wakeup = pending_events.tick_wakeup;
         let events = &mut pending_events.events;
-        // RX IRQs wake the diagnostic UART; timer ticks only pace injected keys.
-        if crate::kernel::serial_control::poll(machine, events, tick_wakeup || irq_clock_wakeup) {
+        // RX IRQs wake the diagnostic UART; injected keys have a service deadline.
+        if crate::kernel::serial_control::poll(machine, events, injected_due) {
             crate::kernel::linux::debug_processes(threads, ctx.tid);
             let thread = ctx.thread(threads);
             let dos = match &thread.personality {
@@ -1532,23 +1536,11 @@ fn event_loop<A: crate::Arch>(
             dump_interrupted_thread(machine, &ctx.regs, dos);
         }
         stats.part(machine, PROFILE_SERIAL_CONTROL);
-        let execute_irq_exit = irq_clock_wakeup;
-        let clock_wakeup = tick_wakeup || execute_irq_exit;
-        if clock_wakeup { crate::kernel::net::poll(); }
+        if network_due { crate::kernel::net::poll(); }
         crate::kernel::linux::wake_record_locks(threads, ctx.tid, &mut ctx.regs);
-        let world_now_ns = if clock_wakeup {
-            irq_clock_wakeup = false;
-            machine.now()
-        } else {
-            last_world_ns
-        };
-        klog_check_passes = klog_check_passes.wrapping_add(1);
-        if clock_wakeup || klog_check_passes.is_multiple_of(256) {
-            let log_now_ns = if clock_wakeup { world_now_ns } else { machine.now() };
-            if log_now_ns >= next_klog_sync_ns {
-                crate::kernel::klog::sync_live();
-                next_klog_sync_ns = log_now_ns.saturating_add(KLOG_SYNC_NS);
-            }
+        if world_now_ns >= next_klog_sync_ns {
+            crate::kernel::klog::sync_live();
+            next_klog_sync_ns = world_now_ns.saturating_add(KLOG_SYNC_NS);
         }
         let now_tick = world_now_ns / 1_000_000;
         // Keep the F12 window list fresh while it is open,
@@ -1564,42 +1556,8 @@ fn event_loop<A: crate::Arch>(
             );
         }
         stats.part(machine, PROFILE_LOOP);
-        // The queue is cheap to drain when empty and carries the IRQ0 wakeup
-        // which gates clock sampling, so it cannot itself be clock-gated.
         let elapsed_ns = world_now_ns.saturating_sub(last_world_ns);
         last_world_ns = world_now_ns;
-        if clock_wakeup {
-            if !clock_diag_seen_sample {
-                crate::compact_dbg_println!(
-                    "CLOCK: first event-loop clock sample (queued_irq0={} execute_irq={})",
-                    tick_wakeup, execute_irq_exit,
-                );
-                clock_diag_seen_sample = true;
-            }
-            if clock_diag_warned {
-                crate::compact_dbg_println!(
-                    "CLOCK: clock sampling resumed after {} ms ({} loop passes)",
-                    world_now_ns.saturating_sub(clock_diag_last_sample_ns) / 1_000_000,
-                    clock_diag_passes_since_sample,
-                );
-                clock_diag_warned = false;
-            }
-            clock_diag_last_sample_ns = world_now_ns;
-            clock_diag_passes_since_sample = 0;
-        } else {
-            clock_diag_passes_since_sample = clock_diag_passes_since_sample.saturating_add(1);
-            if !clock_diag_warned && clock_diag_passes_since_sample.is_multiple_of(1024) {
-                let raw_now_ns = machine.now();
-                let silent_ms = raw_now_ns.saturating_sub(clock_diag_last_sample_ns) / 1_000_000;
-                if silent_ms >= 250 {
-                    crate::compact_dbg_println!(
-                        "CLOCK: no event-loop clock sample for {} ms ({} loop passes)",
-                        silent_ms, clock_diag_passes_since_sample,
-                    );
-                    clock_diag_warned = true;
-                }
-            }
-        }
 
         {
             let thread = ctx.thread(threads);
@@ -1637,20 +1595,20 @@ fn event_loop<A: crate::Arch>(
             {
                 thread.kernel.state = thread::ThreadState::Ready;
             }
-            if elapsed_ns != 0 && !crate::kernel::media::enabled() {
-                audio.lock().poll_inline(machine, world_now_ns);
+            if !crate::kernel::media::enabled() {
+                audio.lock().poll_inline_due(machine, world_now_ns);
             }
             stats.mark(machine, PROFILE_AUDIO);
             // Fullscreen scanout is display work too. Keeping it inside
             // advance_world incorrectly charged it to the devices bucket.
-            if elapsed_ns != 0
+            if display_due
                 && let thread::Personality::Dos(dos) = &mut thread.personality
                 && dos.pc.vga.is_fullscreen()
             {
                 crate::kernel::dos::pump_fullscreen(machine, &mut *bios_workspace,
                     dos, &ctx.regs, world_now_ns);
             }
-            if elapsed_ns != 0
+            if display_due
                 && thread.has_primary_window()
                 && let Some(display) = display.as_mut()
             {
@@ -1670,7 +1628,7 @@ fn event_loop<A: crate::Arch>(
         // Refresh UI status and publish scene transactions at 20 Hz while
         // the OSD is open. The resident renderer samples VGA and paints the
         // complete scene independently at the device refresh rate.
-        let osd_composite_due = if elapsed_ns == 0 {
+        let osd_composite_due = if !display_due {
             false
         } else if crate::kernel::osd::is_open() {
             const OSD_COMPOSITOR_HZ: u128 = 20;
@@ -1852,6 +1810,26 @@ fn event_loop<A: crate::Arch>(
         }
         stats.part(machine, PROFILE_INPUT);
 
+        let mut deadlines = Deadlines::new(world_now_ns);
+        deadlines.include(hardware_deadline);
+        if crate::kernel::klog::needs_sync() { deadlines.include(Some(next_klog_sync_ns)); }
+        if network_active { deadlines.include(Some(network_service.deadline())); }
+        if display_active { deadlines.include(Some(display_service.deadline())); }
+        if !crate::kernel::media::enabled() { deadlines.include(audio.lock().next_deadline()); }
+        if let Some(end) = crate::kernel::serial_control::next_deadline(world_now_ns) {
+            deadlines.include(Some(if end == world_now_ns { end } else { injected_keys.deadline() }));
+        }
+        let mut blocked_polling = false;
+        for (tid, thread) in threads.iter_mut().enumerate() {
+            if matches!(thread.kernel.state, thread::ThreadState::Unused | thread::ThreadState::Zombie) { continue; }
+            if tid != ctx.tid { thread.personality.advance_background_timers(world_now_ns); }
+            deadlines.include(thread.personality.next_deadline(world_now_ns, tid == ctx.tid));
+            blocked_polling |= thread.kernel.state == thread::ThreadState::Blocked
+                && thread.personality.needs_io_poll();
+        }
+        if blocked_polling { deadlines.include(Some(blocked_io_service.deadline())); }
+        if deadlines.immediate() { continue; }
+
         // A blocked thread holds the console but not the CPU: wait for input
         // to unblock it (above) or the F12 window picker to move on.
         let thread = ctx.thread(threads);
@@ -1863,7 +1841,7 @@ fn event_loop<A: crate::Arch>(
             };
             let next = crate::kernel::sched::focus_request(threads, ctx.tid)
                 .or_else(|| if dependency_wait { thread::schedule(threads, ctx.tid) } else { None })
-                .or_else(|| crate::kernel::sched::linux_blocked_successor(threads, ctx.tid, clock_wakeup));
+                .or_else(|| crate::kernel::sched::linux_blocked_successor(threads, ctx.tid, blocked_io_due));
             match next {
                 Some(next) => switch_focus_and_run(
                     machine,
@@ -1876,12 +1854,11 @@ fn event_loop<A: crate::Arch>(
                     &mut display,
                     &mut windows,
                 ),
-                None => machine.idle(),
+                None => {
+                    machine.arm_alarm(deadlines.next());
+                    machine.idle();
+                },
             }
-            // Hosted timers normally wake us by returning from a guest slice.
-            // With every guest thread asleep there is no slice; sample time
-            // after idle too, so audio and other timed services keep advancing.
-            irq_clock_wakeup = true;
             continue;
         }
 
@@ -1890,14 +1867,14 @@ fn event_loop<A: crate::Arch>(
         let paced = matches!(&thread.personality, thread::Personality::Dos(dos)
             if dos.cpu_pacer.limited());
         let run_started = if paced {
-            let now = machine.now();
+            let now = world_now_ns;
             if let thread::Personality::Dos(dos) = &thread.personality
                 && !dos.cpu_pacer.ready(now)
             {
                 // Hosted execution normally supplies clock wakeups on return
                 // from a guest slice. There is no slice while pacing it.
-                irq_clock_wakeup = true;
-                core::hint::spin_loop();
+                machine.arm_alarm(deadlines.next());
+                machine.idle();
                 continue;
             }
             now
@@ -1906,14 +1883,18 @@ fn event_loop<A: crate::Arch>(
         // Lend the CPU; canonicalize the outcome into an action.
         stats.pre_run(machine, &ctx.regs);
         let event_sample = super::event_profile::Sample::start(machine);
-        let kevent = ctx.run(machine, bios_workspace, &mut thread.personality);
+        // A CPU loan has an absolute budget; port exits never renew it.
+        deadlines.include(Some(quantum.deadline()));
+        let kevent = if thread.personality.timer_due(world_now_ns) {
+            // Due logical work is dispatched in this iteration, without an
+            // arch call or an artificial guest entry to provoke a wakeup.
+            crate::KernelEvent::Irq
+        } else {
+            machine.arm_alarm(deadlines.next());
+            ctx.run(machine, bios_workspace, &mut thread.personality)
+        };
         if paced && let thread::Personality::Dos(dos) = &mut thread.personality {
             dos.cpu_pacer.charge(run_started, machine.now());
-        }
-        if matches!(&kevent, crate::KernelEvent::Irq) {
-            // Hosted backends express their periodic preemption kick directly
-            // as KernelEvent::Irq rather than through the metal IRQ queue.
-            irq_clock_wakeup = true;
         }
         stats.post_run(machine, &kevent, &ctx.regs, ctx.device_cycles);
         let event_dispatch = event_sample.returned(machine, &kevent, &ctx.regs, &thread.personality);
@@ -3302,6 +3283,7 @@ fn dump_virtual_hw<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>) {
 static mut PROFILE_DUMP: bool = false;
 
 pub fn reset_profile() {
+    PROFILE_RESET.store(true, core::sync::atomic::Ordering::Relaxed);
     unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, ProfileSnapshot::EMPTY) };
     crate::kernel::osd_profile::reset();
     super::event_profile::reset();
@@ -3395,6 +3377,8 @@ impl ProfileSnapshot {
 }
 
 static mut PROFILE_SNAPSHOT: ProfileSnapshot = ProfileSnapshot::EMPTY;
+static PROFILE_RESET: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 static PROFILE_REBASE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -3498,7 +3482,8 @@ impl EventStats {
             return;
         }
         let now = machine.rdtsc();
-        if self.active {
+        let reset = PROFILE_RESET.swap(false, core::sync::atomic::Ordering::Relaxed);
+        if self.active && !reset {
             self.kernel_cycles[PROFILE_SCHEDULER] = self.kernel_cycles[PROFILE_SCHEDULER]
                 .wrapping_add(now.wrapping_sub(self.last_tsc));
         } else {

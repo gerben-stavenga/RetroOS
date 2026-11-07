@@ -198,6 +198,21 @@ impl LinuxState {
         alloc::sync::Arc::ptr_eq(&self.tty, &other.tty)
     }
 
+    pub(crate) fn timer_due(&self, now: u64) -> bool { self.alarm_deadline().is_some_and(|end| end <= now) }
+    pub(crate) fn expire_alarm(&mut self, now: u64) { self.alarm.expire(now); }
+    pub(crate) fn alarm_deadline(&self) -> Option<u64> {
+        [self.alarm.deadline(), async_io::next_deadline(&self.async_io),
+            self.pending_poll.as_ref().and_then(|poll| poll.deadline_ns),
+            self.pending_select.as_ref().and_then(|request| request.deadline()),
+            self.pending_socket.as_ref().and_then(|socket| socket.deadline)]
+            .into_iter().flatten().min()
+    }
+    pub(crate) fn needs_io_poll(&self) -> bool {
+        self.pending_poll.is_some() || self.pending_socket.is_some() || self.pending_select.is_some()
+            || self.pending_random.is_some() || self.pending_flock.is_some()
+            || self.pending_record_lock.is_some() || self.pending_readv.is_some()
+            || async_io::needs_poll(&self.async_io)
+    }
     pub(crate) fn has_blocked_work(&self) -> bool {
         self.pending_read.is_some() || self.pending_poll.is_some()
             || self.pending_socket.is_some() || self.pending_select.is_some()

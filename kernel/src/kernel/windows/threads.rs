@@ -824,3 +824,14 @@ fn native<A: crate::Arch>(
     }
     0
 }
+
+pub(super) fn next_deadline(state: &State) -> Option<u64> {
+    state.contexts.iter().filter_map(|context| match context.status {
+        Status::NativeWaiting(end) | Status::AlertWaiting(end) if end != u64::MAX => Some(end),
+        _ => None,
+    }).min()
+}
+pub(super) fn needs_io_poll(state: &State) -> bool {
+    state.contexts.iter().any(|context|
+        matches!(context.status, Status::NativeWaiting(_)) && !context.wait_handles.is_empty())
+}

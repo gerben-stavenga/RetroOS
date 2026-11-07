@@ -599,3 +599,9 @@ fn sync_activation(queue: &Queue) {
     }
     session::write_object_part(queue.input_offset, 4, &data);
 }
+
+/// Expired timers already contribute a queue notification until acknowledged.
+pub(super) fn next_deadline(state: &State, now: u64) -> Option<u64> {
+    state.queues.iter().flat_map(|queue| queue.timers.iter())
+        .map(|timer| timer.deadline).filter(|&end| end > now).min()
+}

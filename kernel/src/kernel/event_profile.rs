@@ -24,6 +24,44 @@ const READ_DETAIL_SLOTS: usize = 64;
 static mut READ_DETAILS: [(u16, u64, u64); READ_DETAIL_SLOTS] = [(0, 0, 0); READ_DETAIL_SLOTS];
 // calls, RM-call setup, DOS vector dispatch, continuation unwind.
 static mut DIRECT_RM_PHASES: [u64; 4] = [0; 4];
+// Native device shortcuts do not create event-loop events. Keep their cost
+// separate, including failed attempts that subsequently take the normal path.
+pub(super) const DEVICE_NAMES: [&str; 5] = ["vga_mov", "vga_generic", "vga_status", "vga_mask", "dma_poll"];
+static mut DEVICE_ENTRIES: [[u64; 2]; 5] = [[0; 2]; 5];
+#[derive(Clone, Copy)]
+pub(super) struct VgaInstruction { pub cs: u16, pub ip: u32, pub bytes: u32, pub calls: u64, pub max_count: u32 }
+const EMPTY_VGA: VgaInstruction = VgaInstruction { cs: 0, ip: 0, bytes: 0, calls: 0, max_count: 0 };
+static mut VGA_INSTRUCTIONS: [VgaInstruction; 32] = [EMPTY_VGA; 32];
+
+#[cfg(target_arch = "x86")]
+pub(super) fn record_vga_instruction(cs: u16, ip: u32, bytes: u32, count: u32) {
+    // Only the guest CPU writes; the event loop reads after that loan returns.
+    for entry in unsafe { &mut *core::ptr::addr_of_mut!(VGA_INSTRUCTIONS) } {
+        if entry.calls == 0 || (entry.cs == cs && entry.ip == ip && entry.bytes == bytes) {
+            *entry = VgaInstruction { cs, ip, bytes, calls: entry.calls.wrapping_add(1), max_count: entry.max_count.max(count) };
+            return;
+        }
+    }
+}
+
+pub(super) fn vga_instructions() -> [VgaInstruction; 32] {
+    unsafe { *core::ptr::addr_of!(VGA_INSTRUCTIONS) }
+}
+
+#[cfg(target_arch = "x86")]
+pub(super) fn record_device_entries(details: [[u32; 4]; 5]) {
+    for (kind, [calls_lo, calls_hi, cycles_lo, cycles_hi]) in details.into_iter().enumerate() {
+        unsafe {
+            let counters = &mut (&mut *core::ptr::addr_of_mut!(DEVICE_ENTRIES))[kind];
+            counters[0] = counters[0].wrapping_add(u64::from(calls_lo) | (u64::from(calls_hi) << 32));
+            counters[1] = counters[1].wrapping_add(u64::from(cycles_lo) | (u64::from(cycles_hi) << 32));
+        }
+    }
+}
+
+pub(super) fn device_entries() -> [[u64; 2]; 5] {
+    unsafe { *core::ptr::addr_of!(DEVICE_ENTRIES) }
+}
 
 pub(super) struct Sample(Option<u64>);
 pub(super) struct Dispatch(Option<(usize, u64, u64)>);
@@ -104,6 +142,8 @@ pub(super) fn reset() {
         RM_TARGETS = [(0, 0, 0, 0); RM_TARGET_SLOTS];
         READ_DETAILS = [(0, 0, 0); READ_DETAIL_SLOTS];
         DIRECT_RM_PHASES = [0; 4];
+        DEVICE_ENTRIES = [[0; 2]; 5];
+        VGA_INSTRUCTIONS = [EMPTY_VGA; 32];
     }
     super::block::cache::profile_reset();
 }
@@ -168,6 +208,13 @@ pub(super) fn visit_rm_targets(mut visit: impl FnMut(u8, u16, u16, u64)) {
 }
 
 pub(super) fn print() {
+    for (name, [calls, cycles]) in DEVICE_NAMES.into_iter().zip(device_entries()) {
+        crate::compact_println!("[device-prof] {} calls={} cycles={}", name, calls, cycles);
+    }
+    for entry in vga_instructions().into_iter().filter(|entry| entry.calls != 0) {
+        crate::compact_println!("[vga-instruction] at={:04x}:{:08x} bytes={:08x} calls={} max_count={}",
+            entry.cs, entry.ip, entry.bytes, entry.calls, entry.max_count);
+    }
     for c in unsafe { &*core::ptr::addr_of!(COUNTERS) } {
         if c.calls != 0 {
             crate::compact_println!(

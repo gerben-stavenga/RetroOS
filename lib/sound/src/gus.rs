@@ -463,6 +463,17 @@ impl Gf1 {
     }
 
     // T1 counts 80 µs units, T2 320 µs; unserviced expiries coalesce.
+    /// Remaining source time to the next rate-timer or deferred DMA event.
+    pub fn next_event_ns(&self) -> Option<u64> {
+        let c = self.core.as_ref()?;
+        if c.dma_irq_latch { return Some(0); }
+        c.timers.iter().enumerate().filter(|(_, timer)| timer.running)
+            .map(|(i, timer)| {
+                let unit = if i == 0 { 80_000u64 } else { 320_000 };
+                let count = if i == 0 { c.reg46 } else { c.reg47 };
+                (unit * u64::from(256 - u16::from(count))).saturating_sub(timer.acc_ns)
+            }).min()
+    }
     fn advance_timers(&mut self, dt_ns: u64) {
         let Some(c) = self.core.as_mut() else { return };
         // A long background gap coalesces rather than synthesizing a backlog.

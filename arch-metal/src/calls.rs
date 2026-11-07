@@ -369,3 +369,20 @@ pub fn arch_set_debug_watch(addrs: Option<(u32, u32)>) {
         );
     }
 }
+
+/// Program an absolute alarm from the ring-1 event-loop exit.
+pub fn arch_arm_alarm(deadline: Option<u64>) {
+    unsafe { core::arch::asm!("int 0x80",
+        in("eax") crate::arch_call::ARM_ALARM as u32,
+        in("edx") &deadline as *const Option<u64> as u32); }
+}
+pub fn arch_idle() {
+    unsafe { core::arch::asm!("int 0x80", in("eax") crate::arch_call::IDLE as u32); }
+}
+pub fn arch_poll_timed_devices(now: u64) -> Option<u64> {
+    let mut next = Some(now);
+    unsafe { core::arch::asm!("int 0x80",
+        in("eax") crate::arch_call::POLL_TIMED_DEVICES as u32,
+        in("edx") &mut next as *mut Option<u64> as u32); }
+    next
+}

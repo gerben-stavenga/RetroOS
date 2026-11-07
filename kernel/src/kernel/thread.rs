@@ -465,6 +465,44 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
+    /// Personality-owned timer alarms. Polling blocked I/O is scheduled by
+    /// the event loop separately, only while such requests exist.
+    #[inline(never)]
+    pub(crate) fn next_deadline(&self, now: u64, active: bool) -> Option<u64> {
+        match self {
+            Self::Dos(dos) => {
+                [Some(dos.pc.vpit.irq_deadline_ns()).filter(|&end| end != u64::MAX),
+                    dos.pc.vrtc.irq_deadline_ns(),
+                    dos.pc.vkbd.next_deadline().filter(|_| !dos.pc.vpic.in_service(1)),
+                    dos.cpu_pacer.deadline(now).filter(|_| active),
+                    dos.pc.audio.try_lock().map_or(Some(now.saturating_add(1_000_000)), |audio| audio.next_deadline(now)).filter(|_| active)].into_iter().flatten().min()
+            }
+            Self::Linux(linux) => linux.alarm_deadline().filter(|&end| end > now),
+            Self::Os2(os2) => os2.next_deadline(),
+            Self::Windows(windows) => windows.next_deadline(now),
+        }
+    }
+
+    pub(crate) fn timer_due(&self, now: u64) -> bool {
+        matches!(self, Self::Linux(linux) if linux.timer_due(now))
+    }
+    pub(crate) fn needs_io_poll(&self) -> bool {
+        match self {
+            Self::Linux(linux) => linux.needs_io_poll(),
+            Self::Windows(windows) => windows.needs_io_poll(),
+            _ => false,
+        }
+    }
+    #[inline(never)]
+    pub(crate) fn advance_background_timers(&mut self, now: u64) {
+        match self {
+            Self::Dos(dos) => crate::kernel::dos::advance_timers(dos, now),
+            Self::Os2(os2) => os2.advance_timers(now),
+            Self::Linux(linux) => linux.expire_alarm(now),
+            Self::Windows(_) => {},
+        }
+    }
+
     pub fn has_pending_message(&self) -> bool {
         matches!(self, Self::Os2(os2) if os2.has_pending_message())
     }

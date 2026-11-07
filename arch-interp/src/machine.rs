@@ -99,7 +99,7 @@ pub fn halt_forever() -> ! {
 
 // ── Timer / IRQ queue ────────────────────────────────────────────────────
 //
-// Every backend exposes one high-resolution monotonic `now()`. Periodic timer
+// Every backend exposes one high-resolution monotonic `now()`. Alarm
 // delivery merely returns control to the kernel; the event loop derives elapsed
 // time from consecutive samples. The virtual PIT and RTC retain a millisecond
 // compatibility view while their internal contracts are migrated.
@@ -133,16 +133,55 @@ static VIRT_CYCLES: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "tcg")]
 static VIRT_IDLE_NS: AtomicU64 = AtomicU64::new(0);
 
-/// Let timers advance while the kernel has parked all guest contexts. Keep
-/// idle duration separate from retired-instruction accounting.
+thread_local! {
+    static ALARM: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
+    static FIRMWARE_LOAN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+static INPUT_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+pub fn arm_alarm(deadline: Option<u64>) {
+    ALARM.with(|alarm| alarm.set(deadline));
+    #[cfg(feature = "kvm")]
+    crate::kvm::arm_alarm(deadline);
+}
+pub(crate) fn alarm_deadline() -> Option<u64> { ALARM.with(|alarm| alarm.get()) }
+#[cfg(any(feature = "kvm", test))]
+pub(crate) fn alarm_due() -> bool { !FIRMWARE_LOAN.with(|loan| loan.get()) && alarm_deadline().is_some_and(|end| now() >= end) }
+#[cfg(feature = "tcg")]
+pub(crate) fn instructions_to_alarm() -> usize {
+    if FIRMWARE_LOAN.with(|loan| loan.get()) { return usize::MAX; }
+    alarm_deadline().map_or(usize::MAX, |end|
+        (u128::from(end.saturating_sub(now())) * u128::from(VIRT_INSTR_PER_MS))
+            .div_ceil(1_000_000).min(usize::MAX as u128) as usize)
+}
+
+/// Wait under the input-queue lock so posting input and entering idle cannot
+/// lose a wakeup. Deterministic idle advances directly to the selected alarm.
 pub fn idle() {
     #[cfg(feature = "tcg")]
     {
-        const STEP_NS:u64=1_000_000;
-        VIRT_IDLE_NS.fetch_add(STEP_NS,Ordering::Relaxed);
-        crate::suite_control::advance_idle(STEP_NS);
+        if host_input_pending() { return; }
+        if let Some(end) = alarm_deadline() {
+            let elapsed = end.saturating_sub(now());
+            VIRT_IDLE_NS.fetch_add(elapsed, Ordering::Relaxed);
+            crate::suite_control::advance_idle(elapsed);
+        } else {
+            let queue = INPUT_QUEUE.lock().unwrap();
+            if queue.is_empty() { drop(INPUT_READY.wait(queue).unwrap()); }
+        }
+        std::thread::yield_now();
     }
-    std::thread::yield_now();
+    #[cfg(feature = "kvm")]
+    {
+        let queue = INPUT_QUEUE.lock().unwrap();
+        if !queue.is_empty() { return; }
+        if let Some(end) = alarm_deadline() {
+            let delay = end.saturating_sub(now());
+            if delay != 0 {
+                drop(INPUT_READY.wait_timeout(queue, std::time::Duration::from_nanos(delay)).unwrap());
+            }
+        } else { drop(INPUT_READY.wait(queue).unwrap()); }
+    }
 }
 
 /// Advance virtual time by `instructions` retired in a run slice. Called by the
@@ -202,8 +241,13 @@ pub fn set_irq_line(asserted: bool) {
 
 /// Read the INTR line (CPU core, per basic block — two cheap atomic loads).
 #[inline]
+pub(crate) fn host_input_pending() -> bool {
+    !FIRMWARE_LOAN.with(|loan| loan.get()) && INPUT_PENDING.load(Ordering::Relaxed)
+}
+pub(crate) fn firmware_loan(value: bool) -> bool { FIRMWARE_LOAN.with(|loan| loan.replace(value)) }
+
 pub(crate) fn irq_line() -> bool {
-    INPUT_PENDING.load(Ordering::Relaxed) || VPIC_LINE.load(Ordering::Relaxed)
+    host_input_pending() || VPIC_LINE.load(Ordering::Relaxed)
 }
 
 /// Post a hardware-input event from the host side (called off the CPU thread,
@@ -219,6 +263,9 @@ pub fn post_irq(irq: Irq) {
     if let Ok(mut q) = INPUT_QUEUE.lock() {
         q.push_back((irq, timestamp_ns));
         INPUT_PENDING.store(true, Ordering::Relaxed);
+        INPUT_READY.notify_one();
+        #[cfg(feature = "kvm")]
+        crate::kvm::kick();
     }
 }
 
@@ -268,5 +315,18 @@ mod input_tests {
         drain(|event, _| { assert!(matches!(event, Irq::Hw(5))); next += 1; });
         assert_eq!(next, 1);
         assert!(!INPUT_PENDING.load(Ordering::Relaxed));
+        #[cfg(feature = "tcg")]
+        {
+            let end = now() + 1_234_567;
+            arm_alarm(Some(end));
+            idle();
+            assert_eq!(now(), end);
+            assert!(alarm_due());
+            assert_eq!(instructions_to_alarm(), 0);
+            arm_alarm(None);
+            assert_eq!(instructions_to_alarm(), usize::MAX);
+        }
+
+
     }
 }
