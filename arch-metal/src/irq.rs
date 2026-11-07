@@ -530,8 +530,15 @@ fn init_monotonic_clock(hpet_base: Option<u64>) {
     }, hz);
 }
 
+// A one-millisecond wakeup can miss a DOS timer handler's lead-in to VGA
+// retrace. Death Rally arms its one-shot about 0.6 ms before retrace; missing
+// that edge delays its DMA refill by another video frame and replays audio.
+// Use 250 us wakeup resolution on modern machines. The nanosecond clock, rather
+// than the number of wakeups, still drives guest timers and device services.
+const LAPIC_TICK_HZ: u64 = 4_000;
+
 /// Measure the LAPIC timer input frequency against the HPET (a fixed,
-/// self-describing clock) and return the periodic initial-count for ~1000 Hz.
+/// self-describing clock) and return the periodic initial-count.
 /// Returns None when no usable HPET is present (then there is no fixed
 /// reference and the caller falls back to the PIT).
 fn calibrate_lapic_via_hpet() -> Option<u32> {
@@ -569,7 +576,7 @@ fn calibrate_lapic_via_hpet() -> Option<u32> {
     // slow. This was visible as a 44.1 kHz sink requiring a ~56 kHz numerical
     // mix rate to stay full on intermittent KVM boots.
     let lapic_hz = (elapsed as u128 * hpet_hz as u128 / hpet_elapsed as u128) as u64;
-    Some(((lapic_hz / 1000).max(1)) as u32)
+    Some(((lapic_hz / LAPIC_TICK_HZ).max(1)) as u32)
 }
 
 /// Calibrate the LAPIC timer against PIT channel 2 when firmware has no HPET
@@ -599,7 +606,7 @@ fn calibrate_lapic_via_pit2() -> Option<u32> {
     }
     let lapic_hz = (u128::from(lapic_elapsed) * u128::from(PIT_INPUT_HZ)
         / u128::from(pit_elapsed)) as u64;
-    Some(((lapic_hz / 1000).max(1)) as u32)
+    Some(((lapic_hz / LAPIC_TICK_HZ).max(1)) as u32)
 }
 
 /// Bring up the LAPIC timer as the system tick. Returns true on success; false
@@ -646,7 +653,7 @@ fn setup_lapic_timer() -> bool {
     lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LVT_TIMER_PERIODIC);
     lapic_write(LAPIC_INIT_COUNT, init_count);
     unsafe { core::ptr::write_volatile(&raw mut LAPIC_TIMER_ACTIVE, true); }
-    lib::compact_println!("IRQ: LAPIC timer tick (init_count={} ref={})", init_count, reference);
+    lib::compact_println!("IRQ: LAPIC timer tick (hz={} init_count={} ref={})", LAPIC_TICK_HZ, init_count, reference);
     true
 }
 
