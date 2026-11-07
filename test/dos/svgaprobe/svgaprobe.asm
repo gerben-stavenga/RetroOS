@@ -246,7 +246,8 @@ newline:      db 13, 10, '$'
 align 4
 ; mode, width, height, bpp, memory model
 modes:
-        dw 0x0141, 320, 200
+        ; Shared Bochs/SeaVGABIOS OEM numbering.
+        dw 0x0146, 320, 200
         db 8, 4
         dw 0x101, 640, 480
         db 8, 4
@@ -258,6 +259,8 @@ modes:
         db 16, 6
         dw 0x112, 640, 480
         db 24, 6
+        dw 0x142, 640, 480
+        db 32, 6
         dw 0
 
 align 4

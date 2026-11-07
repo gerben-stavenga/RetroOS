@@ -11,7 +11,7 @@ org 100h
     push cs
     pop es
     mov ax, 4f01h
-    mov cx, 140h
+    mov cx, 14dh ; RetroOS OEM 320x240x8
     mov di, info
     int 10h
     cmp ax, 004fh
@@ -25,7 +25,7 @@ org 100h
     cmp word [info+6], 64
     jne rm_fail
     mov ax, 4f02h
-    mov bx, 140h
+    mov bx, 14dh
     int 10h
     cmp ax, 004fh
     jne rm_fail

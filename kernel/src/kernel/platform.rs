@@ -125,6 +125,9 @@ pub struct Platform {
     /// thread came to mint its own copy of the machine's one card.
     pub audio_hw: AudioHw,
     pub firmware: Firmware,
+    /// Fixed framebuffer dimensions (GOP). Hosted sinks have no size limit;
+    /// native BIOS adapters supply their own mode catalogue instead.
+    pub framebuffer_size: Option<(usize, usize)>,
     /// Preferred packed mode advertised by the native video BIOS. It may be a
     /// linear framebuffer or a firmware-banked aperture.
     /// Discovered once at boot; selecting/mapping it still requires ownership
@@ -444,10 +447,13 @@ pub fn probe<A: crate::Arch>(
 
         let vga_readback = vga_passthrough && vga_readback_answers();
 
+        let framebuffer_size = display.as_ref().map(|display| display.composition_size(0, 0))
+            .filter(|&(width, height)| width != 0 && height != 0);
         (Platform {
             host: env.host(boot.is_qemu),
             vga_passthrough,
             firmware,
+            framebuffer_size,
             vbe_mode: None,
             voodoo_vbe_mode: None,
             voodoo_emulation: false,

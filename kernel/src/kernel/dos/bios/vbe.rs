@@ -6,18 +6,91 @@ use crate::kernel::dos::{dos, dpmi, machine, seg_offset, DosState};
 // VESA VBE (INT 10h AH=4Fh)
 // ============================================================================
 
-/// The banked SVGA modes we expose: (VBE mode#, width, height, bpp). Presented
-/// through the emulated framebuffer sink, integer-scaled/centred to the panel.
-/// 8bpp goes through the DAC palette; 15/16/24 are direct colour. Substitute
-/// path only — the native/SeaBIOS path has the card's own VBE.
+/// Bochs/SeaVGABIOS packed modes: (VBE mode#, width, height, bpp), plus
+/// RetroOS's 320x240 extension. Only modes fitting the fixed framebuffer and
+/// emulated VRAM are exposed, with both banked and linear access. Native BIOS
+/// systems retain the card's own mode catalogue.
 const VBE_MODES: &[(u16, u16, u16, u8)] = &[
-    (0x140, 320, 240, 8), // OEM mode number; clients discover it through 4F00h.
-    (0x141, 320, 200, 8), // Packed 8-bit mode, available banked and linear.
+    (0x100, 640, 400, 8),
     (0x101, 640, 480, 8),
     (0x103, 800, 600, 8),
+    (0x105, 1024, 768, 8),
+    (0x107, 1280, 1024, 8),
+    (0x10D, 320, 200, 15),
+    (0x10E, 320, 200, 16),
+    (0x10F, 320, 200, 24),
     (0x110, 640, 480, 15),
     (0x111, 640, 480, 16),
     (0x112, 640, 480, 24),
+    (0x113, 800, 600, 15),
+    (0x114, 800, 600, 16),
+    (0x115, 800, 600, 24),
+    (0x116, 1024, 768, 15),
+    (0x117, 1024, 768, 16),
+    (0x118, 1024, 768, 24),
+    (0x119, 1280, 1024, 15),
+    (0x11A, 1280, 1024, 16),
+    (0x11B, 1280, 1024, 24),
+    (0x11C, 1600, 1200, 8),
+    (0x11D, 1600, 1200, 15),
+    (0x11E, 1600, 1200, 16),
+    (0x11F, 1600, 1200, 24),
+    (0x140, 320, 200, 32),
+    (0x141, 640, 400, 32),
+    (0x142, 640, 480, 32),
+    (0x143, 800, 600, 32),
+    (0x144, 1024, 768, 32),
+    (0x145, 1280, 1024, 32),
+    (0x146, 320, 200, 8),
+    (0x147, 1600, 1200, 32),
+    (0x148, 1152, 864, 8),
+    (0x149, 1152, 864, 15),
+    (0x14A, 1152, 864, 16),
+    (0x14B, 1152, 864, 24),
+    (0x14C, 1152, 864, 32),
+    (0x14D, 320, 240, 8), // RetroOS OEM extension.
+    (0x175, 1280, 768, 16),
+    (0x176, 1280, 768, 24),
+    (0x177, 1280, 768, 32),
+    (0x178, 1280, 800, 16),
+    (0x179, 1280, 800, 24),
+    (0x17A, 1280, 800, 32),
+    (0x17B, 1280, 960, 16),
+    (0x17C, 1280, 960, 24),
+    (0x17D, 1280, 960, 32),
+    (0x17E, 1440, 900, 16),
+    (0x17F, 1440, 900, 24),
+    (0x180, 1440, 900, 32),
+    (0x181, 1400, 1050, 16),
+    (0x182, 1400, 1050, 24),
+    (0x183, 1400, 1050, 32),
+    (0x184, 1680, 1050, 16),
+    (0x185, 1680, 1050, 24),
+    (0x186, 1680, 1050, 32),
+    (0x187, 1920, 1200, 16),
+    (0x188, 1920, 1200, 24),
+    (0x189, 1920, 1200, 32),
+    (0x18A, 2560, 1600, 16),
+    (0x18B, 2560, 1600, 24),
+    (0x18C, 2560, 1600, 32),
+    (0x18D, 1280, 720, 16),
+    (0x18E, 1280, 720, 24),
+    (0x18F, 1280, 720, 32),
+    (0x190, 1920, 1080, 16),
+    (0x191, 1920, 1080, 24),
+    (0x192, 1920, 1080, 32),
+    (0x193, 1600, 900, 16),
+    (0x194, 1600, 900, 24),
+    (0x195, 1600, 900, 32),
+    (0x196, 2560, 1440, 16),
+    (0x197, 2560, 1440, 24),
+    (0x198, 2560, 1440, 32),
+    (0x199, 3840, 2160, 16),
+    (0x19A, 3840, 2160, 32),
+    (0x19B, 4096, 2160, 16),
+    (0x19C, 4096, 2160, 32),
+    (0x19D, 5120, 2160, 16),
+    (0x19E, 5120, 2160, 32),
 ];
 
 // Relocatable 32-bit near-call entry points. Call our PM service directly:
@@ -54,8 +127,18 @@ pub(in crate::kernel::dos) const VBE_PM_INTERFACE: [u8; 51] = {
 };
 
 fn substitute_vbe_mode(number: u16) -> Option<crate::kernel::platform::VbeMode> {
+    substitute_vbe_mode_for_output(number, crate::kernel::platform::get().framebuffer_size)
+}
+
+fn substitute_vbe_mode_for_output(
+    number: u16,
+    output: Option<(usize, usize)>,
+) -> Option<crate::kernel::platform::VbeMode> {
     let &(_, width, height, bits_per_pixel) =
         VBE_MODES.iter().find(|&&(candidate, ..)| candidate == number)?;
+    if output.is_some_and(|(w, h)| usize::from(width) > w || usize::from(height) > h) {
+        return None;
+    }
     let format = if bits_per_pixel == 8 {
         crate::kernel::display::FormatSpec::Indexed8
     } else {
@@ -63,12 +146,14 @@ fn substitute_vbe_mode(number: u16) -> Option<crate::kernel::platform::VbeMode> 
             15 => crate::kernel::display::PixelFormat::RGB555,
             16 => crate::kernel::display::PixelFormat::RGB565,
             24 => crate::kernel::display::PixelFormat::RGB888,
+            32 => crate::kernel::display::PixelFormat::NATIVE,
             _ => return None,
         };
         crate::kernel::display::FormatSpec::Packed(packed)
     };
     let pitch = width * u16::from(bits_per_pixel.div_ceil(8));
     let image_bytes = usize::from(pitch) * usize::from(height);
+    if image_bytes > machine::vga::SVGA_LFB_MAX_BYTES { return None; }
     let image_count = (machine::vga::SVGA_LFB_MAX_BYTES / image_bytes)
         .clamp(1, 256);
     let image_pages = (image_count - 1) as u8;
@@ -97,6 +182,17 @@ fn substitute_vbe_mode(number: u16) -> Option<crate::kernel::platform::VbeMode> 
     })
 }
 
+fn available_vbe_mode<A: crate::Arch>(
+    bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    number: u16,
+) -> Option<crate::kernel::platform::VbeMode> {
+    if bios.curated_modes().is_some() {
+        bios.curated_mode(number)
+    } else {
+        substitute_vbe_mode(number)
+    }
+}
+
 pub(super) fn vbe<A: crate::Arch>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -115,8 +211,8 @@ pub(super) fn vbe<A: crate::Arch>(
             done(regs, true);
         }
         0x01 => {
-            let native_mode = bios_display.curated_mode(regs.rcx as u16 & 0x3FFF);
-            let ok = synthetic_vbe_mode_info(machine, dos, regs, native_mode);
+            let mode = available_vbe_mode(bios_display, regs.rcx as u16 & 0x3FFF);
+            let ok = synthetic_vbe_mode_info(machine, dos, regs, mode);
             done(regs, ok);
         }
         0x02 => {
@@ -216,7 +312,42 @@ fn pm_display_coordinates(dwords: u32, pitch: u16, bpp: u8) -> Option<(u16, u16)
 
 #[cfg(test)]
 mod tests {
-    use super::pm_display_coordinates;
+    use super::{pm_display_coordinates, substitute_vbe_mode_for_output, VBE_MODES};
+
+    #[test]
+    fn substitute_modes_fit_both_framebuffer_dimensions() {
+        let output = Some((1920, 1080));
+        assert!(substitute_vbe_mode_for_output(0x192, output).is_some()); // exact 1080p
+        assert!(substitute_vbe_mode_for_output(0x189, output).is_none()); // 1920x1200
+        assert!(substitute_vbe_mode_for_output(0x198, output).is_none()); // 2560x1440
+        assert!(substitute_vbe_mode_for_output(0x192, Some((1600, 1200))).is_none());
+        assert!(substitute_vbe_mode_for_output(0x14D, output).is_some());
+        for &(number, ..) in VBE_MODES {
+            if let Some(mode) = substitute_vbe_mode_for_output(number, output) {
+                assert!(mode.width <= 1920 && mode.height <= 1080);
+            }
+        }
+    }
+
+    #[test]
+    fn substitute_32_bit_modes_have_packed_pixels_and_both_apertures() {
+        let mode = substitute_vbe_mode_for_output(0x192, None).unwrap();
+        assert_eq!(mode.pitch, 1920 * 4);
+        assert_eq!(mode.format, crate::kernel::display::FormatSpec::Packed(
+            crate::kernel::display::PixelFormat::NATIVE));
+        assert_ne!(mode.physical_base, 0);
+        assert_eq!(mode.window_segment, 0xA000);
+        assert_eq!(mode.banked_image_pages, mode.linear_image_pages);
+        assert!(mode.linear_image_pages >= 1);
+    }
+
+    #[test]
+    fn substitute_modes_require_a_complete_frame_in_vram() {
+        assert!(substitute_vbe_mode_for_output(0x199, Some((3840, 2160))).is_some()); // 16bpp
+        assert!(substitute_vbe_mode_for_output(0x19A, Some((3840, 2160))).is_none()); // 32bpp
+        assert!(substitute_vbe_mode_for_output(0x19A, None).is_none());
+        assert!(substitute_vbe_mode_for_output(0x1FF, None).is_none());
+    }
 
     #[test]
     fn protected_display_addresses_use_dwords_and_the_active_pitch() {
@@ -367,8 +498,8 @@ fn vbe_controller_info<A: crate::Arch>(
             p += 2;
         }
     } else {
-        for &(num, ..) in VBE_MODES.iter().take(remaining) {
-            machine.write::<u16>(p, num);
+        for mode in VBE_MODES.iter().filter_map(|&(num, ..)| substitute_vbe_mode(num)).take(remaining) {
+            machine.write::<u16>(p, mode.number);
             p += 2;
         }
     }
@@ -383,10 +514,8 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
     machine: &mut A,
     dos: &DosState<A>,
     regs: &mut Regs,
-    native_mode: Option<crate::kernel::platform::VbeMode>,
+    mode: Option<crate::kernel::platform::VbeMode>,
 ) -> bool {
-    let want = regs.rcx as u16 & 0x1FF;
-    let mode = native_mode.or_else(|| substitute_vbe_mode(want));
     let (w, h, bpp, banked_pitch, linear_pitch, format,
         banked_pages, linear_pages, linear, banked) = if let Some(mode) = mode {
         (mode.width, mode.height, mode.bits_per_pixel, mode.banked_pitch,
@@ -542,7 +671,7 @@ fn vbe_set_mode<A: crate::Arch>(
         return success;
     }
     let want = regs.rbx as u16 & 0x3FFF;
-    let Some(mode) = bios_display.curated_mode(want).or_else(|| substitute_vbe_mode(want)) else {
+    let Some(mode) = available_vbe_mode(bios_display, want) else {
         return false;
     };
     machine::vga::svga_set_curated_mode(
