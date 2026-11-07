@@ -14,6 +14,14 @@ integration_test(
 )
 
 integration_test(
+    name = "xhci_full",
+    command = ["python3", "test/xhci_smoke.py", "--full"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["boot", "manual"],
+)
+
+integration_test(
     name = "kernel_smp",
     command = ["python3", "test/kernel_smp.py"],
     sources = ["//:integration_sources"],

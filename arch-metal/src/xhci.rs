@@ -163,6 +163,46 @@ const HID_SC: [u8; 0x68] = [
 // dropped for now.
 const MOD_SC: [u8; 8] = [0x1D, 0x2A, 0x38, 0, 0x1D, 0x36, 0x38, 0];
 
+const REPEAT_DELAY_NS: u64 = 500_000_000;
+const REPEAT_INTERVAL_NS: u64 = 33_333_333;
+
+/// USB reports describe held keys; unlike PS/2, they do not supply typematic
+/// make codes. Repeat the most recently pressed ordinary key from timer polls.
+#[derive(Clone, Copy)]
+struct KeyRepeat {
+    usage: u8,
+    deadline: u64,
+}
+
+impl KeyRepeat {
+    const fn empty() -> Self { Self { usage: 0, deadline: 0 } }
+
+    fn report(&mut self, previous: &[u8], current: &[u8], now: u64) {
+        if !current.contains(&self.usage) { self.usage = 0; }
+        for &usage in current {
+            // Lock keys toggle state, so they must never repeat. Modifiers
+            // live outside this key array and likewise do not arm a repeat.
+            if !previous.contains(&usage) && !matches!(usage, 0x39 | 0x47 | 0x53)
+                && hid_to_scancode(usage).is_some()
+            {
+                self.usage = usage;
+                self.deadline = now.wrapping_add(REPEAT_DELAY_NS);
+            }
+        }
+    }
+
+    fn poll(&mut self, now: u64) {
+        if self.usage == 0 || now.wrapping_sub(self.deadline) >= (1u64 << 63) {
+            return;
+        }
+        if let Some((sc, extended)) = hid_to_scancode(self.usage) {
+            emit_key(sc, extended, false);
+        }
+        // A delayed timer delivers one repeat, without a catch-up burst.
+        self.deadline = now.wrapping_add(REPEAT_INTERVAL_NS);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct HidPipe {
     ready: bool,
@@ -174,6 +214,7 @@ struct HidPipe {
     enq: usize,
     cycle: u32,
     prev: [u8; 16],
+    repeat: KeyRepeat,
 }
 
 impl HidPipe {
@@ -188,6 +229,7 @@ impl HidPipe {
             enq: 0,
             cycle: 1,
             prev: [0; 16],
+            repeat: KeyRepeat::empty(),
         }
     }
 }
@@ -888,7 +930,7 @@ impl Controller {
     /// re-arm their pipes. Cheap when idle (one event-ring cycle-bit check).
     #[cfg(test)]
     fn poll(&mut self) {
-        self.poll_with_buttons(0);
+        self.poll_with_buttons(0, 0);
     }
 
     fn mouse_buttons(&self) -> u8 {
@@ -896,7 +938,7 @@ impl Controller {
             .fold(0, |buttons, pipe| buttons | pipe.prev[0])
     }
 
-    fn poll_with_buttons(&mut self, other_buttons: u8) {
+    fn poll_with_buttons(&mut self, other_buttons: u8, now: u64) {
         if !self.pipes.iter().any(|pipe| pipe.ready) {
             return;
         }
@@ -920,21 +962,32 @@ impl Controller {
                         break;
                     };
                     if index < KEYBOARD_PIPES {
-                        let id_prefixed = self.pipes[index].keyboard_report_id;
+                        let pipe = &mut self.pipes[index];
+                        let id_prefixed = pipe.keyboard_report_id;
+                        let previous = pipe.prev;
                         Self::process_keyboard_report(
-                            &mut self.pipes[index].prev,
+                            &mut pipe.prev,
                             &report,
                             len,
                             id_prefixed,
                         );
+                        let end = if id_prefixed { 16 } else { 8 };
+                        pipe.repeat.report(&previous[2..end], &pipe.prev[2..end], now);
                     } else if let Some((dx, dy, buttons)) = decode_mouse_report(&report, len) {
                         self.pipes[index].prev[0] = buttons;
                         crate::irq::push_mouse(dx, dy, self.mouse_buttons() | other_buttons);
                     }
+                } else {
+                    self.pipes[index].repeat = KeyRepeat::empty();
                 }
                 self.arm_report(index);
                 break;
             }
+        }
+        // Releases above take effect before the repeat deadline is checked,
+        // and an idle endpoint must still repeat without another USB report.
+        for pipe in &mut self.pipes[..KEYBOARD_PIPES] {
+            if pipe.ready { pipe.repeat.poll(now); }
         }
     }
 
@@ -1154,6 +1207,7 @@ impl Controller {
             state.enq = 0;
             state.cycle = 1;
             state.prev = [0; 16];
+            state.repeat = KeyRepeat::empty();
         }
         true
     }
@@ -1402,7 +1456,7 @@ pub fn init() {
     }
 }
 
-pub fn poll() {
+pub fn poll(now: u64) {
     // Called with interrupts disabled on the boot CPU, never during init.
     unsafe {
         for index in 0..CONTROLLER_COUNT {
@@ -1411,7 +1465,7 @@ pub fn poll() {
             for other in 0..CONTROLLER_COUNT {
                 if other != index { other_buttons |= (&**base.add(other)).mouse_buttons(); }
             }
-            (&mut **base.add(index)).poll_with_buttons(other_buttons);
+            (&mut **base.add(index)).poll_with_buttons(other_buttons, now);
         }
     }
 }

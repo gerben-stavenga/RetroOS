@@ -144,10 +144,10 @@ fn mouse_buttons_from_another_controller_survive_idle_reports() {
     f.controller.start_pipes();
     f.report(MOUSE_PIPE, &[2, 4, 0]);
     f.event(0, 32, 1, 3, 13, 5);
-    f.controller.poll_with_buttons(1);
+    f.controller.poll_with_buttons(1, 0);
     f.report(MOUSE_PIPE, &[0, 0, 0]);
     f.event(1, 32, 1, 3, 13, 5);
-    f.controller.poll_with_buttons(1);
+    f.controller.poll_with_buttons(1, 0);
     crate::irq::MOUSE.with(|events| assert_eq!(*events.borrow(), [(4, 0, 3), (0, 0, 1)]));
 }
 
@@ -199,6 +199,100 @@ fn rollover_preserves_held_keys_until_a_valid_report() {
     crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e]));
     Controller::process_keyboard_report(&mut previous, &[0; 16], 8, false);
     crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x9e]));
+}
+
+#[test]
+fn held_arrow_repeats_without_reports_and_release_at_deadline_stops_it() {
+    let mut f = Fixture::new();
+    f.pipe(0, 1, 3, 8);
+    f.controller.start_pipes();
+    f.report(0, &[0, 0, 0x4f, 0, 0, 0, 0, 0]); // Right
+    f.event(0, 32, 1, 3, 1, 0);
+    f.controller.poll_with_buttons(0, 0);
+    f.controller.poll_with_buttons(0, REPEAT_DELAY_NS - 1);
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0xe0, 0x4d]));
+    f.controller.poll_with_buttons(0, REPEAT_DELAY_NS);
+    f.controller.poll_with_buttons(0, REPEAT_DELAY_NS + REPEAT_INTERVAL_NS - 1);
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0xe0, 0x4d, 0xe0, 0x4d]));
+    f.controller.poll_with_buttons(0, REPEAT_DELAY_NS + REPEAT_INTERVAL_NS);
+    f.report(0, &[0; 8]);
+    f.event(1, 32, 1, 3, 1, 0);
+    f.controller.poll_with_buttons(0, REPEAT_DELAY_NS + 2 * REPEAT_INTERVAL_NS);
+    f.controller.poll_with_buttons(0, REPEAT_DELAY_NS * 10);
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(),
+        [0xe0, 0x4d, 0xe0, 0x4d, 0xe0, 0x4d, 0xe0, 0xcd]));
+}
+
+#[test]
+fn unchanged_keyboard_reports_do_not_restart_repeat_delay() {
+    let mut f = Fixture::new();
+    f.pipe(0, 1, 3, 8);
+    f.controller.start_pipes();
+    for event in 0..3 {
+        f.report(0, &[0, 0, 4, 0, 0, 0, 0, 0]);
+        f.event(event, 32, 1, 3, 1, 0);
+        f.controller.poll_with_buttons(0, event as u64 * REPEAT_DELAY_NS / 2);
+    }
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x1e]));
+}
+
+#[test]
+fn newest_key_repeats_while_modifier_and_lock_keys_do_not_arm_repeat() {
+    let mut repeat = KeyRepeat::empty();
+    repeat.report(&[], &[4], 0); // A
+    repeat.report(&[4], &[4, 5], 100); // B takes over
+    repeat.report(&[4, 5], &[4, 5, 0x39, 0x47, 0x53], 200);
+    repeat.poll(REPEAT_DELAY_NS);
+    crate::irq::KEYS.with(|keys| assert!(keys.borrow().is_empty()));
+    repeat.poll(REPEAT_DELAY_NS + 100);
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
+    repeat.report(&[4, 5], &[4], REPEAT_DELAY_NS + 200); // releasing B stops
+    repeat.poll(REPEAT_DELAY_NS * 10);
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
+    repeat.report(&[], &[0x39, 0x47, 0x53], 0);
+    repeat.poll(REPEAT_DELAY_NS);
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
+}
+
+#[test]
+fn invalid_or_unrelated_reports_preserve_the_repeat_of_a_held_key() {
+    let mut f = Fixture::new();
+    f.pipe(0, 1, 3, 16);
+    f.controller.pipes[0].keyboard_report_id = true;
+    f.controller.start_pipes();
+    for (event, report) in [[1, 0, 0x52, 0], [2, 0, 0, 0], [1, 0, 1, 1]].iter().enumerate() {
+        f.report(0, report);
+        f.event(event, 32, 1, 3, 13, 12);
+        f.controller.poll_with_buttons(0, event as u64 * REPEAT_DELAY_NS / 2);
+    }
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0xe0, 0x48, 0xe0, 0x48]));
+}
+
+#[test]
+fn failed_keyboard_transfer_stops_repeat() {
+    let mut f = Fixture::new();
+    f.pipe(0, 1, 3, 8);
+    f.controller.start_pipes();
+    f.report(0, &[0, 0, 4, 0, 0, 0, 0, 0]);
+    f.event(0, 32, 1, 3, 1, 0);
+    f.controller.poll();
+    f.event(1, 32, 1, 3, 6, 0);
+    f.controller.poll_with_buttons(0, REPEAT_DELAY_NS);
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e]));
+}
+
+#[test]
+fn repeat_deadline_wraps_and_late_poll_does_not_flood_input() {
+    let mut repeat = KeyRepeat::empty();
+    let start = u64::MAX - REPEAT_DELAY_NS / 2;
+    repeat.report(&[], &[4], start);
+    repeat.poll(start);
+    repeat.poll(start.wrapping_add(REPEAT_DELAY_NS - 1));
+    crate::irq::KEYS.with(|keys| assert!(keys.borrow().is_empty()));
+    repeat.poll(start.wrapping_add(REPEAT_DELAY_NS));
+    repeat.poll(REPEAT_DELAY_NS * 10);
+    repeat.poll(REPEAT_DELAY_NS * 10);
+    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x1e]));
 }
 
 #[test]

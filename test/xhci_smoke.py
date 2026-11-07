@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise xHCI enumeration and real input with no PS/2 fallback."""
+import argparse
 import json
 from pathlib import Path
 import shutil
@@ -12,7 +13,7 @@ from boot_fixture import prepare_boot
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Wait for an 'a' key plus mouse motion and a left click, then exit normally.
+# Check a held arrow, then wait for 'a', mouse motion and a left click.
 # DOS/BIOS observations verify delivery beyond merely configuring endpoints.
 PROBE = r'''
 bits 16
@@ -45,6 +46,16 @@ org 100h
     jz .mouse
     xor ah, ah
     int 16h
+    cmp ah, 4dh
+    jne .ordinary_key
+    inc word [right_count]
+    cmp word [right_count], 3
+    jne .mouse
+    mov dx, repeated
+    mov ah, 9
+    int 21h
+    jmp .mouse
+.ordinary_key:
 %ifdef TWO_KEYBOARDS
 %ifdef FOUR_KEYBOARDS
     cmp al, 'c'
@@ -127,6 +138,8 @@ failure:
     mov ax, 4c01h
     int 21h
 seen db 0
+right_count dw 0
+repeated db 'USB REPEAT PASS',13,10,'$'
 key_a db 'USB KEY a',13,10,'$'
 key_b db 'USB KEY b',13,10,'$'
 key_c db 'USB KEY c',13,10,'$'
@@ -213,6 +226,16 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
                             return result['return']
 
                 call('qmp_capabilities')
+                # One USB press must produce multiple BIOS key reads while
+                # held, without host-generated repeated key-down events.
+                arguments = {'events': [{'type': 'key', 'data': {
+                    'down': True, 'key': {'type': 'qcode', 'data': 'right'}}}]}
+                if second_keyboard is not None:
+                    arguments['device'] = 'video0'
+                call('input-send-event', arguments)
+                wait_for('USB REPEAT PASS')
+                arguments['events'][0]['data']['down'] = False
+                call('input-send-event', arguments)
                 keyboards = [('a', 'video0'), ('b', 'video1')] if second_keyboard is not None else [('a', None)]
                 if four_keyboards:
                     keyboards += [('c', 'video2'), ('d', 'video3')]
@@ -259,7 +282,7 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
             if controllers > 4:
                 assert 'xHCI: controller limit reached' in text, text
             assert not any(marker in text for marker in ('FATAL', 'PANIC', 'panicked')), text
-            print(f'PASS: {name}: USB keyboard, motion and click delivered', flush=True)
+            print(f'PASS: {name}: USB key repeat, keyboard, motion and click delivered', flush=True)
         finally:
             if proc.poll() is None:
                 proc.terminate()
@@ -267,6 +290,9 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--full', action='store_true', help='run all 21 USB topologies')
+    args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='retroos-xhci-') as temp:
         work = Path(temp)
         source = work / 'input.asm'
@@ -286,6 +312,11 @@ def main():
         subprocess.run(['mcopy', '-i', str(disk), str(probe), '::MICE.COM'], check=True)
         subprocess.run(['mmd', '-i', str(disk), '::RETROOS'], check=True)
         subprocess.run(['mcopy', '-i', str(disk), str(ROOT / 'etc/RETROOS.INI'), '::RETROOS/RETROOS.INI'], check=True)
+        if not args.full:
+            session(work, disk, 'shared', 1, 0, 0)
+            session(work, disk, 'four-keyboards-deep-hub', 1, 0, 0, hubs=4, second_keyboard=0, four_keyboards=True)
+            session(work, disk, 'uefi-split', 3, 1, 2, uefi=True)
+            return
         session(work, disk, 'two-mice', 1, 0, 0, second_mouse=0)
         session(work, disk, 'two-mice-deep-hub', 1, 0, 0, second_mouse=0, hubs=3)
         session(work, disk, 'two-mice-split', 2, 0, 0, second_mouse=1)

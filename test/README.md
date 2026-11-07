@@ -73,8 +73,11 @@ HDA counters no longer exist; cursor and ring
 accounting are tested in `lib:sound_test`. The PCM checker itself has negative
 tests for silence, stalled playback and truncated recordings.
 
-`bazelisk test //tests:xhci_smoke` boots with a USB keyboard and mouse on xHCI,
-checks both HID endpoints initialize, and runs HELLO.COM. Host unit tests
+`bazelisk test //tests:xhci_smoke` runs three representative USB boots:
+one shared controller, four keyboards behind nested hubs, and UEFI with input
+split across controllers. Each checks held-arrow repeat, keyboard delivery,
+mouse motion and clicks with PS/2 disabled. The full 21-topology matrix is
+opt-in with `bazelisk test //tests:xhci_full`. Host unit tests
 (`//arch-metal:xhci_dma_test`) cover X99's 16 scratchpads, the full 1023-buffer
 count, non-overlapping DMA regions, allocation failure, and BIOS ownership
 handoff. `//arch-metal:phys_mm_test` covers the RAM bitmap, shared refcounts,

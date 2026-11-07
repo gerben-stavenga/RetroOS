@@ -1103,7 +1103,7 @@ pub fn handle_irq(regs: &mut Regs) {
                 // Entry sampling already extended the fallback PIT clock.
                 unsafe { queue_irq0_wakeup(timestamp_ns); }
                 // Poll the USB-HID keyboard (if any) into the same key queue.
-                crate::xhci::poll();
+                crate::xhci::poll(timestamp_ns);
             }
             1 => unsafe { let q = &raw mut QUEUE; (*q).push((Irq::Key(inb(0x60)), timestamp_ns)); },
             12 => {
@@ -1148,7 +1148,7 @@ pub fn handle_irq(regs: &mut Regs) {
             // USB HID reports need polling on PIC-only machines too. The
             // APIC timer path does this above; without it the devices can
             // enumerate but never deliver keys or mouse movement.
-            crate::xhci::poll();
+            crate::xhci::poll(timestamp_ns);
             None // the IRQ merely returns control to the event loop
         }
         1 => Some(Irq::Key(inb(0x60))),
