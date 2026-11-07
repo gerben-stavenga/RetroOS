@@ -95,6 +95,9 @@ struct Core {
     // ── register-file state machine ──
     voice_sel: u8,
     reg_sel: u8,
+    /// Classic GF1 ports 3X2/3X3 echo the last byte transferred through
+    /// 3X2..3X5, independently of the selected voice and register.
+    io_latch: u8,
     /// Raw per-voice register images (write indices 0x00-0x0D): the readback
     /// source for programming registers. Live values (current address 0x8A/
     /// 0x8B, current volume 0x89) derive from the engine at playback.
@@ -177,6 +180,7 @@ impl Core {
             engine: Engine::new_boxed(),
             voice_sel: 0,
             reg_sel: 0,
+            io_latch: 0,
             vregs: [[0; 16]; 32],
             reg41: 0, reg42: 0, reg43: 0, reg44: 0,
             reg45: 0, reg46: 0, reg47: 0, reg48: 0, reg49: 0,
@@ -365,10 +369,12 @@ impl Gf1 {
             // card wires this for real later.
             0x00 => 0x02,
             0x01 => 0x00,
-            0x02 => c.voice_sel,
-            0x03 => c.reg_sel,
-            0x04 => c.reg_read(false),
-            0x05 => c.reg_read(true),
+            0x02 | 0x03 => c.io_latch,
+            0x04 | 0x05 => {
+                let value = c.reg_read(p == base + 0x105);
+                c.io_latch = value;
+                value
+            },
             0x07 => c.dram[c.dram_addr()],
             _ => 0xFF,
         }
@@ -420,6 +426,9 @@ impl Gf1 {
             }
             return;
         }
+        // The bus readback latch is separate from the decoded selectors.
+        // MASI probes write active-voice data, then read it back at 3X3.
+        if (base + 0x102..=base + 0x105).contains(&p) { c.io_latch = val; }
         match p.wrapping_sub(base + 0x100) {
             0x00 | 0x01 => {} // MIDI ctrl/data: absorbed until the GM work
             0x02 => c.voice_sel = val & 0x1F,
@@ -921,6 +930,94 @@ impl Core {
 mod dma_tests {
     use super::*;
     use crate::dma::{Completion, Request};
+
+    #[test]
+    fn classic_bus_readback_preserves_register_and_voice_selection() {
+        let mut card = Gf1::new(0x240);
+        // MASI's presence check (Jazz Jackrabbit and Epic Pinball): the
+        // data byte must echo through the index port without selecting it.
+        card.port_out(0x343, 0x4c);
+        card.port_out(0x345, 0x01);
+        card.port_out(0x343, 0x0e);
+        card.port_out(0x345, 0xce);
+        assert_eq!(card.port_in(0x343), 0xce);
+        assert_eq!(card.sel(), (0x0e, 0));
+        assert_eq!(card.debug_state().unwrap().1, 15);
+
+        card.port_out(0x342, 0xe3);
+        assert_eq!(card.port_in(0x342), 0xe3);
+        assert_eq!(card.port_in(0x343), 0xe3);
+        assert_eq!(card.sel(), (0x0e, 3));
+        card.port_out(0x343, 1);
+        card.port_out(0x344, 0x34);
+        assert_eq!(card.port_in(0x343), 0x34);
+        card.port_out(0x345, 0x12);
+        assert_eq!(card.port_in(0x343), 0x12);
+        card.port_out(0x343, 0x81);
+        assert_eq!(card.port_in(0x344), 0x34);
+        assert_eq!(card.port_in(0x343), 0x34);
+        assert_eq!(card.port_in(0x345), 0x12);
+        assert_eq!(card.port_in(0x342), 0x12);
+        assert_eq!(card.sel(), (0x81, 3));
+        // Board and DRAM accesses do not replace the GF1 bus latch.
+        card.port_out(0x248, 0xaa);
+        card.port_out(0x347, 0x56);
+        assert_eq!(card.port_in(0x347), 0x56);
+        assert_eq!(card.port_in(0x343), 0x12);
+    }
+
+    #[test]
+    fn sb_pcm_and_gf1_voices_share_the_full_volume_sample_scale() {
+        for sample in [0x7fu8, 0x80] {
+            let mut gus = Gf1::new(0x240);
+            let c = gus.core();
+            c.reset_reg = 0x03;
+            c.dram[..16].fill(sample);
+            // One copy per stereo channel; hard panning avoids comparing
+            // different pan laws instead of the cards' PCM output scales.
+            for (voice, pan) in c.engine.voices[..2].iter_mut().zip([(4096, 0), (0, 4096)]) {
+                *voice = crate::engine::Voice {
+                    running: true, inc: 1 << 32, end: 16 << 32,
+                    loop_mode: crate::engine::LoopMode::Forward,
+                    vol: volume::FULL << volume::RAMP_FRACT,
+                    pan_l: pan.0, pan_r: pan.1, ..Default::default()
+                };
+            }
+            let mut gf1_output = [(0, 0); 4];
+            gus.mix_into(44_100, (65_536, 65_536), &mut gf1_output);
+
+            let mut sb = crate::sb::Sb::new();
+            sb.begin(crate::sb::Start { bits: 8, stereo: false, signed: false,
+                single: false, block_override: None }, 16, true, 0);
+            let bytes = [sample ^ 0x80; 16];
+            for physical in [false, true] {
+                let mut sb_output = [(0, 0); 4];
+                let _ = sb.advance(crate::sb::Step::Mix {
+                    rate: 44_100, position_q32: 0, step_q32: 1 << 32,
+                    block: &mut sb_output, physical,
+                }, Some(Completion::Read { bytes: &bytes, terminal_count: false }));
+                let reference = i32::from(sample as i8) << 8;
+                for (sb_frame, gus_frame) in sb_output.into_iter().zip(gf1_output) {
+                    assert_eq!(sb_frame, (reference, reference));
+                    // The GF1 logarithmic volume maximum is 65528/65536.
+                    assert!((gus_frame.0 - reference).abs() <= 4);
+                    assert!((gus_frame.1 - reference).abs() <= 4);
+                }
+            }
+            // Guest attenuation remains effective, including per-channel gain.
+            let _ = sb.port_write(0x224, 0x32, 0);
+            let _ = sb.port_write(0x225, 0xf0, 0);
+            let mut attenuated = [(0, 0); 4];
+            let _ = sb.advance(crate::sb::Step::Mix {
+                rate: 44_100, position_q32: 0, step_q32: 1 << 32,
+                block: &mut attenuated, physical: false,
+            }, Some(Completion::Read { bytes: &bytes, terminal_count: false }));
+            for (left, right) in attenuated {
+                assert!(left.abs() < right.abs());
+                assert_eq!(right, i32::from(sample as i8) << 8);
+            }
+        }
+    }
 
     #[test]
     fn overlapping_voices_keep_headroom_through_output_gain() {

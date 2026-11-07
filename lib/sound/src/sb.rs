@@ -57,25 +57,11 @@ const ATT_2DB_5BIT: [u16; 32] = [
     26027, 32767,
 ];
 
-/// Fixed source scales on the card's analog summing node, in Q16. These — not
-/// the mixer registers — set the FM-vs-DAC balance, and both cards' power-on
-/// mixer defaults are *full* volume, so these are what you hear by default.
-/// From 86Box's SB16 mix (`sb_get_buffer_sb16_awe32` / `sb_get_music_buffer_sb16_awe32`):
-///
-/// ```text
-///   DAC: dsp.buffer * voice * master / 3.0
-///   FM : opl_buf    * fm    * master * 0.7171630859375
-/// ```
-///
-/// So FM sits **2.15x above** the DAC at equal digital full scale. Summing both
-/// at unity (what we did before) therefore ran digital SFX ~9.5 dB too hot
-/// against FM music, and pinned the sum at the clipping rail whenever a
-/// full-scale sample played over a track.
-///
-/// Both sources are on *this* card, which is why the balance lives here. How
-/// loud the card sits against a GUS is the host's mix policy, not the SB's.
-const FM_SCALE_Q16: i32 = 47_000; // 0.7171630859375 == 47000/65536, exactly
-const DAC_SCALE_Q16: i32 = 65_536 / 3;
+/// Preserve the card's FM/PCM balance on the common unity-PCM scale.
+/// The former output convention used PCM / 3 and OPL * 47000/65536.
+/// Removing PCM's divisor requires the same factor of three on OPL.
+/// Guest FM/master controls apply afterwards; only the final sink clips.
+const FM_SCALE_Q16: i32 = 47_000 * 3;
 
 /// Combine two Q16 gains without overflowing i32 on the way.
 const fn combine_q16(a: i32, b: i32) -> i32 {
@@ -112,8 +98,7 @@ impl Mixer {
 
     /// Power-on / mixer-index-0 reset. Defaults are 86Box's `sb_ct1745_mixer_reset`:
     /// master, voice, FM and CD all at maximum (0xF8 → level 31 → unity), line/mic
-    /// muted. A game that never touches the mixer gets full volume — which is why
-    /// the FM/DAC balance has to come from the fixed scales, not from these.
+    /// muted. A game that never touches the mixer gets full volume.
     pub fn reset(&mut self) {
         *self = Mixer::new();
     }
@@ -149,29 +134,23 @@ impl Mixer {
 
     /// Linear gain (Q16, unity = 65536) for a CT1745 volume register.
     fn level_q16(&self, reg: usize) -> i32 {
-        // The table is an amplitude out of 32767; 86Box divides by 32768, so
-        // Q16 gain is simply the entry doubled.
-        ATT_2DB_5BIT[(self.regs[reg] >> 3) as usize] as i32 * 2
+        // Preserve the attenuation curve, with 100% exactly unity in Q16.
+        i32::from(ATT_2DB_5BIT[(self.regs[reg] >> 3) as usize]) * 65_536 / 32_767
     }
 
-    /// (left, right) Q16 gain the DSP's PCM is summed at: voice × master ÷ 3.
+    /// DSP PCM gain: guest voice × master, unity at 100% on both controls.
     pub fn voice_gain_q16(&self) -> (i32, i32) {
-        let m = (self.level_q16(0x30), self.level_q16(0x31));
-        (
-            combine_q16(combine_q16(self.level_q16(0x32), m.0), DAC_SCALE_Q16),
-            combine_q16(combine_q16(self.level_q16(0x33), m.1), DAC_SCALE_Q16),
-        )
-    }
-
-    /// PCM gain when the software SB stream is sent through a real SB DAC.
-    /// The hardware supplies the DAC /3 stage itself.
-    pub fn voice_gain_q16_physical(&self) -> (i32, i32) {
         let m = (self.level_q16(0x30), self.level_q16(0x31));
         (combine_q16(self.level_q16(0x32), m.0),
          combine_q16(self.level_q16(0x33), m.1))
     }
 
-    /// (left, right) Q16 gain the FM synth is summed at: fm × master × 0.7172.
+    /// The PCM scale is independent of the sink receiving the samples.
+    pub fn voice_gain_q16_physical(&self) -> (i32, i32) {
+        self.voice_gain_q16()
+    }
+
+    /// (left, right) Q16 gain the FM synth is summed at: fm × master × (141000/65536).
     pub fn fm_gain_q16(&self) -> (i32, i32) {
         let m = (self.level_q16(0x30), self.level_q16(0x31));
         (
@@ -180,13 +159,9 @@ impl Mixer {
         )
     }
 
-    /// OPL gain for software OPL samples sent through a real SB DAC. Boost by
-    /// the inverse DAC normalization so its ratio to PCM matches the card.
+    /// Use the same normalized OPL samples for every PCM sink.
     pub fn fm_gain_q16_physical(&self) -> (i32, i32) {
-        let m = (self.level_q16(0x30), self.level_q16(0x31));
-        let scale = FM_SCALE_Q16.saturating_mul(3);
-        (combine_q16(combine_q16(self.level_q16(0x34), m.0), scale),
-         combine_q16(combine_q16(self.level_q16(0x35), m.1), scale))
+        self.fm_gain_q16()
     }
 }
 
@@ -1188,6 +1163,20 @@ pub fn new_boxed() -> Box<Sb> {
 #[cfg(test)]
 mod tests {
     use super::{Sb, Start, Step};
+
+    #[test]
+    fn unity_pcm_preserves_the_cards_fm_to_pcm_balance() {
+        let mut mixer = super::Mixer::new();
+        assert_eq!(mixer.voice_gain_q16(), (65_536, 65_536));
+        assert_eq!(mixer.fm_gain_q16(), (141_000, 141_000));
+        mixer.write(0x30, 0xf0);
+        let (pcm_left, pcm_right) = mixer.voice_gain_q16();
+        let (fm_left, fm_right) = mixer.fm_gain_q16();
+        assert_eq!(pcm_right, 65_536);
+        assert_eq!(fm_right, 141_000);
+        assert_eq!(fm_left, (i64::from(pcm_left) * 141_000 >> 16) as i32);
+        assert_eq!(mixer.fm_gain_q16_physical(), mixer.fm_gain_q16());
+    }
 
     #[test]
     fn advance_returns_a_wrapped_read_and_renders_only_supplied_frames() {

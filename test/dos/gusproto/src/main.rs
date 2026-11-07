@@ -221,7 +221,6 @@ fn wait_flag(flag: *const bool) -> bool {
 /// caught — the same reason the asm version ended on INT 16h.
 fn park(code: u8) -> ! {
     let mut r = dosrt::dpmi::Rmcs::default();
-    r.eax = 0x0000;
     dosrt::dpmi::sim_int(0x16, &mut r);
     dos::exit(code)
 }
@@ -245,6 +244,15 @@ pub fn app_main(_argc: usize, _argv: &[&[u8]]) {
     }
     selreg(0x4C);
     wr8(0x01);
+
+    // MASI's classic-GUS detection: data written through 3X5 echoes at
+    // 3X3 without replacing the register selector (Jazz / Epic Pinball).
+    selreg(0x0E);
+    wr8(0xCE);
+    if inb(wi.reg()) != 0xCE { die("FAIL-GLATCH"); }
+    selreg(0x8E);
+    if rd8() != 0xCE { die("FAIL-GLATCH"); }
+    if inb(wi.reg()) != 0xCE { die("FAIL-GLATCH"); }
 
     // ── phase 1: DRAM poke/peek at both ends of the 1 MB window ──
     dram_poke(0x0000, 0x00, 0x55);

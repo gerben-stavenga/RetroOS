@@ -312,12 +312,14 @@ The split is "spatial and temporal facts belong to the host":
   `PORT_TRACE`. A library card should not own mutable globals; if the ring
   survives, it wraps the card at the call site.
 
-Open question, deliberately not decided here: the per-card mix scale
-constants (`FM_SCALE_Q16`, `DAC_SCALE_Q16`, `GUS_SCALE_Q16`,
-`OUTPUT_GAIN_Q16`, `vsb.rs:67-88`) are *relative level* facts between
-cards, sourced from 86Box. They are arguably library data (a card's output
-level is a property of the card) but only mean anything as a set. Suggest
-each card exposes its own scale and the host owns the master gain.
+PCM uses one signed 16-bit scale across the cards. At 100% guest volume,
+SB digital samples and full-volume GF1 voices enter the common mixer at
+unity. Guest mixer registers, GF1 voice ramps, and panning still control
+the signal; the shared output master supplies user attenuation. Do not copy
+another emulator's final-output divisor into one card's PCM path or match
+card gains from a single game's music RMS. OPL normalization retains the SB
+FM/PCM ratio: removing the old PCM divisor of three also multiplies the
+OPL coefficient by three, from 47000/65536 to 141000/65536.
 
 ## 4. Crate layout
 

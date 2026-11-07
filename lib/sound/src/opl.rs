@@ -185,8 +185,8 @@ impl Fm {
 
     /// Add FM at the pump's rate: per output frame advance the chip by the
     /// corresponding number of native frames (zero-order hold on the last),
-    /// summing saturating. Each native frame first releases one queued guest
-    /// write, which is what keeps consecutive writes ≥1 frame apart — see
+    /// summing into wide PCM with final clipping left to the sink. Each native
+    /// frame releases one queued guest write, keeping writes ≥1 frame apart — see
     /// `pending`. No sub-block events: the OPL's guest-visible timers run on
     /// virtual time, not the stream.
     pub fn mix_into(
@@ -207,8 +207,24 @@ impl Fm {
                 let _ = self.chip.generate(&mut pair);
                 self.hold = (pair[0], pair[1]);
             }
-            slot.0 += (self.hold.0 as i32 * gain_q16.0) >> 16;
-            slot.1 += (self.hold.1 as i32 * gain_q16.1) >> 16;
+            slot.0 += ((i64::from(self.hold.0) * i64::from(gain_q16.0)) >> 16) as i32;
+            slot.1 += ((i64::from(self.hold.1) * i64::from(gain_q16.1)) >> 16) as i32;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn boosted_opl_retains_headroom_before_final_output_gain() {
+        let mut fm = super::Fm::new(0);
+        fm.hold = (i16::MAX, i16::MIN);
+        let mut block = [(123, -456)];
+        // No native frame elapses: exercise the held sample at both rails.
+        fm.mix_into(super::NATIVE_RATE * 2, &mut block, (141_000, 141_000));
+        assert_eq!(block[0].0, 123 + ((i64::from(i16::MAX) * 141_000) >> 16) as i32);
+        assert_eq!(block[0].1, -456 + ((i64::from(i16::MIN) * 141_000) >> 16) as i32);
+        assert!(block[0].0 > i32::from(i16::MAX));
+        assert!(block[0].1 < i32::from(i16::MIN));
     }
 }
