@@ -355,13 +355,33 @@ fn kvm_engine_proofs() {
     for (i, context) in contexts.iter_mut().enumerate() {
         context.init_user_process_64(entries[i] as u64, stack as u64);
     }
+    // A #UD already queued for SYSCALL still belongs to this context even
+    // when the alarm is due before the next KVM_RUN.
+    let mut syscall = contexts[0];
+    syscall.frame.rip = entries[0] as u64 + 5;
+    syscall.rax = 24;
+    set_regs(syscall);
+    super::setup::with(|k| {
+        let mut events = k.vcpu.get_vcpu_events().unwrap();
+        events.exception.injected = 1;
+        events.exception.nr = 6;
+        events.exception.has_error_code = 0;
+        k.vcpu.set_vcpu_events(&events).unwrap();
+    });
+    mem.arm_alarm(Some(mem.now()));
+    assert!(matches!(execute(), KernelEvent::Syscall), "drain the queued syscall before returning an alarm");
     let mut active = 0;
     let mut syscalls = 0;
+    let mut alarms = 0;
     let start = std::time::Instant::now();
+    mem.arm_alarm(Some(mem.now() + 100_000));
     set_regs(contexts[active]);
     while start.elapsed() < std::time::Duration::from_millis(100) {
         match execute() {
-            KernelEvent::Irq => {},
+            KernelEvent::Irq => {
+                alarms += 1;
+                mem.arm_alarm(Some(mem.now() + 100_000));
+            },
             KernelEvent::Syscall => { syscalls += 1; },
             event => panic!("64-bit context switch yielded {event:?}"),
         }
@@ -370,5 +390,7 @@ fn kvm_engine_proofs() {
         set_regs(contexts[active]);
     }
     assert!(syscalls > 100, "64-bit syscall contexts made progress");
+    assert!(alarms > 10, "context switches exercised real alarm preemption");
+    mem.arm_alarm(None);
 
 }

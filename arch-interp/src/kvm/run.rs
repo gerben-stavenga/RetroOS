@@ -455,6 +455,11 @@ fn in_shim(k: &KvmCpu) -> bool {
     sregs.cs.selector == crate::sysdesc::KERNEL_CS || sregs.cs.selector == KERNEL_CS64
 }
 
+fn queued_exception(k: &KvmCpu) -> bool {
+    let events = k.vcpu.get_vcpu_events().expect("KVM_GET_VCPU_EVENTS");
+    events.exception.injected != 0 || events.exception.pending != 0
+}
+
 /// Program the guest-debug state for this entry: hardware single-step (the
 /// virtual-IF stepping driver) plus DR0-3 (the learned virtual-IF exit
 /// breakpoints). One ioctl carries both — they are the same register file.
@@ -561,7 +566,8 @@ pub fn execute() -> KernelEvent {
             // this check sets immediate_exit, covering the check-to-KVM_RUN race.
             k.vcpu.set_kvm_immediate_exit(0);
             if !in_shim(k) && (crate::machine::alarm_due() || crate::machine::host_input_pending()
-                || (crate::machine::irq_line() && vcpu.flags32() & VIF_FLAG != 0)) {
+                || (crate::machine::irq_line() && vcpu.flags32() & VIF_FLAG != 0))
+                && !queued_exception(k) {
                 sync_out(k, vcpu, mode);
                 return KernelEvent::Irq;
             }
@@ -600,9 +606,8 @@ pub fn execute() -> KernelEvent {
                     // but before its IDT delivery. Let that delivery reach the
                     // shim before scheduling another guest context; otherwise
                     // the queued exception is injected at the new context's IP.
-                    let events = k.vcpu.get_vcpu_events().expect("KVM_GET_VCPU_EVENTS");
-                    if events.exception.injected != 0 || events.exception.pending != 0 {
-                        if trace_on() { eprintln!("[kvm] draining queued exception {}", events.exception.nr); }
+                    if queued_exception(k) {
+                        if trace_on() { eprintln!("[kvm] draining queued exception"); }
                         continue;
                     }
                     sync_out(k, vcpu, mode);
