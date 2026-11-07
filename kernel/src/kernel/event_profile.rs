@@ -26,12 +26,60 @@ static mut READ_DETAILS: [(u16, u64, u64); READ_DETAIL_SLOTS] = [(0, 0, 0); READ
 static mut DIRECT_RM_PHASES: [u64; 4] = [0; 4];
 // Native device shortcuts do not create event-loop events. Keep their cost
 // separate, including failed attempts that subsequently take the normal path.
-pub(super) const DEVICE_NAMES: [&str; 5] = ["vga_mov", "vga_generic", "vga_status", "vga_mask", "dma_poll"];
-static mut DEVICE_ENTRIES: [[u64; 2]; 5] = [[0; 2]; 5];
+pub(super) const DEVICE_NAMES: [&str; 7] = ["vga_mov", "vga_generic", "vga_status", "vga_mask", "dma_poll", "vga_palette", "opl_status"];
+static mut DEVICE_ENTRIES: [[u64; 2]; 7] = [[0; 2]; 7];
 #[derive(Clone, Copy)]
 pub(super) struct VgaInstruction { pub cs: u16, pub ip: u32, pub bytes: u32, pub calls: u64, pub max_count: u32 }
 const EMPTY_VGA: VgaInstruction = VgaInstruction { cs: 0, ip: 0, bytes: 0, calls: 0, max_count: 0 };
 static mut VGA_INSTRUCTIONS: [VgaInstruction; 32] = [EMPTY_VGA; 32];
+#[derive(Clone, Copy)]
+struct StatusPoll { cs: u16, ip: u32, calls: u64, high: u64, max_ns: u64 }
+const EMPTY_POLL: StatusPoll = StatusPoll { cs: 0, ip: 0, calls: 0, high: 0, max_ns: 0 };
+static mut STATUS_POLLS: [StatusPoll; 8] = [EMPTY_POLL; 8];
+static mut LAST_STATUS_POLL: Option<(u16, u32, u8, u64)> = None;
+#[derive(Clone, Copy)]
+struct TimedEvent { ns: u64, kind: u32, value: u32 }
+const EMPTY_TIMED: TimedEvent = TimedEvent { ns: 0, kind: 0, value: 0 };
+static mut TIMELINE: alloc::vec::Vec<TimedEvent> = alloc::vec::Vec::new();
+static mut TIMELINE_USED: usize = 0;
+static mut OPL_INDEX: u8 = 0;
+
+/// BSP-only, preallocated diagnostic events: frame address, palette begin/end,
+/// and OPL key transitions. Recording never allocates or logs in the hot path.
+pub(super) fn timed_event(now: u64, kind: u32, value: u32) {
+    if !super::startup::profile_enabled() { return; }
+    unsafe {
+        let events = &mut *core::ptr::addr_of_mut!(TIMELINE);
+        if TIMELINE_USED < events.len() {
+            events[TIMELINE_USED] = TimedEvent { ns: now, kind, value };
+            TIMELINE_USED += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86")]
+pub(super) fn record_status_poll(cs: u16, ip: u32, status: u8, now: u64) {
+    // Consecutive reads at one instruction, including time spent in timer
+    // handlers between reads. The status level changing ends that wait.
+    let level = status & 8;
+    let start = unsafe {
+        match LAST_STATUS_POLL {
+            Some((old_cs, old_ip, old_level, start))
+                if (cs, ip, level) == (old_cs, old_ip, old_level) => start,
+            _ => { LAST_STATUS_POLL = Some((cs, ip, level, now)); now }
+        }
+    };
+    for entry in unsafe { &mut *core::ptr::addr_of_mut!(STATUS_POLLS) } {
+        if entry.calls == 0 || (entry.cs, entry.ip) == (cs, ip) {
+            entry.cs = cs;
+            entry.ip = ip;
+            entry.calls += 1;
+            entry.high += u64::from(level != 0);
+            entry.max_ns = entry.max_ns.max(now.saturating_sub(start));
+            break;
+        }
+    }
+}
 
 #[cfg(target_arch = "x86")]
 pub(super) fn record_vga_instruction(cs: u16, ip: u32, bytes: u32, count: u32) {
@@ -49,7 +97,7 @@ pub(super) fn vga_instructions() -> [VgaInstruction; 32] {
 }
 
 #[cfg(target_arch = "x86")]
-pub(super) fn record_device_entries(details: [[u32; 4]; 5]) {
+pub(super) fn record_device_entries(details: [[u32; 4]; 7]) {
     for (kind, [calls_lo, calls_hi, cycles_lo, cycles_hi]) in details.into_iter().enumerate() {
         unsafe {
             let counters = &mut (&mut *core::ptr::addr_of_mut!(DEVICE_ENTRIES))[kind];
@@ -59,7 +107,7 @@ pub(super) fn record_device_entries(details: [[u32; 4]; 5]) {
     }
 }
 
-pub(super) fn device_entries() -> [[u64; 2]; 5] {
+pub(super) fn device_entries() -> [[u64; 2]; 7] {
     unsafe { *core::ptr::addr_of!(DEVICE_ENTRIES) }
 }
 
@@ -98,6 +146,15 @@ impl Sample {
             KernelEvent::Ins { .. } => (13, regs.rdx as u32 & 0xFFFF),
             KernelEvent::Outs { .. } => (14, regs.rdx as u32 & 0xFFFF),
         };
+        if let KernelEvent::Out { port, .. } = *event {
+            if port == 0x388 { unsafe { OPL_INDEX = regs.rax as u8; } }
+            if port == 0x389 {
+                let index = unsafe { OPL_INDEX };
+                if (0xb0..=0xb8).contains(&index) {
+                    timed_event(machine.now(), 4, u32::from(index) << 8 | regs.rax as u32 & 255);
+                }
+            }
+        }
         // Single cooperative event loop owns this storage. No IRQ accesses.
         // Keep table lookup outside the measured dispatch interval.
         unsafe {
@@ -142,8 +199,13 @@ pub(super) fn reset() {
         RM_TARGETS = [(0, 0, 0, 0); RM_TARGET_SLOTS];
         READ_DETAILS = [(0, 0, 0); READ_DETAIL_SLOTS];
         DIRECT_RM_PHASES = [0; 4];
-        DEVICE_ENTRIES = [[0; 2]; 5];
+        DEVICE_ENTRIES = [[0; 2]; 7];
         VGA_INSTRUCTIONS = [EMPTY_VGA; 32];
+        STATUS_POLLS = [EMPTY_POLL; 8];
+        LAST_STATUS_POLL = None;
+        (&mut *core::ptr::addr_of_mut!(TIMELINE)).resize(2048, EMPTY_TIMED);
+        TIMELINE_USED = 0;
+        OPL_INDEX = 0;
     }
     super::block::cache::profile_reset();
 }
@@ -208,6 +270,13 @@ pub(super) fn visit_rm_targets(mut visit: impl FnMut(u8, u16, u16, u64)) {
 }
 
 pub(super) fn print() {
+    for event in unsafe { &(&*core::ptr::addr_of!(TIMELINE))[..TIMELINE_USED] } {
+        crate::compact_println!("[frame-timeline] ns={} kind={} value={}", event.ns, event.kind, event.value);
+    }
+    for entry in unsafe { *core::ptr::addr_of!(STATUS_POLLS) }.into_iter().filter(|entry| entry.calls != 0) {
+        crate::compact_println!("[vga-poll] at={:04x}:{:08x} calls={} high={} max_us={}",
+            entry.cs, entry.ip, entry.calls, entry.high, entry.max_ns / 1000);
+    }
     for (name, [calls, cycles]) in DEVICE_NAMES.into_iter().zip(device_entries()) {
         crate::compact_println!("[device-prof] {} calls={} cycles={}", name, calls, cycles);
     }

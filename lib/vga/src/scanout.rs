@@ -4,6 +4,10 @@ use alloc::vec::Vec;
 use crate::{beam::{Phase, Sequencer, Timing}, memory::Memory, Frame, LegacyVgaState,
     Pal, PixelFormat, VgaMode, VgaState, SvgaState, dimensions, render_row_packed, PACKED_ROW_PADDING};
 
+// Scanout observes address/panning latches and row fetches. Horizontal blank
+// edges do not change its state and must not cause extra CPU wakeups.
+const PHASES: &[Phase] = &[Phase::RetraceStart, Phase::RetraceEnd, Phase::FrameStart, Phase::RowStart];
+
 pub enum Device { Legacy(LegacyVgaState), Vbe(SvgaState) }
 impl From<&LegacyVgaState> for Device {
     fn from(value: &LegacyVgaState) -> Self { Self::Legacy(value.scanout_view()) }
@@ -77,7 +81,25 @@ impl Scanout {
             }
         }
     }
-    pub fn deadline_ns(&self) -> u64 { self.beam.deadline_ns() }
+    fn row_step(&self) -> u16 {
+        self.mode.map_or(1, |mode| (usize::from(self.beam.timing().vertical_display)
+            / dimensions(mode).1.max(1)).max(1) as u16)
+    }
+    pub fn deadline_ns(&self) -> u64 {
+        self.beam.row_deadline(PHASES, self.beam.timing().vertical_display, self.row_step())
+    }
+
+    /// Physical presentation must leave the guest-visible retrace pulse free.
+    /// A completed active image can wait until that frame's retrace has ended.
+    pub fn present_after_ns(&self, now: u64) -> u64 {
+        let timing = self.beam.timing();
+        let clock = timing.clock_at(now);
+        let frame = timing.frame_clocks();
+        if frame == 0 || timing.retrace_start >= timing.vertical_total { return now; }
+        let end = clock / frame * frame
+            + u64::from(timing.retrace_end) * u64::from(timing.horizontal_total);
+        timing.time_at(end).max(now)
+    }
 
     /// Process all phases through `now`, swapping only a completed active image
     /// into front. Registers are read at their hardware latch/fetch phases.
@@ -97,7 +119,7 @@ impl Scanout {
         }
         self.last_ns = now;
         let mut completed = None;
-        while let Some(event) = self.beam.next(now) {
+        while let Some(event) = self.beam.next_row_event(now, PHASES, timing.vertical_display, self.row_step()) {
             match event.phase {
                 Phase::RetraceStart => { if let Device::Legacy(v) = &mut self.device { v.latch_display_start(event.frame + 1); } }
                 Phase::RetraceEnd => { if let Device::Legacy(v) = &mut self.device { v.latch_pixel_pan(event.frame + 1); } }

@@ -1811,6 +1811,7 @@ fn event_loop<A: crate::Arch>(
         stats.part(machine, PROFILE_INPUT);
 
         let mut deadlines = Deadlines::new(world_now_ns);
+        deadlines.include(super::media::inline_video_deadline(world_now_ns));
         deadlines.include(hardware_deadline);
         if crate::kernel::klog::needs_sync() { deadlines.include(Some(next_klog_sync_ns)); }
         if network_active { deadlines.include(Some(network_service.deadline())); }

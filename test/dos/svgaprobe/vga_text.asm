@@ -4,6 +4,7 @@ org 100h
 
     mov ax, 3
     int 10h
+    call palette_ports
     ; VChess's VGA probe disables odd/even reads, keeps odd/even writes,
     ; then checks a rotated OR against the byte loaded into the VGA latches.
     mov dx, 3c4h
@@ -90,6 +91,49 @@ org 100h
     int 21h
     mov ax, 4c00h
     int 21h
+palette_ports:
+    ; DAC component masking and index wrap must agree on direct IN/OUT paths.
+    mov dx, 3c6h
+    mov al, 7fh
+    out dx, al
+    in al, dx
+    cmp al, 7fh
+    jne fail
+    mov al, 0ffh
+    out dx, al
+    mov dx, 3c8h
+    mov al, 254
+    out dx, al
+    inc dx
+    mov si, palette_input
+    mov cx, 6
+.write:
+    lodsb
+    out dx, al
+    loop .write
+    dec dx
+    in al, dx
+    test al, al
+    jnz fail
+    dec dx
+    mov al, 254
+    out dx, al
+    in al, dx
+    cmp al, 3
+    jne fail
+    add dx, 2
+    mov si, palette_expected
+    mov cx, 6
+    mov ah, 5ah
+.read:
+    in al, dx
+    cmp ah, 5ah
+    jne fail
+    cmp al, [si]
+    jne fail
+    inc si
+    loop .read
+    ret
 window:
     mov bh, 7
     xor cx, cx
@@ -106,3 +150,5 @@ fail:
     int 21h
 success db 'VGA-TEXT PASS', 13, 10, '$'
 failure db 'VGA-TEXT FAIL', 13, 10, '$'
+palette_input db 63, 128, 255, 1, 2, 3
+palette_expected db 63, 0, 63, 1, 2, 3

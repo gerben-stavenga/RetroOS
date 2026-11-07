@@ -18,12 +18,12 @@ extern entry_wrapper_64
     sbb edx, [PTR ebx + 56]
     add [PTR ebx + 44], eax
     adc [PTR ebx + 48], edx
-    mov ecx, [PTR ebx + 64]
+    mov ecx, [PTR ebx + 60]
     shl ecx, 4
-    add dword [PTR ebx + ecx + 68], 1
-    adc dword [PTR ebx + ecx + 72], 0
-    add [PTR ebx + ecx + 76], eax
-    adc [PTR ebx + ecx + 80], edx
+    add dword [PTR ebx + ecx + 64], 1
+    adc dword [PTR ebx + ecx + 68], 0
+    add [PTR ebx + ecx + 72], eax
+    adc [PTR ebx + ecx + 76], edx
 %%done:
 %endmacro
 
@@ -34,8 +34,6 @@ extern entry_wrapper_64
     jz %%rust
     cmp dword [PTR ebx], 0
     je %%rust
-    cmp dword [PTR ebx + 60], 0
-    jne %%rust               ; synchronous scanout needs a phase check first
     cmp dword [ss:esp + 4], 0
     jne %%cs64
     movzx ecx, word [ss:ebp + 76]
@@ -319,8 +317,12 @@ planar_save32:
 .vga:
     cmp eax, 0x3da
     je .port
+    cmp eax, 0x388
+    jb planar_slow32
+    cmp eax, 0x38b
+    jbe .port
     sub eax, 0x3c4
-    cmp eax, 1
+    cmp eax, 5
     ja planar_slow32
 .port:
     cmp dword [esp + 68], 0
@@ -392,8 +394,12 @@ planar_save64:
 .vga:
     cmp eax, 0x3da
     je .port
+    cmp eax, 0x388
+    jb planar_slow64
+    cmp eax, 0x38b
+    jbe .port
     sub eax, 0x3c4
-    cmp eax, 1
+    cmp eax, 5
     ja planar_slow64
 .port:
     cmp qword [rsp + 72], 0
@@ -438,21 +444,35 @@ planar_common:
     mov ebx, [ss:PLANAR_FAST_CONTEXT]
     cmp dword [ss:ebx + 40], 0
     je .timed
-    mov dword [ss:ebx + 64], 0 ; assembly VGA memory write
+    mov dword [ss:ebx + 60], 0 ; assembly VGA memory write
     cmp ecx, 4
     jne .stamp
     movzx eax, word [ss:ebp + 16] ; guest DX
-    mov dword [ss:ebx + 64], 4 ; DMA polling
+    mov dword [ss:ebx + 60], 4 ; DMA polling
     cmp eax, 0x3da
     jne .mask
-    mov dword [ss:ebx + 64], 2 ; Input Status #1
+    mov dword [ss:ebx + 60], 2 ; Input Status #1
     jmp .stamp
 .mask:
+    cmp eax, 0x388
+    jb .palette
+    cmp eax, 0x38b
+    ja .palette
+    mov dword [ss:ebx + 60], 6 ; FM status
+    jmp .stamp
+.palette:
+    cmp eax, 0x3c6
+    jb .sequencer
+    cmp eax, 0x3c9
+    ja .sequencer
+    mov dword [ss:ebx + 60], 5 ; VGA DAC ports
+    jmp .stamp
+.sequencer:
     cmp eax, 0x3c4
     jb .stamp
     cmp eax, 0x3c5
     ja .stamp
-    mov dword [ss:ebx + 64], 3 ; sequencer plane mask
+    mov dword [ss:ebx + 60], 3 ; sequencer plane mask
 .stamp:
     rdtsc
     mov [ss:ebx + 52], eax
@@ -479,7 +499,7 @@ planar_call:
     cmp dword [ebp + 64], 13
     je .input
     mov edx, [ss:PLANAR_FAST_CONTEXT]
-    mov dword [ss:edx + 64], 1 ; generic VGA memory instruction
+    mov dword [ss:edx + 60], 1 ; generic VGA memory instruction
     call planar_fault
     jmp .called
 .input:

@@ -26,12 +26,29 @@ fn due() -> bool {
     LAST_FRAME.load(Ordering::Relaxed) != frame
 }
 
+fn deadline(now: u64) -> u64 {
+    if PHASE_DRIVEN.load(Ordering::Relaxed) {
+        // The compact deadline wraps every ~71 minutes. Interpret it against
+        // the iteration's time sample, including an already-due phase.
+        let micros = NEXT_PHASE_US.load(Ordering::Relaxed)
+            .wrapping_sub((now / 1000) as u32) as i32;
+        if micros <= 0 { now } else { (now / 1000 + micros as u64) * 1000 }
+    } else {
+        let hz = u64::from(REFRESH_HZ.load(Ordering::Relaxed).max(1));
+        let frame = (u128::from(now) * u128::from(hz) / 1_000_000_000) as u32;
+        if LAST_FRAME.load(Ordering::Relaxed) != frame { now } else {
+            ((u128::from(now) * u128::from(hz) / 1_000_000_000 + 1)
+                * 1_000_000_000).div_ceil(u128::from(hz)) as u64
+        }
+    }
+}
+
 pub(super) struct Video {
     fb: Framebuffer,
     format: PixelFormat,
     device: Option<vga::scanout::Scanout>,
     device_epoch: u32,
-    device_ready: Option<vga::VgaMode>,
+    device_ready: Option<(vga::VgaMode, u64)>,
     presented: Vec<u8>,
     owner: Option<gui::EndpointId>,
     voodoo: Option<alloc::sync::Arc<crate::kernel::dos::VoodooOutput>>,
@@ -58,7 +75,10 @@ impl Video {
         // output. Otherwise the catch-up itself can consume the guest's entire
         // publication window on a single CPU.
         let present_started = crate::kernel::portio::now_ns();
-        if present_started < self.next_present_ns { return; }
+        if present_started < self.next_present_ns {
+            set_deadline(self.next_present_ns);
+            return;
+        }
         if self.owner.is_some() && self.scene.is_none() { return; }
         if let Some(device) = &mut self.device {
             if self.device_epoch != crate::kernel::dos::scanout_epoch() { return; }
@@ -66,7 +86,15 @@ impl Video {
             let completed = device.advance(now, &mut self.scanout.surface, media::checkpoint);
             set_deadline(device.deadline_ns());
             if self.device_epoch != crate::kernel::dos::scanout_epoch() { return; }
-            let Some(mode) = completed.or(self.device_ready.take()) else { return };
+            if let Some(mode) = completed {
+                self.device_ready = Some((mode, device.present_after_ns(now)));
+            }
+            let Some((mode, after)) = self.device_ready else { return };
+            if now < after {
+                set_deadline(device.deadline_ns().min(after));
+                return;
+            }
+            self.device_ready = None;
             core::mem::swap(&mut self.scanout.surface, &mut self.presented);
             let (w, h) = vga::dimensions(mode);
             self.scanout.geo = (w, h, w, h, w, h);
@@ -92,9 +120,10 @@ impl Video {
                     let now = crate::kernel::portio::now_ns();
                     if now >= device.deadline_ns() {
                         if let Some(mode) = device.advance(now, &mut self.scanout.surface, media::checkpoint) {
-                            self.device_ready = Some(mode);
+                            self.device_ready = Some((mode, device.present_after_ns(now)));
                         }
-                        set_deadline(if self.device_ready.is_some() { now } else { device.deadline_ns() });
+                        set_deadline(self.device_ready.map_or(device.deadline_ns(),
+                            |(_, after)| device.deadline_ns().min(after)));
                     }
                 }
             };
@@ -125,6 +154,7 @@ impl Video {
         self.next_present_ns = if finished.saturating_sub(present_started) >= interval {
             finished.saturating_add(interval)
         } else { 0 };
+        if self.next_present_ns != 0 { set_deadline(self.next_present_ns); }
 
     }
 }
@@ -162,7 +192,7 @@ impl Display {
         // Retire the earlier one-shot presenter before transferring its sink.
         if let Some(work) = self.presentation.take() { drop(work); }
         if self.video.is_none() {
-            self.video = Some(unsafe { media::VideoService::new(Video::new(fb, self.rgb), due, Video::render) });
+            self.video = Some(unsafe { media::VideoService::new(Video::new(fb, self.rgb), due, deadline, Video::render) });
         }
         self.video.as_ref()
     }
@@ -195,7 +225,7 @@ impl Display {
                     device.reserve(pixels, &mut video.presented);
                 }
             }
-            set_deadline(video.device.as_ref().unwrap().deadline_ns());
+            set_deadline(video.device.as_ref().unwrap().deadline_ns().max(video.next_present_ns));
             PHASE_DRIVEN.store(true, Ordering::Relaxed);
         }
         service.activate();

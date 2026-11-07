@@ -669,11 +669,26 @@ pub fn port_write<A: crate::Arch>(
     value: u8,
 ) {
     let write = state.port_write(port, value);
+    profile_port_write(state, port, value);
     if let Some(transition) = write.vram_transition {
         rebind_scanout();
         live_planes_mut(machine).transition(transition);
     }
     apply_aperture_write(machine, write);
+}
+
+pub(in crate::kernel::dos) fn profile_port_write(state: &LegacyVgaState, port: u16, value: u8) {
+    if crate::kernel::startup::profile_enabled() {
+        let kind = match port {
+            0x3d5 if state.crtc_index == 0x0c => 1,
+            0x3c8 if value == 0 => 2,
+            0x3c9 if state.dac_index == 0 && state.dac_wsub == 0 => 3,
+            _ => 0,
+        };
+        if kind != 0 {
+            crate::kernel::event_profile::timed_event(crate::kernel::portio::now_ns(), kind, u32::from(value));
+        }
+    }
 }
 
 /// BIOS character-generator services operate on plane 2 regardless of the

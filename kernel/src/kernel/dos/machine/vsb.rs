@@ -440,6 +440,16 @@ impl SoundBlaster {
         }
     }
 
+    /// Resident FM status reads need no architecture calls or allocation.
+    /// Hardware-backed cards retain their ordinary port path.
+    pub fn fm_status(&mut self, port: u16) -> Option<u8> {
+        if !(0x388..=0x38b).contains(&port) { return None; }
+        match &mut self.device {
+            SbDevice::Emulated(emu) => Some(emu.core.port_read(port)),
+            SbDevice::Native { .. } => None,
+        }
+    }
+
     /// Write an SB DSP/mixer/OPL port.
     pub fn sb_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
         let Self { blaster, device } = self;
@@ -1017,6 +1027,24 @@ mod single_cycle_tests {
             assert_eq!(card.dma_poll(&mut dma, port, write, 0), None);
         }
         assert_eq!((dma.ff_lo, dma.ff_hi, dma.read_latch, dma.ch[5].prog.count), before);
+    }
+
+    #[test]
+    fn resident_fm_status_tracks_timer_control_and_preserves_dsp_reads() {
+        let mut card = SoundBlaster::new();
+        assert_eq!(card.fm_status(0x388), Some(0));
+        assert_eq!(card.fm_status(0x22a), None);
+        let SbDevice::Emulated(sb) = &mut card.device else { unreachable!() };
+        sb.core.port_write(0x226, 1, 0);
+        sb.core.port_write(0x226, 0, 0); // Leave the DSP's AA response queued.
+        sb.core.port_write(0x388, 4, 0);
+        sb.core.port_write(0x389, 0x21, 0);
+        for port in 0x388..=0x38b { assert_eq!(card.fm_status(port), Some(0xc0)); }
+        let SbDevice::Emulated(sb) = &mut card.device else { unreachable!() };
+        assert_eq!(sb.core.port_read(0x22a), 0xaa);
+        sb.core.port_write(0x388, 4, 0);
+        sb.core.port_write(0x389, 0x80, 0);
+        assert_eq!(card.fm_status(0x388), Some(0));
     }
 
     fn start(sb: &mut EmulatedSb) {

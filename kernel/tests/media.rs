@@ -201,7 +201,7 @@ fn two_core_priority_handoff_and_drop_fences() {
     static VIDEO_TICKS: AtomicUsize = AtomicUsize::new(0);
     static HOLD_VIDEO: AtomicBool = AtomicBool::new(true);
     static VIDEO_STARTED: AtomicBool = AtomicBool::new(false);
-    let old_video = unsafe { media::VideoService::new((), || true, |_| {
+    let old_video = unsafe { media::VideoService::new((), || true, |now| now, |_| {
         VIDEO_STARTED.store(true, Ordering::Release);
         while HOLD_VIDEO.load(Ordering::Acquire) { media::checkpoint(); }
         VIDEO_TICKS.fetch_add(1, Ordering::Release);
@@ -220,7 +220,7 @@ fn two_core_priority_handoff_and_drop_fences() {
     assert_eq!(VIDEO_TICKS.load(Ordering::Acquire), 1);
     drop(publication);
     while VIDEO_TICKS.load(Ordering::Acquire) < 10 { std::thread::yield_now(); }
-    let video = unsafe { media::VideoService::new((), || true, |_| {
+    let video = unsafe { media::VideoService::new((), || true, |now| now, |_| {
         VIDEO_TICKS.fetch_add(1, Ordering::Release);
     }) };
     video.activate();

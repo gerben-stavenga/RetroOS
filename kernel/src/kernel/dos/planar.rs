@@ -57,17 +57,14 @@ pub fn execute<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>,
                 end: u32::from(pages.end) << 12, plane_mask: u32::from(state.seq.get(2) & 15),
                 profile: u32::from(crate::kernel::startup::profile_enabled()),
                 cycles_lo: 0, cycles_hi: 0, start_lo: 0, start_hi: 0,
-                inline_scanout: u32::from(!crate::kernel::media::enabled()),
-                profile_kind: 0, profile_details: [[0; 4]; 5],
+                profile_kind: 0, profile_details: [[0; 4]; 7],
             };
             // The callback only touches resident device state and atomic VRAM.
             let mut context = Context {
                 fast, state, ldt: &dos.ldt[..], planes: base.as_ptr(),
                 dma: &mut dos.pc.dma, audio: &dos.pc.audio,
-                pit_deadline: dos.pc.vpit.irq_deadline_ns(),
-                pit: &mut dos.pc.vpit, pic: &mut dos.pc.vpic,
                 base: u32::from(pages.start) << 12,
-                end: u32::from(pages.end) << 12, yielded: false, stepped: false, user_tf: regs.user_tf(),
+                end: u32::from(pages.end) << 12, stepped: false, user_tf: regs.user_tf(),
             };
             context.set_code(regs.code_seg(), regs.mode() == crate::UserMode::VM86);
             unsafe {
@@ -87,7 +84,6 @@ pub fn execute<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>,
                 ACTIVE = core::ptr::null_mut();
                 PLANAR_FAST_CONTEXT = core::ptr::null_mut();
                 if context.stepped { event = crate::KernelEvent::EmulatedStep { user_was: context.user_tf }; }
-                else if context.yielded { event = crate::KernelEvent::Irq; }
                 let fast_cycles = (u64::from(context.fast.cycles_hi) << 32) | u64::from(context.fast.cycles_lo);
                 if context.fast.profile != 0 {
                     crate::kernel::event_profile::record_device_entries(context.fast.profile_details);
@@ -109,15 +105,14 @@ struct Fast {
     code_base: u32, code_limit: u32, planes: u32, base: u32,
     end: u32, plane_mask: u32, profile: u32,
     cycles_lo: u32, cycles_hi: u32, start_lo: u32, start_hi: u32,
-    inline_scanout: u32, // synchronous scanout requires a Rust deadline check
     profile_kind: u32,
     // Per kind: calls low/high, cycles low/high. All offsets stay u32-aligned.
-    profile_details: [[u32; 4]; 5],
+    profile_details: [[u32; 4]; 7],
 }
 
 #[cfg(target_arch = "x86")]
 const _: () = {
-    assert!(core::mem::size_of::<Fast>() == 148);
+    assert!(core::mem::size_of::<Fast>() == 176);
     assert!(core::mem::offset_of!(Fast, decode) == 4);
     assert!(core::mem::offset_of!(Fast, code_base) == 16);
     assert!(core::mem::offset_of!(Fast, planes) == 24);
@@ -125,9 +120,8 @@ const _: () = {
     assert!(core::mem::offset_of!(Fast, profile) == 40);
     assert!(core::mem::offset_of!(Fast, cycles_lo) == 44);
     assert!(core::mem::offset_of!(Fast, start_lo) == 52);
-    assert!(core::mem::offset_of!(Fast, inline_scanout) == 60);
-    assert!(core::mem::offset_of!(Fast, profile_kind) == 64);
-    assert!(core::mem::offset_of!(Fast, profile_details) == 68);
+    assert!(core::mem::offset_of!(Fast, profile_kind) == 60);
+    assert!(core::mem::offset_of!(Fast, profile_details) == 64);
 };
 
 #[cfg(target_arch = "x86")]
@@ -153,13 +147,9 @@ struct Context<'a> {
     ldt: &'a [u64],
     dma: &'a mut super::machine::Dma8237,
     audio: &'a crate::kernel::media::Shared<super::AudioDevices>,
-    pit_deadline: u64,
-    pit: &'a mut super::machine::VirtualPit,
-    pic: &'a mut super::machine::VirtualPic,
     planes: *mut u8,
     base: u32,
     end: u32,
-    yielded: bool,
     stepped: bool,
     user_tf: bool,
 }
@@ -236,13 +226,7 @@ unsafe extern "C" fn planar_fault(pointer: *mut u8, wide: u32, address: u32) -> 
     let context = unsafe { &mut *ACTIVE.cast::<Context<'_>>() };
     let mut frame = Frame { pointer, wide: wide != 0 };
     let handled = if !(context.base..context.end).contains(&address) { 0 }
-        else if crate::kernel::media::inline_video_due()
-        {
-            // Scheduling point only: ring 1 services scanout, then retries
-            // this still-unexecuted instruction in the ring-0 handler.
-            context.yielded = true;
-            0
-        } else { u32::from(context.emulate(&mut frame, address)) };
+        else { u32::from(context.emulate(&mut frame, address)) };
     if handled != 0 && frame.read(frame.flags_offset()) & 0x100 != 0 {
         context.stepped = true;
         0
@@ -272,18 +256,6 @@ unsafe extern "C" fn device_io(pointer: *mut u8, wide: u32, _: u32) -> u32 {
         operand32 = !operand32;
         length = 2;
     }
-    let now = crate::kernel::portio::now_ns();
-    if now >= context.pit_deadline {
-        // A normal I/O exit does not resample the event-loop clock. Latch
-        // the edge here before falling back, so the completed I/O can be
-        // followed by IRQ delivery without waiting for a host clock tick.
-        // Keep the original instruction/event intact, including when IF=0:
-        // the PIC must remember the edge until interrupts are enabled.
-        super::machine::pit_io(context.pit, context.pic, now, |_| ());
-        context.pit_deadline = context.pit.irq_deadline_ns();
-        return 0;
-    }
-    if crate::kernel::media::inline_video_due() { return 0; }
     let port = if matches!(opcode, 0xe4 | 0xe6) {
         if ip.checked_add(length).is_none_or(|end| end > context.fast.code_limit) { return 0; }
         let immediate = unsafe { code.wrapping_add(length as usize).read_volatile() };
@@ -292,20 +264,38 @@ unsafe extern "C" fn device_io(pointer: *mut u8, wide: u32, _: u32) -> u32 {
         u16::from(immediate)
     } else { frame.read(16) as u16 };
     match (opcode, port) {
+        (0xec, 0x388..=0x38b) => {
+            let Some(mut audio) = context.audio.try_lock() else { return 0 };
+            let Some(status) = audio.sb.fm_status(port) else { return 0 };
+            unsafe { pointer.write(status); }
+        }
+        (0xec, 0x3c6..=0x3c9) => {
+            let value = context.state.port_read(port);
+            unsafe { pointer.write(value); }
+        }
+        (0xee, 0x3c6..=0x3c9) => {
+            // DAC data/index/mask writes cannot remap the aperture. Use the
+            // device's canonical register operation directly, including its
+            // palette cursor and six-bit component semantics.
+            let value = frame.read(0) as u8;
+            context.state.port_write(port, value);
+            super::machine::vga::profile_port_write(context.state, port, value);
+        }
         (0xec, 0..=7 | 0xc0..=0xcf) | (0xee, 0x0c | 0xd8) => {
             // Never wait for core 1 while trapping a guest instruction.
             // Both paths use the same DMA latch and source-consumption cursor.
             let Some(mut audio) = context.audio.try_lock() else { return 0 };
-            // The ordinary event loop transfers worker-raised device IRQs
-            // into the PIC before reentering the guest. Do not keep retiring
-            // polling instructions while that transfer is pending.
-            if audio.pending_irqs != 0 { return 0; }
             let write = (opcode == 0xee).then_some(frame.read(0) as u8);
+            let now = crate::kernel::portio::now_ns();
             let Some(value) = audio.sb.dma_poll(context.dma, port, write, now) else { return 0 };
             if write.is_none() { unsafe { pointer.write(value); } }
         }
         (0xec, 0x3da) => {
+            let now = crate::kernel::portio::now_ns();
             let status = context.state.beam(now).status;
+            if context.fast.profile != 0 {
+                crate::kernel::event_profile::record_status_poll(frame.cs(), ip, status, now);
+            }
             context.state.ac_state.pending_data = false;
             unsafe { pointer.write(status); }
         }

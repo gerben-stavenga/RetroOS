@@ -1212,6 +1212,50 @@ fn short_beam_timing() -> vga::beam::Timing {
 }
 
 #[test]
+fn subscribed_beam_phases_match_filtering_the_complete_signal_stream() {
+    use vga::beam::{Phase, Sequencer};
+    let timing = short_beam_timing();
+    let phases = [Phase::RetraceStart, Phase::RetraceEnd, Phase::FrameStart, Phase::RowStart];
+    let mut full = Sequencer::new(timing, 0);
+    let mut filtered = Sequencer::new(timing, 0);
+    let mut expected = Vec::new();
+    while let Some(event) = full.next(180) {
+        if phases.contains(&event.phase) { expected.push(event); }
+    }
+    let mut actual = Vec::new();
+    for now in [3, 19, 79, 80, 180] {
+        while let Some(event) = filtered.next_for(now, &phases) { actual.push(event); }
+    }
+    assert_eq!(actual, expected);
+    assert_eq!(full.deadline_ns(), 188); // horizontal blank
+    assert_eq!(filtered.deadline_for(&phases), 190); // next row
+    assert_eq!(filtered.deadline_for(&[]), u64::MAX);
+}
+
+#[test]
+fn subscribed_rows_skip_blank_and_repeated_lines_across_odd_frame_lengths() {
+    use vga::beam::{Phase, Sequencer};
+    let mut timing = short_beam_timing();
+    timing.vertical_total = 7;
+    let phases = [Phase::RetraceStart, Phase::RetraceEnd, Phase::FrameStart, Phase::RowStart];
+    let mut full = Sequencer::new(timing, 0);
+    let mut rows = Sequencer::new(timing, 0);
+    let mut expected = Vec::new();
+    while let Some(event) = full.next(210) {
+        if phases.contains(&event.phase)
+            && (event.phase != Phase::RowStart || event.line < 3 && event.line % 2 == 0) {
+            expected.push(event);
+        }
+    }
+    let mut actual = Vec::new();
+    for now in [19, 80, 129, 210] {
+        while let Some(event) = rows.next_row_event(now, &phases, 3, 2) { actual.push(event); }
+    }
+    assert_eq!(actual, expected);
+    assert_eq!(rows.row_deadline(&phases, 3, 2), 230);
+}
+
+#[test]
 fn beam_phases_do_not_depend_on_polling_frequency() {
     use vga::beam::{Phase, Sequencer};
     let timing = short_beam_timing();
@@ -1338,6 +1382,20 @@ fn assert_packed_colour(pixels: &[u8], start_row: usize, end_row: usize, colour:
             assert_eq!(u32::from_le_bytes(pixels[offset..offset + 4].try_into().unwrap()), colour);
         }
     }
+}
+
+#[test]
+fn completed_scanout_defers_sink_copy_until_after_retrace() {
+    let (device, memory, timing) = tiny_scanout_device();
+    let scanout = vga::scanout::Scanout::new(&device, memory, PixelFormat::NATIVE, 0);
+    let end = u64::from(timing.retrace_end) * u64::from(timing.horizontal_total);
+    let active_end = timing.time_at(u64::from(timing.vertical_display) * u64::from(timing.horizontal_total));
+    let after = timing.time_at(end);
+    assert!(active_end < after);
+    assert_eq!(scanout.present_after_ns(active_end), after);
+    assert_eq!(scanout.present_after_ns(after), after);
+    let frame = timing.time_at(timing.frame_clocks());
+    assert_eq!(scanout.present_after_ns(active_end + frame), timing.time_at(end + timing.frame_clocks()));
 }
 
 #[test]

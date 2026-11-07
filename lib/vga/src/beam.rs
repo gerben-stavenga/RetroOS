@@ -151,13 +151,14 @@ impl Sequencer {
         if timing != self.timing { *self = Self::new(timing, now_ns); }
     }
 
-    fn candidate(&self) -> Option<(u64, Phase)> {
+    fn candidate(&self, phases: Option<&[Phase]>, rows: Option<(u16, u16)>) -> Option<(u64, Phase)> {
         let timing = self.timing;
         if !timing.valid() { return None; }
         let horizontal = u64::from(timing.horizontal_total);
         let frame = timing.frame_clocks();
         let mut best = (u64::MAX, Phase::HorizontalBlankStart);
         let mut consider = |offset: u64, period: u64, phase: Phase| {
+            if phases.is_some_and(|phases| !phases.contains(&phase)) { return; }
             let base = self.after.0 / period * period;
             let Some(mut clock) = base.checked_add(offset) else { return };
             if (clock, phase) <= self.after {
@@ -183,7 +184,19 @@ impl Sequencer {
             }
         }
         consider(0, frame, Phase::FrameStart);
-        consider(0, horizontal, Phase::RowStart);
+        if let Some((end, step)) = rows {
+            let step = u64::from(step.max(1));
+            let base = self.after.0 / frame * frame;
+            let line = (self.after.0 % frame / horizontal).div_ceil(step) * step;
+            let line = if (base + line * horizontal, Phase::RowStart) <= self.after { line + step } else { line };
+            // An explicit row window is relative to each frame, including
+            // frames whose physical line count is not divisible by the step.
+            if end != 0 {
+                consider(if line < u64::from(end) { line * horizontal } else { 0 }, frame, Phase::RowStart);
+            }
+        } else {
+            consider(0, horizontal, Phase::RowStart);
+        }
         if timing.horizontal_display < timing.horizontal_total {
             consider(u64::from(timing.horizontal_display), horizontal, Phase::DisplayEnd);
         }
@@ -196,11 +209,34 @@ impl Sequencer {
     }
 
     pub fn deadline_ns(&self) -> u64 {
-        self.candidate().map_or(u64::MAX, |(clock, _)| self.timing.time_at(clock))
+        self.deadline(None, None)
+    }
+
+    /// Consumers need wakeups only for signals they actually observe.
+    pub fn deadline_for(&self, phases: &[Phase]) -> u64 { self.deadline(Some(phases), None) }
+
+    pub fn row_deadline(&self, phases: &[Phase], end: u16, step: u16) -> u64 {
+        self.deadline(Some(phases), Some((end, step)))
+    }
+
+    fn deadline(&self, phases: Option<&[Phase]>, rows: Option<(u16, u16)>) -> u64 {
+        self.candidate(phases, rows).map_or(u64::MAX, |(clock, _)| self.timing.time_at(clock))
     }
 
     pub fn next(&mut self, now_ns: u64) -> Option<Event> {
-        let (clock, phase) = self.candidate()?;
+        self.next_event(now_ns, None, None)
+    }
+
+    pub fn next_for(&mut self, now_ns: u64, phases: &[Phase]) -> Option<Event> {
+        self.next_event(now_ns, Some(phases), None)
+    }
+
+    pub fn next_row_event(&mut self, now_ns: u64, phases: &[Phase], end: u16, step: u16) -> Option<Event> {
+        self.next_event(now_ns, Some(phases), Some((end, step)))
+    }
+
+    fn next_event(&mut self, now_ns: u64, phases: Option<&[Phase]>, rows: Option<(u16, u16)>) -> Option<Event> {
+        let (clock, phase) = self.candidate(phases, rows)?;
         if clock > self.timing.clock_at(now_ns) { return None; }
         self.after = (clock, phase);
         Some(Event {

@@ -513,7 +513,13 @@ address, palette, and line-compare registers in that loop. Input Status #1 uses
 the same device timing as scanout. There is no VBE configuration snapshot,
 periodic register publication, guest-memory handoff, or stale-revision rejection.
 On SMP the media core consumes phases independently of guest execution; on one
-CPU the same consumer runs at kernel entry. Mode/owner changes rebind device
+CPU the same consumer runs at kernel entry, with logical scanout deadlines
+included in the event loop's alarm selection. Instruction shortcuts depend
+only on completing the instruction, and never inspect unrelated timer or
+scanout state. The consumer subscribes to register latches and active source
+rows; blank and repeated rows require no extra CPU wakeups. Physical sink
+copies wait until after retrace, leaving its short guest-visible pulse free
+for status polling on a single CPU. Mode/owner changes rebind device
 lifetime and storage, rather than publishing per-frame register copies.
 
 Backends supply only a framebuffer or host window; they never emulate VGA.

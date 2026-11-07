@@ -307,6 +307,7 @@ impl<T: Send + 'static> Drop for AudioService<T> {
 struct VideoPoll {
     command: Command,
     due: fn() -> bool,
+    deadline: fn(u64) -> u64,
 }
 static VIDEO_SERVICE: Shared<Option<VideoPoll>> = Shared::new(None);
 static VIDEO_OWNER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
@@ -316,6 +317,7 @@ static VIDEO_OWNER: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 pub struct VideoService<T: Send + 'static> {
     state: Box<VideoState<T>>,
     due: fn() -> bool,
+    deadline: fn(u64) -> u64,
     poll: fn(&mut T),
 }
 struct VideoState<T> {
@@ -326,10 +328,10 @@ impl<T: Send + 'static> VideoService<T> {
     /// # Safety
     /// Same resident/no-allocation contract as AudioService. `due` only reads
     /// permanent storage. Registration, updates and destruction are BSP-only.
-    pub unsafe fn new(value: T, due: fn() -> bool, poll: fn(&mut T)) -> Self {
+    pub unsafe fn new(value: T, due: fn() -> bool, deadline: fn(u64) -> u64, poll: fn(&mut T)) -> Self {
         Self { state: Box::new(VideoState {
             value: Shared::new(value), publication_pending: AtomicBool::new(false),
-        }), due, poll }
+        }), due, deadline, poll }
     }
     pub fn try_lock(&self) -> Option<Guard<'_, T>> { self.state.value.try_lock() }
     /// Defer the next frame until the BSP retries a busy scene publication.
@@ -357,7 +359,7 @@ impl<T: Send + 'static> VideoService<T> {
         }
         let mut slot = VIDEO_SERVICE.lock();
         VIDEO_POLL.store(self.poll as usize, Ordering::Relaxed);
-        *slot = Some(VideoPoll { command: Command { run: invoke::<T>, argument }, due: self.due });
+        *slot = Some(VideoPoll { command: Command { run: invoke::<T>, argument }, due: self.due, deadline: self.deadline });
         VIDEO_OWNER.store(argument, Ordering::Release);
         drop(slot);
         kernel_entry();
@@ -383,13 +385,11 @@ pub(crate) fn kernel_entry() {
     if !enabled() { video_checkpoint(); }
 }
 
-/// A native device-fault handler cannot run the inline renderer. Yield to
-/// the ordinary kernel entry when scanout has a phase to consume.
-#[cfg(target_arch = "x86")]
-pub(crate) fn inline_video_due() -> bool {
-    if enabled() { return false; }
-    let Some(service) = VIDEO_SERVICE.try_lock() else { return true; };
-    service.as_ref().is_some_and(|service| (service.due)())
+/// Without a media core, scanout owns a logical alarm just like other devices.
+/// Native instruction shortcuts need no renderer checks or special exits.
+pub(crate) fn inline_video_deadline(now: u64) -> Option<u64> {
+    if enabled() { return None; }
+    VIDEO_SERVICE.lock().as_ref().map(|service| (service.deadline)(now))
 }
 fn video_checkpoint() {
     if let Some(service) = VIDEO_SERVICE.try_lock()
@@ -511,11 +511,14 @@ impl<T: Copy, const N: usize> Commands<T, N> {
 fn inline_video_entries_do_not_require_a_worker_refresh_callback() {
     assert!(!enabled());
     assert_eq!(REFRESH.load(Ordering::Relaxed), 0);
-    let service = unsafe { VideoService::new(0usize, || true, |calls| *calls += 1) };
+    assert_eq!(inline_video_deadline(100), None);
+    let service = unsafe { VideoService::new(0usize, || true, |now| now + 123, |calls| *calls += 1) };
     service.activate();
+    assert_eq!(inline_video_deadline(100), Some(223));
     kernel_entry();
     assert_eq!(*service.try_lock().unwrap(), 2);
     service.pause();
+    assert_eq!(inline_video_deadline(100), None);
     kernel_entry();
     assert_eq!(*service.try_lock().unwrap(), 2);
     service.activate();
