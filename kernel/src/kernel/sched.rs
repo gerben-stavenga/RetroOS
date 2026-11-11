@@ -8,6 +8,15 @@
 use crate::Regs;
 use crate::kernel::thread;
 
+/// A vfork parent has lent its live address space to its child. Signals can
+/// make it Ready, but neither user execution nor kernel I/O polling is safe
+/// until release_vfork returns that space. Apply this to every selector,
+/// including the child-exit shortcut and explicit window selection.
+pub(crate) fn vfork_suspended<A: crate::Arch>(threads: &[thread::Thread<A>], tid: usize) -> bool {
+    threads.iter().any(|child| matches!(&child.personality,
+        thread::Personality::Linux(linux) if linux.borrows_space_from(tid)))
+}
+
 /// A blocked Linux process may need a peer on its terminal to make progress.
 /// Ready peers run first. Other blocked peers can be activated for kernel I/O
 /// polling; their user code stays parked until the operation completes.
@@ -28,10 +37,7 @@ pub(crate) fn linux_blocked_successor<A: crate::Arch>(
             } else {
                 matches!(candidate.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running)
             };
-            if eligible && !threads.iter().any(|child| {
-                matches!(&child.personality, thread::Personality::Linux(linux)
-                    if linux.borrows_space_from(index))
-            }) { return Some(index); }
+            if eligible && !vfork_suspended(threads, index) { return Some(index); }
         }
     }
     None
@@ -63,8 +69,7 @@ pub(crate) fn linux_timeslice_successor<A: crate::Arch>(
         index != 0 && index != current && owner.shares_terminal(linux)
             && (matches!(candidate.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running)
                 || candidate.kernel.state == thread::ThreadState::Blocked && linux.has_blocked_work())
-            && !threads.iter().any(|child| matches!(&child.personality,
-                thread::Personality::Linux(linux) if linux.borrows_space_from(index)))
+            && !vfork_suspended(threads, index)
     });
     if let Some(next) = next { *cursor = next; }
     next
@@ -171,6 +176,11 @@ fn next_after<A: crate::Arch>(
                 .and_then(|action| next_after(machine, bios_workspace, threads, regs, tid,
                     action, exiting_display, sb_handoff, display))
         }
+        thread::KernelAction::ThreadSignal { group, target, signal } => {
+            crate::kernel::linux::kill_thread(machine, threads, tid, regs, group, target, signal)
+                .and_then(|action| next_after(machine, bios_workspace, threads, regs, tid,
+                    action, exiting_display, sb_handoff, display))
+        }
         thread::KernelAction::DosSynthChild { pid, op } => {
             crate::kernel::dos::handle_synth_child(machine, threads, regs, tid, pid, op)
                 .map(Verdict::Switch)
@@ -248,6 +258,7 @@ pub(crate) fn focus_request<A: crate::Arch>(threads: &[thread::Thread<A>], tid: 
         // focus itself). That case is a focus-only handoff downstream.
         if (target != tid || crate::kernel::focus::focused() != target)
             && target < threads.len()
+            && !vfork_suspended(threads, target)
             && matches!(
                 threads[target].kernel.state,
                 thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked

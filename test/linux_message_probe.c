@@ -7,6 +7,7 @@ struct message {
     void *control; word controllen; unsigned int flags;
 };
 #ifdef __x86_64__
+#define READ 0
 #define WRITE 1
 #define EXIT 60
 #define WRITEV 20
@@ -24,9 +25,10 @@ static long call(word nr, word a, word b, word c) {
     return r;
 }
 static long socket_call(word op, word a, word b, word c) {
-    return call(op == 1 ? 41 : op == 3 ? 42 : 47, a, b, c);
+    return call(op == 1 ? 41 : op == 3 ? 42 : op == 16 ? 46 : 47, a, b, c);
 }
 #else
+#define READ 3
 #define WRITE 4
 #define EXIT 1
 #define WRITEV 146
@@ -85,6 +87,34 @@ void __attribute__((force_align_arg_pointer)) _start(void) {
     vectors[1].length = 4;
     check(socket_call(17, fd, (word)&m, 0) == 6 && m.flags == 0, 19);
     check(a[0]=='g' && a[1]=='h' && b[0]=='i' && b[3]=='l', 20);
+    // Large stream writes may complete partially; scratch-buffer capacity is
+    // not a message-size limit. Exercise one vector and two vectors spanning the limit.
+    static char payload[160000];
+    for (word i=0; i<sizeof payload; i++) payload[i] = 'a' + i % 26;
+    struct vector large[] = {{payload, 65536}, {payload+65536, sizeof payload-65536}};
+    struct message output = {0,0,large,2,0,0,0};
+    check(call(WRITEV, fd, (word)large, 2) == -90, 41);
+    check(socket_call(16, fd, (word)&output, 0) == -90, 42);
+    call(CLOSE, fd, 0, 0);
+    address[2] = TCP_PORT >> 8; address[3] = TCP_PORT & 255;
+    fd = socket_call(1, 2, 1, 0); check(fd >= 0, 43);
+    check(socket_call(3, fd, (word)address, 16) == 0, 44);
+    for (int method=0; method<2; method++) {
+        word done=0;
+        while (done < sizeof payload) {
+            word left = sizeof payload-done;
+            word first = method ? left : (left > 40000 ? 40000 : left);
+            large[0].base=payload+done; large[0].length=first;
+            large[1].base=payload+done+first; large[1].length=left-first;
+            long sent = method ? socket_call(16, fd, (word)&output, 0)
+                               : call(WRITEV, fd, (word)large, 2);
+            check(sent > 0 && (word)sent <= left, 45+method);
+            done += sent;
+        }
+    }
+    char ack = 0;
+    check(call(READ, fd, (word)&ack, 1) == 1 && ack == 'Y', 47);
+    call(CLOSE, fd, 0, 0);
     static const char pass[] = "RECVMSG PASS\n";
     call(WRITE, 2, (word)pass, sizeof(pass)-1);
     call(EXIT, 0, 0, 0);

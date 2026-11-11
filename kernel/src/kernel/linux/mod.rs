@@ -22,7 +22,7 @@ mod high_memory;
 mod statfs;
 mod parent_death;
 pub(crate) use parent_death::{child_exited, parent_exited, notify_thread_exits};
-pub(crate) use parent_death::kill;
+pub(crate) use parent_death::{kill, kill_thread};
 mod async_io;
 mod entropy;
 mod record_lock;
@@ -642,8 +642,8 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         // Identity is derived from the configured session home.
         24 | 49 => SyscallResult::val(environment::identity().0.min(65534) as i32),
         47 | 50 => SyscallResult::val(environment::identity().1.min(65534) as i32),
-        // getppid: real parent if we have one, else 1 (init).
-        64  => SyscallResult::val(kt.parent_tid.max(1)),
+        // Init has no parent; other orphans are adopted by init.
+        64  => SyscallResult::val(crate::kernel::fs::processes::parent_pid(kt.tid, kt.parent_tid)),
         // i386 getuid32/getgid32/geteuid32/getegid32.
         199 | 201 => SyscallResult::val(environment::identity().0 as i32),
         200 | 202 => SyscallResult::val(environment::identity().1 as i32),
@@ -710,7 +710,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         220 => sys_getdents64(machine, kt, linux, a),
         219 => madvise::call(machine, linux, a),
         221 => sys_fcntl(kt, a),
-        238 => sys_exit(machine, tid, a),
+        238 => sys_thread_signal(a, false),
         240 => SyscallResult::val(0),
         243 => sys_set_thread_area(machine, kt, linux, a),
         252 => sys_exit(machine, tid, a),
@@ -720,7 +720,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         403 => time::clock_gettime(machine,a,true),
         406 => time::clock_getres(machine,a,true),
         78  => time::gettimeofday(machine,a,false),
-        270 => sys_exit(machine, tid, a),
+        270 => sys_thread_signal(a, true),
         295 => sys_openat(machine, kt, linux, a),
         300 => sys_fstatat64(machine, kt, linux, a, false),
         305 => sys_readlinkat(machine, kt, linux, a),
@@ -814,7 +814,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         102 | 107 => SyscallResult::val(environment::identity().0 as i32),
         104 | 108 => SyscallResult::val(environment::identity().1 as i32),
         105 | 106 | 113 | 114 | 117 | 119 => fixed_identity_change(a, nr),
-        110 => SyscallResult::val(kt.parent_tid.max(1)),
+        110 => SyscallResult::val(crate::kernel::fs::processes::parent_pid(kt.tid, kt.parent_tid)),
         109 => sys_setpgid(kt, a),
         // getpgrp(111)/setsid(112)/getpgid(121)/getsid(124):
         // single-process job model — return our tid as group/session (mirrors
@@ -823,7 +823,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         111 | 112 | 121 | 124 => SyscallResult::val(kt.tid),
         62  => sys_kill(a),
         158 => sys_arch_prctl(machine, kt, linux, a, regs),
-        200 => sys_exit(machine, tid, a),
+        200 => sys_thread_signal(a, false),
         201 => time::time(machine,a,true),
         202 => sys_futex(machine, kt, a),
         217 => sys_getdents64(machine, kt, linux, a),
@@ -831,7 +831,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         228 => time::clock_gettime(machine,a,true),
         229 => time::clock_getres(machine,a,true),
         231 => sys_exit(machine, tid, a),
-        234 => sys_exit(machine, tid, a),
+        234 => sys_thread_signal(a, true),
         257 => sys_openat(machine, kt, linux, a),
         262 => sys_fstatat64(machine, kt, linux, a, true),
         267 => sys_readlinkat(machine, kt, linux, a),
@@ -911,25 +911,39 @@ pub fn do_chdir(path: &[u8], cwd: &mut [u8; vfs::PATH_KEY_MAX], cwd_len: &mut us
     0
 }
 
-/// Check if path ends with ".EXT" (case-insensitive, 3-letter extension).
-/// Read a C `char**` (NULL-terminated) from 32-bit user memory into Vec<Vec<u8>>.
-fn read_c_argv<A: crate::Arch>(machine: &mut A, ptr: usize, wide: bool) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+/// Read argv/envp before exec destroys the caller's address space. Bound both
+/// strings and pointer storage, and reject oversized input instead of silently
+/// truncating it (notably long shell commands passed as a single argument).
+fn read_c_argv<A: crate::Arch>(machine: &mut A, mut ptr: u64, wide: bool, budget: &mut usize) -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, i32> {
+    const MAX_STRING: usize = 32 * 4096; // Linux MAX_ARG_STRLEN, including NUL.
     let mut args = alloc::vec::Vec::new();
-    if ptr == 0 { return args; }
-    let mut offset = 0usize;
+    if ptr == 0 { return Ok(args); }
+    let word = if wide { 8 } else { 4 };
     loop {
-        let arg_ptr = if wide {
-            machine.read::<u64>(ptr + offset) as usize
-        } else {
-            machine.read::<u32>(ptr + offset) as usize
-        };
+        let mut pointer = [0u8; 8];
+        if !high_memory::copy_from(machine, ptr, &mut pointer[..word]) { return Err(14); }
+        let mut arg_ptr = u64::from_le_bytes(pointer);
         if arg_ptr == 0 { break; }
-        let mut arg_buf = alloc::vec![0u8; 4096];
-        let arg_len = machine.copy_cstr(arg_ptr, &mut arg_buf);
-        args.push(arg_buf[..arg_len].to_vec());
-        offset += if wide { 8 } else { 4 };
+        // Charge eight bytes even for an i386 caller: it can exec an ELF64.
+        *budget = budget.checked_sub(8).ok_or(7)?;
+        let mut arg = alloc::vec::Vec::new();
+        loop {
+            let mut chunk = [0u8; 256];
+            let count = chunk.len().min(4096 - (arg_ptr as usize & 4095))
+                .min(MAX_STRING - arg.len()).min(*budget);
+            if count == 0 { return Err(7); } // E2BIG, caller remains intact.
+            if !high_memory::copy_from(machine, arg_ptr, &mut chunk[..count]) { return Err(14); }
+            let length = chunk[..count].iter().position(|&byte| byte == 0);
+            let copied = length.unwrap_or(count);
+            arg.extend_from_slice(&chunk[..copied]);
+            *budget -= copied + usize::from(length.is_some());
+            if length.is_some() { break; }
+            arg_ptr = arg_ptr.checked_add(count as u64).ok_or(14)?;
+        }
+        args.push(arg);
+        ptr = ptr.checked_add(word as u64).ok_or(14)?;
     }
-    args
+    Ok(args)
 }
 
 // =============================================================================
@@ -1192,6 +1206,16 @@ fn sys_setpgid<A: crate::Arch>(kt: &thread::KernelThread<A>, a: &Args) -> Syscal
         else if pid != 0 && pid != kt.tid { -3 }
         else if group != 0 && group != kt.tid { -1 }
         else { 0 })
+}
+
+fn sys_thread_signal(a: &Args, grouped: bool) -> SyscallResult {
+    let group = grouped.then_some(a.a0 as i32);
+    let target = if grouped { a.a1 } else { a.a0 } as i32;
+    let signal = if grouped { a.a2 } else { a.a1 } as i32;
+    if target <= 0 || group.is_some_and(|pid| pid <= 0) || !(0..=64).contains(&signal) {
+        return SyscallResult::val(-EINVAL);
+    }
+    SyscallResult::act(0, thread::KernelAction::ThreadSignal { group, target, signal: signal as u8 })
 }
 
 fn sys_kill(a: &Args) -> SyscallResult {
@@ -1501,6 +1525,8 @@ fn sys_open_from<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<
         return SyscallResult::val(rc);
     }
 
+    vfs::set_handle_append(handle, flags & 0x400 != 0);
+
     match kt.alloc_fd(3) {
         Some(fd) => {
             kt.fds[fd] = thread::FdKind::Vfs(handle);
@@ -1711,8 +1737,6 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     use crate::kernel::exec;
 
     let path_ptr = a.a0 as usize;
-    let argv_ptr = a.a1 as usize;
-    let envp_ptr = a.a2 as usize;
 
     let mut raw_path_buf = [0u8; vfs::PATH_KEY_MAX];
     let raw_path_len = machine.copy_cstr(path_ptr, &mut raw_path_buf);
@@ -1738,13 +1762,17 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     // rather than argv[0]; only synthesize argv[0] from the path if the caller
     // passed an empty argv.
     let wide = regs.mode() == crate::UserMode::Mode64;
-    let mut args = read_c_argv(machine, argv_ptr, wide);
-    let entries = read_c_argv(machine,envp_ptr,wide);
+    let mut budget = 2 * 1024 * 1024;
+    let mut args = match read_c_argv(machine, a.a1, wide, &mut budget) {
+        Ok(args) => args, Err(error) => return SyscallResult::val(-error),
+    };
+    let entries = match read_c_argv(machine, a.a2, wide, &mut budget) {
+        Ok(entries) => entries, Err(error) => return SyscallResult::val(-error),
+    };
     let mut environment = alloc::vec::Vec::new();
     for entry in entries { environment.extend_from_slice(&entry); environment.push(0); }
     if environment.is_empty() { environment.push(0); }
     environment.push(0);
-    if environment.len() > 32 * 1024 { return SyscallResult::val(-7); } // E2BIG
 
     if args.is_empty() { args.push(path.clone()); }
 
@@ -1798,6 +1826,7 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
 
     let format = exec::detect_format(&buffer, &path);
     let mut cmdtail = if matches!(format, exec::BinaryFormat::MzExe | exec::BinaryFormat::Com) {
+        if environment.len() > 32 * 1024 { return SyscallResult::val(-7); } // DOS environment capacity.
         let tail = dos_command_tail(&args);
         if tail.len() > 126 { return SyscallResult::val(-7); } // E2BIG: PSP command tail capacity.
         let mut resolved = [0; vfs::PATH_KEY_MAX];
@@ -2454,18 +2483,16 @@ fn sys_fcntl<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysc
         F_GETFL => SyscallResult::val(match kt.fds[fd] {
             // libc checks this when attaching a writable FILE to an existing
             // descriptor (for example sed's mkstemp -> fdopen path).
-            FdKind::Vfs(handle) => match vfs::handle_open_access(handle) {
-                Some(vfs::OpenAccess::Read) => 0,
-                Some(vfs::OpenAccess::Write) => 1,
-                Some(vfs::OpenAccess::ReadWrite) => 2,
-                None => -EBADF,
-            },
+            FdKind::Vfs(handle) => vfs::handle_status_flags(handle),
             FdKind::PipeRead(index) => if crate::kernel::kpipe::nonblocking(index, false) { 0x800 } else { 0 },
             FdKind::PipeWrite(index) => 1 | if crate::kernel::kpipe::nonblocking(index, true) { 0x800 } else { 0 },
             thread::FdKind::Socket(h) => 2 | if net::nonblocking(h) { 0x800 } else { 0 },
             _ => 0,
         }),
         F_SETFL => {
+            if let FdKind::Vfs(handle) = kt.fds[fd] {
+                return SyscallResult::val(vfs::set_handle_append(handle, a.a2 & 0x400 != 0));
+            }
             let enabled = a.a2 & 0x800 != 0;
             match kt.fds[fd] {
                 FdKind::Socket(h) => net::set_nonblocking(h, enabled),
@@ -2594,6 +2621,8 @@ pub(crate) fn debug_processes<A: crate::Arch>(threads: &[thread::Thread<A>], act
                 linux.waiting_child.unwrap_or(-1), linux.vfork_parent.map_or(-1, |parent| parent as i32),
                 linux.reap_child.map_or(-1, |child| child as i32));
             async_io::debug_waits(&task.kernel, &linux.async_io);
+            signals::debug_state(linux, task.kernel.tid);
+            parent_death::debug_state(linux, task.kernel.tid);
         }
     }
 }

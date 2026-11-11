@@ -5,11 +5,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/epoll.h>
 #include <unistd.h>
 
 static int reports[2];
 static void check(int ok, int line) {
-    if (!ok) { dprintf(2, "SIGCHLD FAIL line=%d errno=%d\n", line, errno); _exit(1); }
+    if (!ok) { dprintf(2, "SIGCHLD FAIL line=%d errno=%d\n", line, errno); _exit(line); }
 }
 #define CHECK(ok) check((ok), __LINE__)
 static void handler(int signal, siginfo_t *info, void *context) {
@@ -53,6 +55,24 @@ int main(void) {
             CHECK(waitpid(child, &status, WNOHANG) == child && WIFEXITED(status) && WEXITSTATUS(status) == 37);
         }
     }
+    /* Signal-hook style self-pipe: drain it, then receive another signal
+       before epoll samples the empty socket. Include a fork writer so the
+       edge must survive separate descriptor tables sharing one endpoint. */
+    close(reports[0]); close(reports[1]);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, reports) == 0);
+    int ep = epoll_create1(0); CHECK(ep >= 0);
+    struct epoll_event event = {.events=EPOLLIN | EPOLLET, .data.u64=73};
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, reports[0], &event) == 0);
+    for (int repeat=0; repeat<4; repeat++) {
+        CHECK(kill(getpid(), SIGCHLD) == 0);
+        CHECK(epoll_wait(ep, &event, 1, 1000) == 1 && event.data.u64 == 73);
+        int report[4]; CHECK(read(reports[0], report, sizeof report) == sizeof report);
+    }
+    pid_t writer = fork(); CHECK(writer >= 0);
+    if (!writer) { CHECK(write(reports[1], "x", 1) == 1); _exit(0); }
+    CHECK(waitpid(writer, NULL, 0) == writer);
+    CHECK(epoll_wait(ep, &event, 1, 1000) == 1);
+    close(ep); close(reports[0]); close(reports[1]);
     fprintf(stderr, "SIGCHLD_PASS: async wait, parked poll, masked delivery, child identity and status\n");
     return 0;
 }

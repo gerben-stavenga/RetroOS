@@ -115,7 +115,7 @@ follow symlinks = yes
 '''
 
 
-def prepare(work, boot, root, c_root, port, password, startup, native_home=None):
+def prepare(work, boot, root, c_root, port, password, startup, native_home=None, native_tools=None, native_tool_paths=()):
     username = pwd.getpwuid(os.getuid()).pw_name
     for directory in ('private', 'lock', 'cache', 'state', 'run'):
         (work / directory).mkdir(mode=0o700)
@@ -154,6 +154,11 @@ def prepare(work, boot, root, c_root, port, password, startup, native_home=None)
         boot_config = ('[bundle]\nsource=UUID=5E77-0002\nsubdir=/\n\n'
                        f'[mount "data"]\nsource=UUID={ident}\npath=/home/retroos\n'
                        'drive=C\naccess=rw\nsubdir=/home/retroos\ngrant=/home/retroos\n')
+    if native_tools:
+        ident = next(ident for kind, ident in volumes(native_tools) if kind == 'ext4')
+        for index, binding in enumerate(native_tool_paths):
+            boot_config += (f'\n[mount "compiler{index}"]\nsource=UUID={ident}\n'
+                            f'path={binding["path"]}\nsubdir={binding["subdir"]}\naccess=ro\n')
     # Both files are on the disposable boot image; persistent host INIs are
     # never edited and per-launch SMB credentials never enter source control.
     for name, text in [('BOOT.INI', boot_config), ('RETROOS.INI', settings)]:
@@ -177,7 +182,8 @@ def serve(work, boot, startup, profile_path):
         listener.bind(('127.0.0.1', 0))
         port = listener.getsockname()[1]
     password = secrets.token_hex(32)
-    prepare(work, boot, root, c_root, port, password, startup, profile.get("native_home_image"))
+    prepare(work, boot, root, c_root, port, password, startup, profile.get("native_home_image"),
+            profile.get("native_tool_image"), profile.get("native_tool_paths", ()))
     smbd, _ = binaries()
     def interrupted(number, _frame):
         raise SystemExit(128 + number)

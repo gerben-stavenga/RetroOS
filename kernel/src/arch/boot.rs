@@ -382,6 +382,7 @@ unsafe fn prepare_boot(
     // pages on every allocation. Keep at most 1 MiB, scaled down for small RAM.
     let heap_cache = (phys_mm::total_page_count() / 128 * PAGE_SIZE).min(1024 * 1024);
     ALLOCATOR.init_with_cached_release(arch::heap_base(), arch::HEAP_END, Some(arch::release_heap_pages), heap_cache);
+    ALLOCATOR.enable_small_cache();
     phys_mm::complete_initialization();
     crate::kernel::klog::init();
     arch::aperture::init();

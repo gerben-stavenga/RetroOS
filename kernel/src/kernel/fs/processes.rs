@@ -55,6 +55,13 @@ fn numeric(path: &[u8]) -> Option<i32> {
         n.checked_mul(10)?.checked_add(i32::from(c - b'0'))
     })
 }
+
+/// Init terminates the ancestry chain. Reporting PID 1 as its own parent
+/// makes clients such as Git's Trace2 ancestry collector loop indefinitely.
+pub(crate) fn parent_pid(pid: i32, parent: i32) -> i32 {
+    if pid <= 1 { 0 } else { parent.max(1) }
+}
+
 fn stat_text(info: Info) -> Vec<u8> {
     let name = &info.comm[..info.comm.iter().position(|&c| c == 0).unwrap_or(16)];
     let mut text = format!(
@@ -65,7 +72,7 @@ fn stat_text(info: Info) -> Vec<u8> {
     );
     for field in 4..=52 {
         let value: i128 = match field {
-            4 => i128::from(info.parent.max(1)),
+            4 => i128::from(parent_pid(info.pid, info.parent)),
             5 | 6 => i128::from(info.pid),
             8 => -1,
             20 => 1,
@@ -231,6 +238,17 @@ impl Filesystem for ProcessFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn init_terminates_the_process_ancestry_chain() {
+        let text = stat_text(Info {
+            pid: 1, parent: -1, comm: *b"init\0\0\0\0\0\0\0\0\0\0\0\0", state: b'R', start: 1,
+        });
+        let text = core::str::from_utf8(&text).unwrap();
+        assert_eq!(text.rsplit_once(") ").unwrap().1.split_whitespace().nth(1), Some("0"));
+        assert_eq!(parent_pid(1, 1), 0);
+        assert_eq!(parent_pid(2, -1), 1);
+        assert_eq!(parent_pid(3, 2), 2);
+    }
     #[test]
     fn stat_start_time_is_field_22_and_numeric_misses_never_fall_through() {
         let text = stat_text(Info {

@@ -142,17 +142,21 @@ fn cached_page_eviction_never_releases_live_allocations_or_free_headers() {
         let memory = std::alloc::alloc_zeroed(arena);
         let heap = DemandHeap::new();
         heap.init_with_cached_release(memory as usize, memory as usize + arena.size(), Some(cache_release), 8 * PAGE);
+        heap.enable_small_cache();
         let mut live: Vec<(*mut u8, Layout, u8)> = Vec::new();
         let mut random = 17u32;
-        for step in 0..1000 {
+        for step in 0..5000 {
             random = random.wrapping_mul(1664525).wrapping_add(1013904223);
             if live.len() >= 24 || !live.is_empty() && random & 3 == 0 {
                 let index = random as usize % live.len();
                 let (p, layout, _) = live.swap_remove(index);
                 heap.dealloc(p, layout);
             } else {
-                let size = 32 + (random as usize % (6 * PAGE));
-                let layout = Layout::from_size_align(size, if random & 4 == 0 { PAGE } else { 16 }).unwrap();
+                let size = if random & 8 == 0 { 16 + random as usize % 241 }
+                    else if random & 16 == 0 { PAGE }
+                    else { 32 + random as usize % (6 * PAGE) };
+                let align = if random & 4 == 0 { PAGE } else { std::mem::align_of::<usize>() };
+                let layout = Layout::from_size_align(size, align).unwrap();
                 let p = heap.alloc(layout);
                 assert!(!p.is_null());
                 assert_eq!(p as usize % layout.align(), 0);
@@ -172,6 +176,59 @@ fn cached_page_eviction_never_releases_live_allocations_or_free_headers() {
         std::ptr::write_bytes(p, 0xaa, whole.size());
         heap.dealloc(p, whole);
         CACHE_RELEASES.with(|events| assert!(!events.borrow().is_empty()));
+        std::alloc::dealloc(memory, arena);
+    }
+}
+
+#[test]
+fn small_cache_drains_on_exhaustion_and_coalesces_the_whole_arena() {
+    unsafe {
+        let arena = Layout::from_size_align(4 * PAGE, PAGE).unwrap();
+        let memory = std::alloc::alloc_zeroed(arena);
+        let heap = DemandHeap::new();
+        heap.init(memory as usize, memory as usize + arena.size());
+        heap.enable_small_cache();
+        let layout = Layout::from_size_align(128, std::mem::align_of::<usize>()).unwrap();
+        let blocks: Vec<_> = (0..arena.size() / 128).map(|_| heap.alloc(layout)).collect();
+        assert!(blocks.iter().all(|p| !p.is_null()));
+        // Interleave cached blocks, ordinary free regions, and live neighbors.
+        for &p in blocks.iter().step_by(2) { heap.dealloc(p, layout); }
+        for &p in blocks.iter().skip(1).step_by(2) {
+            std::ptr::write_bytes(p, 0xa5, 128);
+            heap.dealloc(p, layout);
+        }
+        let whole = heap.alloc(arena);
+        assert_eq!(whole, memory, "cached blocks must not create false OOM");
+        std::ptr::write_bytes(whole, 0x5a, arena.size());
+        heap.dealloc(whole, arena);
+        std::alloc::dealloc(memory, arena);
+    }
+}
+
+#[test]
+fn small_cache_reuses_exact_sizes_without_violating_stronger_alignment() {
+    unsafe {
+        let arena = Layout::from_size_align(8 * PAGE, PAGE).unwrap();
+        let memory = std::alloc::alloc_zeroed(arena);
+        let heap = DemandHeap::new();
+        heap.init_with_cached_release(memory as usize, memory as usize + arena.size(), Some(cache_release), 2 * PAGE);
+        heap.enable_small_cache();
+        let layout = Layout::from_size_align(24, std::mem::align_of::<usize>()).unwrap();
+        let first = heap.alloc(layout);
+        let second = heap.alloc(layout);
+        assert_ne!(second as usize % 64, 0);
+        heap.dealloc(second, layout);
+        let aligned_layout = Layout::from_size_align(24, 64).unwrap();
+        let aligned = heap.alloc(aligned_layout);
+        assert_eq!(aligned as usize % 64, 0);
+        let recycled = heap.alloc(layout);
+        assert_eq!(recycled, second);
+        std::ptr::write_bytes(first, 0x11, 24);
+        std::ptr::write_bytes(aligned, 0x22, 24);
+        std::ptr::write_bytes(recycled, 0x33, 24);
+        heap.dealloc(first, layout);
+        heap.dealloc(aligned, aligned_layout);
+        heap.dealloc(recycled, layout);
         std::alloc::dealloc(memory, arena);
     }
 }

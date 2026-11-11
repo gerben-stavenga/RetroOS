@@ -13,7 +13,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::{Acquire, Release, Relaxed}};
 
 const PAGE_SIZE: usize = 4096;
 const RETAINED_RANGES: usize = 64;
@@ -41,6 +41,54 @@ pub fn allocation_counts() -> (u32, u32) {
     )
 }
 
+/// Opt-in allocator timings, in timestamp-counter ticks. The kernel switches
+/// this alongside its event profiler; recording never allocates.
+static PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+struct ProfileCounters { lock: AtomicBool, values: UnsafeCell<[u64; 6]> }
+unsafe impl Sync for ProfileCounters {}
+static PROFILE: ProfileCounters = ProfileCounters { lock: AtomicBool::new(false), values: UnsafeCell::new([0; 6]) };
+impl ProfileCounters {
+    fn with<T>(&self, f: impl FnOnce(&mut [u64; 6]) -> T) -> T {
+        while self.lock.swap(true, Acquire) { core::hint::spin_loop(); }
+        let result = f(unsafe { &mut *self.values.get() });
+        self.lock.store(false, Release);
+        result
+    }
+}
+
+pub fn profile_enable(enabled: bool) { PROFILE_ENABLED.store(enabled, Relaxed); }
+pub fn profile_reset() { PROFILE.with(|counters| *counters = [0; 6]); }
+/// Allocation calls/ticks/max, followed by deallocation calls/ticks/max.
+pub fn profile() -> [u64; 6] { PROFILE.with(|counters| *counters) }
+
+fn ticks() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    return unsafe { core::arch::x86_64::_rdtsc() };
+    #[cfg(target_arch = "x86")]
+    return unsafe { core::arch::x86::_rdtsc() };
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    0
+}
+
+struct ProfileSample { start: Option<u64>, offset: usize }
+impl ProfileSample {
+    fn start(offset: usize) -> Self {
+        Self { start: PROFILE_ENABLED.load(Relaxed).then(ticks), offset }
+    }
+}
+impl Drop for ProfileSample {
+    fn drop(&mut self) {
+        if let Some(start) = self.start {
+            let elapsed = ticks().wrapping_sub(start);
+            PROFILE.with(|counters| {
+                counters[self.offset] += 1;
+                counters[self.offset + 1] += elapsed;
+                counters[self.offset + 2] = counters[self.offset + 2].max(elapsed);
+            });
+        }
+    }
+}
+
 /// Free block header stored at the start of each free region.
 struct FreeBlock {
     size: usize,
@@ -49,6 +97,18 @@ struct FreeBlock {
 
 /// Minimum allocation size (must fit a `FreeBlock` for when it's freed).
 const MIN_BLOCK_SIZE: usize = core::mem::size_of::<FreeBlock>();
+const SMALL_STEP: usize = core::mem::align_of::<FreeBlock>();
+const SMALL_CLASSES: usize = 256 / SMALL_STEP + 1;
+const SMALL_LIMIT: u8 = 16;
+
+// Exact sizes: this does not inflate live allocations or change their layouts.
+// Include the page-sized scratch buffers used when expanding mount aliases.
+fn small_class(size: usize, align: usize) -> Option<usize> {
+    if align > SMALL_STEP { return None; }
+    if size == PAGE_SIZE { Some(SMALL_CLASSES - 1) }
+    else if size <= 256 { Some(size / SMALL_STEP - 1) }
+    else { None }
+}
 
 const fn align_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
@@ -56,6 +116,9 @@ const fn align_up(val: usize, align: usize) -> usize {
 
 struct Inner {
     head: Option<NonNull<FreeBlock>>,
+    small_enabled: bool,
+    small: [Option<NonNull<FreeBlock>>; SMALL_CLASSES],
+    small_count: [u8; SMALL_CLASSES],
     /// Top of the virtual range claimed so far (grows toward `heap_end`).
     mapped_end: usize,
     /// Ceiling of the heap window (set in `init`).
@@ -82,9 +145,16 @@ unsafe impl Sync for DemandHeap {}
 impl DemandHeap {
     pub const fn new() -> Self {
         DemandHeap {
-            inner: UnsafeCell::new(Inner { head: None, mapped_end: 0, heap_end: 0, release: None,
+            inner: UnsafeCell::new(Inner { head: None, small_enabled: false, small: [None; SMALL_CLASSES], small_count: [0; SMALL_CLASSES], mapped_end: 0, heap_end: 0, release: None,
                 retained: [EMPTY_RETAINED; RETAINED_RANGES], retained_count: 0, retained_bytes: 0, retain_limit: 0 }),
         }
+    }
+
+    /// Retain a bounded set of exact-size scratch allocations. Call during
+    /// initialization, before this heap is shared. Cached blocks remain backed
+    /// and are returned to the coalescing allocator if its window is exhausted.
+    pub fn enable_small_cache(&self) {
+        unsafe { (*self.inner.get()).small_enabled = true; }
     }
 
     /// Initialize the allocator over `[base, end)`. Call once, after the
@@ -106,6 +176,9 @@ impl DemandHeap {
     pub fn init_with_cached_release(&self, base: usize, end: usize, release: Option<fn(usize, usize)>, cache_bytes: usize) {
         let inner = unsafe { &mut *self.inner.get() };
         inner.head = None;
+        inner.small_enabled = false;
+        inner.small = [None; SMALL_CLASSES];
+        inner.small_count = [0; SMALL_CLASSES];
         inner.mapped_end = base;
         inner.heap_end = end;
         inner.release = release;
@@ -120,6 +193,48 @@ impl Default for DemandHeap {
 }
 
 impl Inner {
+    fn take_small(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        if !self.small_enabled { return None; }
+        let class = small_class(size, align)?;
+        let block = self.small[class]?;
+        self.small[class] = unsafe { (*block.as_ptr()).next };
+        self.small_count[class] -= 1;
+        Some(block.as_ptr().cast())
+    }
+
+    fn put_small(&mut self, ptr: *mut u8, size: usize, align: usize) -> bool {
+        if !self.small_enabled { return false; }
+        let Some(class) = small_class(size, align) else { return false; };
+        if self.small_count[class] == SMALL_LIMIT { return false; }
+        let block = ptr.cast::<FreeBlock>();
+        unsafe { block.write(FreeBlock { size, next: self.small[class] }); }
+        self.small[class] = NonNull::new(block);
+        self.small_count[class] += 1;
+        true
+    }
+
+    fn drain_small(&mut self) {
+        for class in 0..SMALL_CLASSES {
+            while let Some(block) = self.small[class] {
+                let (size, next) = unsafe { ((*block.as_ptr()).size, (*block.as_ptr()).next) };
+                self.small[class] = next;
+                self.small_count[class] -= 1;
+                self.free_region(block.as_ptr() as usize, size);
+            }
+        }
+    }
+
+    fn free_region(&mut self, addr: usize, size: usize) {
+        let (merged, length) = self.add_free_region(addr, size);
+        if self.release.is_some() {
+            // Keep live boundaries and the surviving free-list header backed.
+            let start = align_up(merged + MIN_BLOCK_SIZE, PAGE_SIZE).max(addr & !(PAGE_SIZE - 1));
+            let end = ((merged + length) & !(PAGE_SIZE - 1))
+                .min(align_up(addr + size + MIN_BLOCK_SIZE, PAGE_SIZE));
+            if start < end { self.cache_or_release(start, end); }
+        }
+    }
+
     fn remove_retained(&mut self, index: usize) -> Retained {
         let range = self.retained[index];
         self.retained_bytes -= range.end - range.start;
@@ -321,12 +436,13 @@ impl Inner {
 
 unsafe impl GlobalAlloc for DemandHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _sample = ProfileSample::start(0);
         let inner = unsafe { &mut *self.inner.get() };
 
         let size = align_up(layout.size().max(MIN_BLOCK_SIZE), core::mem::align_of::<FreeBlock>());
         let align = layout.align().max(core::mem::align_of::<FreeBlock>());
 
-        if let Some(ptr) = inner.alloc_from_list(size, align) {
+        if let Some(ptr) = inner.take_small(size, align).or_else(|| inner.alloc_from_list(size, align)) {
             if size >= 100_000 { LARGE_REUSE.fetch_add(1, Relaxed); }
             ALLOCATIONS.fetch_add(1, Relaxed);
             return ptr;
@@ -334,7 +450,7 @@ unsafe impl GlobalAlloc for DemandHeap {
 
         if size >= 100_000 { LARGE_ALLOCS.fetch_add(1, Relaxed); }
         if !inner.extend_heap(size + align) {
-            return core::ptr::null_mut();
+            inner.drain_small();
         }
 
         let ptr = inner.alloc_from_list(size, align).unwrap_or(core::ptr::null_mut());
@@ -345,23 +461,15 @@ unsafe impl GlobalAlloc for DemandHeap {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let _sample = ProfileSample::start(3);
         let inner = unsafe { &mut *self.inner.get() };
 
         let size = align_up(layout.size().max(MIN_BLOCK_SIZE), core::mem::align_of::<FreeBlock>());
         if size >= 100_000 { LARGE_FREES.fetch_add(1, Relaxed); }
         DEALLOCATIONS.fetch_add(1, Relaxed);
-        let addr = ptr as usize;
-        let (merged, length) = inner.add_free_region(addr, size);
-        if inner.release.is_some() {
-            // Keep the surviving free-list header and all boundary pages that
-            // contain live data. Only revisit pages intersecting this free:
-            // interiors of neighboring free blocks were already released.
-            let start = align_up(merged + MIN_BLOCK_SIZE, PAGE_SIZE).max(addr & !(PAGE_SIZE - 1));
-            // Include a coalesced successor's obsolete header, including
-            // when that header sits exactly on the following page boundary.
-            let end = ((merged + length) & !(PAGE_SIZE - 1))
-                .min(align_up(addr + size + MIN_BLOCK_SIZE, PAGE_SIZE));
-            if start < end { inner.cache_or_release(start, end); }
+        let align = layout.align().max(core::mem::align_of::<FreeBlock>());
+        if !inner.put_small(ptr, size, align) {
+            inner.free_region(ptr as usize, size);
         }
     }
 }

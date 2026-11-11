@@ -231,6 +231,15 @@ pub(super) fn deliver_fault<A: crate::Arch>(
     )
 }
 
+pub(super) fn debug_state(linux: &LinuxState, process: i32) {
+    let action = linux.signals.actions[17];
+    crate::compact_dbg_println!("[LINUX SIGCHLD] pid={} handler={:#x} flags={:#x} frames={}",
+        process, action.handler, action.flags, linux.signals.frames.len());
+    for (&tid, local) in &linux.signals.locals {
+        crate::compact_dbg_println!("[LINUX SIGMASK] pid={} tid={} mask={:#x}", process, tid, local.mask);
+    }
+}
+
 pub(super) fn handler(linux: &LinuxState, signal: usize) -> u64 { linux.signals.actions[signal].handler }
 
 pub(super) fn disposition(linux: &LinuxState, tid: i32, signal: usize) -> Option<bool> {
@@ -338,6 +347,9 @@ pub(super) fn deliver<A: crate::Arch>(
     machine.write::<i32>(base + INFO, signal as i32);
     machine.write::<i32>(base + INFO + 8, code);
     machine.write::<u64>(base + INFO + 16, addr);
+    if matches!(code, 0 | -6) && !fault {
+        machine.write::<u32>(base + INFO + 20, super::environment::identity().0);
+    }
     machine.copy_to(base + FP, &image);
     state.frames.push(Frame {
         tid,

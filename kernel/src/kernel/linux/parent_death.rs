@@ -7,14 +7,20 @@ pub(super) struct State {
     owner: i32,
     settings: BTreeMap<i32, u8>,
     pending: u64,
+    directed: BTreeMap<(i32, u8), i32>,
     senders: BTreeMap<u8, i32>,
     child_exit_code: Option<i32>,
     stopped: bool,
 }
 impl State {
-    pub fn retire(&mut self, caller: i32) { self.settings.remove(&caller); }
+    pub fn retire(&mut self, caller: i32) {
+        self.settings.remove(&caller);
+        self.directed.retain(|&(target, _), _| target != caller);
+    }
     pub fn exec(&self, caller: i32, process: i32) -> Self {
         let mut state = Self { owner: process, pending: self.pending, senders: self.senders.clone(), child_exit_code: self.child_exit_code, ..Self::default() };
+        state.directed = self.directed.iter().filter_map(|(&(target, signal), &sender)|
+            (target == caller).then_some(((process, signal), sender))).collect();
         if let Some(&signal) = self.settings.get(&caller) { state.settings.insert(process, signal); }
         state
     }
@@ -37,12 +43,20 @@ pub(super) fn prctl<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A
     SyscallResult::val(0)
 }
 
+pub(super) fn debug_state(linux: &LinuxState, process: i32) {
+    crate::compact_dbg_println!("[LINUX SIGNALS] pid={} pending={:#x} directed={} stopped={} sigchld_target={}",
+        process, linux.parent_death.pending, linux.parent_death.directed.len(), linux.parent_death.stopped, target(linux, 17).unwrap_or(-1));
+}
+
 fn target(linux: &LinuxState, signal: usize) -> Option<i32> {
     async_io::signal_target(&linux.async_io, linux.parent_death.owner,
         |id| signals::disposition(linux, id, signal).is_some())
 }
 pub(super) fn stopped(linux: &LinuxState) -> bool { linux.parent_death.stopped }
 pub(super) fn due(linux: &LinuxState) -> bool {
+    if linux.parent_death.directed.keys().any(|&(id, signal)|
+        (!linux.parent_death.stopped || matches!(signal, 9 | 18))
+            && signals::disposition(linux, id, signal as usize).is_some()) { return true; }
     if linux.parent_death.pending == 0 { return false; }
     (1..=64).any(|signal| linux.parent_death.pending & (1 << (signal - 1)) != 0
         && (!linux.parent_death.stopped || signal == 9 || signal == 18)
@@ -55,8 +69,14 @@ fn queue<A: crate::Arch>(task: &mut thread::Thread<A>, signal: u8, sender: i32) 
     let signal = signal as usize;
     // A continue cancels pending stops even when it is blocked/ignored;
     // conversely a newly generated stop cancels a pending continue.
-    if signal == 18 { linux.parent_death.pending &= !((1 << 18) | (1 << 19) | (1 << 20) | (1 << 21)); }
-    if matches!(signal, 19..=22) { linux.parent_death.pending &= !(1 << 17); }
+    if signal == 18 {
+        linux.parent_death.pending &= !((1 << 18) | (1 << 19) | (1 << 20) | (1 << 21));
+        linux.parent_death.directed.retain(|&(_, sig), _| !matches!(sig, 19..=22));
+    }
+    if matches!(signal, 19..=22) {
+        linux.parent_death.pending &= !(1 << 17);
+        linux.parent_death.directed.retain(|&(_, sig), _| sig != 18);
+    }
     if signal == 17 { linux.parent_death.child_exit_code = None; }
     let handler = signals::handler(linux, signal);
     if signal == 18 && linux.parent_death.stopped {
@@ -94,6 +114,50 @@ pub(crate) fn kill<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Threa
         if signal != 0 && task.kernel.state != thread::ThreadState::Zombie {
             queue(task, signal, caller as i32);
         }
+    }
+    regs.rax = if found { 0 } else { (-3i64) as u64 };
+    let task = &mut threads[caller];
+    if let thread::Personality::Linux(linux) = &mut task.personality {
+        poll(machine, &mut task.kernel, linux, regs)
+    } else { None }
+}
+
+/// Resolve Linux thread IDs across processes; tgkill also verifies the group.
+pub(crate) fn kill_thread<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>],
+    caller: usize, regs: &mut Regs, group: Option<i32>, target: i32, signal: u8) -> Option<thread::KernelAction>
+{
+    let mut found = false;
+    for task in threads.iter_mut() {
+        if !matches!(task.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked)
+            || group.is_some_and(|id| id != task.kernel.tid) { continue; }
+        let thread::Personality::Linux(linux) = &mut task.personality else { continue; };
+        if !async_io::has_thread(&linux.async_io, task.kernel.tid, target) { continue; }
+        found = true;
+        if signal == 0 { break; }
+        if matches!(signal, 9 | 19) {
+            queue(task, signal, caller as i32);
+        } else {
+            linux.parent_death.owner = task.kernel.tid;
+            if signal == 18 {
+                linux.parent_death.stopped = false;
+                linux.parent_death.pending &= !((1 << 18) | (1 << 19) | (1 << 20) | (1 << 21));
+                linux.parent_death.directed.retain(|&(_, sig), _| !matches!(sig, 19..=22));
+                task.kernel.state = thread::ThreadState::Ready;
+            }
+            if matches!(signal, 20..=22) {
+                linux.parent_death.pending &= !(1 << 17);
+                linux.parent_death.directed.retain(|&(_, sig), _| sig != 18);
+            }
+            let handler = signals::handler(linux, signal as usize);
+            if handler != 1 && !(handler == 0 && matches!(signal, 17 | 18 | 23 | 28)) {
+                linux.parent_death.directed.entry((target, signal)).or_insert(caller as i32);
+                if signals::disposition(linux, target, signal as usize).is_some() {
+                    async_io::wake_signal(&mut task.kernel, &mut linux.async_io, target);
+                }
+            }
+            thread::refresh_cpu_hash(task);
+        }
+        break;
     }
     regs.rax = if found { 0 } else { (-3i64) as u64 };
     let task = &mut threads[caller];
@@ -165,18 +229,27 @@ pub(crate) fn notify_thread_exits<A: crate::Arch>(threads: &mut [thread::Thread<
 }
 
 pub(super) fn poll<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, regs: &mut Regs) -> Option<thread::KernelAction> {
-    if linux.parent_death.pending == 0 && !linux.parent_death.stopped { return None; }
+    if linux.parent_death.pending == 0 && linux.parent_death.directed.is_empty() && !linux.parent_death.stopped { return None; }
     let caller = async_io::current_id(&linux.async_io, kt.tid);
-    let signal = (1..=64).find(|&signal| linux.parent_death.pending & (1 << (signal - 1)) != 0
-        && (!linux.parent_death.stopped || signal == 9 || signal == 18)
-        && signals::disposition(linux, caller, signal).is_some());
-    let Some(signal) = signal else {
-        if linux.parent_death.stopped { kt.state = thread::ThreadState::Blocked; return Some(thread::KernelAction::Done); }
-        return None;
+    let directed = linux.parent_death.directed.keys().find(|&&(target, signal)| target == caller
+        && (!linux.parent_death.stopped || matches!(signal, 9 | 18))
+        && signals::disposition(linux, caller, signal as usize).is_some()).copied();
+    let (signal, sender, child_exit_code, code) = if let Some((target, signal)) = directed {
+        let sender = linux.parent_death.directed.remove(&(target, signal)).unwrap();
+        (signal as usize, sender, None, -6) // SI_TKILL
+    } else {
+        let signal = (1..=64).find(|&signal| linux.parent_death.pending & (1 << (signal - 1)) != 0
+            && (!linux.parent_death.stopped || signal == 9 || signal == 18)
+            && signals::disposition(linux, caller, signal).is_some());
+        let Some(signal) = signal else {
+            if linux.parent_death.stopped { kt.state = thread::ThreadState::Blocked; return Some(thread::KernelAction::Done); }
+            return None;
+        };
+        linux.parent_death.pending &= !(1 << (signal - 1));
+        let sender = linux.parent_death.senders.remove(&(signal as u8)).unwrap_or(0);
+        let child_exit_code = if signal == 17 { linux.parent_death.child_exit_code.take() } else { None };
+        (signal, sender, child_exit_code, 0)
     };
-    linux.parent_death.pending &= !(1 << (signal - 1));
-    let sender = linux.parent_death.senders.remove(&(signal as u8)).unwrap_or(0);
-    let child_exit_code = if signal == 17 { linux.parent_death.child_exit_code.take() } else { None };
     let handler = signals::handler(linux, signal);
     if handler == 1 || handler == 0 && matches!(signal, 17 | 18 | 23 | 28) { return Some(thread::KernelAction::Done); }
     if signal == 19 || handler == 0 && matches!(signal, 20..=22) {
@@ -195,7 +268,7 @@ pub(super) fn poll<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThrea
     }
     let delivered = if signal == 9 { false }
         else if let Some(code) = child_exit_code { signals::deliver_child_exit(machine, linux, kt.tid, regs, sender, code) }
-        else { signals::deliver(machine, linux, kt.tid, regs, signal, 0, sender as u64) };
+        else { signals::deliver(machine, linux, kt.tid, regs, signal, code, sender as u64) };
     if !delivered {
         return Some(thread::KernelAction::Exit(-(signal as i32)));
     }

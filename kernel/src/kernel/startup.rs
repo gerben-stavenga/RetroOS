@@ -1533,7 +1533,9 @@ fn event_loop<A: crate::Arch>(
         stats.part(machine, PROFILE_IRQ);
         let events = &mut pending_events.events;
         // RX IRQs wake the diagnostic UART; injected keys have a service deadline.
-        if crate::kernel::serial_control::poll(machine, events, injected_due) {
+        let serial_dump = crate::kernel::serial_control::poll(machine, events, injected_due);
+        let osd_dump = DEBUG_DUMP_REQUESTED.swap(false, core::sync::atomic::Ordering::Relaxed);
+        if serial_dump || osd_dump {
             crate::kernel::linux::debug_processes(threads, ctx.tid);
             let thread = ctx.thread(threads);
             let dos = match &thread.personality {
@@ -3077,6 +3079,13 @@ pub fn arch_dump_exception<A: crate::Arch>(
     dump_interrupted_thread(machine, regs, Some(dos));
 }
 
+// F12 cannot borrow the task table while handling input. Defer its dump to
+// the event-loop owner, just like the COM2 diagnostic command.
+static DEBUG_DUMP_REQUESTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub(crate) fn request_debug_dump() {
+    DEBUG_DUMP_REQUESTED.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
     machine: &mut A,
     regs: &Regs,
@@ -3307,6 +3316,7 @@ fn dump_virtual_hw<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>) {
 static mut PROFILE_DUMP: bool = false;
 
 pub fn reset_profile() {
+    lib::heap::profile_reset();
     PROFILE_RESET.store(true, core::sync::atomic::Ordering::Relaxed);
     unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, ProfileSnapshot::EMPTY) };
     crate::kernel::osd_profile::reset();
@@ -3317,6 +3327,7 @@ pub fn reset_profile() {
 /// Set profiling explicitly; unlike the OSD toggle this is idempotent, which
 /// makes it safe for a remote control client to retry after a lost reply.
 pub fn set_profile(on: bool) {
+    lib::heap::profile_enable(on);
     let was_on = profile_enabled();
     unsafe { core::ptr::write_volatile(&raw mut PROFILE_DUMP, on) };
     if on && !was_on { reset_profile(); }
@@ -3338,9 +3349,11 @@ pub fn profile_enabled() -> bool {
 /// boot/init/DN startup stay silent until something enables it.
 static SYSCALL_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static mut FILESYSTEM_TRACE: bool = false;
+static PROCESS_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Set the trace gate directly (the COMMAND.COM bracket path).
 pub fn set_trace(on: bool) {
+    PROCESS_TRACE.store(false, core::sync::atomic::Ordering::Relaxed);
     unsafe {
         SYSCALL_TRACE.store(on, core::sync::atomic::Ordering::Relaxed);
         core::ptr::write_volatile(&raw mut FILESYSTEM_TRACE, false);
@@ -3353,8 +3366,18 @@ pub fn set_filesystem_trace() {
     unsafe { core::ptr::write_volatile(&raw mut FILESYSTEM_TRACE, true) };
 }
 
+/// Trace process lifecycle and signal syscalls without clock/read traffic.
+pub fn set_process_trace() {
+    set_trace(true);
+    PROCESS_TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn trace_linux_syscall(nr: u32, wide: bool) -> bool {
     if !trace_enabled() { return false; }
+    if PROCESS_TRACE.load(core::sync::atomic::Ordering::Relaxed) {
+        return if wide { matches!(nr, 56..=62 | 200 | 231 | 234 | 435) }
+            else { matches!(nr, 1 | 2 | 7 | 11 | 37 | 114 | 120 | 190 | 238 | 252 | 270 | 435) };
+    }
     if !unsafe { core::ptr::read_volatile(&raw const FILESYSTEM_TRACE) } { return true; }
     if wide {
         matches!(nr, 2..=6 | 8 | 21 | 72..=91 | 217 | 257..=269 | 280 | 316 | 332 | 436)
@@ -3365,6 +3388,7 @@ pub fn trace_linux_syscall(nr: u32, wide: bool) -> bool {
 
 /// Toggle syscall tracing, reporting which way it went (the F12 Trace item).
 pub fn toggle_trace() {
+    PROCESS_TRACE.store(false, core::sync::atomic::Ordering::Relaxed);
     unsafe { core::ptr::write_volatile(&raw mut FILESYSTEM_TRACE, false) };
     let on = !SYSCALL_TRACE.fetch_xor(true, core::sync::atomic::Ordering::Relaxed);
     crate::compact_println!("[trace] syscall tracing {}", if on { "ON" } else { "off" });

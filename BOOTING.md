@@ -248,6 +248,22 @@ over SMB. `--bazel-command version` runs the full JVM-backed version command;
 `--workspace`, `--bazel-arg` and `--env NAME=VALUE` support isolated build probes.
 `--work-dir` selects a separate guest home and diagnostic directory. The default
 full-build timeout is four hours, including boot-image preparation.
+`--native-home` keeps guest outputs on a fresh private 4 GiB ext4/NVMe
+image instead of the writable SMB share. Use a fresh `--work-dir`, or add
+`--reuse-native-home` to resume that fixture's guest outputs. Reuse checks the
+disposable image with e2fsck before updating its startup files. Diagnostics
+are extracted from the image when QEMU exits. `--native-compiler-libs` also
+copies the installed Rust compiler library trees to a private read-only ext4
+image, preserving and hashing their bytes. Sources, JDK and system tools remain
+on the read-only SMB root; this is not a wholly native-root performance test.
+
+Namespace removal follows directory permissions on ext4: the parent needs
+write and search permission, and sticky directories restrict which entries may
+be removed or replaced. A victim's read-only mode does not prohibit unlink,
+rmdir or rename. This allows Bazel to replace its read-only outputs. The mount
+owner's primary group is derived alongside its UID from the configured home.
+File-content writes retain the separate mount grant policy.
+
 Directory `access(F_OK)`, modification timestamps, longer metadata paths and
 SMB installation symlinks now work. Linux provides `getcpu`, the three legacy
 x86-64 vsyscall entries, allocator-backed `sysinfo`, and resource-limit queries.
@@ -279,8 +295,11 @@ Native thread switches now preserve XMM8–15 as well as XMM0–7. Linux x86-64
 page faults can enter a registered SIGSEGV handler with a Linux signal frame,
 alternate stack and per-thread mask; `rt_sigreturn` restores the user context
 and floating-point state. `ITIMER_REAL` delivers SIGALRM using the same frames
-and masks, including interrupting a sleeping process. CPU-accounting timers
-and general signal sending are not yet implemented. Timers are checked when
+and masks, including interrupting a sleeping process. CPU-accounting timers remain unimplemented. On x86-64, `tkill`/`tgkill`
+deliver ordinary signals to the named live thread, retain masked pending
+signals, validate the thread group, and support signal-zero probes.
+Serial `trace process` records fork/exec/wait, signals and exit calls without
+clock/futex traffic. Timers are checked when
 a process runs or its blocked I/O is polled. Linux terminal peers receive
 bounded CPU turns even while a helper remains runnable. `python3 test/linux_xmm_context.py` checks SIMD preservation and
 `python3 test/linux_signal.py` checks fault recovery and rejected invalid
@@ -377,8 +396,11 @@ every file, avoiding a recursive scan of its HTML documentation during analysis.
 `--reuse-repositories /path/to/host/bazel/output-base/external` reads extracted
 repository sources and toolchains from the host instead of unpacking archives
 over SMB. Build outputs remain private in the guest's separate `cache-reused`
-directory; this does not reuse host compilation outputs. A full RetroOS guest
-build has not yet completed.
+directory; this does not reuse host compilation outputs. The kernel library
+(`//kernel:kernel`) has built successfully inside QEMU/KVM RetroOS, using
+guest-built dependencies retained across diagnostic runs. A full bootable
+image has not yet completed: the current `//:boot_disk` attempt stops when
+`cp` incorrectly reports that an unchanged source was replaced while copying.
 The first build is also too slow for practical use. A sampled compiler startup
 spent over 99% of its time in the kernel, dominated by file-backed `mmap`.
 An isolated QEMU/KVM startup probe measured 29 seconds for `rustc --version`
@@ -478,7 +500,12 @@ The subsequent fixes target extra kernel work rather than seeded application
 state. The heap retains at most 1 MiB of free backing (scaled down on small
 machines) instead of releasing and faulting every temporary buffer again.
 Tests poison evicted pages and check that live allocations and free-list
-headers survive fragmentation. New ext4 objects receive initial permissions
+headers survive fragmentation. Exact-size caches also retain up to 16 freed
+blocks per small size (through 256 bytes) and for 4096-byte alias scratch,
+so pathname processing avoids repeated searches through a fragmented free
+list. These caches drain on heap-window exhaustion; stricter alignments
+use the ordinary allocator. F12's profile dump includes allocator timing.
+New ext4 objects receive initial permissions
 and mtime in their creation transaction; unchanged metadata is not rewritten.
 Single-page mappings invalidate that page rather than all translations, and
 a first user write completes demand allocation in one fault instead of

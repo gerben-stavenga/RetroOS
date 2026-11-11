@@ -5,6 +5,8 @@ use alloc::vec::Vec;
 pub struct DeviceFs;
 pub static DEVICES: DeviceFs = DeviceFs;
 const NULL: u64 = 1;
+const RANDOM: u64 = 2;
+const URANDOM: u64 = 3;
 const CHARACTER: u16 = 0o20666;
 
 impl Filesystem for DeviceFs {
@@ -12,31 +14,31 @@ impl Filesystem for DeviceFs {
         "devices"
     }
     fn open(&self, path: &[u8]) -> Option<Vnode> {
-        (path == b"null").then_some(Vnode {
-            handle: NULL,
-            size: 0,
-            mode: CHARACTER,
-        })
+        let handle = match path { b"null" => NULL, b"random" => RANDOM, b"urandom" => URANDOM, _ => return None };
+        Some(Vnode { handle, size: 0, mode: CHARACTER })
     }
     fn open_node(&self, node: u64) -> Option<Vnode> {
-        if node == NULL {
-            self.open(b"null")
-        } else {
-            None
+        match node { NULL => self.open(b"null"), RANDOM => self.open(b"random"), URANDOM => self.open(b"urandom"), _ => None }
+    }
+    fn read(&self, handle: u64, _offset: u32, buf: &mut [u8], _size: u32) -> i32 {
+        match handle {
+            NULL => 0,
+            RANDOM | URANDOM => {
+                let n = buf.len().min(65536);
+                crate::kernel::random::fill(&mut buf[..n]).map_or(-11, |_| n as i32)
+            }
+            _ => -9,
         }
     }
-    fn read(&self, handle: u64, _offset: u32, _buf: &mut [u8], _size: u32) -> i32 {
-        if handle == NULL { 0 } else { -9 }
-    }
     fn write(&self, handle: u64, _offset: u32, data: &[u8]) -> i32 {
-        if handle == NULL {
+        if matches!(handle, NULL | RANDOM | URANDOM) {
             i32::try_from(data.len()).unwrap_or(-22)
         } else {
             -9
         }
     }
     fn seek(&self, handle: u64, _offset: i32, whence: i32) -> Option<i32> {
-        Some(if handle != NULL {
+        Some(if !matches!(handle, NULL | RANDOM | URANDOM) {
             -9
         } else if (0..=2).contains(&whence) {
             0
@@ -75,21 +77,17 @@ impl Filesystem for DeviceFs {
         out: &mut Vec<DirEntry>,
         max: usize,
     ) -> Option<u64> {
-        if path.is_empty() && cookie == 0 && max != 0 {
+        if !path.is_empty() { return None; }
+        let names: [&[u8]; 3] = [b"null", b"random", b"urandom"];
+        let start = usize::try_from(cookie).ok()?.min(names.len());
+        let end = start.saturating_add(max).min(names.len());
+        for (index, name) in names.iter().enumerate().take(end).skip(start) {
             out.push(DirEntry {
-                name: b"null".to_vec(),
-                name_len: 4,
-                short_name: None,
-                size: 0,
-                is_dir: false,
-                is_symlink: false,
-                mode: CHARACTER,
-                dos_attributes: None,
-                mtime: 0,
-                node: NULL,
-                mount_idx: 0,
+                name: name.to_vec(), name_len: name.len(), short_name: None,
+                size: 0, is_dir: false, is_symlink: false, mode: CHARACTER,
+                dos_attributes: None, mtime: 0, node: index as u64 + 1, mount_idx: 0,
             });
         }
-        None
+        (end < names.len()).then_some(end as u64)
     }
 }

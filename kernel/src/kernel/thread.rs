@@ -261,6 +261,7 @@ pub enum KernelAction {
     Wait { pid: i32, status_ptr: usize, options: i32 },
     /// Deliver a Linux process signal after releasing the caller's borrow.
     Signal { pid: i32, signal: u8 },
+    ThreadSignal { group: Option<i32>, target: i32, signal: u8 },
     /// DOS INT-31 synth op on a *child* thread (reap / waitpid probe). Run in
     /// the executor so the cross-thread table
     /// access happens off the caller's `dos`/`kt` borrow. The executor writes
@@ -1023,7 +1024,8 @@ pub fn schedule<A: crate::Arch>(threads: &[Thread<A>], current_tid: usize) -> Op
         if i == current_tid {
             continue;
         }
-        if t.kernel.state == ThreadState::Ready {
+        if t.kernel.state == ThreadState::Ready
+            && !crate::kernel::sched::vfork_suspended(threads, i) {
             count += 1;
             if prng().is_multiple_of(count) {
                 next_idx = i;
@@ -1210,7 +1212,8 @@ pub fn exit_thread<A: crate::Arch>(
     // "parent is Ready but hasn't reached wait4 yet" (Rust Command::status:
     // fork stays on child, parent only reaches wait4 after we exit). If the
     // parent is gone/stuck, fall through to the regular scheduler.
-    if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS {
+    if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS
+        && !crate::kernel::sched::vfork_suspended(threads, parent_tid as usize) {
         let parent_state = threads[parent_tid as usize].kernel.state;
         if woke_parent
             || matches!(parent_state, ThreadState::Ready | ThreadState::Running)

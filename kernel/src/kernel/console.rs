@@ -126,18 +126,14 @@ fn dispatch_dos<A: crate::Arch>(
 fn monitor_key<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    regs: &mut Regs,
+    _regs: &mut Regs,
     sc: u8,
     personality: &mut thread::Personality<A>,
     display: &mut Option<crate::kernel::display::Display>,
     sound: crate::kernel::osd::SoundView,
 ) -> bool {
     if crate::kernel::osd::is_open() {
-        let dos = match &*personality {
-            thread::Personality::Dos(dos) => Some(&**dos),
-            thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_) => None,
-        };
-        crate::kernel::osd::key(machine, regs, sc, dos, sound);
+        crate::kernel::osd::key(sc, sound);
         if !crate::kernel::osd::is_open() {
             restore_from_monitor(machine, &mut *bios_workspace, personality, display);
             personality.repaint_osd();

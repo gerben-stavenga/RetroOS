@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Native IPv4 recvmsg: 32/64-bit vectors, peeking and UDP truncation."""
+"""Native 32/64-bit socket vectors: UDP boundaries and large TCP writes."""
 from pathlib import Path
 import socket
 import subprocess
@@ -19,10 +19,13 @@ def main():
             work = Path(directory) / str(bits)
             tree = work / 'root'
             (tree / "home/retroos/RETROOS").mkdir(parents=True)
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
                 server.bind(('127.0.0.1', 0))
                 server.settimeout(45)
                 port = server.getsockname()[1]
+                tcp.bind(('127.0.0.1', 0))
+                tcp.listen(1)
+                tcp.settimeout(45)
                 errors = []
 
                 def echo():
@@ -31,13 +34,25 @@ def main():
                         assert data == b'hello'
                         server.sendto(b'abcdef', peer)
                         server.sendto(b'ghijkl', peer)
+                        connection, _ = tcp.accept()
+                        with connection:
+                            connection.settimeout(15)
+                            received = bytearray()
+                            while len(received) < 320000:
+                                block = connection.recv(320000 - len(received))
+                                assert block, 'stream closed before all bytes arrived'
+                                received.extend(block)
+                            expected = bytes(ord('a') + i % 26 for i in range(160000))
+                            assert received == expected * 2, 'stream data corrupted or repeated'
+                            connection.sendall(b'Y')
+
                     except Exception as error:
                         errors.append(error)
 
                 thread = threading.Thread(target=echo, daemon=True)
                 thread.start()
                 subprocess.run(['gcc', f'-m{bits}', '-nostdlib', '-static', '-fno-pie', '-no-pie',
-                                '-fno-stack-protector', f'-DPORT={port}',
+                                '-fno-stack-protector', f'-DPORT={port}', f'-DTCP_PORT={tcp.getsockname()[1]}',
                                 str(ROOT / 'test/linux_message_probe.c'), '-o', str(tree / 'probe')], check=True)
                 data = work / 'data.img'
                 with data.open('wb') as output:
@@ -62,7 +77,7 @@ def main():
                 thread.join(timeout=1)
                 assert not errors and not thread.is_alive(), errors
                 assert process.returncode == 0 and '[mem] exit tid=1 code=0' in log.read_text(), str(log)
-    print('PASS: native 32/64-bit recvmsg scatter, source address, peek and datagram truncation')
+    print('PASS: native 32/64-bit recvmsg scatter, source address, peek and datagram truncation; large TCP writev/sendmsg')
 
 
 if __name__ == '__main__':

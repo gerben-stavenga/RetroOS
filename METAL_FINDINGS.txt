@@ -675,3 +675,561 @@ builtin wait after background-child termination can loop on unimplemented
 x86_64 rt_sigsuspend (130). The committed probe uses fork/waitpid directly to
 test proc enumeration independently. That signal syscall is not implemented
 by this patch. The diagnostic-log database warning is likewise unresolved.
+
+2026-11-10: metal disconnect, KLOG0230, vfork parent scheduled without its image
+--------------------------------------------------------------------------------
+The user returned to Linux after the Codex connection dropped during the shell
+check (git status). KLOG0230 records tid=6 faulting at 0x168e1370 with err=0x15,
+then exiting -11 without freeing pages; it subsequently faults at zero and exits
+-11 again, this time releasing its image. The live fault frame and the saved
+process register frame differ; the latter is still at the clone return path.
+The addresses match Codex 0.167.0 with load bias 0x08000000. This boot uses
+session home /home/priv-gerben, NOT the old /home/priv-gerben/DOS/.codex fixture.
+
+Reproduced the same NX-handler / empty first exit / revived parent / second
+fault sequence in a small QEMU/KVM test, independently of Codex and networking:
+  1. Parent installs SIGCHLD handler and forks an ordinary child.
+  2. Parent starts a CLONE_VM|CLONE_VFORK child which borrows its address space.
+  3. The older child exits while the vfork child sleeps.
+  4. SIGCHLD marks the parent Ready. exit_thread's direct-parent successor
+     ignores the vfork loan and activates the parent's empty placeholder.
+  5. The parent faults; later release_vfork returns the image and marks the
+     already-dead parent Ready, explaining the second fault/exit.
+Before-fix artifact: build/ci/linux-vfork-signal-before.log.
+
+Fix: centralize the existing vfork suspension check and apply it to the
+child-exit shortcut, generic ready-task scheduling, and explicit F12 selection,
+as well as the already-guarded Linux round-robin selectors. Pending signals
+remain queued until the child returns the shared image on exec or exit.
+No Codex settings, signal-handler addresses, or page permissions are patched.
+
+New regression //tests:linux_vfork_signal runs 24 overlapping sibling exits
+across child exit, successful exec, and failed exec. Its native Linux reference
+and QEMU/KVM run both pass after the fix. Existing linux_sigchld,
+linux_parent_death, and linux_kill (32/64-bit) also pass. Physical metal has not
+yet been retested. The host's active Codex home/daemon was not modified; the
+interactive VM uses a private state snapshot and read-only host tools.
+
+Final validation: all 544 kernel unit tests and kernel Clippy pass. A full
+Codex 0.167.0 daemon + code-mode command round-trip also passes on the rebuilt
+kernel in QEMU/KVM with 32 GiB RAM and a private ext4 home on NVMe; the helper
+wrote and read back CODEX_TOOL_PASS and the managed daemon persisted its PID.
+Artifacts: build/ci/codex-tools-daemon-ext4-state-ram32768-nvme/ (no SEGV).
+The small signal regression is the causal before/after test; the full Codex
+smoke test also passed before the fix and alone does not prove race coverage.
+Prepared matched metal release 8ce25eaf277f with --no-copy-showcase. It is not
+installed yet; sudo tools/install_kernel.sh installs that prepared release.
+
+2026-11-10: Git status investigation (after the vfork fix)
+---------------------------------------------------------
+The original metal tool record is worse than the earlier "minute" summary:
+the command starts at 02:44:10 UTC, reports 31% at 02:44:37, 71% at 02:45:17,
+80% at 02:45:48, 96% at 02:46:47, and 100% at 02:47:17. It still has no exit
+result at 02:48:08. These are observation timestamps, not per-file timings.
+This is not explained by a successful standalone two-second benchmark.
+
+Measured the same 2,912 tracked working-tree files and a private .git snapshot
+on native ext4/NVMe in QEMU/KVM (32 GiB, six CPUs, no SMB). The private copy
+has about 232.4 MB of tracked file data and a Linux-refreshed index. It omits
+untracked working-tree files. Git's own Trace2 separates index refresh from
+directory enumeration. Linux status on the real checkout: 0.0072 seconds;
+the private copy: 0.0073 seconds. Guest monotonic timer results:
+  VM with host disk cache: first 2.139 s, index-writing refresh 2.435 s,
+                           subsequent 0.420 / 0.360 s.
+  VM cache=none:           first 2.638 s, index-writing refresh 2.800 s,
+                           subsequent 0.352 / 0.397 s.
+  Live Codex daemon:      first 4.379 s, index-writing refresh 4.118 s,
+                           subsequent 0.638 s.
+  This session resumed:   first 3.689 s, index-writing refresh 4.498 s,
+                           subsequent 0.977 s.
+The Codex runs also use a private native filesystem and cache=none. The CLI
+is installed 0.163.0 and managed daemon 0.167.0. The background Git measurements
+use subprocess pipes; they are not yet the full code-mode tool execution path.
+
+Confirmed unnecessary work: the first guest status scans all 2,912 index
+entries; Linux scans only changed entries. After the guest writes its index,
+only 15 modified entries need content checks. The standalone first refresh
+takes 1.805 s of its 2.126 s inside Git; initial metadata preload is 0.210 s,
+untracked enumeration 0.074 s. In the live-daemon profile, two full scans map
+458 MB of working-tree data. Linux stat compatibility currently zeros ctime,
+loses subsecond mtime, and substitutes path-based inode identities. These
+differences invalidate Git's saved Linux metadata even for unchanged files.
+No Git settings were changed to conceal this. Correct metadata propagation
+remains to be implemented; these results do NOT explain the metal three minutes.
+
+Profiling found a separate correctness bug: /proc/1/stat reported PPID 1,
+forming an ancestry cycle. Enabling Git Trace2 then caused 85,000+ opens of
+/proc/1/stat before an allocation failure. Fixed init's parent to 0 in proc
+and both getppid ABIs, preserving parent 1 for other orphans. A new unit test
+checks the generated proc record; all 545 unit tests, linux_ps,
+linux_parent_death and kernel Clippy pass. Real Git tracing now completes.
+Prepared release 541a7a9a089c supersedes 8ce25eaf277f and contains both fixes;
+it is not installed. Artifacts and reproduction scripts are under
+build/ci/git-status-profile/ and build/ci/codex-native-resume-git-*/.
+
+Exec-server follow-up: exercised codex-exec-server 0.167.0's actual
+initialize/process-start/process-read RPCs with bash -lc and captured output,
+while the Codex daemon/UI remained resident. Three git status commands exited
+successfully: 4.874 s without index writes, 5.328 s with index refresh, then
+1.541 s warm (these include command launch/output collection). The driver
+checked exit status and EOF, not just UI readiness. Final successful results:
+build/ci/codex-native-resume-git-rpc-qmp-unprofiled/resident-build.json.
+An earlier attempt failed because its unrelated /bin/cat preflight was absent
+from the private root; the fixture was corrected before recording these numbers.
+No VM remains running. The three-minute metal slowdown is still unresolved.
+
+Comparison limit: copying a working tree into a new ext4 image changes native
+inode numbers even with perfect stat support. The full-scan measurements prove
+the cost of an invalid index metadata cache; the specific RetroOS timestamp
+and identity incompatibilities are independently visible in its stat/VFS code.
+Do not claim these fixture timings establish the whole metal cause or quantify
+the improvement from a metadata fix that has not yet been implemented.
+
+2026-11-10/11: reproduced directory-dependent slowdown; kernel heap fix
+------------------------------------------------------------------------
+Metal release 541a7a9a089c, native ext4, actual checkout:
+- First Git --no-optional-locks status: 3.251s, all 2912 content scans.
+- Same command with output through exec-server pipes: 3.392s.
+- Next normal status: 46.110s: preload 9.239, content refresh 30.204,
+  untracked directory enumeration 5.916, index write only 0.042 seconds.
+- Warm status after index refresh: 3.339s (only 15 content scans).
+- Later private-index full scan with kernel profiling: 42.839s.
+Metal artifacts: build/ci/git-metal-profile/; profile-log.txt preserves the
+F12 dump from KLOG0231. Its wider window includes other commands: pathname
+resolution 47.885s, directory scans 19.143s, disk reads 3.361s, disk flushes
+1.099s. These counters overlap and must not be added.
+
+QEMU/KVM reproduction: native ext4, 32GiB, six CPUs, tracked checkout and
+private .git copied into the guest. Compare full Git scans before/after
+walking 80 directories containing 1000 empty files each. This creates a
+large persistent VFS directory cache without changing Git's repository.
+Instrumentation measured time inside the kernel allocator itself. Its
+address-sorted free list is searched for allocations and twice on frees;
+short-lived path component buffers repeatedly walk a fragmented list.
+Saved driver: build/ci/git-status-profile/heap_repro.py.
+Saved before/after timing and allocator profiles:
+  build/ci/git-heap-repro/before/{timings,samples.jsonl}
+  build/ci/git-heap-repro/after/{timings,samples.jsonl}
+                       Before fix      After fix
+Git before enumeration   2.133s          1.985s
+Enumerate 80000 files    11.056s          5.729s
+Git after enumeration   15.118s          2.430s
+Git again               14.962s          2.155s
+Both builds had identical opt-in allocator timing instrumentation. Each Git
+run uses --no-optional-locks, so this is not an index-refresh workaround.
+The first and subsequent scans still read all tracked contents.
+
+Fix: bounded exact-size free-block caches in lib::heap::DemandHeap, enabled
+for the metal kernel. Up to 16 blocks per size, sizes through 256 bytes plus
+4096-byte alias scratch; stricter-alignment requests bypass these caches.
+Cached blocks stay backed and never enter the coalescing free list until
+needed. Exhausting the heap window drains the caches before retrying, so
+retained scratch blocks cannot produce false OOM. No path metadata checks
+were disabled. F12/COM2 now include opt-in allocator calls/ticks/max counters.
+Regression tests cover alignment, exhaustion/coalescing, and poisoning page
+releases while mixed cached/live allocations are exercised.
+This demonstrates and fixes a matching degradation mechanism in KVM; the
+new allocator still needs confirmation on physical metal. Metadata identity
+and timestamp incompatibilities still cause full scans on switching OSes.
+
+Also fixed the observed append corruption: Linux open ignored O_APPEND,
+and F_SETFL ignored it as well. Append is now shared with the VFS open-file
+description, writes select current EOF while holding the VFS lock, and
+F_GETFL/F_SETFL expose/change it across dup and fork. Regression exercises
+independent opens, seeking before append, writev, and inherited handles.
+The accidentally overwritten METAL_FINDINGS prefix was restored from HEAD;
+all earlier uncommitted appended findings were preserved. Tests pass through
+native ext4/FAT, SMB, and the hosted engine in linux_file_cache.
+
+Validation complete: kernel unit suite, six heap tests (including 5000 mixed
+allocation/eviction steps), linux_file_cache across ext4/FAT/SMB/hosted, and
+Clippy for kernel and lib. Real Codex with managed daemon0.167, code-mode
+command execution, native ext4 home/NVMe,32GiB QEMU/KVM passed CODEX_TOOL_PASS
+and daemon PID-record checks. No QEMU remains.
+Prepared release a47ec459f1ff via tools/install_kernel.sh --prepare
+--no-copy-showcase. Not installed into the physical boot partition.
+Install with sudo tools/install_kernel.sh, then verify on metal.
+
+Metal validation of a47ec459f1ff (KLOG0232):
+Actual full Git scans: baseline 2.691s, private-index before pressure 5.764s, after walking 80000 cached directory entries 2.709s. Normal index refresh 9.409s; following warm status .547s. Each full scan checked2912contents. Enumeration itself took43.402s and remains slower than KVM5.729s. Same-path stat1000 before pressure .049s, after .066s; previous release3.122s. Append probe preserved first and second lines. Thus the progressive Git slowdown is improved on metal; do not claim all operations fixed.
+New/remaining completion bug: every tool command produces its final output and exits(code0 in klog), but tool sessions keep reporting running. ps shows completed ls/bash children as zombies parentPID6. Examples sessions70262,78507,35072,83752,76208. Active Codex processes4..7, code-mode8, Python9/10. No daemon was signaled or restarted. F12 dump saved; regs show userspace futex location rip176acf00, rbpca, rsi80. Dump lacks per-thread signal-mask/wait state; root cause of unreaped children NOT established. /proc/PID/cmdline is absent.
+Artifacts: build/ci/git-metal-fixed/results.json, populate.json, append-probe.txt, kernel-dump.txt (full saved KLOG0232), kernel-tail.txt, trace-*.jsonl. Need reproduce daemon child-completion/SIGCHLD behavior in KVM after return to Linux, checking actual exit/EOF rather than only tool output markers.
+
+2026-11-10/11: Linux/KVM investigation after metal child-completion failure
+
+Metal evidence remains: commands exit code 0 but remain zombies parented by
+app-server PID 6; tool sessions never receive completion. This is NOT yet
+reproduced or claimed fixed. F12 previously dumped only the interrupted
+registers. It now defers to the event loop and dumps all Linux task/context
+waits, SIGCHLD handlers, per-thread masks, pending signals and delivery target.
+
+Completion checks in KVM:
+- Direct exec-server RPC: all exit/EOF notifications pass.
+- Direct app-server stdio RPC process/spawn: immediate, delayed, nonzero and
+  six simultaneous commands all produce process/exited, without drain timeout.
+- Worker-thread SIGCHLD handler with main-thread blocked mask: 40 children pass.
+- Actual Codex daemon tool call with hidden script exit: reports 36 correctly.
+- Resume this actual session, native CLI: reports hidden exit 83 correctly
+  (the temporary harness missed its result because QMP renders a bullet as BEL).
+- Installed Node launcher + resumed session: reports hidden exit 75 correctly.
+  This run also exposed transient EMSGSIZE stream disconnects.
+Artifacts: build/ci/exec-completion-current/, app-completion-native/,
+linux-sigchld-thread.log, codex-tool-completion-no-login-daemon-ext4-ram32768-nvme/,
+codex-native-resume-resumed-command-exit-qmp-unprofiled/,
+codex-native-resume-node-resumed-command-exit-qmp-unprofiled/.
+
+Two independently reproduced kernel bugs fixed:
+1. execve copied every argv/env string into a fixed 4096-byte buffer, silently
+   truncating longer input. A 4097-byte argument fails before the fix.
+   Copy page-bounded chunks, retain up to 131071 content bytes per string,
+   and reject oversized strings/aggregate input with E2BIG before teardown.
+   Bound aggregate strings and pointer storage to 2 MiB. Preserve the 32 KiB
+   environment restriction only for DOS executables. linux_exec_arguments
+   checks argv and env lengths 4095,4096,4097,65536,131071, overlong 131072,
+   and aggregate E2BIG. Native Linux and KVM pass; oversized exec leaves the
+   caller alive. Before evidence: build/ci/exec-arguments-before.txt.
+2. TCP sendmsg/writev wrongly treated the 64 KiB kernel scratch buffer as a
+   message limit (only Unix sockets previously allowed partial writes).
+   Large stream sends now return the accepted prefix; UDP stays atomic.
+   The socketpair gather path also allows short stream writes. linux_message
+   now checks two 160000-byte transfers (split writev and single-vector
+   sendmsg), exact bytes at the host peer, and oversized UDP rejection,
+   for both i386 and x86-64. Old kernel fails the sendmsg case with EMSGSIZE;
+   both ABIs pass after the fix. Test waits for host acknowledgement before
+   shutting the VM down so buffered final TCP bytes are actually delivered.
+   Evidence: build/ci/message-large-before.txt, recvmsg-32.log, recvmsg-64.log.
+
+Final full-feature Node-launched resume with login=true reports hidden exit 33
+correctly; no snapshot truncation error. Actual-session fixture readiness:
+18.650 s from VM launch / 8.217 s from guest-control availability. This is not
+an isolated performance comparison. Completed at 39.308 s including model/tool
+turn. Artifact: build/ci/codex-native-resume-node-resumed-fixed-login-qmp-unprofiled/.
+
+Validation: 545 kernel unit tests, exec-arguments, SIGCHLD, vfork-signal,
+Unix sockets, 32/64-bit message regression, kernel Clippy pass. The initial
+message test lacked the peer acknowledgement and shut the VM down too early;
+corrected test passes with every byte verified. Scoped diff whitespace check
+passes (unrelated DOS application config files remain dirty).
+
+Prepared release c35cba360a6d with --prepare --no-copy-showcase. Not installed
+by this turn. Includes prior allocator, append, PID ancestry and vfork fixes.
+Next metal failure: F12 -> Debug -> Dump state will now capture enough process
+and signal state to distinguish SIGCHLD delivery from event-loop wakeup.
+Remaining separate compatibility observation: ioctl currently identifies all
+pipes as terminals, so Python fed via a pipe can incorrectly become interactive;
+not changed here. Proxy-to-daemon JSONL experiments also failed on native Linux
+and are not valid evidence of a RetroOS completion failure.
+
+2026-11-11: actual live Codex session on physical RetroOS, KLOG0233
+
+User confirmed this was the real interactive session, not a fixture. Native
+uname reported Linux retroos 5.0.0; installed DOS/RETROOS/BOOT.INI selected
+release c35cba360a6d. /home/retroos/RETROOS/BOOT.INI is a stale alternate file
+and must not be used to identify the active physical installation.
+
+Tool commands now completed, including a delayed command returning 37.
+Six simultaneous subprocess children returned 21..26 in 0.484 s. No zombie
+children in saved process snapshots. This run had a single Codex process
+PID5 under Node PID4, with code-mode PID6 and Python helpers. The previous
+failure involved a separate app-server PID6, so this does not establish
+that daemon-backed child collection is fixed.
+
+Measurements saved under build/ci/metal-responsive-20261111/:
+- 20 true executions: 0.190 s total; ten bare bash commands: 0.257 s.
+- Ten login bash commands: 20.010 s (about 2 s each).
+- 1000 stat calls: 0.065 s before directory pressure, 0.064 s afterward.
+- 64 KiB argv and environment strings survived a real child exec.
+- Full Git scan: 2.589 s; private-index refresh 6.118 s; warm 0.644 s.
+- Existing 80000-entry directory tree walk: 23.602 s (previous metal 43.402).
+- After the walk: full Git scan 7.441 s, warm private index 0.613 s.
+  Git stderr contains progress output, not errors; pipe-isatty remains wrong.
+These do not constitute a controlled before/after measurement of every fix.
+The directory walk and null redirects can change global cache state.
+
+New cause isolated: opening /dev/null with O_TRUNC enters regular-file
+creation/truncation in VFS. It calls refresh_written_file; DeviceFs supplies
+no file_identity, so that helper clears the entire directory cache. Bash
+redirections such as true >/dev/null therefore discard metadata for all
+filesystems, including the 80000-entry tree. Existing character-device write
+handling already skips this work; it is the truncating open that is wrong.
+
+Concrete live measurements:
+- Plain bash true: 22..27 ms; true >/dev/null: 373..655 ms.
+- /dev/null O_WRONLY/O_CREAT without truncation: <1 ms.
+- First O_TRUNC open: 433 ms, subsequent opens without repopulating: 8..11 ms.
+- Cached stat /usr/bin/bash: <1 ms. After O_TRUNC /dev/null, same stat:
+  204 ms and 189 ms in two trials. Normal opens left it <1 ms.
+Artifacts: null-open-flags.json, null-cache-invalidation.json,
+shell-redirection-timings.json, login-profile-timings.json. A DEBUG-trap trace
+attempt exited137 and is not used as evidence; the direct flag comparison
+and source inspection establish the cache invalidation independently.
+
+Patch written during the actual RetroOS session: create_to_handle_options
+preserves existing character devices and their open/permission behavior,
+without truncation, file timestamp changes, or cache invalidation. Dispatch
+uses mode bits, not a hard-coded /dev/null pathname. Unit regression checks
+null read/write/size and cached positive/negative lookups in another mount.
+On return to Linux, all546 kernel unit tests including that regression pass.
+KVM before/after performance verification and a prepared build follow below.
+
+KVM verification completed for the character-device fix:
+Identical static probe, native ext4, 80 directories x1000 entries, 1GiB RAM.
+                         old c35 kernel      patched kernel
+ordinary null open           1 ms                1 ms
+truncating null open       860 ms               <1 ms
+stat after truncation       24 ms               <1 ms
+Initial directory walk     3.248 s              3.025 s
+Second cached walk         2.257 s              2.205 s
+The probe verifies character type, zero size before/after writes, discarded
+writes, EOF on reads and zero seek position. Artifacts and runner/source:
+build/ci/dev-null-profile/{before.log,after.log,probe.c,run.py}.
+All546 unit tests and kernel Clippy pass; scoped whitespace check passes.
+Prepared release867c4e445e4f, not installed. This replaces the prepared
+c35cba360a6d selection; user can install via sudo tools/install_kernel.sh.
+No QEMU remains. No daemon/state/auth restart or change was made to the live
+session. Full login-shell latency still needs measurement on the new metal
+kernel; the KVM result isolates the cache-invalidation cause directly.
+
+2026-11-11: live physical RetroOS session, release 867c4e445e4f, KLOG0234
+
+Confirmed native uname Linux retroos 5.0.0 and current DOS BOOT.INI.
+Null-truncation fix measured on metal: bare shell 29 ms, shell with
+true >/dev/null 24 ms (previous 373-655 ms), login shell 446 ms (previous
+about 2 seconds). Separate Python subprocess.run collects each status 0.
+
+Direct Codex tool child completion is broken in this session: tool commands
+print output and exit, but exec sessions remain open and children remain
+zombies under Codex PID 5. This session has Codex PIDs 4, 5, 6 rather than
+the previous successful single-Codex process tree. User triggered F12 dump.
+PID5 child-reaper tid327726 waits indefinitely on futex 0xa9712918.
+SIGCHLD handler 0x1659ffe0, flags0x14000004, frames0, pending0,
+delivery target327682; several live threads have mask0. The dump does not
+prove where notification was lost. PID5 epoll fd1025 and1029 both show
+last1 ready5; these observations alone do not prove an epoll bug.
+Artifacts and full dump: build/ci/metal-self-build-20261111/.
+
+Self-build prerequisite: real Bazel7.4.1 JVM-backed version succeeds status0
+in28.667s, with private output_user_root and installed Bazel runtime on
+native root. Started //kernel:kernel with one job, standalone actions,
+private outputs, and278 overrides for extracted repository sources/tools.
+Host compilation outputs are not reused. Runner caps attempt at180s;
+build-status.json, build.err, build-command.json retain result and invocation.
+No kernel/SMP source change made during this physical session.
+
+Self-build probe result: timed out after181.209s while analyzing
+//kernel:kernel, at117 packages and1080 configured targets. No compiler
+action started. Python runner killed/reaped its Bazel child at the limit.
+This is a bounded cold/private-cache probe, not a completed build or a
+controlled Linux comparison. Build stderr and status are saved alongside
+the successful version probe. Do not attribute this delay to compilation.
+
+2026-11-11 Linux follow-up to KLOG0234
+
+Reproduced a Unix socketpair edge-triggered epoll lost notification. Watch.last
+remains readable after the application drains the endpoint, and another write
+before epoll polls again is invisible. Virtual socket endpoints had no receive
+sequence (native network sockets already have one). Added a shared endpoint
+sequence incremented on writes; epoll compares it with its delivered sequence.
+The sequence survives fork/dup because it belongs to the Rc-shared endpoint.
+This is consistent with the metal SIGCHLD child-reaper sleeping despite
+notifications; actual Codex daemon completion on metal remains unverified.
+
+Extended linux_sigchld_probe.c with repeated signal-handler socketpair writes,
+drain/refill between EPOLLET waits, and a forked writer. Corrected probe passes
+on Linux, fails in KVM with older boot image at line68 (epoll notification),
+and passes with patched image. Logs: build/ci/linux-sigchld-edge-{before,after}.log.
+Initial probe used raise(), revealing a separate issue: syscall200(tkill) and
+234(tgkill) are routed to sys_exit, terminating the process. Used kill() to
+isolate the epoll regression; those syscall aliases still need correction.
+546 kernel unit tests, kernel Clippy, boot build and scoped diff check pass.
+Prepared release90c302930aaf, not installed. sudo tools/install_kernel.sh installs.
+
+Linux fresh private-output dependency analysis with the same repository
+source overrides, one job and JVM settings succeeds in8.138s. Added --nobuild
+for analysis-only comparison. Metal full build attempt was still analyzing
+at181.209s (117 packages/1080 configured targets), before compiler execution.
+Linux profile and log: metal-self-build-20261111/linux-analysis-{profile.json,err}.
+No diagnosis yet of the excessive analysis time; no SMP source changes.
+
+2026-11-11 second physical session, BOOT.INI selects90c302930aaf.
+Tool exit37 returned correctly. Four concurrent tool commands returned21..24
+correctly. Process snapshot shows no zombies. This session has one Codex
+PID4 under shellPID3, not the previous separate Codex PIDs4/5/6; therefore
+it confirms working current session but not a controlled daemon regression.
+Snapshot: build/ci/metal-epoll-fixed-20261111/processes.json.
+Started cached-output analysis-only probe with full Bazel profile and240s
+limit; analysis-status.json and analysis.err retain result. SIGINT requested
+on timeout to permit profile flushing before forced termination.
+
+Physical cached-output analysis-only run completed status0 in141.790s
+(Bazel reported121.152s),267 packages/11606 configured targets. Full profile
+saved at metal-epoll-fixed-20261111/analysis-profile.json. Instrumentation
+record_full_profiler_data was enabled; earlier Linux8.138s run used fresh
+private output cache without full instrumentation, so this is not a matched
+speed ratio. Profile individual nested durations: cargo-bazel repository
+execution9.859s, module working directory VFS delete7.819s, rust_src glob5.091s.
+Do not add nested/overlapping durations. Per-category VFS summary saved,
+along with post-analysis process snapshot. No kernel source changes this
+physical turn. Kernel compilation and boot-image self-build remain undone.
+
+2026-11-11 Linux scheduling follow-up
+
+Same full-profiler settings: Linux analysis9.208s with fresh private output,
+then10.640s restricted to one CPU with that output cache. Linux profiles/status
+under metal-epoll-fixed-20261111/linux-{matched,one-core}*. Output cache/OS
+cache states differ from metal, so these are not exact controlled ratios.
+The metal profile records227 thread names,203 skyframe evaluator threads.
+One-core Linux timing establishes that single-core execution alone does not
+explain141.790s metal. VFS profile durations include descheduling/queue time,
+so a3.652s readdir is not evidence of3.652s disk service time.
+
+Changed private FUTEX_WAIT handling: validate user value at entry, then keep
+waiter asleep until explicit wake, signal or timeout. Previously scheduler
+reread every parked futex value at every syscall/IRQ scheduling boundary.
+Shared futex waits retain existing cross-process memory-poll fallback;
+clear_child_tid joins still use that shared path. No SMP implementation.
+
+New test/linux_private_futex.py + probe:64 pthread waiters, explicit wake,
+thread joins, relative timeout, mismatched-value EAGAIN. Native Linux and
+QEMU/KVM pass. Probe10000 getpid with64 parked waiters: old boot78ms,
+new68ms (one sample each; modest improvement, not the full Bazel explanation).
+Before/after logs build/ci/linux-private_futex-{before,after}.log.
+546 kernel unit tests, kernel Clippy, boot build, SIGCHLD/EPOLLET regression
+and scoped whitespace check pass. Prepared a733369637b8; not installed.
+Full RetroOS self-build and multicore Linux execution remain incomplete.
+
+2026-11-11 live physical releasea733369637b8
+Command exit37 collected correctly. Compiled pthread probe natively with
+gcc -O2 -pthread in1.780s; ran in0.133s.64-thread wakes/joins, mismatch
+and timeout pass.10000 getpid with64 waiters36ms on metal (not a controlled
+comparison to QEMU). Saved metal-futex-fixed-20261111/thread-probe.json.
+
+Actual //kernel:kernel build, one job/private outputs/extracted repositories,
+failed status1 in50.787s before compilation. Bazel WorkspaceStatusAction
+cannot delete bazel-out/volatile-status.txt mode0555. Parent mode0755, owner
+priv-gerben. VFS delete requires both may_write_parent and may_write(victim),
+so an owned read-only file cannot be unlinked even in a writable directory.
+This is the documented owner+write grant policy, differs from Linux unlink.
+Asked user whether to use Linux deletion semantics for owned victims or keep
+policy and configure writable Bazel outputs; no policy changes made yet.
+Full build log/profile/command saved under metal-futex-fixed-20261111.
+
+2026-11-11 POSIX namespace and QEMU self-build follow-up
+
+User explicitly requires POSIX deletion semantics. Namespace permission checks
+now use parent write+search, searchable ancestors, primary group/other mode
+bits and sticky directory restrictions; victim owner-write is not required.
+Unlink/rmdir/rename (including replacement) use this check. Read-only mounts
+return EROFS for removal. File-content writes retain their existing grant.
+Grant primary GID now comes from configured home alongside UID.
+Tests: linux_namespace_permissions probe succeeds on Linux and native ext4
+QEMU; old kernel fails readonly unlink EACCES. Guest fixture covers foreign
+sticky directory ownership and both rename sides. New Bazel test target wired.
+
+Added try_self_build --native-home: private4GiB ext4/NVMe guest home, source
+and extracted tools remain read-only SMB. --reuse-native-home checks/replays
+private filesystem via e2fsck before replacing startup scripts. Runtime build
+logs/status/profile extracted with debugfs after VM exits. First launch omitted
+native disk attachment (fixed in harness). JVM then exposed absent kernel-owned
+/dev/random and /dev/urandom: SMB host device read returned EOF. DeviceFs now
+supplies both through shared kernel entropy service, never cached file bytes.
+Unavailable entropy returns EAGAIN. It does not invent bytes or seed from time.
+Random-device read tests pass; entropy-unseeded blocking semantics remain
+separate work, not claimed complete here.
+
+Actual build passed analysis and compiled core_internal, compiler_builtins,
+rustc_demangle, tinyjson, process_wrapper and other dependencies inside RetroOS.
+No host action outputs are reused. Main run failed at serde_derive proc-macro
+compilation, Exit5 without diagnostic. Its process5 exited5, so the known bad
+syscall200/234-to-exit aliases are suspected but not proven. Isolated action
+reconstructed from host aquery succeeds in guest including gcc/collect2/ld.lld.
+Reconstruction may differ from actual guest action settings; full build retry
+uses --verbose_failures and new serial 'trace process' filter to capture actual
+lifecycle/exit args without clock/read traffic. Full-build failure, profile,
+12MiB isolated syscall trace and action JSON retained in self-build-posix-kvm-3.
+
+General cache bug found during build: PAGE_LIMIT512 included pinned mappings,
+so JVM mappings prevented ordinary read-ahead caching. Profile:197MiB returned,
+1.58GiB backend data. Unit regression initially failed (2 backend reads where
+one32KiB batch suffices). Clean-cache budget now excludes pinned pages; bounded
+LRU tracks only candidate clean pages (lazy pruning of stale/promoted keys).
+Freshness invalidation walks only requested inode's key range. No global mapped
+page scan per read-cache insertion. Native ext4/NVMe probe (no SMB) reads16MiB
+with3MiB live shared mappings, verifies all bytes: old450ms; budget-only277ms;
+intermediate indexed implementation489ms (discarded); final LRU130ms. These
+are single samples, not a full compiler startup or metal before/after claim.
+Later compilation profile backend bytes approximately match requested bytes,
+rather than8x. Kernel549 unit tests and Clippy pass; ext4/FAT/SMB/hosted cache
+regressions pass. Hosted test initially used stale binary; proper Bazel target
+rebuilt it. New cache test target initially lacked log directory; fixed and
+rerun passes. Namespace/private-futex/SIGCHLD regressions also pass.
+Prepared release27c7327fb843 includes namespace, entropy devices and final cache
+LRU; not installed. Later process-trace instrumentation does not alter default
+execution. Full build/self-hosted boot image and SMP execution remain incomplete.
+
+2026-11-11 QEMU compiler failure diagnosed: thread signal aliases
+
+Full traced retry progressed past serde_derive but failed on zerovec_derive.
+Exact evidence tgkill-failure-klog.txt lines69686+: syscall234 a0=5,
+a1=0x5000f,a2=0xa, tid5; then exit tid5 code5. This is tgkill sending
+SIGUSR1 to compiler worker327695, not a compiler error. The syscall was
+wrongly routed to sys_exit(a0), killing the compiler with its process ID.
+Isolated aquery-reconstructed serde_derive command had succeeded including
+linker; therefore early suspicion only became proven with full lifecycle trace.
+
+Implemented tkill/tgkill dispatch (both syscall tables), live thread/group
+lookup, signal-zero probes and errors, per-target pending ordinary signals,
+per-thread mask handling/coalescing, SI_TKILL sender PID/UID, exec remapping
+and exit cleanup. SIGKILL/STOP retain process-wide effects; SIGCONT resumes
+group with pending-stop cancellation. C64 regression passes on native Linux
+and QEMU; old kernel exits at first signal-zero probe. Test waits for Linux
+post-join task teardown before asserting ESRCH (join may observe clear_tid
+before final kernel task removal). Both tgkill and obsolete tkill exercised.
+New Bazel target linux_thread_signal registered. All five integrations pass:
+thread_signal, signal, sigchld, parent_death, vfork_signal.549 unit tests and
+Clippy pass. Signal32 handlers/queued realtime signal semantics are not newly
+claimed here; x64 ordinary worker signals are the exercised path.
+
+New serial 'trace process' filter captures fork/exec/wait/signal/exit calls,
+avoiding per-clock/futex syscall lines. Internal readlink trace lines still
+appear under trace, so traced run timings include instrumentation overhead.
+Resumed full build now passed zerovec_derive and continues at318/738 actions.
+Outputs are guest compiled on native private ext4; source/tools remain SMB.
+Full kernel/boot-image self-build remains uncompleted pending build outcome.
+Fixture helper now holds exclusive work-dir flock to prevent concurrent reuse.
+
+Fixed-kernel full-build trace captured syscall234 a0=5,a1=0x50004,a2=10
+returning0 followed by normal thread exit0 and continued compilation.
+Context saved in self-build-posix-kvm-3/tgkill-fixed-context.txt. Disabled
+trace afterward to remove instrumentation overhead for remaining build.
+Prepared release4d89b259a07c includes thread-signal fix; not installed.
+All five signal integration targets and549 unit tests/Clippy pass.
+
+Native-loader isolation: byte-identical rustc executables, rustc_driver and
+LLVM libraries verified SHA256. Same guest runs rustc --version twice per
+path: SMB6.317s/5.913s, native compiler-library ext4 mounts0.875s/0.876s.
+Result artifacts build/ci/compiler-loader-native/. Only compiler libraries
+are native in that branch; source/JDK/system tools remain SMB. Root custom
+target compiler is a fourth source under _main~_repo_rules~rust_toolchain_
+x86_64_linux/rustc/lib and was not yet included in the three native SDK
+mounts; target crates still8..14s, host-tool crates1..4s after fixture change.
+Kernel eagerly copies private file mappings at mmap, clean cache2MiB does
+not retain large DLLs across launches. Native library355.262064MB plus
+overlapping mappings explain avoidable startup I/O; lazy private mapping/
+file-page reuse remains a real kernel performance task, not fixed by fixture.
+
+FIRST SUCCESS: //kernel:kernel completed inside QEMU/KVM RetroOS status0,
+Bazel748.024s,315 actions (65 local/250 internal), using previous guest-built
+dependency outputs retained across diagnostic/repaired-kernel attempts.
+No host action outputs reused. Artifact guest path /home/retroos/out/
+bazel-bin/kernel/libkernel-622561694.rlib. This is the kernel library, not
+yet a self-hosted linked boot image. Continuing to //:boot_disk.
+
+Full //:boot_disk follow-up: repository overrides now recognize WORKSPACE/
+MODULE markers as well as root BUILD files, covering cached http_file inputs
+without bypassing TLS checks. Native compiler fixtures include the fourth
+custom target compiler's library tree too. Build analyzed321 packages/28029
+targets and stopped at133/1400 actions after208.033s: nasm config_src's
+cp -f reports config_linux.h "was replaced while being copied". This is an
+unresolved guest filesystem/stat compatibility failure; no bootable guest-built
+image yet. The successful kernel library milestone remains independently saved.

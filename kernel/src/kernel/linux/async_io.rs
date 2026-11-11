@@ -34,7 +34,7 @@ pub(super) fn proc_target(state: &State, fd: usize) -> Option<Vec<u8>> {
 #[derive(Clone, Copy)]
 enum Wait {
     Ready,
-    Futex(u64, u32, u64),
+    Futex(u64, Option<u32>, u64),
     Epoll(i32, usize, usize, u64),
     Sleep(u64),
     Poll(usize, usize, u64),
@@ -67,6 +67,7 @@ struct Watch {
     enabled: bool,
 }
 struct SocketEnd {
+    read_sequence: Cell<u64>,
     packets: RefCell<alloc::collections::VecDeque<Vec<u8>>>,
     peer: RefCell<Weak<SocketEnd>>,
     packet_mode: bool,
@@ -266,9 +267,13 @@ fn epoll<A: crate::Arch>(
         .borrow()
         .iter()
         .map(|w| {
-            let sequence = match kt.fds.get(w.fd as usize) {
-                Some(FdKind::Socket(handle)) => crate::kernel::net::read_sequence(*handle),
-                _ => 0,
+            let sequence = if let Some(Descriptor::Socket(end)) = descriptor(s, w.fd) {
+                end.read_sequence.get()
+            } else {
+                match kt.fds.get(w.fd as usize) {
+                    Some(FdKind::Socket(handle)) => crate::kernel::net::read_sequence(*handle),
+                    _ => 0,
+                }
             };
             (ready(kt, s, w.fd), sequence)
         })
@@ -360,6 +365,7 @@ pub(super) fn call<A: crate::Arch>(
             } else {
                 let make = || {
                     Rc::new(SocketEnd {
+                        read_sequence: Cell::new(0),
                         packets: Default::default(),
                         peer: Default::default(),
                         packet_mode: kind == 5,
@@ -415,7 +421,13 @@ pub(super) fn call<A: crate::Arch>(
                         data
                     };
                     let n = data.len() as i32;
-                    if !data.is_empty() { peer.packets.borrow_mut().push_back(data); }
+                    if !data.is_empty() {
+                        peer.packets.borrow_mut().push_back(data);
+                        // The reader may drain and refill between epoll waits.
+                        // Keep the notification on the shared endpoint so writes
+                        // through forked/duplicated descriptors remain visible.
+                        peer.read_sequence.set(peer.read_sequence.get().wrapping_add(1));
+                    }
                     n
                 } else {
                     -EPIPE
@@ -830,7 +842,7 @@ pub(super) fn call<A: crate::Arch>(
                                 machine.now().saturating_add(time)
                             }
                         };
-                        s.contexts[s.active].wait = Wait::Futex(a.a0, a.a2 as u32, until);
+                        s.contexts[s.active].wait = Wait::Futex(a.a0, (a.a1 & 128 == 0).then_some(a.a2 as u32), until);
                         0
                     }
                 }
@@ -936,11 +948,19 @@ pub(super) fn schedule<A: crate::Arch>(
     for i in 0..s.contexts.len() {
         let result = match s.contexts[i].wait {
             Wait::Futex(addr, val, end) => {
-                match futex_value(machine, addr) {
-                    None => Some(-EFAULT),
-                    Some(value) if value != val => Some(0),
-                    Some(_) if now >= end => Some(-110),
-                    Some(_) => None,
+                // Private waiters are made runnable by FUTEX_WAKE, not by
+                // polling user memory at every syscall/IRQ. Large JVMs have
+                // hundreds of sleeping waiters. Retain shared-memory polling
+                // for the existing cross-process fallback.
+                match val {
+                    Some(expected) => match futex_value(machine, addr) {
+                        None => Some(-EFAULT),
+                        Some(value) if value != expected => Some(0),
+                        _ if now >= end => Some(-110),
+                        _ => None,
+                    },
+                    None if now >= end => Some(-110),
+                    None => None,
                 }
             }
             Wait::Epoll(fd, out, max, end) => {
@@ -1072,6 +1092,7 @@ mod tests {
     fn fork_shares_socket_endpoints_and_exec_closes_only_cloexec_handles() {
         let make = || {
             Rc::new(SocketEnd {
+                read_sequence: Cell::new(0),
                 packets: Default::default(),
                 peer: Default::default(),
                 packet_mode: true,
@@ -1151,6 +1172,11 @@ pub(super) fn needs_poll(state: &State) -> bool {
 }
 
 pub(super) fn take_exited(state: &mut State) -> Vec<i32> { core::mem::take(&mut state.exited_tasks) }
+
+pub(super) fn has_thread(state: &State, process: i32, target: i32) -> bool {
+    if state.contexts.is_empty() { return process == target; }
+    state.contexts.iter().any(|context| context.id == target && !matches!(context.wait, Wait::Exited))
+}
 
 pub(super) fn signal_target(state: &State, process: i32, accepts: impl Fn(i32) -> bool) -> Option<i32> {
     if state.contexts.is_empty() { return accepts(process).then_some(process); }

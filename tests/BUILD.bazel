@@ -1411,8 +1411,56 @@ integration_test(
 )
 
 integration_test(
+    name = "linux_exec_arguments",
+    command = ["python3", "test/linux_exec_arguments.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_vfork_signal",
+    command = ["python3", "test/linux_vfork_signal.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
     name = "linux_signal",
     command = ["python3", "test/linux_signal.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_namespace_permissions",
+    command = ["python3", "test/linux_namespace_permissions.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_cache_budget",
+    command = ["python3", "test/linux_cache_budget.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_private_futex",
+    command = ["python3", "test/linux_private_futex.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_thread_signal",
+    command = ["python3", "test/linux_thread_signal.py"],
     sources = ["//:integration_sources"],
     metal = ["//:boot_disk"],
     tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
@@ -1900,6 +1948,8 @@ test_suite(
         ":linux_statfs",
         ":linux_unix_socket",
         ":linux_parent_death",
+        ":linux_vfork_signal",
+        ":linux_exec_arguments",
         ":linux_signal",
         ":linux_sigchld",
         ":linux_time_high",

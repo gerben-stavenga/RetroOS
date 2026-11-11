@@ -15,15 +15,14 @@
 //! Display selects the fullscreen DOS framebuffer scaling policy.
 //!
 //! State is a handful of single-threaded atomics. Input handling ([`key`]) lives here but is
-//! called from [`console`](crate::kernel::console), which has the `machine`/
-//! `regs`/`DosState` the Dump action needs; painting ([`paint`]) happens at the
+//! called from [`console`](crate::kernel::console); diagnostic dumps run in
+//! the event loop. Painting ([`paint`]) happens at the
 //! shared display publication boundary after a personality has rendered.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use vga::{self, PixelFormat};
 
-use crate::Regs;
 use crate::kernel::thread;
 
 // ── Menu model ───────────────────────────────────────────────────────────────
@@ -839,15 +838,9 @@ const K_RIGHT: u8 = 0x4D;
 const K_F12: u8 = 0x58;
 
 /// Drive the panel from one key event. Only called while [`is_open`]; releases
-/// (bit 7) are swallowed so no break code leaks to the guest. `machine`/`regs`/
-/// `dos` are threaded through only for the Dump action.
-pub fn key<A: crate::Arch>(
-    machine: &mut A,
-    regs: &mut Regs,
-    sc: u8,
-    dos: Option<&thread::DosState<A>>,
-    sound: SoundView,
-) {
+/// (bit 7) are swallowed so no break code leaks to the guest. Dumps are
+/// deferred to the event-loop owner, which can inspect all processes.
+pub fn key(sc: u8, sound: SoundView) {
     if sc & 0x80 != 0 {
         return; // release: swallowed, no action
     }
@@ -864,7 +857,7 @@ pub fn key<A: crate::Arch>(
         K_DOWN => move_sel(false, sound),
         K_LEFT => adjust(false, sound),
         K_RIGHT => adjust(true, sound),
-        K_ENTER => activate(machine, regs, dos, sound),
+        K_ENTER => activate(sound),
         _ => {} // any other key: swallowed while open
     }
 }
@@ -1014,12 +1007,7 @@ fn adjust(up: bool, sound: SoundView) {
     }
 }
 
-fn activate<A: crate::Arch>(
-    machine: &mut A,
-    regs: &mut Regs,
-    dos: Option<&thread::DosState<A>>,
-    sound: SoundView,
-) {
+fn activate(sound: SoundView) {
     match active_tab() {
         TAB_DISPLAY => {
             crate::kernel::display::set_dos_scaling(DISPLAY_MODES[active_sel(TAB_DISPLAY)]);
@@ -1078,7 +1066,7 @@ fn activate<A: crate::Arch>(
             DEBUG_ITEM_PROFILE => crate::kernel::startup::toggle_profile(),
             DEBUG_ITEM_PRINT_PROFILE => crate::kernel::startup::print_profile(),
             DEBUG_ITEM_DUMP => {
-                crate::kernel::startup::dump_interrupted_thread(machine, regs, dos);
+                crate::kernel::startup::request_debug_dump();
                 close();
             }
             _ => {}

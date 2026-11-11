@@ -297,6 +297,9 @@ pub(super) fn visit_rm_targets(mut visit: impl FnMut(u8, u16, u16, u64)) {
 }
 
 pub(super) fn print() {
+    let [allocs, alloc_ticks, alloc_max, frees, free_ticks, free_max] = lib::heap::profile();
+    crate::compact_println!("[heap-prof] allocs={} ticks={} max={} frees={} ticks={} max={}",
+        allocs, alloc_ticks, alloc_max, frees, free_ticks, free_max);
     // Include I/O in the F12 dump as well as COM2 replies: physical machines
     // may have no connected diagnostic UART, but retain their kernel log.
     for (name, [calls, bytes, ns]) in FILE_IO_NAMES.into_iter().zip(file_io()) {

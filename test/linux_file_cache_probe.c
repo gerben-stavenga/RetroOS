@@ -6,9 +6,40 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
+static void append_probe(void) {
+    const char *path = "/home/retroos/cache-append";
+    int fd = open(path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    assert(fd >= 0 && write(fd, "abc", 3) == 3);
+    int app = open(path, O_RDWR | O_APPEND);
+    assert(app >= 0 && (fcntl(app, F_GETFL) & O_APPEND));
+    // Another description grows the file after the append handle was opened.
+    assert(write(fd, "++", 2) == 2);
+    assert(lseek(app, 0, SEEK_SET) == 0 && write(app, "Z", 1) == 1);
+    assert(lseek(app, 0, SEEK_CUR) == 6);
+    int copy = dup(app);
+    assert(copy >= 0 && fcntl(copy, F_SETFL, O_RDWR) == 0);
+    assert(!(fcntl(app, F_GETFL) & O_APPEND));
+    assert(lseek(app, 0, SEEK_SET) == 0 && write(app, "X", 1) == 1);
+    assert(fcntl(copy, F_SETFL, O_RDWR | O_APPEND) == 0);
+    assert(fcntl(app, F_GETFL) & O_APPEND);
+    struct iovec parts[] = {{"A", 1}, {"B", 1}};
+    assert(lseek(app, 0, SEEK_SET) == 0 && writev(app, parts, 2) == 2);
+    pid_t child = fork();
+    assert(child >= 0);
+    if (!child) _exit(write(copy, "!", 1) == 1 ? 0 : 1);
+    int status = -1;
+    assert(waitpid(child, &status, 0) == child && status == 0);
+    char bytes[16] = {0};
+    assert(pread(fd, bytes, sizeof(bytes), 0) == 9 && !memcmp(bytes, "Xbc++ZAB!", 9));
+    assert(close(copy) == 0 && close(app) == 0 && close(fd) == 0);
+    assert(unlink(path) == 0);
+}
+
 int main(int argc, char **argv) {
+    append_probe();
     const char *file = "/home/retroos/cache-data";
     int fd = open(file, O_CREAT | O_TRUNC | O_RDWR, 0600);
     assert(fd >= 0);

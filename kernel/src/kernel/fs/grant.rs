@@ -1,25 +1,8 @@
 //! The write-permission rule, and nothing else.
 //!
-//! RetroOS may write an object exactly when its owner UID matches the home
-//! directory's owner UID and it carries the owner-write bit. This policy is
-//! stated here once, as a pure predicate over the facts a filesystem reports
-//! (`vfs::Meta`), so it can be read, reasoned about and tested on its own.
-//!
-//! Two things are deliberately NOT here:
-//!
-//! * **Enforcement.** `vfs` applies this at the single point every file
-//!   operation already passes through. A per-mount decorator was the obvious
-//!   alternative and is the wrong shape for a security rule: its failure mode
-//!   is silent — mount the raw driver anywhere and the policy is simply gone,
-//!   with nothing to grep for. One choke point cannot be forgotten.
-//! * **Lookup.** Only a filesystem can read an inode, so it reports `Meta`;
-//!   deciding what those numbers mean is this module's job and no driver's.
-//!
-//! The host grants access per file or directory with `chown <C:-owner>` +
-//! `chmod u+w` — ordinary Unix administration — and RetroOS can touch nothing
-//! else, no matter where it is or how it was reached. Symlinks stop mattering:
-//! drivers resolve them before reporting, so a link to `/etc/passwd` is
-//! refused because passwd isn't ours, not because of where the link pointed.
+//! File-content writes use the mount's owner/write grant. Namespace changes
+//! follow POSIX directory permissions: write and search on the parent, with
+//! the sticky bit restricting removal to the directory owner or victim owner.
 
 use crate::kernel::vfs::{Filesystem, Meta};
 
@@ -39,7 +22,8 @@ const S_IRUSR: u32 = 0o400;
 pub enum WriteAccess {
     /// Nothing on this mount may be written.
     None,
-    /// RetroOS's owner+write-bit rule applies (ext4, which has ownership).
+    /// File writes use the owner/write grant; namespace changes use POSIX
+    /// directory permissions (ext4, which has ownership).
     Granted(Grant),
     /// The backing filesystem governs its own access: the host punch-through
     /// (where the host OS already enforces real permissions) and the RAM
@@ -54,6 +38,7 @@ pub enum WriteAccess {
 #[derive(Clone, Copy)]
 pub struct Grant {
     uid: u32,
+    gid: u32,
 }
 
 impl Grant {
@@ -64,14 +49,25 @@ impl Grant {
     /// than guessing a uid.
     pub fn from_home(fs: &dyn Filesystem, home: &[u8]) -> Option<Grant> {
         let home = home.strip_suffix(b"/").unwrap_or(home);
-        Some(Grant {
-            uid: fs.meta(home)?.uid,
-        })
+        let meta = fs.meta(home)?;
+        Some(Grant { uid: meta.uid, gid: meta.gid })
     }
 
     /// The rule: ours, and owner-writable.
     pub fn allows(&self, m: &Meta) -> bool {
         m.uid == self.uid && m.mode & S_IWUSR != 0
+    }
+
+    /// Effective identity is the home owner and primary group.
+    pub fn directory_access(&self, meta: &Meta, requested: u32) -> bool {
+        if self.uid == 0 { return true; }
+        let shift = if meta.uid == self.uid { 6 } else if meta.gid == self.gid { 3 } else { 0 };
+        (meta.mode >> shift) & requested == requested
+    }
+
+    pub fn may_remove(&self, parent: &Meta, victim: &Meta) -> bool {
+        parent.mode & 0o1000 == 0 || self.uid == 0
+            || self.uid == parent.uid || self.uid == victim.uid
     }
 
     /// The mode a newly created object should carry so we can reopen it:
@@ -97,4 +93,28 @@ pub fn parent_of(path: &[u8]) -> Option<&[u8]> {
         Some(i) => &path[..i],
         None => b"", // mount root
     })
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    #[test]
+    fn directory_modes_and_sticky_ownership() {
+        let user = Grant { uid: 1000, gid: 100 };
+        for (uid, gid, mode, allowed) in [
+            (1000, 200, 0o700, true), (1000, 100, 0o600, false),
+            (1000, 100, 0o500, false), (2000, 100, 0o070, true),
+            (2000, 200, 0o007, true), (1000, 100, 0o077, false),
+        ] {
+            assert_eq!(user.directory_access(&Meta { uid, gid, mode }, 3), allowed);
+        }
+        let foreign = Meta { uid: 2000, gid: 200, mode: 0o444 };
+        let owned = Meta { uid: 1000, ..foreign };
+        let sticky = Meta { uid: 3000, gid: 300, mode: 0o1777 };
+        assert!(!user.may_remove(&sticky, &foreign));
+        assert!(user.may_remove(&sticky, &owned));
+        assert!(user.may_remove(&Meta { uid: 1000, ..sticky }, &foreign));
+        assert!(user.may_remove(&Meta { mode: 0o777, ..sticky }, &foreign));
+        assert!(Grant { uid: 0, gid: 0 }.may_remove(&sticky, &foreign));
+    }
 }

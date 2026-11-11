@@ -19,7 +19,7 @@
 //! filesystems never call back into `vfs`, so holding the lock across `fs.read`/
 //! `fs.open` is safe.
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 use spin::Mutex;
 use crate::kernel::thread::{FdKind, MAX_FDS};
@@ -375,6 +375,8 @@ fn path_ino(path: &[u8]) -> u64 {
 pub struct FileEntry {
     pub vnode: Vnode,
     pub offset: u32,
+    /// O_APPEND belongs to the shared open file description.
+    append: bool,
     /// Includes the backing references held by shared file pages.
     pub refcount: u32,
     /// Stable per-file inode (FNV hash of the path). fstat reports it so the
@@ -555,6 +557,8 @@ struct Vfs {
     /// with demand; process handle limits belong to each process's fd/JFT.
     file_table: Vec<FileEntry>,
     file_pages: BTreeMap<mapping::Key, mapping::Page>,
+    clean_page_keys: BTreeMap<mapping::Key, u64>,
+    clean_page_lru: BTreeSet<(u64, mapping::Key)>,
     executables: Vec<executable::Image>,
     page_clock: u64,
     dir_cache: Vec<DirCache>,
@@ -575,6 +579,8 @@ impl Vfs {
             record_locks: crate::kernel::fs::record_locks::Table::new(),
             file_table: Vec::new(),
             file_pages: BTreeMap::new(),
+            clean_page_keys: BTreeMap::new(),
+            clean_page_lru: BTreeSet::new(),
             executables: Vec::new(),
             page_clock: 0,
             dir_cache: Vec::new(),
@@ -706,8 +712,8 @@ impl Vfs {
     }
 
     /// May RetroOS write `subpath` on mount `midx`? THE enforcement point:
-    /// every write, create and delete in the system funnels through here, so
-    /// the rule cannot be bypassed by reaching a driver directly.
+    /// File-content changes use the owner/write grant. Namespace operations
+    /// check directory permissions through may_write_parent/check_remove.
     ///
     /// No grant on the mount means nothing on it is writable.
     fn may_write(&self, midx: u8, subpath: &[u8]) -> bool {
@@ -722,13 +728,37 @@ impl Vfs {
         }
     }
 
-    /// May RetroOS create or delete `subpath`? The Unix rule: that mutates the
-    /// PARENT directory, so the parent's ownership decides.
+    /// Namespace mutations require write and search permission on the parent.
     fn may_write_parent(&self, midx: u8, subpath: &[u8]) -> bool {
-        match crate::kernel::fs::grant::parent_of(subpath) {
-            Some(parent) => self.may_write(midx, parent),
-            None => false,
+        let Some(parent) = crate::kernel::fs::grant::parent_of(subpath) else { return false; };
+        match self.mounts[midx as usize].access {
+            WriteAccess::None => false,
+            WriteAccess::Delegated => true,
+            WriteAccess::Granted(grant) => {
+                let fs = self.mount_fs(midx);
+                // Every ancestor must be searchable, including the mount root.
+                let mut end = 0;
+                loop {
+                    if !fs.meta(&parent[..end]).is_some_and(|m| grant.directory_access(&m, 1)) { return false; }
+                    if end == parent.len() { break; }
+                    end = parent[end + 1..].iter().position(|&c| c == b'/')
+                        .map_or(parent.len(), |n| end + 1 + n);
+                }
+                fs.meta(parent).is_some_and(|m| grant.directory_access(&m, 3))
+            }
         }
+    }
+
+    fn check_remove(&self, midx: u8, path: &[u8]) -> Result<(), i32> {
+        if matches!(self.mounts[midx as usize].access, WriteAccess::None) { return Err(-30); }
+        if !self.may_write_parent(midx, path) { return Err(-13); }
+        if let WriteAccess::Granted(grant) = self.mounts[midx as usize].access {
+            let fs = self.mount_fs(midx);
+            let parent = crate::kernel::fs::grant::parent_of(path).and_then(|p| fs.meta(p)).ok_or(-13)?;
+            let victim = fs.meta(path).ok_or(-2)?;
+            if !grant.may_remove(&parent, &victim) { return Err(-1); }
+        }
+        Ok(())
     }
 
     /// Stamp a newly created object as RetroOS's own, so it can be reopened
@@ -826,6 +856,7 @@ impl Vfs {
         let entry = FileEntry {
             vnode,
             offset: 0,
+            append: false,
             refcount: 1,
             ino,
             cache_id: self.mount_fs(mount_idx).file_identity(vnode.handle).unwrap_or_else(|| self.backend_path_id(mount_idx, path)),
@@ -1464,7 +1495,8 @@ impl Vfs {
         if !fs.supports_create() { return -38; }
         // Did it already exist? Decides both which permission applies and
         // whether a successful create needs stamping as ours.
-        let existed = fs.meta(subpath).is_some();
+        let metadata = fs.meta(subpath);
+        let existed = metadata.is_some();
         // Creating or truncating is a write: an existing object must itself
         // be ours, a new one needs write permission on its parent.
         let permitted = if existed {
@@ -1474,6 +1506,18 @@ impl Vfs {
         };
         if !permitted {
             return -13; // EACCES
+        }
+        // Opening a character device with O_TRUNC has no file contents to
+        // discard. In particular, shell redirects to /dev/null must not run
+        // regular-file invalidation: this backend has no file identity, so
+        // refresh_written_file would evict every cached directory.
+        if metadata.is_some_and(|meta| meta.mode & 0o170000 == 0o20000)
+            && let Some(vnode) = fs.open(subpath)
+        {
+            if vnode.mode & 0o170000 == 0o20000 {
+                return self.install_handle(path, original_ino, midx, vnode, true);
+            }
+            fs.clunk(vnode.handle);
         }
         if self.has_mapped_path(path) { return -16; }
         // A different hard-link name can still identify a mapped inode.
@@ -1522,9 +1566,7 @@ impl Vfs {
         let Some(object) = self.resolve_object(path, ALIAS_DEPTH) else { return -2 };
         let (midx, fs, subpath) = (object.mount_idx, object.fs, object.subpath());
         if !fs.supports_directory_mutation() { return -38; }
-        if !self.may_write_parent(midx, subpath) || !self.may_write(midx, subpath) {
-            return -13;
-        }
+        if let Err(error) = self.check_remove(midx, subpath) { return error; }
         let rc = fs.rmdir(subpath);
         if rc >= 0 {
             self.modes.remove(path);
@@ -1561,11 +1603,10 @@ impl Vfs {
             return -22;
         }
         if !old_fs.supports_directory_mutation() { return -38; }
-        if !self.may_write(old_idx, old_sub)
-            || !self.may_write_parent(old_idx, old_sub)
-            || !self.may_write_parent(new_idx, new_sub) { return -13; }
+        if let Err(error) = self.check_remove(old_idx, old_sub) { return error; }
+        if !self.may_write_parent(new_idx, new_sub) { return -13; }
         if let Some(target) = &target {
-            if !self.may_write(new_idx, new_sub) { return -13; }
+            if let Err(error) = self.check_remove(new_idx, new_sub) { return error; }
             if object.stat.is_dir != target.stat.is_dir {
                 return if object.stat.is_dir { -20 } else { -21 };
             }
@@ -1748,13 +1789,7 @@ impl Vfs {
         // Ask the backing filesystem (Tremove). Read-only backends reject it.
         let Some(object) = self.resolve_object(path, ALIAS_DEPTH) else { return -2 };
         let (midx, fs, subpath) = (object.mount_idx, object.fs, object.subpath());
-        // Unlinking mutates the parent, so the parent must be ours — and the
-        // victim too, so a link we may traverse can't delete something we may
-        // not write. Only meaningful where the mount has a rule at all.
-        if !self.may_write_parent(midx, subpath) || !self.may_write(midx, subpath)
-        {
-            return -13; // EACCES
-        }
+        if let Err(error) = self.check_remove(midx, subpath) { return error; }
         if self.has_mapped_path(path) { return -16; }
         self.invalidate_executable_path(path);
         self.drop_clean_pages();
@@ -1818,9 +1853,13 @@ impl Vfs {
 
     fn write_by_handle(&mut self, handle: i32, data: &[u8]) -> i32 {
         let Some(e) = self.file_table.get(handle as usize).filter(|e| e.refcount != 0) else { return -9; };
-        let offset = e.offset;
+        // Size selection and write run under the same VFS lock. Other open
+        // descriptions of this inode have their size refreshed by writes.
+        let offset = if e.append { e.vnode.size } else { e.offset };
         let n = self.write_at_by_handle(handle, offset, data);
-        if n > 0 && self.file_table[handle as usize].vnode.mode & 0o170000 != 0o20000 { self.file_table[handle as usize].offset += n as u32; }
+        if n > 0 && self.file_table[handle as usize].vnode.mode & 0o170000 != 0o20000 {
+            self.file_table[handle as usize].offset = offset + n as u32;
+        }
         n
     }
 
@@ -2884,6 +2923,32 @@ mod tests {
     }
 
     #[test]
+    fn character_device_truncation_preserves_unrelated_directory_cache() {
+        let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(MetadataFs {
+            listings: core::cell::Cell::new(0), path_metadata: core::cell::Cell::new(0),
+            size: core::cell::Cell::new(1), mode: core::cell::Cell::new(0o644),
+        }));
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", fs);
+        vfs.mount(b"dev/", &crate::kernel::fs::devices::DEVICES);
+        assert_eq!(vfs.stat(b"one", true).unwrap().size, 1);
+        assert!(!vfs.path_exists(b"missing"));
+        let listings = fs.listings.get();
+        for _ in 0..3 {
+            let handle = vfs.create_to_handle(b"dev/null");
+            assert!(handle >= 0);
+            assert_eq!(vfs.write_by_handle(handle, b"discarded"), 9);
+            assert_eq!(vfs.file_table[handle as usize].vnode.size, 0);
+            assert!(!vfs.file_table[handle as usize].mtime_dirty);
+            assert_eq!(vfs.read_by_handle(handle, &mut [0; 1]), 0);
+            vfs.close_handle(handle);
+            assert_eq!(vfs.stat(b"one", true).unwrap().size, 1);
+            assert!(!vfs.path_exists(b"missing"));
+            assert_eq!(fs.listings.get(), listings);
+        }
+    }
+
+    #[test]
     fn inode_metadata_and_writes_preserve_cached_names_and_aliases() {
         let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(MetadataFs {
             listings: core::cell::Cell::new(0), path_metadata: core::cell::Cell::new(0),
@@ -3094,6 +3159,7 @@ mod tests {
         fn dir_exists(&self, path: &[u8]) -> bool { path == b"home" }
         fn meta(&self, path: &[u8]) -> Option<super::Meta> {
             match path {
+                b"" => Some(super::Meta { uid: 0, gid: 0, mode: 0o755 }),
                 b"home" => Some(super::Meta { uid: 1000, gid: 1001, mode: 0o755 }),
                 b"home/file" => Some(*self.file.lock()),
                 _ => None,
@@ -3104,6 +3170,21 @@ mod tests {
             *self.file.lock() = super::Meta { uid, gid, mode };
             true
         }
+    }
+
+    #[test]
+    fn namespace_removal_uses_parent_permissions_not_victim_write_bit() {
+        use crate::kernel::fs::grant::Grant;
+        let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(OwnedFs {
+            file: spin::Mutex::new(super::Meta { uid: 2000, gid: 999, mode: 0o444 }),
+            fail_set_meta: core::sync::atomic::AtomicBool::new(false),
+        }));
+        let mut vfs = Vfs::new(); vfs.mount(b"", fs);
+        vfs.mounts[0].access = WriteAccess::Granted(Grant::from_home(fs, b"home").unwrap());
+        assert!(!vfs.may_write(0, b"home/file"));
+        assert_eq!(vfs.check_remove(0, b"home/file"), Ok(()));
+        vfs.mounts[0].access = WriteAccess::None;
+        assert_eq!(vfs.check_remove(0, b"home/file"), Err(-30));
     }
 
     #[test]
@@ -3466,7 +3547,7 @@ mod tests {
         assert!(vfs.path_exists(b"RETROOS/DN.HIS"));
         assert!(vfs.path_exists(b"RETROOS/COMMAND.COM"));
         assert_eq!(vfs.create_to_handle(b"RETROOS/COMMAND.COM"), -13);
-        assert_eq!(vfs.delete(b"RETROOS/COMMAND.COM"), -13);
+        assert_eq!(vfs.delete(b"RETROOS/COMMAND.COM"), -30);
         assert_eq!(vfs.delete(b"RETROOS/DN.HIS"), 0);
         assert!(!vfs.path_exists(b"RETROOS/DN.HIS"));
     }
@@ -3606,6 +3687,20 @@ pub fn release_process_locks(handle: i32, owner: i32) {
 
 pub fn configure_handle_access(handle: i32, access: OpenAccess) -> i32 {
     VFS.lock().configure_open(handle, access, SharePolicy::DenyNone)
+}
+
+pub fn set_handle_append(handle: i32, append: bool) -> i32 {
+    let mut v = VFS.lock();
+    let Some(e) = v.file_table.get_mut(handle as usize).filter(|e| e.refcount != 0) else { return -9; };
+    e.append = append;
+    0
+}
+
+pub fn handle_status_flags(handle: i32) -> i32 {
+    let v = VFS.lock();
+    let Some(e) = v.file_table.get(handle as usize).filter(|e| e.refcount != 0) else { return -9; };
+    let access = match e.access { OpenAccess::Read => 0, OpenAccess::Write => 1, OpenAccess::ReadWrite => 2 };
+    access | if e.append { 0x400 } else { 0 }
 }
 
 /// Positional writes share file contents and size, but never change fd offsets.

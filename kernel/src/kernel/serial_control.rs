@@ -335,6 +335,13 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8]) -> bool {
             send(b",\"bytes\":"); send_u64(bytes); send(b",\"ns\":"); send_u64(ns); send(b"}");
         }
         send(b"}}\n");
+    } else if line.eq_ignore_ascii_case(b"profile heap") {
+        send(b"{\"ok\":true,\"counters\":[");
+        for (i, value) in lib::heap::profile().into_iter().enumerate() {
+            if i != 0 { send(b","); }
+            send_u64(value);
+        }
+        send(b"]}\n");
     } else if line.eq_ignore_ascii_case(b"profile top") {
         top_profile();
     } else if line.eq_ignore_ascii_case(b"profile rm") {
@@ -350,6 +357,9 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8]) -> bool {
             send(b"\""); send(name.as_bytes()); send(b"\":"); send_u64(cycles);
         }
         send(b"}}\n");
+    } else if line.eq_ignore_ascii_case(b"trace process") {
+        super::startup::set_process_trace();
+        ok();
     } else if line.eq_ignore_ascii_case(b"trace fs") {
         super::startup::set_filesystem_trace();
         ok();
