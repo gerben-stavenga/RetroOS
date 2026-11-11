@@ -25,7 +25,7 @@ pub(super) fn copy_region(
     mut read: impl FnMut(u32, &mut [u8]) -> i32,
     mut write: impl FnMut(usize, &[u8]),
 ) -> Result<(), i32> {
-    let mut buffer = alloc::vec![0; length.min(32768)];
+    let mut buffer = alloc::vec![0; length.min(65536)];
     let mut copied = 0;
     while copied < length {
         let position = offset
@@ -33,7 +33,9 @@ pub(super) fn copy_region(
             .and_then(|n| u32::try_from(n).ok())
             .ok_or(-22)?;
         let count = buffer.len().min(length - copied);
+        let sample = crate::kernel::event_profile::file_io_start();
         let n = read(position, &mut buffer[..count]);
+        crate::kernel::event_profile::file_io_finish(4, n.max(0) as usize, sample);
         if n < 0 {
             return Err(n);
         }
@@ -44,7 +46,9 @@ pub(super) fn copy_region(
         if n > count {
             return Err(-5);
         }
+        let sample = crate::kernel::event_profile::file_io_start();
         write(copied, &buffer[..n]);
+        crate::kernel::event_profile::file_io_finish(5, n, sample);
         copied += n;
     }
     Ok(())

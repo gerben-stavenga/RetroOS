@@ -41,6 +41,7 @@ pub mod acpi;
 pub mod smp;
 pub mod boot_mem;
 pub mod paging2;
+mod high_paging;
 pub mod phys_mm;
 mod traps;
 mod vcpu;

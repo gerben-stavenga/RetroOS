@@ -24,6 +24,32 @@ const READ_DETAIL_SLOTS: usize = 64;
 static mut READ_DETAILS: [(u16, u64, u64); READ_DETAIL_SLOTS] = [(0, 0, 0); READ_DETAIL_SLOTS];
 // calls, RM-call setup, DOS vector dispatch, continuation unwind.
 static mut DIRECT_RM_PHASES: [u64; 4] = [0; 4];
+pub(super) const FILE_IO_NAMES: [&str; 41] = ["read_allocate", "read_fetch", "read_copy", "mmap_zero", "mmap_read", "mmap_copy", "elf_allocate", "elf_read", "elf_copy", "ext4_read", "volume_read", "vfs_lock", "vfs_read", "cache_check", "cache_miss", "elf_seek", "cache_insert", "pipe_wait", "pipe_allocate", "disk_read", "disk_write", "disk_flush", "volume_flush", "smb_send", "smb_receive", "smb_sign", "smb_verify", "smb_response_allocate", "smb_read_decode", "smb_encode", "ext4_create", "ext4_set_meta", "ext4_mkdir", "ext4_commit_write", "ext4_unlink", "ext4_rmdir", "ext4_fsync", "ext4_resize", "directory_scan", "path_resolve", "write_permission"];
+static mut FILE_IO: [[u64; 3]; FILE_IO_NAMES.len()] = [[0; 3]; FILE_IO_NAMES.len()];
+
+pub(super) struct FileIoScope { stage: usize, bytes: usize, start: Option<u64> }
+impl FileIoScope {
+    pub(super) fn start(stage: usize, bytes: usize) -> Self {
+        Self { stage, bytes, start: file_io_start() }
+    }
+}
+impl Drop for FileIoScope {
+    fn drop(&mut self) { file_io_finish(self.stage, self.bytes, self.start); }
+}
+
+pub(crate) fn file_io_start() -> Option<u64> {
+    super::startup::profile_enabled().then(super::portio::now_ns)
+}
+pub(crate) fn file_io_finish(stage: usize, bytes: usize, start: Option<u64>) {
+    if let Some(start) = start {
+        let elapsed = super::portio::now_ns().saturating_sub(start);
+        let counters = unsafe { &mut (*core::ptr::addr_of_mut!(FILE_IO))[stage] };
+        counters[0] = counters[0].wrapping_add(1);
+        counters[1] = counters[1].wrapping_add(bytes as u64);
+        counters[2] = counters[2].wrapping_add(elapsed);
+    }
+}
+pub(super) fn file_io() -> [[u64; 3]; FILE_IO_NAMES.len()] { unsafe { *core::ptr::addr_of!(FILE_IO) } }
 // Native device shortcuts do not create event-loop events. Keep their cost
 // separate, including failed attempts that subsequently take the normal path.
 pub(super) const DEVICE_NAMES: [&str; 7] = ["vga_mov", "vga_generic", "vga_status", "vga_mask", "dma_poll", "vga_palette", "opl_status"];
@@ -138,7 +164,7 @@ impl Sample {
             KernelEvent::In { port, .. } => (5, u32::from(port)),
             KernelEvent::Out { port, .. } => (6, u32::from(port)),
             KernelEvent::EmulatedStep { .. } => (7, site),
-            KernelEvent::PageFault { addr } => (8, addr >> 12),
+            KernelEvent::PageFault { addr } => (8, (addr >> 12) as u32),
             KernelEvent::Hlt => (9, 0),
             KernelEvent::Fault => (10, 0),
             KernelEvent::Exception(n) => (11, u32::from(n)),
@@ -199,6 +225,7 @@ pub(super) fn reset() {
         RM_TARGETS = [(0, 0, 0, 0); RM_TARGET_SLOTS];
         READ_DETAILS = [(0, 0, 0); READ_DETAIL_SLOTS];
         DIRECT_RM_PHASES = [0; 4];
+        FILE_IO = [[0; 3]; FILE_IO_NAMES.len()];
         DEVICE_ENTRIES = [[0; 2]; 7];
         VGA_INSTRUCTIONS = [EMPTY_VGA; 32];
         STATUS_POLLS = [EMPTY_POLL; 8];
@@ -270,6 +297,13 @@ pub(super) fn visit_rm_targets(mut visit: impl FnMut(u8, u16, u16, u64)) {
 }
 
 pub(super) fn print() {
+    // Include I/O in the F12 dump as well as COM2 replies: physical machines
+    // may have no connected diagnostic UART, but retain their kernel log.
+    for (name, [calls, bytes, ns]) in FILE_IO_NAMES.into_iter().zip(file_io()) {
+        if calls != 0 {
+            crate::compact_println!("[io-prof] {} calls={} bytes={} ns={}", name, calls, bytes, ns);
+        }
+    }
     for event in unsafe { &(&*core::ptr::addr_of!(TIMELINE))[..TIMELINE_USED] } {
         crate::compact_println!("[frame-timeline] ns={} kind={} value={}", event.ns, event.kind, event.value);
     }

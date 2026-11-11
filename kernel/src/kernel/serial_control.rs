@@ -197,6 +197,10 @@ fn execution_profile<A: crate::Arch>(machine: &A) {
         (b"ring0_exit_frame_out", p.ring0_exit_frame_out),
         (b"decode", p.decode),
         (b"bridge_out", p.bridge_out),
+        (b"user_fault_calls", p.user_fault_calls),
+        (b"user_fault_cycles", p.user_fault_cycles),
+        (b"kernel_fault_calls", p.kernel_fault_calls),
+        (b"kernel_fault_cycles", p.kernel_fault_cycles),
     ] {
         send(b",\"");
         send(name);
@@ -322,12 +326,30 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8]) -> bool {
         status();
     } else if line.eq_ignore_ascii_case(b"profile reads") {
         read_profile();
+    } else if line.eq_ignore_ascii_case(b"profile io") {
+        send(b"{\"ok\":true,\"stages\":{");
+        for (index, (name, [calls, bytes, ns])) in super::event_profile::FILE_IO_NAMES.into_iter()
+            .zip(super::event_profile::file_io()).enumerate() {
+            if index != 0 { send(b","); }
+            send(b"\""); send(name.as_bytes()); send(b"\":{\"calls\":"); send_u64(calls);
+            send(b",\"bytes\":"); send_u64(bytes); send(b",\"ns\":"); send_u64(ns); send(b"}");
+        }
+        send(b"}}\n");
     } else if line.eq_ignore_ascii_case(b"profile top") {
         top_profile();
     } else if line.eq_ignore_ascii_case(b"profile rm") {
         rm_profile();
     } else if line.eq_ignore_ascii_case(b"profile execution") {
         execution_profile(machine);
+    } else if line.eq_ignore_ascii_case(b"profile totals") {
+        let totals = super::startup::profile_totals();
+        send(b"{\"ok\":true,\"elapsed_ns\":"); send_u64(totals.elapsed_ns);
+        send(b",\"cycles\":{");
+        for (index, (name, cycles)) in super::startup::PROFILE_TOTAL_NAMES.into_iter().zip(totals.cycles).enumerate() {
+            if index != 0 { send(b","); }
+            send(b"\""); send(name.as_bytes()); send(b"\":"); send_u64(cycles);
+        }
+        send(b"}}\n");
     } else if line.eq_ignore_ascii_case(b"trace fs") {
         super::startup::set_filesystem_trace();
         ok();
@@ -339,6 +361,13 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8]) -> bool {
         ok();
     } else if line.eq_ignore_ascii_case(b"status") {
         status();
+    } else if line.eq_ignore_ascii_case(b"screen memory") {
+        // A debugger can sample this stable kernel-owned projection without
+        // making the guest transmit 4 KiB of hex through a polling UART.
+        let cells = lib::term::term().cells();
+        send(b"{\"ok\":true,\"address\":");
+        send_u64(cells.as_ptr() as usize as u64);
+        send(b",\"bytes\":4000,\"width\":80,\"height\":25}\n");
     } else if line.eq_ignore_ascii_case(b"screen") {
         // Hex UTF-8 keeps arbitrary terminal cells out of the JSON syntax.
         // The grid is the same source used by VGA and framebuffer renderers.

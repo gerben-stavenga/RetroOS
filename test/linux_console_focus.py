@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Linux yield/wait keep keyboard focus and a stable frame above a DOS launcher."""
+import argparse
 from pathlib import Path
 import json
 import os
@@ -9,13 +10,18 @@ import subprocess
 import tempfile
 import time
 
-from PIL import Image
+from game_suite import ppm
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--busy-helper', action='store_true')
+    options = parser.parse_args()
     artifacts = ROOT / 'build/ci/console-focus'
+    if options.busy_helper:
+        artifacts = artifacts.with_name('console-responsiveness')
     artifacts.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='retroos-console-focus-') as directory:
         work = Path(directory)
@@ -23,7 +29,7 @@ def main():
         (home / 'RETROOS').mkdir(parents=True)
         shutil.copyfile(ROOT / 'etc/RETROOS.INI', home / 'RETROOS/RETROOS.INI')
         subprocess.run(['gcc', '-O2', '-nostdlib', '-static', '-no-pie', '-fno-pie',
-                        '-fno-stack-protector', str(ROOT / 'test/linux_console_focus_probe.c'),
+            '-fno-stack-protector', *(['-DBUSY_HELPER'] if options.busy_helper else []), str(ROOT / 'test/linux_console_focus_probe.c'),
                         '-o', str(home / 'PROBE.ELF')], check=True)
         subprocess.run(['nasm', '-f', 'bin', str(ROOT / 'test/linux_console_focus_launcher.asm'),
                         '-o', str(home / 'LAUNCH.COM')], check=True)
@@ -72,20 +78,23 @@ def main():
                 for index in range(8):
                     path = artifacts / f'frame-{index}.ppm'
                     command('screendump', filename=str(path))
-                    with Image.open(path) as image:
-                        colored.append(sum(g > r + 20 and g > b + 20
-                                           for r, g, b in image.convert('RGB').getdata()))
+                    _, _, pixels = ppm(path.read_bytes())
+                    colored.append(sum(g > r + 20 and g > b + 20
+                                       for r, g, b in zip(pixels[::3], pixels[1::3], pixels[2::3])))
                     time.sleep(.04)
                 assert min(colored) > 10000, ('Shared terminal frame was cleared', colored)
+                input_started = time.monotonic()
                 command('human-monitor-command', **{'command-line': 'sendkey k'})
                 time.sleep(.1)
                 command('human-monitor-command', **{'command-line': 'sendkey ret'})
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + (1 if options.busy_helper else 10)
                 while not (home / 'result').exists():
                     assert process.poll() is None and time.monotonic() < deadline, (
                         'Keyboard input missed the waiting Linux child; ' + str(log_path))
                     time.sleep(.1)
                 assert (home / 'result').read_text() == 'FOCUS PASS\n'
+                if options.busy_helper:
+                    print(f'Keyboard response with CPU-busy helper: {time.monotonic() - input_started:.3f}s', flush=True)
             finally:
                 if connection is not None:
                     connection.close()

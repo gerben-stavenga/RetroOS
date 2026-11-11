@@ -651,6 +651,25 @@ restore_fx_ret_ptr:
     dd restore_fx_long_mode.back
     dw 0x08
 
+ ; Read all of CR2; compatibility-mode MOV truncates it to 32 bits.
+[bits 32]
+global read_cr2_long_mode
+read_cr2_long_mode:
+    jmp 0x10:read_cr2_64
+.back:
+    ret
+[bits 64]
+read_cr2_64:
+    mov rax, cr2
+    mov rdx, rax
+    shr rdx, 32
+    jmp far dword [rel read_cr2_ret_ptr]
+[bits 32]
+align 8
+read_cr2_ret_ptr:
+    dd read_cr2_long_mode.back
+    dw 0x08
+
 ; SIPI image: copied to a caller-reserved page below 1 MiB. There are no
 ; relocations within this image except the far jump into the kernel image.
 section .rodata.ap_trampoline align=16

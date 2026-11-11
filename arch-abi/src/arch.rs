@@ -58,7 +58,8 @@ use crate::{ExecutionProfile, ExecutionProfileStage, FramebufferMapPolicy, Irq, 
 /// byte-at-a-time, so any `addr`/alignment is fine).
 ///
 /// `addr` is a guest-linear address as `usize` (the 32-bit kernel addresses all
-/// guest memory within 4 GiB).
+/// low guest memory within 4 GiB). High long-mode mappings use
+/// `Arch::high_mapping` and `Arch::high_copy` without narrowing their addresses.
 ///
 /// Soundness note: `read::<T>` reconstructs a `T` from copied bytes, so `T` must
 /// be valid for *all* bit patterns (an integer or a `#[repr(C, packed)]` POD
@@ -193,6 +194,13 @@ pub trait Arch: Sized + GuestBytes {
     /// Each entry must obey its mode's interrupt-frame and return conventions.
     /// Restore both entries before their code or associated state expires.
     unsafe fn replace_interrupt_handlers(&mut self, _vector: u8, handlers: crate::InterruptHandlers) -> crate::InterruptHandlers { handlers }
+
+    /// Sparse high user mappings, independent of the kernel's pointer width.
+    /// Operations: 0=reserve/replace, 1=protect, 2=unmap, 3=discard,
+    /// 4=reserve without replacement. Protection uses Linux R/W/X bits.
+    fn high_mapping(&mut self, _address: u64, _length: u64, _operation: u32, _protection: u32) -> i32 { -12 }
+    /// Copy a high user buffer through a backend-owned window. False means EFAULT.
+    fn high_copy(&mut self, _address: u64, _buffer: &mut [u8], _to_user: bool) -> bool { false }
 
     /// Whether this backend can run 64-bit user code (`UserMode::Mode64`).
     /// On metal this is a CPU fact (long mode available); the hosted machine

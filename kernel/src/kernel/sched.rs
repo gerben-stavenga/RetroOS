@@ -1,8 +1,9 @@
 //! Scheduling policy — who runs next.
 //!
-//! The focused thread runs. A blocked Linux process can lend the CPU to peers
-//! sharing its terminal so pipe handshakes and other I/O can complete. Exit,
-//! yield, explicit switches and the F12 picker also choose a successor.
+//! Linux processes sharing a terminal take turns at bounded quanta, including
+//! polling blocked peers so a UI can wake while helpers run. Other application
+//! groups retain foreground execution. Exit, yield, explicit switches and the
+//! F12 picker also choose a successor.
 
 use crate::Regs;
 use crate::kernel::thread;
@@ -34,6 +35,39 @@ pub(crate) fn linux_blocked_successor<A: crate::Arch>(
         }
     }
     None
+}
+
+/// A helper doing CPU work must not starve its terminal's UI or a peer's
+/// timed/descriptor wait. Visit ready and blocked peers in one round-robin
+/// order: always preferring ready peers would starve a blocked UI whenever
+/// two helpers remain runnable. Polling happens after activating that peer's
+/// address space, so its saved user pointers are interpreted correctly.
+pub(crate) fn linux_timeslice_successor<A: crate::Arch>(
+    threads: &[thread::Thread<A>], current: usize, cursor: &mut usize,
+) -> Option<usize> {
+    let owner = &threads[current];
+    if !matches!(owner.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running) {
+        return None;
+    }
+    let thread::Personality::Linux(owner) = &owner.personality else { return None; };
+    // A blocked peer may immediately lend execution back to the same busy
+    // helper. Remember the last peer inspected independently of that helper,
+    // otherwise the first blocked ancestor is polled forever and the actual
+    // UI later in the task table never receives input.
+    let start = if threads.get(*cursor).is_some_and(|candidate|
+        matches!(&candidate.personality, thread::Personality::Linux(linux) if owner.shares_terminal(linux)))
+    { *cursor } else { current };
+    let next = (1..=threads.len()).map(|step| (start + step) % threads.len()).find(|&index| {
+        let candidate = &threads[index];
+        let thread::Personality::Linux(linux) = &candidate.personality else { return false; };
+        index != 0 && index != current && owner.shares_terminal(linux)
+            && (matches!(candidate.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running)
+                || candidate.kernel.state == thread::ThreadState::Blocked && linux.has_blocked_work())
+            && !threads.iter().any(|child| matches!(&child.personality,
+                thread::Personality::Linux(linux) if linux.borrows_space_from(index)))
+    });
+    if let Some(next) = next { *cursor = next; }
+    next
 }
 
 /// The scheduler's answer for this iteration.
@@ -131,6 +165,11 @@ fn next_after<A: crate::Arch>(
         thread::KernelAction::Wait { pid, status_ptr, options } => {
             crate::kernel::linux::handle_wait(machine, threads, regs, tid, pid, status_ptr, options)
                 .map(Verdict::Switch)
+        }
+        thread::KernelAction::Signal { pid, signal } => {
+            crate::kernel::linux::kill(machine, threads, tid, regs, pid, signal)
+                .and_then(|action| next_after(machine, bios_workspace, threads, regs, tid,
+                    action, exiting_display, sb_handoff, display))
         }
         thread::KernelAction::DosSynthChild { pid, op } => {
             crate::kernel::dos::handle_synth_child(machine, threads, regs, tid, pid, op)

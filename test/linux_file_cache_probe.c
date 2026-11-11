@@ -2,8 +2,10 @@
 #include <assert.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 int main(int argc, char **argv) {
@@ -32,6 +34,54 @@ int main(int argc, char **argv) {
     assert(ftruncate(fd, 8192) == 0 && pread(fd, bytes, sizeof bytes, 0) == sizeof bytes);
     for (int i = 17; i < sizeof bytes; ++i) assert(bytes[i] == 0);
     assert(close(fd) == 0);
+    /* Eager private mappings allocate fresh frames in bulk. Replacing a
+       dirty mapping must reload file bytes and clear the partial EOF page. */
+    fd = open("/home/retroos/cache-private", O_CREAT | O_TRUNC | O_RDWR, 0600);
+    assert(fd >= 0);
+    memset(bytes, 'D', sizeof bytes);
+    assert(write(fd, bytes, 5003) == 5003);
+    a = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    assert(a != MAP_FAILED);
+    for (int i = 0; i < 8192; ++i) assert(a[i] == (i < 5003 ? 'D' : 0));
+    memset(a, 'X', 8192);
+    assert(mmap(a, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, 0) == a);
+    for (int i = 0; i < 8192; ++i) assert(a[i] == (i < 5003 ? 'D' : 0));
+    pid_t child = fork();
+    assert(child >= 0);
+    if (child == 0) { a[0] = 'Y'; _exit(a[0] != 'Y'); }
+    int status = -1;
+    assert(waitpid(child, &status, 0) == child && status == 0 && a[0] == 'D');
+    assert(pread(fd, bytes, 1, 0) == 1 && bytes[0] == 'D');
+    assert(munmap(a, 8192) == 0 && close(fd) == 0);
+    /* A large streaming read must still see unflushed MAP_SHARED bytes. */
+    const size_t stream_size = 256 * 1024;
+    unsigned char *stream = malloc(stream_size);
+    assert(stream);
+    memset(stream, 'D', stream_size);
+    fd = open("/home/retroos/cache-stream", O_CREAT | O_TRUNC | O_RDWR, 0600);
+    assert(fd >= 0 && write(fd, stream, stream_size) == (ssize_t)stream_size && fsync(fd) == 0);
+    a = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 128 * 1024);
+    assert(a != MAP_FAILED);
+    a[0] = 'Z';
+    assert(pread(fd, stream, stream_size, 0) == (ssize_t)stream_size);
+    for (size_t i = 0; i < stream_size; ++i) assert(stream[i] == (i == 128 * 1024 ? 'Z' : 'D'));
+    /* Reused read scratch must handle growth, shrinkage, short reads, and
+       pinned shared-page changes without leaking bytes from an earlier read. */
+    assert(lseek(fd, 0, SEEK_SET) == 0);
+    const size_t requests[] = {17, 65536, 8192, 200000};
+    size_t consumed = 0, iteration = 0;
+    while (consumed < stream_size) {
+        size_t requested = requests[iteration++ % 4];
+        ssize_t n = read(fd, stream, requested);
+        assert(n > 0 && (size_t)n <= requested && (size_t)n <= stream_size - consumed);
+        for (ssize_t i = 0; i < n; ++i)
+            assert(stream[i] == (consumed + i == 128 * 1024 ? 'Z' : 'D'));
+        consumed += n;
+    }
+    stream[0] = 'Q';
+    assert(read(fd, stream, 200000) == 0 && stream[0] == 'Q');
+    assert(munmap(a, 4096) == 0 && close(fd) == 0);
+    free(stream);
     if (argc > 1) {
         fd = open("/home/retroos/cache-external", O_RDONLY);
         assert(fd >= 0 && pread(fd, bytes, 8, 0) == 8 && !memcmp(bytes, "original", 8));

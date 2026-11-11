@@ -21,6 +21,10 @@ static mut PROFILE: ExecutionProfile = ExecutionProfile {
     ring0_exit_frame_out: 0,
     bridge_out: 0,
     decode: 0,
+    user_fault_calls: 0,
+    user_fault_cycles: 0,
+    kernel_fault_calls: 0,
+    kernel_fault_cycles: 0,
 };
 #[thread_local]
 static mut LAST: u64 = 0;
@@ -82,4 +86,27 @@ pub(super) fn time(stage: ExecutionProfileStage) {
 
 pub(super) fn snapshot() -> ExecutionProfile {
     unsafe { core::ptr::read_volatile(&raw const PROFILE) }
+}
+
+/// Nested fault-handler cost, without changing the exclusive phase ledger.
+pub(super) struct FaultSample(Option<(bool, u64)>);
+impl FaultSample {
+    pub(super) fn start(user: bool) -> Self {
+        Self(enabled().then(|| (user, crate::x86::rdtsc())))
+    }
+}
+impl Drop for FaultSample {
+    fn drop(&mut self) {
+        let Some((user, start)) = self.0 else { return; };
+        let elapsed = crate::x86::rdtsc().wrapping_sub(start);
+        unsafe {
+            let (calls, cycles) = if user {
+                (&raw mut PROFILE.user_fault_calls, &raw mut PROFILE.user_fault_cycles)
+            } else {
+                (&raw mut PROFILE.kernel_fault_calls, &raw mut PROFILE.kernel_fault_cycles)
+            };
+            calls.write_volatile(calls.read_volatile().wrapping_add(1));
+            cycles.write_volatile(cycles.read_volatile().wrapping_add(elapsed));
+        }
+    }
 }

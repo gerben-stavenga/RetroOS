@@ -10,6 +10,18 @@ use alloc::{
 };
 use core::cell::{Cell, RefCell};
 const FIRST_FD: i32 = 1024;
+fn futex_value<A: crate::Arch>(machine: &mut A, address: u64) -> Option<u32> {
+    let mut bytes = [0; 4];
+    high_memory::copy_from(machine, address, &mut bytes).then_some(u32::from_le_bytes(bytes))
+}
+fn timespec_ns<A: crate::Arch>(machine: &mut A, address: u64) -> Result<u64, i32> {
+    let mut bytes = [0; 16];
+    if !high_memory::copy_from(machine, address, &mut bytes) { return Err(-EFAULT); }
+    let seconds = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let nanos = i64::from_le_bytes(bytes[8..].try_into().unwrap());
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanos) { return Err(-EINVAL); }
+    Ok((seconds as u64).saturating_mul(1_000_000_000).saturating_add(nanos as u64))
+}
 pub(super) fn proc_slots(state: &State) -> usize { state.handles.len() }
 pub(super) fn proc_target(state: &State, fd: usize) -> Option<Vec<u8>> {
     let label = match descriptor(state, i32::try_from(fd).ok()?)? {
@@ -22,17 +34,17 @@ pub(super) fn proc_target(state: &State, fd: usize) -> Option<Vec<u8>> {
 #[derive(Clone, Copy)]
 enum Wait {
     Ready,
-    Futex(usize, u32, u64),
+    Futex(u64, u32, u64),
     Epoll(i32, usize, usize, u64),
     Sleep(u64),
     Poll(usize, usize, u64),
-    Select(super::select::Request),
+    Select,
     Random(super::entropy::Request),
     Flock(i32, u32),
     RecordLock(super::record_lock::Request),
-    Read(u8, usize, usize),
+    Read(u8, u64, usize),
     ReadV,
-    Socket(i32, usize, usize),
+    Socket(i32, u64, usize),
     Exited,
 }
 struct Context {
@@ -40,9 +52,10 @@ struct Context {
     fx: Box<dyn core::any::Any>,
     id: i32,
     comm: [u8; 16],
-    clear_tid: usize,
+    clear_tid: u64,
     wait: Wait,
     readv: Option<super::readv::Request>,
+    select: Option<Box<super::select::Request>>,
 }
 #[derive(Clone)]
 struct Watch {
@@ -50,6 +63,7 @@ struct Watch {
     events: u32,
     data: u64,
     last: u32,
+    read_sequence: u64,
     enabled: bool,
 }
 struct SocketEnd {
@@ -70,6 +84,7 @@ enum Descriptor {
 #[derive(Default)]
 pub(super) struct State {
     contexts: Vec<Context>,
+    exited_tasks: Vec<i32>,
     next_thread: u32,
     active: usize,
     parked: bool,
@@ -80,6 +95,39 @@ pub(super) struct State {
 pub(super) fn live_task_count(state: &State) -> usize {
     if state.contexts.is_empty() { 1 }
     else { state.contexts.iter().filter(|context| !matches!(context.wait, Wait::Exited)).count() }
+}
+
+pub(super) fn debug_waits<A: crate::Arch>(kt: &thread::KernelThread<A>, state: &State) {
+    let now = crate::kernel::portio::now_ns();
+    for context in &state.contexts {
+        let (kind, value, deadline) = match context.wait {
+            Wait::Ready => ("ready", 0, 0),
+            Wait::Futex(address, _, deadline) => ("futex", address, deadline),
+            Wait::Epoll(fd, _, _, deadline) => ("epoll", fd as u64, deadline),
+            Wait::Sleep(deadline) => ("sleep", 0, deadline),
+            Wait::Poll(_, _, deadline) => ("poll", 0, deadline),
+            Wait::Select => ("select", 0, 0),
+            Wait::Random(_) => ("random", 0, 0),
+            Wait::Flock(fd, _) => ("flock", fd as u64, 0),
+            Wait::RecordLock(_) => ("record-lock", 0, 0),
+            Wait::Read(fd, _, _) => ("read", fd as u64, 0),
+            Wait::ReadV => ("readv", 0, 0),
+            Wait::Socket(fd, _, _) => ("socket", fd as u64, 0),
+            Wait::Exited => continue,
+        };
+        let name = &context.comm[..context.comm.iter().position(|&byte| byte == 0).unwrap_or(context.comm.len())];
+        let remaining = if deadline == u64::MAX { -1 } else { (deadline.saturating_sub(now) / 1_000_000) as i64 };
+        crate::compact_dbg_println!("[LINUX WAIT] pid={} tid={} comm={} wait={} value={:#x} remaining_ms={}",
+            kt.tid, context.id, core::str::from_utf8(name).unwrap_or("?"), kind, value, remaining);
+    }
+    for (index, descriptor) in state.descriptors.iter().enumerate() {
+        if let Some(Descriptor::Epoll(watches)) = descriptor {
+            for watch in watches.borrow().iter() {
+                crate::compact_dbg_println!("[LINUX EPOLL] pid={} object={} fd={} events={:#x} last={:#x} ready={:#x} enabled={}",
+                    kt.tid, index, watch.fd, watch.events, watch.last, ready(kt, state, watch.fd), watch.enabled);
+            }
+        }
+    }
 }
 
 fn ensure<A: crate::Arch>(
@@ -99,6 +147,7 @@ fn ensure<A: crate::Arch>(
         clear_tid: 0,
         wait: Wait::Ready,
         readv: None,
+        select: None,
     });
     s.next_thread = 1;
 
@@ -213,10 +262,16 @@ fn epoll<A: crate::Arch>(
     let Some(Descriptor::Epoll(watches)) = descriptor(s, fd) else {
         return -EBADF;
     };
-    let events: Vec<u32> = watches
+    let events: Vec<(u32, u64)> = watches
         .borrow()
         .iter()
-        .map(|w| ready(kt, s, w.fd))
+        .map(|w| {
+            let sequence = match kt.fds.get(w.fd as usize) {
+                Some(FdKind::Socket(handle)) => crate::kernel::net::read_sequence(*handle),
+                _ => 0,
+            };
+            (ready(kt, s, w.fd), sequence)
+        })
         .collect();
     let object_index = object(s, fd).unwrap();
     let Some(Some(Descriptor::Epoll(watches))) = s.descriptors.get_mut(object_index) else {
@@ -224,15 +279,16 @@ fn epoll<A: crate::Arch>(
     };
     let mut watches = watches.borrow_mut();
     let mut n = 0;
-    for (w, bits) in watches.iter_mut().zip(events) {
+    for (w, (bits, sequence)) in watches.iter_mut().zip(events) {
         let bits = bits & (w.events | 0x18);
         let deliver = if w.events & (1 << 31) != 0 {
-            bits & !w.last
+            (bits & !w.last) | if sequence != w.read_sequence { bits & 1 } else { 0 }
         } else {
             bits
         };
         if n < max || deliver == 0 {
             w.last = bits;
+            w.read_sequence = sequence;
         }
         if w.enabled && deliver != 0 && n < max {
             machine.write::<u32>(out + n * 12, deliver);
@@ -332,12 +388,12 @@ pub(super) fn call<A: crate::Arch>(
                     Descriptor::Socket(end) => end.clone(),
                     _ => unreachable!(),
                 };
-                match socket_read(machine, &end, a.a1 as usize, a.a2 as usize) {
+                match socket_read(machine, &end, a.a1, a.a2 as usize) {
                     Some(n) => n,
                     None if end.nonblock.get() || (nr == 45 && a.a3 & 0x40 != 0) => -11,
                     None => {
                         ensure(machine, kt, s, regs);
-                        s.contexts[s.active].wait = Wait::Socket(fd, a.a1 as usize, a.a2 as usize);
+                        s.contexts[s.active].wait = Wait::Socket(fd, a.a1, a.a2 as usize);
                         0
                     }
                 }
@@ -352,8 +408,10 @@ pub(super) fn call<A: crate::Arch>(
                             Ok(bytes) => bytes, Err(e) => return Some(SyscallResult::val(e)),
                         }
                     } else {
+                        let sample = crate::kernel::event_profile::file_io_start();
                         let mut data = alloc::vec![0; a.a2 as usize];
-                        machine.copy_from(a.a1 as usize, &mut data);
+                        crate::kernel::event_profile::file_io_finish(18, data.len(), sample);
+                        if !high_memory::copy_from(machine, a.a1, &mut data) { return Some(SyscallResult::val(-EFAULT)); }
                         data
                     };
                     let n = data.len() as i32;
@@ -420,6 +478,7 @@ pub(super) fn call<A: crate::Arch>(
                                     events: event.0,
                                     data: event.1,
                                     last: 0,
+                                    read_sequence: 0,
                                     enabled: true,
                                 });
                                 0
@@ -485,7 +544,8 @@ pub(super) fn call<A: crate::Arch>(
                 Some(n) => n,
                 None => {
                     ensure(machine, kt, s, regs);
-                    s.contexts[s.active].wait = Wait::Select(request);
+                    s.contexts[s.active].select = Some(Box::new(request));
+                    s.contexts[s.active].wait = Wait::Select;
                     0
                 }
             },
@@ -518,14 +578,16 @@ pub(super) fn call<A: crate::Arch>(
                             -11
                         } else {
                             let value = if *semaphore { 1 } else { count.get() };
+                            if !high_memory::copy_to(machine, a.a1, &value.to_le_bytes()) { return Some(SyscallResult::val(-EFAULT)); }
                             count.set(count.get() - value);
-                            machine.write::<u64>(a.a1 as usize, value);
                             reset_edge(s, fd);
                             8
                         }
                     }
                     Descriptor::Event { count, .. } => {
-                        let value = machine.read::<u64>(a.a1 as usize);
+                        let mut bytes = [0; 8];
+                        if !high_memory::copy_from(machine, a.a1, &mut bytes) { return Some(SyscallResult::val(-EFAULT)); }
+                        let value = u64::from_le_bytes(bytes);
                         if value == u64::MAX {
                             -EINVAL
                         } else if value >= u64::MAX - count.get() {
@@ -601,15 +663,19 @@ pub(super) fn call<A: crate::Arch>(
         },
         0 if fd >= 0 && (fd as usize) < thread::MAX_FDS && !s.contexts.is_empty() => {
             if let FdKind::PipeRead(i) = kt.fds[fd as usize] {
-                let mut data = alloc::vec![0; a.a2 as usize];
+                let sample = crate::kernel::event_profile::file_io_start();
+                let count = a.a2.min(65536) as usize;
+                if !high_memory::range(a.a1, count as u64) { return Some(SyscallResult::val(-EFAULT)); }
+                let mut data = alloc::vec![0; count];
+                crate::kernel::event_profile::file_io_finish(18, data.len(), sample);
                 if let Some(n) = crate::kernel::kpipe::read_event(i, &mut data) {
-                    machine.copy_to(a.a1 as usize, &data[..n]);
+                    if !high_memory::copy_to(machine, a.a1, &data[..n]) { return Some(SyscallResult::val(-EFAULT)); }
                     reset_edge(s, fd);
                     n as i32
                 } else if crate::kernel::kpipe::nonblocking(i, false) {
                     -11
                 } else {
-                    s.contexts[s.active].wait = Wait::Read(i, a.a1 as usize, a.a2 as usize);
+                    s.contexts[s.active].wait = Wait::Read(i, a.a1, count);
                     0
                 }
             } else {
@@ -656,12 +722,8 @@ pub(super) fn call<A: crate::Arch>(
                 if a.a0 & 0x80000 != 0 {
                     child.fs = a.a4;
                 }
-                if a.a0 & 0x100000 != 0 {
-                    machine.write::<i32>(a.a2 as usize, id);
-                }
-                if a.a0 & 0x1000000 != 0 {
-                    machine.write::<i32>(a.a3 as usize, id);
-                }
+                if a.a0 & 0x100000 != 0 && !high_memory::copy_to(machine, a.a2, &id.to_le_bytes()) { return Some(SyscallResult::val(-EFAULT)); }
+                if a.a0 & 0x1000000 != 0 && !high_memory::copy_to(machine, a.a3, &id.to_le_bytes()) { return Some(SyscallResult::val(-EFAULT)); }
                 let mut snapshot = machine.clean_fx_template();
                 machine.switch_fx(&mut snapshot);
                 let inherited_fx = snapshot;
@@ -672,12 +734,13 @@ pub(super) fn call<A: crate::Arch>(
                     id,
                     comm: s.contexts[s.active].comm,
                     clear_tid: if a.a0 & 0x200000 != 0 {
-                        a.a3 as usize
+                        a.a3
                     } else {
                         0
                     },
                     wait: Wait::Ready,
                     readv: None,
+                    select: None,
                 };
                 if let Some(index) = reuse {
                     s.contexts[index] = context;
@@ -687,6 +750,7 @@ pub(super) fn call<A: crate::Arch>(
                 id
             }
         }
+        157 if matches!(a.a0, 1 | 2) => return Some(super::parent_death::prctl(machine, kt, linux, a)),
         157 => match a.a0 {
             15 | 16 if a.a1 == 0 => -EFAULT,
             15 => {
@@ -725,19 +789,21 @@ pub(super) fn call<A: crate::Arch>(
         }
         218 => {
             ensure(machine, kt, s, regs);
-            s.contexts[s.active].clear_tid = a.a0 as usize;
+            s.contexts[s.active].clear_tid = a.a0;
             s.contexts[s.active].id
         }
         60 if !s.contexts.is_empty() => {
             let c = &mut s.contexts[s.active];
             if c.clear_tid != 0 {
-                machine.write::<u32>(c.clear_tid, 0);
+                let _ = high_memory::copy_to(machine, c.clear_tid, &0u32.to_le_bytes());
             }
             c.wait = Wait::Exited;
+            s.exited_tasks.push(c.id);
+            linux.parent_death.retire(c.id);
             if s.contexts.iter().all(|c| matches!(c.wait, Wait::Exited)) {
                 return Some(SyscallResult::act(
                     0,
-                    thread::KernelAction::Exit(a.a0 as i32),
+                    thread::KernelAction::Exit(a.a0 as u8 as i32),
                 ));
             }
             0
@@ -746,30 +812,32 @@ pub(super) fn call<A: crate::Arch>(
             let op = a.a1 as u32 & 0x7f;
             match op {
                 0 | 9 => {
-                    if machine.read::<u32>(a.a0 as usize) != a.a2 as u32 {
+                    let Some(value) = futex_value(machine, a.a0) else { return Some(SyscallResult::val(-EFAULT)); };
+                    if value != a.a2 as u32 {
                         -11
                     } else {
                         ensure(machine, kt, s, regs);
                         let until = if a.a3 == 0 {
                             u64::MAX
                         } else {
-                            let sec = machine.read::<u64>(a.a3 as usize);
-                            let ns = machine.read::<u64>(a.a3 as usize + 8);
-                            let time = sec.saturating_mul(1_000_000_000).saturating_add(ns);
+                            let time = match timespec_ns(machine, a.a3) {
+                                Ok(time) => time,
+                                Err(error) => return Some(SyscallResult::val(error)),
+                            };
                             if op == 9 {
                                 time
                             } else {
                                 machine.now().saturating_add(time)
                             }
                         };
-                        s.contexts[s.active].wait = Wait::Futex(a.a0 as usize, a.a2 as u32, until);
+                        s.contexts[s.active].wait = Wait::Futex(a.a0, a.a2 as u32, until);
                         0
                     }
                 }
                 1 | 10 => {
                     let mut n = 0;
                     for c in &mut s.contexts {
-                        if matches!(c.wait, Wait::Futex(addr, _, _) if addr == a.a0 as usize)
+                        if matches!(c.wait, Wait::Futex(addr, _, _) if addr == a.a0)
                             && n < a.a2
                         {
                             c.wait = Wait::Ready;
@@ -784,11 +852,11 @@ pub(super) fn call<A: crate::Arch>(
         }
         35 | 230 => {
             ensure(machine, kt, s, regs);
-            let ptr = if nr == 35 { a.a0 } else { a.a2 } as usize;
-            let ns = machine
-                .read::<u64>(ptr)
-                .saturating_mul(1_000_000_000)
-                .saturating_add(machine.read::<u64>(ptr + 8));
+            let ptr = if nr == 35 { a.a0 } else { a.a2 };
+            let ns = match timespec_ns(machine, ptr) {
+                Ok(ns) => ns,
+                Err(error) => return Some(SyscallResult::val(error)),
+            };
             s.contexts[s.active].wait = Wait::Sleep(if nr == 230 && a.a1 & 1 != 0 {
                 ns
             } else {
@@ -841,6 +909,7 @@ pub(super) fn interrupt(kt: &mut thread::KernelThread<impl crate::Arch>, s: &mut
         if s.parked { *regs = context.regs; }
         context.wait = Wait::Ready;
         context.readv = None;
+        context.select = None;
         regs.rax = (-4i64) as u64;
     }
     s.parked = false;
@@ -867,12 +936,11 @@ pub(super) fn schedule<A: crate::Arch>(
     for i in 0..s.contexts.len() {
         let result = match s.contexts[i].wait {
             Wait::Futex(addr, val, end) => {
-                if machine.read::<u32>(addr) != val {
-                    Some(0)
-                } else if now >= end {
-                    Some(-110)
-                } else {
-                    None
+                match futex_value(machine, addr) {
+                    None => Some(-EFAULT),
+                    Some(value) if value != val => Some(0),
+                    Some(_) if now >= end => Some(-110),
+                    Some(_) => None,
                 }
             }
             Wait::Epoll(fd, out, max, end) => {
@@ -884,7 +952,7 @@ pub(super) fn schedule<A: crate::Arch>(
                 let n = poll(machine, kt, s, ptr, count);
                 if n != 0 || now >= end { Some(n) } else { None }
             }
-            Wait::Select(request) => request.step(machine, kt),
+            Wait::Select => s.contexts[i].select.as_ref().unwrap().step(machine, kt),
             Wait::Random(request) => request.step(machine),
             Wait::RecordLock(request) => request.step(machine),
             Wait::Flock(handle, operation) => {
@@ -896,19 +964,19 @@ pub(super) fn schedule<A: crate::Arch>(
                 _ => Some(-EBADF),
             },
             Wait::Read(pipe, out, count) => {
+                let _wait = crate::kernel::event_profile::FileIoScope::start(17, count);
+                let sample = crate::kernel::event_profile::file_io_start();
                 let mut data = alloc::vec![0; count];
-                if let Some(n) = crate::kernel::kpipe::read_event(pipe, &mut data) {
-                    machine.copy_to(out, &data[..n]);
-                    Some(n as i32)
-                } else {
-                    None
-                }
+                crate::kernel::event_profile::file_io_finish(18, data.len(), sample);
+                crate::kernel::kpipe::read_event(pipe, &mut data)
+                    .map(|n| if high_memory::copy_to(machine, out, &data[..n]) { n as i32 } else { -EFAULT })
             }
             Wait::ReadV => s.contexts[i].readv.as_ref().unwrap().step(machine),
             _ => None,
         };
         if let Some(result) = result {
             s.contexts[i].readv = None;
+            s.contexts[i].select = None;
             s.contexts[i].regs.rax = result as i64 as u64;
             s.contexts[i].wait = Wait::Ready;
         }
@@ -935,7 +1003,7 @@ pub(super) fn schedule<A: crate::Arch>(
 fn socket_read<A: crate::Arch>(
     machine: &mut A,
     end: &SocketEnd,
-    out: usize,
+    out: u64,
     count: usize,
 ) -> Option<i32> {
     if count == 0 {
@@ -944,7 +1012,10 @@ fn socket_read<A: crate::Arch>(
     let mut packets = end.packets.borrow_mut();
     if let Some(mut packet) = packets.pop_front() {
         let n = count.min(packet.len());
-        machine.copy_to(out, &packet[..n]);
+        if !high_memory::copy_to(machine, out, &packet[..n]) {
+            packets.push_front(packet);
+            return Some(-EFAULT);
+        }
         if !end.packet_mode && n < packet.len() {
             packet.drain(..n);
             packets.push_front(packet);
@@ -969,6 +1040,19 @@ pub(super) fn close_cloexec(s: &mut State) {
         if s.cloexec[i] {
             close_virtual(s, FIRST_FD + i as i32);
             s.cloexec[i] = false;
+        }
+    }
+}
+
+pub(super) fn close_range(s: &mut State, first: u32, last: u32, cloexec: bool) {
+    for index in 0..s.handles.len() {
+        let fd = FIRST_FD as u32 + index as u32;
+        if fd < first || fd > last || s.handles[index].is_none() { continue; }
+        if cloexec {
+            s.cloexec[index] = true;
+        } else {
+            close_virtual(s, fd as i32);
+            s.cloexec[index] = false;
         }
     }
 }
@@ -1056,12 +1140,33 @@ pub(super) fn next_deadline(state: &State) -> Option<u64> {
     state.contexts.iter().filter_map(|context| match context.wait {
         Wait::Sleep(end) | Wait::Futex(_, _, end) | Wait::Epoll(_, _, _, end) | Wait::Poll(_, _, end) =>
             (end != u64::MAX).then_some(end),
-        Wait::Select(request) => request.deadline(),
+        Wait::Select => context.select.as_ref().unwrap().deadline(),
         _ => None,
     }).min()
 }
 pub(super) fn needs_poll(state: &State) -> bool {
     state.contexts.iter().any(|context| matches!(context.wait,
-        Wait::Epoll(..) | Wait::Poll(..) | Wait::Select(..) | Wait::Random(..)
+        Wait::Epoll(..) | Wait::Poll(..) | Wait::Select | Wait::Random(..)
         | Wait::Flock(..) | Wait::RecordLock(..) | Wait::Read(..) | Wait::ReadV | Wait::Socket(..)))
+}
+
+pub(super) fn take_exited(state: &mut State) -> Vec<i32> { core::mem::take(&mut state.exited_tasks) }
+
+pub(super) fn signal_target(state: &State, process: i32, accepts: impl Fn(i32) -> bool) -> Option<i32> {
+    if state.contexts.is_empty() { return accepts(process).then_some(process); }
+    let active = &state.contexts[state.active];
+    if !matches!(active.wait, Wait::Exited) && accepts(active.id) { return Some(active.id); }
+    state.contexts.iter().find(|context| !matches!(context.wait, Wait::Exited) && accepts(context.id)).map(|context| context.id)
+}
+
+pub(super) fn wake_signal<A: crate::Arch>(kt: &mut thread::KernelThread<A>, state: &mut State, target: i32) {
+    if let Some((index, context)) = state.contexts.iter_mut().enumerate().find(|(_, context)| context.id == target)
+        && !matches!(context.wait, Wait::Ready | Wait::Exited) {
+        context.wait = Wait::Ready;
+        context.readv = None;
+        context.select = None;
+        context.regs.rax = (-4i64) as u64;
+        if index == state.active && !state.parked { kt.vcpu.regs.rax = (-4i64) as u64; }
+    }
+    kt.state = thread::ThreadState::Ready;
 }

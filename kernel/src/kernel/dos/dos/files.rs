@@ -82,7 +82,7 @@ pub(super) const FIRST_USER_HANDLE: usize = 3;
 /// slots are empty until something redirects them — their implicit console is
 /// made explicit here so a saved copy survives the redirect.
 pub(super) fn dos_dup_fdkind<A: crate::Arch>(kt: &thread::KernelThread<A>, handle: usize) -> Option<thread::FdKind> {
-    if handle >= thread::MAX_FDS { return None; }
+    if handle >= thread::MAX_DOS_FDS { return None; }
     match kt.fds[handle] {
         thread::FdKind::None if handle <= 2 => Some(thread::FdKind::ConsoleOut),
         thread::FdKind::None => None,

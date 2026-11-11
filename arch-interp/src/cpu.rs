@@ -268,7 +268,7 @@ fn build() -> Unicorn<'static, Ctx> {
     uc.add_mem_hook(HookType::MEM_UNMAPPED, 0, u64::MAX, |uc, _t: MemType, _addr, _sz, _v| {
         let cr2 = uc.reg_read(RegisterX86::CR2).unwrap_or(0) as u32;
         let d = uc.get_data_mut();
-        d.pending = Some(KernelEvent::PageFault { addr: cr2 });
+        d.pending = Some(KernelEvent::PageFault { addr: cr2 as u64 });
         d.stopped = true;
         let _ = uc.emu_stop();
         false
@@ -478,7 +478,7 @@ pub fn execute() -> KernelEvent {
             let cr2 = uc.get_data().pending_cr2;
             vcpu.err_code = uc.get_data().pending_err as u64;
             uc.get_data_mut().pending_intr = None;
-            return KernelEvent::PageFault { addr: cr2 };
+            return KernelEvent::PageFault { addr: cr2 as u64 };
         }
         if trace_on() {
             let intr = uc.get_data().pending_intr;

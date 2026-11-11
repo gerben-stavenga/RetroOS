@@ -16,6 +16,7 @@ pub fn install_socket_backend(hooks: SocketHooks) {
     }
 }
 
+pub(crate) mod local;
 mod config;
 mod stack;
 pub(crate) mod lan;
@@ -63,23 +64,28 @@ pub fn poll() {
 pub fn native_backend() -> bool {
     stack::installed()
 }
-pub fn socket_kind(h: i32) -> Result<SocketKind> { stack::socket_kind(h) }
+pub fn socket_kind(h: i32) -> Result<SocketKind> { if local::is_local(h) { return Ok(SocketKind::Tcp); } stack::socket_kind(h) }
 pub fn nonblocking(h: i32) -> bool {
+    if local::is_local(h) { return local::nonblocking(h); }
     stack::nonblocking(h)
 }
 pub fn available_bytes(h: i32) -> Result<i32> {
+    if local::is_local(h) { return local::available(h); }
     if native_backend() { stack::available_bytes(h) } else { Err(Error::Unsupported) }
 }
 pub fn set_nonblocking(h: i32, value: bool) {
+    if local::is_local(h) { local::set_nonblocking(h, value); return; }
     stack::set_nonblocking(h, value);
 }
 pub fn add_ref(h: i32) {
+    if local::is_local(h) { local::add_ref(h); return; }
     stack::add_ref(h);
 }
 pub fn receive_errors(h: i32) -> Result<bool> {
     stack::receive_errors(h)
 }
 pub fn socket_error(h: i32) -> Result<Option<Error>> {
+    if local::is_local(h) { return local::available(h).map(|_| None); }
     if native_backend() {
         stack::socket_error(h)
     } else {
@@ -87,6 +93,7 @@ pub fn socket_error(h: i32) -> Result<Option<Error>> {
     }
 }
 pub fn readiness(h: i32) -> Readiness {
+    if local::is_local(h) { return local::readiness(h); }
     if native_backend() {
         stack::readiness(h)
     } else {
@@ -96,6 +103,12 @@ pub fn readiness(h: i32) -> Readiness {
             ..Readiness::default()
         }
     }
+}
+
+pub fn read_sequence(h: i32) -> u64 {
+    if local::is_local(h) { local::read_sequence(h) }
+    else if native_backend() { stack::read_sequence(h) }
+    else { 0 }
 }
 
 /// Whether a socket backend is installed.
@@ -166,6 +179,7 @@ pub fn shutdown(h: i32, how: Shutdown) -> Result<i32> {
         .and_then(|b| (b.shutdown)(h, how))
 }
 pub fn close(h: i32) {
+    if local::is_local(h) { local::close(h); return; }
     if let Some(b) = backend() {
         (b.close)(h);
     }

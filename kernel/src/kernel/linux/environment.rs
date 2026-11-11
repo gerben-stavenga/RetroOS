@@ -5,9 +5,25 @@ use alloc::vec::Vec;
 
 static SETTINGS: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
 static HOME: spin::Mutex<Option<Vec<u8>>> = spin::Mutex::new(None);
+static IDENTITY: spin::Mutex<Option<(u32, u32)>> = spin::Mutex::new(None);
 
 pub(crate) fn configure_home(home: Option<&str>) {
     *HOME.lock() = home.map(|home| home.as_bytes().to_vec());
+    *IDENTITY.lock() = None;
+}
+
+/// The session uses the mounted home's identity, just like its VFS write
+/// grant. Environment supplied to exec cannot change this identity. Legacy
+/// filesystems without Unix ownership retain the root identity.
+pub(super) fn identity() -> (u32, u32) {
+    if let Some(identity) = *IDENTITY.lock() { return identity; }
+    let home = HOME.lock().clone();
+    let path = home.as_deref().unwrap_or_else(|| crate::kernel::dos::c_root());
+    let path = path.strip_prefix(b"/").unwrap_or(path);
+    let path = path.strip_suffix(b"/").unwrap_or(path);
+    let identity = crate::kernel::vfs::ownership(path, true).unwrap_or((0, 0));
+    *IDENTITY.lock() = Some(identity);
+    identity
 }
 
 pub(crate) fn configure(settings: Vec<u8>) {

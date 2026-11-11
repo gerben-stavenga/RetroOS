@@ -120,6 +120,18 @@ pub struct BlockChanges {
 }
 
 impl BlockChanges {
+    pub(crate) fn merge(&mut self, newer: Self) -> Result<(), crate::Error> {
+        // Reserve before modifying either logical state: an allocation error
+        // must leave the preceding batch intact.
+        self.blocks.try_reserve(newer.blocks.len()).map_err(|_| crate::Error::OutOfMemory)?;
+        for block in newer.blocks {
+            match self.index(block.number) {
+                Ok(index) => self.blocks[index] = block,
+                Err(index) => self.blocks.insert(index, block),
+            }
+        }
+        Ok(())
+    }
     #[inline(never)]
     pub(crate) fn index(&self, number: u64) -> Result<usize, usize> {
         self.blocks

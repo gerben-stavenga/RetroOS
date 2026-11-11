@@ -1,5 +1,5 @@
 //! Linux time structures have ABI-sized words, independent of kernel bitness.
-use super::{Args, EFAULT, EINVAL, SyscallResult};
+use super::{Args, EFAULT, EINVAL, SyscallResult, high_memory};
 // Arch::get_ticks is milliseconds (Arch::now / 1_000_000), not 100 Hz.
 const TICK_NS: u64 = 1_000_000;
 fn monotonic_pair(milliseconds: u64) -> (u64, u64) {
@@ -20,9 +20,9 @@ fn pair(seconds: u64, fraction: u64, wide: bool) -> ([u8; 16], usize) {
         (out, 8)
     }
 }
-fn store<A: crate::Arch>(machine: &mut A, pointer: u64, seconds: u64, fraction: u64, wide: bool) {
+fn store<A: crate::Arch>(machine: &mut A, pointer: u64, seconds: u64, fraction: u64, wide: bool) -> bool {
     let (bytes, n) = pair(seconds, fraction, wide);
-    machine.copy_to(pointer as usize, &bytes[..n]);
+    high_memory::copy_to(machine, pointer, &bytes[..n])
 }
 fn realtime() -> u64 {
     u64::from(crate::kernel::clock::rtc_unix_timestamp().unwrap_or(0))
@@ -43,8 +43,7 @@ pub(super) fn clock_gettime<A: crate::Arch>(
     } else {
         monotonic_pair(machine.get_ticks())
     };
-    store(machine, args.a1, seconds, nanos, wide);
-    SyscallResult::val(0)
+    SyscallResult::val(if store(machine, args.a1, seconds, nanos, wide) { 0 } else { -EFAULT })
 }
 pub(super) fn clock_getres<A: crate::Arch>(
     machine: &mut A,
@@ -56,13 +55,13 @@ pub(super) fn clock_getres<A: crate::Arch>(
     }
     if args.a1 != 0 {
         let realtime = matches!(args.a0, 0 | 5);
-        store(
+        if !store(
             machine,
             args.a1,
             u64::from(realtime),
             if realtime { 0 } else { TICK_NS },
             wide,
-        );
+        ) { return SyscallResult::val(-EFAULT); }
     }
     SyscallResult::val(0)
 }
@@ -71,11 +70,11 @@ pub(super) fn gettimeofday<A: crate::Arch>(
     args: &Args,
     wide: bool,
 ) -> SyscallResult {
-    if args.a0 != 0 {
-        store(machine, args.a0, realtime(), 0, wide);
+    if args.a0 != 0 && !store(machine, args.a0, realtime(), 0, wide) {
+        return SyscallResult::val(-EFAULT);
     }
-    if args.a1 != 0 {
-        machine.copy_to(args.a1 as usize, &[0; 8]);
+    if args.a1 != 0 && !high_memory::copy_to(machine, args.a1, &[0; 8]) {
+        return SyscallResult::val(-EFAULT);
     }
     SyscallResult::val(0)
 }
@@ -83,7 +82,9 @@ pub(super) fn time<A: crate::Arch>(machine: &mut A, args: &Args, wide: bool) -> 
     let seconds = realtime();
     if args.a0 != 0 {
         let bytes = seconds.to_le_bytes();
-        machine.copy_to(args.a0 as usize, &bytes[..if wide { 8 } else { 4 }]);
+        if !high_memory::copy_to(machine, args.a0, &bytes[..if wide { 8 } else { 4 }]) {
+            return SyscallResult::val(-EFAULT);
+        }
     }
     SyscallResult::val64(seconds as i64)
 }

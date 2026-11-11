@@ -12,7 +12,7 @@ DEFAULT_BINARY = Path('/usr/local/lib/node_modules/@openai/codex/node_modules/'
 LAUNCHER_HEADER = '#!/bin/sh\n# Managed by RetroOS tools/setup_codex.py.\n'
 
 
-def setup(home, binary, auth_from):
+def setup(home, binary, auth_from, refresh_auth=False):
     home = home.resolve(strict=True)
     binary = binary.resolve(strict=True)
     with binary.open('rb') as source:
@@ -57,17 +57,32 @@ def setup(home, binary, auth_from):
     source = auth_from / 'auth.json'
     if target.is_symlink():
         raise ValueError('Refusing a shared authentication symlink')
-    if target.exists():
+    if target.exists() and not refresh_auth:
         print('Preserved existing RetroOS Codex authentication.')
     elif source.is_file():
         # Keep credentials out of command arguments, logs and repository files.
-        fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        try:
-            with os.fdopen(fd, 'wb') as output, source.open('rb') as input_file:
-                shutil.copyfileobj(input_file, output)
-        except BaseException:
-            target.unlink(missing_ok=True)
-            raise
+        if source.resolve() == target.resolve():
+            raise ValueError('Authentication source and guest destination must be separate')
+        if refresh_auth:
+            with tempfile.NamedTemporaryFile(dir=state, prefix='.auth-', delete=False) as output:
+                pending = Path(output.name)
+                try:
+                    with source.open('rb') as input_file:
+                        shutil.copyfileobj(input_file, output)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    pending.chmod(0o600)
+                    pending.replace(target)
+                finally:
+                    pending.unlink(missing_ok=True)
+        else:
+            fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                with os.fdopen(fd, 'wb') as output, source.open('rb') as input_file:
+                    shutil.copyfileobj(input_file, output)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
         print('Copied saved login into private RetroOS Codex state.')
     else:
         print('No saved login found; authentication will need to be configured.')
@@ -82,8 +97,10 @@ def main():
     parser.add_argument('--binary', type=Path, default=DEFAULT_BINARY)
     parser.add_argument('--auth-from', type=Path,
                         default=Path(os.environ.get('CODEX_HOME', Path.home() / '.codex')))
+    parser.add_argument('--refresh-auth', action='store_true',
+                        help='Atomically replace the separate guest login cache with the saved source login')
     args = parser.parse_args()
-    setup(args.home, args.binary, args.auth_from)
+    setup(args.home, args.binary, args.auth_from, args.refresh_auth)
 
 
 if __name__ == '__main__':

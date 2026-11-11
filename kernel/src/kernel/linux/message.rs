@@ -34,16 +34,17 @@ fn send<A: crate::Arch>(machine: &mut A, h: i32, header: usize, flags: i32, wide
             return -EFAULT;
         };
         let base = word(machine, at, wide);
-        let n = word(machine, at + unit, wide);
-        if n > 65536 - data.len() {
-            return -90;
-        }
+        let requested = word(machine, at + unit, wide);
+        let room = 65536 - data.len();
+        if requested > room && !crate::kernel::net::local::is_local(h) { return -90; }
+        let n = requested.min(room);
         if n != 0 && base == 0 {
             return -EFAULT;
         }
         let start = data.len();
         data.resize(start + n, 0);
         machine.copy_from(base, &mut data[start..]);
+        if data.len() == 65536 { break; }
     }
     if name != 0 && namelen < 16 {
         return -EINVAL;
@@ -131,7 +132,7 @@ fn receive<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, args: 
     // UDP must consume the entire packet even when the caller's vectors are
     // short. A stream must consume only the bytes the caller can receive.
     let mut bytes = alloc::vec![0; if datagram { 65536 } else { capacity.min(65536) }];
-    let mut address = [0; 16];
+    let mut address = [0; 128];
     let n = net::recvfrom(h, &mut bytes, (flags & !0x20) as i32, &mut address);
     if n < 0 { return n; }
     let copied = (n as usize).min(capacity);
@@ -142,8 +143,9 @@ fn receive<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, args: 
         offset += len;
     }
     if name != 0 {
-        machine.copy_to(name, &address[..namelen.min(address.len())]);
-        machine.write::<u32>(header + unit, address.len() as u32);
+        let length = net::address_length(h, true);
+        machine.copy_to(name, &address[..namelen.min(length).min(address.len())]);
+        machine.write::<u32>(header + unit, length as u32);
     } else { machine.write::<u32>(header + unit, 0); }
     // msg_controllen and msg_flags are output fields (padding differs by ABI).
     if wide { machine.write::<u64>(iov_at + 3 * unit, 0); }
@@ -154,6 +156,9 @@ fn receive<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, args: 
 
 /// Gather socket writes before sending so a UDP writev remains one datagram.
 pub(super) fn gather<A: crate::Arch>(machine: &mut A, iov: usize, count: usize, wide: bool) -> Result<Vec<u8>, i32> {
+    gather_prefix(machine, iov, count, wide, false)
+}
+fn gather_prefix<A: crate::Arch>(machine: &mut A, iov: usize, count: usize, wide: bool, partial: bool) -> Result<Vec<u8>, i32> {
     if count > 1024 { return Err(-EINVAL); }
     if count != 0 && iov == 0 { return Err(-EFAULT); }
     let unit = if wide { 8 } else { 4 };
@@ -161,17 +166,21 @@ pub(super) fn gather<A: crate::Arch>(machine: &mut A, iov: usize, count: usize, 
     for i in 0..count {
         let at = i.checked_mul(unit * 2).and_then(|n| iov.checked_add(n)).ok_or(-EFAULT)?;
         let base = word(machine, at, wide);
-        let len = word(machine, at + unit, wide);
-        if len > 65536 - bytes.len() { return Err(-90); }
+        let requested = word(machine, at + unit, wide);
+        let room = 65536 - bytes.len();
+        if requested > room && !partial { return Err(-90); }
+        let len = requested.min(room);
         if len != 0 && (base == 0 || base.checked_add(len).is_none_or(|end| end > 0xc000_0000)) { return Err(-EFAULT); }
         let offset = bytes.len();
         bytes.resize(offset + len, 0);
         machine.copy_from(base, &mut bytes[offset..]);
+        if bytes.len() == 65536 { break; }
     }
     Ok(bytes)
 }
 pub(super) fn writev<A: crate::Arch>(machine: &mut A, handle: i32, args: &Args, wide: bool) -> SyscallResult {
-    SyscallResult::val(match gather(machine, args.a1 as usize, args.a2 as usize, wide) {
+    SyscallResult::val(match gather_prefix(machine, args.a1 as usize, args.a2 as usize, wide,
+        crate::kernel::net::local::is_local(handle)) {
         Ok(data) => if data.is_empty() { 0 } else { net::sendto(handle, &data, 0, &[]) },
         Err(e) => e,
     })

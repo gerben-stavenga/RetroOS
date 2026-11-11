@@ -33,13 +33,14 @@ def run_case(failure):
                     process.terminate()
                     process.wait(timeout=5)
         text = log.read_text()
-        expected = '[mem] exit tid=1 code=' + ('-11' if failure else '0')
+        expected = '[mem] exit tid=1 code=' + ('-11' if failure in ('BAD_MXCSR', 'BAD_PC') else '0')
         assert process.returncode == 0 and expected in text and 'PANIC' not in text, text[-2500:]
         print('PASS: native Linux signals ' + (failure or 'context restore'), flush=True)
 
 
 def main():
-    for failure in (None, 'BAD_MXCSR', 'BAD_PC'):
+    (ROOT / 'build/ci').mkdir(parents=True, exist_ok=True)
+    for failure in (None, 'HIGH_FAULT', 'BAD_MXCSR', 'BAD_PC'):
         run_case(failure)
 
 

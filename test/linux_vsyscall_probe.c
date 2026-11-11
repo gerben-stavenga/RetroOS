@@ -110,6 +110,14 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
  check(timezone[0]==0 && timezone[1]==0,27);
  check(GETTIMEOFDAY(0,0,0)==0,28);
 #endif
+#ifndef __x86_64__
+ /* Exercise root switching and fork on both PAE and real legacy paging. */
+ long child=invoke(__NR_fork,0,0,0);
+ check(child>=0,63);
+ if(child==0){invoke(__NR_exit,0,0,0);for(;;){}}
+ int status=-1;
+ check(invoke4(__NR_wait4,child,(word)&status,0,0)==child && status==0,64);
+#endif
  invoke(__NR_write,1,(word)"VSYSCALL PASS\n",14);
  invoke(__NR_exit,0,0,0);for(;;){}
 #endif

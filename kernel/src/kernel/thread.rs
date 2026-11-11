@@ -15,12 +15,66 @@ pub use crate::kernel::windows::WindowsState;
 /// Maximum number of threads
 pub const MAX_THREADS: usize = 1024;
 
-/// Maximum file descriptors per thread
-// 64: BC's project linker holds every .OBJ of the project open at once
-// (wolfsrc = 31 objs + libs + exe + map on top of the std handles); real DOS
-// lets a program raise its JFT to 255 via AH=67h. Keep below the DOS device
-// sentinels at 98/99 (EMS_DEVICE_HANDLE / NULL_FILE_HANDLE).
-pub const MAX_FDS: usize = 64;
+/// Ordinary process descriptors. Async epoll/event handles start at 1024.
+pub const MAX_FDS: usize = 1024;
+/// Preserve legacy DOS allocation below its device sentinels at 98/99.
+pub const MAX_DOS_FDS: usize = 64;
+pub(crate) fn empty_fds() -> alloc::boxed::Box<[FdKind; MAX_FDS]> {
+    alloc::vec![FdKind::None; MAX_FDS].into_boxed_slice().try_into().ok().expect("descriptor table length")
+}
+pub(crate) fn copy_fds(source: &[FdKind; MAX_FDS]) -> alloc::boxed::Box<[FdKind; MAX_FDS]> {
+    let mut table = empty_fds();
+    table.as_mut().copy_from_slice(source);
+    table
+}
+pub const FD_SET_BYTES: usize = MAX_FDS / 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdSet([u64; MAX_FDS / 64]);
+impl FdSet {
+    pub const fn empty() -> Self { Self([0; MAX_FDS / 64]) }
+    pub fn contains(&self, fd: usize) -> bool {
+        fd < MAX_FDS && self.0[fd / 64] & (1u64 << (fd % 64)) != 0
+    }
+    pub fn set(&mut self, fd: usize, present: bool) {
+        assert!(fd < MAX_FDS);
+        let bit = 1u64 << (fd % 64);
+        if present { self.0[fd / 64] |= bit; } else { self.0[fd / 64] &= !bit; }
+    }
+    pub fn from_le_bytes(bytes: &[u8]) -> Self {
+        assert!(bytes.len() <= FD_SET_BYTES);
+        let mut set = Self::empty();
+        for (word, chunk) in set.0.iter_mut().zip(bytes.chunks(8)) {
+            let mut value = [0; 8]; value[..chunk.len()].copy_from_slice(chunk);
+            *word = u64::from_le_bytes(value);
+        }
+        set
+    }
+    pub fn to_le_bytes(self) -> [u8; FD_SET_BYTES] {
+        let mut bytes = [0; FD_SET_BYTES];
+        for (word, chunk) in self.0.into_iter().zip(bytes.chunks_mut(8)) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+}
+
+#[cfg(test)]
+mod fd_set_tests {
+    use super::*;
+    #[test]
+    fn flags_and_select_masks_cover_every_word_without_aliasing() {
+        let mut set = FdSet::empty();
+        for fd in [0, 31, 32, 63, 64, 127, 128, 511, 1023] { set.set(fd, true); }
+        assert_eq!(FdSet::from_le_bytes(&set.to_le_bytes()), set);
+        let copy = set;
+        set.set(64, false);
+        assert!(!set.contains(64) && set.contains(0) && copy.contains(64));
+        assert!(!set.contains(MAX_FDS));
+        let short = FdSet::from_le_bytes(&copy.to_le_bytes()[..12]);
+        assert!(short.contains(64) && !short.contains(127));
+    }
+}
 
 impl FdKind {
     fn retain(self) {
@@ -58,13 +112,13 @@ impl FdKind {
 /// Owns an extra reference to each suspended DOS parent's descriptor.
 /// Drop also handles an EXEC chain abandoned by an OSD kill or failed session.
 pub(crate) struct SavedFdTable {
-    fds: [FdKind; MAX_FDS],
-    cloexec: u64,
+    fds: alloc::boxed::Box<[FdKind; MAX_FDS]>,
+    cloexec: FdSet,
 }
 impl SavedFdTable {
     pub(crate) fn capture<A: crate::Arch>(thread: &KernelThread<A>) -> Self {
-        let saved = Self { fds: thread.fds, cloexec: thread.cloexec };
-        for fd in saved.fds { fd.retain(); }
+        let saved = Self { fds: copy_fds(&thread.fds), cloexec: thread.cloexec };
+        for &fd in saved.fds.iter() { fd.retain(); }
         saved
     }
     pub(crate) fn restore<A: crate::Arch>(mut self, thread: &mut KernelThread<A>) {
@@ -77,7 +131,7 @@ impl SavedFdTable {
 }
 impl Drop for SavedFdTable {
     fn drop(&mut self) {
-        for fd in self.fds { fd.release(); }
+        for &fd in self.fds.iter() { fd.release(); }
     }
 }
 
@@ -111,7 +165,7 @@ impl FdKind {
 /// A pending blocked read — generalized from stdin-only to any fd
 pub struct PendingRead {
     pub fd_kind: FdKind,   // what we're reading from (PipeRead or ConsoleOut won't happen)
-    pub buf_ptr: usize,
+    pub buf_ptr: u64,
     pub buf_len: usize,
 }
 
@@ -205,6 +259,8 @@ pub enum KernelAction {
     /// wait4: reap a zombie child (or block until one exists). Run in the
     /// executor so the child-table scan/reap happens off the parent's borrow.
     Wait { pid: i32, status_ptr: usize, options: i32 },
+    /// Deliver a Linux process signal after releasing the caller's borrow.
+    Signal { pid: i32, signal: u8 },
     /// DOS INT-31 synth op on a *child* thread (reap / waitpid probe). Run in
     /// the executor so the cross-thread table
     /// access happens off the caller's `dos`/`kt` borrow. The executor writes
@@ -616,7 +672,8 @@ pub struct KernelThread<A: crate::Arch> {
     pub priority: i32,
     pub parent_tid: i32,
     pub state: ThreadState,
-    pub time: u32,
+    /// Process birth time in milliseconds since boot (unchanged by exec).
+    pub time: u64,
     /// Register state + address-space handle for this thread's execution
     /// context. `vcpu.regs` is the saved CPU state, `vcpu.space` the page-table
     /// root. Bundled so the kernel manipulates one "thing to run" rather than
@@ -626,10 +683,9 @@ pub struct KernelThread<A: crate::Arch> {
     pub exit_code: i32,
     pub addr_hash: u64,
     pub cpu_hash: u64,
-    pub fds: [FdKind; MAX_FDS],
-    // u64: one bit per fd slot, so it must cover MAX_FDS (was u16 — fds >= 16
-    // silently wrapped the shift in release builds).
-    pub cloexec: u64,
+    pub fds: alloc::boxed::Box<[FdKind; MAX_FDS]>,
+    // Descriptor flags cover the complete ordinary descriptor table.
+    pub cloexec: FdSet,
     /// Short program name for the F12 switch picker (DOS has no stored image
     /// path the way Linux's `exec_path` does). Set from the launch path's
     /// basename at fork-exec; empty until then. NUL-padded.
@@ -697,8 +753,8 @@ impl<A: crate::Arch> KernelThread<A> {
             exit_code: 0,
             addr_hash: 0,
             cpu_hash: 0,
-            fds: [FdKind::None; MAX_FDS],
-            cloexec: 0,
+            fds: empty_fds(),
+            cloexec: FdSet::empty(),
             comm: [0; 16],
             launcher_psp: 0,
         }
@@ -731,7 +787,7 @@ impl<A: crate::Arch> KernelThread<A> {
         }
         self.fds[fd].release();
         self.fds[fd] = FdKind::None;
-        self.cloexec &= !(1 << fd);
+        self.cloexec.set(fd, false);
     }
 
     /// Close all fds.
@@ -745,7 +801,7 @@ impl<A: crate::Arch> KernelThread<A> {
     pub fn close_cloexec(&mut self) {
         let mask = self.cloexec;
         for i in 0..MAX_FDS {
-            if mask & (1 << i) != 0 {
+            if mask.contains(i) {
                 self.close_fd(i);
             }
         }
@@ -753,7 +809,7 @@ impl<A: crate::Arch> KernelThread<A> {
 
     /// Duplicate fd table for fork. Increments refcounts on pipes and VFS handles.
     pub fn dup_all_fds(&self, dst: &mut Self) {
-        dst.fds = self.fds;
+        dst.fds.as_mut().copy_from_slice(self.fds.as_ref());
         dst.cloexec = self.cloexec;
         for i in 0..MAX_FDS {
             dst.fds[i].retain();
@@ -860,13 +916,15 @@ pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut [Thread<A>], machine: 
             k.priority = parent_prio;
             k.parent_tid = parent_tidv;
             k.state = ThreadState::Ready;
-            k.time = machine.get_ticks() as u32;
+            k.time = machine.get_ticks();
             k.vcpu = crate::Vcpu::new(Regs::empty(), root);
             k.fx_state = machine.clean_fx_template();
             k.exit_code = 0;
             k.addr_hash = 0;
             k.cpu_hash = 0;
-            t.personality = Personality::Linux(LinuxState::new());
+            let mut linux = LinuxState::new();
+            linux.parent_creator = (parent_tidv >= 0).then_some(parent_tidv);
+            t.personality = Personality::Linux(linux);
             return Some(t);
         }
     }
@@ -893,13 +951,15 @@ pub fn reserve_live_child<'a, A: crate::Arch>(
             k.priority = parent_prio;
             k.parent_tid = parent_tidv;
             k.state = ThreadState::Ready;
-            k.time = machine.get_ticks() as u32;
+            k.time = machine.get_ticks();
             k.vcpu.regs = Regs::empty();
             k.fx_state = machine.clean_fx_template();
             k.exit_code = 0;
             k.addr_hash = 0;
             k.cpu_hash = 0;
-            t.personality = Personality::Linux(LinuxState::new());
+            let mut linux = LinuxState::new();
+            linux.parent_creator = (parent_tidv >= 0).then_some(parent_tidv);
+            t.personality = Personality::Linux(linux);
             return Some(t);
         }
     }
@@ -1026,6 +1086,7 @@ pub fn exit_thread<A: crate::Arch>(
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::Sb16>,
     event_display: &mut Option<crate::kernel::display::Display>,
 ) -> usize {
+    crate::kernel::linux::parent_exited(threads, tid, None);
     let parent_tid = threads[tid].kernel.parent_tid;
     let term_type = ((exit_code >> 8) & 0xFF) as u8;
     // A successful DOS child returns the live adapter to its DOS parent. The
@@ -1136,6 +1197,11 @@ pub fn exit_thread<A: crate::Arch>(
         linux.release_mappings(machine);
     }
     threads[tid].kernel.state = ThreadState::Zombie;
+    if matches!(threads[tid].personality, Personality::Linux(_))
+        && parent_tid >= 0 && (parent_tid as usize) < threads.len()
+        && parent_tid as usize != tid {
+        crate::kernel::linux::child_exited(&mut threads[parent_tid as usize], tid as i32, exit_code);
+    }
     crate::compact_dbg_println!("[mem] exit tid={} code={} free_pages={}",
         tid, exit_code, machine.free_page_count());
 
@@ -1265,10 +1331,10 @@ mod saved_file_tests {
     #[test]
     fn abandoned_parent_table_releases_its_references() {
         let pipe = crate::kernel::kpipe::alloc().unwrap();
-        let mut fds = [FdKind::None; MAX_FDS];
+        let mut fds = empty_fds();
         fds[0] = FdKind::PipeRead(pipe);
         fds[0].retain(); // Suspended parent plus the active child's copy.
-        let parent = SavedFdTable { fds, cloexec: 0 };
+        let parent = SavedFdTable { fds: copy_fds(&fds), cloexec: FdSet::empty() };
         fds[0].release(); // Child closes its inherited endpoint.
         assert_eq!(crate::kernel::kpipe::write(pipe, b"x"), 1);
         drop(parent); // Session abort must also release the suspended table.

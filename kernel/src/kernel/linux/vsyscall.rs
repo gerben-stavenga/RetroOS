@@ -28,11 +28,11 @@ pub(super) fn getcpu<A: crate::Arch>(machine: &mut A, args: &Args) -> SyscallRes
     SyscallResult::val(0)
 }
 
-fn entry(regs: &Regs, address: u32) -> Option<u32> {
+fn entry(regs: &Regs, address: u64) -> Option<u32> {
     // User instruction fetch, not a data access, write or kernel fault.
     if regs.mode() != UserMode::Mode64
         || regs.err_code & 0x16 != 0x14
-        || regs.frame.rip as u32 != address
+        || regs.frame.rip != address
     {
         return None;
     }
@@ -44,7 +44,7 @@ fn entry(regs: &Regs, address: u32) -> Option<u32> {
     }
 }
 
-pub(super) fn emulate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, address: u32) -> bool {
+pub(super) fn emulate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, address: u64) -> bool {
     let Some(number) = entry(regs, address) else {
         return false;
     };
@@ -93,15 +93,15 @@ mod tests {
         regs.frame.cs = 0x33;
         regs.frame.rip = 0xffff_ffff_ff60_0800;
         regs.err_code = 0x14;
-        assert_eq!(entry(&regs, 0xff600800), Some(2));
+        assert_eq!(entry(&regs, 0xffff_ffff_ff60_0800), Some(2));
         for error in [0, 4, 0x10, 0x16] {
             regs.err_code = error;
-            assert_eq!(entry(&regs, 0xff600800), None);
+            assert_eq!(entry(&regs, 0xffff_ffff_ff60_0800), None);
         }
         regs.err_code = 0x14;
         for rip in [0xffff_ffff_ff60_0801, 0xffff_ffff_ff60_0c00, 0xff60_0800] {
             regs.frame.rip = rip;
-            assert_eq!(entry(&regs, rip as u32), None);
+            assert_eq!(entry(&regs, rip), None);
         }
         assert!(output_ok(0, 16));
         assert!(output_ok(USER_END - 4, 4));

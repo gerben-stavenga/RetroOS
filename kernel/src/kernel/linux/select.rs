@@ -2,7 +2,7 @@
 use super::{Args, EBADF, EINVAL, LinuxState, SyscallResult, thread};
 #[derive(Clone, Copy)]
 pub(super) struct Request {
-    sets: [u64; 3],
+    sets: [thread::FdSet; 3],
     pointers: [usize; 3],
     nfds: usize,
     wide: bool,
@@ -20,7 +20,7 @@ impl Request {
         }
         let nfds = args.a0 as usize;
         let mut request = Self {
-            sets: [0; 3],
+            sets: [thread::FdSet::empty(); 3],
             pointers: [args.a1 as usize, args.a2 as usize, args.a3 as usize],
             nfds,
             wide,
@@ -29,9 +29,9 @@ impl Request {
         let size = request.size();
         for (index, &pointer) in request.pointers.iter().enumerate() {
             if pointer != 0 && size != 0 {
-                let mut bytes = [0; 8];
+                let mut bytes = [0; thread::FD_SET_BYTES];
                 machine.copy_from(pointer, &mut bytes[..size]);
-                request.sets[index] = u64::from_le_bytes(bytes);
+                request.sets[index] = thread::FdSet::from_le_bytes(&bytes[..size]);
             }
         }
         if args.a4 != 0 {
@@ -64,11 +64,10 @@ impl Request {
         machine: &mut A,
         kt: &thread::KernelThread<A>,
     ) -> Option<i32> {
-        let mut output = [0u64; 3];
+        let mut output = [thread::FdSet::empty(); 3];
         let mut count = 0;
         for fd in 0..self.nfds {
-            let bit = 1u64 << fd;
-            if self.sets.iter().all(|set| set & bit == 0) {
+            if self.sets.iter().all(|set| !set.contains(fd)) {
                 continue;
             }
             let events = super::fd_readiness(kt, fd, 1 | 4 | 2);
@@ -76,8 +75,8 @@ impl Request {
                 return Some(-EBADF);
             }
             for (i, mask) in [1 | 8 | 16, 4 | 8 | 16, 2].into_iter().enumerate() {
-                if self.sets[i] & bit != 0 && events & mask != 0 {
-                    output[i] |= bit;
+                if self.sets[i].contains(fd) && events & mask != 0 {
+                    output[i].set(fd, true);
                     count += 1;
                 }
             }

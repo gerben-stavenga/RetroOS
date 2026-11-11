@@ -1,0 +1,677 @@
+Metal performance handoff — 2026-11-08
+
+User returned to Linux after the no-daemon metal run was still too slow.
+No kernel fix was applied during that metal visit. Findings saved after
+returning to Linux; do not treat the remaining cause as measured or proven.
+
+Concrete next candidate
+-----------------------
+kernel/src/kernel/linux/async_io.rs, schedule(), Wait::Read (around line 907)
+allocates and zeroes vec![0; count] before checking read_event on every
+scheduling pass, even when the pipe is empty and still has writers.
+Repeated blocked stdin/IPC reads can therefore allocate, zero and free large
+buffers at syscall/IRQ scheduling boundaries without making progress.
+Heap page reclamation can add faults and mapping work. Its share of the
+observed metal delay has not been measured.
+
+kernel/src/kernel/linux/readv.rs already checks has_data/has_writers before
+allocating and caps the temporary buffer at 65536 bytes. Consider the same
+readiness guard and bounded allocation for Wait::Read, preserving EOF and
+zero-length reads. Validate repeated empty waits, data arrival and EOF,
+then measure actual Codex startup and interaction on metal.
+
+Metal tool/compatibility observations
+------------------------------------
+Even a minimal /bin/sh command printed immediately but exec_command kept
+reporting a running session. write_stdin polling twice led to
+"code-mode host closed its stdout". Cause remains unknown: inspect process
+exit collection and pipe EOF/lifetime rather than assuming CPU work.
+apply_patch disconnected; sed -i failed creating its temporary file with
+EINVAL. A direct file write and python3 -S print succeeded. Back on Linux,
+kernel/src/kernel/linux/sedy9iJPR exists as a zero-byte temporary artifact.
+The attempted async_io.rs edit was verified absent on Linux.
+No RetroOS diagnostic MCP tools were exposed during this metal session.
+
+Previously completed fix and evidence
+-------------------------------------
+vfs/mapping.rs cached_read now keeps the original request's streaming
+threshold after consuming a cached prefix. Previously the smaller remaining
+span repeatedly fell below the threshold and perpetuated read-ahead work.
+Native ext4/NVMe QEMU resume comparison, same 14715 ELF reads / 963726638
+bytes: ELF read time 14.110 s -> 1.073 s; cache insertion bytes approximately
+974 MB -> 35 MB; ready after guest control 41.715 s -> 27.470 s.
+Report: build/ci/codex-native-resume/prefix-fix-comparison.json
+535 kernel unit tests, linux_file_cache, linux_proc_fd and Clippy passed.
+Prepared release: fa20e10ca085. Preparation is not evidence of installation.
+These results did not establish acceptable responsiveness on metal.
+
+Workspace state
+---------------
+Prior kernel, compatibility, profiler and fixture changes remain uncommitted.
+Preserve unrelated DN and game configuration changes. Strict ext4 durability
+remains required; the remaining investigation concerns native ext4 metal,
+not SMB tuning. No further debugging or build was requested at handoff.
+
+
+Linux follow-up (same date)
+---------------------------
+The empty-pipe allocation is not the measured startup bottleneck: a full
+no-daemon resume allocated only about 58 KiB in that path, costing 0.82 ms.
+New optional profile counters distinguish disk_read, disk_write, disk_flush
+and volume_flush. The F12 profile dump now includes I/O counters in KLOG.
+
+Native ext4/NVMe QEMU, 32 GiB/6 CPUs, no daemon, full feature defaults:
+- Cold skills: ready 18.389 s after guest control (30.335 s after VM launch).
+  2040 disk flushes: 7.3366 s; reads: 0.3067 s; writes: 0.2915 s.
+- Copied installed skills: ready 12.205 s after guest control (23.835 s
+  after VM launch). 860 flushes: 3.2091 s; reads: 0.2689 s; writes: 0.1506 s.
+Counters include a few seconds after readiness. Journal code confirms five
+ordered barriers per mutation. No durability policy was relaxed. The copied
+fixture does not include the actual MCP configuration or full project tree.
+Report: build/ci/codex-native-resume/storage-stall-comparison.json
+
+KLOG0214 also records helper fatal Hlt and SoftInt(3); their program identities
+and causes are not established. Saved app logs from the last metal process
+record a model-list refresh timeout and EIO removing existing system skills.
+There is no physical I/O timing in that log, so the entire reported minutes
+on metal are not explained by these QEMU measurements alone.
+
+Two independently reproduced compatibility bugs were corrected:
+- F_GETFL reported every regular file as read-only. mkstemp then fdopen(w)
+  failed with errno 22, exactly matching sed temporary-file symptoms.
+- openat ignored directory fds. Opening a known existing child relative to
+  its parent fd failed with ENOENT, relevant to recursive cleanup operations.
+The expanded native permissions probe failed each reproducer before its fix
+and passed with both fixes. Clippy passed. Additional kernel/proc-fd checks
+are recorded in the current session; no installation was performed.
+
+Final validation and corrected comparison
+------------------------------------------
+All 535 kernel unit tests, linux_permissions, linux_proc_fd (32/64-bit on
+SMB and ext4), and Clippy passed. The final no-daemon Codex resume/typing
+probe also passed on native ext4/NVMe.
+IMPORTANT: after fixing openat, the copied-skills run performs directory
+cleanup that previously failed: 71 unlinkat calls, 2545 disk flushes taking
+8.6736 s, 0.4058 s physical reads, 0.4157 s writes; readiness 20.174 s after
+guest control / 31.903 s after VM launch. The earlier 12.205 s copied-skills
+run is therefore not a reliable successful-cleanup baseline. Do not present
+it as a startup optimization or evidence that ordinary warm startup is fast.
+Saved final artifacts: compat-fixed-existing-skills-samples.jsonl and
+compat-fixed-existing-skills-klog.txt in build/ci/codex-native-resume.
+The report includes all three runs and this caveat. No journal durability
+changes, machine installation or release preparation were performed here.
+
+
+End-to-end time accounting follow-up
+------------------------------------
+See build/ci/time-accounting/comparison.txt and comparison.json for the
+complete exclusive wall-time ledger and nested function timings. Both roots
+load the same 298,515,108 ELF bytes. Profiling begins at an stdin gate BEFORE
+exec, not after some native executable loading may already have completed.
+536 kernel unit tests, 4 SMB protocol tests, Clippy, and actual no-daemon
+resume/typing on both ext4 and SMB passed. Matched compile/link/run measured
+2.416 s ext4 / 4.968 s SMB. A single-step GCC build instead failed with an
+object-file-too-short error; this is recorded separately in the artifact dir.
+
+Gated full startup: 19.54 s ext4 / 26.04 s SMB, including diagnostic serial
+overhead 2.28 / 1.77 s. Pure application instructions: 0.53 / 0.51 s.
+Ext4: 2400 flushes, 8.01 s. Kernel-mode faults: 37198 calls / 1.79 s.
+SMB: zero local disk flushes; receive 7.82 s, signatures verified 1.18 s,
+response allocation 4.30 s, read decoding 3.47 s. Kernel-mode faults:
+182641 calls / 8.39 s. User-mode faults: about 2.5 s on either backend.
+Fault costs overlap other named scopes: DO NOT add these nested numbers.
+Immediate heap backing release on free is a concrete source-level lead for
+the repeated buffer-allocation fault cost; no allocator policy fix or causal
+retention A/B experiment was performed. These QEMU measurements do not prove
+the complete physical-machine delay. No installation was performed.
+
+
+Linux host baseline (same installed tools/binary)
+------------------------------------------------
+Five-run medians: Python -S 7.104 ms; Python imports 19.296 ms;
+C compile/link/run 29.913 ms. Three full Codex resume runs on a private
+80x25 PTY: 1.879 s, 1.824 s, 1.647 s (median 1.824 s); typing verified
+without submitting. Fresh private copied state per run; daemon disabled,
+preparation excluded. Linux used ordinary host caches; no cache dropping.
+RetroOS ext4 comparison: C build 2.416 s; full resume 19.540 s including
+2.277 s diagnostic serial handling. Removing only that measured overhead
+arithmetically gives 17.263 s; this is not a separate unprofiled measurement.
+Reproduce Linux resume: python3 test/linux_host_codex_timing.py --resume
+01a1b8de-7411-7120-9dcc-c9d965089754 --repeat 3
+Reports: build/ci/time-accounting/linux-baseline.json and
+linux-codex-baseline.json. Raw PTY captures are private (contain history).
+
+
+Kernel fixes and final candidate — b05faa2049e7
+-----------------------------------------------
+Implemented bounded heap backing reuse (at most 1 MiB, less on low RAM),
+initial ext4 mode/mtime in one creation transaction, unchanged-metadata skips,
+page-specific TLB invalidation for leaf mappings, and first-write demand
+allocation in one user fault instead of two.
+Native ext4 now enables bounded grouped journal writeback: at most 64 blocks,
+further limited by actual journal ring/descriptor capacity. The same JBD2
+writer and its five ordered barriers commit each batch. Background writeback
+runs every 100 ms; file/directory fsync, explicit kernel-log flush and shutdown
+still commit durably. Ordinary unsynced closes no longer force each mutation
+to disk individually. Pending changes remain visible through one block overlay.
+
+The retain-all experiment was removed. Normal page release is restored, with
+only the bounded allocator cache remaining. It reduced native kernel faults
+from 37198 / 1.79 s to about 5500 / 0.30 s. The corresponding SMB experiment
+cut response allocation+decode from 7.77 s to 0.025 s; it is not the final policy.
+
+Native profiled resume: 19.54 -> 6.42 s. Flushes about 2400 -> 178, flush time
+8.01 -> 0.77 s. Final unprofiled runs: 6.94 s and 6.43 s, with typing verified.
+Linux median remains 1.82 s: performance is improved substantially, not equal.
+See fixes-comparison.json for numeric snapshots and measurement limitations.
+
+Final validation: 536 kernel unit tests; 4 heap tests including eviction
+poisoning/fragmentation; 18 modern ext4 tests including grouped visibility,
+automatic rollover and simulated power loss at every commit step. Native
+permissions, file-cache, high paging, SQLite, DN/F12 and abrupt termination
+after file+directory fsync passed. The crash test verified contents/rename and
+a clean e2fsck. Clippy passed. All changes remain uncommitted.
+Prepared release b05faa2049e7; no root installation was performed.
+
+
+Resume/metadata follow-up — candidate dfc954d9b04d
+-------------------------------------------------
+Metal KLOG0215 confirms the post-startup interaction report but contains no
+I/O profile. No exact physical-machine cause/timing is established.
+Implemented stable-inode ownership lookup in VFS/ext4, inode metadata cache
+refresh across hard links/bind aliases on writes and resize, and scoped
+namespace invalidation. Mount/media changes retain full invalidation.
+Ext4 allocation had restarted at group 0 for EACH new block; a mounted search
+hint now retains the last successful group and wraps over all groups. The
+bitmap counts remain authoritative; no durability policy was changed here.
+
+Measured stat walk (2,000 files): 387 -> 63 ms; 200 stats interspersed with
+unrelated log writes: 414 -> 87 ms. On a valid mostly allocated image with
+thousands of block groups, a 2 MiB append+fsync: 888 -> 164 ms.
+Matched UEFI Codex picker test copies all 118 rollouts and SQLite snapshots,
+uses native ext4/NVMe and a populated filesystem. Selected-session loading:
+8.301 -> 6.857 s; volume_read calls 3,055,508 -> 64,108; ext4_commit_write
+1.655 -> 0.351 s. Picker listing stayed about 0.9 s. Thus the fixes remove
+measured repeated work but do NOT establish acceptable metal responsiveness
+or explain the much longer metal picker delay. Earlier BIOS comparison runs
+have additional text-aperture overhead; do not mix them with UEFI timings.
+
+538 kernel tests; 19 modern ext4 tests; native permissions, file-cache,
+SQLite, abrupt-stop fsync, DN/F12, populated metadata workload/e2fsck and
+Clippy passed. New regressions cover aliases, hard links, negative lookups,
+namespace invalidation and exhausted-group descriptor-read amplification.
+Prepared release dfc954d9b04d; staged kernel SHA256 matches tested Bazel
+kernel 72256b4af70d4fcb0a4cb2e0d47efbf452073d4bfcc58324c64cb001fa6fb008.
+NOT installed. Detailed report: build/ci/metadata/fixes-comparison.json.
+For metal evidence: F12 -> Debug -> Profile before reproducing, then Print
+profile afterward; the dump records I/O counters in KLOG.
+
+Final profiling-disabled matched UEFI runs: session loading 8.060 ->
+6.558 s, picker listing 0.892 -> 0.903 s; post-resume typing verified.
+The picker delay therefore remains unaddressed by these measured fixes.
+
+
+Paging hot-path follow-up — candidate 65ea2d06c272
+------------------------------------------------
+The earlier 6.56-second unprofiled load STILL used UART screen polling.
+Removing only profiling counters did not remove diagnostic interference.
+Added a read-only `screen memory` diagnostic and a QMP debugger screen reader
+for the test; serial control time fell from about 1.92 s to about 0.003 s.
+Before the actual paging fix, passive profiled loading measured about 4.16 s.
+
+Root cause of major remaining kernel waste: paging2::cpu_mode read CR4,
+performed two CPUID probes and read EFER on EVERY mode query. Recursive page
+table helpers queried repeatedly. Mode is now per-core state initialized at
+paging setup and updated using actual EFER after each protected/compat toggle.
+The state does not discard real mode changes; audited all CR4/EFER writers.
+KVM amplifies these hardware probes; do not predict the same ratio on metal.
+
+Isolated 64 MiB first-write workload (16,384 pages): 872 -> 28 ms.
+The same C probe on Linux: about 24 ms. No screen polling in that benchmark.
+Passive profiled user fault handler: 760 -> 20 ms (22,456 vs 19,286 calls).
+Initial passive loading: 4.16 -> 2.18 s.
+Final exact frozen-state comparison preserves rollout date hierarchy, disables
+profiling, uses QMP and the same 118 copied rollouts: loading 3.966 -> 2.273 s;
+picker listing 0.524 -> 0.319 s. Typing verified without submitting.
+Earlier frozen runs flattened paths due to a relative --state-from path;
+normalized that option before the final comparison.
+
+538 kernel unit tests, linux_high_memory, linux_vsyscall (legacy/PAE/64-bit),
+linux_record_lock (32/64/legacy), linux_file_cache, DN/F12, isolated paging
+and Clippy passed. The record-lock harness initially failed to create its
+artifact directory in Bazel isolation; fixed that and the target passed.
+Prepared release 65ea2d06c272, not installed. Staged kernel matches tested
+SHA256 cf56311407498e74823776ec889f5acb6ab494cc2d04a51526b72ee0fe1663fc.
+Full report: build/ci/resume-investigation/report.json.
+Metal latency remains unmeasured; retain F12 profiling instructions.
+
+
+Async command completion follow-up — SIGCHLD
+------------------------------------------
+The metal session did execute diagnostic commands. Their output arrived but
+the execution tool repeatedly kept a live session after command output ended;
+one call reported code-mode host stdout closed. KLOG0216 records a task-6
+SoftInt(3) and exit -11, but contains no profiling report or executable name.
+Do not claim the crash is explained by the lifecycle fix below.
+
+Reproduced command completion failure in native ext4/NVMe UEFI QEMU, using the
+installed codex-exec-server directly through its stdio RPC. No model request,
+network, UART sampling or host filesystem share is involved. Baseline kernel
+SHA cf56311407498e74823776ec889f5acb6ab494cc2d04a51526b72ee0fe1663fc
+matches the installed /boot release 65ea2d06c272 byte for byte.
+
+Root cause: exit_thread only woke a parent actually waiting in wait4. It did
+not send SIGCHLD. Async child monitors perform waitpid(WNOHANG), get zero
+while the child is alive, then wait for SIGCHLD to retry. A finished child
+therefore remained a zombie while the helper reported exited=false.
+
+Fixed by queuing SIGCHLD after publishing the zombie, waking an eligible
+unmasked parent context through the existing process signal queue. Preserve
+child PID, CLD_EXITED/CLD_KILLED and status; default ignored SIGCHLD does not
+interrupt the parent. The regression forces the WNOHANG race and covers
+parked poll and blocked/unblocked signal masks. Existing blocking wait and
+parent-death behavior are also checked.
+
+Before: printf output reached client in 11 ms, but exited=false remained at
+the 20-second probe deadline. After: output 12 ms, exit/closed notification
+13 ms, complete RPC 17 ms. Same command on Linux: 3.16 ms. Final six-command
+fixed run: 17, 15, 13, 19, 95, 25 ms (the fifth includes a 50 ms sleep).
+All output markers and final exit statuses are checked.
+
+Artifacts: build/ci/exec-server-before; build/ci/exec-server-completion-fixed.
+Structured cause, hashes and timings: latter directory/report.json.
+This exercises pipe-backed shells directly, not the complete code-mode and
+app-server transport, and has not yet been verified on physical metal.
+PTY openpty currently fails ENOENT in the fixture. kill() remains a no-op;
+the probe uses stdin EOF for orderly helper shutdown. Neither is fixed here.
+
+Validation passed: 538 kernel tests, linux_exec_server_native, linux_sigchld,
+linux_signal, linux_parent_death, DN/F12, Clippy and scoped diff/Python checks.
+Prepared release c514aa22ab32, NOT installed. Staged and tested kernel SHA:
+c0ab1593c957fe47d8a7ba040f708d9ebd54d9b322b4051135a4e98655f60fd9.
+
+
+Code-mode crash reproduction and fix
+------------------------------------
+Reproduced KLOG0214/0216's exact SoftInt(3), RIP=0x94de7e0, using the CLI's
+installed 0.163 code-mode host, without a model/network/screen polling.
+Eleven sessions completed before the next failed. At ELF offset 0x14de7df
+(V8 monotonic time path), INT3 checks monotonic seconds >= 9223372036853.
+The old syscall returned success after truncating a high timespec
+pointer to 32 bits, leaving the actual high-stack output unwritten.
+
+The first fix exposed getrandom EFAULT on the same high worker stack, which
+panicked Rust's random initialization. Time and entropy now use checked
+full-width user copies. Retained full addresses in asynchronous clone TID
+stores/clear, futex and sleep arguments, pipe/socket/eventfd buffers, and
+signal mask/alternate-stack query structures. High-stack pthread regression
+checks startup/TLS/TID, time, random, signal mask, futex timeout, sleep, pipe,
+eventfd and join. The time/random probe checks alias guards, cross-page
+copies and protected buffers. This is not every high-address Linux ABI.
+
+A later malloc corruption was traced precisely to brk. Musl's guard inside
+the existing heap was treated as a new ceiling. Request 0xc709000 while
+current break=0xc708000 returned 0xc706000, shrinking the recorded heap.
+Later mmap reused live allocator metadata; musl trapped on its secret check.
+Growth now either succeeds exactly or preserves the old break; wholly
+internal guard pages do not block growth. Regression checks this against
+Linux, collisions, retained live bytes, invalid requests and valid shrinking.
+
+Final direct QEMU run: all 24 JavaScript sessions completed in about 0.75 s
+after the protocol driver began, with clean helper/guest exit. Both the CLI
+0.163 and managed 0.167 helpers pass 24 sessions. This is execution testing,
+not a measurement of full interactive Codex startup or remote tool latency.
+Physical metal has not yet been verified after these fixes.
+
+Improved fatal diagnostics preserve full RIP/RSP and executable path. Native
+64-bit #GP no longer enters the legacy decoder, which read and advanced only
+the low 32 address bits and could misreport the failing instruction.
+Evidence: build/ci/code-mode-crash-report.json; code-mode-crash-before.log;
+code-mode-high-trace.log; code-mode-all-fixed/; code-mode-managed-fixed/.
+
+Validation: all 13 targets passed (538 kernel tests, code-mode stress, high
+stack, time/random buffers, brk, signals, parent death, SIGCHLD, unseeded and
+seeded random, legacy/PAE/64-bit vsyscalls, sparse paging, DN/F12 and command
+helper completion). Clippy passed. After the final lint cleanup, kernel
+unit tests, code-mode stress and expanded high-stack/socketpair test passed
+again. Scoped diff and Python compile checks passed.
+Prepared release 4e392b12f870, NOT installed. Tested/staged kernel SHA:
+de041b04bf44f866533074dad5fc9de188ff101e39921ffe0ffd0c29235afbb4.
+
+
+Physical metal verification, KLOG0217 (2026-11-09)
+------------------------------------------------
+Release 4e392b12f870 is now installed. Installed and staged kernel SHA256:
+de041b04bf44f866533074dad5fc9de188ff101e39921ffe0ffd0c29235afbb4.
+BOOT.INI selection and boot segment layout agree with this release.
+
+Both actual installed code-mode hosts passed 24 JS sessions each on metal:
+CLI 4.845 s, managed 4.826 s (whole Python driver wall time).
+The pipe-backed exec-server probe passed all six commands, including exit/
+closed notifications. Direct /bin/sh true: 21 ms; bash without profile: 73 ms.
+Login bash true: 8.113 s, repeated 8.895 s. A concurrent traced run took
+25.431 s, with largest coarse timestamp gaps around read and command.
+This localizes substantial command overhead to login startup but does not
+yet establish which profile command or kernel operation causes it.
+
+Tiny C build: separate compile (12.027 s) and link (10.434 s) succeed;
+result runs and prints METAL_BUILD_PASS (1.283 s). Default single invocation
+fails in 16.345 s: ld says /home/priv-gerben/TEMP/ccYRKAMJ.o file too short.
+-pipe also fails the same way (50.383 s, concurrent with login-shell tracing).
+TMPDIR set to the project artifact directory succeeds (20.552 s), as does
+-save-temps=obj (30.589 s). These are diagnostic variants, not fixes.
+Investigate temp-directory file visibility/caching/metadata lifetime; root
+cause is not yet established. Timings from concurrent probes are not clean
+performance comparisons.
+
+Tool exec sessions remained open after output finished; component process
+exit tests themselves passed. End-to-end tool completion is not resolved.
+
+IMPORTANT: after the component tests, the final klog records another crash:
+thread 5, instruction-fetch protection fault at 0x156dff90, err=0x15;
+later SEGV diagnostic rip=0x164f2e25, then tid=5 exit=-11.
+The log does not identify this thread's executable. This is a different
+signature from the fixed code-mode INT3, and must be investigated before
+claiming overall Codex stability.
+
+Raw reports, protocol logs, compiler outputs, shell timings and saved trace:
+build/ci/metal-runtime-check/. No full interactive startup/resume timing was
+performed during this check. Kernel high-stack C probes were not run here.
+
+Linux follow-up to KLOG0217, performance priority
+------------------------------------------------
+Same machine Linux: bash -lc true 19.7 ms, compile 25.1 ms, link 14.3 ms.
+QEMU/current kernel/native ext4/32 GiB/6 CPUs: separate build 220 ms.
+QEMU system profiles + flatpak and dependent libraries + host directory-name
+population: login 392 ms. Profile measured ~145 MB disk reads, zero flushes;
+eager file mappings dominate dispatch. Fixture preserves system profiles,
+not the entire physical filesystem layout or the live Codex background load.
+Its empty placeholder files must not be mistaken for a full host-root clone.
+Initial smaller-directory fixture measured login 350 ms.
+
+QEMU default RAM TEMP single-step GCC failure reproduces in 183 ms.
+This proves that failure is separable from the 16+ second physical slowdown.
+
+VFS cached_child() calls populate_dir_cache(parent) for a cold pathname.
+The ext4 readdir adapter calls entries(), inspecting EVERY referenced inode.
+This is a concrete source of cold-lookup amplification on populated, scattered
+real directory trees; it is not measured proof of the principal metal delay.
+Do not state that Flatpak itself, disk reads, or this lookup behavior explains
+the entire metal slowdown. The metal run lacked detailed kernel profiling.
+The exact dominant physical-machine stall remains unresolved.
+
+Extended test/linux_time_accounting.py with gated login/flatpak/lookup and
+single-step temp-build workloads; it records exact kernel/guest/I/O counters
+without polling the screen during the workload. temp-build intentionally
+still fails its success assertion on the reproduced compiler error, retaining
+its report and klog. No performance workaround or new kernel fix applied.
+Comparison: build/ci/metal-runtime-check/slowdown-comparison.json.
+
+QEMU reproduction matrix after KLOG0217
+---------------------------------------
+full public tools/libraries, resident code-mode, packed inode layout: 1.378 s
+spread metadata layout: 1.993 s
+spread metadata, direct SSD I/O: 2.844 s
+spread/direct + 2560x1600/HDA/network: 2.705 s
+spread/direct/devices + real DN/DOS parent tasks: 2.582 s
+real resumed Codex UI, full public tools, spread metadata/direct SSD I/O: 3.878 s
+Bare fixture was inadequate: full public system tools/libraries, realistic
+metadata page working set and direct SSD reads expose seconds of metadata cost.
+Host /usr/bin: 2573 entries on 697 distinct 4 KiB inode pages.
+Host arch library directory: 2776 entries on 740 inode pages.
+The kernel block metadata cache holds 512 pages; packed copies hide this cliff.
+With spread layout, tiny Python-launched build disk reads rise 2764 -> 12271.
+Directory scans inspect about 37740 entries in 170 scans per build.
+Real resumed Codex trial: 3.878 s build, 2.329 s directory scans (nested).
+DN route: 2.582 s; all benchmark child exits in klog are zero.
+This is partial reproduction, NOT the complete ~23.744 s physical delay.
+No claim that metadata amplification alone explains all metal time.
+Cold cached_child() enumerates every sibling inode; metadata changes still
+have some global directory invalidations. These are measured investigation
+targets, not yet fixes.
+Added only optional profiling stages for directory_scan/path_resolve/
+write_permission. No new kernel performance change or machine installation.
+Full matrix and caveats: build/ci/metal-runtime-check/qemu-reproduction.json.
+
+
+User QEMU error run KLOG0218, 2026-11-09
+--------------------------------------
+This is the ordinary live-SMB launch with 2 GiB/2 CPUs, not the native ext4
+performance fixture. Guest state is /home/priv-gerben/DOS/.codex, appearing as
+/home/retroos/.codex. It retained an expired October login while the working
+Linux login was valid. Refreshed ONLY the guest auth atomically (0600), and
+trusted the actual current project path in guest config. Linux auth/config
+were not written. tools/setup_codex.py now has explicit --refresh-auth;
+default preservation remains unchanged. Verified preservation, explicit
+replacement, source integrity, private mode and rejection of shared symlinks.
+
+Actual live-SMB checks after repair:
+- Direct --no-daemon startup reaches UI in 27.59 s from VM launch.
+- Managed 0.163 failed once at 60.63 s; managed 0.167 failed at 67.67 s.
+  Restored the original 0.163 package selection after this diagnostic.
+- A profiled managed attempt reached UI at 62.01 s.
+- Moved old arg0 cache intact into DOS/.codex/diagnostics/
+  stale-arg0-linux-1794285299. Subsequent profiled startup reached UI at
+  58.79 s. This does not establish reliable managed startup.
+- No model prompt was submitted.
+
+Tiny independent Unix-stream probe through an SMB MF-symlink alias passed.
+A separate native dangling symlink cleanup repro fails: unlink ENOENT, then
+rmdir ENOTEMPTY. These old links point at removed package staging directories.
+Attempted client/VFS nofollow changes did not resolve the server's ENOENT,
+and one experiment broke a FAT exact-name regression. ALL these kernel
+experiments were reverted; 538 kernel tests pass again. Kept the standalone
+test/linux_smb_native_cleanup.py as a manual known-failure repro, not a fix.
+The generic arg0 warning can recur with MF links too; legacy-cache migration
+does not fix every cleanup case. Open .lock deletion semantics are a separate
+candidate to test (SMB delete-pending versus Linux immediate unlink).
+
+The clean rolled-back-kernel startup profile is now saved. By 47.69 s from
+VM launch: ELF segment reads 1,197,041,338 bytes / 19.33 s; VFS reads
+1,534,974,542 bytes / 24.91 s; SMB response bytes 1,870,008,058 / 26.26 s;
+directory scans 5.01 s. These are NESTED, not additive. This measures the
+live-SMB startup and does not prove corresponding physical-metal timings.
+Loading multiple full roughly-297-MB Codex images is measurable startup
+overhead. Do not attribute the entire metal gap to SMB.
+
+Evidence: build/ci/qemu-error-check/summary.json; per-run reports/screens/
+profiles/klogs there; build/ci/smb-unix-alias.log (pass);
+build/ci/smb-native-clean-before.log and smb-native-clean-64.log (known fail).
+No machine release installation or permanent daemon-version change.
+
+
+QEMU KVM correctness fixes, 2026-11-10 (supersedes failed TEMP/cleanup notes)
+--------------------------------------------------------------------------
+Reproduced and fixed distinct kernel/filesystem errors; these are not a
+claim that the remaining physical-machine slowdown has been explained.
+
+1. FAT positioned writes: rust-fatfs seek clamps positions beyond EOF. The
+   adapter ignored the returned position, so assembler writes intended beyond
+   its reserved header overwrote earlier data. It now zero-fills the gap before
+   writing. Independent cached readers are invalidated before mutation so
+   stale cached directory entries cannot restore an old file size. The native
+   ext4-root / RAM-FAT-TEMP single-step GCC compile, link and execution passes.
+2. kill: 64-bit syscall 62 previously returned success without checking the
+   target or sending a signal; 32-bit syscall 37 was absent. Both now use the
+   existing process signal machinery, check liveness and reject bad signals.
+   Both ABIs pass a blocked-child SIGKILL/reap test; 64-bit caught/blocked
+   signal delivery also passes. This does not add missing thread-group APIs.
+3. Open-file cleanup: Codex keeps an arg0 .lock descriptor open while unlinking
+   its name and removing its directory. SMB previously left a delete-pending
+   name visible until close; native ext4 explicitly returned EBUSY. SMB now
+   moves local open files to unique temporary names within the configured
+   mount root, marks them for deletion on last close, and hides those tracked
+   names from guest enumeration. Native ext4 uses the standard legacy orphan
+   chain and reclaims the inode on last close, or after a crash on the first
+   authorized mutation. Descriptor I/O survives unlink and parent removal.
+   VFS tracks unlinked descriptors so old writes/close cannot change the
+   metadata of a replacement file at the same name.
+4. Journal recovery: replayed ext4 filesystems could be read, but subsequent
+   mutations failed with JournalWriteProfile. Replayed home blocks are now
+   durably checkpointed before clearing the journal/recovery flag and starting
+   a new mutation. Mount/probe remains read-only. Normal write batching remains
+   available after recovery. Tests inject power loss at every write/flush in
+   unlink, final close, and a second recovery; Linux e2fsck also reclaims our
+   durable open orphan correctly.
+
+Validation: 540 kernel unit tests, 6 ext4 library tests, 23 modern-image tests;
+Clippy kernel/ext4 passes. Open-lock cleanup, old-descriptor I/O, name reuse,
+replacement timestamp isolation and parent removal pass on SMB and ext4 for
+both 32-bit and 64-bit Linux programs; ext4 images pass e2fsck -fn.
+
+Actual managed Codex 0.163, copied guest state, full-feature private ext4
+fixture: UI ready 16.365 seconds after VM launch / 5.526 seconds after guest
+control; accepts an unsubmitted draft at 21.439 seconds. The EBUSY stale-arg0
+cleanup warning is gone. Only the fixture's missing system bubblewrap warning
+remains (Codex uses its bundled copy). This is a startup/typing check, not a
+model request or complete tool-execution validation. Evidence:
+build/ci/codex-native-resume-fixes-ext4-final-qmp-unprofiled/.
+
+Actual live-SMB managed startup with the fixes reached the UI at 57.45 seconds
+and no longer reported the open-lock cleanup warning, but did report a model
+refresh timeout. Another QEMU cleanup test briefly overlapped, so that time is
+not a controlled performance comparison. The previously measured repeated
+large executable loads and remaining startup delay are NOT fixed here.
+Native host dangling symlinks hidden by Samba remain a separate known failure
+(test/linux_smb_native_cleanup.py). No kernel installed on physical hardware;
+the boot image and sources contain these changes.
+
+Final additional KVM regressions all pass: linux_file_cache (ext4/FAT/SMB
+plus hosted KVM mappings), linux_fsync_crash (abrupt power loss after fsync),
+linux_open_file_cleanup (both backends/both ABIs), linux_sqlite_ext4 (WAL,
+checkpoint, reopen and host integrity_check), linux_temp_build (compile/link/
+execute through RAM-FAT TEMP). The final tiny-build workload was 270 ms;
+Bazel's 15.4-second test duration includes fixture creation and boot and must
+not be reported as guest compilation time. Final suite: 5/5 targets passed.
+
+
+Managed startup timeout follow-up, 2026-11-10 (KLOG0219)
+------------------------------------------------------
+User reproduced app-server readiness timeout on live SMB, managed 0.163.0.
+Warnings 326 (copy_file_range) and 40 (sendfile) were after the TUI's exit;
+93 is fchown and also appears during startup. These syscalls remain unsupported;
+no success stubs were added. The earlier ext4 startup-only test did not prove
+reliability of this launch configuration.
+
+Added private-home SMB testing with the live host tool tree, configurable
+2 GiB/two-CPU guest, and optional HEADER-ONLY packet capture (54 bytes/packet).
+No packet payloads are saved by that capture. The user's running VM and home
+were not restarted or rewritten. Baseline private run: 66.214 s after the
+start gate; ELF reads 1,199,103,434 bytes / 33.08 s. Nested counters must not
+be added. Four large executable loads were not retained by the ordinary 2 MiB
+read cache; large sequential requests bypass that cache entirely.
+
+New VFS-owned executable snapshots reuse repeated execs across close and
+hard-link opens. They validate external versions before reuse and before/after
+snapshot reads, reject mixed headers/body versions, and are invalidated by
+local writes/truncate/name replacement/shared mappings. Only the ELF prefix
+through the last loadable segment is retained (trailing debug info excluded).
+The optional cache is bounded to one third of available/reclaimable memory,
+at most 384 MiB, with low-memory reclamation below 128 MiB free. Oversized
+images retain the streaming path. This is not demand paging or shared code
+frames; the first exec still loads its segments eagerly.
+
+Matching profiled run with the cache: 39.973 s after the gate; ELF reads
+594.08 MB / 8.73 s. Independent unprofiled run: 36.48 s after the gate. The
+model-refresh timeout warning remained. Real daemon readiness succeeded in
+these runs, but this does not prove that every startup stall is resolved.
+
+A separate native TCP EPOLLET regression was reproduced: new bytes arriving
+while older bytes remain unread did not produce a new epoll event. Linux
+notifies in this case; the old kernel test exited with code 36. Track receive
+notification sequences for TCP and kernel-local Unix streams, and retain them
+per epoll watch until an event can actually be delivered. The failing KVM test
+now passes. This fixes a real lost-notification bug; it did NOT eliminate the
+model-refresh warning in the full Codex check. Unprofiled cache+epoll startup:
+39.59 s after the gate, ready and accepts typing.
+
+End-to-end managed 0.163.0 test now passes in QEMU KVM with a private SMB home:
+Codex creates its PID record, receives a model response, invokes the command
+tool, writes and reads /home/retroos/work/tool-result.txt, and replies exactly
+CODEX_TOOL_PASS. The harness verifies the file contents, not just echoed input.
+It still took substantial time (UI reports 41 s for the turn), and daemon
+stderr still reports model refresh timeout. Keepalive/user-timeout socket
+options also remain unsupported and produce application warnings.
+Evidence: build/ci/codex-tools-daemon-state/ and
+build/ci/qemu-error-check/startup-fixes-nov10.json.
+
+543 kernel unit tests pass, including executable snapshot short reads,
+close/reopen/hard-link reuse, external updates/errors, same-size local writes,
+truncate, and memory-pressure eviction. New KVM linux_exec_cache passes both
+ABIs, including executable modification, writable shared aliases and name
+replacement. Final integration/lint results appended below when complete.
+No physical-machine kernel installation; rebuilt boot image contains fixes.
+
+Final verification: Clippy //kernel:kernel passes. All five KVM integration
+targets pass: linux_epoll_network, linux_exec_cache (64/32), linux_file_cache
+(ext4/FAT/SMB/hosted KVM), linux_temp_build, linux_unix_socket (including the
+new Unix-stream EPOLLET case). Scoped git diff --check passes. Test VMs have
+exited. The latest boot image includes both new fixes.
+
+Nov 10 follow-up: reproduce the fatal readiness failure with installed state
+===========================================================================
+KLOG0220's failure is reproduced in QEMU KVM using the actual DOS home,
+normal Codex configuration, and DN -> shell launch. The earlier private-home
+success did not cover this path. Baseline fatal error at 54.23 seconds after
+VM launch; Codex command was entered around 17 seconds. Do not treat the
+private-home readiness result as evidence that the installed state worked.
+
+Socket tracing proves that the client can connect to the daemon's actual Unix
+socket. The daemon is still initializing when readiness expires. A profiled,
+filesystem-traced failing run performed 1,088 directory scans (~10.06 seconds,
+nested within syscall/I/O totals). chmod, utime, symlink creation and Unix
+socket namespace edits still invalidated the entire VFS directory cache.
+They now invalidate affected inode listings (including hard links/bind aliases)
+or affected namespace paths. Backends without known inode identity invalidate
+their own listings conservatively; unrelated filesystems retain their caches.
+No Codex config, installed skills or plugins were disabled to obtain this fix.
+
+Removing those accidental global invalidations exposed a separate procfs bug:
+GNU ps missed a new PID because /proc's cached directory listing predated it.
+This reproduced the older 'failed to read start time for pid-managed app server'
+error. ProcessFs now marks its root directory dynamic, and VFS refreshes it at
+the start of each new enumeration. linux_ps now creates several new children
+after the initial ps listing and checks a new child's start time through real
+GNU ps. The metadata unit test checks hard-link/bind-alias freshness while an
+unrelated filesystem's directory remains cached.
+
+Installed-state DN launches now reach readiness at 45.17, 45.65 and 44.84
+seconds after VM launch (about 28 seconds after typing the Codex command).
+Artifacts: build/ci/qemu-error-check/real-dn-proc/, real-dn-tools/ and
+real-dn-tools-verified/. The last run executes the command tool, writes and
+reads /home/retroos/.codex/diagnostics/dn-tool-full-path.txt; the harness verifies
+DN_TOOL_PASS in that file. Completion was at 159.23 seconds from VM launch.
+The first command test stopped at a normal approval prompt; the repeated test
+confirms only its known diagnostic command. This is still slow. A model-refresh
+timeout and 'could not save diagnostic logs' warning remain. Host read-only
+SQLite quick_check returned ok for logs_2.sqlite and state_5.sqlite; no database
+was reset or repaired. These warnings are not claimed fixed.
+
+544 kernel unit tests and five KVM integration targets pass: linux_ps,
+linux_unix_socket, linux_smb_symlink (both ABIs/reboots), linux_open_file_cleanup,
+and linux_file_cache. Kernel Clippy passes. Only the test probe's ignored-read
+compiler warning and success text were subsequently cleaned up. The boot image
+is rebuilt; no physical-machine installation was performed.
+
+A durable installed-state driver is now test/linux_codex_dn.py. It uses the
+provided guest home unchanged, launches DN -> COMMAND.COM -> SHELL.ELF, then
+Codex. --tools runs a bounded diagnostic command; --profile captures timings.
+Example: python3 test/linux_codex_dn.py --home /home/priv-gerben/DOS --tools
+
+Full DOS-parent-chain check also passes using the new permanent driver:
+python3 test/linux_codex_dn.py --home /home/priv-gerben/DOS --profile --label metadata-fixed
+The klog confirms DN tid=1 -> COMMAND.COM tid=2 -> SHELL.ELF tid=3. Ready at
+43.022 seconds from VM launch / 25.205 seconds from command submission.
+Artifacts: build/ci/codex-dn-metadata-fixed/. The last periodic profile sample
+at 37.1 seconds records 412 directory scans / 1.07 seconds; this is BEFORE
+readiness, not a final total, and the earlier failing trace had extra syscall
+tracing enabled. Do not present those scan totals as a controlled benchmark.
+The final cleaned-up linux_ps regression was rerun and passes (14.6 seconds).
+All test VMs exited; no host Codex configuration/auth or physical boot disk
+was changed. The Codex guest's normal sessions/logs/cache were allowed to update.
+
+A separate limitation observed while designing the ps regression: a shell
+builtin wait after background-child termination can loop on unimplemented
+x86_64 rt_sigsuspend (130). The committed probe uses fork/waitpid directly to
+test proc enumeration independently. That signal syscall is not implemented
+by this patch. The diagnostic-log database warning is likewise unresolved.

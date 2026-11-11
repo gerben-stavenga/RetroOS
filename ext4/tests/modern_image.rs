@@ -7,6 +7,180 @@ fn image() -> Vec<u8> {
     std::fs::read(image_path).unwrap()
 }
 
+fn check_orphan_image(storage: &ModelStorage, label: &str) {
+    let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+        .join(format!("orphan-{label}.img"));
+    std::fs::write(&output, storage.durable_bytes()).unwrap();
+    let check = std::process::Command::new("/usr/sbin/e2fsck")
+        .args(["-fn", output.to_str().unwrap()]).output().unwrap();
+    assert!(check.status.success(), "{}{}", String::from_utf8_lossy(&check.stdout), String::from_utf8_lossy(&check.stderr));
+}
+
+#[test]
+fn open_unlink_retains_data_until_last_close_and_reclaims_orphan_chain() {
+    use portable_ext4::{Filesystem, Storage};
+    use portable_ext4::ext4::{AttributeUpdate, Object};
+    let mut storage = ModelStorage::new(image());
+    let mut fs = Filesystem::mount(&mut storage).unwrap();
+    let root = fs.root(&mut storage).unwrap();
+    let free = fs.statistics().free_inodes;
+    let mut objects = Vec::new();
+    for name in [b"orphan-a", b"orphan-b", b"orphan-c"] {
+        let object = fs.create_blob(&mut storage, root, name, AttributeUpdate::default()).unwrap();
+        let Object::Blob(blob) = object else { panic!() };
+        fs.write(&mut storage, blob, 0, &[0x5a;8193]).unwrap();
+        let (edge, _) = fs.find(&mut storage, root, name).unwrap().unwrap();
+        assert_eq!(fs.remove_open(&mut storage, edge).unwrap(), Some(object));
+        assert!(fs.find(&mut storage, root, name).unwrap().is_none());
+        assert_eq!(fs.inspect(&mut storage, object).unwrap().references, 0);
+        fs.write(&mut storage, blob, 0, b"open").unwrap();
+        let mut bytes = [0;4];
+        fs.read(&mut storage, blob, 0, &mut bytes).unwrap();
+        assert_eq!(&bytes,b"open");
+        objects.push(object);
+    }
+    // Remove the middle, head and tail; each splice is journaled.
+    for index in [1,2,0] {
+        fs.release_orphan(&mut storage, objects[index]).unwrap();
+        assert!(fs.inspect(&mut storage, objects[index]).is_err());
+    }
+    assert_eq!(fs.statistics().free_inodes, free);
+    storage.flush().unwrap();
+    check_orphan_image(&storage, "closed");
+}
+
+#[test]
+fn orphan_recovery_is_read_only_until_mutation_and_survives_power_loss() {
+    use portable_ext4::{Filesystem, Storage};
+    use portable_ext4::ext4::{AttributeUpdate, Object};
+    use portable_ext4::test_support::EffectKind;
+    let mut initial = ModelStorage::new(image());
+    let mut fs = Filesystem::mount(&mut initial).unwrap();
+    let root = fs.root(&mut initial).unwrap();
+    let object = fs.create_blob(&mut initial, root, b"open-file", AttributeUpdate::default()).unwrap();
+    let Object::Blob(blob) = object else { panic!() };
+    fs.write(&mut initial, blob, 0, &[0x42;8193]).unwrap();
+    initial.flush().unwrap();
+    let source = initial.durable_bytes().to_vec();
+    for closing in [false, true] {
+        let mut success = ModelStorage::new(source.clone());
+        let mut fs = Filesystem::mount(&mut success).unwrap();
+        let root = fs.root(&mut success).unwrap();
+        let edge = fs.find(&mut success,root,b"open-file").unwrap().unwrap().0;
+        let mut start = success.effects().len();
+        fs.remove_open(&mut success,edge).unwrap();
+        if closing {
+            start = success.effects().len();
+            fs.release_orphan(&mut success,object).unwrap();
+        }
+        let failures: Vec<_> = success.effects()[start..].iter()
+            .filter(|e| e.kind != EffectKind::Read).map(|e| e.sequence).collect();
+        for sequence in failures {
+            let mut io = ModelStorage::new(source.clone()).with_injection(Inject::PowerLossAt(sequence));
+            let mut fs = Filesystem::mount(&mut io).unwrap();
+            let root = fs.root(&mut io).unwrap();
+            let edge = fs.find(&mut io,root,b"open-file").unwrap().unwrap().0;
+            let result = fs.remove_open(&mut io,edge);
+            if closing { result.unwrap(); assert!(fs.release_orphan(&mut io,object).is_err()); }
+            else { assert!(result.is_err()); }
+            let mut recovered = ModelStorage::new(io.durable_bytes().to_vec());
+            let mut fs = Filesystem::mount(&mut recovered).unwrap();
+            let root = fs.root(&mut recovered).unwrap();
+            let still_named = fs.find(&mut recovered,root,b"open-file").unwrap().is_some();
+            assert!(recovered.effects().iter().all(|e| e.kind == EffectKind::Read));
+            let was_orphan = fs.inspect(&mut recovered,object).is_ok_and(|info| info.references == 0);
+            let free_before = fs.statistics().free_inodes;
+            fs.create_blob(&mut recovered,root,b"recovery-trigger",AttributeUpdate::default()).unwrap();
+            assert_eq!(fs.statistics().free_inodes, free_before - 1 + u64::from(was_orphan));
+            if still_named {
+                let mut bytes = [0;4];
+                fs.read(&mut recovered,blob,0,&mut bytes).unwrap();
+                assert_eq!(bytes,[0x42;4]);
+            }
+            recovered.flush().unwrap();
+            check_orphan_image(&recovered, &format!("{closing}-{sequence}"));
+        }
+    }
+}
+
+#[test]
+fn journal_checkpoint_and_orphan_recovery_can_be_interrupted_again() {
+    use portable_ext4::{Filesystem, Storage};
+    use portable_ext4::ext4::{AttributeUpdate, Object};
+    use portable_ext4::test_support::EffectKind;
+    let mut seed = ModelStorage::new(image());
+    let mut fs = Filesystem::mount(&mut seed).unwrap();
+    let root = fs.root(&mut seed).unwrap();
+    let object = fs.create_blob(&mut seed,root,b"open-recovery",AttributeUpdate::default()).unwrap();
+    let Object::Blob(blob) = object else { panic!() };
+    fs.write(&mut seed,blob,0,&[0x37;8193]).unwrap();
+    seed.flush().unwrap();
+    let source = seed.durable_bytes().to_vec();
+    let mut run = ModelStorage::new(source.clone());
+    let mut fs = Filesystem::mount(&mut run).unwrap();
+    let root = fs.root(&mut run).unwrap();
+    let edge = fs.find(&mut run,root,b"open-recovery").unwrap().unwrap().0;
+    let start = run.effects().len();
+    fs.remove_open(&mut run,edge).unwrap();
+    // The fourth barrier is after the commit record and home writes. A cut
+    // here leaves a committed log that must be checkpointed before writing.
+    let cut = run.effects()[start..].iter().filter(|e| e.kind == EffectKind::Flush).nth(3).unwrap().sequence;
+    let mut broken = ModelStorage::new(source).with_injection(Inject::PowerLossAt(cut));
+    let mut fs = Filesystem::mount(&mut broken).unwrap();
+    let root = fs.root(&mut broken).unwrap();
+    let edge = fs.find(&mut broken,root,b"open-recovery").unwrap().unwrap().0;
+    assert!(fs.remove_open(&mut broken,edge).is_err());
+    let source = broken.durable_bytes().to_vec();
+    let mut success = ModelStorage::new(source.clone());
+    let mut fs = Filesystem::mount(&mut success).unwrap();
+    let root = fs.root(&mut success).unwrap();
+    assert!(fs.find(&mut success,root,b"open-recovery").unwrap().is_none());
+    let start = success.effects().len();
+    fs.create_blob(&mut success,root,b"after-recovery",AttributeUpdate::default()).unwrap();
+    let cuts: Vec<_> = success.effects()[start..].iter().filter(|e| e.kind != EffectKind::Read).map(|e| e.sequence).collect();
+    for cut in cuts {
+        let mut io = ModelStorage::new(source.clone()).with_injection(Inject::PowerLossAt(cut));
+        let mut fs = Filesystem::mount(&mut io).unwrap();
+        let root = fs.root(&mut io).unwrap();
+        assert!(fs.find(&mut io,root,b"open-recovery").unwrap().is_none());
+        assert!(fs.create_blob(&mut io,root,b"after-recovery",AttributeUpdate::default()).is_err());
+        let mut io = ModelStorage::new(io.durable_bytes().to_vec());
+        let mut fs = Filesystem::mount(&mut io).unwrap();
+        let root = fs.root(&mut io).unwrap();
+        assert!(fs.find(&mut io,root,b"open-recovery").unwrap().is_none());
+        fs.create_blob(&mut io,root,b"second-recovery",AttributeUpdate::default()).unwrap();
+        io.flush().unwrap();
+        check_orphan_image(&io,&format!("repeat-{cut}"));
+    }
+}
+
+#[test]
+fn e2fsck_recovers_our_open_unlinked_inode() {
+    use portable_ext4::{Filesystem, Storage};
+    use portable_ext4::ext4::{AttributeUpdate, Object};
+    let mut storage = ModelStorage::new(image());
+    let mut fs = Filesystem::mount(&mut storage).unwrap();
+    let root = fs.root(&mut storage).unwrap();
+    let before = fs.statistics().free_inodes;
+    let object = fs.create_blob(&mut storage,root,b"linux-orphan",AttributeUpdate::default()).unwrap();
+    let Object::Blob(blob) = object else { panic!() };
+    fs.write(&mut storage,blob,0,&[0x61;8193]).unwrap();
+    let edge = fs.find(&mut storage,root,b"linux-orphan").unwrap().unwrap().0;
+    fs.remove_open(&mut storage,edge).unwrap();
+    storage.flush().unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap()).join("linux-orphan.img");
+    std::fs::write(&output,storage.durable_bytes()).unwrap();
+    let check = std::process::Command::new("/usr/sbin/e2fsck")
+        .args(["-fy",output.to_str().unwrap()]).output().unwrap();
+    assert!(matches!(check.status.code(),Some(0 | 1)), "{}{}",String::from_utf8_lossy(&check.stdout),String::from_utf8_lossy(&check.stderr));
+    let mut storage = ModelStorage::new(std::fs::read(output).unwrap());
+    let mut fs = Filesystem::mount(&mut storage).unwrap();
+    assert_eq!(fs.statistics().free_inodes,before);
+    let root = fs.root(&mut storage).unwrap();
+    assert!(fs.find(&mut storage,root,b"linux-orphan").unwrap().is_none());
+    check_orphan_image(&storage,"linux-recovered");
+}
+
 fn multi_group_image() -> Vec<u8> {
     let image_path = std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap())
         .join(env!("EXT4_MULTI_GROUP_IMAGE"));
@@ -1125,4 +1299,148 @@ fn read_intent_survives_journal_and_transaction_overlays() {
     assert_eq!(data[..4096], [0xaa; 4096]);
     drop(overlay);
     assert_eq!(storage.reads, [ReadKind::FileData]);
+}
+
+#[test]
+fn writeback_groups_visible_mutations_and_sync_persists_them() {
+    use portable_ext4::{Filesystem, Storage};
+    use portable_ext4::ext4::{AttributeUpdate, Object};
+    use portable_ext4::test_support::EffectKind;
+    let mut storage = ModelStorage::new(image());
+    let mut filesystem = Filesystem::mount(&mut storage).unwrap();
+    filesystem.enable_writeback(&mut storage).unwrap();
+    let root = filesystem.root(&mut storage).unwrap();
+    let before = storage.effects().len();
+    let a = filesystem.create_blob(&mut storage, root, b"batched-a", AttributeUpdate::default()).unwrap();
+    let b = filesystem.create_blob(&mut storage, root, b"batched-b", AttributeUpdate::default()).unwrap();
+    let Object::Blob(blob) = a else { panic!("not a blob"); };
+    filesystem.write(&mut storage, blob, 0, b"first").unwrap();
+    filesystem.write(&mut storage, blob, 5, b" second").unwrap();
+    assert_eq!(filesystem.find(&mut storage, root, b"batched-b").unwrap().unwrap().1, b);
+    let mut bytes = [0; 12];
+    assert_eq!(filesystem.read(&mut storage, blob, 0, &mut bytes).unwrap(), 12);
+    assert_eq!(&bytes, b"first second");
+    assert!(!storage.effects()[before..].iter().any(|effect| effect.kind != EffectKind::Read));
+    // Failed operations must preserve all previously staged edits.
+    assert_eq!(filesystem.create_blob(&mut storage, root, b"batched-a", AttributeUpdate::default()).unwrap_err(), Error::AlreadyExists);
+    assert!(filesystem.has_pending());
+    filesystem.sync(&mut storage).unwrap();
+    assert!(!filesystem.has_pending());
+    assert_eq!(storage.effects()[before..].iter().filter(|effect| effect.kind == EffectKind::Flush).count(), 5);
+    storage.power_loss();
+    let mut recovered = Filesystem::mount(&mut storage).unwrap();
+    let root = recovered.root(&mut storage).unwrap();
+    let object = recovered.find(&mut storage, root, b"batched-a").unwrap().unwrap().1;
+    let Object::Blob(blob) = object else { panic!("not a blob"); };
+    assert_eq!(recovered.read(&mut storage, blob, 0, &mut bytes).unwrap(), 12);
+    assert_eq!(&bytes, b"first second");
+    assert!(recovered.find(&mut storage, root, b"batched-b").unwrap().is_some());
+    storage.flush().unwrap();
+}
+
+#[test]
+fn extending_files_does_not_rescan_exhausted_groups_for_every_block() {
+    use portable_ext4::{Storage, ext4::{Ext4, EdgeCursor, Object}};
+    use portable_ext4::test_support::EffectKind;
+    let mut storage = ModelStorage::new(multi_group_image());
+    let mut graph = Ext4::mount(&mut storage).unwrap();
+    let root = graph.root(&mut storage).unwrap();
+    let mut target = None;
+    graph.edges(&mut storage, root, EdgeCursor::START, &mut |edge| {
+        if edge.name == b"target.bin" { target = Some(edge.object); }
+        Ok(true)
+    }).unwrap();
+    let Object::Blob(blob) = target.unwrap() else { panic!("target is not a file"); };
+    // Group 0 has two free data blocks. This growth must leave it behind.
+    graph.write(&mut storage, blob, 0, &[0x5a; 3 * 4096]).unwrap();
+    let before = storage.effects().len();
+    let payload = [0xa5; 32 * 4096];
+    graph.write(&mut storage, blob, 3 * 4096, &payload).unwrap();
+    let group_zero_reads = storage.effects()[before..].iter().filter(|effect| {
+        effect.kind == EffectKind::Read && effect.offset == 4096 && effect.len == 64
+    }).count();
+    // Accessing the existing inode can still read group 0's descriptor;
+    // allocating 32 new blocks must not add 32 exhausted-group probes.
+    assert!(group_zero_reads < 12, "repeated exhausted-group searches: {group_zero_reads}");
+    let mut readback = [0; 32 * 4096];
+    assert_eq!(graph.read(&mut storage, blob, 3 * 4096, &mut readback).unwrap(), payload.len());
+    assert_eq!(readback, payload);
+    // Releasing earlier space must remain reusable after a hint advances.
+    graph.resize(&mut storage, blob, 0).unwrap();
+    graph.write(&mut storage, blob, 0, &payload).unwrap();
+    assert_eq!(graph.read(&mut storage, blob, 0, &mut readback).unwrap(), payload.len());
+    assert_eq!(readback, payload);
+    storage.flush().unwrap();
+}
+
+#[test]
+fn grouped_writeback_is_atomic_across_every_commit_failure() {
+    use portable_ext4::Filesystem;
+    use portable_ext4::ext4::AttributeUpdate;
+    fn stage(storage: &mut ModelStorage) -> Filesystem {
+        let mut filesystem = Filesystem::mount(storage).unwrap();
+        filesystem.enable_writeback(storage).unwrap();
+        let root = filesystem.root(storage).unwrap();
+        filesystem.create_blob(storage, root, b"group-one", AttributeUpdate::default()).unwrap();
+        filesystem.create_node(storage, root, b"group-two", AttributeUpdate::default()).unwrap();
+        filesystem
+    }
+    fn check(bytes: Vec<u8>) -> bool {
+        let mut storage = ModelStorage::new(bytes);
+        let mut filesystem = Filesystem::mount(&mut storage).unwrap();
+        let root = filesystem.root(&mut storage).unwrap();
+        let one = filesystem.find(&mut storage, root, b"group-one").unwrap().is_some();
+        let two = filesystem.find(&mut storage, root, b"group-two").unwrap().is_some();
+        assert_eq!(one, two, "partially published writeback batch");
+        one
+    }
+    let source = image();
+    let mut storage = ModelStorage::new(source.clone());
+    let mut filesystem = stage(&mut storage);
+    assert!(!check(storage.durable_bytes().to_vec()));
+    let begin = storage.effects().len();
+    filesystem.sync(&mut storage).unwrap();
+    let end = storage.effects().len();
+    let mut old = false;
+    let mut new = false;
+    for sequence in begin..end {
+        let mut storage = ModelStorage::new(source.clone()).with_injection(Inject::PowerLossAt(sequence));
+        let mut filesystem = stage(&mut storage);
+        assert!(filesystem.sync(&mut storage).is_err());
+        if check(storage.durable_bytes().to_vec()) { new = true; } else { old = true; }
+    }
+    assert!(old && new);
+}
+
+#[test]
+fn bounded_writeback_rolls_over_without_losing_file_contents() {
+    use portable_ext4::Filesystem;
+    use portable_ext4::ext4::{AttributeUpdate, Object};
+    use portable_ext4::test_support::EffectKind;
+    let mut storage = ModelStorage::new(image());
+    let mut filesystem = Filesystem::mount(&mut storage).unwrap();
+    filesystem.enable_writeback(&mut storage).unwrap();
+    let root = filesystem.root(&mut storage).unwrap();
+    let begin = storage.effects().len();
+    for number in 0..80u8 {
+        let name = format!("rollover-{number}");
+        let object = filesystem.create_blob(&mut storage, root, name.as_bytes(), AttributeUpdate::default()).unwrap();
+        let Object::Blob(blob) = object else { panic!("not a blob"); };
+        filesystem.write(&mut storage, blob, 0, &[number; 4096]).unwrap();
+    }
+    assert!(storage.effects()[begin..].iter().any(|effect| effect.kind == EffectKind::Flush));
+    filesystem.sync(&mut storage).unwrap();
+    let flushes = storage.effects()[begin..].iter().filter(|effect| effect.kind == EffectKind::Flush).count();
+    assert!(flushes < 100, "small mutations were not grouped: {flushes}");
+    storage.power_loss();
+    let mut filesystem = Filesystem::mount(&mut storage).unwrap();
+    let root = filesystem.root(&mut storage).unwrap();
+    for number in 0..80u8 {
+        let name = format!("rollover-{number}");
+        let object = filesystem.find(&mut storage, root, name.as_bytes()).unwrap().unwrap().1;
+        let Object::Blob(blob) = object else { panic!("not a blob"); };
+        let mut bytes = [0; 4096];
+        assert_eq!(filesystem.read(&mut storage, blob, 0, &mut bytes).unwrap(), bytes.len());
+        assert_eq!(bytes, [number; 4096]);
+    }
 }

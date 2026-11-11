@@ -70,6 +70,12 @@ impl Video {
     pub(super) fn invalidate(&mut self) {
         self.last_output = None;
     }
+    fn retire_dos_scanout(&mut self) {
+        self.device = None;
+        self.voodoo = None;
+        self.owner = None;
+        self.device_ready = None;
+    }
     fn render(&mut self) {
         // A slow presenter must yield before beam catch-up as well as before
         // output. Otherwise the catch-up itself can consume the guest's entire
@@ -257,11 +263,22 @@ impl Display {
 
     pub(crate) fn publish_composition<'a, A: crate::Arch>(
         &mut self, machine: &A, windows: &mut gui::WindowManager, width: usize, height: usize,
+        dos_scanout: bool,
         resolve: impl Fn(gui::EndpointId, gui::SurfaceKey) -> Option<gui::PixelBuffer<'a>>,
     ) -> bool {
         let Some(service) = self.video_service() else { return false };
         if let Some(mut video) = service.try_publish() {
             let sample = crate::kernel::osd_profile::Sample::start(machine);
+            // DOS EXEC can hand this same display to a Linux terminal before
+            // the batch helper gets a display tick. Its old VGA beam then
+            // refers to an obsolete VRAM epoch. Keeping it would gate all
+            // composition, including the host monitor, on that stopped beam.
+            // The outgoing DOS window now uses its retained snapshot.
+            if !dos_scanout {
+                video.retire_dos_scanout();
+                PHASE_DRIVEN.store(false, Ordering::Relaxed);
+                REFRESH_HZ.store(60, Ordering::Relaxed);
+            }
             let owner = video.owner;
             let format = video.format;
             windows.publish_processes(&mut video.scene, resolve, owner, format);
@@ -274,5 +291,43 @@ impl Display {
         service.activate();
         sample.finish(machine, crate::kernel::osd_profile::Stage::Register, 0);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_handoff_renders_after_outgoing_vga_epoch_stops() {
+        let mut pixels = alloc::vec![0u32; 8];
+        let mut video = Video::new(Framebuffer {
+            va: pixels.as_mut_ptr() as usize, pitch: 16, width: 4, height: 2,
+            slow: false, wide: false,
+        }, PixelFormat::NATIVE);
+        let dos = crate::kernel::bios_display::EmulatedVga::initial_mode3();
+        let mut planes = alloc::vec![0u8; 4 * 65536];
+        let memory = unsafe { vga::memory::Memory::mapped(planes.as_mut_ptr(), planes.len()) };
+        video.device = Some(vga::scanout::Scanout::new(&dos.state, memory, video.format, 0));
+        video.device_epoch = crate::kernel::dos::scanout_epoch().wrapping_sub(1);
+        video.owner = Some(gui::EndpointId(1));
+        let endpoint = crate::kernel::linux::CONSOLE_ENDPOINT;
+        let mut windows = gui::WindowManager::new(gui::Presentation::Desktop);
+        let desktop = windows.desktop_mut();
+        let surface = desktop.ensure_surface(endpoint, gui::SurfaceKey(1)).unwrap();
+        let node = desktop.ensure_node(endpoint, gui::PresentationKey(1), gui::Rect::new(0, 0, 4, 2)).unwrap();
+        let mut transaction = gui::Transaction::new(endpoint);
+        transaction.attach(node, Some(surface)).set_visible(node, true);
+        desktop.commit(transaction).unwrap();
+        let green = [0x0000ff00u32.to_le_bytes(); 8].concat();
+        windows.publish_processes(&mut video.scene,
+            |_, _| gui::PixelBuffer::new(4, 2, 16, video.format, &green).ok(),
+            video.owner, video.format);
+        video.composed.resize(32, 0);
+        video.render();
+        assert!(pixels.iter().all(|&pixel| pixel == 0));
+        video.retire_dos_scanout();
+        video.render();
+        assert!(pixels.iter().all(|&pixel| pixel == 0x0000ff00));
     }
 }

@@ -12,7 +12,7 @@ use alloc::{
 use smb2_core::{
     Error, Result,
     auth::ntlm::NtlmCredentials,
-    client::{Client, Transport},
+    client::{Client, ProfileStage, Transport},
     msg::create::{CreateDisposition, CreateResponse},
     types::FileId,
 };
@@ -62,6 +62,10 @@ impl Socket {
     }
 }
 impl Transport for Socket {
+    fn profile_start(&self) -> Option<u64> { crate::kernel::event_profile::file_io_start() }
+    fn profile_finish(&mut self, stage: ProfileStage, bytes: usize, start: Option<u64>) {
+        crate::kernel::event_profile::file_io_finish(25 + stage as usize, bytes, start);
+    }
     fn begin_request(&mut self) {
         self.deadline = portio::now_ns().saturating_add(DEADLINE_NS);
     }
@@ -72,6 +76,7 @@ impl Transport for Socket {
         }
     }
     fn send_all(&mut self, mut bytes: &[u8]) -> Result<()> {
+        let _sample = crate::kernel::event_profile::FileIoScope::start(23, bytes.len());
         while !bytes.is_empty() {
             if portio::now_ns() >= self.deadline {
                 return Err(Error::Timeout);
@@ -91,6 +96,7 @@ impl Transport for Socket {
         Ok(())
     }
     fn receive_exact(&mut self, mut bytes: &mut [u8]) -> Result<()> {
+        let _sample = crate::kernel::event_profile::FileIoScope::start(24, bytes.len());
         while !bytes.is_empty() {
             if portio::now_ns() >= self.deadline {
                 return Err(Error::Timeout);
@@ -166,6 +172,7 @@ struct Open {
     file: FileId,
     path: Vec<u8>,
     writable: bool,
+    unlinked_name: Option<Vec<u8>>,
 }
 struct Directory {
     file: FileId,
@@ -178,9 +185,61 @@ struct State {
     handles: BTreeMap<u64, Open>,
     directories: BTreeMap<u64, Directory>,
     next: u64,
+    unlink_root: alloc::string::String,
 }
 pub struct SmbFs(spin::Mutex<State>);
 impl State {
+    fn rename_handle(&mut self, file: FileId, name: &str, replace: bool) -> Result<()> {
+        let name: Vec<u8> = name.replace('/', "\\").encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut data = vec![0; 20];
+        data[0] = u8::from(replace);
+        data[16..20].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        data.extend_from_slice(&name);
+        self.client.set_info(file, 10, data)
+    }
+
+    /// SMB2 delete-pending alone keeps a name until every open closes. Move
+    /// locally open files out of their parent first, then request server-side
+    /// delete-on-last-close. This permits unlink + rmdir while a flock fd is
+    /// alive, and preserves descriptor I/O without copying the file into RAM.
+    fn unlink_open(&mut self, file: FileId, name: &str) -> Result<()> {
+        let mut nonce = [0; 16];
+        random(&mut nonce)?;
+        let basename = alloc::format!(".retroos-unlinked-{:032x}", u128::from_le_bytes(nonce));
+        let temporary = if self.unlink_root.is_empty() { basename.clone() }
+            else { alloc::format!("{}/{}", self.unlink_root, basename) };
+        // Never replace an existing object, even if the random name collides.
+        self.rename_handle(file, &temporary, false)?;
+        // The VFS opens files without an access mode and upgrades on first
+        // write. Acquire permitted write access before delete-pending makes
+        // further opens impossible. Read-only descriptors still work if the
+        // server rejects the upgrade.
+        let ids: Vec<_> = self.handles.iter().filter(|(_, h)| h.path == name.as_bytes()).map(|(&id, _)| id).collect();
+        for &id in &ids {
+            if !self.handles[&id].writable
+                && let Ok(info) = self.client.open(&temporary, WRITE, CreateDisposition::FileOpen, NOT_DIRECTORY) {
+                let handle = self.handles.get_mut(&id).unwrap();
+                let old = handle.file;
+                handle.file = info.file_id;
+                handle.writable = true;
+                let _ = self.client.close(old);
+            }
+        }
+        if let Err(error) = self.client.set_info(file, 13, vec![1]) {
+            // Do not overwrite a concurrent creator when rolling back.
+            let _ = self.rename_handle(file, name, false);
+            return Err(error);
+        }
+        for id in ids {
+            // Empty path denotes an unlinked open. Never let a later upgrade
+            // accidentally reopen a new file created at its old name.
+            let handle = self.handles.get_mut(&id).unwrap();
+            handle.path.clear();
+            handle.unlinked_name = Some(basename.as_bytes().to_vec());
+        }
+        Ok(())
+    }
+
     fn insert(&mut self, info: CreateResponse, path: &[u8], writable: bool) -> Option<Vnode> {
         if self.handles.len() >= 128 {
             let _ = self.client.close(info.file_id);
@@ -195,6 +254,7 @@ impl State {
                 file: info.file_id,
                 path: path.to_vec(),
                 writable,
+                unlinked_name: None,
             },
         );
         Some(Vnode {
@@ -237,16 +297,9 @@ impl State {
             if directory { DIRECTORY } else { 0 },
         )?;
         let result = if let Some(name) = rename {
-            let name: Vec<u8> = name
-                .replace('/', "\\")
-                .encode_utf16()
-                .flat_map(u16::to_le_bytes)
-                .collect();
-            let mut data = vec![0; 20];
-            data[0] = 1;
-            data[16..20].copy_from_slice(&(name.len() as u32).to_le_bytes());
-            data.extend_from_slice(&name);
-            self.client.set_info(info.file_id, 10, data)
+            self.rename_handle(info.file_id, name, true)
+        } else if !directory && self.handles.values().any(|h| h.path == path.as_bytes()) {
+            self.unlink_open(info.file_id, path)
         } else {
             self.client.set_info(info.file_id, 13, vec![1])
         };
@@ -412,6 +465,7 @@ impl Filesystem for SmbFs {
         // VFS open is mode-independent. Upgrade a read handle lazily, leaving
         // read-only shares readable and letting the server enforce writes.
         if !handle.writable {
+            if handle.path.is_empty() { return -13; }
             let p = handle.path.clone();
             let old = handle.file;
             let Some(p) = path(&p) else { return -22 };
@@ -530,6 +584,8 @@ impl Filesystem for SmbFs {
                 if e.file_name == "." || e.file_name == ".." {
                     continue;
                 }
+                if p == s.unlink_root && s.handles.values().any(|h|
+                    h.unlinked_name.as_deref() == Some(e.file_name.as_bytes())) { continue; }
                 let name = e.file_name.into_bytes();
                 let name_len = name.len();
                 let mut link = None;
@@ -718,6 +774,7 @@ pub fn mount_configured() {
                     handles: BTreeMap::new(),
                     directories: BTreeMap::new(),
                     next: 1,
+                    unlink_root: mount.subdir.trim_matches('/').into(),
                 }))));
                 let subdir = mount.subdir.trim_matches('/').as_bytes();
                 if !subdir.is_empty() && !fs.dir_exists(subdir) {

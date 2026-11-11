@@ -29,12 +29,15 @@ def main():
                 with connection:
                     connection.settimeout(10)
                     connection.sendall(b'HELLO')
-                    received = b''
-                    while len(received) < 4:
-                        data = connection.recv(4 - len(received))
-                        assert data, 'TCP client closed before acknowledging the data'
-                        received += data
-                    assert received == b'done'
+                    for expected in (b'next', b'done'):
+                        received = b''
+                        while len(received) < 4:
+                            data = connection.recv(4 - len(received))
+                            assert data, 'TCP client closed before acknowledging the data'
+                            received += data
+                        assert received == expected
+                        if expected == b'next':
+                            connection.sendall(b'WORLD')
             except BaseException as error:
                 errors.append(error)
 
@@ -52,6 +55,7 @@ def main():
         subprocess.run(['mkfs.ext4', '-q', '-F', '-d', str(tree), str(data)], check=True)
         boot = prepare_boot(work, data, '[environment]\nTEST=/probe\n')
         log = ROOT / 'build/ci/epoll-network.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
         with log.open('w') as output:
             process = subprocess.Popen(['qemu-system-x86_64', '-accel', 'kvm', '-cpu', 'host',
                 '-m', '256', '-display', 'none', '-serial', 'none', '-no-reboot',

@@ -49,6 +49,7 @@ impl VolumeStorage {
 
     #[inline(never)]
     fn read_direct(&mut self, offset: u64, output: &mut [u8], kind: ReadKind) -> Result<(), StorageError> {
+        let sample = crate::kernel::event_profile::file_io_start();
         let kind = match kind {
             ReadKind::Metadata => crate::kernel::block::ReadKind::Metadata,
             ReadKind::FileData => crate::kernel::block::ReadKind::FileData,
@@ -94,6 +95,7 @@ impl VolumeStorage {
             }
             output[copied..].copy_from_slice(&sector[..len - copied]);
         }
+        crate::kernel::event_profile::file_io_finish(10, len, sample);
         Ok(())
     }
 }
@@ -155,6 +157,7 @@ impl Storage for VolumeStorage {
     }
 
     fn flush(&mut self) -> Result<(), StorageError> {
+        let _sample = crate::kernel::event_profile::FileIoScope::start(22, 0);
         for write in &self.writes {
             let sectors = write.bytes.len().div_ceil(512);
             if !write.offset.is_multiple_of(512)
@@ -173,6 +176,7 @@ impl Storage for VolumeStorage {
 #[derive(Default)]
 struct OpenFiles {
     slots: Vec<Option<Object>>,
+    unlinked: Vec<Object>,
 }
 
 impl OpenFiles {
@@ -263,8 +267,10 @@ pub struct PortableExt4Fs {
 impl PortableExt4Fs {
     pub fn new(volume: Volume) -> Result<Self, &'static str> {
         let mut storage = VolumeStorage::new(volume);
-        let filesystem = HandleFilesystem::mount(&mut storage)
+        let mut filesystem = HandleFilesystem::mount(&mut storage)
             .map_err(|_| "portable ext4 mount failed")?;
+        // Unsupported journal formats retain their prior direct-commit behavior.
+        let _ = filesystem.enable_writeback(&mut storage);
         Ok(Self {
             mounted: RefCell::new(MountedExt4 {
                 filesystem,
@@ -281,7 +287,10 @@ impl PortableExt4Fs {
         };
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
-        filesystem.write(storage, pending.blob, pending.offset, &pending.bytes)
+        {
+            let _sample = crate::kernel::event_profile::FileIoScope::start(33, pending.bytes.len());
+            filesystem.write(storage, pending.blob, pending.offset, &pending.bytes)
+        }
     }
 
     fn path(path: &[u8]) -> Option<&[u8]> {
@@ -430,7 +439,30 @@ impl Filesystem for PortableExt4Fs {
         self.open.borrow().get(handle).map(Object::opaque)
     }
 
+    fn meta_node(&self, node: u64) -> Option<Meta> {
+        self.flush_pending().ok()?;
+        let object = Object::from_opaque(node)?;
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        let info = filesystem.inspect(storage, object).ok()?;
+        Some(Meta { uid: info.owner, gid: info.group, mode: u32::from(info.format) })
+    }
+
     fn format_name(&self) -> &'static str { "ext4" }
+
+    fn statfs(&self) -> Result<crate::kernel::vfs::FsStats, i32> {
+        self.flush_pending().map_err(|_| -5)?;
+        let stats = self.mounted.borrow().filesystem.statistics();
+        let id = u64::from_le_bytes(stats.uuid[..8].try_into().unwrap())
+            ^ u64::from_le_bytes(stats.uuid[8..].try_into().unwrap());
+        Ok(crate::kernel::vfs::FsStats {
+            kind: 0xef53, block_size: u64::from(stats.block_size), blocks: stats.blocks,
+            free_blocks: stats.free_blocks, available_blocks: stats.available_blocks,
+            files: stats.inodes, free_files: stats.free_inodes, id, name_max: 255, flags: 0,
+        })
+    }
+
+
 
     fn root_node(&self) -> Option<u64> {
         self.flush_pending().ok()?;
@@ -501,7 +533,10 @@ impl Filesystem for PortableExt4Fs {
         };
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
-        let Ok(count) = filesystem.read(storage, blob, u64::from(offset), output) else {
+        let sample = crate::kernel::event_profile::file_io_start();
+        let result = filesystem.read(storage, blob, u64::from(offset), output);
+        crate::kernel::event_profile::file_io_finish(9, output.len(), sample);
+        let Ok(count) = result else {
             return -5;
         };
         drop(mounted);
@@ -515,6 +550,7 @@ impl Filesystem for PortableExt4Fs {
     }
 
     fn resize(&self, handle: u64, size: u32) -> i32 {
+        let _sample = crate::kernel::event_profile::FileIoScope::start(37, 0);
         let Some(Object::Blob(blob)) = self.open.borrow().get(handle) else { return -9; };
         if self.flush_pending().is_err() { return -5; }
         let mut mounted = self.mounted.borrow_mut();
@@ -572,6 +608,11 @@ impl Filesystem for PortableExt4Fs {
     }
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
+        self.create_mode(path, 0o664)
+    }
+
+    fn create_mode(&self, path: &[u8], mode: u32) -> Option<Vnode> {
+        let _sample = crate::kernel::event_profile::FileIoScope::start(30, 0);
         let path = Self::path(path)?;
         if let Ok(mut info) = self.resolve(path) {
             let blob = graph_blob(info)?;
@@ -593,9 +634,10 @@ impl Filesystem for PortableExt4Fs {
                 parent,
                 name,
                 AttributeUpdate {
-                    format: Some(TYPE_BLOB | 0o664),
+                    format: Some(TYPE_BLOB | mode as u16 & 0x0fff),
                     owner: Some(parent_info.owner),
                     group: Some(parent_info.group),
+                    modified: crate::kernel::clock::rtc_unix_timestamp(),
                     ..AttributeUpdate::default()
                 },
             )
@@ -610,6 +652,11 @@ impl Filesystem for PortableExt4Fs {
     }
 
     fn mkdir(&self, path: &[u8]) -> i32 {
+        self.mkdir_mode(path, 0o775)
+    }
+
+    fn mkdir_mode(&self, path: &[u8], mode: u32) -> i32 {
+        let _sample = crate::kernel::event_profile::FileIoScope::start(32, 0);
         let Some(path) = Self::path(path) else {
             return -22;
         };
@@ -630,9 +677,10 @@ impl Filesystem for PortableExt4Fs {
                 parent,
                 name,
                 AttributeUpdate {
-                    format: Some(TYPE_NODE | 0o775),
+                    format: Some(TYPE_NODE | mode as u16 & 0x0fff),
                     owner: Some(parent_info.owner),
                     group: Some(parent_info.group),
+                    modified: crate::kernel::clock::rtc_unix_timestamp(),
                     ..AttributeUpdate::default()
                 },
             )
@@ -657,6 +705,7 @@ impl Filesystem for PortableExt4Fs {
     }
 
     fn rmdir(&self, path: &[u8]) -> i32 {
+        let _sample = crate::kernel::event_profile::FileIoScope::start(35, 0);
         let Some(path) = Self::path(path) else {
             return -22;
         };
@@ -710,6 +759,7 @@ impl Filesystem for PortableExt4Fs {
     }
 
     fn flush(&self, _path: &[u8]) -> i32 {
+        let _sample = crate::kernel::event_profile::FileIoScope::start(36, 0);
         self.flush_pending().map_or(-5, |_| 0)
     }
 
@@ -717,7 +767,18 @@ impl Filesystem for PortableExt4Fs {
         if self.flush_pending().is_err() {
             return -5;
         }
-        self.mounted.borrow_mut().storage.flush().map_or(-5, |_| 0)
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        if filesystem.sync(storage).is_err() { return -5; }
+        storage.flush().map_or(-5, |_| 0)
+    }
+
+    fn writeback(&self) -> i32 {
+        if self.pending.borrow().is_none() && !self.mounted.borrow().filesystem.has_pending() { return 0; }
+        if self.flush_pending().is_err() { return -5; }
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem.sync(storage).map_or(-5, |_| 0)
     }
 
     fn readdir(
@@ -760,6 +821,7 @@ impl Filesystem for PortableExt4Fs {
         let Ok(info) = self.resolve(path) else {
             return false;
         };
+        if info.modified == mtime { return true; }
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
         filesystem
@@ -784,12 +846,16 @@ impl Filesystem for PortableExt4Fs {
     }
 
     fn set_meta(&self, path: &[u8], uid: u32, gid: u32, mode: u32) -> bool {
+        let _sample = crate::kernel::event_profile::FileIoScope::start(31, 0);
         let Some(path) = Self::path(path) else {
             return false;
         };
         let Ok(info) = self.resolve(path) else {
             return false;
         };
+        if info.owner == uid && info.group == gid && u32::from(info.format & 0x0fff) == mode & 0x0fff {
+            return true;
+        }
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
         filesystem
@@ -807,6 +873,7 @@ impl Filesystem for PortableExt4Fs {
     }
 
     fn remove(&self, path: &[u8]) -> i32 {
+        let _sample = crate::kernel::event_profile::FileIoScope::start(34, 0);
         let Some(path) = Self::path(path) else {
             return -22;
         };
@@ -816,11 +883,15 @@ impl Filesystem for PortableExt4Fs {
         if matches!(edge.object, Object::Node(_)) {
             return -21;
         }
-        if self.open.borrow().contains(edge.object) {
-            return -16;
-        }
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
+        if self.open.borrow().contains(edge.object) {
+            return match filesystem.remove_open(storage, edge.handle) {
+                Ok(Some(object)) => { self.open.borrow_mut().unlinked.push(object); 0 }
+                Ok(None) => 0,
+                Err(_) => -5,
+            };
+        }
         filesystem
             .remove(storage, edge.handle)
             .map_or(-5, |_| 0)
@@ -828,7 +899,16 @@ impl Filesystem for PortableExt4Fs {
 
     fn clunk(&self, handle: u64) -> i32 {
         let result = self.flush_pending().map_or(-5, |_| 0);
-        self.open.borrow_mut().remove(handle);
+        let mut opens = self.open.borrow_mut();
+        let object = opens.get(handle);
+        opens.remove(handle);
+        if let Some(object) = object
+            && !opens.contains(object) && opens.unlinked.contains(&object) {
+            let mut mounted = self.mounted.borrow_mut();
+            let (filesystem, storage) = mounted.parts();
+            if filesystem.release_orphan(storage, object).is_err() { return -5; }
+            opens.unlinked.retain(|entry| *entry != object);
+        }
         result
     }
 }

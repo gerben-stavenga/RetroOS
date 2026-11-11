@@ -1167,6 +1167,14 @@ integration_test(
 )
 
 integration_test(
+    name = "linux_code_mode_native",
+    command = ["python3", "test/linux_code_mode_native.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
     name = "linux_code_mode_host",
     command = ["python3", "test/linux_code_mode_host.py"],
     sources = ["//:integration_sources"],
@@ -1299,11 +1307,203 @@ integration_test(
 )
 
 integration_test(
+    name = "linux_console_responsiveness",
+    command = ["python3", "test/linux_console_focus.py", "--busy-helper"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_responsiveness",
+    command = ["python3", "test/linux_responsiveness.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_dn_shell",
+    command = ["python3", "test/linux_dn_shell.py", "--native-root", "--sound", "hda", "--cpus", "2"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk", "//kernel:kernel_elf"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_ext4_batching",
+    command = ["python3", "test/linux_ext4_batching.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_identity",
+    command = ["python3", "test/linux_identity.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_ps",
+    command = ["python3", "test/linux_ps.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_unix_socket",
+    command = ["python3", "test/linux_unix_socket.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_statfs",
+    command = ["python3", "test/linux_statfs.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_permissions",
+    command = ["python3", "test/linux_permissions.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_metadata",
+    command = ["python3", "test/linux_metadata.py", "--filled"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_persistence",
+    command = ["python3", "test/linux_persistence.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_boot_id",
+    command = ["python3", "test/linux_boot_id.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_parent_death",
+    command = ["python3", "test/linux_parent_death.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
     name = "linux_signal",
     command = ["python3", "test/linux_signal.py"],
     sources = ["//:integration_sources"],
     metal = ["//:boot_disk"],
     tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_sigchld",
+    command = ["python3", "test/linux_sigchld.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_time_high",
+    command = ["python3", "test/linux_time_high.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_high_stack",
+    command = ["python3", "test/linux_high_stack.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_brk",
+    command = ["python3", "test/linux_brk.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_kill",
+    command = ["python3", "test/linux_kill.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_temp_build",
+    command = ["python3", "test/linux_time_accounting.py", "--backend", "ext4", "--workload", "temp-build"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_exec_cache",
+    command = ["python3", "test/linux_exec_cache.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_code_mode_stress",
+    command = ["python3", "test/linux_code_mode_stress.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_exec_server_native",
+    command = ["python3", "test/linux_exec_server_native.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_fd_limits",
+    command = ["python3", "test/linux_fd_limits.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_build_profile",
+    command = ["python3", "test/linux_build_profile.py", "--native-ext4"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "requires-qemu-kvm"],
 )
 
 integration_test(
@@ -1317,6 +1517,38 @@ integration_test(
 integration_test(
     name = "linux_smb_symlink",
     command = ["python3", "test/linux_smb_symlink.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_smb_native_cleanup",
+    command = ["python3", "test/linux_smb_native_cleanup.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "known-failure", "no-cache", "no-sandbox", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_open_file_cleanup",
+    command = ["python3", "test/linux_open_file_cleanup.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_sqlite_ext4",
+    command = ["python3", "test/linux_sqlite.py", "--ext4-home"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_fsync_crash",
+    command = ["python3", "test/linux_fsync_crash.py"],
     sources = ["//:integration_sources"],
     metal = ["//:boot_disk"],
     tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
@@ -1341,6 +1573,22 @@ integration_test(
 integration_test(
     name = "linux_timestamps",
     command = ["python3", "test/linux_timestamps.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_high_memory",
+    command = ["python3", "test/linux_high_memory.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_paging_timing",
+    command = ["python3", "test/linux_paging_timing.py"],
     sources = ["//:integration_sources"],
     metal = ["//:boot_disk"],
     tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
@@ -1640,12 +1888,34 @@ test_suite(
         ":linux_rustc",
         ":linux_script",
         ":linux_shell_echo",
+        ":linux_boot_id",
+        ":linux_persistence",
+        ":linux_ps",
+        ":linux_identity",
+        ":linux_ext4_batching",
+        ":linux_dn_shell",
+        ":linux_responsiveness",
+        ":linux_console_responsiveness",
+        ":linux_permissions",
+        ":linux_statfs",
+        ":linux_unix_socket",
+        ":linux_parent_death",
         ":linux_signal",
+        ":linux_sigchld",
+        ":linux_time_high",
+        ":linux_high_stack",
+        ":linux_brk",
+        ":linux_kill",
+        ":linux_temp_build",
+        ":linux_exec_cache",
+        ":linux_open_file_cleanup",
         ":linux_smb_read",
         ":linux_smb_symlink",
         ":linux_sqlite",
+        ":linux_sqlite_ext4",
         ":linux_symlink",
         ":linux_timestamps",
+        ":linux_high_memory",
         ":linux_vsyscall",
         ":linux_xmm_context",
         ":live_root",

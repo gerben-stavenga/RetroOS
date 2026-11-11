@@ -58,10 +58,17 @@ impl Drop for ExecutableFile {
 }
 
 impl ExecutableFile {
+    pub(crate) fn cached_image(&self, free_pages: usize, end: usize) -> Result<Option<alloc::sync::Arc<Vec<u8>>>, i32> {
+        vfs::executable::image(self.handle, free_pages.saturating_mul(4096), end)
+    }
+
     pub(crate) fn read_exact(&self, offset: usize, mut bytes: &mut [u8]) -> Result<(), i32> {
         let end = offset.checked_add(bytes.len()).ok_or(8)?;
         if end > self.size || offset > i32::MAX as usize { return Err(8); }
-        if vfs::seek_by_handle(self.handle, offset as i32, 0) < 0 { return Err(5); }
+        let sample = crate::kernel::event_profile::file_io_start();
+        let result = vfs::seek_by_handle(self.handle, offset as i32, 0);
+        crate::kernel::event_profile::file_io_finish(15, bytes.len(), sample);
+        if result < 0 { return Err(5); }
         while !bytes.is_empty() {
             let count = vfs::read_by_handle(self.handle, bytes);
             if count <= 0 { return Err(5); }

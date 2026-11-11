@@ -859,12 +859,12 @@ pub(super) fn init_win16_psp<A: crate::Arch>(machine: &mut A, psp: u16) {
         ..Default::default()
     };
     value.jft[..3].copy_from_slice(&[0, 1, 2]);
-    value.max_files = thread::MAX_FDS as u16;
+    value.max_files = thread::MAX_DOS_FDS as u16;
     value.jft_far_off = 0x100;
     value.jft_far_seg = psp;
     value.cmdline[0] = 0x0d;
     lowmem::Psp::store(machine, psp, value);
-    for i in 0..thread::MAX_FDS {
+    for i in 0..thread::MAX_DOS_FDS {
         machine.write::<u8>((usize::from(psp) << 4) + 0x100 + i, if i < 3 { i as u8 } else { 0xff });
     }
 }
@@ -875,9 +875,9 @@ pub(super) fn init_win16_psp<A: crate::Arch>(machine: &mut A, psp: u16) {
 pub(super) fn sync_win16_handles<A: crate::Arch>(
     machine: &mut A, kt: &thread::KernelThread<A>, dos: &thread::DosState<A>,
 ) {
-    let count = usize::from(lowmem::Psp::max_files(machine, dos.current_psp)).min(thread::MAX_FDS);
+    let count = usize::from(lowmem::Psp::max_files(machine, dos.current_psp)).min(thread::MAX_DOS_FDS);
     let address = lowmem::Psp::jft_addr(machine, dos.current_psp);
-    let mut entries = [0xff; thread::MAX_FDS];
+    let mut entries = [0xff; thread::MAX_DOS_FDS];
     for (i, fd) in kt.fds.iter().enumerate().take(count) {
         if !fd.is_none() { entries[i] = i as u8; }
     }

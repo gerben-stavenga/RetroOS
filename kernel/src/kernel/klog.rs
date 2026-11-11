@@ -44,7 +44,7 @@ pub use klog::line;
 /// Save one stable pre-launch snapshot through the normal C: write policy.
 /// A failed export must not prevent the interactive startup program running.
 pub fn save_boot_snapshot<A: crate::Arch>(machine: &mut A) -> Result<(), i32> {
-    use crate::kernel::{thread::{FdKind, MAX_FDS}, vfs};
+    use crate::kernel::vfs;
 
     // Copy before filesystem I/O, which can itself append diagnostics. Start
     // the later live writer at this point so no subsequent byte is skipped.
@@ -53,7 +53,7 @@ pub fn save_boot_snapshot<A: crate::Arch>(machine: &mut A) -> Result<(), i32> {
     let captured_through = start + len;
     bytes.truncate(len);
     let (index, path) = next_backing_path().ok_or(-28)?;
-    let mut fds = [FdKind::None; MAX_FDS];
+    let mut fds = crate::kernel::thread::empty_fds();
     let fd = vfs::create(&path, &mut fds);
     if fd < 0 {
         return Err(fd);
@@ -163,7 +163,8 @@ pub fn sync_live() {
     if next >= end && !LIVE_DIRTY.load(Ordering::Acquire) {
         return;
     }
-    let _stall = crate::kernel::portio::StallWatch::new("klog disk flush");
+    // Timing this flush by logging its own stall creates new dirty bytes,
+    // causing another durable flush every second even after the guest is idle.
     let mut chunk = [0u8; 1024];
     while next < end {
         let (start, available) = klog::read_since(next, &mut chunk);

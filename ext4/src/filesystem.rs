@@ -3,18 +3,20 @@
 use crate::ext4::{
     AttributeUpdate, Blob, Edge, EdgeCursor, EdgeHandle, Ext4 as Graph, Node, Object, ObjectInfo,
 };
-use crate::{BlockOverlay, Error, GraphJournal, Storage, StorageError};
+use crate::{BlockChanges, BlockOverlay, Error, GraphJournal, Storage, StorageError};
 
 type Mutation<'a> = dyn FnMut(&mut Graph, &mut dyn Storage) -> Result<Option<Object>, Error> + 'a;
 
 struct RecoveredStorage<'a> {
     base: &'a mut dyn Storage,
     journal: &'a GraphJournal,
+    pending: &'a BlockChanges,
+    block_size: u32,
 }
 
 impl<'a> RecoveredStorage<'a> {
-    fn new(base: &'a mut dyn Storage, journal: &'a GraphJournal) -> Self {
-        Self { base, journal }
+    fn new(base: &'a mut dyn Storage, journal: &'a GraphJournal, pending: &'a BlockChanges, block_size: u32) -> Self {
+        Self { base, journal, pending, block_size }
     }
 }
 
@@ -28,7 +30,9 @@ impl Storage for RecoveredStorage<'_> {
     }
 
     fn read_with_kind(&mut self, offset: u64, output: &mut [u8], kind: crate::ReadKind) -> Result<(), StorageError> {
-        self.journal.read_storage(self.base, offset, output, kind)
+        self.journal.read_storage(self.base, offset, output, kind)?;
+        self.pending.apply(u64::from(self.block_size), offset, output);
+        Ok(())
     }
 
     fn write(&mut self, offset: u64, input: &[u8]) -> Result<(), StorageError> {
@@ -40,6 +44,18 @@ impl Storage for RecoveredStorage<'_> {
     }
 }
 
+/// Allocation accounting from the mounted graph, after journal recovery.
+#[derive(Clone, Copy, Debug)]
+pub struct Statistics {
+    pub block_size: u32,
+    pub blocks: u64,
+    pub free_blocks: u64,
+    pub available_blocks: u64,
+    pub inodes: u64,
+    pub free_inodes: u64,
+    pub uuid: [u8; 16],
+}
+
 /// A mounted ext4 filesystem whose public identities are graph handles.
 ///
 /// Paths, symlink traversal, descriptors, credentials, and errno policy are
@@ -48,6 +64,9 @@ impl Storage for RecoveredStorage<'_> {
 pub struct Filesystem {
     graph: Graph,
     journal: GraphJournal,
+    pending: BlockChanges,
+    writeback_limit: usize,
+    recover_orphans: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -57,17 +76,53 @@ enum ObjectKind {
 }
 
 impl Filesystem {
+    /// Group small mutations until sync or the bounded transaction fills.
+    /// Visibility uses the same block overlay as recovery; journal ordering
+    /// and barriers remain unchanged when a batch is committed.
+    pub fn enable_writeback(&mut self, storage: &mut dyn Storage) -> Result<(), Error> {
+        self.writeback_limit = self.journal.writeback_limit(&self.graph, storage)?;
+        Ok(())
+    }
+
+    pub fn has_pending(&self) -> bool { !self.pending.blocks.is_empty() }
+
+    fn commit_blocks(&mut self, storage: &mut dyn Storage, dirty: BlockChanges) -> Result<(), Error> {
+        if let Err(error) = self.journal.commit_blocks(&self.graph, storage, dirty) {
+            self.graph = Graph::mount(&mut RecoveredStorage::new(storage, &self.journal, &self.pending, self.graph.block_size))?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Make every staged mutation durable through the normal JBD2 writer.
+    pub fn sync(&mut self, storage: &mut dyn Storage) -> Result<(), Error> {
+        let dirty = core::mem::take(&mut self.pending);
+        self.commit_blocks(storage, dirty)
+    }
+
+    pub fn statistics(&self) -> Statistics {
+        Statistics {
+            block_size: self.graph.block_size, blocks: self.graph.blocks_count,
+            free_blocks: self.graph.free_blocks,
+            available_blocks: self.graph.free_blocks.saturating_sub(self.graph.reserved_blocks),
+            inodes: u64::from(self.graph.inodes_count), free_inodes: u64::from(self.graph.free_inodes),
+            uuid: self.graph.uuid,
+        }
+    }
+
     #[inline(never)]
     pub fn mount(storage: &mut dyn Storage) -> Result<Self, Error> {
         let mut graph = Graph::mount(storage)?;
         let journal = GraphJournal::mount(&mut graph, storage)?;
-        let graph = Graph::mount(&mut RecoveredStorage::new(storage, &journal))?;
-        Ok(Self { graph, journal })
+        let pending = BlockChanges::default();
+        let block_size = graph.block_size;
+        let graph = Graph::mount(&mut RecoveredStorage::new(storage, &journal, &pending, block_size))?;
+        Ok(Self { graph, journal, pending, writeback_limit: 0, recover_orphans: true })
     }
 
     pub fn root(&mut self, storage: &mut dyn Storage) -> Result<Node, Error> {
         self.graph
-            .root(&mut RecoveredStorage::new(storage, &self.journal))
+            .root(&mut RecoveredStorage::new(storage, &self.journal, &self.pending, self.graph.block_size))
     }
 
     pub fn inspect(
@@ -76,7 +131,7 @@ impl Filesystem {
         object: Object,
     ) -> Result<ObjectInfo, Error> {
         self.graph.inspect(
-            &mut RecoveredStorage::new(storage, &self.journal),
+            &mut RecoveredStorage::new(storage, &self.journal, &self.pending, self.graph.block_size),
             object,
         )
     }
@@ -89,7 +144,7 @@ impl Filesystem {
         visit: &mut dyn FnMut(Edge<'_>) -> Result<bool, Error>,
     ) -> Result<Option<EdgeCursor>, Error> {
         self.graph.edges(
-            &mut RecoveredStorage::new(storage, &self.journal),
+            &mut RecoveredStorage::new(storage, &self.journal, &self.pending, self.graph.block_size),
             node,
             cursor,
             visit,
@@ -104,7 +159,7 @@ impl Filesystem {
         visit: &mut dyn FnMut(Edge<'_>, ObjectInfo) -> Result<bool, Error>,
     ) -> Result<Option<EdgeCursor>, Error> {
         self.graph.entries(
-            &mut RecoveredStorage::new(storage, &self.journal),
+            &mut RecoveredStorage::new(storage, &self.journal, &self.pending, self.graph.block_size),
             node,
             cursor,
             visit,
@@ -119,7 +174,7 @@ impl Filesystem {
         output: &mut [u8],
     ) -> Result<usize, Error> {
         self.graph.read(
-            &mut RecoveredStorage::new(storage, &self.journal),
+            &mut RecoveredStorage::new(storage, &self.journal, &self.pending, self.graph.block_size),
             blob,
             offset,
             output,
@@ -132,9 +187,10 @@ impl Filesystem {
         node: Node,
         name: &[u8],
     ) -> Result<Option<(EdgeHandle, Object)>, Error> {
+        let block_size = self.graph.block_size;
         find(
             &mut self.graph,
-            &mut RecoveredStorage::new(storage, &self.journal),
+            &mut RecoveredStorage::new(storage, &self.journal, &self.pending, block_size),
             node,
             name,
         )
@@ -145,8 +201,24 @@ impl Filesystem {
         storage: &mut dyn Storage,
         operation: &mut Mutation<'_>,
     ) -> Result<Option<Object>, Error> {
+        self.journal.checkpoint_recovery(&self.graph, storage)?;
+        if self.recover_orphans {
+            // Mount/probe stays read-only. The first authorized mutation
+            // reclaims orphaned opens left by the previous boot, using the
+            // same journal path as ordinary unlink and close.
+            self.recover_orphans = false;
+            let result = (|| {
+                loop {
+                    let object = self.graph.first_orphan(&mut RecoveredStorage::new(
+                        storage, &self.journal, &self.pending, self.graph.block_size))?;
+                    let Some(object) = object else { return Ok(()); };
+                    self.release_orphan(storage, object)?;
+                }
+            })();
+            if let Err(error) = result { self.recover_orphans = true; return Err(error); }
+        }
         let (result, dirty) = {
-            let mut recovered = RecoveredStorage::new(storage, &self.journal);
+            let mut recovered = RecoveredStorage::new(storage, &self.journal, &self.pending, self.graph.block_size);
             let mut overlay = BlockOverlay::new(&mut recovered, self.graph.block_size);
             let result = match operation(&mut self.graph, &mut overlay) {
                 Ok(result) => result,
@@ -158,9 +230,21 @@ impl Filesystem {
             };
             (result, overlay.finish())
         };
-        if let Err(error) = self.journal.commit_blocks(&self.graph, storage, dirty) {
-            self.graph = Graph::mount(&mut RecoveredStorage::new(storage, &self.journal))?;
-            return Err(error);
+        if self.writeback_limit == 0 {
+            self.commit_blocks(storage, dirty)?;
+        } else {
+            // A single unusually large operation keeps its old direct-commit
+            // behavior. Small operations share a bounded journal transaction.
+            let additional = dirty.blocks.iter().filter(|block| self.pending.index(block.number).is_err()).count();
+            if self.pending.blocks.len() + additional > self.writeback_limit {
+                self.sync(storage)?;
+            }
+            if dirty.blocks.len() >= self.writeback_limit {
+                self.commit_blocks(storage, dirty)?;
+            } else if let Err(error) = self.pending.merge(dirty) {
+                self.graph = Graph::mount(&mut RecoveredStorage::new(storage, &self.journal, &self.pending, self.graph.block_size))?;
+                return Err(error);
+            }
         }
         Ok(result)
     }
@@ -276,6 +360,20 @@ impl Filesystem {
         self.mutate(storage, &mut |graph, storage| {
             let detached = graph.detach(storage, edge)?;
             graph.release(storage, detached)?;
+            Ok(None)
+        })?;
+        Ok(())
+    }
+
+    /// Remove a name while an external open retains the blob. Returns the
+    /// zero-link object whose last close must call `release_orphan`.
+    pub fn remove_open(&mut self, storage: &mut dyn Storage, edge: EdgeHandle) -> Result<Option<Object>, Error> {
+        self.mutate(storage, &mut |graph, storage| graph.remove_open(storage, edge))
+    }
+
+    pub fn release_orphan(&mut self, storage: &mut dyn Storage, object: Object) -> Result<(), Error> {
+        self.mutate(storage, &mut |graph, storage| {
+            graph.release_orphan(storage, object)?;
             Ok(None)
         })?;
         Ok(())

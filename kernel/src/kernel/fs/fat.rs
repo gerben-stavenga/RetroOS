@@ -241,6 +241,15 @@ impl<T: fatfs::ReadWriteSeek + 'static> FatState<T> {
     fn media(&self) -> &fatfs::FileSystem<T> {
         self.media.as_ref().expect("FAT filesystem is unmounted")
     }
+
+    fn invalidate_file(&mut self, path: &[u8]) {
+        // A cached reader owns a snapshot of the size/cluster chain and may
+        // write that snapshot back on drop (access-date updates). Retire ALL
+        // readers of the file before changing its metadata, not only the fd
+        // used for the write. VFS supplies resolved long names here.
+        let opens = &self.opens;
+        self.handles.retain(|id, _| !opens.get(id).is_some_and(|p| p.eq_ignore_ascii_case(path)));
+    }
 }
 
 pub struct FatFs<T: fatfs::ReadWriteSeek + 'static> {
@@ -394,6 +403,48 @@ pub(crate) mod tests {
         let volume = Volume::whole(disk);
         fatfs::format_volume(&mut VolumeIo::new(volume, true), fatfs::FormatVolumeOptions::new().fat_type(kind)).unwrap();
         (disk, volume)
+    }
+
+    #[test]
+    fn independent_handles_observe_growth_and_cannot_restore_old_size() {
+        let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
+        let fs = FatFs::new(VolumeIo::new(volume, true)).unwrap();
+        let writer = fs.create(b"object.o").unwrap();
+        let reader = fs.open(b"object.o").unwrap();
+        let mut bytes = [0; 4];
+        // An already-open reader must observe another descriptor's growth.
+        assert_eq!(fs.read(reader.handle, 0, &mut bytes, 0), 0);
+        assert_eq!(fs.write(writer.handle, 0, b"ELF!"), 4);
+        assert_eq!(fs.read(reader.handle, 0, &mut bytes, 4), 4);
+        assert_eq!(&bytes, b"ELF!");
+        fs.clunk(reader.handle);
+        let reader = fs.open(b"object.o").unwrap();
+        assert_eq!(fs.read(reader.handle, 0, &mut bytes, 4), 4);
+        assert_eq!(fs.write(writer.handle, 4, b"tail"), 4);
+        fs.clunk(reader.handle);
+        fs.clunk(writer.handle);
+        let reopened = fs.open(b"object.o").unwrap();
+        assert_eq!(reopened.size, 8);
+        fs.clunk(reopened.handle);
+    }
+
+    #[test]
+    fn positioned_writes_preserve_offsets_and_zero_the_gap() {
+        let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
+        let fs = FatFs::new(VolumeIo::new(volume, true)).unwrap();
+        let node = fs.create(b"sparse.o").unwrap();
+        assert_eq!(fs.write(node.handle, 8193, b"END"), 3);
+        assert_eq!(fs.write(node.handle, 0, b"ELF!"), 4);
+        assert_eq!(fs.write(node.handle, 16384, b""), 0);
+        fs.clunk(node.handle);
+        let node = fs.open(b"sparse.o").unwrap();
+        assert_eq!(node.size, 8196);
+        let mut bytes = alloc::vec![0xff; node.size as usize];
+        assert_eq!(fs.read(node.handle, 0, &mut bytes, node.size), 8196);
+        assert_eq!(&bytes[..4], b"ELF!");
+        assert!(bytes[4..8193].iter().all(|b| *b == 0));
+        assert_eq!(&bytes[8193..], b"END");
+        fs.clunk(node.handle);
     }
 
     #[test]
@@ -573,6 +624,18 @@ pub(crate) mod tests {
 
 impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
     fn format_name(&self) -> &'static str { "FAT" }
+
+    fn statfs(&self) -> Result<crate::kernel::vfs::FsStats, i32> {
+        let state = self.state.lock();
+        let stats = state.media().stats().map_err(|_| -5)?;
+        Ok(crate::kernel::vfs::FsStats {
+            kind: 0x4d44, block_size: u64::from(state.media().cluster_size()),
+            blocks: u64::from(stats.total_clusters()), free_blocks: u64::from(stats.free_clusters()),
+            available_blocks: u64::from(stats.free_clusters()), name_max: 255,
+            flags: if self.writable { 0 } else { 1 }, ..crate::kernel::vfs::FsStats::default()
+        })
+    }
+
 
     fn unmount(&self) -> i32 {
         if !self.writable { return 0; }
@@ -771,23 +834,31 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
     fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {
         let inner = u32::try_from(handle).unwrap_or(0);
         let mut state = self.state.lock();
-        // This writes through its own fresh File, independent of any cached
-        // read handle in `state.handles` — drop that cache entry so the next
-        // read reopens and sees the write, instead of the stale size/cluster
-        // position the cached File captured at its own last use.
-        state.handles.remove(&inner);
-        let Some(path) = state.opens.get(&inner) else {
+        let Some(path) = state.opens.get(&inner).cloned() else {
             return -9;
         };
+        if data.is_empty() { return 0; }
+        state.invalidate_file(&path);
         let media = state.media();
-        let Some(path) = path_str(path) else {
+        let Some(path) = path_str(&path) else {
             return -5;
         };
         let Ok(mut file) = media.root_dir().open_file(path) else {
             return -5;
         };
-        if fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(offset as u64)).is_err() {
-            return -5;
+        // fatfs clamps seeks past EOF. Linux/DOS positioned writes must
+        // extend to the requested offset first, or an assembler's initial
+        // header hole silently shifts every subsequent section toward zero.
+        let Ok(position) = fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(offset as u64))
+            else { return -5; };
+        let mut gap = u64::from(offset).saturating_sub(position);
+        let zeros = [0; 4096];
+        while gap != 0 {
+            let count = gap.min(zeros.len() as u64) as usize;
+            match fatfs::Write::write(&mut file, &zeros[..count]) {
+                Ok(0) | Err(_) => return -28,
+                Ok(n) => gap -= n as u64,
+            }
         }
         let mut done = 0;
         while done < data.len() {
@@ -806,11 +877,9 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
     fn resize(&self, handle: u64, size: u32) -> i32 {
         let inner = u32::try_from(handle).unwrap_or(0);
         let mut state = self.state.lock();
-        // Cached File objects retain the previous size and cluster chain,
-        // including other open handles to the same file.
-        state.handles.clear();
-        let Some(path) = state.opens.get(&inner) else { return -9; };
-        let Some(path) = path_str(path) else { return -5; };
+        let Some(path) = state.opens.get(&inner).cloned() else { return -9; };
+        state.invalidate_file(&path);
+        let Some(path) = path_str(&path) else { return -5; };
         let media = state.media();
         let Ok(mut file) = media.root_dir().open_file(path) else { return -5; };
         let Ok(length) = fatfs::Seek::seek(&mut file, fatfs::SeekFrom::End(0)) else { return -5; };
@@ -834,6 +903,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
     fn create(&self, path: &[u8]) -> Option<Vnode> {
         let mode = unix_mode(path, false, self.dos_attributes(path).unwrap_or(0) & 1 != 0);
         let mut state = self.state.lock();
+        state.invalidate_file(path);
         let media = state.media();
         let path_text = path_str(path)?;
         let (parent, name) = path_text.rsplit_once('/').unwrap_or(("", path_text));

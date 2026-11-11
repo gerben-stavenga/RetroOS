@@ -23,7 +23,7 @@ mod tests;
 use alloc::vec::Vec;
 use core::fmt;
 
-pub use filesystem::Filesystem;
+pub use filesystem::{Filesystem, Statistics};
 pub use journal::GraphJournal;
 pub use overlay::{BlockChanges, BlockOverlay};
 pub use storage::{ReadKind, Storage, StorageError};

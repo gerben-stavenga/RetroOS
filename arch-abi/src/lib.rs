@@ -29,8 +29,9 @@ pub struct InterruptHandlers {
 }
 
 /// Flat, exclusive cycle totals for one guest-entry path. Each elapsed
-/// interval belongs to exactly one field, so the phase values may be summed.
-/// Hosted backends may leave them zero.
+/// interval belongs to exactly one phase field, so those values may be summed.
+/// Fault details are nested measurements, excluded from total_cycles.
+/// Hosted backends may leave these counters zero.
 #[derive(Clone, Copy, Default)]
 pub struct ExecutionProfile {
     pub calls: u64,
@@ -47,6 +48,10 @@ pub struct ExecutionProfile {
     pub ring0_exit_frame_out: u64,
     pub bridge_out: u64,
     pub decode: u64,
+    pub user_fault_calls: u64,
+    pub user_fault_cycles: u64,
+    pub kernel_fault_calls: u64,
+    pub kernel_fault_cycles: u64,
 }
 
 impl ExecutionProfile {
@@ -891,7 +896,7 @@ pub enum KernelEvent {
     /// needs to know a scheduling point happened.
     Irq,
     /// Page fault at `addr` (CR2).
-    PageFault { addr: u32 },
+    PageFault { addr: u64 },
     /// CPU-raised fault from ring 3 — e.g. #DE (0), #UD (6), #NP (11), #SS (12),
     /// #AC (17). Never includes #BP/#OF (vectors 3/4) since those are only
     /// raised by the user `INT3`/`INTO` instructions, nor #PF (handled above).
@@ -982,7 +987,7 @@ impl KernelEvent {
     // Private wire format for `encode`/`decode`. Tags are an arbitrary
     // internal numbering — they have no relationship to any CPU vector,
     // IRQ number, or opcode. The arch boundary sees them only as opaque
-    // `(event, extra)` u32 pairs.
+    // `(u32 event, u64 extra)` pairs.
     const IRQ:        u32 = 1;
     const PAGE_FAULT: u32 = 2;
     const EXCEPTION:  u32 = 3;
@@ -998,14 +1003,15 @@ impl KernelEvent {
     const DEBUG_TRAP:   u32 = 13;
     const EMULATED_STEP: u32 = 14;
 
-    /// Encode into the `(event, extra)` u32 pair that flows across the
-    /// arch→kernel boundary as `(eax, edx)`. Total over all variants.
+    /// Encode an event tag and full-width payload. Metal passes the payload
+    /// in ECX:EDX while the compatibility kernel uses 32-bit registers.
     /// Exact inverse of `decode`.
     #[inline]
-    pub fn encode(self) -> (u32, u32) {
-        match self {
+    pub fn encode(self) -> (u32, u64) {
+        if let Self::PageFault { addr } = self { return (Self::PAGE_FAULT, addr); }
+        let (event, extra): (u32, u32) = match self {
             KernelEvent::Irq                  => (Self::IRQ, 0),
-            KernelEvent::PageFault { addr }   => (Self::PAGE_FAULT, addr),
+            KernelEvent::PageFault { .. }     => unreachable!(),
             KernelEvent::Exception(n)         => (Self::EXCEPTION, n as u32),
             KernelEvent::SoftInt(n)           => (Self::SOFT_INT, n as u32),
             KernelEvent::Syscall              => (Self::SYSCALL, 0),
@@ -1018,14 +1024,17 @@ impl KernelEvent {
             KernelEvent::VifWindow { entry_ip, vif_was_on } => (Self::VIF_WINDOW | ((vif_was_on as u32) << 8), entry_ip),
             KernelEvent::DebugTrap              => (Self::DEBUG_TRAP, 0),
             KernelEvent::EmulatedStep { user_was } => (Self::EMULATED_STEP, user_was as u32),
-        }
+        };
+        (event, u64::from(extra))
     }
 
     /// Decode the `(event, extra)` pair produced by `encode`.
-    pub fn decode(event: u32, extra: u32) -> Self {
+    pub fn decode(event: u32, extra: u64) -> Self {
+        if event & 0xFF == Self::PAGE_FAULT { return Self::PageFault { addr: extra }; }
+        let extra = extra as u32;
         match event & 0xFF {
             Self::IRQ        => KernelEvent::Irq,
-            Self::PAGE_FAULT => KernelEvent::PageFault { addr: extra },
+            Self::PAGE_FAULT => unreachable!(),
             Self::EXCEPTION  => KernelEvent::Exception(extra as u8),
             Self::SOFT_INT   => KernelEvent::SoftInt(extra as u8),
             Self::SYSCALL    => KernelEvent::Syscall,

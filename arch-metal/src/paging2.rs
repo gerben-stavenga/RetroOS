@@ -8,6 +8,7 @@
 //! 0xC0800000 - 0xC09FFFFF  PML4 region (2 MB, compat mode only)
 //! 0xC0A00000 - 0xC0AFFFFF  Low memory (1 MB, VGA/BIOS identity map)
 //! 0xC0B00000 - ...         Kernel code/data
+//! 512 GiB - 128 TiB        Sparse 64-bit user mappings (PML4[1..256])
 //! ```
 //!
 //! ## Recursive mapping
@@ -36,7 +37,7 @@
 //!
 //! Per-thread storage (`RootPageTable`):
 //! - Legacy: 768 saved PD entries (user PD[0..768])
-//! - PAE/Compat: 3 saved PDPT entries (user PDPT[0..3]) + CR3
+//! - PAE/Compat: 3 saved PDPT entries + CR3 + 255 high PML4 entries
 //!
 //! Context switch: load thread's user entries into the constant root,
 //! then reload CR3 (flushes TLB, re-reads hardware PDPT in PAE).
@@ -67,7 +68,10 @@
 //! ```
 //!
 //! - CR3 = PML4 phys (constant, unless 64-bit process deshares PML4)
-//! - Fork: share_and_copy(PDPT). Shares PDPT[0..2] (user PDs). Done.
+//! - Low fork: share_and_copy(PDPT), sharing PDPT[0..2].
+//! - High mappings: high_paging walks physical tables through TEMP_PAGE.
+//!   Nonpresent markers reserve uniform subtrees; faults expand them lazily.
+//!   PML4[1..256] are per-process and COW-shared by fork.
 //!
 //! ## PAE mode (pre-x86-64, 3-level)
 //!
@@ -133,12 +137,13 @@ pub const BOOT_IDENTITY_END: usize = 4 * 1024 * 1024;
 /// root at context switch.
 ///
 /// - Legacy: 768 PD entries (user PD[0..768])
-/// - PAE/Compat: 3 PDPT entries (user PDPT[0..3]) + CR3 value
+/// - PAE/Compat: 3 low PDPT entries, CR3, then PML4[1..256].
+///   The high entries fit within the legacy variant's existing 3 KiB storage.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union RootPageTable {
     pub e32: [Entry32; 768],    // Legacy: user PD entries
-    pub e64: [Entry64; 4],      // PAE/Compat: PDPT[0..3] + CR3
+    pub e64: [Entry64; 259],      // Low PDPT[0..3], CR3, high PML4[1..256]
 }
 
 /// Hardware PDPT for PAE mode (32 bytes, loaded by CPU on CR3 reload).
@@ -161,6 +166,7 @@ impl RootPageTable {
     /// Saves current user entries from the constant root.
     /// Save user entries from the constant root into this struct.
     pub fn save(&mut self) {
+        crate::high_paging::save(self);
         match cpu_mode() {
             CpuMode::Legacy => {
                 if let Entries::E32(e) = entries() {
@@ -191,6 +197,7 @@ impl RootPageTable {
     /// Does NOT reload CR3 — call activate() for that, or use with
     /// toggle_cr3() when a mode switch follows.
     pub fn load_entries(&self) {
+        crate::high_paging::load(self);
         match cpu_mode() {
             CpuMode::Legacy => {
                 if let Entries::E32(e) = entries() {
@@ -217,6 +224,7 @@ impl RootPageTable {
     /// Swap user entries between self and the constant root page, then reload CR3.
     /// On return, self holds the old root entries and the constant root has self's former entries.
     pub fn swap_and_activate(&mut self) {
+        crate::high_paging::swap(self);
         match cpu_mode() {
             CpuMode::Legacy => {
                 if let Entries::E32(e) = entries() {
@@ -584,7 +592,7 @@ unsafe fn allocate_kernel_pages(layout: core::alloc::Layout) {
 
 /// PML4 for long mode - shared with PAE via PML4[0] = PDPT
 #[thread_local]
-static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
+pub(crate) static mut PML4: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 
 /// Set up long mode page tables (call after enable_pae)
 /// Sets PML4[0] = PDPT so long mode uses same address space.
@@ -682,16 +690,24 @@ pub enum CpuMode {
     Compat,  // Long mode compat, 8B entries
 }
 
-/// Read current paging mode from CPU registers (CR4.PAE, EFER.LME)
+/// Current mode, published by paging setup and the protected/compat toggle.
+/// Hardware feature probes and privileged register reads do not belong in
+/// recursive page-table walks: the mode only changes at those boundaries.
 #[inline]
 pub fn cpu_mode() -> CpuMode {
-    if crate::x86::read_cr4() & crate::x86::cr4::PAE == 0 {
-        CpuMode::Legacy
-    } else if !cpu_supports_long_mode() || crate::x86::rdmsr(crate::x86::EFER_MSR) & crate::x86::efer::LME == 0 {
-        CpuMode::Pae
-    } else {
-        CpuMode::Compat
+    match CPU_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => CpuMode::Legacy,
+        1 => CpuMode::Pae,
+        _ => CpuMode::Compat,
     }
+}
+
+#[thread_local]
+static CPU_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn set_long_mode_active(active: bool) {
+    debug_assert!(is_pae());
+    CPU_MODE.store(if active { 2 } else { 1 }, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Number of page table levels for current mode
@@ -751,10 +767,8 @@ pub fn entries() -> Entries {
     }
 }
 
-/// Cached `is_pae()` result. `cpu_mode()` reads CR4 + EFER (ring-0-only),
-/// so any caller outside the arch syscall handlers (e.g. ring-1 kernel
-/// code calling `entries()`) would #GP. The mode is fixed once
-/// `enable_paging` returns; cache it there and read from this static.
+/// Entry width is fixed once `enable_paging` returns, even while switching
+/// between protected and compatibility execution. Safe from any ring.
 #[thread_local]
 static IS_PAE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -1398,6 +1412,7 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
         crate::x86::write_cr0(cr0 | crate::x86::cr0::PG | crate::x86::cr0::WP);
     }
     IS_PAE.store(true, core::sync::atomic::Ordering::Relaxed);
+    CPU_MODE.store(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Read firmware before the heap exists. Borrow one ROM alias PTE, restoring it
@@ -1562,7 +1577,7 @@ pub fn enable_paging(scratch: *mut RawPage, kernel_phys: usize, kernel_pages: us
 /// Page-aligned BSS page whose PTE is repurposed to map arbitrary physical
 /// pages. Callers access it via `&mut TEMP_PAGE` after temp_swap.
 #[thread_local]
-static mut TEMP_PAGE: RawPage = RawPage([0; PAGE_SIZE]);
+pub(crate) static mut TEMP_PAGE: RawPage = RawPage([0; PAGE_SIZE]);
 
 /// Map a physical page at the temp mapping address. Returns the page
 /// that was previously mapped (pass back to restore).
@@ -1578,7 +1593,10 @@ pub fn temp_swap(page: u64) -> u64 {
             replace_entry(&mut *entries.add(vpage), Entry32::new(page, true, false)).page()
         }
     };
-    invalidate_tlb();
+    // Only TEMP_PAGE's leaf changed. Reloading CR3 here discarded every
+    // translation for each temporary frame access, including each PTE read
+    // in high-address page-table walks.
+    crate::x86::invlpg(vpage * PAGE_SIZE);
     old_page
 }
 
@@ -1622,6 +1640,7 @@ pub fn pde_index<E: Entry>(page: usize) -> usize {
 /// Marks parent user entries R/O, increments ref counts, and fills
 /// `child_root` with the child's user root entries.
 pub fn fork_current(child_root: &mut RootPageTable) {
+    crate::high_paging::fork(child_root);
     let user_count = recursive_idx() - root_base();
     // Use a stack buffer for the full root page copy.
     // share_and_copy writes all entries (including kernel), but we only
@@ -1718,7 +1737,8 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
     if ref_count == 1 {
         // Sole owner — just make writable
         entries[idx].set_hw_writable(true);
-        invalidate_tlb();
+        if idx < PAGE_TABLE_BASE_IDX { crate::x86::invlpg(idx * PAGE_SIZE); }
+        else { invalidate_tlb(); }
         return;
     }
 
@@ -1766,7 +1786,7 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
 
     let user = entries[idx].user();
     replace_mapping(&mut entries[idx], E::new(new_phys, true, user));
-    invalidate_tlb();
+    crate::x86::invlpg(idx * PAGE_SIZE);
 }
 
 // =============================================================================
@@ -1793,6 +1813,7 @@ fn free_generic<E: Entry>(entries: &mut [E]) {
 /// Sole-owned subtrees are walked and freed page by page.
 /// Free all user-space pages and page tables.
 pub fn free_user_pages() {
+    crate::high_paging::clean();
     match entries() {
         Entries::E32(e) => free_generic(e),
         Entries::E64(e) => free_generic(e),
@@ -2037,7 +2058,8 @@ pub fn map_user_range_phys(vpage: usize, count: usize, ppage: u64, extra_flags: 
 /// allocation owns the frames; guest cleanup and COW must leave them alone.
 pub(crate) fn map_shared_pages_user(vpage: usize, kernel_base: usize, count: usize) {
     assert!(vpage.checked_add(count).is_some_and(|end| end <= 0xC000_0000 / PAGE_SIZE));
-    assert!(kernel_base.is_multiple_of(PAGE_SIZE) && kernel_base >= heap_base());
+    assert!(kernel_base.is_multiple_of(PAGE_SIZE) && kernel_base >= heap_base(),
+        "shared backing {:#x}, heap starts {:#x}", kernel_base, heap_base());
     assert!(count.checked_mul(PAGE_SIZE).and_then(|len| kernel_base.checked_add(len))
         .is_some_and(|end| end <= HEAP_END));
     for i in 0..count {
@@ -2253,13 +2275,13 @@ pub fn map_fresh_range(base_page: usize, num_pages: usize) {
     match entries() {
         Entries::E32(e) => {
             for i in 0..num_pages {
-                let fresh = phys_mm::alloc_phys_page().unwrap_or(0);
+                let fresh = phys_mm::alloc_phys_page().expect("out of memory mapping fresh user pages");
                 replace_mapping(&mut e[base_page + i], Entry32::new(fresh, true, true));
             }
         }
         Entries::E64(e) => {
             for i in 0..num_pages {
-                let fresh = phys_mm::alloc_phys_page().unwrap_or(0);
+                let fresh = phys_mm::alloc_phys_page().expect("out of memory mapping fresh user pages");
                 replace_mapping(&mut e[base_page + i], Entry64::new(fresh, true, true));
             }
         }

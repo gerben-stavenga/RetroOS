@@ -16,6 +16,11 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 const PAGE_SIZE: usize = 4096;
+const RETAINED_RANGES: usize = 64;
+
+#[derive(Clone, Copy)]
+struct Retained { start: usize, end: usize }
+const EMPTY_RETAINED: Retained = Retained { start: 0, end: 0 };
 
 /// Large-allocation instrumentation (≥ 100 KB), for diagnostic logging.
 static LARGE_ALLOCS: AtomicU32 = AtomicU32::new(0);
@@ -57,6 +62,10 @@ struct Inner {
     heap_end: usize,
     /// Return whole, unused pages to the platform's demand-paging pool.
     release: Option<fn(usize, usize)>,
+    retained: [Retained; RETAINED_RANGES],
+    retained_count: usize,
+    retained_bytes: usize,
+    retain_limit: usize,
 }
 
 /// Demand-paged heap over a `[base, end)` virtual window. Install as the
@@ -73,7 +82,8 @@ unsafe impl Sync for DemandHeap {}
 impl DemandHeap {
     pub const fn new() -> Self {
         DemandHeap {
-            inner: UnsafeCell::new(Inner { head: None, mapped_end: 0, heap_end: 0, release: None }),
+            inner: UnsafeCell::new(Inner { head: None, mapped_end: 0, heap_end: 0, release: None,
+                retained: [EMPTY_RETAINED; RETAINED_RANGES], retained_count: 0, retained_bytes: 0, retain_limit: 0 }),
         }
     }
 
@@ -87,11 +97,21 @@ impl DemandHeap {
     /// and byte length on deallocation. It must not allocate or reenter this
     /// heap, and accesses to released pages must be demand-backed again.
     pub fn init_with_release(&self, base: usize, end: usize, release: Option<fn(usize, usize)>) {
+        self.init_with_cached_release(base, end, release, 0);
+    }
+
+    /// Retain at most `cache_bytes` of free backing for reuse. Old ranges and
+    /// excess bytes are released normally. Allocations remove their pages from
+    /// this cache before any later free can evict them. No bookkeeping allocates.
+    pub fn init_with_cached_release(&self, base: usize, end: usize, release: Option<fn(usize, usize)>, cache_bytes: usize) {
         let inner = unsafe { &mut *self.inner.get() };
         inner.head = None;
         inner.mapped_end = base;
         inner.heap_end = end;
         inner.release = release;
+        inner.retained_count = 0;
+        inner.retained_bytes = 0;
+        inner.retain_limit = cache_bytes & !(PAGE_SIZE - 1);
     }
 }
 
@@ -100,6 +120,54 @@ impl Default for DemandHeap {
 }
 
 impl Inner {
+    fn remove_retained(&mut self, index: usize) -> Retained {
+        let range = self.retained[index];
+        self.retained_bytes -= range.end - range.start;
+        self.retained.copy_within(index + 1..self.retained_count, index);
+        self.retained_count -= 1;
+        range
+    }
+
+    fn release_range(&self, start: usize, end: usize) {
+        if start < end && let Some(release) = self.release { release(start, end - start); }
+    }
+
+    fn append_retained(&mut self, start: usize, end: usize) {
+        if start == end { return; }
+        if self.retained_count == RETAINED_RANGES {
+            self.release_range(start, end);
+        } else {
+            self.retained[self.retained_count] = Retained { start, end };
+            self.retained_count += 1;
+            self.retained_bytes += end - start;
+        }
+    }
+
+    /// Remove allocated pages AND the new remainder's free-list header page.
+    /// Only the untouched free fragments may subsequently be evicted.
+    fn forget_retained(&mut self, start: usize, end: usize) {
+        let mut i = 0;
+        while i < self.retained_count {
+            let range = self.retained[i];
+            if start >= range.end || end <= range.start { i += 1; continue; }
+            self.remove_retained(i);
+            if range.start < start { self.append_retained(range.start, start); }
+            if range.end > end { self.append_retained(end, range.end); }
+        }
+    }
+
+    fn cache_or_release(&mut self, start: usize, end: usize) {
+        if self.release.is_none() { return; }
+        let keep = (end - start).min(self.retain_limit);
+        if keep == 0 { self.release_range(start, end); return; }
+        while self.retained_bytes + keep > self.retain_limit || self.retained_count == RETAINED_RANGES {
+            let old = self.remove_retained(0);
+            self.release_range(old.start, old.end);
+        }
+        self.append_retained(start, start + keep);
+        self.release_range(start + keep, end);
+    }
+
     /// Claim virtual address space (physical pages are demand-backed on access).
     fn extend_heap(&mut self, min_size: usize) -> bool {
         let pages_needed = min_size.div_ceil(PAGE_SIZE).max(4);
@@ -194,7 +262,12 @@ impl Inner {
             let block_addr = block_ptr as usize;
             let block_size = unsafe { (*block_ptr).size };
 
-            let aligned_addr = align_up(block_addr, align);
+            let mut aligned_addr = align_up(block_addr, align);
+            if aligned_addr != block_addr && aligned_addr - block_addr < MIN_BLOCK_SIZE {
+                // Keep a representable free prefix. Returning block_addr here
+                // violates the requested alignment (notably for shared pages).
+                aligned_addr = align_up(block_addr + MIN_BLOCK_SIZE, align);
+            }
             let padding = aligned_addr - block_addr;
             let total_needed = padding + size;
 
@@ -217,24 +290,6 @@ impl Inner {
                             (*block_ptr).next = Some(NonNull::new_unchecked(remainder_ptr));
                         }
                     }
-                } else if padding > 0 {
-                    let alloc_addr = block_addr;
-                    let actual_size = size + padding;
-                    let remainder_size = block_size - actual_size;
-
-                    if remainder_size >= MIN_BLOCK_SIZE {
-                        let remainder_ptr = (alloc_addr + actual_size) as *mut FreeBlock;
-                        unsafe {
-                            (*remainder_ptr).size = remainder_size;
-                            (*remainder_ptr).next = (*block_ptr).next;
-                            *current = Some(NonNull::new_unchecked(remainder_ptr));
-                        }
-                    } else {
-                        unsafe {
-                            *current = (*block_ptr).next;
-                        }
-                    }
-                    return Some(alloc_addr as *mut u8);
                 } else {
                     let remainder_addr = alloc_addr + size;
                     let remainder_size = block_size - size;
@@ -253,6 +308,7 @@ impl Inner {
                     }
                 }
 
+                self.forget_retained(alloc_addr & !(PAGE_SIZE - 1), align_up(alloc_addr + size + MIN_BLOCK_SIZE, PAGE_SIZE));
                 return Some(alloc_addr as *mut u8);
             }
 
@@ -296,7 +352,7 @@ unsafe impl GlobalAlloc for DemandHeap {
         DEALLOCATIONS.fetch_add(1, Relaxed);
         let addr = ptr as usize;
         let (merged, length) = inner.add_free_region(addr, size);
-        if let Some(release) = inner.release {
+        if inner.release.is_some() {
             // Keep the surviving free-list header and all boundary pages that
             // contain live data. Only revisit pages intersecting this free:
             // interiors of neighboring free blocks were already released.
@@ -305,7 +361,7 @@ unsafe impl GlobalAlloc for DemandHeap {
             // when that header sits exactly on the following page boundary.
             let end = ((merged + length) & !(PAGE_SIZE - 1))
                 .min(align_up(addr + size + MIN_BLOCK_SIZE, PAGE_SIZE));
-            if start < end { release(start, end - start); }
+            if start < end { inner.cache_or_release(start, end); }
         }
     }
 }

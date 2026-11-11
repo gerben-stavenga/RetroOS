@@ -70,6 +70,8 @@ struct Entry {
     read_shutdown: bool,
     receive_errors: bool,
     references: usize,
+    read_sequence: u64,
+    observed_rx: usize,
 }
 
 struct Network {
@@ -207,6 +209,11 @@ pub fn poll() {
         for entry in &mut n.entries {
             if entry.kind == Kind::Tcp {
                 let socket = n.sockets.get_mut::<tcp::Socket>(entry.handle);
+                let queued = socket.recv_queue();
+                if queued > entry.observed_rx {
+                    entry.read_sequence = entry.read_sequence.wrapping_add(1);
+                }
+                entry.observed_rx = queued;
                 if matches!(
                     socket.state(),
                     tcp::State::Established | tcp::State::CloseWait
@@ -365,6 +372,8 @@ fn socket(kind: Kind, nonblocking: bool) -> Result<i32, Error> {
             read_shutdown: false,
             receive_errors: false,
             references: 1,
+            read_sequence: 0,
+            observed_rx: 0,
         })
     })
 }
@@ -598,13 +607,15 @@ fn recvfrom(h: i32, buf: &mut [u8], peek: bool, addr: &mut Option<Endpoint>) -> 
             if let Some(peer) = s.remote_endpoint() {
                 encode(peer, addr);
             }
-            return if peek {
+            let result = if peek {
                 s.peek_slice(buf)
             } else {
                 s.recv_slice(buf)
             }
             .map(|n| n as i32)
             .map_err(|_| Error::NotConnected);
+            n.entries[i].observed_rx = s.recv_queue();
+            return result;
         }
         n.udp_bind(i)?;
         let s = n.sockets.get_mut::<udp::Socket>(e.handle);
@@ -780,6 +791,12 @@ pub fn readiness(h: i32) -> Readiness {
         invalid: true,
         ..Readiness::default()
     })
+}
+
+/// Each newly received batch is a readable notification, even if the socket
+/// never became empty between two edge-triggered epoll waits.
+pub fn read_sequence(h: i32) -> u64 {
+    with(|n| Ok(n.entries[n.index(h)?].read_sequence)).unwrap_or(0)
 }
 
 pub fn socket_error(h: i32) -> Result<Option<Error>, Error> {

@@ -88,6 +88,15 @@ static void ipc_roundtrips(void){
 }
 __attribute__((force_align_arg_pointer)) void _start(void){
  if(call(FSTAT,63,(word)&metadata,0,0)==0)ipc_child();
+ int cwd_fd=call(__NR_open,(word)"/home/retroos",0x10000,0,0);check(cwd_fd>=0,201);
+ check(call(__NR_fchdir,cwd_fd,0,0,0)==0,202);
+ check(call(__NR_getcwd,(word)link,sizeof link,0,0)==sizeof "/home/retroos",203);
+ for(word i=0;i<sizeof "/home/retroos";i++)check(link[i]=="/home/retroos"[i],204);
+ check(call(__NR_fchdir,-1,0,0,0)==-9,205);
+ call(__NR_close,cwd_fd,0,0,0);
+ check(call(__NR_fchdir,cwd_fd,0,0,0)==-9,206);
+ check(call(__NR_fchdir,1,0,0,0)==-20,207);
+ check(call(__NR_chdir,(word)"/",0,0,0)==0,208);
  check(call(__NR_setpgid,0,0,0,0)==0,195);
  check(call(__NR_getpgrp,0,0,0,0)==call(__NR_getpid,0,0,0,0),196);
  check(call(FSTAT,0,(word)&metadata,0,0)==0 && (metadata.st_mode&0170000)==0020000,116);

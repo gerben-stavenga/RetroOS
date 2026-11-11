@@ -1,5 +1,5 @@
 //! Linux getrandom ABI backed by the same entropy service as native protocols.
-use super::{Args, EFAULT, EINVAL};
+use super::{Args, EFAULT, EINVAL, high_memory};
 use alloc::{vec, vec::Vec};
 use zeroize::Zeroizing;
 
@@ -9,7 +9,7 @@ const MAX_REQUEST: usize = 65536;
 
 #[derive(Clone, Copy)]
 pub(super) struct Request {
-    address: usize,
+    address: u64,
     length: usize,
     nonblocking: bool,
 }
@@ -24,17 +24,11 @@ impl Request {
         // A bounded short read is valid and keeps a guest length from driving
         // an unbounded kernel allocation or exceeding the generator's limit.
         let length = args.a1.min(MAX_REQUEST as u64) as usize;
-        if length != 0
-            && (args.a0 == 0
-                || args
-                    .a0
-                    .checked_add(length as u64)
-                    .is_none_or(|end| end > 0xc000_0000))
-        {
+        if length != 0 && !high_memory::range(args.a0, length as u64) {
             return Err(-EFAULT);
         }
         Ok(Self {
-            address: args.a0 as usize,
+            address: args.a0,
             length,
             nonblocking: args.a2 & GRND_NONBLOCK != 0,
         })
@@ -56,8 +50,8 @@ impl Request {
     pub fn step<A: crate::Arch>(self, machine: &mut A) -> Option<i32> {
         match self.bytes_with(crate::kernel::random::fill) {
             Ok(bytes) => {
-                if !bytes.is_empty() {
-                    machine.copy_to(self.address, &bytes);
+                if !bytes.is_empty() && !high_memory::copy_to(machine, self.address, &bytes) {
+                    return Some(-EFAULT);
                 }
                 Some(bytes.len() as i32)
             }

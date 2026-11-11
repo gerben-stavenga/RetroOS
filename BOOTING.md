@@ -231,6 +231,14 @@ launchers. The kernel does not export DOS `[environment]` into Linux processes;
 Run `python3 test/linux_codex.py --direct` to check native Codex discovery from
 a shell started without `SHELL.ELF`.
 
+`bazelisk test //tests:linux_dn_shell` exercises DN starting COMMAND.COM's
+batch interpreter, which launches the interactive SHELL.ELF child. It boots
+GNU sh, its loader, the runtime bundle, Linux root and C: from a private native
+ext4/NVMe volume under UEFI with 32 GiB RAM and six CPUs. The probe types a
+command, verifies its saved output, and checks diagnostic control after F12.
+The script also supports `--kernel /path/to/kernel.elf` for comparisons and,
+without `--native-root`, a read-only SMB tool root with native ext4 C:.
+
 `python3 tools/try_self_build.py` attempts `//kernel:kernel` with Linux Bazel
 inside QEMU/KVM running RetroOS. It shares sources/tools read-only and keeps
 guest outputs in `build/ci/self-build/c`; `klog.txt` and `c/build.err` retain
@@ -273,8 +281,8 @@ alternate stack and per-thread mask; `rt_sigreturn` restores the user context
 and floating-point state. `ITIMER_REAL` delivers SIGALRM using the same frames
 and masks, including interrupting a sleeping process. CPU-accounting timers
 and general signal sending are not yet implemented. Timers are checked when
-a process runs or its blocked I/O is polled; the foreground process scheduler
-does not yet preempt a child to run a background parent’s timeout handler. `python3 test/linux_xmm_context.py` checks SIMD preservation and
+a process runs or its blocked I/O is polled. Linux terminal peers receive
+bounded CPU turns even while a helper remains runnable. `python3 test/linux_xmm_context.py` checks SIMD preservation and
 `python3 test/linux_signal.py` checks fault recovery and rejected invalid
 signal contexts. Working directories use the VFS path limit, missing
 `readlink` paths return ENOENT, and `/proc/self/exe` exec stays absolute.
@@ -318,6 +326,40 @@ checks Rust `Command::output()` with separate stdout/stderr, exact exit status,
 and 128 KiB per stream. The proc-fd and
 `python3 test/linux_epoll_network.py` tests cover unread-byte queries.
 
+Linux ordinary descriptor capacity is 1024, with heap-backed tables and
+multiword CLOEXEC/pselect masks. DOS retains its previous 64-handle allocation
+and device sentinels. `close_range` supports closing and CLOEXEC marking across
+ordinary and virtual async descriptors on both ABIs. Fork has a private table;
+UNSHARE on a multi-context thread group returns EOPNOTSUPP until per-thread
+file-table splitting exists. `//tests:linux_fd_limits` opens 192 files, uses
+fds through 963, checks pselect across mask words, and repeats fork/exec cleanup
+24 times per ABI. `python3 test/linux_code_mode_native.py` executes JavaScript
+in the installed managed code-mode host on native ext4 with 96 inherited fds.
+
+When DOS Navigator occupies PID 1, orphaned Linux helpers are adopted by a
+surviving Linux ancestor in the same terminal, rather than by DN. Otherwise
+the helper's exit can hand display ownership to DN while the shell and Codex
+are still alive. The DN shell regression double-forks a helper before checking
+interactive output and F12, covering this transition as well as shell launch.
+
+Synchronous Linux file reads retain a scratch buffer of at most 64 KiB per
+process. Reusing its backing avoids repeatedly demand-faulting and releasing
+temporary buffers while hashing large executables. Larger requests may return
+a short read. The file-cache regression checks changing request sizes, EOF,
+and coherence with unflushed shared mappings through this path.
+`python3 test/linux_codex_native_resume.py --resume latest --daemon --full-features`
+profiles the current project's saved session using copied SQLite snapshots,
+the installed managed daemon, and a native ext4/NVMe root. It types a draft
+without submitting it. Omit `--daemon` to compare direct startup. This external
+test needs saved login/package state; its guest state is private and temporary.
+
+Metal KLOG0211 also exposed persistent log-flush stalls of 100–370 ms.
+Timing that durable flush by appending its own stall warning dirtied the log
+again after every slow flush, sustaining another flush each second while idle.
+The log writer no longer emits its own timing message, and schedules its next
+sync from completion. Actual new log bytes retain the normal durable sync path.
+
+
 Directory identities grow as needed rather than limiting all processes to 32
 open directories. The proc-fd test holds 48 directory descriptors open and
 checks complete 300-entry listings on ext4 and SMB. Serial `trace fs` records
@@ -328,8 +370,8 @@ limit and reject overflow rather than silently changing a truncated path.
 
 The helper defaults to `MALLOC_ARENA_MAX=2`, one loading thread, one globbing
 thread (`--legacy_globbing_threads=1`) and one build job. Java uses its normal
-process-spawn mechanism. This fits the current 3 GiB address space and 64-descriptor process
-limit; Bazel's separate default globbing pool uses 100 threads.
+process-spawn mechanism. This fits the existing low user window; Linux now has a 1024-descriptor
+process table, Bazel's separate default globbing pool uses 100 threads.
 The Rust distribution exposes named toolchain filegroups rather than exporting
 every file, avoiding a recursive scan of its HTML documentation during analysis.
 `--reuse-repositories /path/to/host/bazel/output-base/external` reads extracted
@@ -345,6 +387,229 @@ fresh pages; compiler launches repeatedly load Rust/LLVM libraries totaling
 roughly 350 MB, and loader segment mappings can repeat those reads. Reusing
 file-backed pages or loading them on demand remains performance work; passing
 the genrule regression does not establish practical self-build speed.
+`python3 test/linux_build_profile.py --native-ext4` isolates Python startup
+and a fresh C compile/link/run with tools, libraries and outputs on a private
+ext4/NVMe image. The fixture has no NIC, 32 GiB RAM, six CPUs and HDA audio.
+A small syscall-only helper measures each child with CLOCK_MONOTONIC;
+VM boot and the helper's own loading are excluded. Cumulative profiles and
+outputs are retained under `build/ci/program-profile-ext4`. Add
+`--codex-startup` for two native `codex --version` invocations in an isolated
+home without login/session state (`build/ci/program-profile-codex-ext4`).
+
+The native-ext4 Codex probe initially took about 6 and 5 seconds. Of about
+4.9 seconds inside an executable-read phase, ext4/volume reads accounted for
+only about 0.6 seconds. Large sequential reads were populating and evicting
+4 KiB boxed pages in a 2 MiB cache for a roughly 284 MiB executable. Large
+uncached spans now stream into the caller's buffer, stopping at any existing
+cache page so mapped changes remain authoritative. Small reads and mapping
+fills retain their cache behavior; content-version validation remains in place.
+ELF and private mapping loaders use 64 KiB buffers. The updated probe measured
+1621/1712 ms for Codex and 1200/1297 ms for C compile/link, respectively.
+Compiler/linker loader traffic is roughly 130–140 MB, including repeated
+libraries; eager loading and library sharing remain further performance work.
+These isolated results do not establish full interactive Codex startup time on
+physical hardware. Earlier SMB-root timings are not a model for metal ext4.
+
+The full managed-daemon resume exposed a second streaming failure: an ELF
+segment starting inside a previously cached 32 KiB run consumed that prefix,
+then its remaining request fell below the 64 KiB streaming threshold. Cache
+read-ahead extended past the request and seeded the same prefix in the next
+chunk, so subsequent large reads kept allocating and evicting cache pages.
+The streaming decision now uses the original request length, even after
+consuming cached bytes. The regression primes a metadata prefix and then
+checks eight consecutive 64 KiB reads: nine backend reads total and no cache
+growth beyond the original metadata fill. It failed with 17 backend reads
+before this correction. Existing cached and mapped pages remain authoritative.
+In the full native-ext4 managed-daemon resume probe, the same 14,715 ELF
+payload reads (963,726,638 bytes) fell from 14.11 s to 1.07 s. Cache insertion
+fell from 974 MB to 35 MB across the measured workload. Resume readiness
+after guest control became available improved from 41.72 s to 27.47 s;
+host builds and VM preparation are excluded from that interval. This fixes
+one measured cost and does not establish acceptable metal responsiveness.
+
+The opt-in COM2 command `profile io` reports read allocation/fetch/copy,
+file-mapping allocation/read/copy, ELF allocation/read/copy, and ext4/volume
+read timing in nanoseconds. It also separates VFS lock acquisition and reads,
+cache checking/misses/insertion, and executable seeks. Those stages nest and
+must not be summed. Pipe waits/allocations and physical disk read/write/flush
+timings are also reported. F12's profile dump includes the same I/O counters
+in KLOG, allowing physical-machine capture without a COM2 connection.
+
+A no-daemon native-ext4 resume measured 2,040 physical flushes taking 7.34 s,
+versus 0.31 s for physical reads and 0.29 s for writes. Pipe allocation took
+less than 1 ms. The ext4 journal uses five ordered durability barriers per
+mutation; hundreds of small mutations therefore spend seconds waiting for
+flush completion. This measurement retains the conservative journal policy.
+The probe's `--existing-skills` option copies installed skills into its private
+home. Before correcting directory-relative `openat`, that run reported 860
+flushes / 3.21 s and readiness at 12.21 s. It is not a reliable successful
+cleanup baseline: after the correction, startup performed 71 `unlinkat` calls,
+made 2,545 flushes / 8.67 s and reached readiness at 20.17 s. Correctness exposes
+additional mutation work. These QEMU timings do not account for the complete
+reported metal delay: KLOG0214 contained no I/O profile, and the saved
+application log also recorded a model-list timeout.
+The comparison is saved in
+`build/ci/codex-native-resume/storage-stall-comparison.json`.
+
+`python3 test/linux_time_accounting.py` gates before a real fork/exec/wait
+compile/link/run and compares private ext4 and SMB roots with the same tools,
+32 GiB RAM and six CPUs. `profile totals` exposes cumulative exclusive cycle
+categories and elapsed nanoseconds; idle sleep is separated from scheduler
+work. The two gated build runs measured 2.416 s and 4.968 s, with only about
+24 ms idle sleep on either backend. Reports include boundary overhead.
+
+The full resume probe also gates before exec, so native loading cannot finish
+before profiling starts. Use `--storage smb` for a private SMB root and
+`--sample-interval 0` to disable periodic detailed dumps. Readiness now has its
+own saved `ready-sample.json`, excluding the later typing check. The gated
+comparison loaded the same 298,515,108 ELF bytes on both backends. One measured
+pair took 19.54 s (ext4) and 26.04 s (SMB), including 2.28/1.77 s of diagnostic
+serial handling. Ext4 spent 8.01 s in disk flushes. SMB spent 7.82 s receiving,
+1.18 s verifying responses, 4.30 s allocating response buffers and 3.47 s
+decoding reads. Kernel-mode page-fault handlers took 1.79/8.39 s respectively;
+those costs overlap the allocation/decoding timings. User-mode faults took
+2.53/2.56 s. Actual application instructions accounted for about 0.53/0.51 s.
+These are measurements, not an allocator or durability change. The complete
+exclusive ledger and nested detail are in
+`build/ci/time-accounting/comparison.txt` and `comparison.json`. Nested stages
+must not be summed. Physical-machine timings still require a metal capture.
+
+The subsequent fixes target extra kernel work rather than seeded application
+state. The heap retains at most 1 MiB of free backing (scaled down on small
+machines) instead of releasing and faulting every temporary buffer again.
+Tests poison evicted pages and check that live allocations and free-list
+headers survive fragmentation. New ext4 objects receive initial permissions
+and mtime in their creation transaction; unchanged metadata is not rewritten.
+Single-page mappings invalidate that page rather than all translations, and
+a first user write completes demand allocation in one fault instead of
+installing a read-only zero page and faulting again.
+
+With grouped journal writeback, the same profiled native-ext4 resume measured
+6.42 s, down from 19.54 s. Physical flushes fell from about 2,400 to 178 and
+flush time from 8.01 s to 0.77 s. A separate run with `--no-profile` reached
+readiness in 6.94 s and accepted typing. This is still slower than the Linux
+PTY baseline (1.82 s median, three runs); timings vary with flush/network and
+terminal-detection latency. The no-profile result is an actual run, not a
+subtraction of profiler costs. Boot and private-state preparation are excluded.
+
+The later `/resume` investigation found repeated metadata work outside startup.
+Linux ownership queries now use stable ext4 inode identities instead of walking
+the pathname again after `stat`. File writes refresh cached inode sizes through
+hard links and bind aliases; namespace edits invalidate affected directories and
+aliases rather than every cached directory. Mount changes still invalidate all.
+An ext4 allocation search remembers its last successful block/inode group,
+wrapping across the entire filesystem when needed. Previously every newly
+allocated block restarted at group zero, rescanning occupied groups.
+
+`python3 test/linux_metadata.py --filled` checks a mostly allocated, valid ext4
+image with thousands of block groups and runs `e2fsck` before and after. A 2 MiB
+append and fsync measured 888 ms before the allocation hint and 164 ms afterward.
+The separate 2,000-file stat walk measured 387 -> 63 ms; 200 stat calls interleaved
+with unrelated writes measured 414 -> 87 ms. These are individual QEMU runs.
+`//tests:unit_ext4_modern_image_test` also bounds exhausted-group descriptor reads
+while extending a file, independently of wall-clock timing.
+
+`test/linux_codex_native_resume.py --picker --filled --existing-skills
+--full-features --sample-interval 0 --kernel /path/to/kernel.elf --label NAME`
+uses copied saved rollouts and a populated native ext4/NVMe image. It separately
+times startup, typing `/resume`, listing, and loading the selected session.
+The explicit kernel uses a private UEFI boot copy. Matched profiled runs measured
+8.30 -> 6.86 s for loading; volume read calls fell from 3,055,508 to 64,108.
+Separate runs with profiling disabled measured 8.06 -> 6.56 s for loading.
+Those runs still used serial screen polling; disabling counters did not remove
+the UART sampling cost. The later QMP measurements below avoid that overhead.
+The picker remained about 0.9 s. This does not establish the cause of the much
+longer picker delay reported on metal. KLOG0215 contains no I/O profile.
+For a physical capture, enable F12 -> Debug -> Profile before reproducing the
+delay, then use Print profile; its counters are saved in KLOG.
+
+A subsequent loading profile exposed a separate paging hot path: `cpu_mode()`
+read CR4, executed two CPUID probes and read EFER whenever page-table helpers
+asked for the current mode. Recursive walks and page faults asked repeatedly.
+The mode is now per-core state, initialized by paging setup and updated from
+the actual EFER result after every protected/compatibility transition. Legacy,
+PAE and long-mode execution retain their existing page-table formats.
+The isolated `test/linux_paging_timing.py` maps 64 MiB, first-writes every page,
+checks the bytes and unmaps. First writes measured 872 -> 28 ms in QEMU/KVM;
+the same host Linux probe measured about 24 ms. VM exits make repeated hardware
+queries particularly expensive under KVM; physical timings still need a metal
+run. No application data seeding or durability policy changes produce this gain.
+
+The resume fixture's `--screen-transport qmp` obtains the terminal projection
+address once with `screen memory`, then samples it through QEMU's debugger.
+It avoids guest UART transmission of a whole hex screen on every sample.
+This reduced the measured diagnostic interference before evaluating the paging
+fix: the passive profiled baseline loaded in about 4.16 s, versus the previous
+6.56 s serial-sampled result. With the mode cache the passive run loaded in
+about 2.18 s; user fault-handler time fell from 760 to 20 ms. The raw profiles
+and isolated benchmark are recorded under `build/ci/resume-investigation`.
+The final comparison uses one frozen snapshot of all 118 rollouts, preserves
+their date hierarchy, disables profiling and reads the screen through QMP:
+session loading measured 3.97 -> 2.27 s, with typing verified on both kernels.
+Release `65ea2d06c272` contains the mode cache; preparation is not installation.
+
+A later command-tool investigation reproduced a separate lifecycle bug using
+the installed `codex-exec-server` directly, without a model, network, or screen
+polling. On kernel `65ea2d06c272`, a shell printed its marker and became a
+zombie, while the helper still returned `exited=false` after the probe's
+20-second deadline. Child exit woke blocking `wait4` callers but did not send
+SIGCHLD to asynchronous child monitors. Their initial `waitpid(WNOHANG)` could
+return zero, after which they received no notification to retry it.
+
+Child exit now queues SIGCHLD after publishing the zombie, using the existing
+masked signal delivery and wakeup path. The handler receives child PID, exit
+reason and status. `//tests:linux_sigchld` forces an initially empty WNOHANG,
+then tests a parent parked in poll, masked notification and later unmasking.
+`//tests:linux_exec_server_native` drives initialize, process/start and
+process/read against the installed helper on private native ext4/NVMe, checks
+the output and final status, and compares direct shells on Linux. Pipe-backed
+shells are covered; this fixture does not exercise PTYs or the complete
+code-mode/app-server stack. It shuts down the helper by closing stdin because
+the current kill syscall is still a no-op.
+The final QEMU sample delivered the first marker in 12 ms, reported exit and
+closed in 13 ms, and completed its RPC in 17 ms; before the fix the marker
+arrived in 11 ms but completion was still absent at the 20-second deadline.
+Release `c514aa22ab32` contains the SIGCHLD fix. It is prepared, not installed.
+
+The code-mode crash in KLOG0214/KLOG0216 was reproduced separately with the
+installed CLI's helper. After 11 successful JavaScript sessions it trapped at
+the same `0x94de7e0` address. The preceding INT3 is V8's overflow check on a
+`clock_gettime(CLOCK_MONOTONIC)` result. Time syscalls truncated high output
+pointers to 32 bits, leaving a high-stack timespec unwritten while reporting
+success. Time and entropy output now use checked full-width user copies.
+The entropy service had also rejected high-stack `getrandom` calls with EFAULT,
+which caused the Rust runtime worker to panic after the clock fix.
+
+Asynchronous thread TID stores/clears, futex addresses and timeout buffers,
+sleep buffers, pipe and virtual socket/eventfd buffers, signal masks and
+alternate-stack queries now retain their full user addresses. These paths are
+covered by `//tests:linux_high_stack`, which puts a real pthread on a high
+stack and checks its startup, I/O, time/random calls and join. The focused
+`//tests:linux_time_high` checks alias guards, cross-page writes and protected
+high buffers. These changes do not implement every high-buffer Linux ABI.
+
+A further malloc corruption was traced to `brk`: musl places a guard page
+inside its existing heap, and our growth check treated that guard as a new
+ceiling. A request from `0xc708000` to `0xc709000` returned `0xc706000`,
+shrinking the recorded heap and allowing later mmap allocations to overwrite
+live malloc metadata. `brk` now rejects failed growth without changing the
+current break and ignores guards wholly inside the existing heap. The
+`//tests:linux_brk` regression also checks collisions, invalid full-width
+requests, preserved data and valid shrinking against Linux.
+
+With these fixes, `//tests:linux_code_mode_stress` completes 24 distinct
+JavaScript sessions and shuts down cleanly on private native ext4/NVMe.
+Both installed CLI and managed-daemon helpers passed the 24-session run.
+No model, network or screen polling is involved. Linux fatal logs now retain
+full RIP/RSP and the executable path; native 64-bit general-protection faults
+avoid the legacy instruction decoder, which truncates addresses.
+Evidence and hashes are saved in `build/ci/code-mode-crash-report.json`.
+Release `4e392b12f870` contains these fixes and the preceding SIGCHLD fix.
+The full 13-target validation suite and Clippy passed; kernel unit tests,
+code-mode stress and the expanded high-stack test passed again after the
+final lint cleanup. The release is prepared, not installed; physical metal
+verification is still needed.
+
 `python3 test/linux_bazel_rust.py --compare-host` isolates this with a tiny
 workspace: one genrule compiles a fresh Rust source and another runs the binary
 and checks its output. It uses the same installed compiler and extracted Bazel
@@ -421,7 +686,7 @@ runtime, start `SHELL.ELF` and run `codex --version` or `codex exec`.
 The same setup is used with live QEMU files and the physical-machine root.
 
 Interactive Codex 0.163.0 returned `Hello from interactive Codex on
-RetroOS.` in both in-process and daemon modes in the actual QEMU/KVM terminal,
+RetroOS.` using the in-process server in the actual QEMU/KVM terminal,
 with a prompt entered through the
 guest keyboard and the assistant reply verified from the terminal grid.
 From `SHELL.ELF`, the response-only configuration is:
@@ -468,17 +733,248 @@ explicitly bypasses the Codex process sandbox; `--tools-readonly` instead tests
 the read-only sandbox by asking the command tool to read an unknown marker.
 Neither option changes the normal installation's configuration.
 
-Tool execution remains blocked with the installed 0.163.0 helper. Its V8
-sandbox requests virtual reservations starting above a tebibyte and falls back
-to a final request of roughly 12 GiB. All exceed RetroOS's current 3 GiB user
-address space, and V8 aborts with `Failed to reserve the virtual address space
-for the V8 sandbox`. This is a virtual-address limitation, not a request for
-that much physical RAM. Bypassing the Codex process sandbox does not remove
-V8's internal reservation requirement. Chat responses work; successful helper
-startup or `--help` alone does not establish that tools work.
-Use `python3 test/linux_code_mode_host.py --runtime` for a model-free JavaScript
-runtime probe; it currently fails at this reservation. The same framed request
-was checked successfully against the installed helper on Linux.
+The installed 0.163.0 helper now executes JavaScript in RetroOS:
+`python3 test/linux_code_mode_host.py --runtime` passes the framed runtime
+request and verifies `RUNTIME_PASS`. Add `--sessions 3` to check independent
+V8 isolates; this also verifies smaller reservations fall back high when the
+low window fills. Its V8 sandbox previously failed because
+large virtual reservations exceeded the 3 GiB low user window. Long-mode
+processes now have a sparse anonymous arena from 512 GiB to 128 TiB, using
+PML4 entries 1 through 255. The compatibility kernel and its recursive aliases
+retain PML4 entry 0; ordinary ELF images, stacks, libraries and small anonymous
+allocations prefer the existing low window, with anonymous reservations
+falling back high when it fills. Fixed low mappings and `MAP_32BIT` retain
+their low-address constraint.
+
+Large anonymous mappings and explicit high hints use full-width addresses.
+Uniform nonpresent table entries reserve whole subtrees; protection changes
+and first access expand only the necessary tables. Committed pages are
+zero-filled on demand. Context switches preserve the high roots; fork uses
+copy-on-write for tables and data, and exec/exit release their references.
+High `mprotect`, `munmap`, `MADV_DONTNEED`, and `read`/`write` buffers use the
+physical mapping window rather than truncating pointers in the 32-bit kernel.
+Fault events and Linux signal frames retain the complete 64-bit fault address.
+High file/shared mappings, high `mremap`, and general high pointers in the
+remaining syscall interfaces are not implemented by this change.
+
+Run `bazelisk test //tests:linux_high_memory //tests:linux_signal
+//tests:linux_vsyscall` (on one shell line) for a 4 TiB reservation in a 256 MiB
+VM, cross-page I/O, fork isolation, discard, protection/unmap faults, full-width
+signal addresses, and existing low-address behavior. The JavaScript runtime
+probe establishes V8 execution. The interactive `--tools` probe now reaches
+the command tool and completes a real `printf`/`cat` command: it creates
+`tool-result.txt`, verifies its contents from the host, and checks the assistant's
+`CODEX_TOOL_PASS` reply in the guest terminal. The probe uses its private VM's
+sandbox-bypass option; read-only sandbox operation is a separate check.
+
+The default background server also needs `/proc/sys/kernel/random/boot_id`.
+RetroOS supplies that file from a read-only kernel filesystem, including on
+metal with an ext4 Linux root and no Linux `/proc` mounted. Its UUID is generated
+once from the kernel entropy service, shared by all processes, and changes on
+reboot. It does not expose the hosted Linux machine's boot ID. Run
+`bazelisk test //tests:linux_boot_id` for partial reads, seek, fork/exec,
+write rejection, and two independent boots. An older
+kernel reporting `failed to read Linux boot ID` can bypass this requirement
+with `codex --no-daemon` until the updated kernel is installed.
+
+Physical-machine logs subsequently exposed two gaps that the original SMB,
+pretrusted-project probe did not cover. The daemon reads field 22 of
+`/proc/<pid>/stat` to identify its process lifetime. RetroOS now supplies that
+file and `/proc/self/stat` from its own task table, with birth times in Linux
+clock ticks that survive exec. Numeric process paths mask the backing root's
+`/proc` entries, including absent PIDs, so hosted files cannot supply another
+OS's process identity.
+
+Saving project trust uses temporary-file replacement of the existing
+`config.toml`. Linux `rename` and `renameat` now permit the backend's atomic
+replacement instead of returning `EEXIST`. DOS rename retains its existing
+no-replace policy. Destination metadata overrides are replaced with the
+source's, and failed operations preserve the original. Replacing an open or
+mapped destination currently returns `EBUSY` pending inode lifetime support.
+No unlink-before-rename fallback is used.
+
+`bazelisk test //tests:linux_persistence` exercises these paths on an ext4
+root with fake backing `/proc` entries: live and exited process identities,
+exec-stable start times, config replacement through both rename syscalls,
+metadata transfer, and preservation on errors. The interactive probe's
+`--untrusted` option creates a private Git project, uses default startup,
+accepts the trust prompt, and verifies the saved project entry in its private
+`config.toml`. A folder without a project marker skips trust onboarding.
+`python3 test/linux_codex_interactive.py --untrusted` saved trust and
+completed a live model request in QEMU with the in-process server. These checks
+use a private home; physical hardware still needs the updated kernel installed.
+
+Linux creation permissions also need native ext4 coverage: its previous
+`mkdir` path ignored the requested mode and created directories as `0775`.
+`mkdir`, `mkdirat`, and new regular files now apply their requested mode and
+the process's `umask` (initially `0022`). Fork copies the mask and exec preserves
+it. Directory descriptor metadata reflects the actual directory, and mode
+changes update existing regular-file descriptors. This allows private socket
+parents and temporary directories to retain `0700` without a later chmod.
+Run `bazelisk test //tests:linux_permissions` for creation modes, temporary
+files, directory `fstat`/`statx`, and mask inheritance. Regular-file `F_GETFL`
+must report its actual access mode: reporting every file as read-only caused
+libc's `mkstemp` -> `fdopen("w")` sequence to fail with `EINVAL`, matching
+GNU sed's temporary-file failure on metal. `openat` also resolves relative
+paths against its directory descriptor rather than the process cwd; ignoring
+that descriptor broke opening child directories during recursive operations.
+The permission probe covers both regressions, including relative creation and
+removal through a directory fd.
+
+The interactive probe's `--ext4-home` option keeps the private writable home
+on an ext4 disk while exporting installed host tools over read-only SMB. It
+checks saved trust after stopping the VM and reading back the private disk.
+`--state-from /path/to/codex-home` seeds private database snapshots;
+`--raw-state` also preserves copied WAL/shared-memory files. Neither option
+writes to the source home. `--binary` and `--managed-daemon` permit separate
+checks of the CLI executable and its managed server package. Codex 0.163.0
+started and replied with both checkpointed and WAL-preserving state copies on
+native ext4. Those runs selected the in-process server: command-line feature
+switches excluded daemon startup even when `--daemon` was passed to the probe.
+The corrected probe writes feature switches into its private config and requires
+a freshly created daemon PID record before reporting a daemon-mode pass.
+Previous daemon-mode success claims therefore do not establish background
+server operation. The 0.167.0 CLI test did not reach startup readiness before
+it was stopped, so that CLI version is not established by these checks.
+
+The managed 0.167.0 server performs an NFS check with Linux `statfs` before
+opening SQLite pools. Returning `ENOSYS` was fatal there: the server exited
+with code 1, then its parent reported `failed to record pid-managed ...
+startup` because that process was gone. RetroOS now implements native
+`statfs`/`fstatfs`, plus both i386 layouts. Queries resolve the backing
+filesystem and read-only mount flags; ext4 and FAT supply live allocation
+counts, and virtual/network backends identify their filesystem type without
+inventing capacity. Run `bazelisk test //tests:linux_statfs` for both ABIs,
+path/descriptor queries, allocation changes, read-only flags and errno checks.
+The interactive probe accepts `--memory 32768 --storage nvme --ext4-home`
+to exercise large RAM and the native NVMe driver rather than IDE/SMB defaults.
+
+After SQLite initialization the daemon needs pathname Unix stream sockets.
+RetroOS now provides local bind/listen/connect/accept streams, bounded byte
+queues, polling, half-close/EOF, peer credentials, and abstract names. Pathname
+nodes use the VFS mount namespace and write grants, retain their inode until
+unlink, and support the daemon's chmod and inode-based cleanup checks. These
+streams never use an IP socket or network port. This does not implement Unix
+datagrams, sequenced packets, or descriptor passing. Run
+`bazelisk test //tests:linux_unix_socket` for forked endpoints, credentials,
+large writes, unlink/rebind behavior, and a six-CPU bootstrap.
+
+The legacy PID record also invokes `ps -p PID -o stat= -o lstart=`.
+Providing `/proc/PID/stat` alone was insufficient: GNU procps exited with
+`Unable to get system boot time` because `/proc/stat` lacked `btime`.
+The kernel now exposes a stable boot epoch derived from the RTC and its own
+monotonic clock. CPU headers required by libproc2 contain zero counters;
+CPU usage accounting remains unavailable. Host counters are never imported. Run
+`bazelisk test //tests:linux_ps` for the installed procps command, stable start
+times across repeated queries, and missing guest PID rejection.
+
+An earlier lower-I/O experiment was withdrawn after a metal SHELL.ELF freeze.
+The current implementation groups complete filesystem blocks above the same
+JBD2 writer, preserving its five ordered barriers per committed batch. The
+kernel enables a batch bounded by journal capacity and at most 64 blocks
+(256 KiB on a 4 KiB filesystem). Reads, path lookup and allocation accounting
+see pending changes immediately. Explicit file/directory fsync and shutdown
+commit the batch; ordinary operations can share it until a 100 ms background
+writeback or the size limit. Unsynced changes are therefore buffered rather
+than durably committed on every close. Explicit kernel-log flushes still sync
+the backing filesystem. Unsupported journal write profiles keep direct commits.
+
+Three modern-image regressions cover grouped visibility, failed-operation
+rollback, automatic capacity rollover and power loss at every commit step.
+`//tests:linux_fsync_crash` kills the native guest immediately after file and
+directory fsync, then verifies contents, rename persistence and a clean e2fsck.
+`//tests:linux_ext4_batching` reports physical write amplification and checks
+readback and fsync. `//tests:linux_sqlite_ext4` checks native ext4 WAL snapshots,
+checkpoint, reopen and host integrity.
+
+Linux `fchdir` restores a working directory through an open directory
+handle; it previously returned ENOSYS during Python activity on metal.
+The process-fd probe covers both Linux ABIs on SMB and ext4.
+
+Linux processes sharing one terminal now rotate at 10 ms quanta. A CPU-busy
+helper previously kept its parent UI from running until the helper blocked
+or exited. Ready peers and blocked peers with pending work are visited in
+round-robin order, after activating the appropriate address space; parents
+whose vfork child still borrows their space remain suspended. Terminal
+presentation stays shared and DOS launchers are excluded from this rotation.
+`bazelisk test //tests:linux_responsiveness` runs two CPU-busy children and
+checks parent progress and timer wakeups. The regression's first/second
+parent delays fell from 2000/4000 ms to 7/36 ms in QEMU. The companion
+`//tests:linux_console_responsiveness` keeps a helper CPU-busy behind a
+blocked shell ancestor and verifies typed input reaches the waiting UI in
+under a second without clearing its frame (0.2 seconds in the measured run).
+The rotation cursor survives a blocked peer lending execution back to the
+helper, so later blocked peers cannot be skipped indefinitely. These are
+scheduler measurements, not an end-to-end Codex speed claim.
+
+The DOS-to-Linux display handoff retires the outgoing DOS beam before
+publishing the terminal scene. A batch helper can exec SHELL.ELF before its
+first display tick, leaving the previous scanout bound to an obsolete VRAM
+epoch. That scanout can suppress both the terminal and F12 while the shell
+continues accepting commands. A renderer regression recreates the stale
+epoch and checks physical pixel output after retirement. `//tests:linux_dn_shell`
+also captures the QEMU framebuffer through DN, COMMAND.COM and SHELL.ELF,
+checks terminal pixels and the F12 overlay, and restores the terminal with
+HDA audio and two CPUs. The reported live VM still needs a reboot with this
+kernel to confirm that this accounts for its freeze.
+
+An existing Linux daemon socket alias exposed a separate identity bug on
+metal: Linux had left a link into `/tmp/codex-daemon-1001`, while RetroOS
+reported UID 0 and selected `/tmp/codex-daemon-0`. Codex intentionally removes
+only its deterministic alias, so publication failed with `File exists`.
+Linux session UID/GID now come from the configured home (or legacy C: home)
+ownership, matching the existing VFS grant. Both get-ID ABIs, ELF auxiliary
+IDs, and Unix peer credentials agree. Stat layouts expose backing ownership;
+ownershipless session files use the session identity. Fork/exec cannot change
+identity by supplying a different HOME. Identity switching remains unsupported
+and attempts to select other IDs are rejected. Legacy ownershipless homes
+retain UID/GID 0. Run `bazelisk test //tests:linux_identity` for distinct
+UID/GID, foreign-owned files, all stat layouts, and fork/exec checks.
+The interactive probe's `--stale-daemon-link` seeds a dangling alias from
+the native home's owner; SQLite-only snapshots did not cover this case.
+The full daemon/command probe passed with this pre-existing link, native
+ext4 home, 32 GiB RAM, NVMe, and a WAL-preserving state copy. It verified
+a fresh daemon PID record and saved command output after stopping the VM.
+
+The corrected full probe passed with CLI 0.163.0 and managed server 0.167.0:
+it created a fresh daemon PID record, connected the TUI, executed a shell
+command through Codex, and verified the saved output after stopping the VM.
+This run used 32 GiB RAM, NVMe, native ext4 home, and a private WAL-preserving
+copy of the existing SQLite state. Its initial editor draft needed another
+Enter; the probe's retry now tolerates stale cells in the terminal snapshot.
+This is QEMU validation, not a completed physical-machine run. Reproduce with:
+
+```sh
+python3 test/linux_codex_interactive.py --daemon --tools --ext4-home \
+  --state-from "$HOME/.codex" --raw-state \
+  --managed-daemon "$HOME/.codex/packages/app-server-daemon/current" \
+  --memory 32768 --storage nvme --stale-daemon-link \
+  --timeout 480 --control-timeout 120
+```
+
+The child-setup errors were `prctl(PR_SET_PDEATHSIG, SIGTERM)` returning
+`EINVAL`, followed by x86-64 `getppid` reporting the child's own PID. `getppid`
+now reports the parent process. `PR_SET_PDEATHSIG` and `PR_GET_PDEATHSIG` store
+per-thread settings; fork clears them, exec retains the calling thread's
+setting, and exit of the creating thread queues the configured signal to the
+child process. Blocked children wake for signal delivery; masks, handlers,
+ignored signals, and the sender PID are preserved. Orphaned Linux processes
+are adopted by the live init task. Linux waits report signal deaths separately
+from ordinary eight-bit exit codes.
+
+Run `bazelisk test //tests:linux_parent_death` for the native regression covering
+parent identity, fork/exec, default SIGTERM/SIGKILL termination, handlers,
+masking, clearing, ignoring, and a creating pthread exiting while its process
+continues running.
+
+The heap allocator also now preserves page alignment when a
+free block leaves a prefix smaller than its free-list header; previously that
+case could abort SQLite shared-page mapping during Codex startup.
+
+The interactive test accepts `--timeout` and `--control-timeout` to distinguish
+slow startup from a short diagnostic socket deadline. It retries Enter once
+when the prompt remains in the editor after thread initialization and fails
+early on explicit command-tool startup errors.
 
 Run `python3 test/linux_console_focus.py` to check Linux terminal ownership
 above a ready DOS launcher. It exercises yield, fork and blocking wait, samples
@@ -1930,3 +2426,110 @@ it never flashes a USB device. Boot its default RAM session and inspect
 `C:\KLOG.TXT` for the last `WiFi:` stage and register diagnostics, or
 `C:\PROC\WIFI` for status. Internal disks are not mounted by its boot profile.
 Firmware contents and the generated image remain local build artifacts.
+
+
+QEMU live-root Codex state is separate from the Linux session: with the normal
+live profile it lives in $HOME/DOS/.codex and appears as /home/retroos/.codex.
+setup_codex.py preserves an existing guest login by default. If that copy has
+expired while the Linux login still works, refresh only the guest cache from
+Linux with:
+
+    python3 tools/setup_codex.py --home "$HOME/DOS" --refresh-auth
+
+The replacement is atomic, mode 0600, and refuses shared authentication
+symlinks or using the source as its own destination. The source login is never
+written. Project trust must name the actual mounted project path; the DOS
+home does not itself contain project/RetroOS.
+
+KLOG0218 contained an expired guest login, a project trust warning and a
+managed app-server timeout. Refreshing auth and adding trust cleared the first
+two errors. Direct --no-daemon startup was verified in the same 2 GiB/2 CPU
+live-SMB setup; managed startup remained timing-sensitive (two failures and a
+profiled success after about 62 seconds). Testing managed 0.167 did not resolve
+the failure, so the original 0.163 package selection was restored.
+
+Older guest arg0 caches contain native host symlinks into deleted package
+staging directories. This Samba configuration hides the dangling entries from
+metadata access; unlink returns ENOENT and rmdir returns ENOTEMPTY. The manual
+known-failure //tests:linux_smb_native_cleanup preserves a small reproduction
+for both Linux ABIs and also checks that live-link targets survive deletion.
+No client-side kernel fix has been validated for this case. Unsuccessful VFS/
+reparse-point experiments were reverted. The existing guest's obsolete cache
+was moved intact under .codex/diagnostics, rather than deleted.
+
+Evidence and startup profiles: build/ci/qemu-error-check/.
+
+The final repaired-cache startup check reached the UI at 58.79 seconds with
+profiling enabled. Generic arg0 cleanup warnings can recur even for guest MF
+links; moving the old native-link cache is a migration, not a general fix.
+The manual native-cleanup repro remains expected to fail. Kernel experiments
+were reverted and all 538 kernel unit tests pass again.
+
+
+The November 10 QEMU KVM fixes address the separate open-lock cleanup error:
+ext4 now retains unlinked open inodes through its orphan chain, and SMB
+removes the name immediately while retaining descriptor access. VFS prevents
+an old descriptor from changing a replacement file's metadata. Replayed ext4
+journals are checkpointed before the next mutation, including orphan recovery.
+The native dangling-host-symlink limitation described above remains.
+
+The same build fixes FAT writes beyond EOF (the assembler temporary-object
+corruption) and implements process `kill` for both Linux ABIs. Focused KVM
+regressions are `//tests:linux_temp_build`, `//tests:linux_kill`, and
+`//tests:linux_open_file_cleanup`. The latter tests both ext4 and SMB and runs
+`e2fsck` on the ext4 images. The ext4 modern-image unit tests cover interrupted
+unlink/close and interrupted journal/orphan recovery.
+
+Managed Codex 0.163 now starts without the ext4 arg0 cleanup warning in the
+private fixture and accepts typing. This does not establish that the remaining
+live-SMB startup timeout or physical-machine latency is resolved. Current
+findings and artifact locations are recorded in `METAL_FINDINGS.txt`.
+
+
+The KLOG0219 follow-up adds bounded, version-checked executable caching and
+TCP/Unix-stream readable-notification tracking for edge-triggered epoll.
+Repeated large execs no longer always reread the complete binary. A private
+2 GiB/two-CPU live-tools SMB comparison reduced startup from 66.2 to 40.0
+seconds after the start gate. Managed Codex also passed an actual command-tool
+round trip, including verification of its output file. The model-refresh
+warning and substantial remaining latency are still unresolved; neither the
+cache nor the epoll fix is a claim of complete Codex compatibility.
+
+Reproduce the matching startup fixture with:
+
+```sh
+RETROOS_PREBUILT=1 python3 test/linux_codex_native_resume.py \
+  --storage smb --live-tools --memory 2048 --cpus 2 \
+  --state-from "$HOME/DOS/.codex" --daemon --full-features --existing-skills \
+  --screen-transport qmp --no-profile --sample-interval 0 --timeout 120
+```
+
+Build `//:boot_disk` first when using `RETROOS_PREBUILT=1`. New regression
+`//tests:linux_exec_cache` checks both Linux ABIs after executable writes,
+shared mappings and name replacement. `//tests:linux_epoll_network` now checks
+notifications for new TCP data with old bytes still unread; the corresponding
+Unix-stream case is covered by `//tests:linux_unix_socket`.
+
+
+The KLOG0220 follow-up reproduces the fatal readiness error with the installed
+home and normal configuration. Metadata and socket namespace edits now retain
+unrelated directory caches, and new `/proc` enumerations refresh the process
+list so GNU `ps` can find a newly created daemon. The full DN → COMMAND.COM →
+SHELL.ELF launch now reaches readiness with that state. A separate DN launch
+also executes a command through the managed server and verifies its result.
+Startup still takes roughly 25–28 seconds; diagnostic-log database warnings
+and further interactive latency remain under investigation.
+
+To test the actual installed state, build `//:boot_disk`, then run:
+
+```sh
+python3 test/linux_codex_dn.py --home "$HOME/DOS" --profile
+# Also submit a bounded command and verify the output file:
+python3 test/linux_codex_dn.py --home "$HOME/DOS" --tools --label tools
+```
+
+This driver uses the supplied home as writable guest state, including its
+existing configuration, packages and caches. It creates normal Codex sessions
+and retains test output under `.codex/diagnostics`; `--tools` confirms only the
+known diagnostic command if Codex asks for approval. It does not replace the
+home with the private startup fixture. Artifacts are in `build/ci/codex-dn-*`.

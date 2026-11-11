@@ -100,6 +100,7 @@ pub(crate) fn set_execute_regs(regs: *mut Regs) {
 
 /// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
 pub mod arch_call {
+    pub const HIGH_MEMORY: u64 = 0x128; // EDX=request pointer
     pub const EXECUTE: u64 = 0x100;      // Swap kernel↔user regs
     pub const SWITCH_TO: u64 = 0x101;    // Thread switch: EDX=out_regs, ECX=out_root, EBX=in_regs, ESI=in_root
     pub const SWITCH_FX: u64 = 0x102;    // Swap live FPU/SSE with EDX save area
@@ -227,11 +228,16 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
 #[inline(never)]
 fn arch_dispatch(regs: &mut Regs) {
     match regs.rax {
+        arch_call::HIGH_MEMORY => {
+            let request = unsafe { &mut *(regs.rdx as u32 as *mut crate::high_paging::Request) };
+            request.result = crate::high_paging::request(request);
+        }
         arch_call::EXECUTE => {
             if super::irq::wake_pending() {
                 let (event, extra) = arch_abi::KernelEvent::Irq.encode();
                 regs.rax = u64::from(event);
-                regs.rdx = u64::from(extra);
+                regs.rdx = extra as u32 as u64;
+                regs.rcx = extra >> 32;
             } else { swap_regs(regs); }
         },
         arch_call::SWITCH_TO => arch_switch_to(regs),
@@ -775,6 +781,10 @@ fn isr_handler_ring3(regs: &mut Regs) {
                 }
             }
         }
+        // The legacy sensitive-instruction decoder uses 32-bit addresses.
+        // A native long-mode #GP must retain its full faulting RIP rather
+        // than decoding unrelated bytes at the truncated low address.
+        13 if regs.mode() == UserMode::Mode64 => KE::Exception(13),
         13 => {
             // VME raises #GP with VIF=1 && VIP=1 to ask the host to inject the
             // pending virtual interrupt. It normally lands on STI/POPF/IRET
@@ -834,7 +844,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
         }
         14 => {
             if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
-            KE::PageFault { addr: x86::read_cr2() }
+            KE::PageFault { addr: x86::read_cr2_full() }
         }
         32..=47 | 0xF8..=0xFF => { handle_irq(regs); KE::Irq }
         // Vectors 3/4 (#BP/#OF) are only reachable from user INT3/INTO, so
@@ -875,7 +885,8 @@ fn isr_handler_ring3(regs: &mut Regs) {
     swap_regs(regs);
     let (event, extra) = kevent.encode();
     regs.rax = event as u64;
-    regs.rdx = extra as u64;
+    regs.rdx = extra as u32 as u64;
+    regs.rcx = extra >> 32;
 }
 
 /// Ring-1 (kernel) trap dispatch: arch calls, page faults, IRQs. Anything
@@ -906,9 +917,16 @@ fn isr_handler_ring1(regs: &mut Regs) {
 
 /// Try to handle a page fault. Returns Some(()) if resolved, None if not.
 fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
+    let _sample = crate::exec_profile::FaultSample::start(error & 4 != 0);
     use crate::paging2::{KERNEL_BASE, PAGE_TABLE_BASE, page_idx};
 
-    let fault_addr = x86::read_cr2() as usize;
+    let full_addr = x86::read_cr2_full();
+    if full_addr >= crate::high_paging::START {
+        return crate::high_paging::fault(full_addr, error).then_some(());
+    }
+    // Reject the inaccessible gap rather than truncating to a low address.
+    if full_addr > u32::MAX as u64 { return None; }
+    let fault_addr = full_addr as usize;
     let present = (error & 1) != 0;
     let write = (error & 2) != 0;
     let user = (error & 4) != 0;
@@ -974,6 +992,15 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
             }
         }
     }
+    // A first user write used to install a read-only zero page, return to the
+    // same instruction, then fault a second time just to make its private copy.
+    // Complete that ordinary write fault before returning to user mode.
+    if !present && write && user && !legacy_mode {
+        match paging2::entries() {
+            paging2::Entries::E32(e) => handle_protection_fault(e, fault_addr, page_index, true, true, false)?,
+            paging2::Entries::E64(e) => handle_protection_fault(e, fault_addr, page_index, true, true, false)?,
+        }
+    }
     Some(())
 }
 
@@ -1008,7 +1035,8 @@ fn handle_protection_fault<E: paging2::Entry>(
     }
     if let Some(idx) = cow_idx {
         paging2::cow_entry(entries, idx);
-        paging2::flush_tlb();
+        if idx < paging2::PAGE_TABLE_BASE_IDX { x86::invlpg(page_index * paging2::PAGE_SIZE); }
+        else { paging2::flush_tlb(); }
         return Some(());
     }
 
@@ -1047,7 +1075,8 @@ fn demand_page<E: paging2::Entry>(
         e.set_no_execute(true);
     }
     paging2::replace_mapping(&mut entries[page_index], e);
-    paging2::flush_tlb();
+    if page_index < PAGE_TABLE_BASE_IDX { x86::invlpg(page_index * paging2::PAGE_SIZE); }
+    else { paging2::flush_tlb(); }
 }
 
 // =============================================================================
@@ -1073,7 +1102,7 @@ fn demand_page_kernel(fault_addr: usize) {
             );
         }
     }
-    paging2::flush_tlb();
+    x86::invlpg(fault_addr & !(paging2::PAGE_SIZE - 1));
 }
 
 /// Ring-0 interrupt handler. No frame conversion, no canonicalization.

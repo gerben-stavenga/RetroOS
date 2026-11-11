@@ -8,20 +8,21 @@
 /// words. Decoding stays outside this wrapper so its cost can be measured
 /// independently from the privilege transition and guest run.
 #[inline(never)]
-pub fn do_arch_execute_raw() -> (u32, u32) {
+pub fn do_arch_execute_raw() -> (u32, u64) {
     let event: u32;
     let extra: u32;
+    let extra_high: u32;
     unsafe {
         core::arch::asm!(
             "int 0x80",
             inout("eax") crate::arch_call::EXECUTE as u32 => event,
             out("edx") extra,
-            out("ecx") _,
+            out("ecx") extra_high,
             out("ebx") _,
             out("edi") _,
         );
     }
-    (event, extra)
+    (event, u64::from(extra) | (u64::from(extra_high) << 32))
 }
 
 pub fn arch_replace_interrupt_handlers(vector: u8, mut handlers: arch_abi::InterruptHandlers) -> arch_abi::InterruptHandlers {

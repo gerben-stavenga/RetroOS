@@ -720,10 +720,9 @@ fn dispatch_shim64(
             return None; // re-enter at the faulting RIP (SET_SREGS reflushes)
         }
         vcpu.err_code = f.err_code as u64;
-        // The loader keeps 64-bit user VAs below 4 GiB, so a wider CR2 is
-        // already a wild access — the u32 truncation only affects the SEGV
-        // diagnostic, not the verdict.
-        return Some(KernelEvent::PageFault { addr: cr2 as u32 });
+        // The interpreter has no high mappings; preserve the complete fault
+        // address for the shared kernel's signal delivery and diagnostics.
+        return Some(KernelEvent::PageFault { addr: cr2 });
     }
 
     // `syscall` with EFER.SCE=0 raises #UD: decode 0F 05 at the faulting RIP
@@ -778,7 +777,7 @@ fn dispatch_shim(
             return None; // page-table mutation marked the next entry for a TLB flush
         }
         vcpu.err_code = f.err_code as u64;
-        return Some(KernelEvent::PageFault { addr: cr2 });
+        return Some(KernelEvent::PageFault { addr: cr2 as u64 });
     }
 
     // #GP: the shared monitor — the same decoder arch-metal runs on its real

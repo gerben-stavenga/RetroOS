@@ -12,7 +12,7 @@ import socket
 import subprocess
 import time
 
-from vm_mount_config import split_configuration
+from vm_mount_config import split_configuration, volumes
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE = ROOT / 'build/qemu-live.json'
@@ -115,7 +115,7 @@ follow symlinks = yes
 '''
 
 
-def prepare(work, boot, root, c_root, port, password, startup):
+def prepare(work, boot, root, c_root, port, password, startup, native_home=None):
     username = pwd.getpwuid(os.getuid()).pw_name
     for directory in ('private', 'lock', 'cache', 'state', 'run'):
         (work / directory).mkdir(mode=0o700)
@@ -141,13 +141,19 @@ def prepare(work, boot, root, c_root, port, password, startup):
         if any(c in startup for c in '\n\r\0'):
             raise ValueError('Startup command must be one line')
         settings += '\n[environment]\nTEST=' + startup + '\n'
-    for share, path, access in [('root', '/', 'ro'), ('data', '/home/retroos', 'rw')]:
+    shares = [('root', '/', 'ro')] + ([] if native_home else [('data', '/home/retroos', 'rw')])
+    for share, path, access in shares:
         settings += (f'\n[smb]\nserver=10.0.2.2\nport={port}\nshare={share}\n'
                      f'username={username}\npassword={password}\npath={path}\naccess={access}\n')
         if share == 'data':
             settings += f'subdir={c_root}\n'
     boot_config = ('[bundle]\nsource=UUID=5E77-0002\nsubdir=/\n\n'
                    '[mount "data"]\nsource=bundle\npath=/home/retroos\ndrive=C\naccess=ram\nsubdir=/\n')
+    if native_home:
+        ident = next(ident for kind, ident in volumes(native_home) if kind == 'ext4')
+        boot_config = ('[bundle]\nsource=UUID=5E77-0002\nsubdir=/\n\n'
+                       f'[mount "data"]\nsource=UUID={ident}\npath=/home/retroos\n'
+                       'drive=C\naccess=rw\nsubdir=/home/retroos\ngrant=/home/retroos\n')
     # Both files are on the disposable boot image; persistent host INIs are
     # never edited and per-launch SMB credentials never enter source control.
     for name, text in [('BOOT.INI', boot_config), ('RETROOS.INI', settings)]:
@@ -155,6 +161,11 @@ def prepare(work, boot, root, c_root, port, password, startup):
         target.write_text(text)
         target.chmod(0o600)
         command(['mcopy', '-o', '-i', str(boot) + '@@1048576', target, '::RETROOS/' + name])
+        if native_home and name == 'RETROOS.INI':
+            # Startup reads settings from C: once that native mount is active.
+            # The caller supplies a disposable image, prepared before VM launch.
+            command(['debugfs', '-w', '-R', 'rm /home/retroos/RETROOS/RETROOS.INI', native_home])
+            command(['debugfs', '-w', '-R', f'write {target} /home/retroos/RETROOS/RETROOS.INI', native_home])
 
 
 def serve(work, boot, startup, profile_path):
@@ -166,7 +177,7 @@ def serve(work, boot, startup, profile_path):
         listener.bind(('127.0.0.1', 0))
         port = listener.getsockname()[1]
     password = secrets.token_hex(32)
-    prepare(work, boot, root, c_root, port, password, startup)
+    prepare(work, boot, root, c_root, port, password, startup, profile.get("native_home_image"))
     smbd, _ = binaries()
     def interrupted(number, _frame):
         raise SystemExit(128 + number)
@@ -189,7 +200,8 @@ def serve(work, boot, startup, profile_path):
                         raise RuntimeError('Private Samba server did not start')
                     time.sleep(.05)
             (work / 'smb-ready').write_text(str(port))
-            print(f'Live SMB files: / = {root} (read-only), C: = {c_root} (writable)', flush=True)
+            home_source = profile.get('native_home_image', str(c_root))
+            print(f'Live files: / = {root} (read-only SMB), C: = {home_source} (writable)', flush=True)
             server.wait()
         finally:
             try:

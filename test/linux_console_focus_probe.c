@@ -36,6 +36,20 @@ void _start(void) {
     check(child >= 0);
     if (!child) {
         save("/home/retroos/ready", "ready\n", 6);
+#ifdef BUSY_HELPER
+        long helper = call(__NR_fork, 0, 0, 0, 0);
+        check(helper >= 0);
+        if (!helper) {
+            word start[2], current[2];
+            check(call(__NR_clock_gettime, 1, (word)start, 0, 0) == 0);
+            volatile unsigned value = 1;
+            do {
+                for (int i = 0; i < 1000; i++) value = value * 1664525 + 1013904223;
+                check(call(__NR_clock_gettime, 1, (word)current, 0, 0) == 0);
+            } while (current[0] - start[0] < 8);
+            finish(0);
+        }
+#endif
         char input[8];
         long n = call(__NR_read, 31, (word)input, sizeof input, 0);
         finish(n == 2 && input[0] == 'k' && input[1] == '\n' ? 17 : 2);

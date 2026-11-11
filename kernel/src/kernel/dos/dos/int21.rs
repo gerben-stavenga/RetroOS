@@ -382,7 +382,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             // A redirected std handle (AH=46h put a file in slot 0-2) or a
             // dup'd console handle closes via the thread table: the VFS
             // refcount drops there, and a std slot reverts to the console.
-            let redirected = hidx < thread::MAX_FDS
+            let redirected = hidx < thread::MAX_DOS_FDS
                 && ((handle <= 2 && matches!(kt.fds[hidx], thread::FdKind::Vfs(_)))
                     || kt.fds[hidx] == thread::FdKind::ConsoleOut);
             let result = if redirected {
@@ -409,11 +409,11 @@ pub(super) fn int_21h<A: crate::Arch>(
             let count = regs.rcx as u16 as usize;
             let buf_addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
             // A std handle redirected to a file (AH=46h) reads the file.
-            let vfs_backed = (handle as usize) < thread::MAX_FDS
+            let vfs_backed = (handle as usize) < thread::MAX_DOS_FDS
                 && matches!(kt.fds[handle as usize], thread::FdKind::Vfs(_));
             let empty = !vfs_backed
                 && (handle <= 2
-                    || (handle as usize) < thread::MAX_FDS
+                    || (handle as usize) < thread::MAX_DOS_FDS
                         && kt.fds[handle as usize] == thread::FdKind::ConsoleOut)
                 || handle == NULL_FILE_HANDLE as i32
                 || count == 0
@@ -571,11 +571,11 @@ pub(super) fn int_21h<A: crate::Arch>(
                     let hidx = handle as usize;
                     // A redirected std handle must report FILE, not device —
                     // it's how programs detect their output is captured.
-                    let vfs_backed = hidx < thread::MAX_FDS
+                    let vfs_backed = hidx < thread::MAX_DOS_FDS
                         && matches!(kt.fds[hidx], thread::FdKind::Vfs(_));
                     let console = !vfs_backed
                         && (handle <= 2
-                            || (hidx < thread::MAX_FDS && kt.fds[hidx] == thread::FdKind::ConsoleOut));
+                            || (hidx < thread::MAX_DOS_FDS && kt.fds[hidx] == thread::FdKind::ConsoleOut));
                     if console {
                         // stdin/stdout/stderr: bit 7=1 (device), bit 0=1 (stdin), bit 1=1 (stdout)
                         let info: u16 = 0x80 | match handle {
@@ -649,7 +649,7 @@ pub(super) fn int_21h<A: crate::Arch>(
         // (TASM via TASM2MSG, FILTER.H's BI#PIP#OK protocol).
         0x45 => {
             let src = regs.rbx as u16 as usize;
-            match (dos_dup_fdkind(kt, src), kt.alloc_fd(FIRST_USER_HANDLE)) {
+            match (dos_dup_fdkind(kt, src), kt.alloc_fd(FIRST_USER_HANDLE).filter(|fd| *fd < thread::MAX_DOS_FDS)) {
                 (Some(kind), Some(fd)) => {
                     if let thread::FdKind::Vfs(h) = kind { crate::kernel::vfs::add_vfs_ref(h); }
                     kt.fds[fd] = kind;
@@ -672,7 +672,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             let src = regs.rbx as u16 as usize;
             let dst = regs.rcx as u16 as usize;
             match dos_dup_fdkind(kt, src) {
-                Some(kind) if dst < thread::MAX_FDS => {
+                Some(kind) if dst < thread::MAX_DOS_FDS => {
                     if dst != src
                         && Psp::set_jft(machine, psp_struct_seg(dos), dst, dst as u8).is_err()
                     {
@@ -729,11 +729,11 @@ pub(super) fn int_21h<A: crate::Arch>(
             // Std handles write to the console only while their fd slot is
             // not redirected to a file; a dup'd console handle (AH=45h of an
             // unredirected 1/2) is a console too.
-            let vfs_backed = hidx < thread::MAX_FDS
+            let vfs_backed = hidx < thread::MAX_DOS_FDS
                 && matches!(kt.fds[hidx], thread::FdKind::Vfs(_));
             let console = !vfs_backed
                 && (handle == 1 || handle == 2
-                    || (hidx < thread::MAX_FDS && kt.fds[hidx] == thread::FdKind::ConsoleOut));
+                    || (hidx < thread::MAX_DOS_FDS && kt.fds[hidx] == thread::FdKind::ConsoleOut));
             if console {
                 let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
                 for i in 0..count as u32 {
@@ -1342,7 +1342,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             // requests at or below that size as successful no-ops.
             if requested <= PSP_JFT_LEN {
                 DosExit::Ok
-            } else if requested <= thread::MAX_FDS {
+            } else if requested <= thread::MAX_DOS_FDS {
                 let old_count = Psp::max_files(machine, psp_seg) as usize;
                 let old_addr = Psp::jft_addr(machine, psp_seg);
                 let old_external_seg = Psp::external_jft_seg(machine, psp_seg);

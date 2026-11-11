@@ -609,8 +609,10 @@ fn expose_user_config(bytes: &[u8], disk_settings: bool) {
 }
 
 fn mount_kernel_log_fs() {
+    vfs::mount_readonly(b"proc/sys/kernel/random/", &crate::kernel::fs::proc_sys::RANDOM_SYSCTL);
     vfs::mount_union(b"dev/", &crate::kernel::fs::devices::DEVICES);
     vfs::mount_union(b"proc/", &crate::kernel::klog::KLOG_FS);
+    vfs::mount_union_readonly(b"proc/", &crate::kernel::fs::processes::PROCESSES);
 
     let c_root = crate::kernel::dos::c_root();
     if !c_root.is_empty() {
@@ -1363,6 +1365,7 @@ fn present_desktop<A: crate::Arch>(
     display: &mut crate::kernel::display::Display,
     windows: &mut crate::kernel::gui::WindowManager,
     sound: crate::kernel::osd::SoundView,
+    dos_scanout: bool,
 ) {
     let extent = windows.desktop().extent();
     let compose_sample = crate::kernel::osd_profile::Sample::start(machine);
@@ -1402,7 +1405,7 @@ fn present_desktop<A: crate::Arch>(
             .surface_buffer(key, format)
     };
     let scene_sample = crate::kernel::osd_profile::Sample::start(machine);
-    if display.publish_composition(machine, windows, canvas_width, canvas_height, resolve) {
+    if display.publish_composition(machine, windows, canvas_width, canvas_height, dos_scanout, resolve) {
         scene_sample.finish(machine, crate::kernel::osd_profile::Stage::Scene, 0);
         compose_sample.finish(machine, crate::kernel::osd_profile::Stage::Compose, 0);
         return;
@@ -1487,6 +1490,9 @@ fn event_loop<A: crate::Arch>(
     let mut blocked_io_service = Periodic::new(last_world_ns, 1_000_000);
     let mut injected_keys = Periodic::new(last_world_ns, 1_000_000);
     let mut quantum = Periodic::new(last_world_ns, 10_000_000);
+    let mut writeback = Periodic::new(last_world_ns, 100_000_000);
+    let mut writeback_error_reported = false;
+    let mut linux_timeslice_cursor = first_tid;
     let mut hardware_deadline = None;
     let mut hardware_initialized = false;
 
@@ -1504,13 +1510,16 @@ fn event_loop<A: crate::Arch>(
         let display_due = display_active && display_service.consume(world_now_ns);
         let blocked_io_due = blocked_io_service.consume(world_now_ns);
         let injected_due = injected_keys.consume(world_now_ns);
-        quantum.consume(world_now_ns);
+        let quantum_due = quantum.consume(world_now_ns);
+        if quantum_due && machine.free_page_count() < 32768 {
+            super::vfs::executable::reclaim();
+        }
         // Service synchronous VGA before handling queued kernel events.
         // The linear VBE fallback still uses the guest-memory handoff.
         // Audio DMA and legacy VGA read resident device storage independently.
         super::media::kernel_entry();
         crate::kernel::linux::reap_waited_child(machine, threads, ctx.tid);
-        crate::kernel::linux::refresh_system_tasks(threads);
+        crate::kernel::linux::refresh_system_tasks(threads, ctx.tid, machine.get_ticks());
         if display.is_none() {
             windows.release_output_buffers();
         }
@@ -1540,7 +1549,11 @@ fn event_loop<A: crate::Arch>(
         crate::kernel::linux::wake_record_locks(threads, ctx.tid, &mut ctx.regs);
         if world_now_ns >= next_klog_sync_ns {
             crate::kernel::klog::sync_live();
-            next_klog_sync_ns = world_now_ns.saturating_add(KLOG_SYNC_NS);
+            next_klog_sync_ns = machine.now().saturating_add(KLOG_SYNC_NS);
+        }
+        if writeback.consume(world_now_ns) && crate::kernel::vfs::writeback_all() < 0 && !writeback_error_reported {
+            crate::compact_println!("Filesystem background writeback failed");
+            writeback_error_reported = true;
         }
         let now_tick = world_now_ns / 1_000_000;
         // Keep the F12 window list fresh while it is open,
@@ -1667,6 +1680,7 @@ fn event_loop<A: crate::Arch>(
                 display,
                 &mut windows,
                 sound,
+                matches!(threads[ctx.tid].personality, thread::Personality::Dos(_)),
             );
         }
         stats.mark(machine, PROFILE_DISPLAY);
@@ -1811,6 +1825,7 @@ fn event_loop<A: crate::Arch>(
         stats.part(machine, PROFILE_INPUT);
 
         let mut deadlines = Deadlines::new(world_now_ns);
+        deadlines.include(Some(writeback.deadline()));
         deadlines.include(super::media::inline_video_deadline(world_now_ns));
         deadlines.include(hardware_deadline);
         if crate::kernel::klog::needs_sync() { deadlines.include(Some(next_klog_sync_ns)); }
@@ -1830,6 +1845,12 @@ fn event_loop<A: crate::Arch>(
         }
         if blocked_polling { deadlines.include(Some(blocked_io_service.deadline())); }
         if deadlines.immediate() { continue; }
+
+        if quantum_due && let Some(next) = crate::kernel::sched::linux_timeslice_successor(threads, ctx.tid, &mut linux_timeslice_cursor) {
+            switch_focus_and_run(machine, &mut *bios_workspace, threads, &mut ctx, next,
+                &mut exiting_display, &mut sb_handoff, &mut display, &mut windows);
+            continue;
+        }
 
         // A blocked thread holds the console but not the CPU: wait for input
         // to unblock it (above) or the F12 window picker to move on.
@@ -1857,7 +1878,7 @@ fn event_loop<A: crate::Arch>(
                 ),
                 None => {
                     machine.arm_alarm(deadlines.next());
-                    machine.idle();
+                    stats.idle(machine);
                 },
             }
             continue;
@@ -1875,7 +1896,7 @@ fn event_loop<A: crate::Arch>(
                 // Hosted execution normally supplies clock wakeups on return
                 // from a guest slice. There is no slice while pacing it.
                 machine.arm_alarm(deadlines.next());
-                machine.idle();
+                stats.idle(machine);
                 continue;
             }
             now
@@ -1920,6 +1941,8 @@ fn event_loop<A: crate::Arch>(
                 &mut display,
             );
         }
+
+        crate::kernel::linux::notify_thread_exits(threads, ctx.tid);
 
         // Ask the scheduler.
         let exiting = matches!(action, thread::KernelAction::Exit(_));
@@ -2265,7 +2288,7 @@ fn dispatch<A: crate::Arch>(
             && crate::kernel::linux::try_signal_fault(machine, linux, thread.kernel.tid, regs, addr) {
             return thread::KernelAction::Done;
         }
-        if thread.personality.try_vga_fault(machine, regs, addr) {
+        if addr <= u32::MAX as u64 && thread.personality.try_vga_fault(machine, regs, addr as u32) {
             return thread::KernelAction::Done;
         }
         crate::compact_println!(
@@ -2580,7 +2603,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let parent_cwd_len: usize;
     let parent_env_snapshot: Option<alloc::vec::Vec<u8>>;
     let parent_is_dos: bool;
-    let parent_fds = parent.kernel.fds;
+    let parent_fds = thread::copy_fds(&parent.kernel.fds);
     match &mut parent.personality {
         thread::Personality::Dos(dos) => {
             parent_is_dos = true;
@@ -3378,6 +3401,19 @@ impl ProfileSnapshot {
 }
 
 static mut PROFILE_SNAPSHOT: ProfileSnapshot = ProfileSnapshot::EMPTY;
+pub(super) const PROFILE_TOTAL_NAMES: [&str; 11] = [
+    "guest_arch", "loop", "irq_drain", "devices", "audio", "display",
+    "input", "dispatch", "scheduler", "serial_control", "idle",
+];
+#[derive(Clone, Copy)]
+pub(super) struct ProfileTotals {
+    pub elapsed_ns: u64,
+    pub cycles: [u64; 11],
+}
+static mut PROFILE_TOTALS: ProfileTotals = ProfileTotals { elapsed_ns: 0, cycles: [0; 11] };
+pub(super) fn profile_totals() -> ProfileTotals {
+    unsafe { core::ptr::read_volatile(&raw const PROFILE_TOTALS) }
+}
 static PROFILE_RESET: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 static PROFILE_REBASE: core::sync::atomic::AtomicBool =
@@ -3459,6 +3495,8 @@ struct EventStats {
     last_publish: u64,
     guest_cycles: u64,
     kernel_cycles: [u64; PROFILE_BUCKETS + 1],
+    started_ns: u64,
+    idle_cycles: u64,
 }
 
 impl EventStats {
@@ -3472,6 +3510,8 @@ impl EventStats {
             last_publish: now,
             guest_cycles: 0,
             kernel_cycles: [0; PROFILE_BUCKETS + 1],
+            started_ns: 0,
+            idle_cycles: 0,
         }
     }
 
@@ -3492,8 +3532,31 @@ impl EventStats {
             self.last_publish = now;
             self.guest_cycles = 0;
             self.kernel_cycles = [0; PROFILE_BUCKETS + 1];
+            self.started_ns = machine.now();
+            self.idle_cycles = 0;
         }
         self.last_tsc = now;
+        let totals = self.totals(machine.now().saturating_sub(self.started_ns));
+        unsafe { core::ptr::write_volatile(&raw mut PROFILE_TOTALS, totals); }
+    }
+
+    fn totals(&self, elapsed_ns: u64) -> ProfileTotals {
+        let mut cycles = [0; 11];
+        cycles[0] = self.guest_cycles;
+        cycles[1..10].copy_from_slice(&self.kernel_cycles);
+        // Sleeping was charged to scheduler by slice_begin. Expose it as a
+        // separate, disjoint category instead of labelling sleep as CPU work.
+        let idle = self.idle_cycles.min(cycles[1 + PROFILE_SCHEDULER]);
+        cycles[1 + PROFILE_SCHEDULER] -= idle;
+        cycles[10] = idle;
+        ProfileTotals { elapsed_ns, cycles }
+    }
+
+    fn idle<A: crate::Arch>(&mut self, machine: &mut A) {
+        if !self.active { machine.idle(); return; }
+        let start = machine.rdtsc();
+        machine.idle();
+        self.idle_cycles = self.idle_cycles.wrapping_add(machine.rdtsc().wrapping_sub(start));
     }
 
     fn mark<A: crate::Arch>(&mut self, machine: &mut A, bucket: usize) {
@@ -3583,6 +3646,7 @@ mod profile_tests {
         let mut stats = EventStats {
             active: true, last_tsc: 0, last_publish: 0, guest_cycles: 800,
             kernel_cycles: [0; PROFILE_BUCKETS + 1],
+            started_ns: 0, idle_cycles: 0,
         };
         stats.kernel_cycles[PROFILE_IRQ] = 120;
         stats.kernel_cycles[PROFILE_SERIAL_CONTROL] = 40;
@@ -3592,5 +3656,20 @@ mod profile_tests {
         assert_eq!(snapshot.parts[PROFILE_IRQ], 800);
         assert_eq!(snapshot.parts[PROFILE_DISPATCH], 200);
         assert_eq!(snapshot.irq_parts, [750, 250]);
+    }
+
+    #[test]
+    fn cumulative_totals_separate_sleep_without_losing_time() {
+        let mut stats = EventStats {
+            active: true, last_tsc: 0, last_publish: 0, guest_cycles: 80,
+            kernel_cycles: [0; PROFILE_BUCKETS + 1], started_ns: 0, idle_cycles: 35,
+        };
+        stats.kernel_cycles[PROFILE_SCHEDULER] = 50;
+        stats.kernel_cycles[PROFILE_DISPATCH] = 20;
+        let totals = stats.totals(150);
+        assert_eq!(totals.elapsed_ns, 150);
+        assert_eq!(totals.cycles[1 + PROFILE_SCHEDULER], 15);
+        assert_eq!(totals.cycles[10], 35);
+        assert_eq!(totals.cycles.iter().sum::<u64>(), 150);
     }
 }

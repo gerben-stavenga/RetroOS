@@ -36,6 +36,17 @@ impl Arch for Metal {
     // `&mut *(&raw mut REGS)` is the deliberate `&raw`-first form that avoids a
     // `static_mut_refs` reference; clippy's `deref_addrof` "simplification"
     // would reintroduce exactly that, so allow it here.
+    fn high_mapping(&mut self, address: u64, length: u64, operation: u32, protection: u32) -> i32 {
+        super::high_paging::invoke(super::high_paging::Request {
+            address, length, operation, protection, buffer: 0, result: 0,
+        })
+    }
+    fn high_copy(&mut self, address: u64, buffer: &mut [u8], to_user: bool) -> bool {
+        super::high_paging::invoke(super::high_paging::Request {
+            address, length: buffer.len() as u64, operation: if to_user { 6 } else { 5 },
+            protection: 0, buffer: buffer.as_mut_ptr() as usize, result: 0,
+        }) == 0
+    }
     fn user_64_supported(&self) -> bool {
         // Long mode is toggled per-thread on demand (traps::toggle_mode_if_needed),
         // so CPU support is the whole capability.

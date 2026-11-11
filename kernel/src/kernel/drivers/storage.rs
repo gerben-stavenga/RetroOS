@@ -121,6 +121,8 @@ impl<H: Hardware> Storage<H> {
 impl<H: Hardware> State<H> {
     fn execute(&mut self, command: Command, name: &str) -> bool {
         if self.failed { return false; }
+        let stage = match command.operation { Operation::Read => 19, Operation::Write => 20, Operation::Flush => 21 };
+        let _sample = crate::kernel::event_profile::FileIoScope::start(stage, command.sectors as usize * SECTOR);
         // Publish CPU-written data before the controller reads it, and observe
         // controller-written data only after its completion has been consumed.
         fence(Ordering::SeqCst);

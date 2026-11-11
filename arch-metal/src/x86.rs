@@ -128,6 +128,14 @@ pub fn read_cr2() -> u32 {
     value
 }
 
+/// Full fault address, including while Rust runs in compatibility mode.
+pub fn read_cr2_full() -> u64 {
+    unsafe extern "C" { fn read_cr2_long_mode() -> u64; }
+    if crate::paging2::cpu_mode() == crate::paging2::CpuMode::Compat {
+        unsafe { read_cr2_long_mode() }
+    } else { read_cr2() as u64 }
+}
+
 /// Read CR3 register (page directory base)
 #[inline]
 pub fn read_cr3() -> u32 {

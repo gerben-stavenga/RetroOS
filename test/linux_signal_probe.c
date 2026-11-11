@@ -3,6 +3,13 @@
 #include <sys/ucontext.h>
 #include <asm/unistd.h>
 typedef unsigned long word;
+#ifdef HIGH_FAULT
+#define FAULT_ADDRESS 0x123456789000UL
+#define FAULT_SETUP "movabs $0x123456789000,%%rdx\n"
+#else
+#define FAULT_ADDRESS 0UL
+#define FAULT_SETUP "xor %%edx,%%edx\n"
+#endif
 static long call(word n,word a,word b,word c,word d) {
  long result;register word fourth __asm__("r10")=d;
  __asm__ volatile("syscall":"=a"(result):"a"(n),"D"(a),"S"(b),"d"(c),"r"(fourth):"rcx","r11","memory");return result;
@@ -15,7 +22,7 @@ __asm__(".text\n.global restorer\nrestorer: mov $15,%eax\nsyscall\nud2\n"
  ".global fault_site,resume_site\n");
 static void handler(int sig,siginfo_t *info,void *context) {
  ucontext_t *uc=context;word mask=0;
- check(sig==SIGSEGV && info->si_signo==SIGSEGV && info->si_addr==0,11);
+ check(sig==SIGSEGV && info->si_signo==SIGSEGV && (word)info->si_addr==FAULT_ADDRESS,11);
  check((word)&uc>=(word)alt && (word)&uc<(word)alt+sizeof alt,12);
  check(uc->uc_mcontext.gregs[REG_RIP]==(word)fault_site,13);
  check(uc->uc_mcontext.gregs[REG_RAX]==0x12345678,14);
@@ -47,7 +54,7 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
  check(call(__NR_rt_sigaction,SIGSEGV,0,0xbfffffffUL,8)==-14,5);
  check(call(__NR_sigaltstack,(word)&stack,0,0,0)==0,6);
  check(call(__NR_rt_sigprocmask,2,(word)&mask,0,8)==0,7);
- __asm__ volatile("mov $0x12345678,%%eax\nmovq %%rax,%%xmm15\nmov %%rax,-8(%%rsp)\nxor %%edx,%%edx\n"
+ __asm__ volatile("mov $0x12345678,%%eax\nmovq %%rax,%%xmm15\nmov %%rax,-8(%%rsp)\n" FAULT_SETUP
  "fault_site: mov (%%rdx),%%rdx\nresume_site: movq %%xmm15,%1\nmov -8(%%rsp),%2"
  :"=a"(result),"=r"(simd),"=r"(redzone)::"rdx","xmm15","memory");
  check(called==1 && result==0x87654321 && simd==0x12345678 && redzone==0x12345678,8);

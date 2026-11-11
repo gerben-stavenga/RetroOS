@@ -47,6 +47,16 @@ impl Anonymous {
 }
 
 pub(super) fn call<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args) -> SyscallResult {
+    if a.a0 >= high_memory::START {
+        let Some(length) = a.a1.checked_add(4095).map(|n| n & !4095) else { return SyscallResult::val(-EINVAL); };
+        if a.a0 & 4095 != 0 || !high_memory::range(a.a0, length) { return SyscallResult::val(-EINVAL); }
+        return match a.a2 {
+            4 => high_memory::change(machine, a, 3),
+            0..=3 | 8 | 12..=17 => SyscallResult::val(0),
+            _ => SyscallResult::val(-EINVAL),
+        };
+    }
+    if a.a0 > u32::MAX as u64 || a.a1 > u32::MAX as u64 { return SyscallResult::val(-EINVAL); }
     if a.a0 & 4095 != 0 { return SyscallResult::val(-EINVAL); }
     let Some(end) = a.a0.checked_add(a.a1).and_then(|n| n.checked_add(4095))
         .map(|n| n & !4095).filter(|end| *end <= 0xc0000000)

@@ -148,14 +148,13 @@ pub(super) fn call<A: crate::Arch>(
             if a.a3 != 8 || (a.a1 != 0 && a.a0 > 2) {
                 return SyscallResult::val(-22);
             }
-            if (a.a1 != 0 && !valid(a.a1, 8)) || (a.a2 != 0 && !valid(a.a2, 8)) {
-                return SyscallResult::val(-14);
-            }
-            let new = (a.a1 != 0).then(|| machine.read::<u64>(a.a1 as usize));
+            let new = if a.a1 != 0 {
+                let mut bytes = [0; 8];
+                if !super::high_memory::copy_from(machine, a.a1, &mut bytes) { return SyscallResult::val(-14); }
+                Some(u64::from_le_bytes(bytes))
+            } else { None };
             let local = state.locals.entry(tid).or_default();
-            if a.a2 != 0 {
-                machine.write(a.a2 as usize, local.mask);
-            }
+            if a.a2 != 0 && !super::high_memory::copy_to(machine, a.a2, &local.mask.to_le_bytes()) { return SyscallResult::val(-14); }
             if let Some(mask) = new {
                 local.mask = match a.a0 {
                     0 => local.mask | mask,
@@ -166,25 +165,24 @@ pub(super) fn call<A: crate::Arch>(
             0
         }
         131 => {
-            if (a.a0 != 0 && !valid(a.a0, 24)) || (a.a1 != 0 && !valid(a.a1, 24)) {
-                return SyscallResult::val(-14);
-            }
             let old = state.locals.get(&tid).copied().unwrap_or_default();
             let active = on_stack(old, regs.frame.rsp);
             let new = if a.a0 != 0 {
                 if active {
                     return SyscallResult::val(-1);
                 }
-                let flags = machine.read::<u32>(a.a0 as usize + 8);
-                let stack = machine.read::<u64>(a.a0 as usize);
-                let size = machine.read::<u64>(a.a0 as usize + 16);
+                let mut bytes = [0; 24];
+                if !super::high_memory::copy_from(machine, a.a0, &mut bytes) { return SyscallResult::val(-14); }
+                let flags = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                let stack = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                let size = u64::from_le_bytes(bytes[16..].try_into().unwrap());
                 if flags != 0 && flags != 2 {
                     return SyscallResult::val(-22);
                 }
                 if flags == 0 && size < 2048 {
                     return SyscallResult::val(-12);
                 }
-                if flags == 0 && !valid(stack, size) {
+                if flags == 0 && !super::high_memory::range(stack, size) {
                     return SyscallResult::val(-14);
                 }
                 Some(if flags == 2 {
@@ -199,13 +197,11 @@ pub(super) fn call<A: crate::Arch>(
                 None
             };
             if a.a1 != 0 {
-                machine.write(a.a1 as usize, old.stack);
-                machine.write::<u32>(
-                    a.a1 as usize + 8,
-                    if old.size == 0 { 2 } else { u32::from(active) },
-                );
-                machine.write::<u32>(a.a1 as usize + 12, 0);
-                machine.write(a.a1 as usize + 16, old.size);
+                let mut bytes = [0; 24];
+                bytes[..8].copy_from_slice(&old.stack.to_le_bytes());
+                bytes[8..12].copy_from_slice(&(if old.size == 0 { 2 } else { u32::from(active) }).to_le_bytes());
+                bytes[16..].copy_from_slice(&old.size.to_le_bytes());
+                if !super::high_memory::copy_to(machine, a.a1, &bytes) { return SyscallResult::val(-14); }
             }
             if let Some(local) = new {
                 state.locals.insert(tid, local);
@@ -222,7 +218,7 @@ pub(super) fn deliver_fault<A: crate::Arch>(
     linux: &mut LinuxState,
     process: i32,
     regs: &mut Regs,
-    addr: u32,
+    addr: u64,
 ) -> bool {
     deliver(
         machine,
@@ -234,6 +230,8 @@ pub(super) fn deliver_fault<A: crate::Arch>(
         addr,
     )
 }
+
+pub(super) fn handler(linux: &LinuxState, signal: usize) -> u64 { linux.signals.actions[signal].handler }
 
 pub(super) fn disposition(linux: &LinuxState, tid: i32, signal: usize) -> Option<bool> {
     let local = linux.signals.locals.get(&tid).copied().unwrap_or_default();
@@ -250,11 +248,12 @@ pub(super) fn deliver<A: crate::Arch>(
     regs: &mut Regs,
     signal: usize,
     code: i32,
-    addr: u32,
+    addr: u64,
 ) -> bool {
     if regs.mode() != crate::UserMode::Mode64 {
         return false;
     }
+    let fault = signal == 11 && matches!(code, 1 | 2);
     let tid = async_io::current_id(&linux.async_io, process);
     let state = &mut linux.signals;
     let action = state.actions[signal];
@@ -326,10 +325,10 @@ pub(super) fn deliver<A: crate::Arch>(
         regs.frame.rip,
         regs.frame.rflags,
         regs.frame.cs | (regs.frame.ss << 48),
-        if signal == 11 { regs.err_code } else { 0 },
-        if signal == 11 { 14 } else { 0 },
+        if fault { regs.err_code } else { 0 },
+        if fault { 14 } else { 0 },
         local.mask,
-        u64::from(addr),
+        if fault { addr } else { 0 },
     ];
     for (index, value) in general.iter().enumerate() {
         machine.write(base + MC + index * 8, *value);
@@ -338,7 +337,7 @@ pub(super) fn deliver<A: crate::Arch>(
     machine.write(base + MASK, local.mask);
     machine.write::<i32>(base + INFO, signal as i32);
     machine.write::<i32>(base + INFO + 8, code);
-    machine.write::<u64>(base + INFO + 16, u64::from(addr));
+    machine.write::<u64>(base + INFO + 16, addr);
     machine.copy_to(base + FP, &image);
     state.frames.push(Frame {
         tid,
@@ -363,6 +362,19 @@ pub(super) fn deliver<A: crate::Arch>(
     regs.rsi = (base + INFO) as u64;
     regs.rdx = (base + UC) as u64;
     regs.rax = 0;
+    true
+}
+
+pub(super) fn deliver_child_exit<A: crate::Arch>(
+    machine: &mut A, linux: &mut LinuxState, process: i32, regs: &mut Regs,
+    child: i32, exit_code: i32,
+) -> bool {
+    let signaled = (-64..0).contains(&exit_code);
+    if !deliver(machine, linux, process, regs, 17, if signaled { 2 } else { 1 }, child as u64) {
+        return false;
+    }
+    machine.write::<i32>(regs.frame.rsp as usize + INFO + 24,
+        if signaled { -exit_code } else { exit_code & 0xff });
     true
 }
 

@@ -20,8 +20,14 @@ const MORE_PROCESSING: u32 = 0xc0000016;
 pub const EOF: u32 = 0xc0000011;
 pub const NO_MORE_FILES: u32 = 0x80000006;
 
+/// Optional platform timings; these do not alter protocol behavior.
+#[repr(usize)]
+pub enum ProfileStage { Sign, Verify, AllocateResponse, DecodeRead, Encode }
+
 pub trait Transport {
     fn begin_request(&mut self) {}
+    fn profile_start(&self) -> Option<u64> { None }
+    fn profile_finish(&mut self, _stage: ProfileStage, _bytes: usize, _start: Option<u64>) {}
     fn disconnect(&mut self) {}
     fn send_all(&mut self, bytes: &[u8]) -> Result<()>;
     fn receive_exact(&mut self, bytes: &mut [u8]) -> Result<()>;
@@ -238,12 +244,17 @@ impl<T: Transport> Client<T> {
         if self.key.is_some() {
             header.flags.set_signed();
         }
+        let encode_start = self.transport.profile_start();
         let mut cursor = WriteCursor::new();
         header.pack(&mut cursor);
         body.pack(&mut cursor);
         let mut message = cursor.into_inner();
+        self.transport.profile_finish(ProfileStage::Encode, message.len(), encode_start);
         if let Some(key) = &self.key {
-            let sig = signature(&message, key)?;
+            let start = self.transport.profile_start();
+            let sig = signature(&message, key);
+            self.transport.profile_finish(ProfileStage::Sign, message.len(), start);
+            let sig = sig?;
             message[48..64].copy_from_slice(&sig);
         }
         if message.len() > MAX_FRAME {
@@ -262,7 +273,9 @@ impl<T: Transport> Client<T> {
             if !(64..=MAX_FRAME).contains(&length) {
                 return Err(Error::invalid_data("invalid frame length"));
             }
+            let start = self.transport.profile_start();
             let mut response = vec![0; length];
+            self.transport.profile_finish(ProfileStage::AllocateResponse, length, start);
             self.transport.receive_exact(&mut response)?;
             let header = header::Header::unpack(&mut ReadCursor::new(&response))?;
             if !header.is_response()
@@ -284,7 +297,10 @@ impl<T: Transport> Client<T> {
                 if response[16] & 8 != 0
                     && let Some(key) = &self.key
                 {
-                    verify(&response, key)?;
+                    let start = self.transport.profile_start();
+                    let result = verify(&response, key);
+                    self.transport.profile_finish(ProfileStage::Verify, response.len(), start);
+                    result?;
                 }
                 async_id = header.async_id;
                 self.credits = self.credits.saturating_add(u32::from(header.credits));
@@ -297,7 +313,10 @@ impl<T: Transport> Client<T> {
                 if response[16] & 8 == 0 {
                     return Err(Error::Signature);
                 }
-                verify(&response, key)?;
+                let start = self.transport.profile_start();
+                let result = verify(&response, key);
+                self.transport.profile_finish(ProfileStage::Verify, response.len(), start);
+                result?;
             }
             self.credits = self.credits.saturating_add(u32::from(header.credits));
             if header.status.0 != 0 && header.status.0 != allowed {
@@ -382,7 +401,10 @@ impl<T: Transport> Client<T> {
             Err(Error::Status(EOF)) => return Ok(Vec::new()),
             r => r?,
         };
-        let result = read::ReadResponse::unpack(&mut ReadCursor::new(&bytes[64..]))?;
+        let start = self.transport.profile_start();
+        let result = read::ReadResponse::unpack(&mut ReadCursor::new(&bytes[64..]));
+        self.transport.profile_finish(ProfileStage::DecodeRead, bytes.len(), start);
+        let result = result?;
         if result.data.len() > count {
             return Err(Error::invalid_data("read exceeds request"));
         }

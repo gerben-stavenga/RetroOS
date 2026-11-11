@@ -1,7 +1,7 @@
 //! ELF executable loader
 //!
 //! Uses lib::elf for parsing, handles memory mapping.
-//! Page tables are allocated on-demand via the page fault handler.
+//! Eager segment frames are installed in batches before payload copies.
 
 const PAGE_SIZE: usize = 4096;
 extern crate alloc;
@@ -27,6 +27,25 @@ pub fn dyn_info(elf_data: &[u8]) -> Result<(bool, Option<Vec<u8>>), ElfError> {
 /// User stack top address (just below kernel space)
 pub const USER_STACK_TOP: usize = 0xC000_0000;
 
+fn load_page_ranges(segments: impl Iterator<Item = (usize, usize)>, bias: usize) -> Result<Vec<(usize, usize)>, ElfError> {
+    let mut ranges = Vec::new();
+    for (address, length) in segments {
+        if length == 0 { continue; }
+        let start = address.checked_add(bias).ok_or(ElfError::InvalidType)?;
+        let end = start.checked_add(length).filter(|end| *end <= USER_STACK_TOP)
+            .ok_or(ElfError::InvalidType)?;
+        ranges.push((start / PAGE_SIZE, end.div_ceil(PAGE_SIZE)));
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut() && start <= last.1 {
+            last.1 = last.1.max(end);
+        } else { merged.push((start, end)); }
+    }
+    Ok(merged)
+}
+
 
 /// Loaded ELF info
 pub struct LoadedElf {
@@ -48,17 +67,41 @@ pub struct LoadedElf {
 /// applied here — for dynamically-linked images the interpreter (ld.so) does
 /// that; `load_bias` only places the segments.
 pub(crate) fn load_elf_source<A: crate::Arch>(machine: &mut A, elf_data: &[u8], load_bias: usize, source: Option<&crate::kernel::exec::ExecutableFile>) -> Result<LoadedElf, ElfError> {
+    let metadata = lib::elf::Elf::parse(elf_data)?;
+    let mut file_end = elf_data.len();
+    for segment in metadata.segments() {
+        file_end = file_end.max(segment.file_offset.checked_add(segment.filesz).ok_or(ElfError::InvalidType)?);
+    }
+    let cached = source.map(|file| file.cached_image(machine.free_page_count(), file_end)).transpose()
+        .map_err(|_| ElfError::InvalidType)?.flatten();
+    // The metadata used to select/validate the executable must agree with
+    // the snapshot. Never combine headers from one version with another body.
+    if let Some(bytes) = &cached
+        && bytes.get(..elf_data.len()) != Some(elf_data) { return Err(ElfError::InvalidType); }
+    let elf_data = cached.as_ref().map_or(elf_data, |bytes| bytes.as_slice());
+    let source = if cached.is_some() { None } else { source };
     let elf = lib::elf::Elf::parse(elf_data)?;
+
+    // Adjacent PT_LOAD segments may share a page. Allocate the union before
+    // copying any payload, so a later segment cannot clear an earlier one.
+    let ranges = load_page_ranges(elf.segments().map(|s| (s.vaddr, s.memsz)), load_bias)?;
+    let sample = crate::kernel::event_profile::file_io_start();
+    let mut allocated = 0;
+    for (start, end) in ranges {
+        machine.map_fresh_range(start, end - start);
+        allocated += (end - start) * PAGE_SIZE;
+    }
+    crate::kernel::event_profile::file_io_finish(6, allocated, sample);
 
     let mut max_vaddr = 0usize;
 
     // First pass: copy data into the active address space through the vcpu
-    // (pages demand-allocated on access). Going through the vcpu's guest-memory
+    // (frames were installed above). Going through the vcpu's guest-memory
     // API — rather than dereferencing `seg.vaddr` as a host pointer — is what
     // keeps this loader backend-agnostic: on metal the guest VA is a valid
     // kernel pointer, while on the interpreter it indexes the software MMU's
     // address space.
-    let mut scratch = source.map(|_| alloc::vec![0u8; 16 * 1024]);
+    let mut scratch = source.map(|_| alloc::vec![0u8; 64 * 1024]);
     for seg in elf.segments() {
         let vaddr = seg.vaddr.checked_add(load_bias).ok_or(ElfError::InvalidType)?;
         let end = vaddr.checked_add(seg.memsz).ok_or(ElfError::InvalidType)?;
@@ -70,8 +113,13 @@ pub(crate) fn load_elf_source<A: crate::Arch>(machine: &mut A, elf_data: &[u8], 
             while copied < seg.filesz {
                 let count = (seg.filesz - copied).min(scratch.len());
                 let offset = seg.file_offset.checked_add(copied).ok_or(ElfError::InvalidType)?;
-                source.read_exact(offset, &mut scratch[..count]).map_err(|_| ElfError::InvalidType)?;
+                let sample = crate::kernel::event_profile::file_io_start();
+                let result = source.read_exact(offset, &mut scratch[..count]);
+                crate::kernel::event_profile::file_io_finish(7, count, sample);
+                result.map_err(|_| ElfError::InvalidType)?;
+                let sample = crate::kernel::event_profile::file_io_start();
                 machine.copy_to(vaddr + copied, &scratch[..count]);
+                crate::kernel::event_profile::file_io_finish(8, count, sample);
                 copied += count;
             }
         } else if seg.filesz > 0 {
@@ -116,4 +164,16 @@ pub(crate) fn load_elf_source<A: crate::Arch>(machine: &mut A, elf_data: &[u8], 
         phentsize,
         phnum,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn eager_elf_frames_preserve_shared_segment_pages_and_sparse_holes() {
+        assert_eq!(load_page_ranges([(0x1801, 0x1000), (0x2100, 0x1400), (0x8000, 1), (0, 0)].into_iter(), 0x10000).unwrap(),
+            alloc::vec![(0x11, 0x14), (0x18, 0x19)]);
+        assert!(load_page_ranges([(USER_STACK_TOP - 1, 2)].into_iter(), 0).is_err());
+        assert!(load_page_ranges([(usize::MAX, 1)].into_iter(), 4096).is_err());
+    }
 }

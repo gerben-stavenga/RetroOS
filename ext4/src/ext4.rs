@@ -305,6 +305,10 @@ pub struct Ext4 {
     pub log_groups_per_flex: u8,
     journal_inode: u32,
     needs_recovery: bool,
+    // Search hints only: bitmap/group counts remain authoritative. Retaining
+    // the last successful group avoids rescanning a full filesystem prefix
+    // for every single block of an extending file.
+    allocation_group: [u32; 2],
 }
 
 #[derive(Clone, Copy)]
@@ -1151,6 +1155,7 @@ impl Ext4 {
             log_groups_per_flex: superblock.log_groups_per_flex,
             journal_inode: superblock.journal_inode.get(),
             needs_recovery: features.incompatible & 0x0004 != 0,
+            allocation_group: [0; 2],
         };
         graph.validate_mount(&superblock, storage.len())?;
         Ok(graph)
@@ -1684,7 +1689,10 @@ impl Ext4 {
         storage: &mut dyn Storage,
         kind: AllocationKind,
     ) -> Result<Allocation, Error> {
-        for number in 0..self.groups_count {
+        let slot = usize::from(kind.inode());
+        let start = self.allocation_group[slot];
+        for distance in 0..self.groups_count {
+            let number = ((u64::from(start) + u64::from(distance)) % u64::from(self.groups_count)) as u32;
             let mut group = self.group(storage, number)?;
             let domain = self.allocation_domain(kind, number);
             let (free, block) = if kind.inode() {
@@ -1755,6 +1763,7 @@ impl Ext4 {
             } else {
                 0
             };
+            self.allocation_group[slot] = number;
             return Ok(Allocation {
                 number: domain.base + index,
                 inode_offset,
@@ -2103,11 +2112,96 @@ impl Ext4 {
         let offset = self.inode_offset(storage, number)?;
         let base: Inode128 = read_record(storage, offset)?;
         let inode = decode_inode(number, base)?;
-        if inode.references == 0 {
+        if inode.references == 0 && self.orphan_predecessor(storage, number)?.is_none() {
             Err(Error::NotFound)
         } else {
             Ok(inode)
         }
+    }
+
+    // Legacy ext4 orphan chain: s_last_orphan is the head, i_dtime is the
+    // next inode. Keep zero-link open blobs allocated and Linux-recoverable.
+    fn orphan_predecessor(&self, storage: &mut dyn Storage, wanted: u32) -> Result<Option<Option<u32>>, Error> {
+        let sb: Superblock = read_record(storage, SUPERBLOCK_OFFSET)?;
+        let mut current = sb.last_orphan.get();
+        let mut previous = None;
+        let mut found = None;
+        for _ in 0..self.inodes_count {
+            if current == 0 { return Ok(found); }
+            let offset = self.inode_offset(storage, current)?;
+            let base: Inode128 = read_record(storage, offset)?;
+            if current == wanted { found = Some(previous); }
+            previous = Some(current);
+            current = base.deletion_time.get();
+        }
+        Err(Corrupt::InvalidInode(wanted).into())
+    }
+
+    fn set_orphan_head(&self, storage: &mut dyn Storage, head: u32) -> Result<(), Error> {
+        let mut sb: Superblock = read_record(storage, SUPERBLOCK_OFFSET)?;
+        sb.last_orphan.set(head);
+        if self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
+            let mut checksum = crate::checksum::Checksum::new();
+            checksum.update(&bytemuck::bytes_of(&sb)[..size_of::<Superblock>() - size_of::<Le32>()]);
+            sb.checksum.set(checksum.finalize());
+        }
+        write_record(storage, SUPERBLOCK_OFFSET, &sb)
+    }
+
+    pub(crate) fn first_orphan(&self, storage: &mut dyn Storage) -> Result<Option<Object>, Error> {
+        let sb: Superblock = read_record(storage, SUPERBLOCK_OFFSET)?;
+        let number = sb.last_orphan.get();
+        if number == 0 { return Ok(None); }
+        let offset = self.inode_offset(storage, number)?;
+        let base: Inode128 = read_record(storage, offset)?;
+        let inode = decode_inode(number, base)?;
+        // Linked truncate-orphans from another implementation require its
+        // truncate recovery; never reclaim a file that still has a name.
+        if inode.references != 0 || !matches!(inode.object(), Object::Blob(_)) {
+            return Err(Unsupported::MutationProfile.into());
+        }
+        Ok(Some(inode.object()))
+    }
+
+    pub(crate) fn remove_open(&mut self, storage: &mut dyn Storage, edge: EdgeHandle) -> Result<Option<Object>, Error> {
+        let detached = self.detach(storage, edge)?;
+        let inode = self.inode(storage, detached.object.number())?;
+        if !matches!(detached.object, Object::Blob(_)) { return Err(Error::InvalidArgument); }
+        if inode.references > 1 {
+            self.release(storage, detached)?;
+            return Ok(None);
+        }
+        let sb: Superblock = read_record(storage, SUPERBLOCK_OFFSET)?;
+        self.edit_inode(storage, inode.number, &mut |base, _| {
+            base.links_count.set(0);
+            base.deletion_time.set(sb.last_orphan.get());
+            Ok(())
+        })?;
+        self.set_orphan_head(storage, inode.number)?;
+        Ok(Some(detached.object))
+    }
+
+    pub(crate) fn release_orphan(&mut self, storage: &mut dyn Storage, object: Object) -> Result<(), Error> {
+        let number = object.number();
+        let previous = self.orphan_predecessor(storage, number)?.ok_or(Error::NotFound)?;
+        let offset = self.inode_offset(storage, number)?;
+        let base: Inode128 = read_record(storage, offset)?;
+        let inode = decode_inode(number, base)?;
+        if inode.references != 0 || inode.object() != object || !matches!(object, Object::Blob(_)) {
+            return Err(Error::InvalidArgument);
+        }
+        self.resize_object(storage, object, 0)?;
+        if let Some(previous) = previous {
+            self.edit_inode(storage, previous, &mut |entry, _| {
+                entry.deletion_time = base.deletion_time;
+                Ok(())
+            })?;
+        } else { self.set_orphan_head(storage, base.deletion_time.get())?; }
+        let released = self.edit_inode(storage, number, &mut |entry, _| {
+            entry.deletion_time.set(1_700_000_000);
+            Ok(())
+        })?;
+        self.release_inode(storage, released)
     }
 
     fn inode_raw(&self, storage: &mut dyn Storage, number: u32) -> Result<Vec<u8>, Error> {
@@ -3495,7 +3589,7 @@ impl Ext4 {
 
     pub fn retain(&mut self, storage: &mut dyn Storage, blob: Blob) -> Result<Detached, Error> {
         let inode = self.inode(storage, blob.number())?;
-        if inode.object() != Object::Blob(blob) || inode.references == u16::MAX {
+        if inode.object() != Object::Blob(blob) || matches!(inode.references, 0 | u16::MAX) {
             return Err(Error::InvalidArgument);
         }
         self.change_references(storage, Object::Blob(blob), inode.generation, 1)?;

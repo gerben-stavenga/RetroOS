@@ -9,14 +9,16 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
+    (ROOT / 'build/ci').mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='retroos-vsyscall-') as directory:
         work = Path(directory)
         tree = work / 'root'
         (tree / 'home/retroos/RETROOS').mkdir(parents=True)
-        cases = [(64, None), (32, None), (64, 'BAD_ENTRY'),
-                 (64, 'BAD_OUTPUT'), (64, 'READ_GATE')]
-        for bits, failure in cases:
-            label = failure or str(bits)
+        cases = [(64, None, 'host'), (32, None, 'host'), (32, None, '486'),
+                 (64, 'BAD_ENTRY', 'host'), (64, 'BAD_OUTPUT', 'host'),
+                 (64, 'READ_GATE', 'host')]
+        for bits, failure, cpu in cases:
+            label = (failure or str(bits)) + ('-legacy' if cpu == '486' else '')
             subprocess.run(['gcc', f'-m{bits}', '-nostdlib', '-static', '-no-pie',
                 '-fno-pie', '-fno-stack-protector', *(['-mno-red-zone'] if bits == 64 else []),
                 *(['-D' + failure] if failure else []),
@@ -25,13 +27,13 @@ def main():
         with data.open('wb') as output:
             output.truncate(32 * 1024 * 1024)
         subprocess.run(['mkfs.ext4', '-q', '-F', '-d', str(tree), str(data)], check=True)
-        for bits, failure in cases:
-            label = failure or str(bits)
+        for bits, failure, cpu in cases:
+            label = (failure or str(bits)) + ('-legacy' if cpu == '486' else '')
             boot = prepare_boot(work, data, '[environment]\nTEST=/' + label + '\n')
             log = ROOT / 'build/ci' / ('vsyscall-' + label + '.log')
             with log.open('w') as output:
-                process = subprocess.Popen(['qemu-system-x86_64', '-accel', 'kvm',
-                    '-cpu', 'host', '-m', '256', '-display', 'none', '-serial', 'none',
+                process = subprocess.Popen(['qemu-system-x86_64', '-accel', 'tcg' if cpu == '486' else 'kvm',
+                    '-cpu', cpu, '-m', '256', '-display', 'none', '-serial', 'none',
                     '-no-reboot', '-nic', 'none', '-debugcon', 'stdio',
                     '-drive', f'file={boot},format=raw,snapshot=on',
                     '-drive', f'file={data},format=raw,snapshot=on'],

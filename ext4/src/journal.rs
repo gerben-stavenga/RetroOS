@@ -360,9 +360,23 @@ pub struct GraphJournal {
     blob: GraphBlob,
     blob_size: u64,
     overlay: BlockChanges,
+    needs_checkpoint: bool,
+    next_sequence: u32,
 }
 
 impl GraphJournal {
+    pub(crate) fn writeback_limit(&self, graph: &Graph, storage: &mut dyn Storage) -> Result<usize, Error> {
+        let format = self.format(graph, storage)?;
+        if (!format.csum_v3() && format.has_checksums())
+            || format.incompat & INCOMPAT_ASYNC_COMMIT != 0 {
+            return Err(Unsupported::JournalWriteProfile.into());
+        }
+        // One descriptor, payload blocks and one commit record must all fit.
+        // The descriptor allowance is conservative even for 1 KiB blocks.
+        Ok((self.block_size as usize / 32).saturating_sub(2)
+            .min((format.max_len - format.first).saturating_sub(2) as usize).min(64))
+    }
+
     #[inline(never)]
     pub fn mount(graph: &mut Graph, storage: &mut dyn Storage) -> Result<Self, Error> {
         let blob = graph.journal_blob()?;
@@ -377,11 +391,48 @@ impl GraphJournal {
             blob,
             blob_size: info.size,
             overlay: BlockChanges::default(),
+            needs_checkpoint: graph.needs_recovery(),
+            next_sequence: 0,
         };
+        let format = journal.format(graph, storage)?;
+        journal.needs_checkpoint |= format.start != 0;
+        journal.next_sequence = format.sequence.wrapping_add(u32::from(format.start != 0));
         if graph.needs_recovery() {
             journal.replay(graph, storage)?;
         }
         Ok(journal)
+    }
+
+    /// Finish replay only after the caller has authorized a mutation. Keep
+    /// the log and recovery flag until the recovered home blocks are durable;
+    /// then empty the log before clearing the flag. Every prefix is replayable.
+    pub(crate) fn checkpoint_recovery(&mut self, graph: &Graph, storage: &mut dyn Storage) -> Result<(), Error> {
+        if !self.needs_checkpoint { return Ok(()); }
+        let format = self.format(graph, storage)?;
+        let superblock_target = SUPERBLOCK_OFFSET / u64::from(self.block_size);
+        let mut superblock = self.buffer()?;
+        self.read_recovered(storage, superblock_target * u64::from(self.block_size), &mut superblock)?;
+        enable_recovery(&mut superblock)?;
+        self.write_block(storage, superblock_target, &superblock)?;
+        for block in &self.overlay.blocks {
+            if block.number != superblock_target { self.write_block(storage, block.number, &block.bytes)?; }
+        }
+        storage.flush().map_err(Error::Storage)?;
+        let mut jsb = self.read_log(graph, storage, 0)?;
+        JournalSuperblock::set_state(&mut jsb, self.next_sequence, 0, format.has_checksums())?;
+        let journal_super = self.physical(graph, storage, 0)?;
+        self.write_block(storage, journal_super, &jsb)?;
+        storage.flush().map_err(Error::Storage)?;
+        let sb = superblock_in_block(&mut superblock)?;
+        sb.feature_incompat = Le32::new(sb.feature_incompat.get() & !EXT4_INCOMPAT_RECOVER);
+        let mut checksum = Checksum::new();
+        checksum.update(&bytemuck::bytes_of(sb)[..offset_of!(Superblock, checksum)]);
+        sb.checksum = Le32::new(checksum.finalize());
+        self.write_block(storage, superblock_target, &superblock)?;
+        storage.flush().map_err(Error::Storage)?;
+        self.overlay = BlockChanges::default();
+        self.needs_checkpoint = false;
+        Ok(())
     }
 
     pub fn read_recovered(
@@ -569,6 +620,7 @@ impl GraphJournal {
             }
         }
         logged.truncate(committed_blocks);
+        self.next_sequence = sequence;
         revokes.truncate(committed_revokes);
         for update in logged {
             if revokes.iter().any(|revoke| {
@@ -815,6 +867,8 @@ impl GraphJournal {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.overlay = committed;
+                self.needs_checkpoint = true;
+                self.next_sequence = format.sequence.wrapping_add(1);
                 Err(error)
             }
         }

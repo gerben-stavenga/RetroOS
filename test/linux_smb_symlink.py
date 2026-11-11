@@ -13,15 +13,17 @@ ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = ROOT / 'build/ci'
 
 
-def launch(work, program, label, timeout=120, memory=None):
+def launch(work, program, label, timeout=120, memory=None, qemu_args=()):
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
     env.pop('RETROOS_DATA_IMAGE', None)
     env['RETROOS_QEMU_LIVE_PROFILE'] = str(work / 'profile.json')
     log = ARTIFACTS / (label + '.log')
     command = [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--headless',
         '--sound', 'none', '--cmd', '/home/retroos/' + program]
-    if memory is not None:
-        command += ['--', '-m', str(memory)]
+    extra = (['-m', str(memory)] if memory is not None else []) + list(qemu_args)
+    if extra:
+        command += ['--', *extra]
     with log.open('w') as output:
         process = subprocess.Popen(command, cwd=ROOT,
             env=env, stdout=output, stderr=subprocess.STDOUT)

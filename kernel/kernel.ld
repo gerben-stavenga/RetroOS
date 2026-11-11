@@ -107,8 +107,12 @@ SECTIONS
         BOOT_POOL_END = .;
     }
     _end = .;
-    ASSERT(KERNEL_CORE_END - KERNEL_BASE + KERNEL_PHYS <= 0x320000,
-           "kernel excluding boot pool must end below physical 0x320000")
+    /* BSP paging needs seven 4K pages at most (PAE plus the canonical root).
+     * Reserve 64K including alignment, and retain boot_mem's 128K transition
+     * margin below its 4M identity ceiling. AP allocation is separately bounded
+     * by BootMemory::can_allocate; it cannot consume this transition margin. */
+    ASSERT(KERNEL_CORE_END - KERNEL_BASE + KERNEL_PHYS + 64K + 128K <= 4M,
+           "kernel must leave bootstrap paging space below the identity ceiling")
     ASSERT(BOOT_POOL_END == _end, "boot pool must be last in BSS")
     ASSERT(_end - KERNEL_BASE <= 5M,
            "reserved pool exceeds the existing high kernel mapping")

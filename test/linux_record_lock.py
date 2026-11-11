@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
+    (ROOT / 'build/ci').mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='retroos-record-lock-') as directory:
         for bits, legacy in [(32, False), (64, False), (32, True)]:
             label = 'legacy-486' if legacy else str(bits)

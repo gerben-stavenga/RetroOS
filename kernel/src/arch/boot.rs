@@ -378,7 +378,10 @@ unsafe fn prepare_boot(
     // VGA framebuffer scanout needs its packed shadow as soon as fbcon is
     // attached below. Paging, phys_mm, and the #PF page-backing are now ready,
     // so the demand-paged heap can safely be enabled here.
-    ALLOCATOR.init_with_release(arch::heap_base(), arch::HEAP_END, Some(arch::release_heap_pages));
+    // Reuse hot temporary buffers without returning and faulting their backing
+    // pages on every allocation. Keep at most 1 MiB, scaled down for small RAM.
+    let heap_cache = (phys_mm::total_page_count() / 128 * PAGE_SIZE).min(1024 * 1024);
+    ALLOCATOR.init_with_cached_release(arch::heap_base(), arch::HEAP_END, Some(arch::release_heap_pages), heap_cache);
     phys_mm::complete_initialization();
     crate::kernel::klog::init();
     arch::aperture::init();

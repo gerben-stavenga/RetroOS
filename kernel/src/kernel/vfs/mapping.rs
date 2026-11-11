@@ -96,6 +96,7 @@ impl Vfs {
     }
 
     pub(super) fn invalidate_file_pages(&mut self, handle: i32) {
+        self.invalidate_executable(handle);
         let Ok((mount, identity, _)) = self.mapping_key(handle, 0) else { return; };
         self.file_pages.retain(|&(m, ino, _), page| m != mount || ino != identity || page.pinned());
     }
@@ -142,7 +143,10 @@ impl Vfs {
             return self.mount_fs(mount).read(fid, offset, out, size);
         }
         if out.is_empty() { return 0; }
-        let version = match self.check_content(handle) {
+        let sample = crate::kernel::event_profile::file_io_start();
+        let version = self.check_content(handle);
+        crate::kernel::event_profile::file_io_finish(13, out.len(), sample);
+        let version = match version {
             Ok(Some(version)) => version,
             Ok(None) => return self.mount_fs(mount).read(fid, offset, out, size),
             Err(error) => return error,
@@ -167,6 +171,29 @@ impl Vfs {
                 self.file_pages.get_mut(&key).unwrap().version = version;
             }
             if !self.file_pages.contains_key(&key) {
+                let _miss = crate::kernel::event_profile::FileIoScope::start(14, length - done);
+                // Large sequential consumers (ELF/library loading and hashes)
+                // should not allocate and evict a boxed page for every 4 KiB
+                // they pass through. Stream only uncached spans; an existing
+                // page, especially a writable guest alias, remains authoritative.
+                // Keep the original request's streaming policy after a
+                // cached prefix. Testing only the remainder makes read-ahead
+                // seed the next chunk and disable streaming indefinitely.
+                if out.len() >= READ_BATCH * 2 {
+                    let next_page = self.file_pages.range(key..=(key.0, key.1, u32::MAX))
+                        .next().map(|(&(.., page), _)| u64::from(page) * PAGE_SIZE as u64);
+                    let mut count = (length - done).min(256 * 1024);
+                    if let Some(next) = next_page {
+                        count = count.min(next.saturating_sub(u64::from(position)) as usize);
+                    }
+                    if count >= READ_BATCH {
+                        let n = self.mount_fs(mount).read(fid, position, &mut out[done..done + count], size);
+                        if n <= 0 { return if done != 0 { done as i32 } else { n }; }
+                        if n as usize > count { return if done != 0 { done as i32 } else { -5 }; }
+                        done += n as usize;
+                        continue;
+                    }
+                }
                 // Batch adjacent misses so SMB keeps its normal 32 KiB request
                 // size, rather than issuing one network round trip per page.
                 let start = position - within as u32;
@@ -188,6 +215,7 @@ impl Vfs {
                 }
                 // Only complete pages (including a verified final EOF page)
                 // are reusable. Never turn a short read/error into cached zeros.
+                let _insert = crate::kernel::event_profile::FileIoScope::start(16, got);
                 for begin in (0..got).step_by(PAGE_SIZE) {
                     let end = (begin + PAGE_SIZE).min(wanted);
                     if end > got || !self.make_page_room() { break; }
@@ -245,6 +273,7 @@ pub fn validate(handle: i32, offset: usize, length: usize, writable: bool) -> Re
 
 pub fn acquire<A: crate::Arch>(machine: &mut A, handle: i32, offset: u32, writable: bool) -> Result<(Key, NonNull<u8>), i32> {
     let mut vfs = VFS.lock();
+    vfs.invalidate_executable(handle);
     let key = vfs.mapping_key(handle, offset)?;
     let mut bytes = alloc::vec![0; PAGE_SIZE];
     let n = vfs.cached_read(handle, offset, &mut bytes);
@@ -380,6 +409,49 @@ mod tests {
         let other = vfs.install_handle(b"file", 2, 0, fs.open(b"file").unwrap(), true);
         assert_eq!(vfs.cached_read(other, 456, &mut out), 8000);
         assert_eq!(fs.reads.get(), 1, "reopen uses the same cached contents");
+    }
+
+    #[test]
+    fn cached_prefix_does_not_disable_the_rest_of_a_streaming_read() {
+        let (mut vfs, fs, h) = setup(1024 * 1024);
+        // ELF metadata reads cache an initial 32 KiB. A following segment
+        // starts inside that cached run and reads in 64 KiB chunks.
+        let mut header = [0; 64];
+        assert_eq!(vfs.cached_read(h, 0, &mut header), 64);
+        let mut output = alloc::vec![0; 64 * 1024];
+        for chunk in 0..8 {
+            let offset = PAGE_SIZE + chunk * output.len();
+            assert_eq!(vfs.cached_read(h, offset as u32, &mut output), output.len() as i32);
+            assert!(output.iter().enumerate().all(|(i, &b)| b == (offset + i) as u8));
+        }
+        assert_eq!(fs.reads.get(), 9, "one metadata fill and one backend read per streaming chunk");
+        assert_eq!(vfs.file_pages.len(), READ_BATCH / PAGE_SIZE,
+            "read-ahead must not propagate a cached prefix into every following chunk");
+    }
+
+    #[test]
+    fn streaming_reads_preserve_mapped_changes_and_external_freshness() {
+        let (mut vfs, fs, h) = setup(256 * 1024);
+        let mut small = [0; 8];
+        assert_eq!(vfs.cached_read(h, 128 * 1024, &mut small), 8);
+        let key = vfs.mapping_key(h, 128 * 1024).unwrap();
+        let page = vfs.file_pages.get_mut(&key).unwrap();
+        page.handle = h;
+        page.refs = 1;
+        page.writable = true;
+        unsafe { (page.base as *mut u8).write(99); }
+        let mut output = alloc::vec![0; 256 * 1024];
+        assert_eq!(vfs.cached_read(h, 0, &mut output), output.len() as i32);
+        assert_eq!(output[128 * 1024], 99);
+        assert!(output.iter().enumerate().all(|(i, &b)| b == if i == 128 * 1024 { 99 } else { i as u8 }));
+        assert!(vfs.file_pages.len() < 32, "stream must not populate the whole cache");
+        fs.bytes.borrow_mut()[0] = 77;
+        fs.revision.set(1);
+        assert_eq!(vfs.cached_read(h, 0, &mut output), output.len() as i32);
+        assert_eq!(output[0], 77);
+        assert_eq!(output[128 * 1024], 99, "writable mapping retains ownership");
+        fs.fail.set(true);
+        assert_eq!(vfs.cached_read(h, 0, &mut output), -5);
     }
 
     #[test]

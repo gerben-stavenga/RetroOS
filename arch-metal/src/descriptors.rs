@@ -734,6 +734,7 @@ pub fn toggle_mode(new_cr3: u32) {
     // mode (LMA=1), so a 32-bit lidt zero-extends the base into the now-64-bit
     // IDTR.
     let efer = x86::rdmsr(x86::EFER_MSR);
+    crate::paging2::set_long_mode_active(efer & x86::efer::LMA != 0);
     if efer & x86::efer::LMA != 0 {
         load_long_mode_descriptors();
         // Clear RSP[63:32] before enabling interrupts. UEFI/OVMF runs in 64-bit
