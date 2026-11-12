@@ -80,7 +80,7 @@ mouse motion and clicks with PS/2 disabled. The full 21-topology matrix is
 opt-in with `bazelisk test //tests:xhci_full`. Host unit tests
 (`//arch-metal:xhci_dma_test`) cover X99's 16 scratchpads, the full 1023-buffer
 count, non-overlapping DMA regions, allocation failure, and BIOS ownership
-handoff. `//arch-metal:phys_mm_test` covers the RAM bitmap, shared refcounts,
+handoff. `//kernel:phys_mm_test` covers the RAM bitmap, shared refcounts,
 firmware holes, contiguous allocations, and bootstrap metadata.
 
 `bazelisk test //tests:arch_tls` checks guest FS/GS restoration across syscalls and
@@ -126,14 +126,15 @@ mount a host directory inside the kernel. Live network-sharing tests use SMB.
 four CPUs in legacy and PAE modes. It checks the common BSP/AP Rust entry,
 initialized/zeroed and isolated TLS, dynamically allocated stacks, private GDTs
 and page roots, and reuse of the low-memory trampoline after acknowledgement.
-AP stacks/TLS are allocated first from the final BSS pool, then ISA DMA
-buffers use the remaining space. Actual CPU boot allocations leave 128 KiB
-below physical 4 MiB; the reserved pool tail may extend beyond it. Ordinary
-heap/physical allocations stay outside the whole pool.
+The standalone example and real kernel both reserve stacks/TLS from resident
+heap mappings after initializing the kernel physical allocator.
+APs enable the BSP bootstrap page table before using their virtual stack/TLS,
+then switch to private roots. ISA DMA remains in the loader-reserved pool;
+ordinary heap/physical allocations stay outside the whole pool.
 Add `--kvm` to exercise xAPIC and x2APIC startup with hardware virtualization.
 
 `bazelisk test //tests:kernel_smp` checks actual-kernel MADT discovery and parked APs,
 then runs a guest syscall/IRQ/TLS workload on core 0. Cases cover one CPU, four
-CPUs, pool-limited startup with eight CPUs, sparse APIC IDs, missing ACPI, and
+CPUs, eight and sixteen CPUs with resident heap stacks/TLS, sparse APIC IDs, missing ACPI, and
 legacy paging. Add `--kvm` for the hardware cases. `//arch-metal:acpi_test` checks
 enabled/disabled entries, x2APIC IDs, duplicates and malformed MADT records.

@@ -72,6 +72,7 @@ rust_library(
         "//conditions:default": [],
     }),
     deps = [
+        ":physical_memory",
         "//arch-abi",
         "//ext4",
         "//klog",
@@ -293,4 +294,30 @@ host_platform_test(
     name = "xhci_dma_test",
     visibility = ["//visibility:public"],
     test = ":xhci_dma_test_host",
+)
+
+# Physical RAM ownership and allocation policy, independent of any arch backend.
+rust_library(
+    name = "physical_memory",
+    visibility = ["//visibility:public"],
+    srcs = ["src/kernel/phys_mm.rs"] + glob(["src/kernel/phys_mm/*.rs"]),
+    crate_root = "src/kernel/phys_mm.rs",
+    crate_name = "physical_memory",
+    edition = "2024",
+    rustc_flags = panic_strategy(),
+    deps = ["//arch-abi"],
+)
+
+rust_test(
+    name = "phys_mm_test_host",
+    visibility = ["//visibility:public"],
+    tags = ["manual"],
+    crate = ":physical_memory",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
+)
+
+host_platform_test(
+    name = "phys_mm_test",
+    visibility = ["//visibility:public"],
+    test = ":phys_mm_test_host",
 )

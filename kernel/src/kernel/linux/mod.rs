@@ -1257,7 +1257,7 @@ pub(crate) fn handle_fork<A: crate::Arch>(
     on_done: fn(&mut Regs, i32),
 ) -> Option<usize> {
     let mut child_root = A::PageTable::default();
-    if !shared_until_exec { machine.user_fork(&mut child_root); }
+    if !shared_until_exec { crate::kernel::memory::fork(machine, &mut child_root); }
 
     let child_tid = match thread::create_thread(threads, machine, Some(parent_tid), child_root, true) {
         Some(t) => t.kernel.tid as usize,

@@ -1228,7 +1228,7 @@ impl<A: crate::Arch> DosTemplate<A> {
         let mut regs = crate::Regs::empty();
         initialize_dos_template(machine, &mut regs);
         let mut space = A::PageTable::default();
-        machine.user_fork(&mut space);
+        crate::kernel::memory::fork(machine, &mut space);
         machine.free_user_pages();
         Self {
             vcpu: crate::Vcpu::new(regs, space),
@@ -1243,7 +1243,7 @@ impl<A: crate::Arch> DosTemplate<A> {
             core::ptr::null_mut(),
         );
         let mut child = A::PageTable::default();
-        machine.user_fork(&mut child);
+        crate::kernel::memory::fork(machine, &mut child);
         self.vcpu.space = machine.activate(child, &mut self.fx, core::ptr::null_mut());
         let mut previous = previous;
         machine.destroy_space(&mut previous);
@@ -1253,7 +1253,7 @@ impl<A: crate::Arch> DosTemplate<A> {
 /// Construct the kernel's pristine real-mode BIOS/DOS-low-memory template.
 /// This is called exactly once; top-level DOS worlds COW-clone the result.
 pub(crate) fn initialize_dos_template<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
-    machine.map_low_mem();
+    crate::kernel::memory::map_low_mem(machine);
     back_vga_window_if_emulated(machine);
     dos::setup_ivt(machine, regs);
 }
@@ -1302,7 +1302,7 @@ pub(crate) const fn bios_int10_return_ip() -> u32 {
 pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, policy: LaunchPolicy, vga: DosVideo) {
     let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
-    machine.map_low_mem();
+    crate::kernel::memory::map_low_mem(machine);
     // The virtual-IF exit map (dpmi::vif) is owned by the DPMI client and made
     // fresh at each `dpmi_enter`, so a new address space starts with an empty
     // one — no global clear needed.

@@ -60,7 +60,9 @@ fn prepare_startup<A: crate::Arch>(
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
-    if let Some(access) = machine.frame_access() {
+    if let Some(supply) = machine.page_supply() { crate::kernel::memory::install_supply(supply); }
+    if let Some(access) = machine.physical_frame_io().map(crate::kernel::memory::cache_access)
+        .or_else(|| machine.frame_access()) {
         crate::kernel::cache::install(access, vfs::mapping::reclaim_frame);
     }
     crate::compact_println!("{}", crate::build_info::VersionBanner);
@@ -225,7 +227,7 @@ fn prepare_audio<A: crate::Arch>(
     if sb_card.is_some() {
         crate::compact_println!(
             "Audio: ISA DMA buffer pages ch1={:#x} ch5={:#x} (0 means unavailable)",
-            machine.dma_channel_buf(1), machine.dma_channel_buf(5));
+            crate::kernel::memory::dma_channel(machine, 1), crate::kernel::memory::dma_channel(machine, 5));
     }
     if platform.audio == crate::kernel::platform::Audio::NativeSb
         && let Some(card) = sb_card.as_mut()
@@ -2822,7 +2824,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     {
         let parent = thread::get_thread(threads, parent_tid).unwrap();
         parent.personality.on_suspend(machine);
-        machine.user_fork(&mut parent.kernel.vcpu.space);
+        crate::kernel::memory::fork(machine, &mut parent.kernel.vcpu.space);
     }
 
     // ELF needs user pages freed before loading; DOS handles its own address space

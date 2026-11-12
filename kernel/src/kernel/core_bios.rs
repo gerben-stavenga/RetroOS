@@ -469,9 +469,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
     fn new(machine: &mut A) -> Self {
         // Snapshot the firmware view before the DOS substitute BIOS replaces
         // the IVT. This address space is never handed to a personality.
-        machine.map_low_mem();
+        crate::kernel::memory::map_low_mem(machine);
         let mut bios_space = A::PageTable::default();
-        machine.user_fork(&mut bios_space);
+        crate::kernel::memory::fork(machine, &mut bios_space);
 
         Self {
             bios_vcpu: Vcpu::new(Regs::empty(), bios_space),
@@ -1704,6 +1704,7 @@ fn run_bios<A: Arch>(
     returned: impl Fn(&Regs, &crate::KernelEvent) -> bool,
 ) -> Result<(), BiosError> {
     loop {
+        crate::kernel::memory::service(machine);
         let event = machine.execute_firmware(regs, io);
         if returned(regs, &event) {
             return Ok(());

@@ -1092,3 +1092,12 @@ pub struct FrameAccess {
     /// The callback must not allocate, block, or enter privileged operations.
     pub set_reclaim: fn(fn() -> Option<u64>),
 }
+
+pub mod page_supply;
+
+/// Privileged physical-byte access only. Allocation belongs to the kernel.
+#[derive(Clone, Copy)]
+pub struct PhysicalFrameIo {
+    pub read: fn(u64, usize, &mut [u8]),
+    pub write: fn(u64, usize, &[u8]),
+}

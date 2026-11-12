@@ -185,7 +185,7 @@ impl Region {
         }
         let bytes = pages.checked_mul(crate::PAGE_SIZE)?;
         let raw_pages = pages.checked_add(alignment_pages - 1)?;
-        let raw = machine.alloc_phys_contig(raw_pages);
+        let raw = crate::kernel::memory::alloc_contig(machine, raw_pages);
         if raw == 0 {
             return None;
         }
@@ -200,14 +200,14 @@ impl Region {
             Some((page, prefix, suffix, phys, va))
         })();
         let Some((page, prefix, suffix, phys, va)) = span else {
-            machine.free_phys_contig(raw, raw_pages);
+            crate::kernel::memory::free_contig(machine, raw, raw_pages);
             return None;
         };
         if prefix != 0 {
-            machine.free_phys_contig(raw, prefix);
+            crate::kernel::memory::free_contig(machine, raw, prefix);
         }
         if suffix != 0 {
-            machine.free_phys_contig(page + pages as u64, suffix);
+            crate::kernel::memory::free_contig(machine, page + pages as u64, suffix);
         }
         machine.map_phys_range(va >> 12, pages, page, 0);
         unsafe { core::ptr::write_bytes(va as *mut u8, 0, bytes) };

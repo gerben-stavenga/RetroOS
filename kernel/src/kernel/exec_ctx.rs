@@ -69,6 +69,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
         bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         personality: &mut thread::Personality<A>,
     ) -> crate::KernelEvent {
+        crate::kernel::memory::service(machine);
         machine.execution_profile_begin();
         let key = crate::kernel::io_policy::key(personality, bios);
         if self.io_key != Some(key) {

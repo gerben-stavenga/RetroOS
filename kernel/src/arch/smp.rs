@@ -1,6 +1,6 @@
 //! BSP boot policy. Core 1 waits for the resident-buffer media worker;
 //! remaining APs park. Allocation and guest execution stay on the BSP.
-use arch::{MultibootMmapEntry, boot_mem::BootMemory, smp, x86};
+use arch::{MultibootMmapEntry, smp, x86};
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -100,7 +100,9 @@ fn trampoline(
     } else {
         0x80000
     };
-    (0x1000..ceiling)
+    // In PAE bootstrap the first two scratch entries also act as directory
+    // links, so pages 0 and 1 are not identity mappings. Start beyond them.
+    (0x2000..ceiling)
         .step_by(4096)
         .find(|&start| {
             let end = start + 4096;
@@ -128,7 +130,6 @@ pub(super) unsafe fn start(
     map: &[MultibootMmapEntry],
     modules: &[Option<crate::multiboot::AcceptedModule>; arch_abi::MAX_BOOT_MODULES],
 ) {
-    let mut memory = unsafe { BootMemory::new() };
     let mut ids = [0; MAX_CPUS];
     let own = x86::current_apic_id();
     let count = arch::acpi::processor_ids(rsdp, &mut ids)
@@ -162,14 +163,17 @@ pub(super) unsafe fn start(
             if Some(id) == own || (!x2 && id >= 255) {
                 continue;
             }
-            // AP resources take priority. DMA uses the pool tail after paging.
-            let layouts = [trap, tls, stack];
-            if !memory.can_allocate(&layouts) {
-                break;
-            }
-            let trap = memory.allocate(trap).unwrap();
-            let tls = memory.allocate(tls).unwrap();
-            let stack = memory.allocate(stack).unwrap();
+            // Allocate virtual ranges from the ordinary kernel heap. Touch
+            // every page on the BSP: AP bootstrap must never demand-fault
+            // while borrowing the BSP root or before installing its own IDT.
+            let resident = |layout: Layout| {
+                let storage = unsafe { alloc::alloc::alloc_zeroed(layout) };
+                assert!(!storage.is_null(), "cannot allocate resident AP storage");
+                storage
+            };
+            let trap = resident(trap);
+            let tls = resident(tls);
+            let stack = resident(stack);
             let logical = selected + 1;
             starts[selected] = Some((
                 id,
@@ -180,13 +184,16 @@ pub(super) unsafe fn start(
                     tls,
                     entry: park,
                     argument: 0,
+                    memory: crate::kernel::phys_mm::bootstrap_supply(super::frame_refill_entry as *const () as usize),
                     ready: &READY[logical],
                 },
             ));
             selected += 1;
         }
     }
-    memory.finish();
+    if selected != 0 {
+        lib::compact_screenln!(screen, "SMP: AP stacks/TLS use resident kernel heap mappings");
+    }
     let mut online = 1;
     for &(id, start) in starts.iter().flatten() {
         match unsafe { smp::start_core(id, page.unwrap(), start, delay) } {
@@ -215,8 +222,9 @@ pub(super) unsafe fn start(
                     id,
                     reason
                 );
-                // A delayed AP may still use this page. Never reuse it after failure.
-                break;
+                // A delayed AP may still use the trampoline and borrowed BSP
+                // root. Stop boot instead of removing or reusing either.
+                lib::compact_panic!("AP startup unacknowledged; retaining bootstrap state");
             }
         }
     }

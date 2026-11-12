@@ -132,7 +132,11 @@ impl Arch for Metal {
     }
     fn map_low_mem(&mut self) { super::calls::arch_map_low_mem() }
     fn map_vga_text_aperture(&mut self) { super::calls::arch_map_vga_text_aperture() }
-    fn frame_access(&self) -> Option<arch_abi::FrameAccess> { Some(crate::frames::access()) }
+    fn physical_frame_io(&self) -> Option<arch_abi::PhysicalFrameIo> { Some(crate::frames::io()) }
+    fn page_supply(&self) -> Option<*mut arch_abi::page_supply::PageSupply> { Some(crate::memory::supply()) }
+    fn set_page_input(&mut self, input: *mut arch_abi::page_supply::PageInput) -> *mut arch_abi::page_supply::PageInput {
+        crate::memory::set_input(input)
+    }
     fn map_frame(&mut self, vpage: usize, frame: u64, shared: bool, writable: bool, executable: bool) -> bool {
         crate::frames::map(vpage, frame, shared, writable, executable)
     }
@@ -171,12 +175,12 @@ impl Arch for Metal {
         super::paging2::framebuffer_map_policy()
     }
     fn alloc_phys_contig(&mut self, num_pages: usize) -> u64 {
-        super::calls::arch_alloc_phys_contig(num_pages)
+        panic!("kernel must supply contiguous backing ({num_pages} pages)")
     }
     fn free_phys_contig(&mut self, start_page: u64, num_pages: usize) {
-        super::calls::arch_free_phys_contig(start_page, num_pages)
+        panic!("kernel must release contiguous backing ({start_page}, {num_pages})")
     }
-    fn dma_channel_buf(&self, ch: usize) -> u64 { super::calls::arch_dma_channel_buf(ch) }
+    fn dma_channel_buf(&self, ch: usize) -> u64 { panic!("kernel must supply ISA channel {ch}") }
     fn set_tls_entry(&mut self, index: i32, base: u32, limit: u32, limit_in_pages: bool) -> i32 {
         super::calls::arch_set_tls_entry(index, base, limit, limit_in_pages)
     }
@@ -187,8 +191,8 @@ impl Arch for Metal {
     fn fpu_pop(&mut self) { super::x86::fpu_pop() }
 
     // ── Diagnostics & power ──
-    fn free_page_count(&self) -> usize { super::phys_mm::free_page_count() }
-    fn total_page_count(&self) -> Option<usize> { Some(super::phys_mm::total_page_count()) }
+    fn free_page_count(&self) -> usize { super::memory::free_page_count() }
+    fn total_page_count(&self) -> Option<usize> { Some(super::memory::total_page_count()) }
     fn shutdown(&mut self) -> ! { super::x86::shutdown() }
     fn halt_forever(&mut self) -> ! { super::halt_forever() }
 

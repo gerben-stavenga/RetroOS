@@ -25,10 +25,11 @@ def main():
         output = result.stdout.decode(errors='replace')
         if command == 'missing':
             assert result.returncode == 1 and 'SMP TIMEOUT PASS' in output, output
-            print('PASS:', name, 'missing CPU times out before kernel init')
+            print('PASS:', name, 'missing CPU times out without reclaiming startup state')
             continue
         assert result.returncode == 1 and 'SMP PASS:' in output, output
-        assert 'SMP DMA allocated after AP resources' in output, output
+        assert 'SMP DMA separate from heap AP resources' in output, output
+        assert 'SMP FAULT RESERVE PASS' in output, output
         assert output.count('SMP AP initialized') == 3, output
         if command:
             assert 'SMP x2APIC sender' in output, output

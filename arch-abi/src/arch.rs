@@ -363,6 +363,10 @@ pub trait Arch: Sized + GuestBytes {
     fn map_vga_text_aperture(&mut self);
     /// Physical-frame mechanisms for kernel-owned storage. No file/cache policy.
     fn frame_access(&self) -> Option<crate::FrameAccess> { None }
+    fn physical_frame_io(&self) -> Option<crate::PhysicalFrameIo> { None }
+    fn page_supply(&self) -> Option<*mut crate::page_supply::PageSupply> { None }
+    fn set_page_input(&mut self, _input: *mut crate::page_supply::PageInput) -> *mut crate::page_supply::PageInput { core::ptr::null_mut() }
+
     /// Map a retained physical frame. Private writable aliases start COW;
     /// shared aliases remain coherent across fork. Cache retains its own owner.
     fn map_frame(&mut self, _vpage: usize, _frame: u64, _shared: bool,

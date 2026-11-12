@@ -1,7 +1,8 @@
 //! A loader-reserved, physically contiguous pool placed last in kernel BSS.
-//! Minimal BSP setup reserves the shared kernel tables. Then allocate every
-//! AP stack/TLS before other consumers. Finishing
-//! that phase opens the remaining pool to permanent low-memory allocations.
+//! Minimal BSP setup reserves the shared kernel tables. Callers can reserve
+//! other early storage before opening the tail to permanent low-memory DMA.
+//! The kernel starts APs with resident heap stacks/TLS after allocator setup;
+//! those allocations do not consume this pool.
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -20,7 +21,7 @@ struct Pool([u8; CAPACITY]);
 #[used]
 #[unsafe(link_section = ".boot_pool")]
 static mut POOL: Pool = Pool([0; CAPACITY]);
-// 0: unclaimed, 1: AP allocations, 2: permanent allocations (including DMA).
+// 0: unclaimed, 1: early reservations, 2: permanent allocations (including DMA).
 static PHASE: AtomicU8 = AtomicU8::new(0);
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -75,11 +76,11 @@ pub struct BootMemory {
     next: usize,
 }
 impl BootMemory {
-    /// Claim the AP-allocation phase after minimal BSP arch initialization.
+    /// Claim early reservations after minimal BSP arch initialization.
     /// The ELF loader has already reserved the entire pool as part of BSS.
     ///
     /// # Safety
-    /// Call once on the BSP, before starting APs or allocating DMA buffers.
+    /// Call once on the BSP, before allocating permanent DMA buffers.
     pub unsafe fn new() -> Self {
         assert!(
             PHASE
@@ -107,7 +108,7 @@ impl BootMemory {
         }
         true
     }
-    /// Close AP allocation before starting CPUs. Remaining pool space can now
+    /// Close early reservations. Remaining pool space can now
     /// supply DMA buffers and other permanent, contiguous low-memory storage.
     pub fn finish(self) {
         NEXT.store(self.next, Ordering::Relaxed);
@@ -115,7 +116,7 @@ impl BootMemory {
     }
 }
 
-/// Permanent allocation after all AP stacks/TLS have been reserved. This never
+/// Permanent allocation after early reservations have been closed. This never
 /// uses the ordinary heap or the frame allocator. Exhaustion leaves the cursor
 /// unchanged. The caller initializes the returned bytes before publishing them.
 pub fn allocate_permanent(layout: Layout) -> Result<*mut u8, OutOfBootMemory> {

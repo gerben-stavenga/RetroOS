@@ -682,8 +682,9 @@ old-space pages; missing page-discard support caused V8's
 File contents use one kernel cache keyed by backing file identity and page
 offset. `kernel/cache.rs` supplies physical frame storage and common LRU
 bookkeeping for file contents and block metadata; `vfs/mapping.rs` owns file
-identity, freshness, pinning and writeback policy. Arch supplies allocation,
-temporary physical access and page-table mechanisms. Cached bytes have no
+identity, freshness, pinning and writeback policy. The kernel physical-memory
+library owns frame allocation and reference counts; arch supplies temporary
+physical access and page-table mechanisms. Cached bytes have no
 permanent kernel virtual mapping. Clean file pages grow into available RAM,
 with a small free-frame reserve and reclamation under pressure, including an
 allocator callback that can accept an exclusively-owned cached frame.
@@ -2680,3 +2681,56 @@ undeclared test outputs. It checks known sleep/active work, stopped stability,
 counter resets/window IDs, cache invalidations and real stdio MCP reports.
 `//tests:profile_report` tests negative residuals, missing time, unsupported
 clock conversion and malformed counters using independent synthetic ledgers.
+
+
+Physical RAM allocation lives in `kernel/src/kernel/phys_mm.rs` and its `pool.rs`
+metadata implementation, built as `//kernel:physical_memory`. It takes generic
+usable/reserved physical ranges, an addressability ceiling and the permanent
+zero-page identity from boot. `arch-metal/memory.rs` holds only donated per-core
+pages and resident ownership data; it has no allocator callbacks or dependency
+on the kernel allocator. x86 address-width probing remains there. ISA channel-buffer lifetime/alignment policy lives in
+`kernel/phys_mm/isa_dma.rs`; boot supplies access to the loader-reserved pool
+and the operation which removes its cached alias.
+
+The BSP initializes physical RAM and the demand-paged heap before starting APs.
+AP stacks and TLS use permanent, resident kernel-heap allocations; each page is
+touched on the BSP before startup. The low-memory trampoline enables paging with
+the BSP's existing root before accessing those virtual addresses, then the AP
+builds its private recursive root, GDT and TSS. Physical backing for AP stacks
+and TLS need not be contiguous or below the early identity-map ceiling. The
+BSP retains its boot identity mapping until all APs acknowledge the private
+roots. An unacknowledged AP stops boot with bootstrap storage retained rather
+than reusing the trampoline or removing mappings a delayed CPU could still use.
+This enables initializing all discovered CPUs up to the existing 64-CPU limit;
+Linux execution is still confined to the BSP, with core 1 reserved for media.
+
+
+Each core receives a fault reserve of owned physical frames. A top-level fault
+starts only with at least five available pages: one data page plus four possible
+x86 page-table levels. Nested page-table faults share that same budget; resident
+reference-count metadata cannot recurse into allocation. Arch records and checks
+the maximum pages consumed per complete fault. Reserves hold up to 64 pages to
+amortize replenishment. APs receive their initial five pages from the BSP.
+
+The kernel replenishes reserves before guest/firmware execution. A user fault
+with insufficient reserve returns to the kernel; a supervisor fault returns via
+IRET to a kernel-owned refill continuation, preserving registers, flags, stack
+and the original instruction address. That kernel continuation drains returned
+frames, replenishes the reserve and retries the interrupted instruction. Arch
+never calls an allocator to resolve the fault. Refill rechecks reserve capacity
+after reclaim, because releasing kernel mappings can itself return pages.
+
+Ordinary mapping operations receive a separate `PageInput` of kernel-owned
+frames. Fork receives its table-copy budget, VM86 low-memory setup receives its
+sixteen data pages, and high-address operations receive bounded batches. The
+kernel reuses unused inputs. Fresh anonymous ranges use zero mappings and first
+writes fault through the reserve. Contiguous DMA and VGA backing allocations
+are kernel operations; arch receives physical addresses to map.
+
+Ownership metadata keeps one resident reference byte per usable physical page,
+plus the bitmap and reference-block directory. Blocks remain resident so COW
+never allocates metadata. The bitmap allocator uses a short spin lock around
+resident metadata; reclaim and heap operations run outside it. Atomic reference
+counts are shared by kernel and arch, while the layout published to arch is
+immutable and separate from the allocator's mutable state. This does not make
+the rest of the kernel safe for concurrent process execution.

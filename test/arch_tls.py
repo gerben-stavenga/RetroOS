@@ -47,6 +47,7 @@ def session(work, disk, name, cpu, accel, extra=(), initialized=None):
                         assert text.count('initialized, parking') == initialized - 1, text
                         assert 'startup failed' not in text, text
                         if initialized > 1:
+                            assert 'SMP: AP stacks/TLS use resident kernel heap mappings' in text, text
                             assert 'core 1: Media worker: audio and graphics ready' in text, text
                         serial_text = serial.read_text(errors='replace')
                         summary = f'core 0: SMP: {initialized} CPUs initialized,'

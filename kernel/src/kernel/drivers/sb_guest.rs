@@ -397,7 +397,7 @@ impl NativeSb {
     pub fn arm<A: crate::Arch>(&mut self, machine: &mut A,
            chan: usize, host: usize, is16: bool,
            gpa: u32, len: u32, mode: u8) -> bool {
-        let bufpage = machine.dma_channel_buf(host);
+        let bufpage = crate::kernel::memory::dma_channel(machine, host);
         if bufpage == 0 { return false; }        // no reserved buffer
         // The buffer sits at `off` inside its channel's 64 KB / 128 KB
         // window; the channel buffer is window-aligned, so the same `off`

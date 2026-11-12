@@ -3,8 +3,9 @@
 //! Both ELF entry and the AP trampoline call `boot_kernel(core_id, magic, info)`
 //! with paging off, offset segments, a private stack, and initialized Rust TLS.
 //! The consumer calls `init_core` on both paths; only core 0 initializes devices.
-//! AP memory comes first from the final BSS pool through `boot_mem::BootMemory`,
-//! keeping the kernel's linear physical mapping instead of using the heap. Keep that storage alive for the CPU's lifetime.
+//! APs borrow the BSP page table only for the trampoline, then adopt private
+//! roots. Caller-owned stacks/TLS need resident virtual mappings, not contiguous
+//! physical memory or storage from the loader's BSS pool.
 
 use crate::{descriptors, paging2, x86};
 use core::alloc::Layout;
@@ -40,6 +41,7 @@ pub struct CoreStart {
     pub tls: *mut u8,
     pub entry: extern "C" fn(u32, usize) -> !,
     pub argument: usize,
+    pub memory: arch_abi::page_supply::PageBootstrap,
     /// Written with Release after CPU-local initialization, before `entry`.
     pub ready: &'static AtomicU32,
 }
@@ -52,36 +54,27 @@ pub fn tls_layout() -> Layout {
     .unwrap()
 }
 
-/// Common BSP/AP initialization, called once per core before any other Rust
-/// code that needs paging or descriptors. Assembly has already installed TLS.
+/// Common BSP/AP initialization. Assembly installs the stack and TLS first.
 ///
 /// # Safety
-/// Must run at ring 0 with interrupts and paging off, under the boot offset
-/// segments. The linker-reserved image and pool must fit the identity window.
+/// BSP: paging off, boot offset segments. AP: paging on using the BSP root,
+/// flat segments, resident caller-owned stack/TLS. Interrupts remain masked.
 pub unsafe fn init_core(core_id: u32) {
-    unsafe {
-        CORE_ID = core_id;
-    }
+    unsafe { CORE_ID = core_id; }
     let stack = if core_id == 0 {
+        assert!(crate::boot_mem::pool_start() - paging2::KERNEL_BASE + paging2::KERNEL_PHYS
+            <= paging2::BOOT_IDENTITY_END, "boot storage exceeds the physical 4 MiB identity window");
+        let pages = (crate::boot_mem::end() - (&raw const _kernel_start) as usize).div_ceil(4096);
+        paging2::enable_paging(&raw mut crate::SCRATCH, paging2::KERNEL_PHYS, pages);
         (&raw const ARCH_STACK_TOP) as u32 - 16
     } else {
+        let start = unsafe { START.expect("AP missing startup context") };
+        crate::memory::bootstrap(start.memory);
+        paging2::init_secondary();
         unsafe { START.expect("AP missing startup context").trap_stack_top }
     };
-    assert!(
-        crate::boot_mem::pool_start() - paging2::KERNEL_BASE + paging2::KERNEL_PHYS
-            <= paging2::BOOT_IDENTITY_END,
-        "boot storage exceeds the physical 4 MiB identity window"
-    );
-    let pages = (crate::boot_mem::end() - (&raw const _kernel_start) as usize).div_ceil(4096);
-    paging2::enable_paging(&raw mut crate::SCRATCH, paging2::KERNEL_PHYS, pages);
     descriptors::setup_descriptor_tables(stack);
     descriptors::setup_syscall();
-    if core_id != 0 && paging2::is_pae() {
-        // Before READY: the BSP will harden shared PTEs and publish WC device
-        // mappings. Their interpretation must already match on every AP.
-        paging2::enable_nx();
-        paging2::enable_wc_pat();
-    }
 }
 
 /// Complete the AP branch of the common Rust entry. No shared allocator,
@@ -118,8 +111,9 @@ pub enum StartError {
 /// The 4 KiB `page_phys` page must be reserved RAM, writable via LOW_MEM_BASE.
 /// `start` must provide exclusive, mapped, resident storage: a 64 KiB kernel
 /// stack, a 16 KiB trap stack in one 64 KiB window, and `tls_layout()` bytes.
-/// These allocations must come from the finished `boot_mem::BootMemory`
-/// phase of the final BSS pool, and must never be freed.
+/// Stack/TLS mappings must be resident in the BSP root, writable, and remain
+/// alive for the CPU's lifetime. Physical contiguity is unnecessary. Keep the
+/// BSP root and its boot identity mapping stable until this AP acknowledges.
 /// `ready` must be distinct for each AP, initially zero, and valid on both CPUs.
 /// After ANY delivery/startup timeout, retain the page and all AP storage and
 /// do not retry/reuse them: an AP may still arrive late. Callback code must
@@ -142,12 +136,15 @@ pub unsafe fn start_core(
         return Err(StartError::InvalidCore);
     }
     let layout = tls_layout();
-    let lo = crate::boot_mem::pool_start();
-    let hi = crate::boot_mem::boot_limit();
     let valid = |base: usize, size: usize| {
-        base >= lo && base.checked_add(size).is_some_and(|end| end <= hi)
+        base >= paging2::KERNEL_BASE && base.checked_add(size).is_some_and(|end| {
+            end <= paging2::HEAP_END && (base / 4096..end.div_ceil(4096)).all(|page| {
+                paging2::kernel_page_resident(page * 4096)
+            })
+        })
     };
     if !(0x1000..0xa0000).contains(&page_phys)
+        || (paging2::is_pae() && page_phys < 0x2000)
         || page_phys & 4095 != 0
         || start.tls as usize & (layout.align() - 1) != 0
         || !valid(start.tls as usize, layout.size())
@@ -189,14 +186,18 @@ pub unsafe fn start_core(
         assert!(len <= 0x800);
         core::ptr::write_bytes(page, 0, 4096);
         core::ptr::copy_nonoverlapping(&raw const ap_trampoline, page, len);
-        // Header at 0x800: GDTR, padding, ESP, logical ID, then 19 GDT slots.
+        // Header: GDTR, ESP, logical ID, bootstrap CR3/CR4/NXE, then GDT.
+        // The trampoline enables this immutable BSP root before using virtual
+        // stack/TLS addresses. It never allocates or edits the borrowed root.
         page.add(0x800).cast::<u16>().write_unaligned(19 * 8 - 1);
         page.add(0x802)
             .cast::<u32>()
             .write_unaligned(page_phys + 0x820);
         page.add(0x808).cast::<u32>().write(start.stack_top);
         page.add(0x80c).cast::<u32>().write(start.core_id);
-        let offset = (paging2::KERNEL_PHYS as u32).wrapping_sub(paging2::KERNEL_BASE as u32);
+        page.add(0x810).cast::<u32>().write(paging2::root_cr3() as u32);
+        page.add(0x814).cast::<u32>().write(x86::read_cr4());
+        page.add(0x818).cast::<u32>().write(if paging2::nx_enabled() { x86::efer::NXE as u32 } else { 0 });
         let segment = |base: u32, code: bool, ring: u64| -> u64 {
             0x00cf_0000_0000_ffff
                 | ((if code { 0x9a } else { 0x92 }) | (ring << 5)) << 40
@@ -206,14 +207,13 @@ pub unsafe fn start_core(
         };
         page.add(0x828)
             .cast::<u64>()
-            .write_unaligned(segment(offset, true, 0));
+            .write_unaligned(segment(0, true, 0));
         page.add(0x830)
             .cast::<u64>()
-            .write_unaligned(segment(offset, false, 0));
-        let phys_tp = (tp as u32).wrapping_add(offset);
+            .write_unaligned(segment(0, false, 0));
         page.add(0x8b0)
             .cast::<u64>()
-            .write_unaligned(segment(phys_tp, false, 1));
+            .write_unaligned(segment(tp as u32, false, 1));
     }
     // A locked fence also orders startup memory before x2APIC WRMSR.
     core::sync::atomic::fence(Ordering::SeqCst);

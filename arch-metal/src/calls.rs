@@ -259,34 +259,6 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
     }
 }
 
-/// Allocate `num_pages` physically contiguous DMA pages from general RAM.
-/// Returns the starting physical page number, or 0 on failure.
-#[allow(dead_code)]
-pub fn arch_alloc_phys_contig(num_pages: usize) -> u64 {
-    let r: u32;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            inlateout("eax") crate::arch_call::ALLOC_PHYS_CONTIG as u32 => r,
-            in("edx") num_pages as u32,
-        );
-    }
-    r as u64
-}
-
-/// Free a contiguous run previously returned by `arch_alloc_phys_contig`.
-#[allow(dead_code)]
-pub fn arch_free_phys_contig(start_page: u64, num_pages: usize) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch_call::FREE_PHYS_CONTIG as u32,
-            in("edx") start_page as u32,
-            in("ecx") num_pages as u32,
-        );
-    }
-}
-
 /// Re-arm (re-unmask) an IRQ line that `handle_irq` left masked because
 /// its ack is deferred to the guest. Call once the guest's device-ack
 /// has passed through, so the next interrupt on that line can fire.
@@ -298,19 +270,6 @@ pub fn arch_rearm_irq(line: u8) {
             in("edx") line as u32,
         );
     }
-}
-
-/// Physical page of DMA channel `ch`'s permanent ISA-DMA buffer (0 = none).
-pub fn arch_dma_channel_buf(ch: usize) -> u64 {
-    let r: u32;
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            inlateout("eax") crate::arch_call::DMA_CHANNEL_BUF as u32 => r,
-            in("edx") ch as u32,
-        );
-    }
-    r as u64
 }
 
 /// Replace `count` user pages at `vpage` with fresh anonymous RW frames.

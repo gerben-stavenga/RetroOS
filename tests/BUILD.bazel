@@ -844,7 +844,7 @@ host_platform_test(
 
 host_platform_test(
     name = "unit_arch_metal_phys_mm_test",
-    test = "//arch-metal:phys_mm_test_host",
+    test = "//kernel:phys_mm_test_host",
     tags = ["unit"],
     size = "small",
     timeout = "short",

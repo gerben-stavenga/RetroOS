@@ -7,7 +7,8 @@
 #[path = "smp.rs"]
 mod smp;
 
-use arch::{paging2, phys_mm, descriptors, irq, x86};
+use arch::{paging2, descriptors, irq, x86};
+use crate::kernel::phys_mm;
 use arch::MultibootMmapEntry;
 use paging2::{PAGE_SIZE, LOW_MEM_BASE};
 
@@ -239,8 +240,8 @@ unsafe fn capture_boot_info_v2(
 
 /// boot_kernel - Entry point called by asm boot stub
 ///
-/// Runs with offset segments (base = KERNEL_PHYS - KERNEL_BASE) so linked
-/// addresses access physical memory correctly. Paging is off on entry.
+/// BSP enters with paging off and boot offset segments. APs enter with flat
+/// segments and paging enabled using the BSP's bootstrap table.
 /// Assembly has installed this core's stack and TLS. `core_id == 0` is the BSP;
 /// APs receive caller-assigned nonzero IDs and do only CPU-local initialization.
 ///
@@ -346,11 +347,11 @@ unsafe fn prepare_boot(
     // kernel text needs that value; ambient println! stays log-only throughout.
     let screen = lib::term::term();
 
-    unsafe { smp::start(screen, &acpi_rsdp[..acpi_rsdp_len], &mmap_buf[..mmap_count], &boot_modules_raw); }
+    // Only minimal page tables and permanent low-memory DMA use the BSS pool.
+    // AP stacks/TLS will use resident heap mappings after allocator setup.
+    unsafe { arch::boot_mem::BootMemory::new() }.finish();
 
     lib::compact_screenln!(screen, "\x1b[96mRetroOS Rust Kernel\x1b[0m");
-
-    paging2::finish_setup_paging();
 
     lib::compact_screenln!(screen, "kernel_phys: {:#x}", KERNEL_PHYS);
 
@@ -362,14 +363,19 @@ unsafe fn prepare_boot(
     let mmap_entries: &[MultibootMmapEntry] = &mmap_buf[..mmap_count];
 
     phys_mm::init_phys_mm(
-        mmap_entries,
-        mmap_count,
+        mmap_entries.iter().map(|entry| phys_mm::MemoryRegion {
+            base: entry.base, length: entry.length, usable: entry.typ == 1,
+        }),
+        arch::memory::physical_page_limit(),
         kernel_low_page,
         kernel_high_page,
+        paging2::physical_page(&arch::ZERO_PAGE as *const _ as usize),
     );
     crate::multiboot::reserve_modules(&boot_modules_raw, |start, end| {
         phys_mm::mark_reserved(start, end)
     });
+    install_physical_memory();
+    paging2::set_vga_text_aperture(phys_mm::alloc_contig(8).expect("no VGA backing pages"));
     lib::compact_println!(
         "ISA DMA: reserved buffer pages ch1={:#x} ch5={:#x}",
         phys_mm::dma_channel_buf(1), phys_mm::dma_channel_buf(5),
@@ -384,8 +390,15 @@ unsafe fn prepare_boot(
     ALLOCATOR.init_with_cached_release(arch::heap_base(), arch::HEAP_END, Some(arch::release_heap_pages), heap_cache);
     ALLOCATOR.enable_small_cache();
     phys_mm::complete_initialization();
+    arch::memory::configure(phys_mm::ownership(), frame_refill_entry as *const () as usize);
+    phys_mm::prepare_fault_metadata();
     crate::kernel::klog::init();
     arch::aperture::init();
+
+    // APs borrow the BSP bootstrap root, then acknowledge their private roots.
+    // Retain the existing identity mapping until every startup has completed.
+    unsafe { smp::start(screen, &acpi_rsdp[..acpi_rsdp_len], &mmap_buf[..mmap_count], &boot_modules_raw); }
+    paging2::finish_setup_paging();
 
     let boot_modules = crate::multiboot::handoff_modules(boot_modules_raw);
 
@@ -622,4 +635,48 @@ fn fatal_finish() -> ! {
     // mapped framebuffer for one best-effort publication before stopping.
     crate::fbcon::panic_present();
     arch::halt_forever();
+}
+
+
+/// Bind kernel-owned allocation policy to the privileged paging/trap mechanisms.
+fn install_physical_memory() {
+    static DMA: phys_mm::LowDmaMemory = phys_mm::LowDmaMemory {
+        reserve: |layout| {
+            let storage = arch::boot_mem::allocate_permanent(layout).ok()? as usize;
+            let physical = storage.checked_sub(paging2::KERNEL_BASE)?
+                .checked_add(paging2::KERNEL_PHYS)?;
+            Some((storage, (physical / PAGE_SIZE) as u64))
+        },
+        unmap: paging2::unmap_kernel_page,
+    };
+    phys_mm::install_low_dma_memory(&DMA);
+    arch::memory::configure(phys_mm::ownership(), frame_refill_entry as *const () as usize);
+    unsafe { phys_mm::replenish_supply(arch::memory::supply()); }
+}
+
+
+#[unsafe(naked)]
+unsafe extern "C" fn frame_refill_entry() -> ! {
+    core::arch::naked_asm!(
+        "lea esp, [esp - 4]", "pushfd", "pushad", "mov ebp, esp",
+        "and esp, -16", "call {refill}", "mov esp, ebp",
+        "mov [esp + 36], eax", "popad", "popfd", "ret",
+        refill = sym frame_refill_resume,
+    );
+}
+extern "C" fn frame_refill_resume() -> usize {
+    let supply = arch::memory::supply();
+    // Normal allocation touches only resident bitmap/refcount metadata.
+    unsafe {
+        let mut returned = [0; arch_abi::page_supply::SUPPLY_CAPACITY];
+        loop {
+            let count = arch::memory::collect_returns(&mut returned);
+            for page in &returned[..count] { phys_mm::free_phys_page(*page); }
+            if count < returned.len() { break; }
+        }
+        phys_mm::replenish_supply(supply);
+        let ip = (*supply).resume_ip;
+        (*supply).resume_ip = 0;
+        ip
+    }
 }

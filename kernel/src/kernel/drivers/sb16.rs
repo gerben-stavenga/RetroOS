@@ -358,7 +358,7 @@ fn dsp_read_at<A: crate::Arch>(machine: &mut A, base: u16) -> u8 {
 /// with a 0x80 bias, so zeroing it writes full-scale negative DC — a rail, not
 /// silence. 16-bit transfers are signed, where zero is exactly silence.
 pub fn zero_channel_buf<A: crate::Arch>(machine: &mut A, chan: u8) {
-    let page = machine.dma_channel_buf(chan as usize);
+    let page = crate::kernel::memory::dma_channel(machine, chan as usize);
     if page == 0 {
         return;
     }
@@ -398,7 +398,7 @@ pub fn open_output<A: crate::Arch>(machine: &mut A, device: &Sb16) -> Option<Sb1
 fn open_ring<A: crate::Arch>(machine: &mut A, card: &Sb16) -> Option<u32> {
     // Map the permanent contiguous channel-5 buffer into the stolen low-mem
     // window so the kernel can write PCM; the DSP reads it by physical address.
-    let phys_page = machine.dma_channel_buf(DMA_CHANNEL);
+    let phys_page = crate::kernel::memory::dma_channel(machine, DMA_CHANNEL);
     if phys_page == 0 {
         crate::compact_println!("sb16: no channel-{} DMA buffer — output is silent", DMA_CHANNEL);
         return None;

@@ -79,3 +79,8 @@ pub mod mount_config;
 pub mod user_config;
 
 pub mod mount_editor;
+
+// Physical allocation policy is a kernel library shared with boot consumers.
+pub use physical_memory as phys_mm;
+
+pub mod memory;

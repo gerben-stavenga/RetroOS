@@ -100,6 +100,7 @@ pub(crate) fn set_execute_regs(regs: *mut Regs) {
 
 /// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
 pub mod arch_call {
+    pub const RETURNED_FRAMES: u64 = 0x12A; // EDX=returned-page exchange
     pub const FRAME_OPERATION: u64 = 0x129; // EDX=frame request
     pub const HIGH_MEMORY: u64 = 0x128; // EDX=request pointer
     pub const EXECUTE: u64 = 0x100;      // Swap kernel↔user regs
@@ -119,10 +120,7 @@ pub mod arch_call {
     #[allow(dead_code)]
     pub const HASH_PHYS_PAGE: u64 = 0x118; // EDX=phys_page_num. Returns FNV-1a u64 hash of that physical page in EAX.
     pub const SET_DEBUG_WATCH: u64 = 0x119; // EBX=count, EDX/ECX=watched linear addrs
-    pub const ALLOC_PHYS_CONTIG: u64 = 0x11A; // EDX=num_pages -> EAX=start_page (0=fail)
-    pub const FREE_PHYS_CONTIG: u64 = 0x11B;  // EDX=start_page, ECX=num_pages
     pub const REARM_IRQ: u64 = 0x11C;         // EDX=irq line — re-unmask a deferred-ack Hw line
-    pub const DMA_CHANNEL_BUF: u64 = 0x11D;   // EDX=channel 0-7 -> EAX=phys page of its permanent DMA buffer
     pub const MAP_FRESH_RANGE: u64 = 0x11E;   // EDX=vpage_start, ECX=count — replace range with fresh anon frames
     pub const HALT: u64 = 0x11F;              // cli + hlt forever at ring 0 (never returns)
     pub const REDIRECT_PHYSICAL_ALIASES: u64 = 0x120; // ESI:EDX=phys page ECX=shadow vpage EBX=count EDI=redirect
@@ -304,6 +302,9 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::LOAD_LDT => {
             crate::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
         }
+        arch_call::RETURNED_FRAMES => {
+            crate::memory::handle_returns(unsafe { &mut *(regs.rdx as *mut crate::memory::Returns) });
+        }
         arch_call::FRAME_OPERATION => {
             crate::frames::handle(unsafe { &mut *(regs.rdx as *mut crate::frames::Request) });
         }
@@ -320,12 +321,6 @@ fn arch_dispatch(regs: &mut Regs) {
             let physical_base = (regs.rdx as u32 as u64)
                 | ((regs.rcx as u32 as u64) << 32);
             regs.rax = crate::aperture::remap(physical_base) as u64;
-        }
-        arch_call::ALLOC_PHYS_CONTIG => {
-            regs.rax = crate::phys_mm::alloc_phys_contig(regs.rdx as usize).unwrap_or(0);
-        }
-        arch_call::FREE_PHYS_CONTIG => {
-            crate::phys_mm::free_phys_contig(regs.rdx, regs.rcx as usize);
         }
         // HALT: the ring-1 kernel cannot `hlt` (CPL-0-only, #GPs); panic and
         // shutdown funnel here to die quietly at ring 0.
@@ -344,9 +339,6 @@ fn arch_dispatch(regs: &mut Regs) {
         }
         arch_call::REARM_IRQ => {
             crate::irq::rearm_irq(regs.rdx as u8);
-        }
-        arch_call::DMA_CHANNEL_BUF => {
-            regs.rax = crate::phys_mm::dma_channel_buf(regs.rdx as usize);
         }
         arch_call::MAP_FRESH_RANGE => {
             paging2::map_fresh_range(regs.rdx as usize, regs.rcx as usize);
@@ -543,6 +535,13 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
             for i in 0..10 {
                 lib::compact_println!("  [esp+{:2}] = {:#010x}", i * 4, unsafe { p.add(i).read_volatile() });
             }
+        }
+        if raw_int_num == 14 && !crate::memory::can_fault() {
+            let mut ip = raw_eip;
+            crate::memory::defer_fault(&mut ip);
+            if from_64 { unsafe { (*stack).regs.frame.rip = ip; } }
+            else { unsafe { (*stack).raw32.0.eip = ip as u32; } }
+            return from_64;
         }
         handle_ring0(raw_int_num, raw_err_code, raw_cs, raw_eip);  // No canonicalization because in 32-bit mode doesn't match Regs layout due to missing esp:ss
         return from_64;
@@ -847,8 +846,9 @@ fn isr_handler_ring3(regs: &mut Regs) {
             }
         }
         14 => {
-            if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
-            KE::PageFault { addr: x86::read_cr2_full() }
+            if !crate::memory::can_fault() { KE::Irq }
+            else if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
+            else { KE::PageFault { addr: x86::read_cr2_full() } }
         }
         32..=47 | 0xF8..=0xFF => { handle_irq(regs); KE::Irq }
         // Vectors 3/4 (#BP/#OF) are only reachable from user INT3/INTO, so
@@ -905,6 +905,7 @@ fn isr_handler_ring1(regs: &mut Regs) {
             panic_with_regs("Unexpected debug exception in kernel", regs);
         }
         14 => {
+            if !crate::memory::can_fault() { crate::memory::defer_fault(&mut regs.frame.rip); return; }
             if try_handle_page_fault(regs.err_code, false).is_none() {
                 panic_with_regs("Unhandled page fault in kernel", regs);
             }
@@ -921,6 +922,7 @@ fn isr_handler_ring1(regs: &mut Regs) {
 
 /// Try to handle a page fault. Returns Some(()) if resolved, None if not.
 fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
+    let _reserve = crate::memory::FaultGuard::enter();
     let _sample = crate::exec_profile::FaultSample::start(error & 4 != 0);
     use crate::paging2::{KERNEL_BASE, PAGE_TABLE_BASE, page_idx};
 
@@ -1094,8 +1096,8 @@ fn demand_page<E: paging2::Entry>(
 
 /// Demand-page a kernel heap page: allocate a real writable physical page.
 fn demand_page_kernel(fault_addr: usize) {
-    let phys = crate::phys_mm::alloc_phys_page()
-        .unwrap_or_else(|| panic!("Arch: OOM during kernel heap demand paging at {fault_addr:#x}; managed pages={}", crate::phys_mm::total_page_count()));
+    let phys = crate::memory::take_page()
+        .unwrap_or_else(|| panic!("Arch: fault reserve exhausted for kernel heap at {fault_addr:#x}; managed pages={}", crate::memory::total_page_count()));
     let page_index = paging2::page_idx(fault_addr);
     match paging2::entries() {
         paging2::Entries::E32(e) => {

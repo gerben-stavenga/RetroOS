@@ -4,6 +4,10 @@
 #![feature(thread_local)]
 extern crate alloc;
 use arch_metal::{smp, x86};
+use arch_metal as arch;
+use arch_metal::paging2;
+use arch_metal::PAGE_SIZE;
+use physical_memory as phys_mm;
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -106,8 +110,10 @@ fn check_local(id: u32) {
             assert_eq!(e[root + 3].addr(), own);
             if paging2::cpu_supports_long_mode() {
                 let pml4 = e[root + 4].addr();
-                // Use the pool/image affine mapping to inspect the back edge.
-                let linked = pml4 as usize - paging2::KERNEL_PHYS + paging2::KERNEL_BASE;
+                // Inspect the back edge through the recursive mapping. With
+                // ROOT[3] pointing to ROOT, its leaf slot 4 maps this PML4.
+                // Heap TLS has no kernel-image affine physical alias.
+                let linked = paging2::PAGE_TABLE_BASE + 3 * (512 * PAGE_SIZE) + 4 * PAGE_SIZE;
                 let back = unsafe { (linked as *const u64).read_volatile() };
                 assert_eq!(back & 0x000f_ffff_ffff_f000, own);
                 PML4_ROOT[id as usize].store(pml4 as u32, Ordering::Release);
@@ -147,11 +153,15 @@ extern "C" fn secondary(id: u32, argument: usize) -> ! {
 }
 
 fn allocate_core(
-    memory: &mut arch_metal::boot_mem::BootMemory,
     id: u32,
     ready: &'static AtomicU32,
 ) -> smp::CoreStart {
-    let mut allocate = |layout| memory.allocate(layout).unwrap();
+    let allocate = |layout| {
+        let storage = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        assert!(!storage.is_null());
+        assert!(storage as usize >= arch_metal::heap_base());
+        storage
+    };
     // A 16 KiB-aligned trap stack fits wholly within one 64 KiB espfix window.
     let trap = allocate(Layout::from_size_align(16384, 16384).unwrap());
     let tls = allocate(smp::tls_layout());
@@ -163,6 +173,7 @@ fn allocate_core(
         trap_stack_top: trap as u32 + 16384 - 16,
         entry: secondary,
         argument: 0xabcdef,
+        memory: phys_mm::bootstrap_supply(frame_refill_entry as *const () as usize),
         ready,
     }
 }
@@ -238,18 +249,35 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
             smp::run_secondary();
         }
     }
-    // Minimal arch first, then reserve ALL AP resources, then engage CPUs.
-    let mut memory = unsafe { arch_metal::boot_mem::BootMemory::new() };
+    // Close early BSS reservations; AP resources come from resident heap pages.
+    let memory = unsafe { arch_metal::boot_mem::BootMemory::new() };
     assert!(arch_metal::boot_mem::allocate_permanent(Layout::new::<u8>()).is_err());
+    memory.finish();
+    // Initialize the common kernel allocator before reserving AP storage.
+    let physical_end = arch_metal::boot_mem::end() - arch_metal::paging2::KERNEL_BASE
+        + arch_metal::paging2::KERNEL_PHYS;
+    phys_mm::init_phys_mm(
+        map[..count].iter().map(|entry| phys_mm::MemoryRegion {
+            base: entry.base, length: entry.length, usable: entry.typ == 1,
+        }),
+        arch::memory::physical_page_limit(),
+        0x100,
+        physical_end.div_ceil(4096) as u64,
+        paging2::physical_page(&arch::ZERO_PAGE as *const _ as usize),
+    );
+    install_physical_memory();
+    ALLOC.init(arch_metal::heap_base(), arch_metal::HEAP_END);
+    phys_mm::complete_initialization();
+    arch::memory::configure(phys_mm::ownership(), frame_refill_entry as *const () as usize);
+    phys_mm::prepare_fault_metadata();
     let missing = if missing_test {
-        Some(allocate_core(&mut memory, 4, &MISSING_READY))
+        Some(allocate_core(4, &MISSING_READY))
     } else {
         for id in 1..4u32 {
-            starts[id as usize - 1] = Some(allocate_core(&mut memory, id, &READY[id as usize]));
+            starts[id as usize - 1] = Some(allocate_core(id, &READY[id as usize]));
         }
         None
     };
-    memory.finish();
     assert_eq!(arch_metal::boot_mem::pool_end(), arch_metal::heap_base());
     if use_x2 {
         assert_ne!(x86::cpuid(1).2 & (1 << 21), 0);
@@ -288,17 +316,6 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
         }
         print("SMP AP initialized\n");
     }
-    // Only after the APs are engaged do we initialize the ordinary allocators.
-    let physical_end = arch_metal::boot_mem::end() - arch_metal::paging2::KERNEL_BASE
-        + arch_metal::paging2::KERNEL_PHYS;
-    arch_metal::phys_mm::init_phys_mm(
-        &map[..count],
-        count,
-        0x100,
-        physical_end.div_ceil(4096) as u64,
-    );
-    ALLOC.init(arch_metal::heap_base(), arch_metal::HEAP_END);
-    arch_metal::phys_mm::complete_initialization();
     // Normal heap allocations must follow the entire early extension.
     let ordinary = alloc::boxed::Box::new(0xfeed1234u32);
     assert!((&*ordinary as *const u32 as usize) >= arch_metal::boot_mem::end());
@@ -308,22 +325,29 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
             >= physical_end.div_ceil(4096) as u64
     );
     for channel in [1, 5] {
-        let dma = arch_metal::phys_mm::dma_channel_buf(channel);
+        let dma = phys_mm::dma_channel_buf(channel);
         assert_ne!(dma, 0);
         let alignment = if channel < 4 { 65536 } else { 131072 };
         assert_eq!((dma * 4096) % alignment, 0);
         assert!(dma * 4096 < 0x1000000);
-        assert_eq!(arch_metal::phys_mm::dma_channel_buf(channel), dma);
+        assert_eq!(phys_mm::dma_channel_buf(channel), dma);
         let dma_va = dma as usize * 4096 - arch_metal::paging2::KERNEL_PHYS
             + arch_metal::paging2::KERNEL_BASE;
         for start in starts.iter().flatten() {
-            assert!(dma_va >= start.stack_top as usize);
+            assert!(dma_va + alignment as usize <= arch_metal::heap_base());
+            assert!(start.stack_top as usize >= arch_metal::heap_base());
         }
     }
-    print("SMP DMA allocated after AP resources\n");
+    print("SMP DMA separate from heap AP resources\n");
     // Demand paging creates kernel root entries after AP startup. A generation
     // refresh must bring them into every private root before kernel access.
     let shared = alloc::vec![0x5au8; 3 * 1024 * 1024];
+    unsafe {
+        let supply = &*arch::memory::supply();
+        assert!(supply.refills > 1 && supply.fault_pages_used > 64);
+        assert!(supply.fault_pages_peak <= 5);
+    }
+    print("SMP FAULT RESERVE PASS\n");
     SHARED_ADDRESS.store(shared.as_ptr() as u32, Ordering::Release);
     GO.store(1, Ordering::Release);
     for id in 1..4 {
@@ -365,4 +389,48 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
     }
     print("SMP PASS: 4 cores, private TLS and page roots, shared Rust entry\n");
     stop(0)
+}
+
+
+/// Bind kernel-owned allocation policy to the privileged paging/trap mechanisms.
+fn install_physical_memory() {
+    static DMA: phys_mm::LowDmaMemory = phys_mm::LowDmaMemory {
+        reserve: |layout| {
+            let storage = arch::boot_mem::allocate_permanent(layout).ok()? as usize;
+            let physical = storage.checked_sub(paging2::KERNEL_BASE)?
+                .checked_add(paging2::KERNEL_PHYS)?;
+            Some((storage, (physical / PAGE_SIZE) as u64))
+        },
+        unmap: paging2::unmap_kernel_page,
+    };
+    phys_mm::install_low_dma_memory(&DMA);
+    arch::memory::configure(phys_mm::ownership(), frame_refill_entry as *const () as usize);
+    unsafe { phys_mm::replenish_supply(arch::memory::supply()); }
+}
+
+
+#[unsafe(naked)]
+unsafe extern "C" fn frame_refill_entry() -> ! {
+    core::arch::naked_asm!(
+        "lea esp, [esp - 4]", "pushfd", "pushad", "mov ebp, esp",
+        "and esp, -16", "call {refill}", "mov esp, ebp",
+        "mov [esp + 36], eax", "popad", "popfd", "ret",
+        refill = sym frame_refill_resume,
+    );
+}
+extern "C" fn frame_refill_resume() -> usize {
+    let supply = arch::memory::supply();
+    // Normal allocation touches only resident bitmap/refcount metadata.
+    unsafe {
+        let mut returned = [0; 64];
+        loop {
+            let count = arch::memory::collect_returns(&mut returned);
+            for page in &returned[..count] { phys_mm::free_phys_page(*page); }
+            if count < returned.len() { break; }
+        }
+        phys_mm::replenish_supply(supply);
+        let ip = (*supply).resume_ip;
+        (*supply).resume_ip = 0;
+        ip
+    }
 }

@@ -31,20 +31,8 @@ rust_library(
 alias(name = "xhci_dma_test_host", actual = "//kernel:xhci_dma_test_host")
 alias(name = "xhci_dma_test", actual = "//kernel:xhci_dma_test")
 
-rust_test(
-    name = "phys_mm_test_host",
-    tags = ["manual"],
-    srcs = ["phys_mm_test.rs", "src/phys_mm.rs", "src/phys_mm/pool.rs"],
-    crate_root = "phys_mm_test.rs",
-    edition = "2024",
-    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
-    deps = ["//lib", "//lib:compact_fmt"],
-)
-
-host_platform_test(
-    name = "phys_mm_test",
-    test = ":phys_mm_test_host",
-)
+alias(name = "phys_mm_test_host", actual = "//kernel:phys_mm_test_host")
+alias(name = "phys_mm_test", actual = "//kernel:phys_mm_test")
 
 # Small allocation-owning consumer of the same BSP/AP entry ABI as the kernel.
 rust_binary(
@@ -58,7 +46,7 @@ rust_binary(
         "-Clink-arg=-T$(location //kernel:kernel_ld)",
         "-Clink-arg=$(location :entry)", "-Clink-arg=-nostdlib", "-Clink-arg=-no-pie",
     ],
-    deps = [":arch-metal", "//lib"],
+    deps = [":arch-metal", "//lib", "//kernel:physical_memory"],
 )
 
 rust_test(

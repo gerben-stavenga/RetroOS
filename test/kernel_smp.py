@@ -27,7 +27,8 @@ def main():
         ('single', ('-smp', '1'), 1),
         ('dual', ('-smp', '2'), 2),
         ('four', ('-smp', '4'), 4),
-        ('capacity', ('-smp', '8'), 7),
+        ('capacity', ('-smp', '8'), 8),
+        ('sixteen', ('-smp', '16'), 16),
         ('sparse', ('-smp', '4,sockets=2,cores=3,threads=1,maxcpus=6'), 4),
         ('no-acpi', ('-smp', '4', '-no-acpi'), 1),
     ]

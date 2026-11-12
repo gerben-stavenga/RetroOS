@@ -1,5 +1,5 @@
 //! `arch-metal` — the bare-metal x86 backend (ring-0 privileged supervisor:
-//! interrupt handling, paging, physical memory, descriptor tables, and the arch
+//! interrupt handling, paging mechanisms, descriptor tables, and the arch
 //! call interface for the ring-1 kernel).
 //!
 //! This is one of the two `arch_abi::Arch` backends (the other is the software
@@ -42,7 +42,7 @@ pub mod smp;
 pub mod boot_mem;
 pub mod paging2;
 mod high_paging;
-pub mod phys_mm;
+pub mod memory;
 mod traps;
 mod vcpu;
 pub mod x86;
@@ -176,7 +176,7 @@ pub fn set_irq_line(_asserted: bool) {}
 
 /// Physical free-page count, maintained by the RAM pool in constant time.
 pub fn free_page_count() -> usize {
-    phys_mm::free_page_count()
+    memory::free_page_count()
 }
 
 mod frames;

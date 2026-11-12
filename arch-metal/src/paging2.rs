@@ -403,7 +403,7 @@ fn owns_frame<E: Entry>(entry: E) -> bool {
 pub(crate) fn replace_mapping<E: Entry>(slot: &mut E, incoming: E) {
     let outgoing = replace_entry(slot, incoming);
     if owns_frame(outgoing) {
-        crate::phys_mm::free_phys_page(outgoing.page());
+        crate::memory::release_page(outgoing.page());
     }
 }
 
@@ -412,7 +412,7 @@ pub(crate) fn replace_mapping<E: Entry>(slot: &mut E, incoming: E) {
 #[inline]
 fn retain_mapping<E: Entry>(entry: E) -> E {
     if owns_frame(entry) {
-        let _ = crate::phys_mm::inc_shared_count(entry.page());
+        let _ = crate::memory::inc_shared_count(entry.page());
     }
     entry
 }
@@ -610,6 +610,40 @@ pub fn setup_long_mode_tables() {
     // PDPT[4] = PML4 (back-pointer so PML4 is visible in recursive mapping)
     if let Entries::E64(e) = entries() {
         let _ = replace_entry(&mut e[root_base() + 4], Entry64::new(pml4_phys, true, false));
+    }
+}
+
+/// Adopt private paging state after the AP trampoline enabled the BSP's root.
+/// TLS and stacks are already mapped and resident; physical backing may be scattered.
+/// Runs with flat segments, initialized GS, and interrupts masked.
+pub(crate) fn init_secondary() {
+    use core::sync::atomic::Ordering;
+    let pae = crate::x86::read_cr4() & crate::x86::cr4::PAE != 0;
+    IS_PAE.store(pae, Ordering::Relaxed);
+    CPU_MODE.store(u8::from(pae), Ordering::Relaxed);
+    // These translations still use the BSP recursive view. No linear-image
+    // arithmetic is valid for AP TLS allocated from the ordinary kernel heap.
+    let root_page = physical_page((&raw const ROOT) as usize);
+    if pae {
+        enable_nx();
+        enable_wc_pat();
+        let hw_va = (&raw const HW_PDPT) as usize;
+        let hw_phys = physical_page(hw_va) * PAGE_SIZE as u64 + (hw_va % PAGE_SIZE) as u64;
+        let pml4_page = physical_page((&raw const PML4) as usize);
+        unsafe {
+            register_root::<Entry64>();
+            let root = (&raw mut ROOT).cast::<Entry64>();
+            root.add(3).write(Entry64::new(root_page, true, false));
+            root.add(4).write(Entry64::new(pml4_page, true, false));
+            for i in 0..4 { HW_PDPT.0[i] = hardware_pdpte(root.add(i).read()); }
+            crate::x86::write_cr3(hw_phys as u32);
+        }
+    } else {
+        unsafe {
+            register_root::<Entry32>();
+            (&raw mut ROOT).cast::<Entry32>().add(768).write(Entry32::new(root_page, true, false));
+            crate::x86::write_cr3((root_page * PAGE_SIZE as u64) as u32);
+        }
     }
 }
 
@@ -1040,6 +1074,20 @@ pub fn release_heap_pages(addr: usize, bytes: usize) {
     }
 }
 
+/// Validate boot-owned mapped storage without triggering demand paging.
+pub(crate) fn kernel_page_resident(address: usize) -> bool {
+    if !(KERNEL_BASE..HEAP_END).contains(&address) { return false; }
+    fn present<E: Entry>(entries: &[E], index: usize) -> bool {
+        let parent = parent_index::<E>(index);
+        (parent == index || present(entries, parent)) && entries[index].present()
+    }
+    let page = address / PAGE_SIZE;
+    match entries() {
+        Entries::E32(e) => present(e, page) && e[page].hw_writable(),
+        Entries::E64(e) => present(e, page) && e[page].hw_writable(),
+    }
+}
+
 /// Get physical page number for a virtual address
 pub fn physical_page(vaddr: usize) -> u64 {
     let idx = page_idx(vaddr);
@@ -1089,7 +1137,7 @@ pub fn flush_tlb() {
 /// Clears the first root entry (PD[0] for legacy, PDPT[0] for PAE)
 fn remove_identity_mapping<E: Entry>(entries: &mut [E]) {
     let _ = replace_entry(&mut entries[root_base()], E::default());
-    invalidate_tlb();
+    flush_tlb();
 }
 
 /// Finish paging setup after stack switch
@@ -1604,7 +1652,7 @@ pub fn temp_swap(page: u64) -> u64 {
 /// Returns the saved page (pass to temp_swap to restore and get the new page back).
 #[must_use]
 fn fresh_temp_page() -> u64 {
-    temp_swap(crate::phys_mm::alloc_phys_page().expect("out of memory"))
+    temp_swap(crate::memory::take_page().expect("mapping has no supplied backing page"))
 }
 
 /// Get entries per page for an Entry type
@@ -1701,7 +1749,7 @@ fn fork_generic<E: Entry>(entries: &mut [E], dst: &mut [E]) {
 /// COW-share a page table page: mark each present non-MMIO entry R/O
 /// in `src`, increment its ref count, and write the R/O copy to `dst`.
 fn share_and_copy<E: Entry>(src: &mut [E], dst: &mut [E]) {
-    use crate::phys_mm;
+    use crate::memory;
 
     debug_assert_eq!(src.len(), dst.len());
 
@@ -1710,7 +1758,7 @@ fn share_and_copy<E: Entry>(src: &mut [E], dst: &mut [E]) {
         if owns_frame(e) {
             e.set_hw_writable(false);
             src[i].set_hw_writable(false);
-            phys_mm::inc_shared_count(src[i].page());
+            memory::inc_shared_count(src[i].page());
         }
         // `dst` is either fresh physical storage (whose prior bytes carry no
         // mappings) or a plain stack snapshot, so displaced bits own nothing.
@@ -1726,13 +1774,13 @@ fn share_and_copy<E: Entry>(src: &mut [E], dst: &mut [E]) {
 /// copies the old contents, and updates the entry. For page table entries,
 /// also marks children R/O and increments their ref counts.
 pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
-    use crate::phys_mm;
+    use crate::memory;
 
     debug_assert!(idx < recursive_idx(),
         "cow_entry: idx {} is at or above recursive entry, must be a user entry", idx);
 
     let old_phys = entries[idx].page();
-    let ref_count = phys_mm::get_ref_count(old_phys);
+    let ref_count = memory::get_ref_count(old_phys);
 
     if ref_count == 1 {
         // Sole owner — just make writable
@@ -1751,14 +1799,14 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         // of child entries is writable (no R/O ancestor). Then temp_map
         // the old page as src and share_and_copy into the recursive view.
         let user = entries[idx].user();
-        let p = phys_mm::alloc_phys_page().expect("Out of memory during COW");
+        let p = memory::take_page().expect("COW has no supplied backing page");
         let displaced = replace_entry(&mut entries[idx], E::new(p, true, user));
         debug_assert_eq!(displaced.page(), old_phys);
         invalidate_tlb();
         let saved = temp_swap(old_phys);
         let src = unsafe { let tp = &raw mut TEMP_PAGE; core::slice::from_raw_parts_mut((*tp).0.as_mut_ptr() as *mut E, epp) };
         share_and_copy(src, &mut entries[child_base..child_base + epp]);
-        phys_mm::free_phys_page(temp_swap(saved));
+        memory::release_page(temp_swap(saved));
         return;
     } else {
         // Leaf: copy old page content into a new physical page.
@@ -1831,7 +1879,7 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
     }
 
     let epp = entries_per_page::<E>();
-    let ref_count = crate::phys_mm::get_ref_count(entries[parent_idx].page());
+    let ref_count = crate::memory::get_ref_count(entries[parent_idx].page());
 
     if ref_count == 1 {
         // Sole owner — walk children
@@ -2074,19 +2122,16 @@ pub(crate) fn map_shared_pages_user(vpage: usize, kernel_base: usize, count: usi
 /// text screen; this is the dedicated RAM that does. The kernel low-mem window
 /// and every DOS process's guest 0xB8000 are both mapped to these pages, giving
 /// one shared text screen — the emulated equivalent of VGA hardware's video RAM.
+static mut VGA_APERTURE: u64 = 0;
+/// Kernel donates permanent backing; arch only installs its mappings.
+pub fn set_vga_text_aperture(page: u64) {
+    assert!(page != 0);
+    unsafe { let current = VGA_APERTURE; assert_eq!(current, 0); VGA_APERTURE = page; }
+}
 pub fn vga_text_aperture_ppage() -> u64 {
-    // Single-threaded kernel state, allocated once at boot — a plain static like
-    // the other paging/phys_mm globals (no atomic needed).
-    static mut APERTURE: u64 = 0;
-    unsafe {
-        let cur = *core::ptr::addr_of!(APERTURE);
-        if cur != 0 {
-            return cur;
-        }
-        let base = crate::phys_mm::alloc_contig(8).expect("VGA text aperture alloc");
-        *core::ptr::addr_of_mut!(APERTURE) = base;
-        base
-    }
+    let page = unsafe { VGA_APERTURE };
+    assert!(page != 0, "kernel did not supply VGA backing");
+    page
 }
 
 /// Map the current process's VGA color-text aperture (guest 0xB8000-0xBFFFF, 8
@@ -2271,31 +2316,19 @@ pub fn unmap_range(base_page: usize, num_pages: usize) {
 /// frames currently mapped are freed first; cache-disabled / externally-
 /// owned pages (an aliased DMA buffer) are left intact.
 pub fn map_fresh_range(base_page: usize, num_pages: usize) {
-    use crate::phys_mm;
+    let zero = physical_page(&crate::ZERO_PAGE as *const _ as usize);
     match entries() {
-        Entries::E32(e) => {
-            for i in 0..num_pages {
-                let fresh = phys_mm::alloc_phys_page().expect("out of memory mapping fresh user pages");
-                replace_mapping(&mut e[base_page + i], Entry32::new(fresh, true, true));
-            }
-        }
-        Entries::E64(e) => {
-            for i in 0..num_pages {
-                let fresh = phys_mm::alloc_phys_page().expect("out of memory mapping fresh user pages");
-                replace_mapping(&mut e[base_page + i], Entry64::new(fresh, true, true));
-            }
-        }
+        Entries::E32(e) => for i in 0..num_pages {
+            replace_mapping(&mut e[base_page + i], Entry32::new(zero, false, true));
+        },
+        Entries::E64(e) => for i in 0..num_pages {
+            replace_mapping(&mut e[base_page + i], Entry64::new(zero, false, true));
+        },
     }
     flush_tlb();
-    // Zero the freshly-mapped pages. `alloc_phys_page` hands back uninitialised
-    // frames; on real hardware that RAM reads as 0xFF, so a fresh VGA aperture
-    // showed as a white screen wherever the guest hadn't drawn (qemu happens to
-    // zero-fill, hiding it). The pages are now mapped + TLB-flushed, so write
-    // through the mapped VA. (DOS callers also rely on a clean B8000/A0000.)
+    // First writes fault and consume the per-core reserve, including tables.
     for i in 0..num_pages {
-        unsafe {
-            core::ptr::write_bytes(((base_page + i) * PAGE_SIZE) as *mut u8, 0, PAGE_SIZE);
-        }
+        unsafe { core::ptr::write_bytes(((base_page + i) * PAGE_SIZE) as *mut u8, 0, PAGE_SIZE); }
     }
 }
 
@@ -2358,7 +2391,7 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
 /// counted COW reference; shared mappings borrow the cache's pinned ownership.
 pub(crate) fn map_frame(vpage: usize, frame: u64, shared: bool, writable: bool, executable: bool) -> bool {
     if vpage >= 0xc0000000 / PAGE_SIZE { return false; }
-    if !shared && !crate::phys_mm::inc_shared_count(frame) { return false; }
+    if !shared && !crate::memory::inc_shared_count(frame) { return false; }
     fn map<E: Entry>(entries: &mut [E], vpage: usize, frame: u64, shared: bool, writable: bool, executable: bool) {
         let mut entry = E::new(frame, shared && writable, true);
         entry.set_writable(writable);

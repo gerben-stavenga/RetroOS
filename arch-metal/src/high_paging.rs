@@ -60,7 +60,7 @@ pub fn fork(space: &mut RootPageTable) {
         let mut entry = root(index);
         if entry.present() {
             entry.set_hw_writable(false);
-            crate::phys_mm::inc_shared_count(entry.page());
+            crate::memory::inc_shared_count(entry.page());
             set_root(index, entry);
         }
         unsafe { space.e64[index + 3] = entry; }
@@ -80,7 +80,7 @@ fn write(page: u64, index: usize, entry: Entry64) {
     with_frame(page, |p| unsafe { p.cast::<Entry64>().add(index).write_volatile(entry); });
 }
 fn allocate(fill: Entry64) -> Result<u64, i32> {
-    let page = crate::phys_mm::alloc_phys_page().ok_or(-12)?;
+    let page = crate::memory::take_page().ok_or(-11)?;
     with_frame(page, |p| {
         for index in 0..512 { unsafe { p.cast::<Entry64>().add(index).write(fill); } }
     });
@@ -88,10 +88,10 @@ fn allocate(fill: Entry64) -> Result<u64, i32> {
 }
 fn release(entry: Entry64, level: u32) {
     if !entry.present() { return; }
-    if level > 0 && crate::phys_mm::get_ref_count(entry.page()) == 1 {
+    if level > 0 && crate::memory::get_ref_count(entry.page()) == 1 {
         for index in 0..512 { release(read(entry.page(), index), level - 1); }
     }
-    crate::phys_mm::free_phys_page(entry.page());
+    crate::memory::release_page(entry.page());
 }
 pub fn clean() {
     if !paging2::is_pae() { return; }
@@ -107,18 +107,18 @@ pub fn clean() {
 fn table(entry: &mut Entry64) -> Result<u64, i32> {
     if !entry.present() {
         *entry = Entry64::new(allocate(*entry)?, true, true);
-    } else if crate::phys_mm::get_ref_count(entry.page()) > 1 {
+    } else if crate::memory::get_ref_count(entry.page()) > 1 {
         let page = allocate(Entry64(0))?;
         for index in 0..512 {
             let mut child = read(entry.page(), index);
             if child.present() {
                 child.set_hw_writable(false);
-                crate::phys_mm::inc_shared_count(child.page());
+                crate::memory::inc_shared_count(child.page());
                 write(entry.page(), index, child);
             }
             write(page, index, child);
         }
-        crate::phys_mm::free_phys_page(entry.page());
+        crate::memory::release_page(entry.page());
         *entry = Entry64::new(page, true, true);
     } else { entry.set_hw_writable(true); }
     Ok(entry.page())
@@ -162,7 +162,7 @@ fn update(entry: &mut Entry64, level: u32, base: u64, start: u64, end: u64, op: 
             // semantic permissions survive fork independently of hardware COW.
             entry.set_user(prot & 7 != 0);
             entry.set_writable(prot & 2 != 0);
-            entry.set_hw_writable(prot & 2 != 0 && crate::phys_mm::get_ref_count(entry.page()) == 1);
+            entry.set_hw_writable(prot & 2 != 0 && crate::memory::get_ref_count(entry.page()) == 1);
             entry.set_no_execute(prot & 4 == 0);
         }
         return Ok(());
@@ -236,12 +236,12 @@ fn resolve(address: u64, write_access: bool, execute: bool) -> Option<u64> {
                 entry.set_writable(old.hw_writable());
                 entry.set_no_execute(old.raw() & NO_EXECUTE != 0);
             } else if write_access {
-                if crate::phys_mm::get_ref_count(entry.page()) > 1 {
+                if crate::memory::get_ref_count(entry.page()) > 1 {
                     let page = allocate(Entry64(0)).ok()?;
                     let scratch = (&raw mut crate::SCRATCH).cast::<u8>();
                     with_frame(entry.page(), |p| unsafe { core::ptr::copy_nonoverlapping(p, scratch, 4096); });
                     with_frame(page, |p| unsafe { core::ptr::copy_nonoverlapping(scratch, p, 4096); });
-                    crate::phys_mm::free_phys_page(entry.page());
+                    crate::memory::release_page(entry.page());
                     entry.0 = (entry.0 & !Entry64::ADDR_MASK) | (page << 12);
                 }
                 entry.set_hw_writable(true);

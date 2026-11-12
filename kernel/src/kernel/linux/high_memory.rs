@@ -53,13 +53,13 @@ pub fn copy_to<A: crate::Arch>(machine: &mut A, address: u64, bytes: &[u8]) -> b
     else {
         // Keep the Arch interface mutable-buffer-only without exposing a guest reference.
         let mut buffer = bytes.to_vec();
-        machine.high_copy(address, &mut buffer, true)
+        crate::kernel::memory::high_copy(machine, address, &mut buffer, true)
     }
 }
 pub fn copy_from<A: crate::Arch>(machine: &mut A, address: u64, bytes: &mut [u8]) -> bool {
     if !range(address, bytes.len() as u64) { return false; }
     if address < START { machine.copy_from(address as usize, bytes); true }
-    else { machine.high_copy(address, bytes, false) }
+    else { crate::kernel::memory::high_copy(machine, address, bytes, false) }
 }
 
 pub fn mmap<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
@@ -82,7 +82,7 @@ pub fn mmap<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
     let hint = a.a0 & !4095;
     if hint >= START && hint.checked_add(size).is_some_and(|end| end <= END) {
         let operation = if a.a3 & 0x10 != 0 { 0 } else { 4 };
-        let result = machine.high_mapping(hint, size, operation, a.a2 as u32);
+        let result = crate::kernel::memory::high_mapping(machine, hint, size, operation, a.a2 as u32);
         if result == 0 { linux.high_mappings.reserve(hint, hint + size); return SyscallResult::val64(hint as i64); }
         linux_trace!("[LINUX-HIGH] hint failed {}", result);
         if fixed { return SyscallResult::val(result); }
@@ -91,7 +91,7 @@ pub fn mmap<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
     // The sparse high arena is used for large reservations and explicit hints.
     let Some(base) = linux.high_mappings.allocate(size)
         else { return SyscallResult::val(-ENOMEM); };
-    let result = machine.high_mapping(base, size, 4, a.a2 as u32);
+    let result = crate::kernel::memory::high_mapping(machine, base, size, 4, a.a2 as u32);
     if result == 0 {
         linux.high_mappings.cursor = base;
         linux.high_mappings.reserve(base, base + size);
@@ -105,7 +105,7 @@ pub fn change<A: crate::Arch>(machine: &mut A, a: &Args, operation: u32) -> Sysc
         else { return SyscallResult::val(-EINVAL); };
     if !range(a.a0, length) || a.a0 < START { return SyscallResult::val(-EINVAL); }
     if length == 0 { return SyscallResult::val(if operation == 2 { -EINVAL } else { 0 }); }
-    SyscallResult::val(machine.high_mapping(a.a0, length, operation, if operation == 1 { a.a2 as u32 } else { 0 }))
+    SyscallResult::val(crate::kernel::memory::high_mapping(machine, a.a0, length, operation, if operation == 1 { a.a2 as u32 } else { 0 }))
 }
 
 pub fn unmap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args) -> SyscallResult {

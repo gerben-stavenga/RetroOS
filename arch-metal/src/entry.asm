@@ -682,11 +682,14 @@ ap_trampoline:
     mov ds, ax
     lgdt [0x800]
     mov esi, [0x808]            ; linked kernel stack top
-    mov ecx, [0x80c]            ; caller-assigned logical core ID
+    mov ebx, [0x80c]            ; caller-assigned logical core ID
+    mov edi, [0x810]            ; BSP bootstrap CR3
+    mov ebp, [0x814]            ; BSP CR4 (including paging mode)
+    mov edx, [0x818]            ; EFER.NXE, if active in the borrowed table
     mov eax, cr0
     or eax, 1
     mov cr0, eax
-    jmp dword 0x08:ap_entry
+    jmp dword 0x08:(ap_entry - KERNEL_BASE + KERNEL_PHYS)
 ap_trampoline_end:
 
 section .text.ap_entry
@@ -697,6 +700,23 @@ ap_entry:
     mov es, ax
     mov fs, ax
     mov ss, ax
+    ; All addresses used so far are physical. The BSP retains its identity
+    ; mapping until this AP has adopted a private root and acknowledged.
+    mov eax, ebp
+    mov cr4, eax
+    test edx, edx
+    jz .no_nxe
+    mov eax, edx
+    xor edx, edx
+    mov ecx, 0xC0000080
+    wrmsr
+.no_nxe:
+    mov cr3, edi
+    mov eax, cr0
+    or eax, 0x80010000          ; PG | WP
+    mov cr0, eax
+    jmp dword 0x08:.virtual
+.virtual:
     mov ax, KERNEL_TLS_SEL
     mov gs, ax
     mov esp, esi
@@ -704,6 +724,6 @@ ap_entry:
     sub esp, 4
     push dword 0               ; no Multiboot data on an AP
     push dword 0
-    push ecx
-    call boot_kernel           ; same Rust entry, still paging off
+    push ebx
+    call boot_kernel           ; same Rust entry, paging on for APs
     ud2
