@@ -972,6 +972,9 @@ impl Vfs {
     // ── dir cache ────────────────────────────────────────────────────────
 
     fn invalidate_dir_cache(&mut self) {
+        if super::startup::profile_enabled() {
+            for path in self.dir_cache.keys() { super::event_profile::directory_event(path, 9, 1); }
+        }
         self.dir_cache.clear();
         self.dir_generation = self.dir_generation.wrapping_add(1);
     }
@@ -983,10 +986,14 @@ impl Vfs {
         let Some(entry) = entry else { self.invalidate_dir_cache(); return; };
         let fs = self.mount_fs(entry.mount_idx);
         let mut cached = core::mem::take(&mut self.dir_cache);
-        cached.retain(|_, directory| !directory.entries.iter().any(|child| {
+        cached.retain(|path, directory| {
+            let keep = !directory.entries.iter().any(|child| {
             core::ptr::eq(self.mount_fs(child.mount_idx), fs)
                 && (entry.node == 0 || child.node == 0 || child.node == entry.node)
-        }));
+            });
+            if !keep { super::event_profile::directory_event(path, 6, 1); }
+            keep
+        });
         self.dir_cache = cached;
         self.dir_generation = self.dir_generation.wrapping_add(1);
     }
@@ -1010,15 +1017,16 @@ impl Vfs {
         let mut cached = core::mem::take(&mut self.dir_cache);
         cached.retain(|name, directory| {
             // Synthetic mount ancestors have no backend-relative counterpart.
-            if name.as_slice() == parent { return false; }
-            !directory.sources.iter().any(|(idx, subpath)| {
+            let keep = name.as_slice() != parent && !directory.sources.iter().any(|(idx, subpath)| {
                 targets.iter().any(|(mount, path, parent, grandparent)| {
                     if *mount != *idx && !core::ptr::eq(self.mount_fs(*mount), self.mount_fs(*idx)) { return false; }
                     subpath == parent || grandparent.as_deref() == Some(subpath.as_slice())
                         || subtree && (subpath == path || subpath.strip_prefix(path.as_slice())
                             .is_some_and(|tail| tail.starts_with(b"/")))
                 })
-            })
+            });
+            if !keep { super::event_profile::directory_event(name, 5, 1); }
+            keep
         });
         self.dir_cache = cached;
         self.dir_generation = self.dir_generation.wrapping_add(1);
@@ -1041,10 +1049,11 @@ impl Vfs {
         };
         let size = entry.vnode.size;
         let modified = if entry.unlinked { None } else { self.mtimes.get(&entry.path).copied() };
-        self.dir_cache.retain(|_, directory| {
+        self.dir_cache.retain(|path, directory| {
             // An exact file bind deliberately discards the shadowed node.
             // Re-read that listing rather than retaining unknown metadata.
             if directory.files_by_node.binary_search_by_key(&(mount, 0), |entry| entry.0).is_ok() {
+                super::event_profile::directory_event(path, 7, 1);
                 return false;
             }
             let key = (mount, identity);
@@ -1211,14 +1220,20 @@ impl Vfs {
         }
 
         crate::kernel::event_profile::file_io_finish(38, entries.len(), sample);
+        if let Some(start) = sample {
+            super::event_profile::directory_event(dir, 2, 1);
+            super::event_profile::directory_event(dir, 3, entries.len() as u64);
+            super::event_profile::directory_event(dir, 4, super::portio::now_ns().saturating_sub(start));
+        }
         self.dir_cache.insert(dir.to_vec(), DirCache::new(entries, visible_names, sources));
     }
 
     fn directory_tail(&mut self, dir: &[u8], index: usize) -> Option<&[DirEntry]> {
-        if index == 0 && self.visit_layers(dir, ALIAS_DEPTH, &mut |_, fs, path| fs.dynamic_directory(path)) {
-            self.dir_cache.remove(dir);
-        }
-        if !self.dir_cache.contains_key(dir) { self.populate_dir_cache(dir); }
+        if index == 0 && self.visit_layers(dir, ALIAS_DEPTH, &mut |_, fs, path| fs.dynamic_directory(path))
+            && self.dir_cache.remove(dir).is_some() { super::event_profile::directory_event(dir, 8, 1); }
+        let cached = self.dir_cache.contains_key(dir);
+        super::event_profile::directory_event(dir, usize::from(!cached), 1);
+        if !cached { self.populate_dir_cache(dir); }
         self.dir_cache.get(dir)?.entries.get(index..)
     }
 
@@ -1272,7 +1287,9 @@ impl Vfs {
             true
         });
         if let Some(entry) = live { return entry.map(ChildLookup::Live); }
-        if !self.dir_cache.contains_key(parent) {
+        let cached = self.dir_cache.contains_key(parent);
+        super::event_profile::directory_event(parent, usize::from(!cached), 1);
+        if !cached {
             self.populate_dir_cache(parent);
         }
         let cached = self.dir_cache.get(parent)?;

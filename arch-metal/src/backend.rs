@@ -107,6 +107,7 @@ impl Arch for Metal {
     fn drain(&mut self, f: &mut dyn FnMut(Irq, u64)) { super::irq::drain(f) }
     fn rdtsc(&self) -> u64 { super::x86::rdtsc() }
     fn execution_profile_set(&mut self, enabled: bool) { super::exec_profile::set(enabled) }
+    fn execution_profile_reset(&mut self) { super::exec_profile::reset() }
     fn execution_profile_begin(&mut self) { super::exec_profile::begin() }
     fn execution_profile_time(&mut self, stage: ExecutionProfileStage) { super::exec_profile::time(stage) }
     fn execution_profile(&self) -> ExecutionProfile { super::exec_profile::snapshot() }

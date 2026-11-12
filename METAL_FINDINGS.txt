@@ -2109,3 +2109,189 @@ matches measured final binary exactly:
 Prepared release84d295a0b771, NOT installed. Durable evidence/logs copied into
 build/ci/native-bazel-analysis/no-waste-final/; comparison includes disjoint
 per-run active ledger and separately labeled nested per-pair I/O counters.
+
+2026-11-11/12: live metal benchmark with Codex running, then Linux recheck.
+Metal cached batch --nobuild analysis first27.857s/repeat26.026s,status0,
+11785configuredtargets, saved build/ci/metal-live-analysis-8/. Same command,
+source and output-user cache on Linux pinned CPU6 after reboot gives
+11.374095/10.300493s,status0, saved build/ci/linux-after-metal/. Means
+metal26.9415s/Linux10.837294s, ratio2.486 (~2.5x). Previous Linux reference
+10.240/12.200s was broadly representative; gap survives fresh host recheck.
+Metal repeat Bazel analysis phase18.064s vs prior Linux8.651328s; this is
+actual analysis work elapsed, not only launcher overhead. Do not add nested
+Bazel spans. No per-benchmark metal kernel profile captured. KLOG0240 confirms
+native NVMe/ext4 root, TSC3992771448Hz vs KVM3992487770Hz. Profile toggles
+appear around DOS games; their relation to benchmark cannot be established
+from these untimestamped log lines. Do not attribute gap to profiling.
+
+Important fixture fidelity issue: installed metal /usr/lib/x86_64-linux-gnu
+has2776entries vs pruned native-root fixture40; /usr/bin2572vs19. Installer's
+Bazel tree has12entries in both. VFS directory listing/metadata cache populates
+whole directories on lookup; extra cost is plausible, NOT yet measured as
+cause of metal-vs-KVM difference. Isolated KVM ~18.95s should not be presented
+as actual metal ~26.94s. Fresh comparison JSON saved linux-after-metal/
+metal-comparison.json. No kernel changes made during this recheck.
+
+Live diagnostic friction: Python invoked with stdin code displayed REPL
+prompts; -c worked. Initial helper stopped before loop and own process was
+terminated. Actual timed pair used explicit -c. shutil.copy2 also encountered
+listxattr ENOSYS; diagnostic archive used copyfile. These failures occurred
+outside measured runs. Existing Linux reference results.json was preserved;
+the live run initially overwrote only build.out/build.err/status at original
+relative paths, then captured final repeat logs separately and repaired the
+saved run script output paths. First/repeat Bazel profiles and statuses saved.
+
+2026-11-12: in-guest MCP/kernel diagnostics transport.
+Added /dev/retroos-control to kernel-owned DeviceFs, mode0600, owner configured
+session identity. Device stat does not allocate sessions. Metadata uses cached
+session identity (initialized by ELF auxv setup), never recursively enters VFS.
+Each open has an independent bounded stream; VFS dup/fork share their open fid.
+Limits16clients,256Bline includingnewline,256KiBreply; malformed input rejected
+without appending it, one outstanding command per stream, unread reply/busy
+returnsEBUSY, empty readEAGAIN, partial commands and reads allowed. Close drops
+session/request/reply. Character mode bypasses VFS file-content page cache and
+file offsets. No serial hardware/configuration is required.
+
+VFS read/write only touch bounded local session queues. Event-loop poll takes
+command without holding client/VFS locks, executes SAME serial handler and JSON
+serializers with captured output, then publishes reply. Local polling precedes
+UART LIVE guard and input injection also works without UART. Pending atomic
+avoids scanning clients when idle; queued work contributes immediate deadline.
+Replies bounded/fallible; excess replies return structured error. No automatic
+replay of mutating commands on timeout. Existing serial transport remains.
+
+MCP bridge auto-selects local character device before discovering serial
+endpoints; explicit --device/--socket/--pipe mutually exclusive. Existing repo
+MCP config unchanged. Added read-only profile_io,profile_heap,profile_totals
+alongside syscalls/execution etc. Local client uses O_RDWR|O_NONBLOCK|CLOEXEC,
+whole command write and fragmented reads; idle waits5ms onEAGAIN, no UART byte
+pacing or select dependency. BOOTING.md documents protocol and test.
+
+KVM integration linux_local_control boots real Python + bridge on private
+ext4 with NO COM2 endpoint and no MCP boot setting. Home owner1001/gid1001
+proves non-root session ownership and open. Checks reset/on/off/counters,
+execution/io/heap/totals, unknown command recovery, independent clients,
+fragmented command and7-byte response reads, invalid ASCII/multiline/oversize,
+unread replyEBUSY, queued close/repeated40open-close, actual stdio MCP
+initialize/list/calls in child Python server with automatic local selection.
+First harness attempt missed success because print used terminal stdout; guest
+already exited0. Marker moved to stderr for kernel-log capture. Final checks:
+552kernel units,localcontrol,namespacedevicepermissions and external-serial
+vDSO(static/dynamic/fallback)pass; kernelClippy pass. Logs /tmp/retroos-local-
+control-final-tests.log and /tmp/retroos-local-control-clippy.log. Tightened
+host assertion checks no serial-control startup line at all, rerun below.
+
+Tightened no-UART assertion rerun passes. Prepared releaseaff77cff89d2, NOT
+installed. Validation logs copied build/ci/local-control-validation/. Existing
+MCP config unchanged; updated Python bridge detects new kernel device when
+next started in RetroOS. Feature not committed/pushed in this step.
+
+2026-11-12: atomic, rubriced MCP profile captures and accounting audit.
+Fixed coarse stop snapshots previously ending at preceding loop iteration;
+control checkpoint now publishes actual command boundary. Stop deactivates
+EventStats immediately, freezing totals before JSON formatting/transport.
+Reset immediately clears public coarse totals and introduces generation/window
+IDs. New Arch execution_profile_reset clears metal stage counters without
+changing enable state, including resets while disabled (previously stale).
+MCP profile_begin resets all recording layers and starts boundary; profile_end
+stops and returns one frozen composite packet, profile_report rereads it and
+rejects live captures. Composite framing has exactly one terminal newline.
+Reply uses supplied stable-TSC fixed-point conversion, not a rate fitted to
+counter sums. Unsupported conversion remains explicit with no fake ns ledger.
+
+Bridge profile_report.py provides disjoint elapsed-ns categories and percentages;
+separate syscall ABI/name/rubric/count/total/average/max; nested inclusive I/O by
+rubric with max/average; allocator counts/ticks/ns; block cache; per-directory
+hits/misses/builds/entries/buildns and actual invalidations by cause. Directory
+full totals include omitted paths; cost-ranked64path rows, omitted count, exact
+pathbytes(hex) retained. Generated syscall names451i386/373x86_64 ship locally,
+no guest development headers needed. Heap counters include shared-allocator
+callers on other cores: separate scope, not additive to event-loop ledger.
+Whole capture includes all processes on event-loop CPU and bracketing; no
+per-process or Linux user/sys CPU-time claims. Residual categories stay visible,
+negative residuals are never clamped. Profiler overhead included, not guessed
+and subtracted. Legacy print-dump rebasing during capture may invalidate ledger.
+
+quality checks frozen/nonempty/same-window duration, conversion,counter validity,
+nonnegative categories, coarse and architecture coverage. Tolerance is max50us,
+0.1%ofwindow; signed errors retained; MCP isError set on failed quality. Raw
+packet optional include_raw=true; normal tool response avoids duplicated tables.
+Tests mutate residuals/clocks/maxima/windows/coverage to prove invalid data
+is rejected. Actual in-guest stdio server covers begin/end/report, stable reads
+before/after10ms, reset tozero includingarchitectural total, generation changes,
+80ms sleep vsactive file work, per-directory rebuild/hit/invalidation counters.
+KVM local test still noUART,uid1001. Unit552+4report tests+local KVMpass;
+namespace and serial-vDSO tests passed earlier in same audit. Final kernel and
+arch-metal Clippy pass. One earlier Clippy invocation used wrong target name;
+corrected it, then corrected a collapsible-if style finding; final checks pass.
+
+Final controlled test capture82,407,305ns: coarse and ledger sums differ from
+wall by+15ns, architecture sum by+30ns. This validates accounting coverage,
+NOT an absolute30ns clock accuracy claim. Directory526hits,8misses/builds,
+19entriesloaded;4namespace+2metadata invalidations;0global. Syscalls include
+newfstatat101/openat1/unlink1. Idle47.4183ms; scheduler/loopcontrol32.6787ms.
+Added loop_prelude and alarm_arm scopes to expose hidden control cost:
+prelude121calls/32.521735ms (max6.7136ms), alarm121calls/0.099667ms;
+task_snapshot0.171801ms,deadlines0.128418ms are nested in broader contexts.
+This reveals prelude work in this tiny KVM idle fixture, not proof of metal
+Bazel bottleneck or a performance fix. Counter data saved
+build/ci/profile-report-validation/capture.json, plus validation/Clippy/prepare
+logs. Prepared releasea70da65280c0, NOT installed. No commit/push in this step.
+
+2026-11-12 live metal profile and F12-unresponsive hard hang, KLOG0241.
+Ran same cached native Bazel --batch build --nobuild command through local
+kernel MCP-device begin/end in one driver, avoiding chat/tool idle bracketing.
+first27.036s/repeat25.907s,status0,allqualitycheckspass. Raw+normalizedcaptures
+andBazelprofiles in build/ci/metal-profile-1794463430000000000/. Repeat disjoint
+seconds: guestwindow17.35237;archentry0.22508;wrapper0.13372;syscallhandlers
+5.81750;deferreddispatch0.08754;writeback0.03085;otherloop1.36505;
+scheduler/loopcontrol0.62788;irq0.00881;devices0.00554;audio0.00200;
+display0.20093;input0.01530;control0.00309;idle0.03174. Sum matches wall
+within56ns;archwithin69ns. Guest-window faults nested0.13772s (126253calls),
+not an explanation for large guest execution time. KVM old fault comparison
+is PAIR not perrun; do not compare raw pair directly with single metal run.
+
+Repeat directorycache596027hits,3278misses/builds,296693entriesloaded,
+1.16014sbuildtime;no globalinvalidations. External dir945builds,0.75790s,
+940namespace+5metadata invalidations. Root332builds,0.17035s:287metadata+
+45unknown-write invalidations. Home286metadata rebuilds,0.08626s. Source
+invalidate_metadata_cache drops listings containing node0 on same backend,
+explaining overly broad unknown-binding invalidation opportunity. Cache works,
+but specific mutations cause avoidable rebuilds; they explain ~1.16s inclusive,
+not26s. Pathwalk2.34091s inclusive, deviceflush448calls/0.73414s inclusive.
+Liveklogsync50calls/0.58011s,networkpoll23809/0.44329s insideotherloop.
+klog sync uses try_flush_by_handle ->filesystem-wide sync every500ms ifdirty,
+so5second background cadence does NOT prevent those earlier journal commits.
+No fsync/fdatasync/sync/syncfs in foreground syscall table during capture.
+Heapalloc+free~0.40743s nested, not multi-second unexplained allocator cost.
+
+Idle3s local capture: guest0.12649s;idle2.55870s;active~0.44071s includes
+background Codex/helpers/device work. Entire profiling scope is event-loop
+CPU across ALL processes. Schedulerquantum10ms; selection includes blocked
+same-terminal peers with pending I/O; it switches address spaces to poll them.
+F12 alternating Codex/Python is consistent with this policy. No per-switch
+counter exists yet; do NOT call all14.7%active time context-switch overhead.
+Background activity is measurable but cannot simply be subtracted unchanged
+from a loaded benchmark. ScalarCPUprobe samebinary: metal196/213/198ms vs
+Linux185/188/186ms initially; rawCPU not remotely2.5x slower for that probe.
+Java flags: sameembedded21.0.4runtime metalUseAVX0/UseFMAfalse, LinuxCPU0
+UseAVX3/UseFMAtrue; bothUseSSE4/SerialGC/2compilerthreads. Controlled Linux
+CPU6analysis A/B normal11.501/10.246s vsAVXoff12.466/11.470s,status0: means
+10.87370vs11.96841s (~1.095s difference), NOT explanation of17s guest window.
+The JFR recording attempt failed because bundledJDK lacksjdk.jfr, not kernel.
+A helper FileNotFoundError was my missed relative-log redirection; corrected
+and recorded underjfr/, original successful captures preserved. No kernel
+filesystem bug established by those particular diagnostic errors.
+
+Then user reported full hang includingF12, returned toLinux. KLOG0241 ends
+with ordinary successful helper exits, no savedpanic/exception/CPUcorruption.
+Captures and profiling-off completed before hang; this does not rule out a
+kernel bug. No rootcause or hardhangfix claimed. Bounded private nativeext4
+KVM Codex resume/typing/background-C-build reproduction with5CPUs/32GiB,
+fullfeatures, installedskills, no kernelprofiling, QMPscreen capture passes:
+ready13.991s fromlaunch,3.354s aftercontrol; backgroundCbuild0.265s;
+typingPASS42.878s. No prompt submitted, host FS not mounted; private copied
+state. Artifact codex-native-resume-hard-hang-0241-qmp-unprofiled/. Reproduction
+was ~43s, not long enough to rule out delayed metal-only hardware/lock stalls.
+LinuxAVXtest and nativeCPUcomparison were run after that VM exited. No kernel
+changes made during this investigation. Summary saved next to captures.

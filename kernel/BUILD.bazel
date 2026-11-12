@@ -276,3 +276,21 @@ rust_test(
         "WINE_FPU16": "$(execpath @wine_pe//:pe/win87em.dll16)",
     },
 )
+
+# Exercise the real xHCI controller and HID code against host register memory.
+rust_test(
+    name = "xhci_dma_test_host",
+    visibility = ["//visibility:public"],
+    tags = ["manual"],
+    srcs = ["xhci_test.rs", "src/kernel/drivers/xhci.rs"] + glob(["src/kernel/drivers/xhci/*.rs"]),
+    crate_root = "xhci_test.rs",
+    deps = ["//lib", "//lib:compact_fmt", "@crates//:spin"],
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
+)
+
+host_platform_test(
+    name = "xhci_dma_test",
+    visibility = ["//visibility:public"],
+    test = ":xhci_dma_test_host",
+)

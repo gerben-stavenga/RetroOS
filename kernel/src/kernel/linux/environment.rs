@@ -7,6 +7,10 @@ static SETTINGS: spin::Mutex<Vec<u8>> = spin::Mutex::new(Vec::new());
 static HOME: spin::Mutex<Option<Vec<u8>>> = spin::Mutex::new(None);
 static IDENTITY: spin::Mutex<Option<(u32, u32)>> = spin::Mutex::new(None);
 
+/// Device metadata may be queried under the VFS lock. Exec initializes the
+/// session identity before entering user code; do not recursively resolve home.
+pub(crate) fn cached_identity() -> (u32, u32) { IDENTITY.lock().unwrap_or((0, 0)) }
+
 pub(crate) fn configure_home(home: Option<&str>) {
     *HOME.lock() = home.map(|home| home.as_bytes().to_vec());
     *IDENTITY.lock() = None;

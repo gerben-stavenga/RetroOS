@@ -1,10 +1,34 @@
 //! Compact xHCI USB host-controller driver for USB-HID keyboard and mouse input.
 //! Each controller retains up to twelve devices (including USB 1/2 hubs),
 //! and keyboard/mouse endpoints for every retained device. Reports feed the same
-//! `irq::QUEUE` as i8042 input, so nothing above the arch boundary depends on
-//! the physical input bus.
+//! input queue as i8042 input. Boot supplies the platform operations; controller
+//! protocols and HID handling live entirely in this kernel driver.
 
-use crate::x86::{inl, outl};
+/// Boot-supplied mechanisms. Allocations and mappings remain resident until reboot.
+/// Callbacks run on the boot CPU with interrupts masked, including during polling.
+pub struct Platform {
+    pub inl: fn(u16) -> u32,
+    pub outl: fn(u16, u32),
+    pub map_uncached: fn(usize, u64),
+    /// Allocate contiguous physical pages below 4 GiB; return a page number.
+    pub allocate_dma: fn(usize) -> Option<u64>,
+    pub allocate_permanent: fn(core::alloc::Layout) -> Result<*mut u8, ()>,
+    pub now: fn() -> u64,
+    pub push_key: fn(u8),
+    pub push_mouse: fn(i16, i16, u8),
+}
+
+static PLATFORM: spin::Once<Platform> = spin::Once::new();
+fn platform() -> &'static Platform {
+    #[cfg(test)]
+    PLATFORM.call_once(tests::platform);
+    PLATFORM.get().expect("xHCI platform not initialized")
+}
+
+fn inl(port: u16) -> u32 { (platform().inl)(port) }
+fn outl(port: u16, value: u32) { (platform().outl)(port, value) }
+fn map_uncached(vpage: usize, page: u64) { (platform().map_uncached)(vpage, page); }
+const PAGE_SIZE: usize = 4096;
 
 // ── PCI config space, legacy 0xCF8/0xCFC mechanism ─────────────────────────
 // q35 (and real chipsets) route this for every bus, so it reaches a controller
@@ -264,9 +288,9 @@ fn hid_to_scancode(usage: u8) -> Option<(u8, bool)> {
 /// the make (or `| 0x80` break) code — exactly what a PS/2 keyboard sends.
 fn emit_key(sc: u8, extended: bool, release: bool) {
     if extended {
-        crate::irq::push_key(0xE0);
+        (platform().push_key)(0xE0);
     }
-    crate::irq::push_key(if release { sc | 0x80 } else { sc });
+    (platform().push_key)(if release { sc | 0x80 } else { sc });
 }
 
 /// Decode the HID boot-mouse prefix: buttons, signed X, signed Y. HID mouse Y
@@ -346,10 +370,9 @@ impl Controller {
     }
     fn map_mmio(&self, phys: u64, pages: usize) {
         for i in 0..pages {
-            crate::paging2::map_user_page_phys(
-                self.mmio_va / crate::paging2::PAGE_SIZE + i,
-                phys / crate::paging2::PAGE_SIZE as u64 + i as u64,
-                crate::paging2::flags::CACHE_DISABLE,
+            map_uncached(
+                self.mmio_va / PAGE_SIZE + i,
+                phys / PAGE_SIZE as u64 + i as u64,
             );
         }
     }
@@ -539,7 +562,7 @@ impl Controller {
             lib::compact_println!("xHCI: 4 KiB pages unsupported - skipping");
             return false;
         }
-        let Some(page) = crate::phys_mm::alloc_contig(DMA_PAGES) else {
+        let Some(page) = (platform().allocate_dma)(DMA_PAGES) else {
             lib::compact_println!("xHCI: DMA allocation failed - skipping");
             return false;
         };
@@ -560,12 +583,11 @@ impl Controller {
             )
         };
         let scratch = dma::scratchpads(self.r32(0x08), array, || {
-            let page = crate::phys_mm::alloc_contig(1)?;
+            let page = (platform().allocate_dma)(1)?;
             let temporary = self.dma_va + DMA_PAGES * 0x1000;
-            crate::paging2::map_user_page_phys(
+            map_uncached(
                 temporary / 0x1000,
                 page,
-                crate::paging2::flags::CACHE_DISABLE,
             );
             unsafe {
                 core::ptr::write_bytes(temporary as *mut u8, 0, 0x1000);
@@ -616,10 +638,9 @@ impl Controller {
 
     fn map_dma(&self, phys: u64, pages: usize) {
         for i in 0..pages {
-            crate::paging2::map_user_page_phys(
-                self.dma_va / crate::paging2::PAGE_SIZE + i,
-                phys / crate::paging2::PAGE_SIZE as u64 + i as u64,
-                crate::paging2::flags::CACHE_DISABLE,
+            map_uncached(
+                self.dma_va / PAGE_SIZE + i,
+                phys / PAGE_SIZE as u64 + i as u64,
             );
         }
     }
@@ -631,7 +652,7 @@ impl Controller {
         let state = port::reset(
             || self.r32(off),
             |v| self.w32(off, v),
-            || crate::irq::now(false),
+            || (platform().now)(),
         );
         if state.is_none() {
             lib::compact_println!(
@@ -890,7 +911,7 @@ impl Controller {
         for (b, &sc) in MOD_SC.iter().enumerate() {
             let (now, was) = (r[mod_off] & (1 << b), previous[mod_off] & (1 << b));
             if now != was && sc != 0 {
-                crate::irq::push_key(if now != 0 { sc } else { sc | 0x80 });
+                (platform().push_key)(if now != 0 { sc } else { sc | 0x80 });
             }
         }
         // Regular keys: newly present → make; newly absent → break.
@@ -975,7 +996,7 @@ impl Controller {
                         pipe.repeat.report(&previous[2..end], &pipe.prev[2..end], now);
                     } else if let Some((dx, dy, buttons)) = decode_mouse_report(&report, len) {
                         self.pipes[index].prev[0] = buttons;
-                        crate::irq::push_mouse(dx, dy, self.mouse_buttons() | other_buttons);
+                        (platform().push_mouse)(dx, dy, self.mouse_buttons() | other_buttons);
                     }
                 } else {
                     self.pipes[index].repeat = KeyRepeat::empty();
@@ -1012,7 +1033,7 @@ impl Controller {
         if !port::debounce(
             || self.r32(off),
             |v| self.w32(off, v),
-            || crate::irq::now(false),
+            || (platform().now)(),
         ) {
             lib::compact_println!(
                 "xHCI: port {} connection unstable (portsc={:#x})",
@@ -1287,7 +1308,7 @@ impl Controller {
                 core::ptr::write_volatile(byte, core::ptr::read_volatile(byte) | 1);
             },
             |offset, value| self.w32(offset, value),
-            || crate::irq::now(false),
+            || (platform().now)(),
         ) {
             lib::compact_println!(
                 "xHCI: firmware handoff failed ({}) - skipping",
@@ -1323,7 +1344,7 @@ impl Controller {
             let off = op + OP_PORTSC + (p as usize - 1) * 0x10;
             self.w32(off, port::neutral(self.r32(off)) | (1 << 9));
         }
-        if !port::delay(100_000_000, || crate::irq::now(false)) {
+        if !port::delay(100_000_000, || (platform().now)()) {
             lib::compact_println!("xHCI: port power-on wait failed - skipping");
             return;
         }
@@ -1428,8 +1449,10 @@ static mut CONTROLLERS: [*mut Controller; MAX_CONTROLLERS] =
     [core::ptr::null_mut(); MAX_CONTROLLERS];
 static mut CONTROLLER_COUNT: usize = 0;
 
-pub fn init() {
-    debug_assert!(!crate::x86::interrupts_enabled());
+/// Initialize once during boot, with interrupts masked on the boot CPU.
+pub fn init(operations: Platform) {
+    assert!(!PLATFORM.is_completed(), "xHCI initialized twice");
+    PLATFORM.call_once(|| operations);
     for_each_xhci(|bus, dev, func| unsafe {
         let index = CONTROLLER_COUNT;
         if index == MAX_CONTROLLERS {
@@ -1441,7 +1464,7 @@ pub fn init() {
             );
             return;
         }
-        let Ok(storage) = crate::boot_mem::allocate_permanent(core::alloc::Layout::new::<Controller>()) else {
+        let Ok(storage) = (platform().allocate_permanent)(core::alloc::Layout::new::<Controller>()) else {
             lib::compact_println!("xHCI: no boot memory for controller state");
             return;
         };

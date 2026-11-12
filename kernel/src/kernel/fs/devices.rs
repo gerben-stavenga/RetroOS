@@ -1,5 +1,5 @@
 //! Kernel-owned device files, independent of the root filesystem backend.
-use crate::kernel::vfs::{DirEntry, Filesystem, Meta, Vnode};
+use crate::kernel::vfs::{DirEntry, Filesystem, Meta, Stat, Vnode};
 use alloc::vec::Vec;
 
 pub struct DeviceFs;
@@ -7,18 +7,37 @@ pub static DEVICES: DeviceFs = DeviceFs;
 const NULL: u64 = 1;
 const RANDOM: u64 = 2;
 const URANDOM: u64 = 3;
+const CONTROL: u64 = 4;
 const CHARACTER: u16 = 0o20666;
+const CONTROL_MODE: u16 = 0o20600;
+use crate::kernel::serial_control::local;
 
 impl Filesystem for DeviceFs {
     fn format_name(&self) -> &'static str {
         "devices"
     }
+    fn stat(&self, path: &[u8], _follow: bool) -> Option<Stat> {
+        // Metadata lookup must not allocate a control session or depend on
+        // how many clients currently have the device open.
+        let (ino, mode, is_dir) = match path {
+            b"" => (0, 0o755, true),
+            b"null" => (NULL, CHARACTER, false),
+            b"random" => (RANDOM, CHARACTER, false),
+            b"urandom" => (URANDOM, CHARACTER, false),
+            b"retroos-control" => (CONTROL, CONTROL_MODE, false),
+            _ => return None,
+        };
+        Some(Stat { ino, mode, is_dir, size: 0, is_symlink: false, mtime: None })
+    }
     fn open(&self, path: &[u8]) -> Option<Vnode> {
+        if path == b"retroos-control" {
+            return Some(Vnode { handle: local::open()?, size: 0, mode: CONTROL_MODE });
+        }
         let handle = match path { b"null" => NULL, b"random" => RANDOM, b"urandom" => URANDOM, _ => return None };
         Some(Vnode { handle, size: 0, mode: CHARACTER })
     }
     fn open_node(&self, node: u64) -> Option<Vnode> {
-        match node { NULL => self.open(b"null"), RANDOM => self.open(b"random"), URANDOM => self.open(b"urandom"), _ => None }
+        match node { NULL => self.open(b"null"), RANDOM => self.open(b"random"), URANDOM => self.open(b"urandom"), CONTROL => self.open(b"retroos-control"), _ => None }
     }
     fn read(&self, handle: u64, _offset: u32, buf: &mut [u8], _size: u32) -> i32 {
         match handle {
@@ -27,10 +46,12 @@ impl Filesystem for DeviceFs {
                 let n = buf.len().min(65536);
                 crate::kernel::random::fill(&mut buf[..n]).map_or(-11, |_| n as i32)
             }
+            CONTROL.. => local::read(handle, buf),
             _ => -9,
         }
     }
     fn write(&self, handle: u64, _offset: u32, data: &[u8]) -> i32 {
+        if handle >= CONTROL { return local::write(handle, data); }
         if matches!(handle, NULL | RANDOM | URANDOM) {
             i32::try_from(data.len()).unwrap_or(-22)
         } else {
@@ -38,6 +59,7 @@ impl Filesystem for DeviceFs {
         }
     }
     fn seek(&self, handle: u64, _offset: i32, whence: i32) -> Option<i32> {
+        if handle >= CONTROL { return Some(-29); }
         Some(if !matches!(handle, NULL | RANDOM | URANDOM) {
             -9
         } else if (0..=2).contains(&whence) {
@@ -59,17 +81,25 @@ impl Filesystem for DeviceFs {
     fn meta(&self, path: &[u8]) -> Option<Meta> {
         let mode = if path.is_empty() {
             0o755
+        } else if path == b"retroos-control" {
+            CONTROL_MODE
         } else {
             self.open(path)?.mode
         };
+        let (uid, gid) = if path == b"retroos-control" {
+            crate::kernel::linux::environment::cached_identity()
+        } else { (0, 0) };
         Some(Meta {
-            uid: 0,
-            gid: 0,
+            uid,
+            gid,
             mode: u32::from(mode),
         })
     }
     fn resize(&self, _handle: u64, _size: u32) -> i32 {
         -22
+    }
+    fn clunk(&self, handle: u64) -> i32 {
+        if handle >= CONTROL { local::close(handle) } else { 0 }
     }
     fn readdir(
         &self,
@@ -79,13 +109,13 @@ impl Filesystem for DeviceFs {
         max: usize,
     ) -> Option<u64> {
         if !path.is_empty() { return None; }
-        let names: [&[u8]; 3] = [b"null", b"random", b"urandom"];
+        let names: [&[u8]; 4] = [b"null", b"random", b"urandom", b"retroos-control"];
         let start = usize::try_from(cookie).ok()?.min(names.len());
         let end = start.saturating_add(max).min(names.len());
         for (index, name) in names.iter().enumerate().take(end).skip(start) {
             out.push(DirEntry {
                 name: name.to_vec(), name_len: name.len(), short_name: None,
-                size: 0, is_dir: false, is_symlink: false, mode: CHARACTER,
+                size: 0, is_dir: false, is_symlink: false, mode: if index == 3 { CONTROL_MODE } else { CHARACTER },
                 dos_attributes: None, mtime: 0, node: index as u64 + 1, mount_idx: 0,
             });
         }

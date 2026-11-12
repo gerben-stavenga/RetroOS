@@ -27,21 +27,9 @@ rust_library(
     deps = ["//arch-abi", "//lib", "//lib:compact_fmt"],
 )
 
-# Exercise xHCI enumeration helpers and input rings without privileged code.
-rust_test(
-    name = "xhci_dma_test_host",
-    tags = ["manual"],
-    srcs = ["xhci_test.rs", "src/xhci.rs"] + glob(["src/xhci/*.rs"]),
-    crate_root = "xhci_test.rs",
-    deps = ["//lib", "//lib:compact_fmt"],
-    edition = "2024",
-    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
-)
-
-host_platform_test(
-    name = "xhci_dma_test",
-    test = ":xhci_dma_test_host",
-)
+# Compatibility aliases; the driver and its host tests now belong to kernel.
+alias(name = "xhci_dma_test_host", actual = "//kernel:xhci_dma_test_host")
+alias(name = "xhci_dma_test", actual = "//kernel:xhci_dma_test")
 
 rust_test(
     name = "phys_mm_test_host",

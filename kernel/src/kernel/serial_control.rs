@@ -9,6 +9,22 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use arch_abi::ComPort;
 use crate::kernel::drivers::uart16550::{Uart16550, UartConfig};
 
+pub(crate) mod local;
+mod report;
+static mut COMPOSITE_REPLY: bool = false;
+
+// Only the cooperative event-loop owner serializes replies. A local command
+// captures the same serializer's output instead of transmitting it on a UART.
+struct LocalReply { bytes: alloc::vec::Vec<u8>, failed: bool }
+static mut LOCAL_REPLY: Option<LocalReply> = None;
+
+fn execute_local(machine: &mut impl crate::Arch, line: &[u8], stats: &mut super::startup::EventStats) -> (bool, alloc::vec::Vec<u8>) {
+    unsafe { LOCAL_REPLY = Some(LocalReply { bytes: alloc::vec::Vec::new(), failed: false }); }
+    let dump = execute(machine, line, stats);
+    let reply = unsafe { (*core::ptr::addr_of_mut!(LOCAL_REPLY)).take().unwrap() };
+    (dump, if reply.failed { b"{\"ok\":false,\"error\":\"reply too large or out of memory\"}\n".to_vec() } else { reply.bytes })
+}
+
 const RX_CAPACITY: usize = 256;
 const RX_PER_POLL: usize = 64;
 const INJECT_CAPACITY: usize = 512;
@@ -45,6 +61,15 @@ pub fn init<A: crate::Arch>(machine: &mut A, port: ComPort) -> bool {
 }
 
 fn send(bytes: &[u8]) {
+    let bytes = if unsafe { COMPOSITE_REPLY } { bytes.strip_suffix(b"\n").unwrap_or(bytes) } else { bytes };
+    if let Some(reply) = unsafe { (*core::ptr::addr_of_mut!(LOCAL_REPLY)).as_mut() } {
+        if !reply.failed {
+            if bytes.len() > local::MAX_REPLY.saturating_sub(reply.bytes.len())
+                || reply.bytes.try_reserve(bytes.len()).is_err() { reply.failed = true; }
+            else { reply.bytes.extend_from_slice(bytes); }
+        }
+        return;
+    }
     let Some(endpoint) = uart() else { return };
     for &byte in bytes {
         if endpoint.write_byte(TX_READY_POLLS, byte).is_err() {
@@ -321,21 +346,44 @@ fn decode_hex_pair(pair: &[u8]) -> Option<u8> {
     Some((high << 4) | low)
 }
 
-fn execute<A: crate::Arch>(machine: &mut A, line: &[u8]) -> bool {
+fn execute<A: crate::Arch>(machine: &mut A, line: &[u8], stats: &mut super::startup::EventStats) -> bool {
     let line = trim(line);
-    if line.eq_ignore_ascii_case(b"profile on") {
+    stats.control_checkpoint(machine);
+    if line.eq_ignore_ascii_case(b"profile begin") {
+        machine.execution_profile_set(false);
+        if super::startup::profile_enabled() { super::startup::reset_profile(); }
+        else { super::startup::set_profile(true); }
+        machine.execution_profile_reset();
         machine.execution_profile_set(true);
-        super::startup::set_profile(true);
+        stats.control_start(machine);
+        send(b"{\"ok\":true,\"window_id\":"); send_u64(u64::from(super::startup::profile_generation()));
+        send(b",\"started_ns\":"); send_u64(super::startup::profile_totals().started_ns); send(b"}\n");
+    } else if line.eq_ignore_ascii_case(b"profile end") {
+        machine.execution_profile_set(false);
+        stats.control_stop(machine);
+        super::startup::set_profile(false);
+        report::write(machine, stats);
+    } else if line.eq_ignore_ascii_case(b"profile report") {
+        if super::startup::profile_enabled() {
+            send(b"{\"ok\":false,\"error\":\"stop recording with profile end before reading a frozen report\"}\n");
+        } else { report::write(machine, stats); }
+    } else if line.eq_ignore_ascii_case(b"profile on") {
+        if !super::startup::profile_enabled() {
+            super::startup::set_profile(true);
+            machine.execution_profile_set(true);
+            stats.control_start(machine);
+        }
         ok();
     } else if line.eq_ignore_ascii_case(b"profile off") {
         machine.execution_profile_set(false);
+        stats.control_stop(machine);
         super::startup::set_profile(false);
         ok();
     } else if line.eq_ignore_ascii_case(b"profile reset") {
         let enabled = super::startup::profile_enabled();
-        machine.execution_profile_set(false);
-        machine.execution_profile_set(enabled);
+        machine.execution_profile_reset();
         super::startup::reset_profile();
+        if enabled { stats.control_start(machine); }
         ok();
     } else if line.eq_ignore_ascii_case(b"profile dump") {
         super::startup::print_profile();
@@ -344,11 +392,12 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8]) -> bool {
         read_profile();
     } else if line.eq_ignore_ascii_case(b"profile io") {
         send(b"{\"ok\":true,\"stages\":{");
-        for (index, (name, [calls, bytes, ns])) in super::event_profile::FILE_IO_NAMES.into_iter()
-            .zip(super::event_profile::file_io()).enumerate() {
+        for (index, ((name, [calls, bytes, ns]), maximum)) in super::event_profile::FILE_IO_NAMES.into_iter()
+            .zip(super::event_profile::file_io()).zip(super::event_profile::file_io_max()).enumerate() {
             if index != 0 { send(b","); }
             send(b"\""); send(name.as_bytes()); send(b"\":{\"calls\":"); send_u64(calls);
-            send(b",\"bytes\":"); send_u64(bytes); send(b",\"ns\":"); send_u64(ns); send(b"}");
+            send(b",\"bytes\":"); send_u64(bytes); send(b",\"ns\":"); send_u64(ns);
+            send(b",\"max_ns\":"); send_u64(maximum); send(b"}");
         }
         send(b"}}\n");
     } else if line.eq_ignore_ascii_case(b"profile heap") {
@@ -466,15 +515,17 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8]) -> bool {
 
 /// Drain a bounded amount of RX work before returning to the guest. `true`
 /// asks the event-loop owner to dump its current register/personality state.
-pub fn poll<A: crate::Arch>(machine: &mut A, events: &mut alloc::vec::Vec<crate::Irq>, tick: bool) -> bool {
-    if !LIVE.load(Ordering::Relaxed) { return false; }
-    let Some(endpoint) = uart() else { return false };
+pub(super) fn poll<A: crate::Arch>(machine: &mut A, events: &mut alloc::vec::Vec<crate::Irq>, tick: bool, stats: &mut super::startup::EventStats) -> bool {
+    let mut dump = local::poll(machine, stats);
+    // Local clients can inject keys without a physical diagnostic UART.
+    if tick && let Some(scancode) = pop_injected() { events.push(crate::Irq::Key(scancode)); }
+    if !LIVE.load(Ordering::Relaxed) { return dump; }
+    let Some(endpoint) = uart() else { return dump };
     // Consume our physical UART IRQ instead of forwarding it to the guest.
     // An idle diagnostic channel must not cause a port-I/O VM exit every ms.
     let irq = take_irq(events, endpoint.irq());
     let receive = irq || RX_PENDING.load(Ordering::Relaxed);
     let mut pending = receive;
-    let mut dump = false;
     for _ in 0..if receive { RX_PER_POLL } else { 0 } {
         let Ok(byte) = endpoint.read_byte(1) else { pending = false; break };
         unsafe {
@@ -486,7 +537,7 @@ pub fn poll<A: crate::Arch>(machine: &mut A, events: &mut alloc::vec::Vec<crate:
                 } else if RX_LEN != 0 {
                     let len = RX_LEN;
                     RX_LEN = 0;
-                    dump |= execute(machine, &RX[..len]);
+                    dump |= execute(machine, &RX[..len], stats);
                 }
             } else if !DISCARDING {
                 if RX_LEN == RX_CAPACITY {
@@ -501,10 +552,6 @@ pub fn poll<A: crate::Arch>(machine: &mut A, events: &mut alloc::vec::Vec<crate:
     }
     RX_PENDING.store(pending, Ordering::Relaxed);
     if receive { machine.rearm_irq(endpoint.irq()); }
-    // Keep injected make/break pacing independent of RX interrupt frequency.
-    if tick && let Some(scancode) = pop_injected() {
-        events.push(crate::Irq::Key(scancode));
-    }
     dump
 }
 
@@ -541,6 +588,7 @@ mod tests {
 
 /// Injected keyboard bytes have their own serial cadence; RX is IRQ-driven.
 pub(crate) fn next_deadline(now: u64) -> Option<u64> {
+    if local::pending() { return Some(now); }
     if RX_PENDING.load(Ordering::Relaxed) { return Some(now); }
     unsafe { (INJECT_HEAD != INJECT_TAIL).then(|| now.saturating_add(1_000_000)) }
 }

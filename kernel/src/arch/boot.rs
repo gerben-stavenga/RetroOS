@@ -428,8 +428,21 @@ unsafe fn prepare_boot(
         lib::compact_screenln!(screen, "HPET: no ACPI table found; using timer fallback");
     }
     lib::compact_screenln!(screen, "Boot: IRQ init");
+    use crate::kernel::drivers::xhci;
     irq::init_interrupts(hpet_base, |stage| {
         lib::compact_screenln!(screen, "Boot: IRQ {}", stage);
+    }, xhci::poll_deadline);
+    lib::compact_screenln!(screen, "Boot: USB controller initialization");
+    xhci::init(xhci::Platform {
+        inl: crate::kernel::portio::inl,
+        outl: crate::kernel::portio::outl,
+        map_uncached: |vpage, page| paging2::map_user_page_phys(
+            vpage, page, paging2::flags::CACHE_DISABLE),
+        allocate_dma: phys_mm::alloc_contig,
+        allocate_permanent: |layout| arch::boot_mem::allocate_permanent(layout).map_err(|_| ()),
+        now: || irq::now(false),
+        push_key: irq::push_key,
+        push_mouse: irq::push_mouse,
     });
     lib::compact_screenln!(screen, "Interrupts initialized");
 

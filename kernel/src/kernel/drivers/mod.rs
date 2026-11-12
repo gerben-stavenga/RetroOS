@@ -35,3 +35,5 @@ pub mod ce;
 
 pub mod qca_dp;
 pub(crate) mod srng;
+
+pub mod xhci;

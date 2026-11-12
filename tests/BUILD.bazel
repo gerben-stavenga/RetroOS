@@ -852,7 +852,7 @@ host_platform_test(
 
 host_platform_test(
     name = "unit_arch_metal_xhci_dma_test",
-    test = "//arch-metal:xhci_dma_test_host",
+    test = "//kernel:xhci_dma_test_host",
     tags = ["unit"],
     size = "small",
     timeout = "short",
@@ -1531,6 +1531,21 @@ integration_test(
 )
 
 integration_test(
+    name = "profile_report",
+    command = ["python3", "test/profile_report_test.py"],
+    sources = ["//:integration_sources"],
+    tags = ["regression"],
+)
+
+integration_test(
+    name = "linux_local_control",
+    command = ["python3", "test/linux_local_control.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
     name = "linux_fd_metadata",
     command = ["python3", "test/linux_fd_metadata.py"],
     sources = ["//:integration_sources"],
@@ -2028,6 +2043,8 @@ test_suite(
         ":linux_sigchld",
         ":linux_time_high",
         ":linux_fd_metadata",
+        ":linux_local_control",
+        ":profile_report",
         ":linux_writeback_shutdown",
         ":linux_vdso",
         ":linux_clock_progress",

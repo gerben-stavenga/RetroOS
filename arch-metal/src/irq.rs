@@ -702,7 +702,14 @@ fn i8042_present() -> bool {
 }
 
 /// Initialize interrupts (PIC + alarm source + keyboard/mouse)
-pub fn init_interrupts(hpet_base: Option<u64>, mut progress: impl FnMut(&str)) {
+pub fn init_interrupts(
+    hpet_base: Option<u64>,
+    mut progress: impl FnMut(&str),
+    poll_devices: fn(u64) -> Option<u64>,
+) {
+    // Published during single-CPU boot before interrupts are enabled. Only the
+    // boot CPU runs this polling path; device state retains its existing owner.
+    unsafe { DEVICE_POLL = Some(poll_devices); }
     progress("PIC setup");
     lib::compact_println!("IRQ: PIC");
     remap_pic();
@@ -732,22 +739,16 @@ pub fn init_interrupts(hpet_base: Option<u64>, mut progress: impl FnMut(&str)) {
         legacy_intr_and_pit();
     }
 
-    // Probe xHCI for USB-HID keyboard and mouse input. It feeds the same typed
-    // event queue as i8042 and is polled from the timer top half below.
-    progress("USB controller initialization");
-    crate::xhci::init();
     progress("PS/2 keyboard and mouse");
 
     // Keyboard/mouse SOURCE is a separate axis from delivery: PROBE the i8042
     // rather than guessing "no keyboard" from x2APIC. A real controller (many
     // laptops expose the internal keyboard as PS/2 via the EC) is used either
     // way — routed through the IOAPIC in APIC mode, the PIC otherwise. A truly
-    // legacy-free box (no i8042) uses the xHCI USB-HID driver above.
+    // legacy-free box (no i8042) relies on the kernel's other input drivers.
     if !i8042_present() {
-        // Legacy-free laptop: no PS/2 controller. The keyboard comes from the
-        // xHCI USB-HID driver (initialised above), polled from the timer IRQ —
-        // nothing more to route here.
-        lib::compact_println!("IRQ: no i8042 - keyboard via USB-HID (xHCI)");
+        // No PS/2 controller, so there is no legacy device IRQ to route.
+        lib::compact_println!("IRQ: no i8042 - using platform input devices");
         return;
     }
 
@@ -1359,9 +1360,11 @@ pub fn idle() {
     }
 }
 
+static mut DEVICE_POLL: Option<fn(u64) -> Option<u64>> = None;
+
 #[inline(never)]
 pub fn poll_timed_devices(current: u64) -> Option<u64> {
-    let mut next = crate::xhci::poll_deadline(current);
+    let mut next = unsafe { DEVICE_POLL }.and_then(|poll| poll(current));
     // Every iteration samples now(), extending the wrapping clock. When the
     // CPU becomes idle it still needs an alarm before an ambiguous wrap.
     let maintenance = clock_maintenance_interval();

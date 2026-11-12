@@ -1503,6 +1503,7 @@ fn event_loop<A: crate::Arch>(
     let mut hardware_initialized = false;
 
     loop {
+        let prelude_sample = super::event_profile::FileIoScope::start(super::event_profile::LOOP_PRELUDE, 0);
         let world_now_ns = machine.now();
         if !hardware_initialized || hardware_deadline.is_some_and(|end| end <= world_now_ns) {
             hardware_deadline = machine.poll_timed_devices(world_now_ns);
@@ -1532,12 +1533,13 @@ fn event_loop<A: crate::Arch>(
             machine.execution_profile_set(requested_profile);
             execution_profile_on = requested_profile;
         }
+        drop(prelude_sample);
         stats.slice_begin(machine);
         pending_events.drain(machine);
         stats.part(machine, PROFILE_IRQ);
         let events = &mut pending_events.events;
         // RX IRQs wake the diagnostic UART; injected keys have a service deadline.
-        let serial_dump = crate::kernel::serial_control::poll(machine, events, injected_due);
+        let serial_dump = crate::kernel::serial_control::poll(machine, events, injected_due, &mut stats);
         let osd_dump = DEBUG_DUMP_REQUESTED.swap(false, core::sync::atomic::Ordering::Relaxed);
         if serial_dump || osd_dump {
             crate::kernel::linux::debug_processes(threads, ctx.tid);
@@ -1892,7 +1894,9 @@ fn event_loop<A: crate::Arch>(
                     &mut windows,
                 ),
                 None => {
+                    let alarm_sample = super::event_profile::FileIoScope::start(super::event_profile::ALARM_ARM, 0);
                     machine.arm_alarm(deadlines.next());
+                    drop(alarm_sample);
                     stats.idle(machine);
                 },
             }
@@ -1910,7 +1914,9 @@ fn event_loop<A: crate::Arch>(
             {
                 // Hosted execution normally supplies clock wakeups on return
                 // from a guest slice. There is no slice while pacing it.
+                let alarm_sample = super::event_profile::FileIoScope::start(super::event_profile::ALARM_ARM, 0);
                 machine.arm_alarm(deadlines.next());
+                drop(alarm_sample);
                 stats.idle(machine);
                 continue;
             }
@@ -1929,7 +1935,9 @@ fn event_loop<A: crate::Arch>(
             let kevent = if thread.personality.timer_due(machine.now()) {
                 crate::KernelEvent::Irq
             } else {
+                let alarm_sample = super::event_profile::FileIoScope::start(super::event_profile::ALARM_ARM, 0);
                 machine.arm_alarm(loan_deadline);
+                drop(alarm_sample);
                 ctx.run(machine, bios_workspace, &mut thread.personality)
             };
             let clock_read = matches!(&thread.personality, thread::Personality::Linux(_))
@@ -3348,6 +3356,8 @@ pub fn reset_profile() {
     lib::heap::profile_reset();
     PROFILE_RESET.store(true, core::sync::atomic::Ordering::Relaxed);
     unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, ProfileSnapshot::EMPTY) };
+    unsafe { core::ptr::write_volatile(&raw mut PROFILE_TOTALS, ProfileTotals::EMPTY) };
+    PROFILE_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::kernel::osd_profile::reset();
     super::event_profile::reset();
     super::voodoo_profile::reset();
@@ -3461,9 +3471,16 @@ pub(super) const PROFILE_TOTAL_NAMES: [&str; 11] = [
 #[derive(Clone, Copy)]
 pub(super) struct ProfileTotals {
     pub elapsed_ns: u64,
+    pub started_ns: u64,
+    pub stopped_ns: u64,
     pub cycles: [u64; 11],
 }
-static mut PROFILE_TOTALS: ProfileTotals = ProfileTotals { elapsed_ns: 0, cycles: [0; 11] };
+impl ProfileTotals {
+    const EMPTY: Self = Self { elapsed_ns: 0, started_ns: 0, stopped_ns: 0, cycles: [0; 11] };
+}
+static mut PROFILE_TOTALS: ProfileTotals = ProfileTotals::EMPTY;
+static PROFILE_GENERATION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub(super) fn profile_generation() -> u32 { PROFILE_GENERATION.load(core::sync::atomic::Ordering::Relaxed) }
 pub(super) fn profile_totals() -> ProfileTotals {
     unsafe { core::ptr::read_volatile(&raw const PROFILE_TOTALS) }
 }
@@ -3542,7 +3559,7 @@ pub fn print_profile() {
 
 /// Coarse accounting for the two questions the permanent profiler answers:
 /// guest versus kernel time, and which broad kernel phase consumed that time.
-struct EventStats {
+pub(super) struct EventStats {
     active: bool,
     last_tsc: u64,
     last_publish: u64,
@@ -3554,6 +3571,25 @@ struct EventStats {
 
 impl EventStats {
     const PUBLISH_CYCLES: u64 = 100_000_000;
+
+    /// Called by the event-loop control handler, before changing recording
+    /// state. Publish the current boundary, not last iteration's snapshot.
+    pub(super) fn control_checkpoint(&mut self, machine: &mut impl crate::Arch) {
+        if !self.active { return; }
+        self.mark(machine, PROFILE_SERIAL_CONTROL);
+        let totals = self.totals(machine.now().saturating_sub(self.started_ns));
+        unsafe { core::ptr::write_volatile(&raw mut PROFILE_TOTALS, totals); }
+    }
+
+    pub(super) fn control_start(&mut self, machine: &mut impl crate::Arch) {
+        self.active = false;
+        self.slice_begin(machine);
+    }
+
+    pub(super) fn control_stop(&mut self, machine: &mut impl crate::Arch) {
+        self.control_checkpoint(machine);
+        self.active = false;
+    }
 
     fn new<A: crate::Arch>(machine: &mut A) -> Self {
         let now = machine.rdtsc();
@@ -3602,7 +3638,8 @@ impl EventStats {
         let idle = self.idle_cycles.min(cycles[1 + PROFILE_SCHEDULER]);
         cycles[1 + PROFILE_SCHEDULER] -= idle;
         cycles[10] = idle;
-        ProfileTotals { elapsed_ns, cycles }
+        ProfileTotals { elapsed_ns, started_ns: self.started_ns,
+            stopped_ns: self.started_ns.saturating_add(elapsed_ns), cycles }
     }
 
     fn idle<A: crate::Arch>(&mut self, machine: &mut A) {

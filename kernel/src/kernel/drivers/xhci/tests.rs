@@ -1,3 +1,24 @@
+mod input {
+    extern crate std;
+    std::thread_local! {
+        pub static KEYS: std::cell::RefCell<alloc::vec::Vec<u8>> = const { std::cell::RefCell::new(alloc::vec::Vec::new()) };
+        pub static MOUSE: std::cell::RefCell<alloc::vec::Vec<(i16, i16, u8)>> = const { std::cell::RefCell::new(alloc::vec::Vec::new()) };
+    }
+}
+
+pub(super) fn platform() -> super::Platform {
+    super::Platform {
+        inl: |_| panic!("PCI read in host test"),
+        outl: |_, _| panic!("PCI write in host test"),
+        map_uncached: |_, _| panic!("mapping in host test"),
+        allocate_dma: |_| panic!("physical allocation in host test"),
+        allocate_permanent: |_| panic!("boot allocation in host test"),
+        now: || panic!("clock in host test"),
+        push_key: |key| input::KEYS.with(|keys| keys.borrow_mut().push(key)),
+        push_mouse: |x, y, buttons| input::MOUSE.with(|events| events.borrow_mut().push((x, y, buttons))),
+    }
+}
+
 use super::*;
 
 struct Fixture {
@@ -81,8 +102,8 @@ fn setup_finishes_before_any_keyboard_or_mouse_transfer_is_published() {
     f.event(1, 32, 1, 3, 1, 0);
     f.event(2, 32, 1, 5, 13, 5);
     f.controller.poll();
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e]));
-    crate::irq::MOUSE.with(|events| assert_eq!(*events.borrow(), [(2, 3, 1)]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e]));
+    input::MOUSE.with(|events| assert_eq!(*events.borrow(), [(2, 3, 1)]));
     assert_eq!(f.controller.pipes[0].enq, 2);
     assert_eq!(f.controller.pipes[MOUSE_PIPE].enq, 2);
 }
@@ -95,7 +116,7 @@ fn short_mouse_report_does_not_invent_motion_or_release_buttons() {
     f.report(MOUSE_PIPE, &[1, 20]);
     f.event(0, 32, 1, 5, 13, 6); // only two bytes actually received
     f.controller.poll();
-    crate::irq::MOUSE.with(|events| assert!(events.borrow().is_empty()));
+    input::MOUSE.with(|events| assert!(events.borrow().is_empty()));
     assert_eq!(f.controller.pipes[MOUSE_PIPE].enq, 2);
 }
 
@@ -119,7 +140,7 @@ fn every_mouse_pipe_delivers_and_wraps_without_an_idle_mouse_releasing_buttons()
     f.report(MOUSE_PIPE, &[0, 0, 0]);
     f.event(event, 32, 1, 5, 13, 5);
     f.controller.poll();
-    crate::irq::MOUSE.with(|events| {
+    input::MOUSE.with(|events| {
         let events = events.borrow();
         assert_eq!(events.len(), (HID_RING_TRBS + 1) * (DEVICE_LANES - 1) + 1);
         for (index, &(dx, dy, buttons)) in events[..events.len() - 1].iter().enumerate() {
@@ -134,7 +155,7 @@ fn every_mouse_pipe_delivers_and_wraps_without_an_idle_mouse_releasing_buttons()
         f.event(event, 32, index as u32 + 1, 5, 13, 5);
         f.controller.poll();
     }
-    crate::irq::MOUSE.with(|events| assert_eq!(events.borrow().last(), Some(&(0, 0, 0))));
+    input::MOUSE.with(|events| assert_eq!(events.borrow().last(), Some(&(0, 0, 0))));
 }
 
 #[test]
@@ -148,7 +169,7 @@ fn mouse_buttons_from_another_controller_survive_idle_reports() {
     f.report(MOUSE_PIPE, &[0, 0, 0]);
     f.event(1, 32, 1, 3, 13, 5);
     f.controller.poll_with_buttons(1, 0);
-    crate::irq::MOUSE.with(|events| assert_eq!(*events.borrow(), [(4, 0, 3), (0, 0, 1)]));
+    input::MOUSE.with(|events| assert_eq!(*events.borrow(), [(4, 0, 3), (0, 0, 1)]));
 }
 
 #[test]
@@ -160,16 +181,16 @@ fn boot_keyboard_layout_is_independent_of_endpoint_packet_size() {
     f.report(0, &[2, 0, 4, 0, 0, 0, 0, 0]);
     f.event(0, 32, 1, 3, 13, 8);
     f.controller.poll();
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x2a, 0x1e]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x2a, 0x1e]));
     // A truncated next report must leave both held keys intact.
     f.report(0, &[0, 0]);
     f.event(1, 32, 1, 3, 13, 14);
     f.controller.poll();
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x2a, 0x1e]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x2a, 0x1e]));
     f.report(0, &[0; 8]);
     f.event(2, 32, 1, 3, 13, 8);
     f.controller.poll();
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x2a, 0x1e, 0xaa, 0x9e]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x2a, 0x1e, 0xaa, 0x9e]));
 }
 
 #[test]
@@ -181,11 +202,11 @@ fn legacy_report_id_keyboard_keeps_its_layout_for_short_packets() {
     f.report(0, &[1, 2, 4, 0, 0, 0, 0, 0]);
     f.event(0, 32, 1, 3, 13, 8);
     f.controller.poll();
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x2a, 0x1e]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x2a, 0x1e]));
     f.report(0, &[2, 0, 0, 0, 0, 0, 0, 0]); // unrelated consumer report
     f.event(1, 32, 1, 3, 13, 8);
     f.controller.poll();
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x2a, 0x1e]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x2a, 0x1e]));
 }
 
 #[test]
@@ -196,9 +217,9 @@ fn rollover_preserves_held_keys_until_a_valid_report() {
     Controller::process_keyboard_report(&mut previous, &report, 8, false);
     report[2..8].fill(1);
     Controller::process_keyboard_report(&mut previous, &report, 8, false);
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e]));
     Controller::process_keyboard_report(&mut previous, &[0; 16], 8, false);
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x9e]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x9e]));
 }
 
 #[test]
@@ -210,16 +231,16 @@ fn held_arrow_repeats_without_reports_and_release_at_deadline_stops_it() {
     f.event(0, 32, 1, 3, 1, 0);
     f.controller.poll_with_buttons(0, 0);
     f.controller.poll_with_buttons(0, REPEAT_DELAY_NS - 1);
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0xe0, 0x4d]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0xe0, 0x4d]));
     f.controller.poll_with_buttons(0, REPEAT_DELAY_NS);
     f.controller.poll_with_buttons(0, REPEAT_DELAY_NS + REPEAT_INTERVAL_NS - 1);
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0xe0, 0x4d, 0xe0, 0x4d]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0xe0, 0x4d, 0xe0, 0x4d]));
     f.controller.poll_with_buttons(0, REPEAT_DELAY_NS + REPEAT_INTERVAL_NS);
     f.report(0, &[0; 8]);
     f.event(1, 32, 1, 3, 1, 0);
     f.controller.poll_with_buttons(0, REPEAT_DELAY_NS + 2 * REPEAT_INTERVAL_NS);
     f.controller.poll_with_buttons(0, REPEAT_DELAY_NS * 10);
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(),
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(),
         [0xe0, 0x4d, 0xe0, 0x4d, 0xe0, 0x4d, 0xe0, 0xcd]));
 }
 
@@ -233,7 +254,7 @@ fn unchanged_keyboard_reports_do_not_restart_repeat_delay() {
         f.event(event, 32, 1, 3, 1, 0);
         f.controller.poll_with_buttons(0, event as u64 * REPEAT_DELAY_NS / 2);
     }
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x1e]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x1e]));
 }
 
 #[test]
@@ -243,15 +264,15 @@ fn newest_key_repeats_while_modifier_and_lock_keys_do_not_arm_repeat() {
     repeat.report(&[4], &[4, 5], 100); // B takes over
     repeat.report(&[4, 5], &[4, 5, 0x39, 0x47, 0x53], 200);
     repeat.poll(REPEAT_DELAY_NS);
-    crate::irq::KEYS.with(|keys| assert!(keys.borrow().is_empty()));
+    input::KEYS.with(|keys| assert!(keys.borrow().is_empty()));
     repeat.poll(REPEAT_DELAY_NS + 100);
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
     repeat.report(&[4, 5], &[4], REPEAT_DELAY_NS + 200); // releasing B stops
     repeat.poll(REPEAT_DELAY_NS * 10);
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
     repeat.report(&[], &[0x39, 0x47, 0x53], 0);
     repeat.poll(REPEAT_DELAY_NS);
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
 }
 
 #[test]
@@ -265,7 +286,7 @@ fn invalid_or_unrelated_reports_preserve_the_repeat_of_a_held_key() {
         f.event(event, 32, 1, 3, 13, 12);
         f.controller.poll_with_buttons(0, event as u64 * REPEAT_DELAY_NS / 2);
     }
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0xe0, 0x48, 0xe0, 0x48]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0xe0, 0x48, 0xe0, 0x48]));
 }
 
 #[test]
@@ -278,7 +299,7 @@ fn failed_keyboard_transfer_stops_repeat() {
     f.controller.poll();
     f.event(1, 32, 1, 3, 6, 0);
     f.controller.poll_with_buttons(0, REPEAT_DELAY_NS);
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e]));
 }
 
 #[test]
@@ -288,11 +309,11 @@ fn repeat_deadline_wraps_and_late_poll_does_not_flood_input() {
     repeat.report(&[], &[4], start);
     repeat.poll(start);
     repeat.poll(start.wrapping_add(REPEAT_DELAY_NS - 1));
-    crate::irq::KEYS.with(|keys| assert!(keys.borrow().is_empty()));
+    input::KEYS.with(|keys| assert!(keys.borrow().is_empty()));
     repeat.poll(start.wrapping_add(REPEAT_DELAY_NS));
     repeat.poll(REPEAT_DELAY_NS * 10);
     repeat.poll(REPEAT_DELAY_NS * 10);
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x1e]));
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x1e]));
 }
 
 #[test]
@@ -391,8 +412,8 @@ fn every_device_lane_can_deliver_keyboard_reports() {
         f.event(index, 32, index as u32 + 1, 3, 1, 0);
     }
     f.controller.poll();
-    crate::irq::KEYS.with(|keys| assert_eq!(*keys.borrow(),
+    input::KEYS.with(|keys| assert_eq!(*keys.borrow(),
         [0x1e, 0x30, 0x2e, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26]));
-    crate::irq::MOUSE.with(|events| assert!(events.borrow().is_empty()));
+    input::MOUSE.with(|events| assert!(events.borrow().is_empty()));
     assert!(f.controller.pipes[..KEYBOARD_PIPES].iter().all(|p| p.enq == 2));
 }

@@ -266,6 +266,8 @@ pub trait Arch: Sized + GuestBytes {
 
     /// Deterministic profiling for the kernel/arch/guest execution boundary.
     fn execution_profile_set(&mut self, _enabled: bool) {}
+    /// Clear execution counters without changing whether recording is enabled.
+    fn execution_profile_reset(&mut self) {}
     fn execution_profile_begin(&mut self) {}
     fn execution_profile_time(&mut self, _stage: ExecutionProfileStage) {}
     fn execution_profile(&self) -> ExecutionProfile { ExecutionProfile::default() }

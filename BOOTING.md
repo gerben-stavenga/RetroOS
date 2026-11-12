@@ -2597,3 +2597,86 @@ existing configuration, packages and caches. It creates normal Codex sessions
 and retains test output under `.codex/diagnostics`; `--tools` confirms only the
 known diagnostic command if Codex asks for approval. It does not replace the
 home with the private startup fixture. Artifacts are in `build/ci/codex-dn-*`.
+
+## Kernel diagnostics from inside RetroOS
+
+`tools/86box_mcp.py` automatically uses `/dev/retroos-control` when running
+inside RetroOS, including on physical hardware. The existing repository MCP
+configuration works unchanged. No COM2 configuration, serial cable or external
+machine is required. Host-side QEMU sockets and 86Box pipes remain supported;
+explicit `--socket`, `--pipe`, or `--device` selects a transport.
+
+The character device is owned by the configured session identity with mode
+0600. Open it read/write with `O_NONBLOCK`, write one ASCII command terminated
+by a newline, and read its newline-terminated JSON reply before sending the
+next command. Reads without a reply return `EAGAIN`; partial commands and
+partial reply reads are supported. Independent opens have independent streams;
+dup/fork share the same open stream. Commands are limited to 256 bytes including
+the newline, replies to 256 KiB, and there are at most 16 open clients. Closing
+a client discards its outstanding request/reply. Commands already executed
+are not undone or automatically retried.
+
+The event-loop owner executes queued commands outside the VFS lock, using
+the same handler and serializers as serial control. The idle path checks a
+pending flag without scanning clients. The MCP bridge adds `profile_io`,
+`profile_heap`, and `profile_totals` alongside existing profile tools.
+`profile_totals` reports the coarse execution ledger; `profile_io` contains
+nested timings which must not be summed as independent costs.
+
+Run `bazelisk test //tests:linux_local_control` for a KVM test of the actual
+in-guest Python stdio MCP server with no diagnostic UART. It also checks a
+non-root session, profile reset/on/off and counters, independent streams,
+fragmented commands/replies, input rejection and repeated open/close.
+
+### Measuring a workload through MCP
+
+Call `profile_begin`, run the workload, then call `profile_end`. Begin resets
+all timing layers at the control boundary and returns a window ID and monotonic
+start timestamp. End stops recording at its control boundary and returns one
+frozen packet from every layer. `profile_report` rereads that same packet;
+it rejects a running capture. Both report tools accept `include_raw=true` for
+the original counters in addition to the normalized report.
+
+The normalized schema uses nanoseconds, counts, bytes and explicit percentages:
+
+* `accounting.categories` partitions elapsed time into guest execution window,
+  architecture crossings, execution wrapper/checks, synchronous syscall
+  handlers, deferred dispatch/instrumentation, background writeback, other
+  loop work, scheduler/loop control, IRQ drain, devices, audio, display, input,
+  diagnostic control and idle. Residual categories remain visible.
+* `syscalls` groups every measured ABI/number by purpose, with names, calls,
+  total/average/maximum handler time and shares. Names ship with the bridge;
+  development headers are not required. Unknown newer ABI numbers stay numeric.
+* `nested_io` groups storage, filesystem, namespace, cache, mapping/loader,
+  network, pipes, clock and loop diagnostics. These are **inclusive and
+  overlapping**, not extra execution time. Prelude and alarm programming have
+  their own scopes. Heap allocation/free timings also overlap execution time.
+* `directory_cache` reports hits, misses, builds, entries loaded, build time,
+  and invalidations by namespace, metadata, writes, dynamic namespace or global
+  reset. Totals include every observed path. Up to 64 paths are returned,
+  ranked by build time; omitted path count is explicit. Negative name lookups
+  within an already cached directory count as directory-cache hits.
+* `quality` checks stopped/nonempty and matching windows, calibrated cycles,
+  valid counters, nonnegative derived categories, and reconciliation against
+  both coarse and architectural ledgers. The tolerance is max(50 microseconds,
+  0.1% of the window). Signed errors are retained; no residual is clamped to
+  zero. Failed checks mark the MCP result as an error while retaining the data.
+  Without an independently supplied stable-TSC conversion, raw cycles remain
+  available but a combined nanosecond ledger is not invented.
+
+These are elapsed-time measurements on the event-loop CPU for **all processes**,
+including device stalls and concurrent Codex activity. Dedicated rendering/AP
+work is outside the execution ledger. Shared allocator counters can include
+other cores and are labeled separately. These are not Linux `user`/`sys` CPU accounting, nor
+an automatically isolated process benchmark. MCP bracketing and profiler
+instrumentation are included in the window. Run a separately timed unprofiled
+workload when measuring observer overhead; do not subtract a guessed cost.
+Collect reports after stopping so formatting/transport cannot inflate counters.
+Legacy `profile dump` while recording deliberately rebases some coarse timing;
+avoid it during a benchmark, and check reconciliation if it was used.
+
+The local-control KVM regression saves `local-control-capture.json` in Bazel's
+undeclared test outputs. It checks known sleep/active work, stopped stability,
+counter resets/window IDs, cache invalidations and real stdio MCP reports.
+`//tests:profile_report` tests negative residuals, missing time, unsupported
+clock conversion and malformed counters using independent synthetic ledgers.

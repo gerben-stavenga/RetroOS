@@ -46,6 +46,13 @@ pub(super) fn set(enabled: bool) {
     }
 }
 
+pub(super) fn reset() {
+    unsafe {
+        core::ptr::write_volatile(&raw mut PROFILE, ExecutionProfile::default());
+        if enabled() { core::ptr::write_volatile(&raw mut LAST, crate::x86::rdtsc()); }
+    }
+}
+
 #[inline]
 pub(super) fn begin() {
     if !enabled() { return; }

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Expose RetroOS's COM2 diagnostic-control service as local MCP tools.
+"""Expose RetroOS diagnostic control as local MCP tools.
 
 RetroOS owns the commands and executes them in its kernel. This process only
 adapts a stdio MCP session to the host serial endpoint: an 86Box named-pipe
-pair, or the unix socket QEMU attaches to COM2.
+pair, the unix socket QEMU attaches to COM2, or /dev/retroos-control
+when running inside RetroOS itself.
 """
 
 from __future__ import annotations
@@ -22,6 +23,22 @@ from typing import Any
 
 
 TOOLS = [
+    {
+        "name": "profile_begin",
+        "description": "Start a fresh whole-system capture on the event-loop CPU: reset every counter and begin recording. Run the workload immediately, then call profile_end. Concurrent processes and MCP bracketing are included.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "profile_end",
+        "description": "Stop recording at the current boundary and return one frozen, rubriced profile: disjoint nanosecond ledger, syscall names/counts/total/average/max, nested I/O, directory cache hits/rebuilds/invalidations, and reconciliation checks. Check quality.valid before trusting derived totals.",
+        "inputSchema": {"type": "object", "properties": {"include_raw": {"type": "boolean", "default": False, "description": "Also include original counters for independent auditing."}}, "additionalProperties": False},
+    },
+    {
+        "name": "profile_report",
+        "description": "Read the same frozen capture without changing counters. Requires recording stopped; use profile_end first. Nested I/O must not be added to the disjoint execution ledger.",
+        "inputSchema": {"type": "object", "properties": {"include_raw": {"type": "boolean", "default": False, "description": "Also include original counters for independent auditing."}}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True},
+    },
     {
         "name": "profile_set",
         "description": "Enable or disable RetroOS kernel cycle profiling directly.",
@@ -54,6 +71,16 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": {"readOnlyHint": True},
     },
+    *[{
+        "name": "profile_" + name,
+        "description": description,
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True},
+    } for name, description in (
+        ("io", "Return nested filesystem, cache, device and outer-loop timings; do not add overlapping stages."),
+        ("heap", "Return kernel heap allocation counters."),
+        ("totals", "Return the disjoint coarse kernel execution ledger and profile duration."),
+    )],
     {
         "name": "profile_top",
         "description": "Return the 32 busiest profiled guest-exit classes over the reliable control channel.",
@@ -172,6 +199,57 @@ def discover_endpoints(pipe: str | None, sock: str | None) -> list[tuple[str, Pa
             continue
     found.sort(key=lambda item: item[0], reverse=True)
     return [(kind, path) for _, kind, path in found]
+
+
+class LocalControl:
+    """A per-open kernel command stream; actions are never automatically replayed."""
+
+    def __init__(self, path: str = "/dev/retroos-control"):
+        self.path = path
+        self.fd: int | None = None
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def request(self, command: str, timeout: float = 8.0) -> dict[str, Any]:
+        payload = command.encode("ascii") + b"\n"
+        if len(payload) > 256 or b"\n" in payload[:-1]:
+            raise ValueError("expected one command of at most 255 ASCII bytes")
+        if self.fd is None:
+            self.fd = os.open(self.path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+        deadline = time.monotonic() + timeout
+        try:
+            count = os.write(self.fd, payload)
+            if count != len(payload):
+                raise RuntimeError("short local control write")
+            reply = bytearray()
+            while time.monotonic() < deadline:
+                try:
+                    chunk = os.read(self.fd, 4096)
+                except BlockingIOError:
+                    time.sleep(.005)
+                    continue
+                if not chunk:
+                    raise RuntimeError("local control stream closed")
+                reply.extend(chunk)
+                if len(reply) > 256 * 1024:
+                    raise RuntimeError("local control reply too large")
+                if reply.endswith(b"\n"):
+                    return json.loads(reply)
+            raise RuntimeError("local control request timed out")
+        except Exception:
+            self.close()
+            raise
+
+
+def control_for(pipe: str | None, sock: str | None, device: str | None = None):
+    if device is not None:
+        return LocalControl(device)
+    if pipe is None and sock is None and Path("/dev/retroos-control").is_char_device():
+        return LocalControl()
+    return SerialControl(pipe, sock)
 
 
 class SerialControl:
@@ -326,12 +404,18 @@ def text_content(value: Any) -> list[dict[str, Any]]:
 
 
 def commands_for(name: str, arguments: dict[str, Any]) -> list[str]:
+    if name == "profile_begin": return ["profile begin"]
+    if name == "profile_end": return ["profile end"]
+    if name == "profile_report": return ["profile report"]
     if name == "profile_set":
         return ["profile on" if arguments.get("enabled") is True else "profile off"]
     if name == "profile_reset": return ["profile reset"]
     if name == "profile_dump": return ["profile dump"]
     if name == "profile_reads": return ["profile reads"]
     if name == "profile_syscalls": return ["profile syscalls"]
+    if name == "profile_io": return ["profile io"]
+    if name == "profile_heap": return ["profile heap"]
+    if name == "profile_totals": return ["profile totals"]
     if name == "profile_top": return ["profile top"]
     if name == "profile_rm_calls": return ["profile rm"]
     if name == "profile_execution": return ["profile execution"]
@@ -361,8 +445,8 @@ def emit(identifier: Any, result: Any = None, error: dict[str, Any] | None = Non
     sys.stdout.flush()
 
 
-def serve(pipe: str | None, sock: str | None) -> None:
-    serial = SerialControl(pipe, sock)
+def serve(pipe: str | None, sock: str | None, device: str | None = None) -> None:
+    serial = control_for(pipe, sock, device)
     for raw_line in sys.stdin.buffer:
         try:
             request = json.loads(raw_line)
@@ -375,7 +459,7 @@ def serve(pipe: str | None, sock: str | None) -> None:
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "retroos-serial", "version": "1.0.0"},
-                    "instructions": "These tools execute directly in the RetroOS kernel over COM2, via an 86Box named pipe or the QEMU socket printed as 'MCP control'. Use profile_reads for reliable structured DOS read timings; profile_dump also writes the complete report to the kernel log.",
+                    "instructions": "These tools execute in the RetroOS kernel. Inside RetroOS the bridge automatically uses /dev/retroos-control; outside it uses the QEMU COM2 socket or 86Box pipe. profile_totals is a disjoint execution ledger; profile_io stages overlap and must not be added together. profile_dump also writes to the kernel log.",
                 })
             elif method == "ping": emit(identifier, {})
             elif method == "tools/list": emit(identifier, {"tools": TOOLS})
@@ -383,9 +467,15 @@ def serve(pipe: str | None, sock: str | None) -> None:
                 params = request.get("params") or {}
                 try:
                     commands = commands_for(str(params.get("name", "")), params.get("arguments") or {})
-                    replies = [serial.request(command) for command in commands]
+                    replies = [serial.request(command, timeout=60.0 if command in ("profile end", "profile report") else 8.0) for command in commands]
+                    if params.get("name") in ("profile_end", "profile_report"):
+                        from profile_report import make_report
+                        replies = [make_report(reply) for reply in replies]
+                        if not (params.get("arguments") or {}).get("include_raw", False):
+                            for reply in replies:
+                                reply.pop("raw", None)
                     result: Any = replies[0] if len(replies) == 1 else replies
-                    failed = any(not reply.get("ok", False) for reply in replies)
+                    failed = any(not reply.get("ok", False) or not reply.get("quality", {}).get("valid", True) for reply in replies)
                     emit(identifier, {"content": text_content(result), "isError": failed})
                 except Exception as error:
                     emit(identifier, {"content": [{"type": "text", "text": str(error)}], "isError": True})
@@ -398,12 +488,12 @@ def serve(pipe: str | None, sock: str | None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pipe", help="86Box COM pipe base (without .in/.out)")
-    parser.add_argument("--socket", help="QEMU COM2 unix socket (run.sh prints this path)")
+    endpoint = parser.add_mutually_exclusive_group()
+    endpoint.add_argument("--pipe", help="86Box COM pipe base (without .in/.out)")
+    endpoint.add_argument("--socket", help="QEMU COM2 unix socket (run.sh prints this path)")
+    endpoint.add_argument("--device", help="Local RetroOS kernel control device (auto-detected by default)")
     args = parser.parse_args()
-    if args.pipe and args.socket:
-        parser.error("pass only one of --pipe and --socket")
-    serve(args.pipe, args.socket)
+    serve(args.pipe, args.socket, args.device)
 
 
 if __name__ == "__main__":

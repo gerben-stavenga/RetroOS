@@ -24,7 +24,7 @@ const READ_DETAIL_SLOTS: usize = 64;
 static mut READ_DETAILS: [(u16, u64, u64); READ_DETAIL_SLOTS] = [(0, 0, 0); READ_DETAIL_SLOTS];
 // calls, RM-call setup, DOS vector dispatch, continuation unwind.
 static mut DIRECT_RM_PHASES: [u64; 4] = [0; 4];
-pub(super) const FILE_IO_NAMES: [&str; 48] = ["read_allocate", "read_fetch", "read_copy", "mmap_zero", "mmap_read", "mmap_copy", "elf_allocate", "elf_read", "elf_copy", "ext4_read", "volume_read", "vfs_lock", "vfs_read", "cache_check", "cache_miss", "elf_seek", "cache_insert", "pipe_wait", "pipe_allocate", "disk_read", "disk_write", "disk_flush", "volume_flush", "smb_send", "smb_receive", "smb_sign", "smb_verify", "smb_response_allocate", "smb_read_decode", "smb_encode", "ext4_create", "ext4_set_meta", "ext4_mkdir", "ext4_commit_write", "ext4_unlink", "ext4_rmdir", "ext4_fsync", "ext4_resize", "directory_scan", "path_resolve", "write_permission", "loop_writeback", "loop_klog_sync", "loop_deadlines", "task_snapshot", "loop_network", "write_refresh", "rtc_read"];
+pub(super) const FILE_IO_NAMES: [&str; 50] = ["read_allocate", "read_fetch", "read_copy", "mmap_zero", "mmap_read", "mmap_copy", "elf_allocate", "elf_read", "elf_copy", "ext4_read", "volume_read", "vfs_lock", "vfs_read", "cache_check", "cache_miss", "elf_seek", "cache_insert", "pipe_wait", "pipe_allocate", "disk_read", "disk_write", "disk_flush", "volume_flush", "smb_send", "smb_receive", "smb_sign", "smb_verify", "smb_response_allocate", "smb_read_decode", "smb_encode", "ext4_create", "ext4_set_meta", "ext4_mkdir", "ext4_commit_write", "ext4_unlink", "ext4_rmdir", "ext4_fsync", "ext4_resize", "directory_scan", "path_resolve", "write_permission", "loop_writeback", "loop_klog_sync", "loop_deadlines", "task_snapshot", "loop_network", "write_refresh", "rtc_read", "loop_prelude", "alarm_arm"];
 pub(super) const LOOP_WRITEBACK: usize = 41;
 pub(super) const LOOP_KLOG_SYNC: usize = 42;
 pub(super) const LOOP_DEADLINES: usize = 43;
@@ -32,7 +32,37 @@ pub(super) const TASK_SNAPSHOT: usize = 44;
 pub(super) const LOOP_NETWORK: usize = 45;
 pub(super) const WRITE_REFRESH: usize = 46;
 pub(super) const RTC_READ: usize = 47;
+pub(super) const LOOP_PRELUDE: usize = 48;
+pub(super) const ALARM_ARM: usize = 49;
 static mut FILE_IO: [[u64; 3]; FILE_IO_NAMES.len()] = [[0; 3]; FILE_IO_NAMES.len()];
+static mut FILE_IO_MAX: [u64; FILE_IO_NAMES.len()] = [0; FILE_IO_NAMES.len()];
+pub(super) fn file_io_max() -> [u64; FILE_IO_NAMES.len()] { unsafe { *core::ptr::addr_of!(FILE_IO_MAX) } }
+
+pub(super) const DIRECTORY_FIELDS: [&str; 10] = ["hits", "misses", "builds", "entries_loaded", "build_ns",
+    "namespace_invalidations", "metadata_invalidations", "write_invalidations", "dynamic_invalidations", "global_invalidations"];
+static mut DIRECTORIES: alloc::collections::BTreeMap<alloc::vec::Vec<u8>, [u64; 10]> = alloc::collections::BTreeMap::new();
+pub(super) fn directory_event(path: &[u8], field: usize, count: u64) {
+    if !super::startup::profile_enabled() { return; }
+    let counters = unsafe { &mut *core::ptr::addr_of_mut!(DIRECTORIES) };
+    if let Some(row) = counters.get_mut(path) { row[field] = row[field].wrapping_add(count); }
+    else { let mut row = [0; 10]; row[field] = count; counters.insert(path.to_vec(), row); }
+}
+pub(super) fn directory_count() -> usize { unsafe { (&*core::ptr::addr_of!(DIRECTORIES)).len() } }
+pub(super) fn directory_totals() -> [u64; 10] {
+    let mut totals = [0u64; 10];
+    for row in unsafe { &*core::ptr::addr_of!(DIRECTORIES) }.values() {
+        for (total, value) in totals.iter_mut().zip(row) { *total = total.wrapping_add(*value); }
+    }
+    totals
+}
+pub(super) fn directories_top(limit: usize) -> alloc::vec::Vec<(&'static [u8], [u64; 10])> {
+    let mut rows: alloc::vec::Vec<_> = unsafe { &*core::ptr::addr_of!(DIRECTORIES) }.iter()
+        .map(|(path, counters)| (path.as_slice(), *counters)).collect();
+    rows.sort_unstable_by_key(|(_, values)| core::cmp::Reverse(values[4]));
+    rows.truncate(limit);
+    rows
+}
+pub(super) fn overflow() -> u64 { unsafe { OVERFLOW } }
 
 pub(super) struct FileIoScope { stage: usize, bytes: usize, start: Option<u64> }
 impl FileIoScope {
@@ -54,6 +84,10 @@ pub(crate) fn file_io_finish(stage: usize, bytes: usize, start: Option<u64>) {
         counters[0] = counters[0].wrapping_add(1);
         counters[1] = counters[1].wrapping_add(bytes as u64);
         counters[2] = counters[2].wrapping_add(elapsed);
+        unsafe {
+            let maximum = &mut (*core::ptr::addr_of_mut!(FILE_IO_MAX))[stage];
+            *maximum = (*maximum).max(elapsed);
+        }
     }
 }
 pub(super) fn file_io() -> [[u64; 3]; FILE_IO_NAMES.len()] { unsafe { *core::ptr::addr_of!(FILE_IO) } }
@@ -272,6 +306,8 @@ pub(super) fn reset() {
         READ_DETAILS = [(0, 0, 0); READ_DETAIL_SLOTS];
         DIRECT_RM_PHASES = [0; 4];
         FILE_IO = [[0; 3]; FILE_IO_NAMES.len()];
+        FILE_IO_MAX = [0; FILE_IO_NAMES.len()];
+        (&mut *core::ptr::addr_of_mut!(DIRECTORIES)).clear();
         DEVICE_ENTRIES = [[0; 2]; 7];
         VGA_INSTRUCTIONS = [EMPTY_VGA; 32];
         STATUS_POLLS = [EMPTY_POLL; 8];

@@ -255,7 +255,7 @@ impl Controller {
             } // PORT_POWER
         }
         if !port::delay((descriptor.power_ms + 100) * 1_000_000, || {
-            crate::irq::now(false)
+            (super::platform().now)()
         }) {
             return None;
         }
@@ -287,7 +287,7 @@ impl Controller {
             if stable >= 100 {
                 break;
             }
-            if !port::delay(25_000_000, || crate::irq::now(false)) {
+            if !port::delay(25_000_000, || (super::platform().now)()) {
                 return None;
             }
         }
@@ -295,7 +295,7 @@ impl Controller {
             return None;
         }
         for _ in 0..50 {
-            if !port::delay(10_000_000, || crate::irq::now(false)) {
+            if !port::delay(10_000_000, || (super::platform().now)()) {
                 return None;
             }
             let state = self.hub_status(slot, lane, downstream)?;
@@ -311,7 +311,7 @@ impl Controller {
                         return None;
                     }
                 }
-                if !port::delay(50_000_000, || crate::irq::now(false)) {
+                if !port::delay(50_000_000, || (super::platform().now)()) {
                     return None;
                 }
                 let state = self.hub_status(slot, lane, downstream)?;
