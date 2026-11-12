@@ -49,6 +49,12 @@ TOOLS = [
         "annotations": {"readOnlyHint": True},
     },
     {
+        "name": "profile_syscalls",
+        "description": "Return every Linux syscall's ABI, number, count, total handler nanoseconds and maximum; excludes blocked waiting and outer-loop work.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
         "name": "profile_top",
         "description": "Return the 32 busiest profiled guest-exit classes over the reliable control channel.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -325,6 +331,7 @@ def commands_for(name: str, arguments: dict[str, Any]) -> list[str]:
     if name == "profile_reset": return ["profile reset"]
     if name == "profile_dump": return ["profile dump"]
     if name == "profile_reads": return ["profile reads"]
+    if name == "profile_syscalls": return ["profile syscalls"]
     if name == "profile_top": return ["profile top"]
     if name == "profile_rm_calls": return ["profile rm"]
     if name == "profile_execution": return ["profile execution"]

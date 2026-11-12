@@ -2,7 +2,7 @@
 use super::*;
 
 #[derive(Clone, Copy)]
-struct Alias { address: usize, key: vfs::mapping::Key }
+struct Alias { address: usize, key: vfs::mapping::Key, may_write: bool }
 
 #[derive(Default)]
 pub(super) struct State { aliases: alloc::vec::Vec<Alias> }
@@ -30,9 +30,10 @@ impl State {
     pub fn map<A: crate::Arch>(&mut self, machine: &mut A, handle: i32, offset: usize,
         base: usize, size: usize, protection: u64) -> Result<(), i32>
     {
+        let may_write = vfs::mapping::validate(handle, offset, size, true).is_ok();
         let mut pending = alloc::vec::Vec::new();
         for page in 0..size / 4096 {
-            match vfs::mapping::acquire(machine, handle, (offset + page * 4096) as u32, protection & 2 != 0) {
+            match vfs::mapping::acquire(machine, handle, (offset + page * 4096) as u32, may_write) {
                 Ok((key, pointer)) => pending.push((key, pointer)),
                 Err(error) => {
                     for (key, _) in pending { vfs::mapping::release(machine, key); }
@@ -43,12 +44,22 @@ impl State {
         // All backing pages are ready before MAP_FIXED replaces anything.
         machine.unmap_range(base / 4096, size / 4096);
         self.release(machine, base, base + size);
-        for (index, (key, pointer)) in pending.into_iter().enumerate() {
+        for (index, &(_, frame)) in pending.iter().enumerate() {
             let address = base + index * 4096;
-            unsafe { machine.map_shared_pages(address / 4096, pointer, 1); }
-            machine.set_page_flags(address / 4096, 1, protection & 2 != 0, protection & 4 != 0);
-            self.aliases.push(Alias { address, key });
+            if !machine.map_frame(address / 4096, frame, true, protection & 2 != 0, protection & 4 != 0) {
+                machine.unmap_range(base / 4096, index);
+                for (key, _) in pending { vfs::mapping::release(machine, key); }
+                return Err(-12);
+            }
         }
+        self.aliases.extend(pending.into_iter().enumerate().map(|(index, (key, _))|
+            Alias { address: base + index * 4096, key, may_write }));
+        Ok(())
+    }
+
+    pub fn protect(&self, start: usize, end: usize, writable: bool) -> Result<(), i32> {
+        if writable && self.aliases.iter().any(|alias|
+            alias.address >= start && alias.address < end && !alias.may_write) { return Err(-13); }
         Ok(())
     }
 

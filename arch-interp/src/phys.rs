@@ -113,6 +113,13 @@ pub fn alloc_frames(count: usize) -> u64 {
             return f;
         }
     }
+    if count == 1 && NEXT_FRAME.load(Ordering::Relaxed) >= PHYS_SIZE / PAGE {
+        let callback = RECLAIM.load(Ordering::Acquire);
+        if callback != 0 {
+            let reclaim: fn() -> Option<u64> = unsafe { core::mem::transmute(callback) };
+            if let Some(frame) = reclaim() { return frame; }
+        }
+    }
     let start = NEXT_FRAME.fetch_add(count, Ordering::Relaxed);
     assert!((start + count) * PAGE <= PHYS_SIZE, "guest phys exhausted");
     start as u64
@@ -229,4 +236,28 @@ mod tests {
             libc::munmap(scratch, 2 * PAGE);
         }
     }
+}
+
+static RECLAIM: AtomicUsize = AtomicUsize::new(0);
+fn set_reclaim(callback: fn() -> Option<u64>) { RECLAIM.store(callback as usize, Ordering::Release); }
+fn allocate_owned() -> Option<u64> {
+    if free_page_count() == 0 {
+        let callback = RECLAIM.load(Ordering::Acquire);
+        if callback == 0 { return None; }
+        return unsafe { core::mem::transmute::<usize, fn() -> Option<u64>>(callback) }();
+    }
+    Some(alloc_frames(1))
+}
+fn release_owned(page: u64) { free_frames(page, 1); }
+fn read_owned(page: u64, offset: usize, bytes: &mut [u8]) {
+    unsafe { core::ptr::copy_nonoverlapping(frame_ptr(page).add(offset), bytes.as_mut_ptr(), bytes.len()); }
+}
+fn write_owned(page: u64, offset: usize, bytes: &[u8]) {
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), frame_ptr(page).add(offset), bytes.len()); }
+}
+fn references_owned(page: u64) -> usize { shared().lock().unwrap().get(&page).copied().unwrap_or(1) as usize }
+pub(crate) fn frame_access() -> arch_abi::FrameAccess {
+    arch_abi::FrameAccess { allocate: allocate_owned, release: release_owned,
+        read: read_owned, write: write_owned, free: free_page_count,
+        total: || PHYS_SIZE / PAGE, references: references_owned, set_reclaim }
 }

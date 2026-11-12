@@ -123,6 +123,22 @@ fn read_profile() {
     send(b"}}\n");
 }
 
+fn syscall_profile() {
+    send(b"{\"ok\":true,\"syscalls\":[");
+    let mut first = true;
+    super::event_profile::visit_syscalls(|abi, number, calls, ns, max| {
+        if !first { send(b","); }
+        first = false;
+        send(b"{\"abi\":"); send_u64(u64::from(abi));
+        send(b",\"nr\":"); send_u64(u64::from(number));
+        send(b",\"calls\":"); send_u64(calls);
+        send(b",\"ns\":"); send_u64(ns);
+        send(b",\"max_ns\":"); send_u64(max);
+        send(b"}");
+    });
+    send(b"]}\n");
+}
+
 fn top_profile() {
     send(b"{\"ok\":true,\"events\":[");
     let mut first = true;
@@ -342,6 +358,8 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8]) -> bool {
             send_u64(value);
         }
         send(b"]}\n");
+    } else if line.eq_ignore_ascii_case(b"profile syscalls") {
+        syscall_profile();
     } else if line.eq_ignore_ascii_case(b"profile top") {
         top_profile();
     } else if line.eq_ignore_ascii_case(b"profile rm") {

@@ -21,6 +21,13 @@ nasm_library(
     copts = ["-f", "elf32"],
 )
 
+# Raw one-page ELF image, assembled using the existing NASM toolchain.
+nasm_library(
+    name = "vdso64",
+    srcs = ["src/kernel/linux/vdso.asm"],
+    copts = ["-f", "bin"],
+)
+
 # The linker script, materialized into bazel-out so the rust_binary link action
 # stages it reliably (a source file passed via compile_data wasn't found by the
 # linker; bazel-out inputs are).
@@ -48,9 +55,10 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     crate_name = "kernel",
     edition = "2024",
-    compile_data = [":build_info_generated"],
+    compile_data = [":build_info_generated", ":vdso64"],
     rustc_env = {
         "RETROOS_BUILD_INFO_RS": "$(location :build_info_generated)",
+        "RETROOS_VDSO64": "$(location :vdso64)",
     },
     visibility = ["//visibility:public"],
     rustc_flags = [

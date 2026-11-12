@@ -173,6 +173,9 @@ pub(crate) fn child_exited<A: crate::Arch>(parent: &mut thread::Thread<A>, child
     if !matches!(parent.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked) {
         return;
     }
+    if let thread::Personality::Linux(linux) = &mut parent.personality {
+        async_io::children_changed(&mut linux.async_io);
+    }
     queue(parent, 17, child);
     if let thread::Personality::Linux(linux) = &mut parent.personality
         && linux.parent_death.pending & (1 << 16) != 0 {

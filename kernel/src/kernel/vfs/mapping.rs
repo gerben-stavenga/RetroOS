@@ -1,48 +1,56 @@
 //! One kernel-owned file-content cache for every VFS backend.
 //! Ordinary reads, pread, private-mapping fills and shared mappings use these
-//! same pages. Clean pages share one bounded LRU; live mappings pin their pages.
+//! same physical frames. Clean pages are reclaimable; shared mappings pin them.
 //! Writes go through to the backend; mapped modifications retain their existing
 //! fsync/unmap writeback semantics. Backends only supply identity and freshness.
 //! Guest execution is stopped whenever the VFS lock accesses their kernel view.
 use super::*;
-use core::ptr::NonNull;
-use alloc::boxed::Box;
+use crate::kernel::cache::{self, Frame};
 
 const PAGE_SIZE: usize = 4096;
 const PAGE_LIMIT: usize = 512;
 const READ_BATCH: usize = 32768;
+const BULK_READ_BATCH: usize = 128 * 1024;
 
 pub type Key = (u8, u64, u32);
 
 pub(super) struct Page {
-    base: usize,
     refs: usize,
     handle: i32,
     writable: bool,
-    // Ordinary cache pages own heap bytes. A mapped page instead owns an Arch
-    // allocation until its last alias is released (interpreter frames are not
-    // interchangeable with heap pointers).
-    heap: Option<Box<[u8]>>,
+    data: Frame,
     version: ContentVersion,
     used: u64,
 }
 
 impl Page {
-    fn clean(bytes: Box<[u8]>, version: ContentVersion, used: u64) -> Self {
-        Self { base: bytes.as_ptr() as usize, refs: 0, handle: -1,
-            writable: false, heap: Some(bytes), version, used }
+    fn clean(bytes: &[u8], version: ContentVersion, used: u64) -> Result<Self, i32> {
+        Ok(Self { refs: 0, handle: -1, writable: false,
+            data: Frame::new(bytes)?, version, used })
     }
     pub(super) fn pinned(&self) -> bool { self.handle >= 0 }
 }
 
 impl Vfs {
     pub(super) fn has_mapped_path(&self, path: &[u8]) -> bool {
-        self.file_pages.iter().any(|(&(mount, identity, _), page)| {
-            if !page.pinned() { return false; }
-            if self.file_table[page.handle as usize].path == path { return true; }
+        self.mapped_handles.keys().any(|&handle| {
+            let entry = &self.file_table[handle as usize];
+            if entry.path == path { return true; }
             // Bind aliases resolve to the same backend-relative pathname.
-            self.backend_path_id(mount, path) == identity
+            self.backend_path_id(entry.mount_idx, path) == entry.cache_id
         })
+    }
+
+    fn pin_mapping_handle(&mut self, handle: i32) {
+        self.add_ref(handle);
+        *self.mapped_handles.entry(handle).or_default() += 1;
+    }
+
+    fn unpin_mapping_handle(&mut self, handle: i32) -> i32 {
+        let count = self.mapped_handles.get_mut(&handle).expect("pinned mapping handle");
+        *count -= 1;
+        if *count == 0 { self.mapped_handles.remove(&handle); }
+        self.close_handle(handle)
     }
     pub(super) fn zero_mapping_growth(&mut self, handle: i32, old_size: u32, size: u32) {
         let Ok((mount, ino, _)) = self.mapping_key(handle, 0) else { return; };
@@ -51,7 +59,7 @@ impl Vfs {
             let lo = start.max(u64::from(old_size));
             let hi = (start + 4096).min(u64::from(size));
             if hi > lo {
-                unsafe { core::ptr::write_bytes((entry.base + (lo - start) as usize) as *mut u8, 0, (hi - lo) as usize); }
+                entry.data.write((lo - start) as usize, &alloc::vec![0; (hi - lo) as usize]);
             }
         }
     }
@@ -63,12 +71,12 @@ impl Vfs {
     fn flush_page(&mut self, key: Key) -> i32 {
         let Some(page) = self.file_pages.get(&key) else { return 0; };
         if !page.writable { return 0; }
-        let (base, handle) = (page.base, page.handle);
+        let handle = page.handle;
         let entry = &self.file_table[handle as usize];
         let offset = key.2 * 4096;
         let length = entry.vnode.size.saturating_sub(offset).min(4096) as usize;
-        // The mapping owns this allocation. Guests cannot run under this lock.
-        let data = unsafe { core::slice::from_raw_parts(base as *const u8, length) };
+        let mut data = alloc::vec![0; length];
+        page.data.read(0, &mut data);
         let (mount, fid) = (entry.mount_idx, entry.vnode.handle);
         let mut written = 0;
         while written < length {
@@ -91,16 +99,61 @@ impl Vfs {
         0
     }
 
+    pub(super) fn forget_empty_cache_file(&mut self, key: (u8, u64)) {
+        if self.file_pages.range((key.0, key.1, 0)..=(key.0, key.1, u32::MAX)).next().is_none()
+            && !self.file_table.iter().any(|entry| entry.refcount != 0 && (entry.mount_idx, entry.cache_id) == key)
+        {
+            self.cached_paths.remove(&key);
+            self.validated_versions.remove(&key);
+        }
+    }
+
     pub(super) fn drop_clean_pages(&mut self) {
         self.file_pages.retain(|_, page| page.pinned());
-        self.clean_page_keys.clear();
-        self.clean_page_lru.clear();
+        self.clean_pages.clear();
+        let pages = &self.file_pages;
+        self.cached_paths.retain(|&(mount, id), _|
+            pages.range((mount, id, 0)..=(mount, id, u32::MAX)).next().is_some());
+        self.validated_versions.retain(|&(mount, id), _|
+            pages.range((mount, id, 0)..=(mount, id, u32::MAX)).next().is_some());
+    }
+
+    /// Invalidate one identity with a range lookup, not a whole-cache scan.
+    pub(super) fn invalidate_cached_file(&mut self, key: (u8, u64)) {
+        let keys: Vec<_> = self.file_pages.range((key.0, key.1, 0)..=(key.0, key.1, u32::MAX))
+            .filter_map(|(&key, page)| (!page.pinned()).then_some(key)).collect();
+        for key in keys { self.file_pages.remove(&key); self.clean_pages.remove(key); }
+        self.validated_versions.remove(&key);
+        self.forget_empty_cache_file(key);
     }
 
     pub(super) fn invalidate_file_pages(&mut self, handle: i32) {
-        self.invalidate_executable(handle);
         let Ok((mount, identity, _)) = self.mapping_key(handle, 0) else { return; };
-        self.file_pages.retain(|&(m, ino, _), page| m != mount || ino != identity || page.pinned());
+        self.invalidate_cached_file((mount, identity));
+    }
+
+    /// Closed path-identity files retain only their backend-relative name.
+    /// Directory renames retire that subtree. Stable inode source pages stay
+    /// valid across renames; an unlink/replaced victim must retire its identity.
+    pub(super) fn namespace_cache_keys(&self, object: &ResolvedObject, preserve_stable: bool) -> Vec<(u8, u64)> {
+        if object.stat.is_dir {
+            return self.cached_paths.iter().filter_map(|(&key, path)| {
+                (key.0 == object.mount_idx && (path.as_slice() == object.subpath()
+                    || path.strip_prefix(object.subpath()).is_some_and(|tail| tail.starts_with(b"/"))))
+                    .then_some(key)
+            }).collect();
+        }
+        if object.stat.is_symlink { return Vec::new(); }
+        let path_key = (object.mount_idx, path_ino(object.subpath()));
+        if self.cached_paths.contains_key(&path_key) { return alloc::vec![path_key]; }
+        let Some(node) = object.fs.open(object.subpath()) else { return Vec::new(); };
+        let identity = object.fs.file_identity(node.handle);
+        object.fs.clunk(node.handle);
+        match identity {
+            Some(id) if !preserve_stable => alloc::vec![(object.mount_idx, id)],
+            None => alloc::vec![path_key],
+            _ => Vec::new(),
+        }
     }
 
     pub(super) fn file_is_mapped(&self, handle: i32) -> bool {
@@ -109,26 +162,31 @@ impl Vfs {
             .any(|(_, page)| page.pinned())
     }
 
-    fn make_page_room(&mut self) -> bool {
-        // The bounded LRU can contain stale entries after invalidation or
-        // promotion to a live mapping. Retire them lazily, without scanning
-        // every pinned page or looking up every clean page for each insertion.
-        while self.clean_page_keys.len() >= PAGE_LIMIT {
-            let (used, key) = *self.clean_page_lru.first().unwrap();
-            self.clean_page_lru.remove(&(used, key));
-            self.clean_page_keys.remove(&key);
+    fn evict_clean_page(&mut self) -> Option<Frame> {
+        while let Some(key) = self.clean_pages.pop() {
             if self.file_pages.get(&key).is_some_and(|p| !p.pinned()) {
-                self.file_pages.remove(&key);
+                let page = self.file_pages.remove(&key).unwrap();
+                self.forget_empty_cache_file((key.0, key.1));
+                return Some(page.data);
             }
+        }
+        None
+    }
+
+    fn make_page_room(&mut self) -> bool {
+        if let Some(a) = cache::access() {
+            while (a.free)() <= cache::reserve() {
+                let Some(frame) = self.evict_clean_page() else { return false; };
+                drop(frame);
+            }
+        } else {
+            while self.clean_pages.len() >= PAGE_LIMIT { drop(self.evict_clean_page()); }
         }
         true
     }
 
     fn cache_page(&mut self, key: Key, page: Page) {
-        if let Some(old) = self.clean_page_keys.insert(key, page.used) {
-            self.clean_page_lru.remove(&(old, key));
-        }
-        self.clean_page_lru.insert((page.used, key));
+        self.clean_pages.touch(key, page.used);
         self.file_pages.insert(key, page);
     }
 
@@ -136,15 +194,29 @@ impl Vfs {
         let (mount, identity, _) = self.mapping_key(handle, 0)?;
         let fid = self.file_table[handle as usize].vnode.handle;
         let version = self.mount_fs(mount).content_version(fid)?;
+        if version.is_some() && self.file_table[handle as usize].cache_path_based
+            && !self.cached_paths.contains_key(&(mount, identity))
+        {
+            let path = self.file_table[handle as usize].path.clone();
+            let mut relative = None;
+            self.visit_layers(&path, ALIAS_DEPTH, &mut |index, _, subpath| {
+                if index != mount { return false; }
+                relative = Some(subpath.to_vec()); true
+            });
+            if let Some(path) = relative { self.cached_paths.insert((mount, identity), path); }
+        }
+        if version.is_some() && self.validated_versions.get(&(mount, identity)) == version.as_ref() {
+            return Ok(version);
+        }
+        if let Some(version) = version { self.validated_versions.insert((mount, identity), version); }
+        else { self.validated_versions.remove(&(mount, identity)); }
         // Pinned aliases cannot be discarded. Refresh clean aliases in-place
         // below; writable mappings retain ownership until writeback.
         let stale: Vec<_> = self.file_pages.range((mount, identity, 0)..=(mount, identity, u32::MAX))
             .filter_map(|(&key, page)| (!page.pinned() && Some(page.version) != version).then_some(key)).collect();
         for key in stale {
             self.file_pages.remove(&key);
-            if let Some(used) = self.clean_page_keys.remove(&key) {
-                self.clean_page_lru.remove(&(used, key));
-            }
+            self.clean_pages.remove(key);
         }
         if let Some(size) = version.and_then(|v| v.size) {
             for e in &mut self.file_table {
@@ -157,6 +229,10 @@ impl Vfs {
     }
 
     pub(super) fn cached_read(&mut self, handle: i32, offset: u32, out: &mut [u8]) -> i32 {
+        self.fill_cache(handle, offset, out, true)
+    }
+
+    fn fill_cache(&mut self, handle: i32, offset: u32, out: &mut [u8], copy: bool) -> i32 {
         let Some(e) = self.file_table.get(handle as usize).filter(|e| e.refcount != 0) else { return -9; };
         let (mount, fid, size, mode) = (e.mount_idx, e.vnode.handle, e.vnode.size, e.vnode.mode);
         if !matches!(mode & 0o170000, 0 | 0o100000) {
@@ -181,43 +257,22 @@ impl Vfs {
             let count = (length - done).min(PAGE_SIZE - within);
             let stale = self.file_pages.get(&key).is_some_and(|p| p.version != version && !p.writable);
             if stale {
-                let base = self.file_pages[&key].base;
                 let mut bytes = alloc::vec![0; PAGE_SIZE];
                 let start = key.2 * PAGE_SIZE as u32;
                 let wanted = size.saturating_sub(start).min(PAGE_SIZE as u32) as usize;
                 let n = self.mount_fs(mount).read(fid, start, &mut bytes[..wanted], size);
                 if n != wanted as i32 { return if done != 0 { done as i32 } else if n < 0 { n } else { -5 }; }
-                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), base as *mut u8, PAGE_SIZE); }
+                self.file_pages.get_mut(&key).unwrap().data.write(0, &bytes);
                 self.file_pages.get_mut(&key).unwrap().version = version;
             }
             if !self.file_pages.contains_key(&key) {
                 let _miss = crate::kernel::event_profile::FileIoScope::start(14, length - done);
-                // Large sequential consumers (ELF/library loading and hashes)
-                // should not allocate and evict a boxed page for every 4 KiB
-                // they pass through. Stream only uncached spans; an existing
-                // page, especially a writable guest alias, remains authoritative.
-                // Keep the original request's streaming policy after a
-                // cached prefix. Testing only the remainder makes read-ahead
-                // seed the next chunk and disable streaming indefinitely.
-                if out.len() >= READ_BATCH * 2 {
-                    let next_page = self.file_pages.range(key..=(key.0, key.1, u32::MAX))
-                        .next().map(|(&(.., page), _)| u64::from(page) * PAGE_SIZE as u64);
-                    let mut count = (length - done).min(256 * 1024);
-                    if let Some(next) = next_page {
-                        count = count.min(next.saturating_sub(u64::from(position)) as usize);
-                    }
-                    if count >= READ_BATCH {
-                        let n = self.mount_fs(mount).read(fid, position, &mut out[done..done + count], size);
-                        if n <= 0 { return if done != 0 { done as i32 } else { n }; }
-                        if n as usize > count { return if done != 0 { done as i32 } else { -5 }; }
-                        done += n as usize;
-                        continue;
-                    }
-                }
-                // Batch adjacent misses so SMB keeps its normal 32 KiB request
-                // size, rather than issuing one network round trip per page.
+                // Small consumers keep modest read-ahead. Bulk reads and ELF
+                // mappings amortize storage commands over a larger fill; each
+                // backend still applies its negotiated transport limits.
                 let start = position - within as u32;
-                let mut wanted = (size - start).min(READ_BATCH as u32) as usize;
+                let batch = if out.len() >= READ_BATCH * 2 { BULK_READ_BATCH } else { READ_BATCH };
+                let mut wanted = (size - start).min(batch as u32) as usize;
                 for delta in 1..wanted.div_ceil(PAGE_SIZE) {
                     if self.file_pages.contains_key(&(key.0, key.1, key.2 + delta as u32)) {
                         wanted = delta * PAGE_SIZE;
@@ -239,11 +294,17 @@ impl Vfs {
                 for begin in (0..got).step_by(PAGE_SIZE) {
                     let end = (begin + PAGE_SIZE).min(wanted);
                     if end > got || !self.make_page_room() { break; }
-                    let mut page = alloc::vec![0; PAGE_SIZE].into_boxed_slice();
-                    page[..end - begin].copy_from_slice(&bytes[begin..end]);
+                    let mut tail;
+                    let data = if end - begin == PAGE_SIZE { &bytes[begin..end] }
+                    else {
+                        tail = alloc::vec![0; PAGE_SIZE];
+                        tail[..end - begin].copy_from_slice(&bytes[begin..end]);
+                        &tail
+                    };
                     self.page_clock = self.page_clock.wrapping_add(1);
-                    self.cache_page((key.0, key.1, key.2 + (begin / PAGE_SIZE) as u32),
-                        Page::clean(page, version, self.page_clock));
+                    if let Ok(page) = Page::clean(data, version, self.page_clock) {
+                        self.cache_page((key.0, key.1, key.2 + (begin / PAGE_SIZE) as u32), page);
+                    }
                 }
                 if !self.file_pages.contains_key(&key) {
                     let n = count.min(got.saturating_sub(within));
@@ -256,12 +317,8 @@ impl Vfs {
             self.page_clock = self.page_clock.wrapping_add(1);
             let page = self.file_pages.get_mut(&key).unwrap();
             page.used = self.page_clock;
-            if !page.pinned() && let Some(old) = self.clean_page_keys.get_mut(&key) {
-                self.clean_page_lru.remove(&(*old, key));
-                *old = self.page_clock;
-                self.clean_page_lru.insert((self.page_clock, key));
-            }
-            unsafe { core::ptr::copy((page.base + within) as *const u8, out.as_mut_ptr().add(done), count); }
+            if !page.pinned() { self.clean_pages.touch(key, self.page_clock); }
+            if copy { page.data.read(within, &mut out[done..done + count]); }
             done += count;
         }
         done as i32
@@ -275,8 +332,8 @@ impl Vfs {
             let lo = start.max(u64::from(offset));
             let hi = (start + 4096).min(end);
             if hi > lo {
-                unsafe { core::ptr::copy(data.as_ptr().add((lo - u64::from(offset)) as usize),
-                    (entry.base + (lo - start) as usize) as *mut u8, (hi - lo) as usize); }
+                let at = (lo - u64::from(offset)) as usize;
+                entry.data.write((lo - start) as usize, &data[at..at + (hi - lo) as usize]);
             }
         }
     }
@@ -286,6 +343,7 @@ pub fn validate(handle: i32, offset: usize, length: usize, writable: bool) -> Re
     let vfs = VFS.lock();
     let e = vfs.file_table.get(handle as usize).filter(|e| e.refcount != 0).ok_or(-9)?;
     if !matches!(e.vnode.mode & 0o170000, 0 | 0o100000) { return Err(-19); }
+    if writable && matches!(e.access, OpenAccess::Read) { return Err(-13); }
     if writable && !e.writable { return Err(-30); }
     if offset & 4095 != 0 { return Err(-22); }
     // Until mapped truncation can deliver SIGBUS, reject pages wholly beyond
@@ -296,37 +354,88 @@ pub fn validate(handle: i32, offset: usize, length: usize, writable: bool) -> Re
     Ok(())
 }
 
-pub fn acquire<A: crate::Arch>(machine: &mut A, handle: i32, offset: u32, writable: bool) -> Result<(Key, NonNull<u8>), i32> {
+pub fn acquire<A: crate::Arch>(_machine: &mut A, handle: i32, offset: u32, writable: bool) -> Result<(Key, u64), i32> {
     let mut vfs = VFS.lock();
-    vfs.invalidate_executable(handle);
     let key = vfs.mapping_key(handle, offset)?;
     let mut bytes = alloc::vec![0; PAGE_SIZE];
     let n = vfs.cached_read(handle, offset, &mut bytes);
     if n < 0 { return Err(n); }
     let expected = vfs.file_table[handle as usize].vnode.size.saturating_sub(offset).min(PAGE_SIZE as u32);
     if n as u32 != expected { return Err(-5); }
-    if !vfs.file_pages.contains_key(&key) {
-        vfs.make_page_room();
-        vfs.cache_page(key, Page::clean(bytes.into_boxed_slice(), ContentVersion::LOCAL, 0));
-    }
-    if !vfs.file_pages.get(&key).unwrap().pinned() {
-        let base = machine.alloc_shared_pages(1);
-        let page = vfs.file_pages.get_mut(&key).unwrap();
-        unsafe { core::ptr::copy_nonoverlapping(page.base as *const u8, base.as_ptr(), PAGE_SIZE); }
-        page.heap = None;
-        page.base = base.as_ptr() as usize;
-        page.handle = handle;
-        vfs.add_ref(handle);
-    } else if writable && !vfs.file_table[vfs.file_pages[&key].handle as usize].writable {
-        let previous = vfs.file_pages.get_mut(&key).unwrap().handle;
-        vfs.add_ref(handle);
+    if !vfs.file_pages.contains_key(&key) { return Err(-12); }
+    let physical = vfs.file_pages[&key].data.physical().ok_or(-12)?;
+    if !vfs.file_pages[&key].pinned() {
         vfs.file_pages.get_mut(&key).unwrap().handle = handle;
-        vfs.close_handle(previous);
+        vfs.pin_mapping_handle(handle);
+    } else if writable && !vfs.file_table[vfs.file_pages[&key].handle as usize].writable {
+        let previous = vfs.file_pages[&key].handle;
+        vfs.pin_mapping_handle(handle);
+        vfs.file_pages.get_mut(&key).unwrap().handle = handle;
+        vfs.unpin_mapping_handle(previous);
     }
     let page = vfs.file_pages.get_mut(&key).unwrap();
     page.refs += 1;
     page.writable |= writable;
-    Ok((key, NonNull::new(page.base as *mut u8).unwrap()))
+    Ok((key, physical))
+}
+
+/// Private mappings own counted aliases. They need no retained backend handle
+/// and survive eviction, close and fork through architecture frame ownership.
+pub fn map_private<A: crate::Arch>(machine: &mut A, handle: i32, offset: usize,
+    base: usize, length: usize, protection: u64) -> Result<(), i32>
+{
+    if offset & 4095 != 0 { return Err(-22); }
+    let mut vfs = VFS.lock();
+    let mut buffer = alloc::vec![0; BULK_READ_BATCH];
+    let pages = length.div_ceil(4096);
+    offset.checked_add(pages.checked_mul(4096).ok_or(-22)?).ok_or(-22)?;
+    let version = vfs.check_content(handle)?;
+    let file_size = vfs.file_table[handle as usize].vnode.size as usize;
+    let mut page = 0;
+    while page < pages {
+        let at = offset.checked_add(page * 4096).filter(|&n| n <= u32::MAX as usize).ok_or(-22)?;
+        let count = (pages - page).min(BULK_READ_BATCH / 4096);
+        let wanted = (count * 4096).min(file_size.saturating_sub(at));
+        let missing = (0..count).any(|index| {
+            let position = at + index * 4096;
+            position < file_size && vfs.mapping_key(handle, position as u32).is_ok_and(|key|
+                vfs.file_pages.get(&key).is_none_or(|page| !page.writable && Some(page.version) != version))
+        });
+        if wanted > 0 && missing {
+            let n = vfs.fill_cache(handle, at as u32, &mut buffer[..wanted], false);
+            if n < 0 { return Err(n); }
+            if n as usize != wanted { return Err(-5); }
+        }
+        for index in 0..count {
+            let address = base + (page + index) * 4096;
+            if at + index * 4096 >= file_size {
+                machine.map_fresh_range(address / 4096, 1);
+                machine.set_page_flags(address / 4096, 1, protection & 2 != 0, protection & 4 != 0);
+                continue;
+            }
+            let key = vfs.mapping_key(handle, (at + index * 4096) as u32)?;
+            let frame = vfs.file_pages.get(&key).and_then(|p| p.data.physical()).ok_or(-12)?;
+            if !machine.map_frame(address / 4096, frame, false, protection & 2 != 0, protection & 4 != 0) {
+                return Err(-12);
+            }
+        }
+        page += count;
+    }
+    Ok(())
+}
+
+/// Called by the physical allocator on exhaustion, including ring 0. Never
+/// reenter VFS or privileged frame operations: only transfer exclusive frames.
+pub(crate) fn reclaim_frame() -> Option<u64> {
+    let mut vfs = VFS.try_lock()?;
+    while let Some(frame) = vfs.evict_clean_page() {
+        if let Some(frame) = frame.into_reclaimed() { return Some(frame); }
+    }
+    None
+}
+
+pub(crate) fn reclaim_pressure() {
+    if let Some(mut vfs) = VFS.try_lock() { vfs.make_page_room(); }
 }
 
 pub fn retain(key: Key) {
@@ -334,30 +443,24 @@ pub fn retain(key: Key) {
 }
 
 /// Caller must remove its guest alias before releasing the last reference.
-pub fn release<A: crate::Arch>(machine: &mut A, key: Key) {
+pub fn release<A: crate::Arch>(_machine: &mut A, key: Key) {
     let mut vfs = VFS.lock();
     let page = vfs.file_pages.get_mut(&key).expect("live mapped file page");
     page.refs -= 1;
     if page.refs != 0 { return; }
     let status = vfs.flush_page(key);
     if status < 0 {
-        // Preserve modified RAM and its backing handle for later fsync/shutdown
-        // retry rather than silently discarding data on a storage failure.
         crate::compact_dbg_println!("mapped file writeback failed: {}", status);
         return;
     }
-    let page = vfs.file_pages.remove(&key).unwrap();
-    let mut bytes = alloc::vec![0; PAGE_SIZE].into_boxed_slice();
-    unsafe { core::ptr::copy_nonoverlapping(page.base as *const u8, bytes.as_mut_ptr(), PAGE_SIZE); }
-    unsafe { machine.free_shared_pages(NonNull::new(page.base as *mut u8).unwrap(), 1); }
-    // Drop the mapping's fid before retaining clean bytes; cache entries must
-    // not keep backend handles open or postpone their close-time flush.
-    let status = vfs.close_handle(page.handle);
-    if status >= 0 && vfs.make_page_room() {
-        let used = vfs.page_clock;
-        vfs.cache_page(key, Page::clean(bytes, page.version, used));
-    }
-    if status < 0 { crate::compact_dbg_println!("mapped file close failed: {}", status); }
+    let handle = vfs.file_pages[&key].handle;
+    let page = vfs.file_pages.get_mut(&key).unwrap();
+    page.handle = -1;
+    page.writable = false;
+    let used = vfs.page_clock;
+    vfs.clean_pages.touch(key, used);
+    let status = vfs.unpin_mapping_handle(handle);
+    if status < 0 { vfs.drop_clean_pages(); }
 }
 
 pub fn sync(key: Key) -> i32 {
@@ -372,6 +475,7 @@ pub fn sync(key: Key) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::boxed::Box;
     use core::cell::{Cell, RefCell};
 
     struct Backend {
@@ -426,9 +530,10 @@ mod tests {
     fn pinned_mappings_do_not_consume_the_clean_read_cache_budget() {
         let (mut vfs, fs, h) = setup(READ_BATCH * 2);
         for index in 0..PAGE_LIMIT + 1 {
-            let mut page = Page::clean(alloc::vec![0; PAGE_SIZE].into_boxed_slice(), ContentVersion::LOCAL, 0);
+            let mut page = Page::clean(&alloc::vec![0; PAGE_SIZE], ContentVersion::LOCAL, 0).unwrap();
             page.handle = h;
             page.refs = 1;
+            vfs.pin_mapping_handle(h);
             vfs.file_pages.insert((0, 999, index as u32), page);
         }
         let mut bytes = [0; 8192];
@@ -455,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_prefix_does_not_disable_the_rest_of_a_streaming_read() {
+    fn large_reads_reuse_the_same_file_pages() {
         let (mut vfs, fs, h) = setup(1024 * 1024);
         // ELF metadata reads cache an initial 32 KiB. A following segment
         // starts inside that cached run and reads in 64 KiB chunks.
@@ -467,9 +572,25 @@ mod tests {
             assert_eq!(vfs.cached_read(h, offset as u32, &mut output), output.len() as i32);
             assert!(output.iter().enumerate().all(|(i, &b)| b == (offset + i) as u8));
         }
-        assert_eq!(fs.reads.get(), 9, "one metadata fill and one backend read per streaming chunk");
-        assert_eq!(vfs.file_pages.len(), READ_BATCH / PAGE_SIZE,
-            "read-ahead must not propagate a cached prefix into every following chunk");
+        let reads = fs.reads.get();
+        for chunk in 0..8 {
+            let offset = PAGE_SIZE + chunk * output.len();
+            assert_eq!(vfs.cached_read(h, offset as u32, &mut output), output.len() as i32);
+        }
+        assert_eq!(fs.reads.get(), reads, "large reads retain reusable pages");
+    }
+
+    #[test]
+    fn bulk_cache_fills_amortize_backend_requests_without_changing_small_reads() {
+        let (mut vfs, fs, handle) = setup(512 * 1024);
+        let mut small = [0; 1];
+        assert_eq!(vfs.cached_read(handle, 0, &mut small), 1);
+        assert_eq!(vfs.file_pages.len(), READ_BATCH / PAGE_SIZE);
+        let before = fs.reads.get();
+        let mut bulk = alloc::vec![0; 256 * 1024];
+        assert_eq!(vfs.cached_read(handle, 128 * 1024, &mut bulk), bulk.len() as i32);
+        assert_eq!(fs.reads.get() - before, 2, "bulk consumers need two 128 KiB backend fills");
+        assert!(bulk.iter().enumerate().all(|(i, &b)| b == (128 * 1024 + i) as u8));
     }
 
     #[test]
@@ -482,12 +603,12 @@ mod tests {
         page.handle = h;
         page.refs = 1;
         page.writable = true;
-        unsafe { (page.base as *mut u8).write(99); }
+        page.data.write(0, &[99]);
         let mut output = alloc::vec![0; 256 * 1024];
         assert_eq!(vfs.cached_read(h, 0, &mut output), output.len() as i32);
         assert_eq!(output[128 * 1024], 99);
         assert!(output.iter().enumerate().all(|(i, &b)| b == if i == 128 * 1024 { 99 } else { i as u8 }));
-        assert!(vfs.file_pages.len() < 32, "stream must not populate the whole cache");
+        assert_eq!(vfs.file_pages.len(), 64, "large reads use the same cache as mappings");
         fs.bytes.borrow_mut()[0] = 77;
         fs.revision.set(1);
         assert_eq!(vfs.cached_read(h, 0, &mut output), output.len() as i32);
@@ -533,13 +654,14 @@ mod tests {
         page.handle = h;
         page.refs = 1;
         page.writable = true;
-        unsafe { core::ptr::copy_nonoverlapping(b"mapped!!".as_ptr(), page.base as *mut u8, 8); }
+        page.data.write(0, b"mapped!!");
         assert_eq!(vfs.cached_read(h, 0, &mut out), 8);
         assert_eq!(&out, b"mapped!!");
         assert_eq!(fs.reads.get(), 1);
         assert_eq!(vfs.write_at_by_handle(h, 0, b"write!!!"), 8);
         let page = &vfs.file_pages[&key];
-        assert_eq!(unsafe { core::slice::from_raw_parts(page.base as *const u8, 8) }, b"write!!!");
+        let mut bytes = [0; 8]; page.data.read(0, &mut bytes);
+        assert_eq!(&bytes, b"write!!!");
         assert_eq!(vfs.resize_by_handle(h, 1), -16);
         assert_eq!(vfs.flush_mappings(h), 0);
         assert_eq!(&fs.bytes.borrow()[..8], b"write!!!");

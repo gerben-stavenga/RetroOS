@@ -335,7 +335,7 @@ pub(super) fn deliver<A: crate::Arch>(
         regs.frame.rflags,
         regs.frame.cs | (regs.frame.ss << 48),
         if fault { regs.err_code } else { 0 },
-        if fault { 14 } else { 0 },
+        if fault { 14 } else if signal == 4 && code == 2 { 6 } else { 0 },
         local.mask,
         if fault { addr } else { 0 },
     ];

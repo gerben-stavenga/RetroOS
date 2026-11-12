@@ -1,5 +1,6 @@
 /* One file-content cache must agree with MAP_SHARED and external writers. */
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,6 +9,25 @@
 #include <sys/wait.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+static void mapping_lifetime_probe(void) {
+    const char *path = "/home/retroos/cache-map-lifetime";
+    unsigned char bytes[8192] = {0};
+    int writer = open(path, O_CREAT | O_TRUNC | O_RDWR, 0600);
+    assert(writer >= 0 && write(writer, bytes, sizeof bytes) == sizeof bytes);
+    int reader = open(path, O_RDONLY); assert(reader >= 0);
+    unsigned char *r = mmap(NULL, sizeof bytes, PROT_READ, MAP_SHARED, reader, 0);
+    assert(r != MAP_FAILED && close(reader) == 0);
+    unsigned char *w = mmap(NULL, sizeof bytes, PROT_READ | PROT_WRITE, MAP_SHARED, writer, 0);
+    assert(w != MAP_FAILED && close(writer) == 0);
+    w[4097] = 'K'; assert(r[4097] == 'K');
+    assert(munmap(w, sizeof bytes) == 0);
+    assert(munmap(r, 4096) == 0 && r[4097] == 'K');
+    assert(munmap(r + 4096, 4096) == 0);
+    reader = open(path, O_RDONLY);
+    assert(reader >= 0 && pread(reader, bytes, sizeof bytes, 0) == sizeof bytes && bytes[4097] == 'K');
+    assert(close(reader) == 0 && unlink(path) == 0);
+}
 
 static void append_probe(void) {
     const char *path = "/home/retroos/cache-append";
@@ -39,6 +59,7 @@ static void append_probe(void) {
 }
 
 int main(int argc, char **argv) {
+    mapping_lifetime_probe();
     append_probe();
     const char *file = "/home/retroos/cache-data";
     int fd = open(file, O_CREAT | O_TRUNC | O_RDWR, 0600);
@@ -56,6 +77,18 @@ int main(int argc, char **argv) {
     assert(b[33] == 'B');
     assert(pread(second, bytes, 128, 0) == 128 && bytes[33] == 'B');
     assert(pwrite(second, "C", 1, 33) == 1 && a[33] == 'C' && b[33] == 'C');
+    unsigned char *protected = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    assert(protected != MAP_FAILED && mprotect(protected, 4096, PROT_READ | PROT_WRITE) == 0);
+    protected[33] = 'C'; assert(a[33] == 'C');
+    assert(munmap(protected, 4096) == 0);
+    int readonly = open(file, O_RDONLY); assert(readonly >= 0);
+    errno = 0;
+    assert(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, readonly, 0) == MAP_FAILED && errno == EACCES);
+    protected = mmap(NULL, 4096, PROT_READ, MAP_SHARED, readonly, 0);
+    assert(protected != MAP_FAILED);
+    errno = 0;
+    assert(mprotect(protected, 4096, PROT_READ | PROT_WRITE) == -1 && errno == EACCES);
+    assert(munmap(protected, 4096) == 0 && close(readonly) == 0);
     assert(msync(a, 8192, MS_SYNC) == 0);
     assert(munmap(a, 8192) == 0 && munmap(b, 8192) == 0);
     assert(close(fd) == 0 && close(second) == 0);

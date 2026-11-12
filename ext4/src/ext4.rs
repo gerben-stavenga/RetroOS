@@ -13,6 +13,7 @@
 use alloc::vec::Vec;
 use bytemuck::{Pod, Zeroable};
 use core::mem::{offset_of, size_of};
+use core::cell::RefCell;
 
 use crate::{Corrupt, Error, Storage, Unsupported};
 
@@ -309,6 +310,15 @@ pub struct Ext4 {
     // the last successful group avoids rescanning a full filesystem prefix
     // for every single block of an extending file.
     allocation_group: [u32; 2],
+    // Enabled only by Filesystem, whose transaction owner resets these on
+    // rollback. Bare graphs can be passed arbitrary Storage views and stay
+    // uncached. Layout facts are immutable; inode facts follow typed edits.
+    decoded: RefCell<Option<DecodedMetadata>>,
+}
+
+struct DecodedMetadata {
+    inodes: crate::decoded::Index<Inode, 4096>,
+    inode_tables: crate::decoded::Index<u64, 256>,
 }
 
 #[derive(Clone, Copy)]
@@ -1156,9 +1166,28 @@ impl Ext4 {
             journal_inode: superblock.journal_inode.get(),
             needs_recovery: features.incompatible & 0x0004 != 0,
             allocation_group: [0; 2],
+            decoded: RefCell::new(None),
         };
         graph.validate_mount(&superblock, storage.len())?;
         Ok(graph)
+    }
+
+    pub(crate) fn enable_decoded_metadata(&self) {
+        *self.decoded.borrow_mut() = Some(DecodedMetadata {
+            inodes: crate::decoded::Index::new(), inode_tables: crate::decoded::Index::new(),
+        });
+    }
+
+    fn forget_inode(&self, number: u32) {
+        if let Some(decoded) = self.decoded.borrow_mut().as_mut() { decoded.inodes.remove(number); }
+    }
+
+    fn remember_inode(&self, inode: Inode) {
+        // Zero-link orphans must recheck the current orphan chain, never a
+        // cached successful validation of an earlier chain position.
+        if inode.references != 0 && let Some(decoded) = self.decoded.borrow_mut().as_mut() {
+            decoded.inodes.insert(inode.number, inode);
+        }
     }
 
     pub(crate) fn journal_blob(&self) -> Result<Blob, Error> {
@@ -1834,6 +1863,7 @@ impl Ext4 {
         };
         let allocation = self.allocate(storage, kind)?;
         let inode = u32::try_from(allocation.number).map_err(|_| Corrupt::AddressOverflow)?;
+        self.forget_inode(inode);
         let old: Inode128 = read_record(storage, allocation.inode_offset)?;
         let generation = old.generation.get().wrapping_add(1).max(1);
         let mut raw = Vec::new();
@@ -1886,6 +1916,7 @@ impl Ext4 {
     }
 
     fn release_inode(&mut self, storage: &mut dyn Storage, inode: Inode) -> Result<(), Error> {
+        self.forget_inode(inode.number);
         self.release_allocation(
             storage,
             if matches!(inode.object(), Object::Node(_)) {
@@ -2098,7 +2129,12 @@ impl Ext4 {
             .ok_or(Corrupt::InvalidInode(number))?;
         let group = index / self.inodes_per_group;
         let within = u64::from(index % self.inodes_per_group);
-        let inode_table = self.group(storage, group)?.inode_table;
+        let cached = self.decoded.borrow().as_ref().and_then(|decoded| decoded.inode_tables.get(group));
+        let inode_table = if let Some(table) = cached { table } else {
+            let table = self.group(storage, group)?.inode_table;
+            if let Some(decoded) = self.decoded.borrow_mut().as_mut() { decoded.inode_tables.insert(group, table); }
+            table
+        };
         if inode_table == 0 || inode_table >= self.blocks_count {
             return Err(Corrupt::InvalidInodeTable.into());
         }
@@ -2109,12 +2145,16 @@ impl Ext4 {
     }
 
     fn inode(&self, storage: &mut dyn Storage, number: u32) -> Result<Inode, Error> {
+        if let Some(inode) = self.decoded.borrow().as_ref().and_then(|decoded| decoded.inodes.get(number)) {
+            return Ok(inode);
+        }
         let offset = self.inode_offset(storage, number)?;
         let base: Inode128 = read_record(storage, offset)?;
         let inode = decode_inode(number, base)?;
         if inode.references == 0 && self.orphan_predecessor(storage, number)?.is_none() {
             Err(Error::NotFound)
         } else {
+            self.remember_inode(inode);
             Ok(inode)
         }
     }
@@ -2525,6 +2565,7 @@ impl Ext4 {
         number: u32,
         edit: &mut RawInodeEdit<'_>,
     ) -> Result<Inode, Error> {
+        self.forget_inode(number);
         let offset = self.inode_offset(storage, number)?;
         let mut raw = Vec::new();
         raw.try_reserve_exact(usize::from(self.inode_size))
@@ -2566,7 +2607,9 @@ impl Ext4 {
             raw[INODE_BASE_SIZE..160].copy_from_slice(bytemuck::bytes_of(extra));
         }
         write_storage(storage, offset, &raw)?;
-        decode_inode(number, base)
+        let inode = decode_inode(number, base)?;
+        self.remember_inode(inode);
+        Ok(inode)
     }
 
     fn change_references(

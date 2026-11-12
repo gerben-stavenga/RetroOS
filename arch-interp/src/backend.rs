@@ -117,6 +117,12 @@ impl Arch for Interp {
     }
     fn map_low_mem(&mut self) { crate::calls::arch_map_low_mem() }
     fn map_vga_text_aperture(&mut self) { crate::calls::arch_map_vga_text_aperture() }
+    fn frame_access(&self) -> Option<arch_abi::FrameAccess> { Some(crate::phys::frame_access()) }
+    fn map_frame(&mut self, vpage: usize, frame: u64, shared: bool, writable: bool, _executable: bool) -> bool {
+        crate::paging::space_map_frame(vpage, frame, shared, writable);
+        crate::engine::invalidate_pages(vpage, 1);
+        true
+    }
     fn alloc_shared_pages(&mut self, count: usize) -> core::ptr::NonNull<u8> {
         assert!(count != 0);
         let base = crate::phys::frame_ptr(crate::phys::alloc_frames(count));

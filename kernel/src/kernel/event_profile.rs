@@ -24,7 +24,14 @@ const READ_DETAIL_SLOTS: usize = 64;
 static mut READ_DETAILS: [(u16, u64, u64); READ_DETAIL_SLOTS] = [(0, 0, 0); READ_DETAIL_SLOTS];
 // calls, RM-call setup, DOS vector dispatch, continuation unwind.
 static mut DIRECT_RM_PHASES: [u64; 4] = [0; 4];
-pub(super) const FILE_IO_NAMES: [&str; 41] = ["read_allocate", "read_fetch", "read_copy", "mmap_zero", "mmap_read", "mmap_copy", "elf_allocate", "elf_read", "elf_copy", "ext4_read", "volume_read", "vfs_lock", "vfs_read", "cache_check", "cache_miss", "elf_seek", "cache_insert", "pipe_wait", "pipe_allocate", "disk_read", "disk_write", "disk_flush", "volume_flush", "smb_send", "smb_receive", "smb_sign", "smb_verify", "smb_response_allocate", "smb_read_decode", "smb_encode", "ext4_create", "ext4_set_meta", "ext4_mkdir", "ext4_commit_write", "ext4_unlink", "ext4_rmdir", "ext4_fsync", "ext4_resize", "directory_scan", "path_resolve", "write_permission"];
+pub(super) const FILE_IO_NAMES: [&str; 48] = ["read_allocate", "read_fetch", "read_copy", "mmap_zero", "mmap_read", "mmap_copy", "elf_allocate", "elf_read", "elf_copy", "ext4_read", "volume_read", "vfs_lock", "vfs_read", "cache_check", "cache_miss", "elf_seek", "cache_insert", "pipe_wait", "pipe_allocate", "disk_read", "disk_write", "disk_flush", "volume_flush", "smb_send", "smb_receive", "smb_sign", "smb_verify", "smb_response_allocate", "smb_read_decode", "smb_encode", "ext4_create", "ext4_set_meta", "ext4_mkdir", "ext4_commit_write", "ext4_unlink", "ext4_rmdir", "ext4_fsync", "ext4_resize", "directory_scan", "path_resolve", "write_permission", "loop_writeback", "loop_klog_sync", "loop_deadlines", "task_snapshot", "loop_network", "write_refresh", "rtc_read"];
+pub(super) const LOOP_WRITEBACK: usize = 41;
+pub(super) const LOOP_KLOG_SYNC: usize = 42;
+pub(super) const LOOP_DEADLINES: usize = 43;
+pub(super) const TASK_SNAPSHOT: usize = 44;
+pub(super) const LOOP_NETWORK: usize = 45;
+pub(super) const WRITE_REFRESH: usize = 46;
+pub(super) const RTC_READ: usize = 47;
 static mut FILE_IO: [[u64; 3]; FILE_IO_NAMES.len()] = [[0; 3]; FILE_IO_NAMES.len()];
 
 pub(super) struct FileIoScope { stage: usize, bytes: usize, start: Option<u64> }
@@ -137,6 +144,44 @@ pub(super) fn device_entries() -> [[u64; 2]; 7] {
     unsafe { *core::ptr::addr_of!(DEVICE_ENTRIES) }
 }
 
+/// Syscalls have their own unbounded table: faults and port traffic must not
+/// evict them from the bounded guest-event profile. ABI distinguishes equal
+/// syscall numbers with different meanings. Only the event loop accesses it.
+static mut SYSCALLS: alloc::collections::BTreeMap<(u32, u32), [u64; 3]> =
+    alloc::collections::BTreeMap::new();
+
+pub(crate) struct SyscallScope { key: (u32, u32), start: Option<u64> }
+impl SyscallScope {
+    pub(crate) fn start(number: u32, mode64: bool) -> Self {
+        let key = (if mode64 { 64 } else { 32 }, number);
+        let start = if super::startup::profile_enabled() {
+            // Allocate/lookup outside the measured handler interval.
+            unsafe { (&mut *core::ptr::addr_of_mut!(SYSCALLS)).entry(key).or_default(); }
+            Some(super::portio::now_ns())
+        } else { None };
+        Self { key, start }
+    }
+}
+impl Drop for SyscallScope {
+    fn drop(&mut self) {
+        let Some(start) = self.start else { return; };
+        let elapsed = super::portio::now_ns().saturating_sub(start);
+        unsafe {
+            let counters = (&mut *core::ptr::addr_of_mut!(SYSCALLS)).get_mut(&self.key)
+                .expect("profiled syscall has a counter");
+            counters[0] = counters[0].wrapping_add(1);
+            counters[1] = counters[1].wrapping_add(elapsed);
+            counters[2] = counters[2].max(elapsed);
+        }
+    }
+}
+
+pub(super) fn visit_syscalls(mut visit: impl FnMut(u32, u32, u64, u64, u64)) {
+    for (&(abi, number), &[calls, ns, max]) in unsafe { &*core::ptr::addr_of!(SYSCALLS) } {
+        visit(abi, number, calls, ns, max);
+    }
+}
+
 pub(super) struct Sample(Option<u64>);
 pub(super) struct Dispatch(Option<(usize, u64, u64)>);
 
@@ -222,6 +267,7 @@ pub(super) fn reset() {
     unsafe {
         (&mut *core::ptr::addr_of_mut!(COUNTERS)).fill(EMPTY);
         OVERFLOW = 0;
+        (&mut *core::ptr::addr_of_mut!(SYSCALLS)).clear();
         RM_TARGETS = [(0, 0, 0, 0); RM_TARGET_SLOTS];
         READ_DETAILS = [(0, 0, 0); READ_DETAIL_SLOTS];
         DIRECT_RM_PHASES = [0; 4];
@@ -300,6 +346,10 @@ pub(super) fn print() {
     let [allocs, alloc_ticks, alloc_max, frees, free_ticks, free_max] = lib::heap::profile();
     crate::compact_println!("[heap-prof] allocs={} ticks={} max={} frees={} ticks={} max={}",
         allocs, alloc_ticks, alloc_max, frees, free_ticks, free_max);
+    visit_syscalls(|abi, number, calls, ns, max| {
+        crate::compact_println!("[syscall-prof] abi={} nr={} calls={} ns={} max_ns={}",
+            abi, number, calls, ns, max);
+    });
     // Include I/O in the F12 dump as well as COM2 replies: physical machines
     // may have no connected diagnostic UART, but retain their kernel log.
     for (name, [calls, bytes, ns]) in FILE_IO_NAMES.into_iter().zip(file_io()) {

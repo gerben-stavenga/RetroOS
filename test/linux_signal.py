@@ -40,7 +40,7 @@ def run_case(failure):
 
 def main():
     (ROOT / 'build/ci').mkdir(parents=True, exist_ok=True)
-    for failure in (None, 'HIGH_FAULT', 'BAD_MXCSR', 'BAD_PC'):
+    for failure in (None, 'HIGH_FAULT', 'BAD_MXCSR', 'BAD_PC', 'ILLEGAL'):
         run_case(failure)
 
 

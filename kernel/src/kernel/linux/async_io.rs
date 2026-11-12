@@ -44,6 +44,8 @@ enum Wait {
     RecordLock(super::record_lock::Request),
     Read(u8, u64, usize),
     ReadV,
+    Splice,
+    Child(i32, usize),
     Socket(i32, u64, usize),
     Exited,
 }
@@ -55,6 +57,7 @@ struct Context {
     clear_tid: u64,
     wait: Wait,
     readv: Option<super::readv::Request>,
+    splice: Option<super::splice::Request>,
     select: Option<Box<super::select::Request>>,
 }
 #[derive(Clone)]
@@ -89,6 +92,7 @@ pub(super) struct State {
     next_thread: u32,
     active: usize,
     parked: bool,
+    children_changed: bool,
     descriptors: Vec<Option<Descriptor>>,
     handles: Vec<Option<usize>>,
     cloexec: Vec<bool>,
@@ -113,6 +117,8 @@ pub(super) fn debug_waits<A: crate::Arch>(kt: &thread::KernelThread<A>, state: &
             Wait::RecordLock(_) => ("record-lock", 0, 0),
             Wait::Read(fd, _, _) => ("read", fd as u64, 0),
             Wait::ReadV => ("readv", 0, 0),
+            Wait::Splice => ("splice", 0, 0),
+            Wait::Child(pid, _) => ("child", pid as u64, 0),
             Wait::Socket(fd, _, _) => ("socket", fd as u64, 0),
             Wait::Exited => continue,
         };
@@ -148,6 +154,7 @@ fn ensure<A: crate::Arch>(
         clear_tid: 0,
         wait: Wait::Ready,
         readv: None,
+        splice: None,
         select: None,
     });
     s.next_thread = 1;
@@ -694,6 +701,19 @@ pub(super) fn call<A: crate::Arch>(
                 return None;
             }
         }
+        275 => {
+            let request = match super::splice::Request::new(kt, a) {
+                Ok(request) => request,
+                Err(error) => return Some(SyscallResult::val(-error)),
+            };
+            if let Some(result) = request.step() { result }
+            else {
+                ensure(machine, kt, s, regs);
+                s.contexts[s.active].splice = Some(request);
+                s.contexts[s.active].wait = Wait::Splice;
+                0
+            }
+        }
         19 => {
             if descriptor(s, fd).is_some() { return Some(SyscallResult::val(-95)); }
             let request = match super::readv::Request::new(machine, kt, a, true) {
@@ -752,6 +772,7 @@ pub(super) fn call<A: crate::Arch>(
                     },
                     wait: Wait::Ready,
                     readv: None,
+                    splice: None,
                     select: None,
                 };
                 if let Some(index) = reuse {
@@ -909,6 +930,34 @@ pub(super) fn after_io<A: crate::Arch>(kt: &thread::KernelThread<A>, linux: &mut
 }
 
 pub(super) fn parked(state: &State) -> bool { state.parked }
+
+/// wait4 blocks the calling user thread, not the whole shared-address-space
+/// process. Child-table access and status writes happen with the process root
+/// active in the executor, outside the syscall handler's task-table borrow.
+pub(super) fn wait_child<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
+    linux: &mut LinuxState, regs: &mut Regs, pid: i32, status: usize)
+{
+    ensure(machine, kt, &mut linux.async_io, regs);
+    let s = &mut linux.async_io;
+    s.contexts[s.active].wait = Wait::Child(pid, status);
+    s.children_changed = true;
+    schedule(machine, kt, linux, regs, false);
+}
+
+pub(super) fn children_changed(state: &mut State) { state.children_changed = true; }
+pub(super) fn take_child_changes(state: &mut State) -> bool { core::mem::take(&mut state.children_changed) }
+
+pub(super) fn next_child_wait(state: &State, start: usize) -> Option<(usize, i32, usize)> {
+    state.contexts.iter().enumerate().skip(start).find_map(|(index, context)| {
+        if let Wait::Child(pid, status) = context.wait { Some((index, pid, status)) } else { None }
+    })
+}
+
+pub(super) fn complete_child_wait(state: &mut State, index: usize, result: i32) {
+    let context = &mut state.contexts[index];
+    context.regs.rax = result as i64 as u64;
+    context.wait = Wait::Ready;
+}
 pub(super) fn current_id(state: &State, process: i32) -> i32 {
     state.contexts.get(state.active).map_or(process, |context| context.id)
 }
@@ -921,6 +970,7 @@ pub(super) fn interrupt(kt: &mut thread::KernelThread<impl crate::Arch>, s: &mut
         if s.parked { *regs = context.regs; }
         context.wait = Wait::Ready;
         context.readv = None;
+        context.splice = None;
         context.select = None;
         regs.rax = (-4i64) as u64;
     }
@@ -933,12 +983,20 @@ pub(super) fn schedule<A: crate::Arch>(
     kt: &mut thread::KernelThread<A>,
     linux: &mut LinuxState,
     regs: &mut Regs,
+    rotate: bool,
 ) {
     if regs.mode() != crate::UserMode::Mode64 {
         return;
     }
     let s = &mut linux.async_io;
     if s.contexts.is_empty() {
+        return;
+    }
+    // A successful ordinary syscall is not a yield. In particular JVM
+    // nanoTime calls should not poll every sleeper and switch FP/TLS state
+    // to a different runnable thread. IRQ preemption, blocking and explicit
+    // sched_yield still select another context.
+    if !rotate && !s.parked && matches!(s.contexts[s.active].wait, Wait::Ready) {
         return;
     }
     if !s.parked {
@@ -992,10 +1050,12 @@ pub(super) fn schedule<A: crate::Arch>(
                     .map(|n| if high_memory::copy_to(machine, out, &data[..n]) { n as i32 } else { -EFAULT })
             }
             Wait::ReadV => s.contexts[i].readv.as_ref().unwrap().step(machine),
+            Wait::Splice => s.contexts[i].splice.as_ref().unwrap().step(),
             _ => None,
         };
         if let Some(result) = result {
             s.contexts[i].readv = None;
+            s.contexts[i].splice = None;
             s.contexts[i].select = None;
             s.contexts[i].regs.rax = result as i64 as u64;
             s.contexts[i].wait = Wait::Ready;
@@ -1190,6 +1250,7 @@ pub(super) fn wake_signal<A: crate::Arch>(kt: &mut thread::KernelThread<A>, stat
         && !matches!(context.wait, Wait::Ready | Wait::Exited) {
         context.wait = Wait::Ready;
         context.readv = None;
+        context.splice = None;
         context.select = None;
         context.regs.rax = (-4i64) as u64;
         if index == state.active && !state.parked { kt.vcpu.regs.rax = (-4i64) as u64; }

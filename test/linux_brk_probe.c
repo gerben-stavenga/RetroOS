@@ -20,8 +20,12 @@ int main(void) {
     CHECK(brk_at(0)==base+4*4096 && *live==0x123456789abcdef0UL);
     CHECK(brk_at(0x500020000000UL)==base+4*4096);
     CHECK(brk_at(1)==base+4*4096);
+    volatile unsigned char *released=(void *)(base+3*4096);
+    for (unsigned i=0;i<4096;i++) released[i]=0xa5;
     CHECK(brk_at(base+2*4096)==base+2*4096);
     CHECK(brk_at(0)==base+2*4096 && *live==0x123456789abcdef0UL);
+    CHECK(brk_at(base+4*4096)==base+4*4096);
+    for (unsigned i=0;i<4096;i++) CHECK(released[i]==0);
     static const char pass[]="BRK_PASS: internal guard, growth, collision preserves heap, full-width rejection and shrink\n";
     CHECK(write(2,pass,sizeof pass-1)==sizeof pass-1);
     _exit(0);

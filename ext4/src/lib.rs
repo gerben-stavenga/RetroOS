@@ -9,6 +9,7 @@
 
 extern crate alloc;
 
+mod decoded;
 mod checksum;
 pub mod ext4;
 mod filesystem;

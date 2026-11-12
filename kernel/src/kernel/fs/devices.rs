@@ -55,6 +55,7 @@ impl Filesystem for DeviceFs {
     fn supports_create(&self) -> bool {
         true
     }
+    fn discard_sink(&self, handle: u64) -> bool { handle == NULL }
     fn meta(&self, path: &[u8]) -> Option<Meta> {
         let mode = if path.is_empty() {
             0o755

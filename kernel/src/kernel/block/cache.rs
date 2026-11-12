@@ -7,6 +7,7 @@
 
 use super::{Disk, FlushError, ReadKind, Volume};
 use alloc::boxed::Box;
+use crate::kernel::cache::{Frame, Lru};
 use alloc::collections::BTreeMap;
 use core::cell::{Cell, RefCell};
 
@@ -40,8 +41,7 @@ pub(crate) fn profile() -> [u64; 4] {
 }
 
 struct Page {
-    data: Box<[u8]>,
-    used: u64,
+    data: Frame,
 }
 
 /// Kernel-owned policy, independent of filesystem implementations.
@@ -59,6 +59,7 @@ pub struct CachedDisk {
     policy: CachePolicy,
     pages: RefCell<BTreeMap<u64, Page>>,
     clock: Cell<u64>,
+    lru: RefCell<Lru<u64>>,
 }
 
 struct VolumeDisk {
@@ -110,16 +111,17 @@ impl CachedDisk {
             policy,
             pages: RefCell::new(BTreeMap::new()),
             clock: Cell::new(0),
+            lru: RefCell::new(Lru::new()),
         }
     }
 
     fn load_page(&self, page: u64, kind: ReadKind) -> bool {
         let now = self.clock.get().wrapping_add(1);
         self.clock.set(now);
-        let mut pages = self.pages.borrow_mut();
-        if let Some(cached) = pages.get_mut(&page) {
+        let pages = self.pages.borrow();
+        if pages.contains_key(&page) {
             profile_add(0, 1);
-            cached.used = now;
+            self.lru.borrow_mut().touch(page, now);
             return true;
         }
         drop(pages);
@@ -147,15 +149,12 @@ impl CachedDisk {
         profile_add(3, available as u64);
 
         let mut pages = self.pages.borrow_mut();
-        if pages.len() == PAGE_LIMIT
-            && let Some(oldest) = pages
-                .iter()
-                .min_by_key(|(_, cached)| cached.used)
-                .map(|(&page, _)| page)
-        {
+        if pages.len() == PAGE_LIMIT && let Some(oldest) = self.lru.borrow_mut().pop() {
             pages.remove(&oldest);
         }
-        pages.insert(page, Page { data, used: now });
+        let Ok(data) = Frame::new(&data) else { return false; };
+        pages.insert(page, Page { data });
+        self.lru.borrow_mut().touch(page, now);
         true
     }
 
@@ -169,6 +168,7 @@ impl CachedDisk {
         let mut pages = self.pages.borrow_mut();
         for page in first..=last {
             pages.remove(&page);
+            self.lru.borrow_mut().remove(page);
         }
     }
 }
@@ -207,8 +207,7 @@ impl Disk for CachedDisk {
             let Some(cached) = pages.get(&page) else {
                 return copied.div_ceil(512) as u32;
             };
-            buffer[copied..copied + amount]
-                .copy_from_slice(&cached.data[within..within + amount]);
+            cached.data.read(within, &mut buffer[copied..copied + amount]);
             copied += amount;
             position += amount as u64;
         }

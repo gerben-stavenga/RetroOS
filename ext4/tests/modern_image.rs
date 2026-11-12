@@ -1285,12 +1285,19 @@ fn read_intent_survives_journal_and_transaction_overlays() {
         format: Some(0x8000 | 0o644), ..AttributeUpdate::default()
     }).unwrap() else { panic!("expected file") };
     fs.write(&mut storage, blob, 0, &[0x5a; 8192]).unwrap();
+    // A fresh mount exercises uncached metadata intent; a warm inode should
+    // not manufacture metadata reads just to demonstrate the hint.
+    let mut fs = Filesystem::mount(&mut storage).unwrap();
     storage.reads.clear();
     let mut data = [0; 8192];
     assert_eq!(fs.read(&mut storage, blob, 0, &mut data).unwrap(), data.len());
     assert_eq!(data, [0x5a; 8192]);
     assert!(storage.reads.contains(&ReadKind::Metadata));
     assert!(storage.reads.contains(&ReadKind::FileData));
+    storage.reads.clear();
+    assert_eq!(fs.read(&mut storage, blob, 0, &mut data).unwrap(), data.len());
+    assert!(!storage.reads.is_empty());
+    assert!(storage.reads.iter().all(|kind| *kind == ReadKind::FileData));
 
     storage.reads.clear();
     let mut overlay = BlockOverlay::new(&mut storage, 4096);
@@ -1426,7 +1433,7 @@ fn bounded_writeback_rolls_over_without_losing_file_contents() {
         let name = format!("rollover-{number}");
         let object = filesystem.create_blob(&mut storage, root, name.as_bytes(), AttributeUpdate::default()).unwrap();
         let Object::Blob(blob) = object else { panic!("not a blob"); };
-        filesystem.write(&mut storage, blob, 0, &[number; 4096]).unwrap();
+        filesystem.write(&mut storage, blob, 0, &[number; 16384]).unwrap();
     }
     assert!(storage.effects()[begin..].iter().any(|effect| effect.kind == EffectKind::Flush));
     filesystem.sync(&mut storage).unwrap();
@@ -1439,8 +1446,51 @@ fn bounded_writeback_rolls_over_without_losing_file_contents() {
         let name = format!("rollover-{number}");
         let object = filesystem.find(&mut storage, root, name.as_bytes()).unwrap().unwrap().1;
         let Object::Blob(blob) = object else { panic!("not a blob"); };
-        let mut bytes = [0; 4096];
+        let mut bytes = [0; 16384];
         assert_eq!(filesystem.read(&mut storage, blob, 0, &mut bytes).unwrap(), bytes.len());
-        assert_eq!(bytes, [number; 4096]);
+        assert_eq!(bytes, [number; 16384]);
     }
+}
+
+#[test]
+fn decoded_inode_facts_are_reused_and_follow_mutation_rollback_and_reuse() {
+    use portable_ext4::Filesystem;
+    use portable_ext4::ext4::{AttributeUpdate, Object};
+    let mut storage = ModelStorage::new(image());
+    let mut fs = Filesystem::mount(&mut storage).unwrap();
+    fs.enable_writeback(&mut storage).unwrap();
+    let root = fs.root(&mut storage).unwrap();
+    let attributes = AttributeUpdate { format: Some(0x8000 | 0o640), owner: Some(123),
+        modified: Some(1700000000), ..AttributeUpdate::default() };
+    let object = fs.create_blob(&mut storage, root, b"decoded-test", attributes).unwrap();
+    let Object::Blob(blob) = object else { panic!() };
+    let expected = fs.inspect(&mut storage, object).unwrap();
+    let effects = storage.effects().len();
+    for _ in 0..1000 {
+        assert_eq!(fs.inspect(&mut storage, object).unwrap(), expected);
+        assert_eq!(fs.root(&mut storage).unwrap(), root);
+    }
+    assert_eq!(storage.effects().len(), effects, "hot inode reads repeated storage work");
+    fs.write(&mut storage, blob, 0, &[0x5a;8193]).unwrap();
+    fs.update_attributes(&mut storage, object, AttributeUpdate { format: Some(0x8000|0o600),
+        owner: Some(456), modified: Some(1700000123), ..AttributeUpdate::default() }).unwrap();
+    // An aborted namespace mutation must not retire previously staged facts.
+    assert!(fs.create_blob(&mut storage, root, b"decoded-test", attributes).is_err());
+    let after_failure = storage.effects().len();
+    let current = fs.inspect(&mut storage, object).unwrap();
+    assert_eq!(storage.effects().len(), after_failure, "read-only failure discarded hot metadata");
+    assert_eq!((current.size,current.owner,current.modified,current.format),
+        (8193,456,1700000123,0x8000|0o600));
+    let (edge,_) = fs.find(&mut storage,root,b"decoded-test").unwrap().unwrap();
+    fs.remove(&mut storage,edge).unwrap();
+    assert!(fs.inspect(&mut storage,object).is_err());
+    let replacement = fs.create_blob(&mut storage,root,b"decoded-test",attributes).unwrap();
+    assert_eq!(replacement,object,"fixture must exercise inode reuse");
+    let current = fs.inspect(&mut storage,replacement).unwrap();
+    assert_eq!((current.size,current.owner,current.modified,current.format),
+        (0,123,1700000000,0x8000|0o640));
+    fs.sync(&mut storage).unwrap();
+    storage.power_loss();
+    let mut recovered = Filesystem::mount(&mut storage).unwrap();
+    assert_eq!(recovered.inspect(&mut storage,replacement).unwrap(),current);
 }

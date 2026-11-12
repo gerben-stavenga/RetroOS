@@ -508,6 +508,22 @@ pub fn space_map_shared(vpage: usize, count: usize, ppage: u64) {
     });
 }
 
+/// Alias one externally-owned RAM frame, retaining a PTE owner. Private
+/// writable mappings start COW; mprotect also accounts for retained owners.
+pub fn space_map_frame(vpage: usize, frame: u64, shared: bool, writable: bool) {
+    with_active_pd(|pd| {
+        let address = (vpage * 4096) as u32;
+        phys::inc_ref(frame);
+        if let Some(old) = translate(pd, address) { phys::free_frames(u64::from(old >> 12), 1); }
+        if shared || !writable { map_page(pd, address, frame, writable); }
+        else { map_page_cow(pd, address, frame); }
+        let pt = u64::from(read_entry(pd, pde_index(address)) >> 12);
+        let mut entry = pte_raw(pd, address);
+        if shared { entry |= SHARED; }
+        write_entry(pt, pte_index(address), entry);
+    });
+}
+
 /// Set writability across `count` present pages.
 pub fn space_set_writable(vpage: usize, count: usize, writable: bool) {
     with_active_pd(|pd| {
@@ -522,7 +538,10 @@ pub fn space_set_writable(vpage: usize, count: usize, writable: bool) {
             if pte & PRESENT == 0 {
                 continue;
             }
-            let nf = if writable { pte | WRITABLE } else { pte & !WRITABLE };
+            let nf = if !writable { pte & !(WRITABLE | COW) }
+            else if pte & SHARED == 0 && phys::is_shared(u64::from(pte >> 12)) {
+                (pte | COW) & !WRITABLE
+            } else { (pte | WRITABLE) & !COW };
             write_entry(pt, pte_index(v), nf);
         }
     });
@@ -1054,6 +1073,26 @@ fn translate64(pml4: u64, vaddr: u64) -> Option<u64> {
 #[cfg(test)]
 mod space_ops {
     use super::*;
+
+    #[test]
+    fn cached_frame_private_protection_and_cow_preserve_backing_owner() {
+        space_init(); let parent = space_new(); space_switch(parent);
+        let frame = phys::alloc_frames(1);
+        unsafe { *phys::frame_ptr(frame) = 0x42; }
+        space_map_frame(0x41000, frame, false, false);
+        assert_eq!(space_translate(0x41000000), Some((frame * 4096) as u32));
+        assert!(!space_cow_fault(0x41000000), "read-only protection denies writes");
+        let child = space_fork(parent); space_switch(child);
+        assert!(!space_cow_fault(0x41000000));
+        space_set_writable(0x41000, 1, true);
+        assert!(space_cow_fault(0x41000000));
+        let copy = space_translate(0x41000000).unwrap();
+        assert_ne!(u64::from(copy >> 12), frame);
+        unsafe { *phys::frame_ptr(u64::from(copy >> 12)) = 0x77; }
+        assert_eq!(unsafe { *phys::frame_ptr(frame) }, 0x42);
+        space_clean(); space_switch(parent); space_clean();
+        assert!(!phys::is_shared(frame)); phys::free_frames(frame, 1);
+    }
 
     #[test]
     fn shared_kernel_ram_aliases_survive_fork_and_guest_teardown() {

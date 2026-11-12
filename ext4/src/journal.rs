@@ -220,6 +220,12 @@ impl Format {
         }
     }
 
+    fn descriptor_capacity(self, block_size: u32) -> usize {
+        (block_size as usize).saturating_sub(
+            usize::from(self.has_checksums()) * 4 + size_of::<JournalHeader>() + self.uuid.len())
+            / self.tag_len()
+    }
+
     fn advance(self, block: u32) -> u32 {
         if block + 1 == self.max_len {
             self.first
@@ -371,10 +377,12 @@ impl GraphJournal {
             || format.incompat & INCOMPAT_ASYNC_COMMIT != 0 {
             return Err(Unsupported::JournalWriteProfile.into());
         }
-        // One descriptor, payload blocks and one commit record must all fit.
-        // The descriptor allowance is conservative even for 1 KiB blocks.
-        Ok((self.block_size as usize / 32).saturating_sub(2)
-            .min((format.max_len - format.first).saturating_sub(2) as usize).min(64))
+        // Bound temporary transaction bytes, not an arbitrary block count.
+        // Larger blocks must not reserve hundreds of MiB of kernel VA.
+        const STAGING_BYTES: usize = 1024 * 1024;
+        Ok(format.descriptor_capacity(self.block_size)
+            .min((format.max_len - format.first).saturating_sub(2) as usize)
+            .min(STAGING_BYTES / self.block_size as usize))
     }
 
     #[inline(never)]
@@ -666,14 +674,7 @@ impl GraphJournal {
         format: Format,
         dirty: &BlockChanges,
     ) -> Result<(Vec<u8>, Vec<u8>), Error> {
-        let capacity = self.block_size as usize - usize::from(format.has_checksums()) * 4;
-        let tags_len = dirty
-            .blocks
-            .len()
-            .checked_mul(format.tag_len())
-            .and_then(|bytes| bytes.checked_add(size_of::<JournalHeader>() + format.uuid.len()))
-            .ok_or(Corrupt::AddressOverflow)?;
-        if tags_len > capacity {
+        if dirty.blocks.len() > format.descriptor_capacity(self.block_size) {
             return Err(Unsupported::JournalWriteProfile.into());
         }
 

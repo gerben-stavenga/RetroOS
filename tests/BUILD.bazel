@@ -1443,6 +1443,38 @@ integration_test(
 )
 
 integration_test(
+    name = "linux_splice",
+    command = ["python3", "test/linux_splice.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_thread_wait",
+    command = ["python3", "test/linux_thread_wait.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_frame_cache",
+    command = ["python3", "test/linux_frame_cache.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_frame_cache_large",
+    command = ["python3", "test/linux_frame_cache.py", "--large"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
     name = "linux_cache_budget",
     command = ["python3", "test/linux_cache_budget.py"],
     sources = ["//:integration_sources"],
@@ -1469,6 +1501,38 @@ integration_test(
 integration_test(
     name = "linux_sigchld",
     command = ["python3", "test/linux_sigchld.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_clock_progress",
+    command = ["python3", "test/linux_clock_progress.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_vdso",
+    command = ["python3", "test/linux_vdso.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_writeback_shutdown",
+    command = ["python3", "test/linux_writeback_shutdown.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_fd_metadata",
+    command = ["python3", "test/linux_fd_metadata.py"],
     sources = ["//:integration_sources"],
     metal = ["//:boot_disk"],
     tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
@@ -1544,6 +1608,14 @@ integration_test(
     sources = ["//:integration_sources"],
     metal = ["//:boot_disk"],
     tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_build_cache",
+    command = ["python3", "test/linux_build_cache.py", "--shape-directories"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["external", "manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
 )
 
 integration_test(
@@ -1951,8 +2023,14 @@ test_suite(
         ":linux_vfork_signal",
         ":linux_exec_arguments",
         ":linux_signal",
+        ":linux_splice",
+        ":linux_thread_wait",
         ":linux_sigchld",
         ":linux_time_high",
+        ":linux_fd_metadata",
+        ":linux_writeback_shutdown",
+        ":linux_vdso",
+        ":linux_clock_progress",
         ":linux_high_stack",
         ":linux_brk",
         ":linux_kill",

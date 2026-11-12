@@ -19,14 +19,13 @@
 //! filesystems never call back into `vfs`, so holding the lock across `fs.read`/
 //! `fs.open` is safe.
 
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
 use crate::kernel::thread::{FdKind, MAX_FDS};
 use crate::kernel::fs::grant::WriteAccess;
 
 pub mod mapping;
-pub(crate) mod executable;
 
 /// First usable file descriptor (0=stdin, 1=stdout, 2=stderr)
 const FIRST_FD: usize = 3;
@@ -94,6 +93,10 @@ pub trait Filesystem {
     /// Ownership of a stable node returned by directory enumeration or
     /// file_identity, without repeating a pathname walk.
     fn meta_node(&self, _node: u64) -> Option<Meta> { None }
+
+    /// Fresh metadata by stable object identity, without resolving its name.
+    /// Return ownership in the same snapshot instead of inspecting twice.
+    fn stat_node(&self, _node: u64) -> Option<(Stat, Meta)> { None }
 
     /// Stop union lookup even on a miss within a kernel-owned namespace.
     fn exclusive_path(&self, _path: &[u8]) -> bool { false }
@@ -226,6 +229,9 @@ pub trait Filesystem {
     /// failed. VFS never substitutes another filesystem.
     fn supports_create(&self) -> bool { false }
 
+    /// A stateless sink that accepts and discards every written byte.
+    fn discard_sink(&self, _handle: u64) -> bool { false }
+
     /// Create a directory. Returns 0 on success, negative errno on failure.
     fn mkdir(&self, _path: &[u8]) -> i32 { -38 }
     fn mkdir_mode(&self, path: &[u8], _mode: u32) -> i32 { self.mkdir(path) }
@@ -281,6 +287,20 @@ pub trait Filesystem {
     /// as "cannot be judged", not "permitted".
     fn meta(&self, _path: &[u8]) -> Option<Meta> {
         None
+    }
+
+    /// Visit directory metadata from the mount root through `path`, stopping
+    /// on a missing component or a rejected ancestor. Backends with object
+    /// handles can walk once instead of resolving each prefix from the root.
+    fn walk_directory_metadata(&self, path: &[u8], visit: &mut dyn FnMut(Meta, bool) -> bool) -> bool {
+        let mut end = 0;
+        loop {
+            let Some(meta) = self.meta(&path[..end]) else { return false; };
+            if !visit(meta, end == path.len()) { return false; }
+            if end == path.len() { return true; }
+            end = path[end + 1..].iter().position(|&c| c == b'/')
+                .map_or(path.len(), |n| end + 1 + n);
+        }
     }
 
     /// Set ownership and mode. False if unsupported or the write failed.
@@ -384,6 +404,7 @@ pub struct FileEntry {
     /// it every file shares ino 0 and ld.so thinks libc == the main binary.
     pub ino: u64,
     cache_id: u64,
+    cache_path_based: bool,
     /// Index into the mount table (which filesystem owns this file)
     pub mount_idx: u8,
     /// Decided once at open/create, when the PATH was still in hand: may
@@ -512,19 +533,33 @@ const READDIR_BATCH: usize = 64;
 
 /// A directory listing owned by the namespace layer. Backends enumerate;
 /// name lookup is performed against these retained listings.
+enum ChildLookup {
+    Cached(usize),
+    Live(DirEntry),
+}
+
 struct DirCache {
-    dir: Vec<u8>,
     entries: Vec<DirEntry>,
+    // Index only metadata positions, not names or file contents. Equal keys
+    // include every hard-link name in this listing.
+    files_by_node: Vec<((u8, u64), usize)>,
     names: BTreeMap<Vec<u8>, usize>,
+    /// Resolved once with the listing. Namespace invalidation must not walk
+    /// and allocate bind paths again for every cached directory.
+    sources: Vec<(u8, Vec<u8>)>,
 }
 
 impl DirCache {
     fn new(
-        dir: &[u8],
         entries: Vec<DirEntry>,
         names: BTreeMap<Vec<u8>, usize>,
+        sources: Vec<(u8, Vec<u8>)>,
     ) -> Self {
-        Self { dir: dir.to_vec(), entries, names }
+        let mut files_by_node: Vec<_> = entries.iter().enumerate()
+            .filter(|(_, entry)| !entry.is_dir)
+            .map(|(index, entry)| ((entry.mount_idx, entry.node), index)).collect();
+        files_by_node.sort_unstable_by_key(|entry| entry.0);
+        Self { entries, files_by_node, names, sources }
     }
 }
 
@@ -557,11 +592,14 @@ struct Vfs {
     /// with demand; process handle limits belong to each process's fd/JFT.
     file_table: Vec<FileEntry>,
     file_pages: BTreeMap<mapping::Key, mapping::Page>,
-    clean_page_keys: BTreeMap<mapping::Key, u64>,
-    clean_page_lru: BTreeSet<(u64, mapping::Key)>,
-    executables: Vec<executable::Image>,
+    /// Number of shared cache pages retaining each backing handle. Private
+    /// aliases and ordinary cached file contents do not pin a handle.
+    mapped_handles: BTreeMap<i32, usize>,
+    clean_pages: crate::kernel::cache::Lru<mapping::Key>,
+    validated_versions: BTreeMap<(u8, u64), ContentVersion>,
+    cached_paths: BTreeMap<(u8, u64), Vec<u8>>,
     page_clock: u64,
-    dir_cache: Vec<DirCache>,
+    dir_cache: BTreeMap<Vec<u8>, DirCache>,
     /// Changes whenever directory-visible metadata may have changed. DOS's
     /// 8.3 cache keys off this so a file grown after create is not forever
     /// reported with its original zero size.
@@ -579,11 +617,12 @@ impl Vfs {
             record_locks: crate::kernel::fs::record_locks::Table::new(),
             file_table: Vec::new(),
             file_pages: BTreeMap::new(),
-            clean_page_keys: BTreeMap::new(),
-            clean_page_lru: BTreeSet::new(),
-            executables: Vec::new(),
+            mapped_handles: BTreeMap::new(),
+            clean_pages: crate::kernel::cache::Lru::new(),
+            validated_versions: BTreeMap::new(),
+            cached_paths: BTreeMap::new(),
             page_clock: 0,
-            dir_cache: Vec::new(),
+            dir_cache: BTreeMap::new(),
             dir_generation: 0,
         }
     }
@@ -652,7 +691,10 @@ impl Vfs {
                 let done = match binding.target {
                     BindTarget::Server(fs) => visit(index as u8, fs, subpath) || fs.exclusive_path(subpath),
                     BindTarget::Alias { src_prefix } if depth != 0 => {
-                        let mut rewritten = alloc::vec![0; PATH_KEY_MAX];
+                        // Alias recursion is capped at eight levels. Keep its 1 KiB
+                        // temporary off the heap rather than allocate/free on every
+                        // cached path component.
+                        let mut rewritten = [0; PATH_KEY_MAX];
                         compose_alias(src_prefix, subpath, &mut rewritten)
                             .is_some_and(|len| self.visit_layers(&rewritten[..len], depth - 1, visit))
                     }
@@ -736,15 +778,9 @@ impl Vfs {
             WriteAccess::Delegated => true,
             WriteAccess::Granted(grant) => {
                 let fs = self.mount_fs(midx);
-                // Every ancestor must be searchable, including the mount root.
-                let mut end = 0;
-                loop {
-                    if !fs.meta(&parent[..end]).is_some_and(|m| grant.directory_access(&m, 1)) { return false; }
-                    if end == parent.len() { break; }
-                    end = parent[end + 1..].iter().position(|&c| c == b'/')
-                        .map_or(parent.len(), |n| end + 1 + n);
-                }
-                fs.meta(parent).is_some_and(|m| grant.directory_access(&m, 3))
+                fs.walk_directory_metadata(parent, &mut |meta, final_component| {
+                    grant.directory_access(&meta, if final_component { 3 } else { 1 })
+                })
             }
         }
     }
@@ -797,7 +833,7 @@ impl Vfs {
     /// same prefix (single-winner); `Union` stacks on top. The whole table is
     /// built at startup before any open, so this never reindexes live handles.
     fn add_binding(&mut self, prefix: &'static [u8], target: BindTarget, mode: MountMode) {
-        self.executables.clear();
+        self.validated_versions.clear();
         self.drop_clean_pages();
         if mode == MountMode::Replace {
             self.mounts.retain(|b| !eq_ignore_case(b.prefix, prefix));
@@ -853,13 +889,15 @@ impl Vfs {
         writable: bool,
     ) -> i32 {
         let index = self.alloc_file_entry();
+        let identity = self.mount_fs(mount_idx).file_identity(vnode.handle);
         let entry = FileEntry {
             vnode,
             offset: 0,
             append: false,
             refcount: 1,
             ino,
-            cache_id: self.mount_fs(mount_idx).file_identity(vnode.handle).unwrap_or_else(|| self.backend_path_id(mount_idx, path)),
+            cache_id: identity.unwrap_or_else(|| self.backend_path_id(mount_idx, path)),
+            cache_path_based: identity.is_none(),
             mount_idx,
             writable,
             mtime_dirty: false,
@@ -899,6 +937,7 @@ impl Vfs {
             let handle = self.file_table[i].vnode.handle;
             let midx = self.file_table[i].mount_idx;
             let closed = self.mount_fs(midx).clunk(handle);
+            self.forget_empty_cache_file((midx, self.file_table[i].cache_id));
             if flushed < 0 || closed < 0 { self.drop_clean_pages(); }
             return if flushed < 0 { flushed } else { closed };
         }
@@ -944,7 +983,7 @@ impl Vfs {
         let Some(entry) = entry else { self.invalidate_dir_cache(); return; };
         let fs = self.mount_fs(entry.mount_idx);
         let mut cached = core::mem::take(&mut self.dir_cache);
-        cached.retain(|directory| !directory.entries.iter().any(|child| {
+        cached.retain(|_, directory| !directory.entries.iter().any(|child| {
             core::ptr::eq(self.mount_fs(child.mount_idx), fs)
                 && (entry.node == 0 || child.node == 0 || child.node == entry.node)
         }));
@@ -969,13 +1008,13 @@ impl Vfs {
             false
         });
         let mut cached = core::mem::take(&mut self.dir_cache);
-        cached.retain(|directory| {
+        cached.retain(|name, directory| {
             // Synthetic mount ancestors have no backend-relative counterpart.
-            if directory.dir == parent { return false; }
-            !self.visit_layers(&directory.dir, ALIAS_DEPTH, &mut |idx, fs, subpath| {
+            if name.as_slice() == parent { return false; }
+            !directory.sources.iter().any(|(idx, subpath)| {
                 targets.iter().any(|(mount, path, parent, grandparent)| {
-                    if *mount != idx && !core::ptr::eq(self.mount_fs(*mount), fs) { return false; }
-                    subpath == parent || grandparent.as_deref() == Some(subpath)
+                    if *mount != *idx && !core::ptr::eq(self.mount_fs(*mount), self.mount_fs(*idx)) { return false; }
+                    subpath == parent || grandparent.as_deref() == Some(subpath.as_slice())
                         || subtree && (subpath == path || subpath.strip_prefix(path.as_slice())
                             .is_some_and(|tail| tail.starts_with(b"/")))
                 })
@@ -989,26 +1028,31 @@ impl Vfs {
     /// names (including negative lookups) and update every listed hard link
     /// and bind alias of that inode. Path-only backends retain invalidation.
     fn refresh_written_file(&mut self, handle: i32) {
-        self.invalidate_executable(handle);
+        let _sample = super::event_profile::FileIoScope::start(super::event_profile::WRITE_REFRESH, 0);
         let entry = &self.file_table[handle as usize];
         let mount = entry.mount_idx;
         let Some(identity) = self.mount_fs(mount).file_identity(entry.vnode.handle) else {
-            self.invalidate_dir_cache();
+            // Path-only filesystems have no hard-link identities to refresh.
+            // Retire the affected directory views, including bind aliases.
+            // A session TEMP write must not evict Linux header/library names.
+            let path = entry.path.clone();
+            self.invalidate_path_cache(&path, false);
             return;
         };
         let size = entry.vnode.size;
         let modified = if entry.unlinked { None } else { self.mtimes.get(&entry.path).copied() };
-        self.dir_cache.retain_mut(|directory| {
+        self.dir_cache.retain(|_, directory| {
             // An exact file bind deliberately discards the shadowed node.
             // Re-read that listing rather than retaining unknown metadata.
-            if directory.entries.iter().any(|e| e.mount_idx == mount && e.node == 0 && !e.is_dir) {
+            if directory.files_by_node.binary_search_by_key(&(mount, 0), |entry| entry.0).is_ok() {
                 return false;
             }
-            for child in &mut directory.entries {
-                if child.mount_idx == mount && child.node == identity {
-                    child.size = size;
-                    if let Some(time) = modified { child.mtime = time; }
-                }
+            let key = (mount, identity);
+            let first = directory.files_by_node.partition_point(|entry| entry.0 < key);
+            for &(_, index) in directory.files_by_node[first..].iter().take_while(|entry| entry.0 == key) {
+                let child = &mut directory.entries[index];
+                child.size = size;
+                if let Some(time) = modified { child.mtime = time; }
             }
             true
         });
@@ -1017,7 +1061,11 @@ impl Vfs {
 
     fn ownership(&mut self, path: &[u8], follow_final: bool) -> Option<(u32, u32)> {
         let path = self.resolve_symlinks(path, follow_final)?;
-        if let Some((parent, name)) = split_parent_bytes(&path)
+        self.ownership_resolved(&path)
+    }
+
+    fn ownership_resolved(&mut self, path: &[u8]) -> Option<(u32, u32)> {
+        if let Some((parent, name)) = split_parent_bytes(path)
             && let Some(entry) = self.cached_child(parent, name)
             && entry.node != 0
             && let Some(meta) = self.mount_fs(entry.mount_idx).meta_node(entry.node)
@@ -1025,7 +1073,7 @@ impl Vfs {
             return Some((meta.uid, meta.gid));
         }
         let mut owner = None;
-        self.visit_layers(&path, ALIAS_DEPTH, &mut |_, fs, subpath| {
+        self.visit_layers(path, ALIAS_DEPTH, &mut |_, fs, subpath| {
             owner = fs.meta(subpath).map(|meta| (meta.uid, meta.gid));
             owner.is_some()
         });
@@ -1034,7 +1082,7 @@ impl Vfs {
 
     fn cached_directory_node(&self, dir: &[u8], mount_idx: u8) -> Option<u64> {
         let (parent, name) = split_parent_bytes(dir)?;
-        let cached = self.dir_cache.iter().find(|cached| cached.dir == parent)?;
+        let cached = self.dir_cache.get(parent)?;
         let entry = cached.entries.get(*cached.names.get(name)?)?;
         (entry.mount_idx == mount_idx && entry.node != 0 && entry.is_dir)
             .then_some(entry.node)
@@ -1048,11 +1096,13 @@ impl Vfs {
         let sample = crate::kernel::event_profile::file_io_start();
         let mut entries: Vec<DirEntry> = Vec::new();
         let mut visible_names: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+        let mut sources = Vec::new();
 
         // Union merge: visit every member of the group in priority order (most
         // recent first); an upper layer shadows a lower one on a name clash.
         // For a Replace group this is just the one backing fs (== old behavior).
         self.visit_layers(dir, ALIAS_DEPTH, &mut |idx, fs, subpath| {
+            sources.push((idx, subpath.to_vec()));
             let mut batch: Vec<DirEntry> = Vec::new();
             let mut cookie = READDIR_START;
             let directory_node = if subpath.is_empty() {
@@ -1161,21 +1211,32 @@ impl Vfs {
         }
 
         crate::kernel::event_profile::file_io_finish(38, entries.len(), sample);
-        self.dir_cache.push(DirCache::new(dir, entries, visible_names));
+        self.dir_cache.insert(dir.to_vec(), DirCache::new(entries, visible_names, sources));
+    }
+
+    fn directory_tail(&mut self, dir: &[u8], index: usize) -> Option<&[DirEntry]> {
+        if index == 0 && self.visit_layers(dir, ALIAS_DEPTH, &mut |_, fs, path| fs.dynamic_directory(path)) {
+            self.dir_cache.remove(dir);
+        }
+        if !self.dir_cache.contains_key(dir) { self.populate_dir_cache(dir); }
+        self.dir_cache.get(dir)?.entries.get(index..)
     }
 
     fn readdir(&mut self, dir: &[u8], index: usize) -> Option<DirEntry> {
-        if index == 0 && self.visit_layers(dir, ALIAS_DEPTH, &mut |_, fs, path| fs.dynamic_directory(path)) {
-            self.dir_cache.retain(|cached| cached.dir != dir);
+        self.directory_tail(dir, index)?.first().map(clone_dir_entry)
+    }
+
+    fn visit_directory(&mut self, dir: &[u8], index: usize,
+        mut visit: impl FnMut(usize, &DirEntry) -> bool) -> usize
+    {
+        let Some(resolved) = self.resolve_symlinks(dir, true) else { return index; };
+        let Some(entries) = self.directory_tail(&resolved, index) else { return index; };
+        let mut next = index;
+        for entry in entries {
+            if !visit(next, entry) { break; }
+            next += 1;
         }
-        if !self.dir_cache.iter().any(|cached| cached.dir == dir) {
-            self.populate_dir_cache(dir);
-        }
-        self.dir_cache
-            .iter()
-            .find(|cached| cached.dir == dir)
-            .and_then(|cached| cached.entries.get(index))
-            .map(clone_dir_entry)
+        next
     }
 
     fn local_key(&self, path: &[u8]) -> (u8, crate::kernel::net::local::Address) {
@@ -1192,13 +1253,13 @@ impl Vfs {
             node: node.ino, mount_idx: idx, mtime: node.mtime, dos_attributes: None })
     }
 
-    fn cached_child(&mut self, parent: &[u8], name: &[u8]) -> Option<DirEntry> {
+    fn lookup_child(&mut self, parent: &[u8], name: &[u8]) -> Option<ChildLookup> {
         // Kernel-owned live namespaces must bypass cached lower-layer entries,
         // including negative lookups and task IDs created since the last listing.
         let mut path = parent.to_vec();
         if !path.is_empty() { path.push(b'/'); }
         path.extend_from_slice(name);
-        if let Some(entry) = self.local_entry(&path, name) { return Some(entry); }
+        if let Some(entry) = self.local_entry(&path, name) { return Some(ChildLookup::Live(entry)); }
         let mut live = None;
         self.visit_layers(&path, ALIAS_DEPTH, &mut |idx, fs, subpath| {
             if !fs.exclusive_path(subpath) { return false; }
@@ -1210,13 +1271,13 @@ impl Vfs {
             }));
             true
         });
-        if let Some(entry) = live { return entry; }
-        if !self.dir_cache.iter().any(|cached| cached.dir == parent) {
+        if let Some(entry) = live { return entry.map(ChildLookup::Live); }
+        if !self.dir_cache.contains_key(parent) {
             self.populate_dir_cache(parent);
         }
-        let cached = self.dir_cache.iter().find(|cached| cached.dir == parent)?;
+        let cached = self.dir_cache.get(parent)?;
         if let Some(index) = cached.names.get(name) {
-            return Some(clone_dir_entry(cached.entries.get(*index)?));
+            return Some(ChildLookup::Cached(*index));
         }
         // Private mount points are omitted from listings, but direct lookup
         // still walks their synthetic ancestors (e.g. mountfs/1/file).
@@ -1224,11 +1285,18 @@ impl Vfs {
             mount_child_in_dir(binding.prefix, parent)
                 .filter(|child| eq_ignore_case(child, name))
         })?;
-        Some(DirEntry {
+        Some(ChildLookup::Live(DirEntry {
             name: name.to_vec(), name_len: name.len(), short_name: None,
             size: 0, is_dir: true, is_symlink: false, mode: 0o755,
             dos_attributes: Some(0x10), mtime: 0, node: 0, mount_idx: 0,
-        })
+        }))
+    }
+
+    fn cached_child(&mut self, parent: &[u8], name: &[u8]) -> Option<DirEntry> {
+        match self.lookup_child(parent, name)? {
+            ChildLookup::Cached(index) => self.dir_cache.get(parent)?.entries.get(index).map(clone_dir_entry),
+            ChildLookup::Live(entry) => Some(entry),
+        }
     }
 
     fn readlink_entry(&self, path: &[u8], entry: &DirEntry, out: &mut [u8]) -> Option<usize> {
@@ -1257,52 +1325,58 @@ impl Vfs {
         if path.contains(&0) {
             return None;
         }
-        let mut resolved: Vec<Vec<u8>> = Vec::new();
-        let mut pending: VecDeque<Vec<u8>> = path
-            .split(|byte| *byte == b'/')
-            .filter(|component| !component.is_empty() && *component != b".")
-            .map(|component| component.to_vec())
-            .collect();
+        // Reuse one prefix instead of allocating each component and joining
+        // all previous components again at every step. Only actual symlink
+        // expansion replaces the pending buffer.
+        let mut resolved = Vec::with_capacity(path.len());
+        let mut pending = alloc::borrow::Cow::Borrowed(path);
+        let mut cursor = 0;
         let mut links = 0;
-        while !pending.is_empty() {
-            let component = pending.pop_front()?;
+        while let Some((begin, end)) = next_path_component(&pending, cursor) {
+            cursor = end;
+            let component = &pending[begin..end];
             if component == b".." {
-                resolved.pop();
+                resolved.truncate(resolved.iter().rposition(|&byte| byte == b'/').unwrap_or(0));
                 continue;
             }
-            let parent = join_path_components(&resolved);
-            let entry = self.cached_child(&parent, &component)?;
-            let is_final = pending.is_empty();
+            let child = self.lookup_child(&resolved, component)?;
+            let entry = match &child {
+                ChildLookup::Cached(index) => self.dir_cache.get(resolved.as_slice())?.entries.get(*index)?,
+                ChildLookup::Live(entry) => entry,
+            };
+            let is_final = next_path_component(&pending, end).is_none();
             if entry.is_symlink && (follow_final || !is_final) {
                 links += 1;
                 if links > 40 {
                     return None;
                 }
-                let mut candidate = parent;
-                if !candidate.is_empty() {
-                    candidate.push(b'/');
+                let parent_len = resolved.len();
+                if !resolved.is_empty() {
+                    resolved.push(b'/');
                 }
-                candidate.extend_from_slice(&entry.name[..entry.name_len]);
-            let mut target = alloc::vec![0u8; DIR_PATH_MAX];
-                let len = self.readlink_entry(&candidate, &entry, &mut target)?;
-                if len == 0 || target[..len].contains(&0) {
+                resolved.extend_from_slice(&entry.name[..entry.name_len]);
+                let mut target = alloc::vec![0u8; DIR_PATH_MAX];
+                let len = self.readlink_entry(&resolved, entry, &mut target)?;
+                if len == 0 || len > target.len() || target[..len].contains(&0) {
                     return None;
                 }
+                resolved.truncate(parent_len);
                 if target[..len].first() == Some(&b'/') {
                     resolved.clear();
                 }
-                let mut expanded: VecDeque<Vec<u8>> = target[..len]
-                    .split(|byte| *byte == b'/')
-                    .filter(|part| !part.is_empty() && *part != b".")
-                    .map(|part| part.to_vec())
-                    .collect();
-                expanded.append(&mut pending);
-                pending = expanded;
+                target.truncate(len);
+                if end < pending.len() {
+                    target.push(b'/');
+                    target.extend_from_slice(&pending[end..]);
+                }
+                pending = alloc::borrow::Cow::Owned(target);
+                cursor = 0;
                 continue;
             }
-            resolved.push(entry.name[..entry.name_len].to_vec());
+            if !resolved.is_empty() { resolved.push(b'/'); }
+            resolved.extend_from_slice(&entry.name[..entry.name_len]);
         }
-        Some(join_path_components(&resolved))
+        Some(resolved)
     }
 
     fn resolve_parent_symlinks(&mut self, path: &[u8]) -> Option<Vec<u8>> {
@@ -1373,7 +1447,17 @@ impl Vfs {
 
     fn stat(&mut self, path: &[u8], follow_final: bool) -> Option<Stat> {
         let resolved = self.resolve_symlinks(path, follow_final)?;
-        let path = resolved.as_slice();
+        self.stat_resolved(&resolved)
+    }
+
+    fn stat_with_ownership(&mut self, path: &[u8], follow_final: bool) -> Option<(Stat, Option<(u32, u32)>)> {
+        let resolved = self.resolve_symlinks(path, follow_final)?;
+        let stat = self.stat_resolved(&resolved)?;
+        let owner = self.ownership_resolved(&resolved);
+        Some((stat, owner))
+    }
+
+    fn stat_resolved(&mut self, path: &[u8]) -> Option<Stat> {
         let override_mode = self.modes.get(path).copied();
         if let Some((parent, name)) = split_parent_bytes(path)
             && let Some(entry) = self.cached_child(parent, name)
@@ -1445,12 +1529,12 @@ impl Vfs {
     // ── open / create / read / write / seek ──────────────────────────────
 
     fn open_to_handle(&mut self, path: &[u8]) -> i32 {
-        let original_ino = path_ino(path);
         let resolved_path = match self.resolve_symlinks(path, true) {
             Some(path) => path,
             None => return -2,
         };
         let path = resolved_path.as_slice();
+        let original_ino = path_ino(path);
         // Try each member of the group in priority order; first hit wins and
         // its mount_idx is recorded (a Replace group = the single backing fs).
         // Every open gets its OWN fid from `fs.open` — fids are never cached or
@@ -1480,12 +1564,12 @@ impl Vfs {
     }
 
     fn create_to_handle_options(&mut self, path: &[u8], mode: Option<u32>) -> i32 {
-        let original_ino = path_ino(path);
         let resolved = self
             .resolve_symlinks(path, true)
             .or_else(|| self.resolve_parent_symlinks(path));
         let Some(resolved) = resolved else { return -2 };
         let path = resolved.as_slice();
+        let original_ino = path_ino(path);
         // Truncation belongs to the visible object. Creating an invisible
         // lower-layer copy of a read-only boot file would lose the user's edit.
         let (midx, fs, subpath) = self.resolve_object(path, ALIAS_DEPTH)
@@ -1528,10 +1612,8 @@ impl Vfs {
                 .any(|(_, page)| page.pinned());
             fs.clunk(vnode.handle);
             if mapped { return -16; }
-            self.file_pages.retain(|&(mount, id, _), page| mount != midx || id != identity || page.pinned());
-            self.executables.retain(|image| image.key != (midx, identity));
+            self.invalidate_cached_file((midx, identity));
         }
-        self.invalidate_executable_path(path);
         let vnode = match mode.filter(|_| !existed) {
             Some(mode) => fs.create_mode(subpath, mode),
             None => fs.create(subpath),
@@ -1618,11 +1700,13 @@ impl Vfs {
         }
         // Mapped files retain their VFS identity until the last unmap.
         if self.has_mapped_path(old) { return -16; }
-        self.invalidate_executable_path(old);
-        self.invalidate_executable_path(new);
-        self.drop_clean_pages();
+        // Inode-backed source bytes survive a rename. Path identities under
+        // the moved name, and replaced destination identities, must retire.
+        let mut retired = self.namespace_cache_keys(&object, true);
+        if let Some(target) = &target { retired.extend(self.namespace_cache_keys(target, false)); }
         let rc = old_fs.rename(old_sub, new_sub);
         if rc < 0 { return rc; }
+        for key in retired { self.invalidate_cached_file(key); }
         self.rekey_open_paths(old, new);
         self.modes.remove(new);
         self.mtimes.remove(new);
@@ -1685,8 +1769,16 @@ impl Vfs {
         }
         let Some(object) = self.resolve_object(path, ALIAS_DEPTH) else { return -2 };
         let (midx, fs, subpath) = (object.mount_idx, object.fs, object.subpath());
-        if !self.may_write(midx, subpath) { return -13; }
-        if let Some(m) = fs.meta(subpath)
+        let metadata = fs.meta(subpath);
+        // chmod is an ownership operation: an owner must be able to restore
+        // write permission after making their own object read-only.
+        match self.mounts[midx as usize].access {
+            WriteAccess::None => return -13,
+            WriteAccess::Granted(grant) if !metadata.as_ref()
+                .is_some_and(|m| grant.uid() == 0 || grant.uid() == m.uid) => return -1,
+            _ => {},
+        }
+        if let Some(m) = metadata
             && !fs.set_meta(subpath, m.uid, m.gid, mode) { return -13; }
         self.modes.insert(path.to_vec(), mode);
         for entry in &mut self.file_table {
@@ -1743,6 +1835,33 @@ impl Vfs {
         entry.mtime_dirty = true;
     }
 
+    fn handle_stat(&mut self, handle: i32) -> Option<(Stat, Option<(u32, u32)>)> {
+        let entry = self.file_table.get(usize::try_from(handle).ok()?)
+            .filter(|entry| entry.refcount != 0)?;
+        let fs = self.mount_fs(entry.mount_idx);
+        let identity = fs.file_identity(entry.vnode.handle);
+        if let Some((mut stat, meta)) = identity.and_then(|node| fs.stat_node(node)) {
+            // Inode facts follow the open object across unlink/rename. VFS
+            // overrides still apply while this path names the same object.
+            stat.ino = entry.ino;
+            if !entry.unlinked {
+                stat.mtime = self.mtimes.get(&entry.path).copied().or(stat.mtime);
+                if let Some(&mode) = self.modes.get(&entry.path) { stat.mode = mode as u16; }
+            }
+            return Some((stat, Some((meta.uid, meta.gid))));
+        }
+        // Backends without native object metadata retain their path policy.
+        let stat = Stat { mtime: self.handle_mtime(handle), size: entry.vnode.size,
+            mode: entry.vnode.mode, ino: entry.ino, is_dir: false, is_symlink: false };
+        let owner = if let Some(meta) = identity.and_then(|node| fs.meta_node(node)) {
+            Some((meta.uid, meta.gid))
+        } else {
+            let path = entry.path.clone();
+            self.ownership(&path, true)
+        };
+        Some((stat, owner))
+    }
+
     fn handle_mtime(&self, handle: i32) -> Option<u32> {
         if self.file_table.get(handle as usize)?.unlinked { return None; }
         let path = self.handle_path(handle)?;
@@ -1791,10 +1910,10 @@ impl Vfs {
         let (midx, fs, subpath) = (object.mount_idx, object.fs, object.subpath());
         if let Err(error) = self.check_remove(midx, subpath) { return error; }
         if self.has_mapped_path(path) { return -16; }
-        self.invalidate_executable_path(path);
-        self.drop_clean_pages();
+        let retired = self.namespace_cache_keys(&object, false);
         let r = fs.remove(subpath);
         if r >= 0 {
+            for key in retired { self.invalidate_cached_file(key); }
             let name_id = self.backend_path_id(midx, path);
             for index in 0..self.file_table.len() {
                 let entry = &self.file_table[index];
@@ -2089,17 +2208,14 @@ fn clone_dir_entry(e: &DirEntry) -> DirEntry {
     }
 }
 
-fn join_path_components(components: &[Vec<u8>]) -> Vec<u8> {
-    let capacity = components.iter().map(Vec::len).sum::<usize>()
-        .saturating_add(components.len().saturating_sub(1));
-    let mut path = Vec::with_capacity(capacity);
-    for component in components {
-        if !path.is_empty() {
-            path.push(b'/');
-        }
-        path.extend_from_slice(component);
+fn next_path_component(path: &[u8], mut cursor: usize) -> Option<(usize, usize)> {
+    loop {
+        while path.get(cursor) == Some(&b'/') { cursor += 1; }
+        if cursor == path.len() { return None; }
+        let begin = cursor;
+        while path.get(cursor).is_some_and(|&byte| byte != b'/') { cursor += 1; }
+        if &path[begin..cursor] != b"." { return Some((begin, cursor)); }
     }
-    path
 }
 
 fn split_parent_bytes(path: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -2462,6 +2578,15 @@ pub fn readdir(dir: &[u8], index: usize) -> Option<DirEntry> {
     vfs.readdir(&resolved, index)
 }
 
+/// Visit borrowed cached entries under one VFS lock and one directory lookup.
+/// A rejected entry remains at the returned cursor. The visitor must not
+/// re-enter VFS; copying a dirent to the caller does not need another lookup.
+pub fn visit_directory(dir: &[u8], index: usize,
+    visit: impl FnMut(usize, &DirEntry) -> bool) -> usize
+{
+    VFS.lock().visit_directory(dir, index, visit)
+}
+
 /// Namespace/metadata generation used by personality-level directory caches.
 pub fn directory_generation() -> u64 {
     VFS.lock().dir_generation
@@ -2487,6 +2612,11 @@ pub fn readlink(path: &[u8], out: &mut [u8]) -> Option<usize> {
 /// without ownership (and kernel-local socket nodes) return None.
 pub fn ownership(path: &[u8], follow_final: bool) -> Option<(u32, u32)> {
     VFS.lock().ownership(path, follow_final)
+}
+
+/// A single metadata snapshot for an open VFS file description.
+pub fn handle_stat(handle: i32) -> Option<(Stat, Option<(u32, u32)>)> {
+    VFS.lock().handle_stat(handle)
 }
 
 pub fn handle_ownership(handle: i32) -> Option<(u32, u32)> {
@@ -2554,6 +2684,12 @@ fn filesystem_stats(vfs: &Vfs, mount: u8) -> Result<FsStats, i32> {
 pub fn stat(path: &[u8], follow_final: bool) -> Option<Stat> {
     VFS.lock().stat(path, follow_final)
 }
+
+/// One namespace traversal and lock for both stat fields and ownership.
+pub fn stat_with_ownership(path: &[u8], follow_final: bool) -> Option<(Stat, Option<(u32, u32)>)> {
+    VFS.lock().stat_with_ownership(path, follow_final)
+}
+
 
 /// If `parent/<name>` (case-insensitive) is a mount point, return its directory
 /// component (so a VFS mount is traversable by DFS's component walk).
@@ -2812,10 +2948,16 @@ pub fn file_mode_by_handle(handle: i32) -> u16 {
     VFS.lock().file_mode_by_handle(handle)
 }
 
+pub(super) fn discard_sink(handle: i32) -> bool {
+    let vfs = VFS.lock();
+    vfs.file_table.get(handle as usize).is_some_and(|entry| entry.refcount != 0
+        && entry.writable && vfs.mount_fs(entry.mount_idx).discard_sink(entry.vnode.handle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DirEntry, Filesystem, Vfs, Vnode, WriteAccess, mount_child_in_dir,
+        DirEntry, Filesystem, Vfs, Vnode, Stat, Meta, WriteAccess, MountMode, path_ino, mount_child_in_dir,
     };
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2864,6 +3006,7 @@ mod tests {
     }
 
     struct MetadataFs {
+        reads: core::cell::Cell<usize>,
         listings: core::cell::Cell<usize>,
         path_metadata: core::cell::Cell<usize>,
         size: core::cell::Cell<u32>,
@@ -2887,6 +3030,12 @@ mod tests {
             (node == 42).then_some(Vnode { handle: node, size: self.size.get(), mode: 0o644 })
         }
         fn file_identity(&self, handle: u64) -> Option<u64> { Some(handle) }
+        fn stat_node(&self, node: u64) -> Option<(Stat, Meta)> {
+            assert_eq!(node, 42);
+            Some((Stat { size: self.size.get(), mode: self.mode.get(), mtime: Some(1234),
+                is_dir: false, is_symlink: false, ino: node },
+                Meta { uid: 42, gid: 123, mode: self.mode.get() as u32 }))
+        }
         fn meta_node(&self, node: u64) -> Option<super::Meta> {
             Some(super::Meta { uid: node as u32, gid: 123, mode: 0o644 })
         }
@@ -2900,7 +3049,12 @@ mod tests {
             out[..3].copy_from_slice(b"one");
             Some(3)
         }
-        fn read(&self, _handle: u64, _offset: u32, _out: &mut [u8], _size: u32) -> i32 { 0 }
+        fn read(&self, _handle: u64, offset: u32, out: &mut [u8], size: u32) -> i32 {
+            self.reads.set(self.reads.get() + 1);
+            let n = out.len().min(size.saturating_sub(offset) as usize);
+            out[..n].fill(0x42);
+            n as i32
+        }
         fn write(&self, _handle: u64, offset: u32, bytes: &[u8]) -> i32 {
             self.size.set(self.size.get().max(offset + bytes.len() as u32));
             bytes.len() as i32
@@ -2923,8 +3077,69 @@ mod tests {
     }
 
     #[test]
+    fn directory_batch_retries_unconsumed_entry_and_resumes_cursor() {
+        let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(MetadataFs {
+            reads: core::cell::Cell::new(0), listings: core::cell::Cell::new(0),
+            path_metadata: core::cell::Cell::new(0), size: core::cell::Cell::new(1),
+            mode: core::cell::Cell::new(0o644),
+        }));
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", fs);
+        vfs.bind(b"alias/", b"", MountMode::Replace);
+        let mut names = Vec::new();
+        let next = vfs.visit_directory(b"alias", 0, |index, entry| {
+            if !names.is_empty() { return false; }
+            names.push((index, entry.name.clone())); true
+        });
+        assert_eq!(next, 1);
+        let listings = fs.listings.get();
+        assert_eq!(vfs.visit_directory(b"alias", next, |index, entry| {
+            names.push((index, entry.name.clone())); true
+        }), 3);
+        assert_eq!(names, alloc::vec![(0, b"one".to_vec()), (1, b"two".to_vec()), (2, b"link".to_vec())]);
+        assert_eq!(fs.listings.get(), listings);
+        assert_eq!(vfs.visit_directory(b"alias", 3, |_, _| panic!("past end")), 3);
+    }
+
+    #[test]
+    fn open_metadata_uses_live_inode_and_ignores_reused_unlinked_name() {
+        let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(MetadataFs {
+            reads: core::cell::Cell::new(0), listings: core::cell::Cell::new(0),
+            path_metadata: core::cell::Cell::new(0), size: core::cell::Cell::new(1),
+            mode: core::cell::Cell::new(0o644),
+        }));
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", fs);
+        let handle = vfs.open_to_handle(b"one");
+        assert!(handle >= 0);
+        let ino = vfs.file_ino_by_handle(handle);
+        let counts = (fs.listings.get(), fs.path_metadata.get());
+        fs.size.set(4097);
+        fs.mode.set(0o640);
+        for _ in 0..100 {
+            let (stat, owner) = vfs.handle_stat(handle).unwrap();
+            assert_eq!((stat.size, stat.mode, stat.ino, stat.mtime), (4097, 0o640, ino, Some(1234)));
+            assert_eq!(owner, Some((42, 123)));
+        }
+        assert_eq!((fs.listings.get(), fs.path_metadata.get()), counts);
+        vfs.mtimes.insert(b"one".to_vec(), 5678);
+        vfs.modes.insert(b"one".to_vec(), 0o600);
+        let (stat, _) = vfs.handle_stat(handle).unwrap();
+        assert_eq!((stat.mtime, stat.mode), (Some(5678), 0o600));
+        // These path overrides now belong to a replacement, not this open inode.
+        vfs.file_table[handle as usize].unlinked = true;
+        let (stat, owner) = vfs.handle_stat(handle).unwrap();
+        assert_eq!((stat.size, stat.mode, stat.ino, stat.mtime), (4097, 0o640, ino, Some(1234)));
+        assert_eq!(owner, Some((42, 123)));
+        vfs.close_handle(handle);
+        assert!(vfs.handle_stat(handle).is_none());
+        assert!(vfs.handle_stat(-1).is_none());
+    }
+
+    #[test]
     fn character_device_truncation_preserves_unrelated_directory_cache() {
         let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(MetadataFs {
+            reads: core::cell::Cell::new(0),
             listings: core::cell::Cell::new(0), path_metadata: core::cell::Cell::new(0),
             size: core::cell::Cell::new(1), mode: core::cell::Cell::new(0o644),
         }));
@@ -2951,6 +3166,7 @@ mod tests {
     #[test]
     fn inode_metadata_and_writes_preserve_cached_names_and_aliases() {
         let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(MetadataFs {
+            reads: core::cell::Cell::new(0),
             listings: core::cell::Cell::new(0), path_metadata: core::cell::Cell::new(0),
             size: core::cell::Cell::new(1), mode: core::cell::Cell::new(0o644),
         }));
@@ -2990,28 +3206,109 @@ mod tests {
         assert_eq!(other.mkdir(b"keep"), 0);
         let mut vfs = Vfs::new();
         vfs.mount(b"source/", data);
+        vfs.mount(b"second-source/", data);
         vfs.mount(b"other/", other);
         vfs.bind(b"alias/", b"source/", super::MountMode::Replace);
         assert!(!vfs.path_exists(b"source/parent/new"));
         assert!(!vfs.path_exists(b"alias/parent/new"));
+        assert!(!vfs.path_exists(b"second-source/parent/new"));
         assert!(!vfs.path_exists(b"other/keep/missing"));
-        assert!(vfs.dir_cache.iter().any(|c| c.dir == b"other/keep"));
+        assert!(vfs.dir_cache.contains_key(b"other/keep".as_slice()));
         assert_eq!(vfs.mkdir(b"source/parent/new"), 0);
-        assert!(vfs.dir_cache.iter().any(|c| c.dir == b"other/keep"));
+        assert!(vfs.dir_cache.contains_key(b"other/keep".as_slice()));
         assert!(vfs.dir_exists(b"source/parent/new"));
         assert!(vfs.dir_exists(b"alias/parent/new"));
+        assert!(vfs.dir_exists(b"second-source/parent/new"));
         assert!(!vfs.path_exists(b"alias/parent/new/child"));
         assert_eq!(vfs.rename(b"source/parent/new", b"source/parent/moved"), 0);
         assert!(!vfs.dir_exists(b"alias/parent/new"));
         assert!(vfs.dir_exists(b"alias/parent/moved"));
-        assert!(vfs.dir_cache.iter().any(|c| c.dir == b"other/keep"));
+        assert!(vfs.dir_exists(b"second-source/parent/moved"));
+        assert!(vfs.dir_cache.contains_key(b"other/keep".as_slice()));
         assert_eq!(vfs.rmdir(b"source/parent/moved"), 0);
         assert!(!vfs.dir_exists(b"alias/parent/moved"));
+        assert!(!vfs.dir_exists(b"second-source/parent/moved"));
+    }
+
+    #[test]
+    fn temp_writes_rename_and_unlink_preserve_unrelated_names_and_file_pages() {
+        let hot = alloc::boxed::Box::leak(alloc::boxed::Box::new(MetadataFs {
+            reads: core::cell::Cell::new(0), listings: core::cell::Cell::new(0),
+            path_metadata: core::cell::Cell::new(0), size: core::cell::Cell::new(1), mode: core::cell::Cell::new(0o644),
+        }));
+        let temp = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", hot); vfs.mount(b"tmp/", temp);
+        vfs.bind(b"temp-alias/", b"tmp/", MountMode::Replace);
+        let file = vfs.open_to_handle(b"one"); assert!(file >= 0);
+        assert_eq!(vfs.cached_read(file, 0, &mut [0; 1]), 1);
+        assert!(!vfs.path_exists(b"missing"));
+        let listings = hot.listings.get();
+        let key = vfs.mapping_key(file, 0).unwrap();
+        for _ in 0..3 {
+            assert!(!vfs.path_exists(b"temp-alias/new"));
+            let writer = vfs.create_to_handle(b"tmp/new"); assert!(writer >= 0);
+            assert_eq!(vfs.write_by_handle(writer, b"abc"), 3);
+            assert_eq!(vfs.close_handle(writer), 0);
+            assert_eq!(vfs.stat(b"temp-alias/new", true).unwrap().size, 3);
+            assert!(vfs.file_pages.contains_key(&key), "TEMP create/write retains hot file bytes");
+            assert_eq!(vfs.rename(b"tmp/new", b"tmp/moved"), 0);
+            assert!(!vfs.path_exists(b"temp-alias/new"));
+            assert_eq!(vfs.stat(b"temp-alias/moved", true).unwrap().size, 3);
+            assert!(vfs.file_pages.contains_key(&key), "unrelated rename retains hot bytes");
+            assert_eq!(vfs.delete(b"tmp/moved"), 0);
+            assert!(!vfs.path_exists(b"temp-alias/moved"));
+            assert!(vfs.file_pages.contains_key(&key), "unrelated unlink retains hot bytes");
+            assert_eq!(vfs.stat(b"two", true).unwrap().size, 1);
+            assert!(!vfs.path_exists(b"missing"));
+            assert_eq!(hot.listings.get(), listings, "TEMP activity retains header/library name lookups");
+            assert_eq!(vfs.cached_read(file, 0, &mut [0; 1]), 1);
+            assert_eq!(hot.reads.get(), 1, "no backend reload of unrelated file");
+        }
+        assert_eq!(vfs.close_handle(file), 0);
+    }
+
+    #[test]
+    fn path_identity_rename_and_unlink_retire_only_affected_bytes() {
+        let data = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
+        assert_eq!(data.mkdir(b"old"), 0);
+        let mut vfs = Vfs::new(); vfs.mount(b"", data);
+        for (path, bytes) in [(b"old/file".as_slice(), b"old".as_slice()), (b"keep", b"keep"), (b"replacement", b"new")] {
+            let file = vfs.create_to_handle(path); assert!(file >= 0);
+            assert_eq!(vfs.write_by_handle(file, bytes), bytes.len() as i32);
+            assert_eq!(vfs.cached_read(file, 0, &mut [0; 4]), bytes.len() as i32);
+            assert_eq!(vfs.close_handle(file), 0);
+        }
+        let keep = (0, path_ino(b"keep"), 0);
+        let old = (0, path_ino(b"old/file"), 0);
+        assert!(vfs.file_pages.contains_key(&old));
+        assert_eq!(vfs.rename(b"old", b"moved"), 0);
+        assert!(!vfs.file_pages.contains_key(&old));
+        assert!(!vfs.cached_paths.contains_key(&(0, old.1)));
+        assert!(vfs.file_pages.contains_key(&keep));
+        let file = vfs.open_to_handle(b"moved/file"); assert!(file >= 0);
+        let mut bytes = [0; 4]; assert_eq!(vfs.cached_read(file, 0, &mut bytes), 3);
+        assert_eq!(&bytes[..3], b"old"); assert_eq!(vfs.close_handle(file), 0);
+        // FAT's backend cannot overwrite a destination. A failed operation
+        // must retain existing bytes, followed by a real unlink/name reuse.
+        let moved = (0, path_ino(b"moved/file"), 0);
+        assert_eq!(vfs.rename_inner(b"replacement", b"moved/file", true), -2);
+        assert!(vfs.file_pages.contains_key(&moved));
+        assert_eq!(vfs.delete(b"moved/file"), 0);
+        assert!(!vfs.file_pages.contains_key(&moved));
+        assert_eq!(vfs.rename(b"replacement", b"moved/file"), 0);
+        let file = vfs.open_to_handle(b"moved/file"); assert!(file >= 0);
+        assert_eq!(vfs.cached_read(file, 0, &mut bytes), 3); assert_eq!(&bytes[..3], b"new");
+        assert!(vfs.file_pages.contains_key(&keep)); assert_eq!(vfs.close_handle(file), 0);
+        assert_eq!(vfs.delete(b"moved/file"), 0);
+        assert!(!vfs.cached_paths.contains_key(&(0, path_ino(b"moved/file"))));
+        assert!(vfs.file_pages.contains_key(&keep));
     }
 
     #[test]
     fn chmod_refreshes_hard_links_and_bind_aliases_without_rescanning_other_mounts() {
         let data = alloc::boxed::Box::leak(alloc::boxed::Box::new(MetadataFs {
+            reads: core::cell::Cell::new(0),
             listings: core::cell::Cell::new(0), path_metadata: core::cell::Cell::new(0),
             size: core::cell::Cell::new(1), mode: core::cell::Cell::new(0o644),
         }));
@@ -3027,7 +3324,7 @@ mod tests {
         assert_eq!(vfs.set_path_mode(b"source/one", 0o600), 0);
         assert_eq!(vfs.stat(b"source/two", true).unwrap().mode, 0o600);
         assert_eq!(vfs.stat(b"alias/two", true).unwrap().mode, 0o600);
-        assert!(vfs.dir_cache.iter().any(|c| c.dir == b"other/keep"));
+        assert!(vfs.dir_cache.contains_key(b"other/keep".as_slice()));
     }
 
     #[test]
@@ -3482,7 +3779,7 @@ mod tests {
         assert!(vfs.path_exists(b"shell/DN.COM"));
         assert!(vfs.resolve_symlinks(b"private/1/RETROOS/DN/DN.COM", true).is_some());
         vfs.populate_dir_cache(b"");
-        let names = &vfs.dir_cache[0].names;
+        let names = &vfs.dir_cache[b"".as_slice()].names;
         assert!(names.contains_key(b"shell".as_slice()));
         assert!(!names.contains_key(b"private".as_slice()));
     }
@@ -3649,6 +3946,8 @@ mod tests {
         assert!(nested >= 0);
         assert_eq!(vfs.file_table[nested as usize].vnode.handle, 22);
         assert_eq!(PATH_OPEN_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(vfs.file_ino_by_handle(handle), vfs.stat(b"link", true).unwrap().ino);
+        assert_eq!(vfs.file_ino_by_handle(nested), vfs.stat(b"dlink/child", true).unwrap().ino);
     }
 }
 

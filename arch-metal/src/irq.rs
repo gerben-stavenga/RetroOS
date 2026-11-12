@@ -1166,6 +1166,13 @@ pub fn route_isa_irq(line: u8) {
     }
 }
 
+/// Frozen calibration for a user-space clock reader. HPET/PIT require kernel
+/// access and must never be represented as a TSC clock.
+pub fn user_tsc_clock() -> Option<(u64, u64)> {
+    let clock = unsafe { CLOCK };
+    matches!(clock.source, ClockSource::Tsc).then_some((clock.epoch, clock.ns_mult))
+}
+
 /// High-resolution monotonic time in nanoseconds, also sampled at IRQ entry.
 /// TSC/64-bit HPET are read-only; PIT2 and 32-bit HPET extension state needs
 /// an interrupt-masked cross-core critical section.

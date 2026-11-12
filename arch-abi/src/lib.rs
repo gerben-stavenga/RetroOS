@@ -1076,3 +1076,19 @@ pub enum Irq {
     /// wired IRQ 11.
     Msi(u8),
 }
+
+/// Mechanisms for owned RAM frames with no permanent kernel virtual address.
+/// Callbacks run in task context, except reclaim, which may run on allocation.
+#[derive(Clone, Copy)]
+pub struct FrameAccess {
+    pub allocate: fn() -> Option<u64>,
+    pub release: fn(u64),
+    pub read: fn(u64, usize, &mut [u8]),
+    pub write: fn(u64, usize, &[u8]),
+    pub free: fn() -> usize,
+    pub total: fn() -> usize,
+    pub references: fn(u64) -> usize,
+    /// Reclaim transfers one exclusively-owned frame to the allocator.
+    /// The callback must not allocate, block, or enter privileged operations.
+    pub set_reclaim: fn(fn() -> Option<u64>),
+}

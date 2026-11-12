@@ -18,17 +18,30 @@ static void check(int ok,int code){if(!ok){call(__NR_exit_group,code,0,0,0);for(
 static unsigned char alt[16384] __attribute__((aligned(16)));
 static volatile int called;
 extern void fault_site(void), resume_site(void), restorer(void);
+#ifdef ILLEGAL
+#define EXPECTED_SIGNAL SIGILL
+#define FAULT_INSTRUCTION "ud2\n"
+#else
+#define EXPECTED_SIGNAL SIGSEGV
+#define FAULT_INSTRUCTION "mov (%%rdx),%%rdx\n"
+#endif
 __asm__(".text\n.global restorer\nrestorer: mov $15,%eax\nsyscall\nud2\n"
  ".global fault_site,resume_site\n");
 static void handler(int sig,siginfo_t *info,void *context) {
  ucontext_t *uc=context;word mask=0;
- check(sig==SIGSEGV && info->si_signo==SIGSEGV && (word)info->si_addr==FAULT_ADDRESS,11);
+ check(sig==EXPECTED_SIGNAL && info->si_signo==EXPECTED_SIGNAL,11);
+#ifdef ILLEGAL
+ check((word)info->si_addr==(word)fault_site && info->si_code==ILL_ILLOPN,19);
+ check(uc->uc_mcontext.gregs[REG_TRAPNO]==6 && uc->uc_mcontext.gregs[REG_ERR]==0,20);
+#else
+ check((word)info->si_addr==FAULT_ADDRESS,19);
+#endif
  check((word)&uc>=(word)alt && (word)&uc<(word)alt+sizeof alt,12);
  check(uc->uc_mcontext.gregs[REG_RIP]==(word)fault_site,13);
  check(uc->uc_mcontext.gregs[REG_RAX]==0x12345678,14);
  check(uc->uc_mcontext.fpregs && ((word)uc->uc_mcontext.fpregs&15)==0,15);
  check(call(__NR_rt_sigprocmask,0,0,(word)&mask,8)==0,16);
- check((mask&((1UL<<(SIGSEGV-1))|(1UL<<(SIGUSR1-1))))==((1UL<<(SIGSEGV-1))|(1UL<<(SIGUSR1-1))),17);
+ check((mask&((1UL<<(EXPECTED_SIGNAL-1))|(1UL<<(SIGUSR1-1))))==((1UL<<(EXPECTED_SIGNAL-1))|(1UL<<(SIGUSR1-1))),17);
  stack_t current;
  check(call(__NR_sigaltstack,0,(word)&current,0,0)==0 && current.ss_flags==SS_ONSTACK,18);
  uc->uc_mcontext.gregs[REG_RIP]=(word)resume_site;
@@ -47,7 +60,7 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
  struct action act={(word)handler,SA_SIGINFO|SA_ONSTACK|0x04000000,(word)restorer,0},old={0};
  stack_t stack={.ss_sp=alt,.ss_size=sizeof alt};
  word mask=1UL<<(SIGUSR1-1),result,simd,redzone;
- check(call(__NR_rt_sigaction,SIGSEGV,(word)&act,(word)&old,8)==0,1);
+ check(call(__NR_rt_sigaction,EXPECTED_SIGNAL,(word)&act,(word)&old,8)==0,1);
  check(old.handler==0,2);
  check(call(__NR_rt_sigaction,SIGKILL,(word)&act,0,8)==-22,3);
  check(call(__NR_rt_sigaction,65,0,0,8)==-22,4);
@@ -55,7 +68,7 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
  check(call(__NR_sigaltstack,(word)&stack,0,0,0)==0,6);
  check(call(__NR_rt_sigprocmask,2,(word)&mask,0,8)==0,7);
  __asm__ volatile("mov $0x12345678,%%eax\nmovq %%rax,%%xmm15\nmov %%rax,-8(%%rsp)\n" FAULT_SETUP
- "fault_site: mov (%%rdx),%%rdx\nresume_site: movq %%xmm15,%1\nmov -8(%%rsp),%2"
+ "fault_site: " FAULT_INSTRUCTION "resume_site: movq %%xmm15,%1\nmov -8(%%rsp),%2"
  :"=a"(result),"=r"(simd),"=r"(redzone)::"rdx","xmm15","memory");
  check(called==1 && result==0x87654321 && simd==0x12345678 && redzone==0x12345678,8);
  check(call(__NR_rt_sigprocmask,0,0,(word)&mask,8)==0 && mask==(1UL<<(SIGUSR1-1)),9);

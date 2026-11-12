@@ -191,6 +191,23 @@ pub fn read_event(idx: u8, buf: &mut [u8]) -> Option<usize> {
     }
 }
 
+/// Consume bytes without copying, preserving the stream's EOF ordering.
+pub fn discard_event(idx: u8, maximum: usize) -> Option<usize> {
+    let mut pipes = PIPES.lock();
+    let p = &mut pipes[idx as usize];
+    if maximum == 0 { return Some(0); }
+    if p.pending_eof { p.pending_eof = false; return Some(0); }
+    let mut count = 0;
+    while count < maximum {
+        match p.buffer.pop_front() {
+            Some(256) => { p.pending_eof = count != 0; return Some(count); }
+            Some(_) => count += 1,
+            None => break,
+        }
+    }
+    if count != 0 || p.writers == 0 { Some(count) } else { None }
+}
+
 /// Discard queued terminal input for TCSETSF.
 pub fn discard(idx: u8) {
     let mut pipes = PIPES.lock();

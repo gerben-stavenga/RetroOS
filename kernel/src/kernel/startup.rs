@@ -60,6 +60,9 @@ fn prepare_startup<A: crate::Arch>(
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
+    if let Some(access) = machine.frame_access() {
+        crate::kernel::cache::install(access, vfs::mapping::reclaim_frame);
+    }
     crate::compact_println!("{}", crate::build_info::VersionBanner);
 
     // GRUB config is available before physical storage discovery.
@@ -1490,7 +1493,10 @@ fn event_loop<A: crate::Arch>(
     let mut blocked_io_service = Periodic::new(last_world_ns, 1_000_000);
     let mut injected_keys = Periodic::new(last_world_ns, 1_000_000);
     let mut quantum = Periodic::new(last_world_ns, 10_000_000);
-    let mut writeback = Periodic::new(last_world_ns, 100_000_000);
+    // Ordinary writes become visible immediately but need not force durability
+    // every 100 ms. Full batches apply backpressure; explicit sync and clean
+    // shutdown persist sooner. Keep unsynced background transactions bounded.
+    let mut writeback = Periodic::new(last_world_ns, 5_000_000_000);
     let mut writeback_error_reported = false;
     let mut linux_timeslice_cursor = first_tid;
     let mut hardware_deadline = None;
@@ -1511,9 +1517,7 @@ fn event_loop<A: crate::Arch>(
         let blocked_io_due = blocked_io_service.consume(world_now_ns);
         let injected_due = injected_keys.consume(world_now_ns);
         let quantum_due = quantum.consume(world_now_ns);
-        if quantum_due && machine.free_page_count() < 32768 {
-            super::vfs::executable::reclaim();
-        }
+        if quantum_due { super::vfs::mapping::reclaim_pressure(); }
         // Service synchronous VGA before handling queued kernel events.
         // The linear VBE fallback still uses the guest-memory handoff.
         // Audio DMA and legacy VGA read resident device storage independently.
@@ -1547,15 +1551,22 @@ fn event_loop<A: crate::Arch>(
             dump_interrupted_thread(machine, &ctx.regs, dos);
         }
         stats.part(machine, PROFILE_SERIAL_CONTROL);
-        if network_due { crate::kernel::net::poll(); }
+        if network_due {
+            let _sample = super::event_profile::FileIoScope::start(super::event_profile::LOOP_NETWORK, 0);
+            crate::kernel::net::poll();
+        }
         crate::kernel::linux::wake_record_locks(threads, ctx.tid, &mut ctx.regs);
         if world_now_ns >= next_klog_sync_ns {
+            let _sample = super::event_profile::FileIoScope::start(super::event_profile::LOOP_KLOG_SYNC, 0);
             crate::kernel::klog::sync_live();
             next_klog_sync_ns = machine.now().saturating_add(KLOG_SYNC_NS);
         }
-        if writeback.consume(world_now_ns) && crate::kernel::vfs::writeback_all() < 0 && !writeback_error_reported {
-            crate::compact_println!("Filesystem background writeback failed");
-            writeback_error_reported = true;
+        if writeback.consume(world_now_ns) {
+            let _sample = super::event_profile::FileIoScope::start(super::event_profile::LOOP_WRITEBACK, 0);
+            if crate::kernel::vfs::writeback_all() < 0 && !writeback_error_reported {
+                crate::compact_println!("Filesystem background writeback failed");
+                writeback_error_reported = true;
+            }
         }
         let now_tick = world_now_ns / 1_000_000;
         // Keep the F12 window list fresh while it is open,
@@ -1826,6 +1837,7 @@ fn event_loop<A: crate::Arch>(
         }
         stats.part(machine, PROFILE_INPUT);
 
+        let deadline_sample = super::event_profile::FileIoScope::start(super::event_profile::LOOP_DEADLINES, 0);
         let mut deadlines = Deadlines::new(world_now_ns);
         deadlines.include(Some(writeback.deadline()));
         deadlines.include(super::media::inline_video_deadline(world_now_ns));
@@ -1846,6 +1858,7 @@ fn event_loop<A: crate::Arch>(
                 && thread.personality.needs_io_poll();
         }
         if blocked_polling { deadlines.include(Some(blocked_io_service.deadline())); }
+        drop(deadline_sample);
         if deadlines.immediate() { continue; }
 
         if quantum_due && let Some(next) = crate::kernel::sched::linux_timeslice_successor(threads, ctx.tid, &mut linux_timeslice_cursor) {
@@ -1904,31 +1917,47 @@ fn event_loop<A: crate::Arch>(
             now
         } else { 0 };
 
-        // Lend the CPU; canonicalize the outcome into an action.
-        stats.pre_run(machine, &ctx.regs);
-        let event_sample = super::event_profile::Sample::start(machine);
-        // A CPU loan has an absolute budget; port exits never renew it.
+        // A CPU loan has an absolute budget. Pure clock reads neither change
+        // task topology nor invalidate deadlines: resume them within this same
+        // loan instead of publishing every task and rebuilding all deadlines.
+        // IRQs, other syscalls and lifecycle actions return to the full loop.
         deadlines.include(Some(quantum.deadline()));
-        let kevent = if thread.personality.timer_due(world_now_ns) {
-            // Due logical work is dispatched in this iteration, without an
-            // arch call or an artificial guest entry to provoke a wakeup.
-            crate::KernelEvent::Irq
-        } else {
-            machine.arm_alarm(deadlines.next());
-            ctx.run(machine, bios_workspace, &mut thread.personality)
+        let loan_deadline = deadlines.next();
+        let (action, hide_window, old_endpoint) = loop {
+            stats.pre_run(machine, &ctx.regs);
+            let event_sample = super::event_profile::Sample::start(machine);
+            let kevent = if thread.personality.timer_due(machine.now()) {
+                crate::KernelEvent::Irq
+            } else {
+                machine.arm_alarm(loan_deadline);
+                ctx.run(machine, bios_workspace, &mut thread.personality)
+            };
+            let clock_read = matches!(&thread.personality, thread::Personality::Linux(_))
+                && matches!(kevent, crate::KernelEvent::Syscall | crate::KernelEvent::SoftInt(0x80))
+                && match ctx.regs.mode() {
+                    crate::UserMode::Mode64 => ctx.regs.rax as u32 == 228,
+                    _ => matches!(ctx.regs.rax as u32, 265 | 403),
+                };
+            if paced && let thread::Personality::Dos(dos) = &mut thread.personality {
+                dos.cpu_pacer.charge(run_started, machine.now());
+            }
+            stats.post_run(machine, &kevent, &ctx.regs, ctx.device_cycles);
+            let event_dispatch = event_sample.returned(machine, &kevent, &ctx.regs, &thread.personality);
+            super::media::kernel_entry();
+            let had_window = thread.has_primary_window();
+            let action = dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent);
+            let hide_window = had_window && !thread.has_primary_window();
+            let old_endpoint = thread.window_endpoint();
+            event_dispatch.finish(machine);
+            stats.after_dispatch(machine);
+            if clock_read && matches!(action, thread::KernelAction::Done)
+                && matches!(thread.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running)
+                && loan_deadline.is_some_and(|end| machine.now() < end)
+            {
+                continue;
+            }
+            break (action, hide_window, old_endpoint);
         };
-        if paced && let thread::Personality::Dos(dos) = &mut thread.personality {
-            dos.cpu_pacer.charge(run_started, machine.now());
-        }
-        stats.post_run(machine, &kevent, &ctx.regs, ctx.device_cycles);
-        let event_dispatch = event_sample.returned(machine, &kevent, &ctx.regs, &thread.personality);
-        super::media::kernel_entry();
-        let had_window = thread.has_primary_window();
-        let action = dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent);
-        let hide_window = had_window && !thread.has_primary_window();
-        let old_endpoint = thread.window_endpoint();
-        event_dispatch.finish(machine);
-        stats.after_dispatch(machine);
 
         // The OSD holds foreground scanout while the personality targets its
         // headless display.

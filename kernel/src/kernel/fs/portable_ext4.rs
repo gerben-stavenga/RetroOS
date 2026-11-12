@@ -448,6 +448,18 @@ impl Filesystem for PortableExt4Fs {
         Some(Meta { uid: info.owner, gid: info.group, mode: u32::from(info.format) })
     }
 
+    fn stat_node(&self, node: u64) -> Option<(Stat, Meta)> {
+        self.flush_pending().ok()?;
+        let object = Object::from_opaque(node)?;
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        let info = filesystem.inspect(storage, object).ok()?;
+        Some((Stat { mtime: Some(info.modified), size: info.size.min(u64::from(u32::MAX)) as u32,
+            mode: info.format & 0x0fff, is_dir: info.node().is_some(),
+            is_symlink: Self::is_symlink(info), ino: info.object.opaque() },
+            Meta { uid: info.owner, gid: info.group, mode: u32::from(info.format) }))
+    }
+
     fn format_name(&self) -> &'static str { "ext4" }
 
     fn statfs(&self) -> Result<crate::kernel::vfs::FsStats, i32> {
@@ -845,6 +857,26 @@ impl Filesystem for PortableExt4Fs {
         })
     }
 
+    fn walk_directory_metadata(&self, path: &[u8], visit: &mut dyn FnMut(Meta, bool) -> bool) -> bool {
+        let Some(path) = Self::path(path) else { return false; };
+        if self.flush_pending().is_err() { return false; }
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        let Ok(root) = filesystem.root(storage) else { return false; };
+        let Ok(mut info) = filesystem.inspect(storage, Object::Node(root)) else { return false; };
+        let mut components = path.split(|&byte| byte == b'/').filter(|part| !part.is_empty()).peekable();
+        loop {
+            if info.node().is_none() || !visit(Meta {
+                uid: info.owner, gid: info.group, mode: u32::from(info.format),
+            }, components.peek().is_none()) { return false; }
+            let Some(name) = components.next() else { return true; };
+            if matches!(name, b"." | b"..") || name.len() > 255 { return false; }
+            let Ok(Some((_, object))) = filesystem.find(storage, info.node().unwrap(), name) else { return false; };
+            let Ok(next) = filesystem.inspect(storage, object) else { return false; };
+            info = next;
+        }
+    }
+
     fn set_meta(&self, path: &[u8], uid: u32, gid: u32, mode: u32) -> bool {
         let _sample = crate::kernel::event_profile::FileIoScope::start(31, 0);
         let Some(path) = Self::path(path) else {
@@ -889,12 +921,21 @@ impl Filesystem for PortableExt4Fs {
             return match filesystem.remove_open(storage, edge.handle) {
                 Ok(Some(object)) => { self.open.borrow_mut().unlinked.push(object); 0 }
                 Ok(None) => 0,
-                Err(_) => -5,
+                Err(error) => {
+                    let detail = alloc::format!("{:?}", error);
+                    crate::compact_dbg_println!("ext4: unlink open object failed: {}", detail.as_str());
+                    -5
+                },
             };
         }
-        filesystem
-            .remove(storage, edge.handle)
-            .map_or(-5, |_| 0)
+        match filesystem.remove(storage, edge.handle) {
+            Ok(()) => 0,
+            Err(error) => {
+                let detail = alloc::format!("{:?}", error);
+                crate::compact_dbg_println!("ext4: unlink failed: {}", detail.as_str());
+                -5
+            },
+        }
     }
 
     fn clunk(&self, handle: u64) -> i32 {

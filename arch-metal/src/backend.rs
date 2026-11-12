@@ -100,6 +100,7 @@ impl Arch for Metal {
 
     // ── Timer ──
     fn now(&self) -> u64 { super::irq::now(false) }
+    fn user_tsc_clock(&self) -> Option<(u64, u64)> { super::irq::user_tsc_clock() }
     fn arm_alarm(&mut self, deadline: Option<u64>) { super::calls::arch_arm_alarm(deadline) }
     fn idle(&mut self) { super::calls::arch_idle() }
     fn poll_timed_devices(&mut self, now: u64) -> Option<u64> { super::calls::arch_poll_timed_devices(now) }
@@ -130,6 +131,10 @@ impl Arch for Metal {
     }
     fn map_low_mem(&mut self) { super::calls::arch_map_low_mem() }
     fn map_vga_text_aperture(&mut self) { super::calls::arch_map_vga_text_aperture() }
+    fn frame_access(&self) -> Option<arch_abi::FrameAccess> { Some(crate::frames::access()) }
+    fn map_frame(&mut self, vpage: usize, frame: u64, shared: bool, writable: bool, executable: bool) -> bool {
+        crate::frames::map(vpage, frame, shared, writable, executable)
+    }
     fn alloc_shared_pages(&mut self, count: usize) -> core::ptr::NonNull<u8> {
         assert!(count != 0);
         let layout = alloc::alloc::Layout::from_size_align(count.checked_mul(4096).unwrap(), 4096).unwrap();

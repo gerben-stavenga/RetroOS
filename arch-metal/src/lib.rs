@@ -179,3 +179,5 @@ pub fn set_irq_line(_asserted: bool) {}
 pub fn free_page_count() -> usize {
     phys_mm::free_page_count()
 }
+
+mod frames;

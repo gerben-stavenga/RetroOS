@@ -1240,7 +1240,8 @@ pub fn peek_zombie_child<A: crate::Arch>(threads: &[Thread<A>], current_tid: usi
 
     for t in threads.iter().take(MAX_THREADS).skip(1) {
         let k = &t.kernel;
-        if k.parent_tid == current_tid && k.state != ThreadState::Unused {
+        if k.parent_tid == current_tid && k.state != ThreadState::Unused
+            && (pid <= 0 || k.tid == pid) {
             has_children = true;
             if k.state == ThreadState::Zombie && (pid == -1 || k.tid == pid) {
                 return (k.tid, k.exit_code);

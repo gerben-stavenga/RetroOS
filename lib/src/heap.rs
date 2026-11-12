@@ -1,4 +1,4 @@
-//! Demand-paged linked-list heap allocator (freestanding).
+//! Demand-paged heap allocator with an indexed free-space tree (freestanding).
 //!
 //! A generic `GlobalAlloc` that carves allocations out of a fixed virtual
 //! address window `[base, end)`. It is *demand-paged*: `extend_heap` only claims
@@ -7,8 +7,10 @@
 //! platform (a `#PF` handler on bare metal). An optional embedder callback
 //! returns whole free pages to that platform on deallocation. The allocator
 //! otherwise knows only the two window bounds supplied via [`DemandHeap::init`].
-//! The raw free-list pointer-juggling lives here, off the
-//! kernel, with `lib`'s other freestanding primitives.
+//! Free-space indexing and page reclamation live here with `lib`'s other
+//! freestanding primitives. Allocations round to a header-sized power of two
+//! (32 bytes on the kernel target), keeping splits representable without
+//! hidden headers on live allocations.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -89,19 +91,19 @@ impl Drop for ProfileSample {
     }
 }
 
-/// Free block header stored at the start of each free region.
-struct FreeBlock {
-    size: usize,
-    next: Option<NonNull<FreeBlock>>,
-}
+#[path = "heap/tree.rs"]
+mod tree;
+use tree::{FreeBlock, FreeTree};
 
-/// Minimum allocation size (must fit a `FreeBlock` for when it's freed).
-const MIN_BLOCK_SIZE: usize = core::mem::size_of::<FreeBlock>();
+/// Keep every split representable as an intrusive free node. A power-of-two
+/// quantum divides pages and every larger requested alignment, so no tiny
+/// remainder is lost when an allocation is freed and coalesced again.
+const MIN_BLOCK_SIZE: usize = core::mem::size_of::<FreeBlock>().next_power_of_two();
 const SMALL_STEP: usize = core::mem::align_of::<FreeBlock>();
 const SMALL_CLASSES: usize = 256 / SMALL_STEP + 1;
 const SMALL_LIMIT: u8 = 16;
 
-// Exact sizes: this does not inflate live allocations or change their layouts.
+// Exact rounded sizes; allocations retain the caller's alignment contract.
 // Include the page-sized scratch buffers used when expanding mount aliases.
 fn small_class(size: usize, align: usize) -> Option<usize> {
     if align > SMALL_STEP { return None; }
@@ -115,7 +117,7 @@ const fn align_up(val: usize, align: usize) -> usize {
 }
 
 struct Inner {
-    head: Option<NonNull<FreeBlock>>,
+    free: FreeTree,
     small_enabled: bool,
     small: [Option<NonNull<FreeBlock>>; SMALL_CLASSES],
     small_count: [u8; SMALL_CLASSES],
@@ -145,12 +147,12 @@ unsafe impl Sync for DemandHeap {}
 impl DemandHeap {
     pub const fn new() -> Self {
         DemandHeap {
-            inner: UnsafeCell::new(Inner { head: None, small_enabled: false, small: [None; SMALL_CLASSES], small_count: [0; SMALL_CLASSES], mapped_end: 0, heap_end: 0, release: None,
+            inner: UnsafeCell::new(Inner { free: FreeTree::new(), small_enabled: false, small: [None; SMALL_CLASSES], small_count: [0; SMALL_CLASSES], mapped_end: 0, heap_end: 0, release: None,
                 retained: [EMPTY_RETAINED; RETAINED_RANGES], retained_count: 0, retained_bytes: 0, retain_limit: 0 }),
         }
     }
 
-    /// Retain a bounded set of exact-size scratch allocations. Call during
+    /// Retain a bounded set of rounded-size scratch allocations. Call during
     /// initialization, before this heap is shared. Cached blocks remain backed
     /// and are returned to the coalescing allocator if its window is exhausted.
     pub fn enable_small_cache(&self) {
@@ -175,12 +177,12 @@ impl DemandHeap {
     /// this cache before any later free can evict them. No bookkeeping allocates.
     pub fn init_with_cached_release(&self, base: usize, end: usize, release: Option<fn(usize, usize)>, cache_bytes: usize) {
         let inner = unsafe { &mut *self.inner.get() };
-        inner.head = None;
+        inner.free = FreeTree::new();
         inner.small_enabled = false;
         inner.small = [None; SMALL_CLASSES];
         inner.small_count = [0; SMALL_CLASSES];
-        inner.mapped_end = base;
-        inner.heap_end = end;
+        inner.heap_end = end & !(MIN_BLOCK_SIZE - 1);
+        inner.mapped_end = align_up(base, MIN_BLOCK_SIZE).min(inner.heap_end);
         inner.release = release;
         inner.retained_count = 0;
         inner.retained_bytes = 0;
@@ -207,7 +209,7 @@ impl Inner {
         let Some(class) = small_class(size, align) else { return false; };
         if self.small_count[class] == SMALL_LIMIT { return false; }
         let block = ptr.cast::<FreeBlock>();
-        unsafe { block.write(FreeBlock { size, next: self.small[class] }); }
+        unsafe { block.write(FreeBlock::new(size, self.small[class])); }
         self.small[class] = NonNull::new(block);
         self.small_count[class] += 1;
         true
@@ -286,152 +288,27 @@ impl Inner {
     /// Claim virtual address space (physical pages are demand-backed on access).
     fn extend_heap(&mut self, min_size: usize) -> bool {
         let pages_needed = min_size.div_ceil(PAGE_SIZE).max(4);
-
+        let wanted = pages_needed.saturating_mul(PAGE_SIZE);
         let region_start = self.mapped_end;
-        let mut region_pages = 0;
-
-        while region_pages < pages_needed {
-            if self.mapped_end >= self.heap_end {
-                break;
-            }
-            self.mapped_end += PAGE_SIZE;
-            region_pages += 1;
+        self.mapped_end = self.mapped_end.saturating_add(wanted).min(self.heap_end);
+        let bytes = self.mapped_end - region_start;
+        if bytes > 0 {
+            self.add_free_region(region_start, bytes);
         }
-
-        if region_pages > 0 {
-            self.add_free_region(region_start, region_pages * PAGE_SIZE);
-        }
-
-        region_pages >= pages_needed
+        bytes >= wanted
     }
 
-    /// Add a region to the free list (sorted by address, coalesces).
+    /// Insert and coalesce in address order without scanning free blocks.
     fn add_free_region(&mut self, addr: usize, size: usize) -> (usize, usize) {
-        if size < MIN_BLOCK_SIZE {
-            return (addr, 0); // Too small to track
-        }
-
-        let block_ptr = addr as *mut FreeBlock;
-        unsafe {
-            (*block_ptr).size = size;
-            (*block_ptr).next = None;
-        }
-        let new_block = unsafe { NonNull::new_unchecked(block_ptr) };
-
-        // Find insertion point (sorted by address).
-        let mut current = &mut self.head;
-        while let Some(block) = *current {
-            if block.as_ptr() as usize > addr {
-                break;
-            }
-            current = unsafe { &mut (*block.as_ptr()).next };
-        }
-
-        // Insert.
-        unsafe {
-            (*new_block.as_ptr()).next = *current;
-            *current = Some(new_block);
-        }
-
-        // Coalesce with next block if adjacent.
-        unsafe {
-            let block = new_block.as_ptr();
-            if let Some(next) = (*block).next {
-                let block_end = addr + (*block).size;
-                if block_end == next.as_ptr() as usize {
-                    (*block).size += (*next.as_ptr()).size;
-                    (*block).next = (*next.as_ptr()).next;
-                }
-            }
-        }
-
-        // Coalesce with previous block if adjacent (re-traverse to find prev).
-        let mut merged = new_block;
-        let mut prev: Option<NonNull<FreeBlock>> = None;
-        let mut current = self.head;
-        while let Some(block) = current {
-            if block.as_ptr() as usize == addr {
-                if let Some(mut prev_block) = prev {
-                    let prev_ptr = unsafe { prev_block.as_mut() };
-                    let prev_end = prev_block.as_ptr() as usize + prev_ptr.size;
-                    if prev_end == addr {
-                        prev_ptr.size += unsafe { (*block.as_ptr()).size };
-                        prev_ptr.next = unsafe { (*block.as_ptr()).next };
-                        merged = prev_block;
-                    }
-                }
-                break;
-            }
-            prev = current;
-            current = unsafe { (*block.as_ptr()).next };
-        }
-        (merged.as_ptr() as usize, unsafe { (*merged.as_ptr()).size })
+        self.free.insert_coalescing(addr, size)
     }
 
-    /// Allocate from the free list.
-    fn alloc_from_list(&mut self, size: usize, align: usize) -> Option<*mut u8> {
-        let mut current = &mut self.head;
-
-        while let Some(block) = *current {
-            let block_ptr = block.as_ptr();
-            let block_addr = block_ptr as usize;
-            let block_size = unsafe { (*block_ptr).size };
-
-            let mut aligned_addr = align_up(block_addr, align);
-            if aligned_addr != block_addr && aligned_addr - block_addr < MIN_BLOCK_SIZE {
-                // Keep a representable free prefix. Returning block_addr here
-                // violates the requested alignment (notably for shared pages).
-                aligned_addr = align_up(block_addr + MIN_BLOCK_SIZE, align);
-            }
-            let padding = aligned_addr - block_addr;
-            let total_needed = padding + size;
-
-            if block_size >= total_needed {
-                let alloc_addr = aligned_addr;
-
-                if padding >= MIN_BLOCK_SIZE {
-                    unsafe {
-                        (*block_ptr).size = padding;
-                    }
-
-                    let remainder_addr = alloc_addr + size;
-                    let remainder_size = block_size - total_needed;
-
-                    if remainder_size >= MIN_BLOCK_SIZE {
-                        let remainder_ptr = remainder_addr as *mut FreeBlock;
-                        unsafe {
-                            (*remainder_ptr).size = remainder_size;
-                            (*remainder_ptr).next = (*block_ptr).next;
-                            (*block_ptr).next = Some(NonNull::new_unchecked(remainder_ptr));
-                        }
-                    }
-                } else {
-                    let remainder_addr = alloc_addr + size;
-                    let remainder_size = block_size - size;
-
-                    if remainder_size >= MIN_BLOCK_SIZE {
-                        let remainder_ptr = remainder_addr as *mut FreeBlock;
-                        unsafe {
-                            (*remainder_ptr).size = remainder_size;
-                            (*remainder_ptr).next = (*block_ptr).next;
-                            *current = Some(NonNull::new_unchecked(remainder_ptr));
-                        }
-                    } else {
-                        unsafe {
-                            *current = (*block_ptr).next;
-                        }
-                    }
-                }
-
-                self.forget_retained(alloc_addr & !(PAGE_SIZE - 1), align_up(alloc_addr + size + MIN_BLOCK_SIZE, PAGE_SIZE));
-                return Some(alloc_addr as *mut u8);
-            }
-
-            current = unsafe { &mut (*block_ptr).next };
-        }
-
-        None
+    fn alloc_from_tree(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        let address = self.free.allocate(size, align.max(MIN_BLOCK_SIZE))?;
+        self.forget_retained(address & !(PAGE_SIZE - 1), align_up(address + size + MIN_BLOCK_SIZE, PAGE_SIZE));
+        Some(address as *mut u8)
     }
+
 }
 
 unsafe impl GlobalAlloc for DemandHeap {
@@ -439,10 +316,10 @@ unsafe impl GlobalAlloc for DemandHeap {
         let _sample = ProfileSample::start(0);
         let inner = unsafe { &mut *self.inner.get() };
 
-        let size = align_up(layout.size().max(MIN_BLOCK_SIZE), core::mem::align_of::<FreeBlock>());
+        let size = align_up(layout.size().max(MIN_BLOCK_SIZE), MIN_BLOCK_SIZE);
         let align = layout.align().max(core::mem::align_of::<FreeBlock>());
 
-        if let Some(ptr) = inner.take_small(size, align).or_else(|| inner.alloc_from_list(size, align)) {
+        if let Some(ptr) = inner.take_small(size, align).or_else(|| inner.alloc_from_tree(size, align)) {
             if size >= 100_000 { LARGE_REUSE.fetch_add(1, Relaxed); }
             ALLOCATIONS.fetch_add(1, Relaxed);
             return ptr;
@@ -453,7 +330,7 @@ unsafe impl GlobalAlloc for DemandHeap {
             inner.drain_small();
         }
 
-        let ptr = inner.alloc_from_list(size, align).unwrap_or(core::ptr::null_mut());
+        let ptr = inner.alloc_from_tree(size, align).unwrap_or(core::ptr::null_mut());
         if !ptr.is_null() {
             ALLOCATIONS.fetch_add(1, Relaxed);
         }
@@ -464,7 +341,7 @@ unsafe impl GlobalAlloc for DemandHeap {
         let _sample = ProfileSample::start(3);
         let inner = unsafe { &mut *self.inner.get() };
 
-        let size = align_up(layout.size().max(MIN_BLOCK_SIZE), core::mem::align_of::<FreeBlock>());
+        let size = align_up(layout.size().max(MIN_BLOCK_SIZE), MIN_BLOCK_SIZE);
         if size >= 100_000 { LARGE_FREES.fetch_add(1, Relaxed); }
         DEALLOCATIONS.fetch_add(1, Relaxed);
         let align = layout.align().max(core::mem::align_of::<FreeBlock>());

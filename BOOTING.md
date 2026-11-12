@@ -406,9 +406,10 @@ spent over 99% of its time in the kernel, dominated by file-backed `mmap`.
 An isolated QEMU/KVM startup probe measured 29 seconds for `rustc --version`
 versus 0.44 seconds for `/bin/true`. File mappings eagerly read regions into
 fresh pages; compiler launches repeatedly load Rust/LLVM libraries totaling
-roughly 350 MB, and loader segment mappings can repeat those reads. Reusing
-file-backed pages or loading them on demand remains performance work; passing
-the genrule regression does not establish practical self-build speed.
+roughly 350 MB, and loader segment mappings repeated those reads. Those are
+historical measurements before the physical file-cache change below; demand
+loading remains performance work. Passing the genrule regression alone does
+not establish practical self-build speed.
 `python3 test/linux_build_profile.py --native-ext4` isolates Python startup
 and a fresh C compile/link/run with tools, libraries and outputs on a private
 ext4/NVMe image. The fixture has no NIC, 32 GiB RAM, six CPUs and HDA audio.
@@ -422,13 +423,12 @@ The native-ext4 Codex probe initially took about 6 and 5 seconds. Of about
 4.9 seconds inside an executable-read phase, ext4/volume reads accounted for
 only about 0.6 seconds. Large sequential reads were populating and evicting
 4 KiB boxed pages in a 2 MiB cache for a roughly 284 MiB executable. Large
-uncached spans now stream into the caller's buffer, stopping at any existing
-cache page so mapped changes remain authoritative. Small reads and mapping
-fills retain their cache behavior; content-version validation remains in place.
-ELF and private mapping loaders use 64 KiB buffers. The updated probe measured
+uncached spans were subsequently streamed into the caller's buffer, stopping
+at existing mapped pages. That interim policy has now been replaced by the
+physical file cache described below. The interim probe measured
 1621/1712 ms for Codex and 1200/1297 ms for C compile/link, respectively.
 Compiler/linker loader traffic is roughly 130–140 MB, including repeated
-libraries; eager loading and library sharing remain further performance work.
+libraries. These results predate physical page sharing.
 These isolated results do not establish full interactive Codex startup time on
 physical hardware. Earlier SMB-root timings are not a model for metal ext4.
 
@@ -679,9 +679,46 @@ The proc-fd probe checks both ABIs on ext4 and SMB. Run
 old-space pages; missing page-discard support caused V8's
 `DiscardSystemPages` fatal assertion on metal.
 
-Private file mappings currently use eager copies. Shared file mappings alias
-kernel-owned VFS pages: overlapping mappings and forked processes see the same
-RAM, regular reads overlay mapped bytes, and regular writes update those pages.
+File contents use one kernel cache keyed by backing file identity and page
+offset. `kernel/cache.rs` supplies physical frame storage and common LRU
+bookkeeping for file contents and block metadata; `vfs/mapping.rs` owns file
+identity, freshness, pinning and writeback policy. Arch supplies allocation,
+temporary physical access and page-table mechanisms. Cached bytes have no
+permanent kernel virtual mapping. Clean file pages grow into available RAM,
+with a small free-frame reserve and reclamation under pressure, including an
+allocator callback that can accept an exclusively-owned cached frame.
+
+Private file mappings alias cached physical pages and copy on write. Shared
+mappings pin the same cache frames: overlapping mappings and forked processes
+see the same RAM, regular reads observe mapped bytes, and regular writes update
+those pages. ELF loading uses the same cache for complete segment pages and
+private copies for boundary pages requiring zero fill; the executable snapshot
+cache has been removed. File mapping fills remain eager, not demand-paged.
+
+QEMU/KVM tests map a 1152 MiB file twice with 3072 MiB RAM; the second mapping
+uses 2359296 bytes of additional frames (page tables), not a second file copy.
+The smaller regression checks mprotect-driven COW, fork isolation, warm reuse
+and anonymous allocation pressure. Both are registered as `linux_frame_cache`
+and `linux_frame_cache_large` in `//tests`. An isolated compiler probe measured
+warm `rustc --version` at 126 ms over SMB and 120 ms with native libraries,
+versus earlier 5913 and 876 ms. The first physical-cache version regressed
+native cold startup (1406 ms in that earlier run). A controlled comparison with
+profiling disabled now measures old-cache cold/warm 989/930 ms, initial physical
+cache 1234/157 ms, and corrected physical cache 965/143 ms. Bulk fills use
+128 KiB rather than the 32 KiB read-ahead retained for small consumers. This
+amortizes storage commands while keeping the same cached physical pages;
+backends retain their protocol limits. Profiled physical disk reads fell from
+9247 to4646 for identical bytes. These are QEMU loader measurements with native
+compiler libraries, not full Codex startup or metal timings.
+
+Namespace changes retire only affected file identities. Directory renames on
+path-identity backends retire the affected cached subtree; inode-backed source
+pages remain valid. RAM/FAT TEMP writes invalidate their directory views and
+bind aliases, preserving unrelated header/library lookup caches. The native
+build comparison fixture is `python3 test/linux_build_cache.py`, with optional
+`--shape-directories` to reproduce host tool-directory entry counts using inert
+empty files. It uses a private frozen ext4 tool/input image and validates all
+five compiled programs; it does not reuse host build outputs.
 `msync`, `fsync` and final unmapping write modified pages back to the backend;
 closing the original fd does not invalidate the mapping. Protection changes
 retain page ownership flags so fork and cleanup cannot free kernel-owned RAM.

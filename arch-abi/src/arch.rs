@@ -237,6 +237,10 @@ pub trait Arch: Sized + GuestBytes {
     /// forces `execute` to return, while this clock remains the sole authority
     /// for how much time elapsed.
     fn now(&self) -> u64;
+    /// Optional stable user-readable TSC calibration: epoch and 32.32 ns per
+    /// cycle, exactly matching now(). Valid for every CPU executing user code;
+    /// immutable for the address space lifetime, with user RDTSC enabled.
+    fn user_tsc_clock(&self) -> Option<(u64, u64)> { None }
     /// Arm one wakeup at an absolute `now()` timestamp, or cancel with None.
     /// An elapsed deadline must wake promptly, including when it passes during
     /// programming. The interrupt identifies no logical timer. Called only at
@@ -355,6 +359,12 @@ pub trait Arch: Sized + GuestBytes {
     /// On VGA-text hardware this is implicit (the aperture already is shared
     /// RAM); this is the GOP/emulated stand-in.
     fn map_vga_text_aperture(&mut self);
+    /// Physical-frame mechanisms for kernel-owned storage. No file/cache policy.
+    fn frame_access(&self) -> Option<crate::FrameAccess> { None }
+    /// Map a retained physical frame. Private writable aliases start COW;
+    /// shared aliases remain coherent across fork. Cache retains its own owner.
+    fn map_frame(&mut self, _vpage: usize, _frame: u64, _shared: bool,
+        _writable: bool, _executable: bool) -> bool { false }
     /// Allocate zeroed, page-aligned RAM with a stable kernel view. Ownership
     /// passes to the caller; guest aliases do not own the allocation.
     fn alloc_shared_pages(&mut self, count: usize) -> core::ptr::NonNull<u8>;

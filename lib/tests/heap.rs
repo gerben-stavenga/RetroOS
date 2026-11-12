@@ -216,11 +216,11 @@ fn small_cache_reuses_exact_sizes_without_violating_stronger_alignment() {
         let layout = Layout::from_size_align(24, std::mem::align_of::<usize>()).unwrap();
         let first = heap.alloc(layout);
         let second = heap.alloc(layout);
-        assert_ne!(second as usize % 64, 0);
+        assert_ne!(second as usize % 256, 0);
         heap.dealloc(second, layout);
-        let aligned_layout = Layout::from_size_align(24, 64).unwrap();
+        let aligned_layout = Layout::from_size_align(24, 256).unwrap();
         let aligned = heap.alloc(aligned_layout);
-        assert_eq!(aligned as usize % 64, 0);
+        assert_eq!(aligned as usize % 256, 0);
         let recycled = heap.alloc(layout);
         assert_eq!(recycled, second);
         std::ptr::write_bytes(first, 0x11, 24);
@@ -229,6 +229,84 @@ fn small_cache_reuses_exact_sizes_without_violating_stronger_alignment() {
         heap.dealloc(first, layout);
         heap.dealloc(aligned, aligned_layout);
         heap.dealloc(recycled, layout);
+        std::alloc::dealloc(memory, arena);
+    }
+}
+
+#[test]
+fn fragmented_extents_preserve_live_blocks_and_recover_the_whole_arena() {
+    unsafe {
+        let arena = Layout::from_size_align(32 * 1024 * 1024, PAGE).unwrap();
+        let memory = std::alloc::alloc_zeroed(arena);
+        assert!(!memory.is_null());
+        let heap = DemandHeap::new();
+        heap.init_with_cached_release(memory as usize, memory as usize + arena.size(), Some(cache_release), 16 * PAGE);
+        heap.enable_small_cache();
+        let small = Layout::from_size_align(512, 8).unwrap();
+        let larger = Layout::from_size_align(544, 8).unwrap();
+        let mut blocks = Vec::new();
+        for _ in 0..8000 {
+            let p = heap.alloc(small);
+            assert!(!p.is_null());
+            std::ptr::write_bytes(p, 0x71, small.size());
+            blocks.push(p);
+        }
+        // Thousands of separated holes; none can satisfy the larger request.
+        // Insert in reverse order to exercise balancing in both directions.
+        for &p in blocks.iter().step_by(2).rev() { heap.dealloc(p, small); }
+        let mut extra = Vec::new();
+        for _ in 0..3000 {
+            let p = heap.alloc(larger);
+            assert!(!p.is_null());
+            std::ptr::write_bytes(p, 0x39, larger.size());
+            extra.push(p);
+        }
+        for &p in blocks.iter().skip(1).step_by(2) {
+            assert!(std::slice::from_raw_parts(p, small.size()).iter().all(|&b| b == 0x71));
+        }
+        for &p in &extra {
+            assert!(std::slice::from_raw_parts(p, larger.size()).iter().all(|&b| b == 0x39));
+        }
+        // Mix predecessor, successor and two-sided coalescing at many depths.
+        for &p in blocks.iter().skip(1).step_by(2) { heap.dealloc(p, small); }
+        for &p in extra.iter().step_by(2) { heap.dealloc(p, larger); }
+        for &p in extra.iter().skip(1).step_by(2).rev() { heap.dealloc(p, larger); }
+        let whole = heap.alloc(arena);
+        assert_eq!(whole, memory, "splits must not lose unrepresentable tails");
+        std::ptr::write_bytes(whole, 0x55, arena.size());
+        heap.dealloc(whole, arena);
+        std::alloc::dealloc(memory, arena);
+    }
+}
+
+#[test]
+fn unaligned_window_edges_never_allocate_or_write_beyond_the_window() {
+    unsafe {
+        let arena = Layout::from_size_align(4 * PAGE, PAGE).unwrap();
+        let memory = std::alloc::alloc(arena);
+        std::ptr::write_bytes(memory, 0x77, arena.size());
+        let start = memory as usize + 8;
+        let end = memory as usize + 3 * PAGE - 8;
+        let heap = DemandHeap::new();
+        heap.init(start, end);
+        let tiny = Layout::from_size_align(1, 1).unwrap();
+        let mut live = Vec::new();
+        loop {
+            let p = heap.alloc(tiny);
+            if p.is_null() { break; }
+            assert!(p as usize >= start && (p as usize) < end);
+            p.write(0x39);
+            live.push(p);
+        }
+        assert!(live.len() > 100);
+        for p in live { heap.dealloc(p, tiny); }
+        let page = Layout::from_size_align(PAGE, PAGE).unwrap();
+        let p = heap.alloc(page);
+        assert!(!p.is_null() && p as usize % PAGE == 0);
+        std::ptr::write_bytes(p, 0x11, PAGE);
+        heap.dealloc(p, page);
+        assert!(std::slice::from_raw_parts(memory, 8).iter().all(|&b| b == 0x77));
+        assert!(std::slice::from_raw_parts(end as *const u8, arena.size() - (end - memory as usize)).iter().all(|&b| b == 0x77));
         std::alloc::dealloc(memory, arena);
     }
 }

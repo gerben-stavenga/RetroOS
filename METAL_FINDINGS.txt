@@ -1233,3 +1233,879 @@ targets and stopped at133/1400 actions after208.033s: nasm config_src's
 cp -f reports config_linux.h "was replaced while being copied". This is an
 unresolved guest filesystem/stat compatibility failure; no bootable guest-built
 image yet. The successful kernel library milestone remains independently saved.
+
+2026-11-11 Physical file cache and shared library pages
+
+Implemented one kernel cache storage/LRU module (kernel/cache.rs), used by
+VFS file contents and block metadata. Cached bytes use owned physical frames,
+accessed on metal through the existing fixed physical aperture; they no longer
+need permanent kernel heap virtual mappings. Arch supplies frame allocation,
+release, references and user mapping mechanisms through FrameAccess/map_frame;
+file identities, freshness, eviction and writeback remain kernel policy.
+No content deduplication. The separate vfs/executable.rs snapshot cache is gone.
+
+Reads, private/shared mmap and full ELF segment pages use the same file-page
+identities. Private aliases have counted PTE ownership and COW; shared aliases
+pin cache ownership. EOF tails are zero-filled; ELF boundary/BSS pages retain
+private copies. Block metadata uses the same Frame and Lru code, retaining its
+separate bounded metadata working set. File contents are no longer capped at
+512 clean pages on a running machine: they grow subject to physical pressure,
+retaining a free reserve (1/32 of RAM, clamped to64..8192 frames). Pure kernel
+unit fixtures without a machine retain the small heap-backed test fallback.
+
+The physical allocator can accept an exclusively-owned clean cached frame on
+exhaustion. The kernel callback uses VFS.try_lock and never waits/reenters a
+locked VFS; mappings retain their own frame references after cache eviction.
+Periodic kernel pressure handling also evicts clean pages. Anonymous allocation
+pressure and the allocator donation contract are exercised separately.
+
+Low mprotect was previously a no-op; now applies W/X protection changes to
+present pages, preserving COW and shared ownership. A per-shared-alias write
+permission prevents upgrading O_RDONLY mappings; RW-opened shared mappings
+can be upgraded and retain writeback ownership. This does not claim complete
+PROT_NONE/nonpresent reservation semantics or general POSIX mmap completion.
+
+QEMU/KVM regression:16MiB mapped twice costs32768 extra physical bytes for the
+second mapping.1152MiB mapped twice in a3GiB VM costs2359296 extra bytes
+(page tables), rather than another1152MiB file copy. Both pass COW after
+mprotect, fork isolation and warm reuse. Small test also fills200MiB anonymous
+memory under256MiB RAM. Initial wrapper false failures had clean guest exits
+but an uncaptured stdout success marker; switched marker to stderr. Tests are
+//tests:linux_frame_cache and //tests:linux_frame_cache_large.
+
+Compiler isolation reuses the byte-identical SDK fixture, no copied application
+state. Final artifacts build/ci/compiler-loader-frames/{klog.txt,result.err,
+result.out,status,profile.json}; guest status0. Timings exclude VM boot:
+                 old cold/warm       physical-cache cold/warm
+SMB libraries    6.317s/5.913s        4.905s/0.126s
+native libraries 0.875s/0.876s        1.406s/0.120s
+Native cold startup regresses; the improvement is warm reuse, not a claim that
+all startup paths are solved. Removed a redundant cold-mapping copy from cache
+frames into an unused buffer. File cache fills/mappings remain eager: lazy
+private file faults are still future work. Full Codex/session and metal startup
+have not been measured with this change.
+
+Validation:545 kernel unit tests, physical allocator test,11 hosted architecture
+KVM tests, kernel and arch-metal/arch-abi Clippy pass. Ext4/FAT/SMB/hosted file
+cache regression passes including shared mprotect/read-only FD permissions.
+Signal/thread-signal/vfork-signal regressions pass. Native Rust compile/link/run
+passes inside QEMU over SMB (explicit installed --toolchain). Large/small frame
+cache regressions pass; previous pinned-cache budget regression passed too.
+Prepared release21404f5c2adf, not installed. Full guest-built boot image remains
+blocked at the previously recorded cp/stat compatibility failure; no SMP guest
+execution changes in this work.
+
+2026-11-11 Metal build regression measured on release21404f5c2adf
+
+We are inside physical RetroOS (uname Linux retroos5.0.0), not the Linux host;
+/dev/kvm is absent. Root/project use native ext4/NVMe. Default TMPDIR is
+/home/priv-gerben/TEMP, bound to RAM-backed FAT sessionfs/TEMP. Measurements
+and reproducible sources/scripts saved in build/ci/metal-frame-build/README.txt
+and adjacent JSON/JSONL files. Running session klog KLOG0237.TXT.
+
+Tiny C: compile1.766/2.057/1.942s; link1.242/1.397/1.455s.200-function C
+translation unit compiles2.488/2.322/2.435s. Nine-file/800-function Make build,
+-j1 -O2,29.176s; no-op0.488s; -pipe8.164/8.837s. Reversed order:
+default36.674s, -save-temps=obj8.633s, -pipe9.898s. Executable verified.
+Tiny compile changing only TMPDIR: default RAM5.103/4.508s; private ext4
+0.885/1.089s. Saving intermediates or bypassing RAM temp path changes timings
+strongly, so repeated rustc --version was inadequate build-regression coverage.
+
+Confirmed global policies: remove/rename discard every clean file page;
+refresh_written_file drops every directory listing on each create/write for
+backends without stable file_identity, including RAM/FAT temp storage. Warm
+cc1 --version27..43ms becomes171..208ms after unlink/rename of an unrelated
+one-byte file. Those unrelated operations took74..100ms. Large file cache
+makes whole-cache invalidation more expensive; old snapshot tests did not
+exercise intermediate-file activity. Targeted inode/path/subtree invalidation
+is required; changing compiler flags/TMPDIR is only a diagnostic control.
+
+Important qualification: successful LD_PRELOAD unlink trace shows default
+tiny compile4.563s with only16ms+1ms in actual unlink calls; -pipe0.633s and
+retaining intermediates0.687s. Thus global deletion duration alone is not the
+multi-second explanation. Metadata-cache eviction/reload and temp-path work
+need detailed attribution. The RAM-temp backend's global directory eviction
+is another concrete slow path. COM2 diagnostics could not synchronize on
+metal, so no kernel counter attribution claimed.
+
+An instrumentation-library -O2 PIC compile also hit GCC's 'free(): invalid
+pointer' internal error during RTL reload; -O0 -pipe succeeded. Recorded as
+an unresolved correctness observation, not treated as valid instrumented data.
+No kernel source change or installed fix in these measurements; all build
+artifacts isolated from normal outputs. Full ext4-TMPDIR project result is
+in ext4-project.json. Next Linux work: reproduce the same fixture on frozen
+old/new kernels, fix global namespace and path-only metadata invalidation,
+and validate cache correctness and build timing together.
+Full nine-file build with the same default GCC flags and only TMPDIR changed
+to the private ext4 directory completed in5.323s (status0), versus29.176s and
+36.674s with RAM/FAT temp. This is a native-metal, no-SMB comparison; the
+RAM temp path, not source compile complexity, is the strongest isolated lead.
+
+2026-11-11 Linux follow-up: invalidation fixes and the separate cold-cache regression
+
+User clarified that the specific performance regression in question was cold
+compiler startup after switching old heap/streaming caches to the physical
+cache (historical native-library probe0.875s ->1.406s), not just TEMP builds.
+Both paths were investigated, but cold-start success must be reported separately.
+
+Fixed global namespace/content invalidation in VFS: inode source pages survive
+renames; unlink/replaced victims retire by identity; path-backed closed files
+retain minimal backend-relative names so directory renames retire their subtree.
+Those path records and freshness entries are retired after the last cached page
+and live handle disappear. Explicit invalidation uses BTreeMap file ranges,
+not whole-cache scans. FAT/session writes invalidate the affected directory
+views and bind aliases, retaining unrelated lookup/name/data caches.
+Two new unit regressions cover hot unrelated file/lookup retention across TEMP
+create/write/rename/unlink plus alias visibility, path directory renames, failed
+FAT replacement, unlink and name reuse. FAT backend overwrite remains unsupported;
+its failure must preserve cached bytes. New tests do not claim that capability.
+
+Frozen native build fixture test/linux_build_cache.py (registered external/manual
+//tests:linux_build_cache) validates five nine-file build variants. QEMU baseline
+small tool tree did NOT reproduce the whole metal29..37s slowdown:
+before-controlled RAM first/repeat4.550/5.207s, ext4TEMP4.927s;
+after-controlled RAM2.824/2.775s, ext4TEMP3.053s.
+Adding inert empty entries to match host /usr/bin2572 and shared-lib directory
+2776 entries gave before-shaped RAM6.531/8.891s vs after-shaped2.935/2.894s;
+ext4TEMP5.367s vs3.131s. This isolates lookup-cache rebuild sensitivity but is
+not a complete metal filesystem/layout/aging reproduction. Inputs frozen per
+fixture; before kernel saved as cache-invalidation-build/before.bin. One
+intermediate fixture regeneration mistakenly expanded script escape sequences;
+it failed Python parsing, was corrected, and is excluded from these results.
+
+Cold startup: new controlled gated native-library rustc --version harness
+build/ci/cold_cache_compare.py swaps the kernel in a private boot image, keeping
+the same SDK, libraries, static timer, native home and SMB root metadata. SDK
+library data is native; small compiler executable/system dependencies remain
+SMB as in the original isolation. Timer starts after PROFILE_READY input and
+ends on child exit, before PROFILE_HOLD. Each VM starts with an empty kernel
+file cache. old kernel is prepared4d89b259a07c; regressed kernel is the frozen
+physical-cache before.bin, and corrected kernel uses current boot_disk.bin.
+
+Profiling found new32KiB fills read fewer bytes but issue more physical reads:
+ old: native ext4 reads522883072B, disk7948 calls/511086592B,
+      ext4_read0.782554s, disk_read0.596512s, cache_insert0.000219s.
+ new32: native ext4 reads307167232B, disk9247 calls/299900928B,
+      ext4_read0.789210s, disk_read0.549673s, cache_insert0.139773s.
+Thus lower byte count did not reduce native read time, while populating physical
+cache pages added CPU cost. Changed bulk reads/mapping fills to128KiB; small
+consumers retain32KiB read-ahead. Backends still enforce their own transport
+limits; this is common kernel cache policy, not an SMB configuration workaround.
+ bulk128: same307167232 native bytes; disk4646 calls/299900928B,
+          ext4_read0.499373s, disk_read0.292287s, cache_insert0.124123s.
+These scopes are nested and must not be summed as independent time components.
+
+                  profiled cold/warm     profiling-disabled cold/warm
+ old cache        1.132s/0.952s           0.989s/0.930s
+ physical32KiB    1.263s/0.150s           1.234s/0.157s
+ physical128KiB   0.956s/0.141s           0.965s/0.143s
+Cold regression removed in this controlled QEMU comparison; new warm reuse is
+retained. Do not compare absolute times across older machine/boot/profile setups
+or claim full interactive Codex/metal startup has been measured after this fix.
+Raw logs and structured phase profiles: build/ci/cold-cache-compare/{old-profile,
+new-profile,bulk128-profile,old-unprofile,new32-unprofile,bulk128-unprofile}/.
+
+Validation:548 kernel unit tests (including a bulk-fill request-count/data test),
+QEMU ext4/FAT/SMB/hosted file-cache integration, namespace permissions, small and
+1152MiB physical sharing tests, pinned cache-budget regression all pass. Kernel
+Clippy passes. A new prepared metal release is recorded by the final prepare
+log /tmp/cold-cache-fixed-prepare.log; not installed by this agent.
+Prepared release9f216d2e017a contains the bulk-fill cold-start fix and targeted
+namespace invalidation. Not installed. Install using sudo tools/install_kernel.sh.
+
+2026-11-11 Physical confirmation on release9f216d2e017a
+
+Boot config selects9f216d2e017a; actual RetroOS uname, native root/DOS ext4,
+KLOG0238.TXT. Measurements saved separately in build/ci/metal-cache-fixed/;
+previous project/recheck JSON copied there before reusing the same scripts.
+First measured native rustc --version1.074s, repeats0.168s and0.121s, all status0
+and expected rustc1.97.0-nightly output. This is the first invocation observed
+by this probe, not a claim of externally enforced empty cache on metal.
+Same nine-file/800-function make -j1 project and compiler flags as earlier:
+ default5.004s (earlier29.176s), no-op0.041s (earlier0.488s),
+ -pipe2.792s and3.215s (earlier8.164/8.837s).
+Reversed/warm order: default6.051s (earlier36.674s), saved intermediates5.409s
+(earlier8.633s), pipe4.292s (earlier9.898s). All return0; generated executable
+prints PROJECT_BUILD_PASS. Default real build is about5..6x faster than the
+previous physical-cache release. Remaining variation/gap with pipe is not
+claimed explained by this confirmation. No profiling-on, SEGV, invalid-pointer
+or panic entries found in current klog at completion. No kernel/source edits
+or new installation from the RetroOS session; measurements only.
+
+2026-11-11 Linux investigation of the failed full metal self-build
+
+Metal attempt is build/ci/metal-self-build (status139, KLOG0238.TXT).
+The build-runfiles action was killed with signal9 after reporting154s; Java
+then faulted with Exception(6) at RIP0xb39e99f4. The independent helper probe
+also exceeded45s. Free-page counts do not indicate physical-memory exhaustion.
+The original kill sender and the instruction at Java's fault are not captured;
+these remain unproven. Unimplemented times(100) spam is not established as the
+cause. Large-file cleanup EIO on metal is also unresolved; Linux cleanup worked.
+
+Isolated the exact saved4015-line/1239054-byte runfiles manifest and installed
+Bazel helper, without Java. Linux with strace -c completes in0.179s, status0,
+3991 symlink calls and287 mkdir calls. Native-ext4 QEMU/KVM helper completes,
+but gated profiling shows14.548s in a shallow output path and61.201s under a
+build-like deep output path. No SMB traffic in this isolated probe.
+Shallow/deep volume_read calls2519601/10464001: these are logical filesystem
+requests, NOT physical disk reads. Physical disk reads15.8/26.4MB respectively.
+Deep disk_flush3070 calls9.062s, directory_scan2.879s, path_resolve3.646s;
+scopes overlap and must not be added as disjoint wall-time components.
+
+Root cause isolated: may_write_parent checks every ancestor by calling fs.meta
+on successively longer prefixes. Portable ext4 resolves each prefix from its
+root, repeating all preceding name lookups (quadratic work in path depth).
+Added Filesystem::walk_directory_metadata with the same permission callback;
+portable ext4 walks object handles once, inspecting every directory and stopping
+on rejection/missing components. No permission result is cached. Other backends
+retain their former prefix-based lookup through the default implementation.
+Same deep fixture now21.170s, volume_read2677804 calls, disk_flush1065/3.196s.
+Logs, source harness, manifest reproduction and structured profiles retained in
+build/ci/runfiles-repro/, especially deep-full/ and deep-walk/.
+One intermediate deep/ run had a boot-command truncation and failed permissions;
+it is excluded. Final deep runs launch timer via Python execv and a short boot
+command to preserve the complete argv; output parent directories are writable.
+
+Full-build QEMU reproduction, using a COPY of the earlier native home, found a
+second independent blocker: cp reports its source was replaced while being
+copied (nasm config_src action). Before log retained in
+build/ci/self-build-failure-repro/before/; elapsed143.053s, status1, no JVM fault.
+VFS open/create hashed the original symlink path for fstat's inode while stat
+hashed the resolved path. Move inode selection after symlink resolution. Unit
+coverage includes final and directory symlinks; native integration compares
+stat/fstat inode and device for an opened symlink.
+
+Permission regression testing exposed another existing POSIX mismatch: chmod
+required an owner's current write permission, making0500 directories impossible
+to restore. chmod now checks mount writability and ownership (or uid0), rather
+than content write bits. Integration revokes ancestor search, allows an
+execute-only ancestor with a writable leaf, rejects a nonwritable leaf, then
+restores modes and repeats creation. This tests live metadata, not cached grants.
+
+Illegal instructions previously bypassed installed signal handlers and exited
+as SIGSEGV. Deliver x86 #UD as SIGILL/ILL_ILLOPN, si_addr=RIP, trapno6/error0;
+unhandled #UD now exits with signal4. A new UD2 case verifies alternate signal
+stack, siginfo, trap context, register/SIMD restoration and resuming at an edited
+RIP. Same probe also passes on Linux. This fixes a definite ABI bug relevant to
+JVM handling/reporting; it does NOT establish why Java executed that instruction
+or prove the original metal Java crash is resolved.
+
+Validation: kernel unit suite, native namespace permissions and all five signal
+cases (ordinary/high SIGSEGV, invalid MXCSR/PC rejection, SIGILL) pass. Unlink
+failure logging now retains the ext4 engine error instead of just generic EIO.
+A corrected-kernel full QEMU build rerun is in progress separately.
+
+Follow-up: corrected full-build run passed the nasm config copy and compiled
+16 C actions, then GCC ICE'd in RTL reload compiling nasm output/outobj.c.
+Elapsed188.005s; status1; retained as self-build-failure-repro/before-brk-fix/.
+This was an actual guest GCC heap corruption, not evidence of a GCC source bug.
+
+Isolated exact GCC action without Bazel/Java in build/ci/gcc-crash-repro/:
+current-run exact/retained/repeat all status1 (1.583/1.125/0.923s). Retained
+preprocessed outobj.i compiles successfully under Linux. Diagnostic LD_PRELOAD
+signal/free tracing (fault.c, fault-caller/) finds htab_delete passing invalid
+hash entries to free (caller0x119b70d, including pointer0xffffffff00000000).
+The preload is diagnostic only and is absent from the successful fixed runs.
+
+Root cause: sys_brk shrink changed only heap_end/anonymous bookkeeping, never
+unmapping released pages. Regrowth exposes stale heap data, violating the zero
+contents that calloc/malloc expect from newly grown whole brk pages. Extended
+existing linux_brk_probe.c to fill a released page, shrink, regrow and verify
+zero; passes Linux and fails current RetroOS at line28 before the fix (saved
+brk-before.log). sys_brk now takes the Arch and unmaps only whole pages beyond
+the rounded new break, preserving the partial retained page and fork siblings.
+After this single heap fix, exact same GCC action succeeds without preload:
+brk-fixed exact2.078s, retained1.528s, repeat1.202s, all status0/no stderr.
+linux_brk integration and kernel unit tests pass. This directly links the heap
+contract violation to the GCC failure. No compiler flag or cache bypass used.
+A full boot-image build is running again with this additional fix.
+
+2026-11-11 Kernel heap allocator scalability fix
+
+User prioritized the allocator after a live full-build sample found one mmap
+spending77330215760 TSC ticks (~19.4s at the calibrated3.99GHz). Allocator totals
+for that sample:127724 allocations/27751196471 ticks and119422 frees/
+47634916353 ticks (~18.9s combined). Saved as self-build-failure-repro/
+live-profile.json (profile top/heap succeeded; totals/io requests timed out).
+The kernel cannot service serial diagnostics during a long synchronous syscall.
+The full build was deliberately interrupted to change the allocator; it was
+around action892 (Wine objects/Rust tools), not a new compiler failure.
+
+DemandHeap's address-sorted linked list scanned all holes for allocation and
+traversed twice on free/coalescing. Large physical-cache metadata populations
+and LRU tree churn expose this fragmentation-sensitive path. Improved the
+allocator itself; cache/LRU policy has NOT been changed as a workaround.
+
+New lib/src/heap/tree.rs is an intrusive AVL index ordered by address, with
+maximum extent size per subtree. Common-alignment allocations prune undersized
+subtrees; free finds neighbors and coalesces using logarithmic tree operations.
+Nodes reside inside free memory, with no allocated index and no hidden headers
+on live objects. Large-alignment searches can still visit holes whose size fits
+but whose aligned payload does not. Do not claim worst-case constant-time/TLSF.
+
+Allocations use a power-of-two quantum containing the free node (32B on the
+32-bit kernel,64B on the host test target). This adds bounded rounding to small
+allocations, preserves stronger requested alignments and prevents untrackable
+split tails. Window edges align inward; growth clamps to the supplied end even
+for a partial final page. Retained backing limits, small caches, release callback
+and physical-page reclamation remain. Tests destroy released contents to verify
+surviving tree headers stay mapped and live allocations stay intact.
+
+Standalone same-request fragmentation benchmark (40000 allocations512B,
+interleaved frees,12000 requests544B and coalescing; small cache enabled):
+ before setup1650ms, fragmented4944ms, coalesce0ms;
+ after setup3ms, fragmented8ms, coalesce5ms.
+This is an allocator stress benchmark, NOT an application startup speed claim.
+Source, baseline allocator and binaries/results: build/ci/heap-allocator/.
+Fresh native-ext4 QEMU256MiB cache mapping, same timed static probe:
+ before kernel90126b124447 cold255ms/alias35ms;
+ indexed allocator cold197ms/alias35ms; alias physical overhead524288B in both.
+This fresh-cache probe does not reproduce the aged full-build heap's19s mmap.
+
+Validation:8 allocator tests including thousands of fragmented extents, both
+coalescing directions, full-arena recovery, alignment, partial-window bounds,
+small-cache draining and page reclamation;548 kernel unit tests; ext4/FAT/SMB/
+hosted file cache, small/1152MiB frame sharing, cache budget/pressure, brk tests
+pass. Final kernel rerun of large sharing/budget/brk also passes. Kernel/lib
+Clippy passes; final prepared metal release is f47c1af15d34 (not installed).
+Full boot-image self-build remains incomplete; its correctness/performance
+validation will resume with this allocator. Earlier prepared90126b124447 has the
+brk fix but still the old linear kernel allocator.
+
+Follow-up validation with indexed heap: same frozen native build fixture and
+host-sized tool-directory population (no SMB) before/after kernels:
+ RAM first2.873/2.783s, ext4TEMP3.001/2.960s, RAM repeat2.842/2.619s,
+ retained intermediates3.882/3.648s, pipe3.046/2.914s; all status0 and run.
+Fresh small builds improve modestly; do not present the synthetic allocator's
+~600x fragmented-phase improvement as whole-build speedup. Saved labels are
+cache-invalidation-build/allocator-{before,after}-shaped; native simple fixture
+allocator-after2.590/2.584/2.431/2.996/2.423s for the same five modes.
+
+Indexed-heap full-build attempt ended normally (267.027s, status1) in GNU Make
+bootstrap configure, with a separate missing fchmodat syscall268. Config.log
+also exposed false feature probes (uid_t/headers/fork) from grep's null-output
+optimization: ordinary gcc -E | egrep succeeds, but redirecting output to
+/dev/null makes grep call splice275. ENOSYS caused status2 and broken-pipe
+errors from the preprocessor, cascading into invalid generated config macros.
+Isolated in build/ci/autoconf-probe/: null/ fails the null-output pipe cases;
+splice-fixed/ passes all8 variants with the same inputs and normal shell/tools.
+
+Added legacy fchmodat for x86-64 and i386 using existing pathname/ownership
+policy, with directory-FD, absolute path and error tests. Added x86-64
+pipe-to-discard-sink splice with actual consumption, partial transfers, EOF,
+blocking/asynchronous completion and O_NONBLOCK/SPLICE_F_NONBLOCK. Backend
+capability identifies /dev/null; other combinations remain unsupported/EINVAL.
+The request retains the input pipe while parked and cancels on thread exit or
+signal interruption. Invalid flags, offsets, read-only/append destinations and
+wrong endpoint modes leave input untouched. No fabricated splice success or
+configure/build flag workaround. New static linux_splice test also passes on
+Linux, and native namespace/thread-signal/kernel unit tests pass. Kernel Clippy
+passes. Full image has not yet completed; retry follows these compatibility fixes.
+
+Prepared release942ae6f3b005 includes the indexed heap and these compatibility
+fixes (not installed). Full //:boot_disk guest build is running again with
+4 jobs and preserved guest outputs, progressing past action897/1402.
+Live indexed-heap build sample,15.012614013s, calibratedTSC3992486378Hz:
+ allocations4557193,total1296669309ticks,max337440ticks;
+ frees4530021,total1089576742ticks,max232320ticks.
+Combined heap time0.598s across9.087million operations; longest allocation
+84.5us/free58.2us. Saved build/ci/heap-allocator/indexed-build-profile.json.
+This is a different build phase from the old19s mmap sample, so it verifies
+real-workload scalability but is not a matched whole-build speed comparison.
+
+Metal validation: BOOT.INI confirms release942ae6f3b005. Native nine-file
+build fixture passes all modes: RAM first2.603s, ext4TEMP2.716s, RAM repeat
+2.539s, retained intermediates2.848s, pipe2.255s. Outputs execute correctly.
+Results: build/ci/heap-allocator/metal-942ae6f3b005/results.json. These are
+small-build timings, not a full-self-build or Codex startup measurement.
+Previous indexed-heap full QEMU build stopped at260.998s: ENOSPC while
+extracting Wine sources into its private4GiB home.ext4; status1. Preserve
+guest artifacts, enlarge that filesystem offline before retrying in Linux.
+
+Native full //:boot_disk attempt: build/ci/metal-self-build-indexed. Reused
+metal-self-build/cache; jobs4; nativeTMPDIR;56GiB initially available. NASM
+compiles and prior runfiles failure is passed. Bazel stopped490.209s with
+Wine action exit216, yet process-wrapper10/childPython11 remained alive
+(parent reparented to3). Saved orphan-processes.json and klog.txt.
+A diagnostic SIGQUIT was sent to Java7 during the stall; failure reporting
+followed that signal, so exit216 is not an independent unsignalled failure.
+Stopped own leftover wrapper withSIGTERM after saving state.
+Native wait-thread.c repro: child sleeps1.5s, one pthread blocks in waitpid,
+sibling should wake at0.15s but wakes1.710s, at child exit. waitpid returns
+correct child11. Code inspection: sys_wait4/handle_wait parks entire kernel
+process; async_io::call does not implement per-context wait4. This explains
+why all Java progress/reporting freezes behind a long child. Signal-driven
+wakeup/exit216 still needs separate diagnosis; no fix claimed.
+Kernel-only //kernel:kernel_elf retry ongoing: build/ci/metal-kernel-indexed.
+Wine is a Windows runtime dependency of full boot bundle, not kernel-only.
+
+2026-11-11 later native session / hard hang / POSIX child-wait fix:
+Latest saved metal log DOS/KLOG0239.TXT ends without a panic/SEGV. User says
+F12 also stopped. Native kernel-only build reached829/833 then no saved result;
+final kernel Rust rlib was in progress. Do NOT claim the hard hang is fixed.
+
+Implemented per-user-context x86-64 wait4: Wait::Child parks only the caller;
+executor polls/reaps with the parent's address space active, writes the saved
+status, preserves sibling registers and signal interruption. Positive nonchild
+PID now givesECHILD even if unrelated children exist. Child-table scans happen
+only on a new wait or child-exit notification, not every syscall. Static
+linux_thread_wait probe exercises sibling-to-child pipe progress (old kernel
+hangs), two concurrent waits/status, WNOHANG/ECHILD, EINTR and unreaped child.
+Six targets pass:548 kernel unit tests plus thread_wait,thread_signal,SIGCHLD,
+parent_death,vfork_signal. Clippy passes. Prepared08e3f23ab44c, not installed;
+intermediate847a3cb5d11e has wait fix before event-driven child polling.
+
+Complete guest //kernel:kernel_elf build with847a3cb5d11e succeeded185.970s,
+critical75.43s,7 local actions, using preserved guest outputs. Disk grew4->12GiB
+before retry; no discarded build state. Saved ELF extracted to
+build/ci/self-build-failure-repro/guest-kernel.elf; build.status0. Harness now
+accepts --gdb-socket for a private Unix GDB endpoint. Full boot bundle remains
+incomplete; kernel-only target excludes Wine. Native Wine's earlier reported
+exit216 followed diagnosticSIGQUIT while blocked; wrapper/child outlivedBazel.
+Do not describe that status as an independent unsignalled compiler failure.
+
+Isolated exact kernel compile action from aquery, using dependencies compiled
+on metal and a separate native output directory:
+ Linux28.388s; fixed kernel4GiB/1CPU62.368s; old942 kernel32GiB/5CPUs39.554s.
+These different VM configurations are NOT allocator before/after measurements.
+The latter extra CPUs serve video/park; Linux work still one core. No hard hang
+in either KVM compiler run. Debugger samples saved underkernel-compile-hang/.
+
+Frozen all-native-ext4 compiler benchmark (no SMB/network), same compiler/input
+bytes with manifest541 tool/input paths999773759B, same flags and output action:
+ Linux first26.173s (user25.280/sys0.968),repeat25.234(user24.328/sys1.001);
+ RetroOS36.242/35.436s, bothstatus0. VM32GiB/2CPUs: one Linux core, one video.
+Raw results/source/profile: build/ci/kernel-compile-hang/native/.
+Profile74.00457s includes2s pre-run idle/short collection delay, two compiles:
+ TSC3992745136Hz; guest_arch58.564s, dispatch11.145s; exact guest57.275s;
+ heap1.763m alloc+1.710mfree total0.208s;939k userfaults0.607s.
+ IO: ext4_commit_write8.076s, disk_flush5.530s/1970calls, path_resolve0.309s.
+Scopes nest: do NOT sum ext4 writes, volume flushes and disk flush times.
+Compiler gap is about40%, not the much larger Bazel setup gap.
+
+Bazel phase comparison: Linux batch analysis pinned to one CPU, same512MiB JVM
+and loading/globbing flags, //kernel:kernel_elf --nobuild:13.610s wall,
+11.462user/0.756sys; build/ci/linux-kernel-analysis-single-core/.
+A frozen native-only whole workspace+installed repositories+runtime fixture
+(8.8GiB staging,12GiB image) is build/ci/native-bazel-analysis/. Initial failed
+fixture attempts lacked USER, registry metadata/cache ownership; not timings.
+Current valid comparison uses real local registry files reconstructed from
+149 recorded/cached registry bytes, lockfile_mode=off and downloads disabled
+in BOTH systems, same extracted repositories, no SMB/network. Linux needs
+explicit --repository_cache to the reference cache for cargo-bazel generator.
+ Linux single-core local-registry:9.949/10.041s (user9.311/9.412,sys0.610/0.613).
+ RetroOS08e3f23ab44c:53.403/60.645s,status0. Source and raw profiles retained.
+Native profile116.507s (both runs): guest39.001s, dispatch57.699s, outerloop
+13.333s, scheduler3.755s, idle2.404s;1.790m clock_gettime syscalls4.60s.
+Heap43.34m allocations+43.24m frees consume7.56s. IO:4190diskflushes10.169s;
+path_resolve10.268s/143205calls; volume_read4.896s/3.303m calls;
+directory_scan3.116s/8926calls. These IO scopes are nested, not additive.
+Namespace syscall costs across BOTH runs: unlink11.896s/1906calls,
+rename9.067s/300calls,openat7.65s/11424calls,getdents3.978s/14377calls.
+
+Candidate under test, not yet accepted as a measured improvement:
+async_io::schedule no longer rotates user threads after successful ordinary
+syscalls. Timer IRQs, blocked callers and explicit sched_yield still rotate.
+Previously even every clock_gettime polled all sleepers and rotated FP/TLS.
+Validation running: /tmp/retroos-syscall-scheduler-tests.log (session64387).
+Need benchmark SAME native fixture again, preserving baseline results/profile,
+before claiming a gain. Native analysis run_vm.py currently forces08e3f23ab44c;
+update to candidate prepared release only after tests pass. Preserve fixture
+until comparisons done; its staging/image are disposable and consume~18GiB.
+
+Continuation: scheduler candidate passed7 targets (unit,epoll_network,thread
+wait/signal,SIGCHLD,parent_death,vfork_signal) and Clippy. Native frozen Bazel
+analysis improved modestly to50.387/53.133s; saved scheduler-only/ under the
+native-bazel-analysis fixture. It reduced guest execution time39.0->31.8s
+across the pair, while syscall dispatch stayed~57s.
+
+Found/fixed cache-scalability problems in VFS namespace bookkeeping:
+ * has_mapped_path scanned ALL cached file pages for each unlink/rename, and
+   re-expanded the same alias for each shared page. New mapped_handles index
+   counts actual shared pages per retained backing handle. Pin, writable
+   handle upgrade and final unpin maintain it; private aliases stay unpinned.
+ * Directory invalidation re-ran alias resolution for EVERY cached listing.
+   DirCache now retains its resolved backend-relative sources at population;
+   existing invalidation rules compare those stable coordinates. Bind table
+   changes still retire all listings, preserving mount-index validity.
+Native same fixture31.849/32.252s. Across both runs dispatch56.9->22.1s;
+unlink15.25->1.52s; allocations46.82m->19.75m. Same filesystem data and journal
+policy. Tests: unit,ext4/FAT/SMB/hosted file cache,1152MiB frame sharing,
+namespace permissions pass. Extended mapping-lifetime probe closes both fds,
+exercises shared read/write views, partial unmaps, final write visibility and
+successful unlink; namespace tests cover aliases and two mounts of one fs.
+
+Path resolver now reuses flat prefix/pending buffers instead of allocating
+components and rejoining prefixes at every step. Existing symlink semantics,
+40-link bound and node lookup remain. Allocations19.75m->13.98m, but runtime
+31.748/32.729s: no material speedup claimed. Saved path-buffer-reused/.
+Outer directory cache was also a linear Vec searched for each path component.
+Now keyed BTreeMap<Vec<u8>,DirCache>; no duplicate stored directory path.
+Profiled native analysis30.009/28.736s; path_resolve10.60->6.81s across pair.
+Clippy,548 kernel tests,file-cache integration,namespace and/proc/fd tests pass.
+Prepared23c9e342c5ed includes all these changes, NOT installed.
+
+Final local-registry timing with KERNEL PROFILING DISABLED:29.464/27.872s;
+Linux matched local-registry case9.949/10.041s. Therefore meaningful progress
+from53.4/60.6s, but still~2.8-3x and not the desired~1.5x.
+Retained stages: before-scheduler/,scheduler-only/,namespace-indexed/,
+path-buffer-reused/,directory-indexed/,directory-indexed-unprofiled/.
+
+Corrected an additional fixture omission: MODULE.bazel.lock is gitignored,
+so the source-file snapshot initially omitted this real generated input.
+Without known registry hashes, a copied content-addressable registry cache
+cannot serve HTTP registry reads offline. The matched local-registry test
+above remains valid (both used identical local bytes/lockfile_mode=off).
+Now copied the real generated MODULE lock into the native fixture and reverted
+to standard registry/cache behavior for an additional ordinary cached analysis
+comparison; this restoration is fixture setup, NOT a kernel optimization.
+First native unprofiled standard-cache run29.381s; Linux single-core10.240s.
+Second runs still being recorded under native-bazel-analysis/results.json and
+linux-cached-analysis/results.json. No claim the metal F12 hang is resolved.
+Standard cached-registry comparison finished (kernel profiling disabled):
+ native29.381/26.977s; Linux one-core10.240/12.200s, bothstatus0. This is still
+~2-3x, not the desired1.5x. MODULE-lock restoration solved fixture fidelity,
+not a kernel bug. Kernel/profile source invariants and timings remain in the
+stage archives. Final prepared23c9e342c5ed, unit/cache/namespace/proc-fd tests
+and Clippy pass. No running VM is required to inspect these artifacts.
+
+Coarse-profile label correction: "loop" includes background filesystem
+writeback, not just scheduling/bookkeeping. Added opt-in detailed scopes in
+event_profile.rs/startup.rs/linux/mod.rs (disabled path does not read time).
+Native standard-cache pair30.046/27.624s, statuses0, profile59.7827s:
+ loop6.624s total = writeback4.04176s/592calls + deadline construction/scans
+2.49217s/1978391calls + ~0.09s other; logsync0.000015s,network0.
+Per run: loop3.312s, backgroundwriteback2.021s,deadlines1.246s,other0.045s.
+Process snapshot publication2.448s/1978391calls is in scheduler/control,
+NOT loop; scheduler/control total3.071s across pair. Thus prior naming of
+~1.5s/run as pure scheduling was also too broad. Instrumentation only; no
+scheduling/writeback policy changed in this diagnostic update. Tests and
+Clippy pass. Raw data/source: native-bazel-analysis/loop-details/.
+
+Diagnostic counters prepared as release a9ef0df013e4 (not installed);
+previous functional/performance release23c9e342c5ed remains available.
+
+Clock syscall amplification identified: 1,677,522 clock_gettime calls out of
+1,978,391 outer-loop passes across the standard native analysis pair. Each
+clock call needlessly republished all process snapshots and rebuilt global
+deadlines. startup.rs now resumes pure Linux clock reads within the SAME
+absolute CPU loan; IRQs, other syscalls, blocked states, lifecycle actions,
+or expiration return to the full loop. Alarms are still armed on each entry;
+no quantum extension, background service omission, or durability-policy change.
+New linux_clock_progress integration exercises a clock flood with interval
+SIGALRM, sleeping sibling, and a pipe-unblocked separate child; observes
+progress before join/wait. Uses SIGCHLD to observe the child, avoiding the
+unrelated unsupported shared-anonymous-across-fork behavior exposed by the
+first probe draft. Final Linux reference and KVM probe pass. All six targeted
+tests (kernel unit, clock progress, time-high, thread wait, thread signal,
+SIGCHLD) pass and kernel Clippy passes. Broad //tests:unit additionally found
+an existing workflow_lint violation at linux_codex_native_resume.py:59
+(undeclared nested Bazel build); not changed as part of this scheduler fix.
+Exploratory pair27.200/24.838s passed while host tests were also active, so use
+only for functional/counter validation, not final performance comparison.
+Scans293266, task_snapshot0.5353s + deadlines0.3759s across pair vs previous
+1,978,391 and4.9402s. Journal flush count1895 /4.1921s persists; background
+writeback3.9576s. This second source of stalls remains unmodified.
+
+Final quiet clock-loan comparison (same standard-cache fixture, profiling on,
+no concurrent host test/build):25.857/23.981s, bothstatus0, vs30.046/27.624s
+before; ~14%/13% faster. Saved clock-loan-quiet/summary.json and raw profiles.
+Across pair: task/deadline scans291731 (~85% fewer), task_snapshot0.5102s +
+deadlines0.3728s =0.8831s (was4.9402s). Background writeback4.0540s and disk
+flush4.1824s/1835calls remain (nested totals, DO NOT add together). Source
+still services writeback every100ms, small JBD2 batches synchronously commit
+with5durability barriers. This explains~2s/run of main-loop blocking; changing
+clock handling did not change writeback/durability policy. Overall runtime
+still~2-2.5x the saved Linux10.240/12.200s pair, not the desired1.5x.
+
+Clock-loan fix prepared as release97ae1ed1a7ad; NOT installed.
+
+Complete syscall measurement added (2026-11-11): existing event counters were
+shared with faults/ports and serial output capped at32 event classes. Added
+separate opt-in BTreeMap keyed(ABI,nr) with calls,total handler ns,max ns at
+Linux dispatch_action entry/exit, including early returns. Storage allocations
+and counter updates excluded from measured handler interval. Disabled profiler
+reads no clock and allocates no counter storage. profile reset clears table;
+profile syscalls returns ALL rows via COM2, F12/profile dump includes rows too.
+MCP bridge profile_syscalls tool added. tools/report_syscall_profile.py exports
+all rows with syscall names, count,total ms,average us,max ms and optional CSV.
+Scope is synchronous handler elapsed time, including synchronous disk waits;
+excludes blocked task sleep, deferred lifecycle/completion work, arch crossings
+and outer-loop work. These must not be silently charged to zero or added twice.
+Quiet native standard-cache analysis24.640/24.024s,status0, two runs total:
+84syscall types,1,929,211calls,15.240110s measured handler time.
+Top handler totals across pair: getdents64 14384/1.767833s; write4873/1.735430s;
+symlink918/1.640484s; lstat21254/1.549104s; unlink1898/1.511589s;
+mmap8607/1.293921s; openat10890/1.289517s; fstat10670/0.992647s;
+read52507/0.738237s; clock_gettime1655599/0.705540s (0.426us avg).
+Clock handler itself~0.353s/run; global scans bypassed in previous fix were
+additional work, not clock handler time. Background writeback3.975185s/pair is
+also separate. File/directory mutations and metadata dominate handler cost.
+Validated all84rows(max<=total,positive count) and exact call-count agreement
+with all31retained x64 syscall rows in the old independent event profiler.
+Kernel548unit tests +Clippy pass. RawJSON,fullCSV,fulltext,stderr,klog and
+Bazeltrace archived native-bazel-analysis/syscall-profile/. Profiler reset
+check now in the collector for future runs, not executed in this recorded run.
+
+Complete syscall profiler prepared as release9006710767b5; NOT installed.
+
+64-bit clock_gettime vDSO implemented (2026-11-11). One-page position-independent
+ELF64 image assembled by existing NASM toolchain (no new host C compiler/linker
+dependency); SysV hash, dynamic symbols and LINUX_2.6 version expose
+__vdso_clock_gettime plus weak clock_gettime alias. Kernel installs immutable
+TSC epoch +32.32 ns multiplier, RX user page, AT_SYSINFO_EHDR; reserves its
+range against ordinary mmap/brk and carries it through fork/exec. Loader/policy
+live in kernel/linux/vdso.rs+asm; arch adds only optional user_tsc_clock facts.
+Only advertised for64-bit guests when active clocksource is stable user-readable
+TSC; other backends,32-bit processes,and HPET/PIT retain normal syscall fallback.
+Fast clock IDs1/4/6/7 use same conversion and millisecond truncation as existing
+kernel time service. IDs0/5 and unsupported clocks execute syscall228, retaining
+real-time/errors. No periodic kernel update, clocksource approximation, fake
+realtime offset, or change to clock precision introduced.
+KVM integration: static+dynamic glibc find and use the vDSO. Each performs
+200000monotonic direct/libc reads plus20000after child exec, producing exactly
+14clock syscalls (8explicit before/after references +6fallback cases). Also
+verifies all4fast IDs against explicit syscalls, monotonicity, full64-bit and
+cross-page output pointers, mmap collision avoidance, fork/exec,and RX write
+fault. KVM with invariant/hypervisor TSC hints disabled advertises no vDSO and
+libc fallback issues2clock syscalls. Profiler-reset empty-table assertion passes.
+All6targeted tests(kernel548unit,linux_vdso,clock_progress,time_high,thread_wait,
+thread_signal)pass. Kernel+arch-metal Clippy pass. Bazel tests use private
+workspaces: persisted vdso-integration.log is authoritative, root build/ci
+linux-vdso-*.json from earlier direct diagnostic run may be stale.
+Matched quiet standard-cache analysis23.390/22.264s,status0, vs immediately
+preceding syscall-profile24.640/24.024s. Across pair clock syscalls1655599 ->
+6191(~99.6% fewer); total syscalls1929211 ->282750; actual arch guest entries
+287517. Remaining clock handler0.4978s/pair includes slow RTC fallback calls.
+Outer snapshots/deadlines0.4962+0.3776s,persistent background writeback3.6916s,
+disk_flush3.9616s/1775calls(nested; do not add writeback+flush). This improves
+runtime modestly and does not eliminate the remaining filesystem gap to Linux.
+Artifacts native-bazel-analysis/vdso/: full profile,syscallCSV,klog,Bazel traces,
+status/time rows and integration test log. No claim metal F12 hang resolved.
+
+vDSO release5ad2fd0847da prepared; NOT installed.
+
+Accounting reconciliation after user challenged syscall-vs-kernel totals:
+reporting had mixed TWO-RUN handler totals with per-run wall times and did not
+present the unmeasured wrapper/outer-loop costs together. No new runtime fix.
+Saved reproducible reconcile.py,execution-reconciliation.json/.txt under
+native-bazel-analysis/. Converts cycles using independently recorded boot-log
+TSC calibration (3992227774Hz before,3992721137Hz after); asserts flat coarse
+ledger closes against elapsed clock (<1ms), architecture stages sum exactly
+and independent architecture/coarse sample windows agree within5ms.
+AVERAGE PER RUN before/after vDSO: handlers7.6201/7.6667s; backgroundwriteback
+1.9876/1.8458s; architectureentryexit0.4796/0.1833s; executionwrapper residual
+0.5945/0.1095s; dispatchoutsidehandler0.1455/0.0398s; otherouterloop0.2047/
+0.1941s; schedulercontrol0.4849/0.5284s; otherservices0.0335/0.0343s.
+Kernelactive sum11.5506/10.6020s; userexecutionwindow12.8034/12.2371s;
+activeprofiletotal24.3540/22.8391s vs measuredworkloadwall24.3320/22.8270s.
+Fullprofile25.8409/24.3239s includesidle1.4869/1.4848s mostly deliberate
+pre-workload/collection waits. Active-vs-workload residual22/12ms reflects
+slightly different windows, not seconds of missing work. All are elapsed
+stage measurements, NOT Linux rusage CPU-accounting fields.
+Nested fault timings are ALREADY inside architecture dispatch and other
+stages; disk_flush ALREADY inside handlers/writeback. Do NOT add again.
+Coarse guest_arch is NOT pure user execution; split explicit architecture
+stages and remainingwrapper time from the detailed execution ledger.
+Remainingwrapper is a measured DIFFERENCE (timerchecks/alarm/profiling etc
+aroundexecute), not an individually resolved substage. Entries fell1.934m->
+0.288m but outerpasses288480->290381: prior clock-return fix already removed
+per-clock outerloops before this comparison. vDSO removed~0.887s/run from
+entry/exit+wrapper+dispatchoutsidehandler and~0.104s/run clockhandler; other
+handlers rose~0.151s/run. Userexecutionwindow also fell~0.566s/run, whose
+cause this aggregate profile cannot independently attribute to vDSO.
+Thus remaining syscall crossing cost was order1us/call, not10us+. Current
+handlers+writeback9.5125s of10.6020s kernelactive(~90%): main remaining gap is
+there, not several hidden seconds in the eliminated clock-entry path.
+
+Linux comparison investigation after "why can Linux do this fast?":
+Ran same cached native-only Bazel analysis command under strace -f -c with
+filesystem/read/write/mmap/sync syscall filter, taskset one allowed CPU0.
+status0, wall18.376s UNDER PTRACE (NOT an untraced benchmark; baseline10-12s).
+Current host source differs slightly from frozen guest snapshot (11784vs11781
+configuredtargets), do not call exact byte-for-byte workload. Namespace counts
+closely match: Linux459symlinks vsRetro918/2=459; Linux7198getdents vs14388/2=
+7194; Linux950unlink vs1898/2=949. No requested fsync/fdatasync/sync/syncfs
+in filtered trace. This does NOT mean Linux's background journal does noflushes.
+strace table CPU estimates1.434s filtered syscall total inflated byinstrumentation;
+DO NOT compare traced us/call directly with Retro synchronous-handler elapsed
+ns or use18.376s as Linux baseline. Saved linux-cached-analysis/syscall-summary
+.txt/.json,strace-run.json,strace-launcher.err. Linux workspace ext4rw,relatime.
+Confirmed concrete extra RetroFS work: regular fstat calls fd_mtime ->VFS
+handle_mtime ->fs.mtime(subpath) ->portable_ext4.resolve ->walk fromroot,
+while mode/size/ino alreadyavailableonopenhandle. Ownership additionally
+inspects nativeinode. Directory-fstat repeats path lookup for stat,mtime,
+ownership. portable_ext4 append_entries uses graph.entries ->inspect every
+childinode to construct full(size,mtime,mode,uid...)metadata; getdents only
+needs names/inode/type. vfs::readdir clones name/entry and locks perentry.
+Native ext4 inode() re-reads group/inode records and decodes each access,
+even if volume/blockcache hits: content/sector caching isn't parsed-inode cache.
+Journal pending cap64blocks, periodicwriteback100ms,5barriers/commit; current
+vdso profile1775flushes acrosspair(~888/run) despite no explicit durability
+requests in Linux trace. Linux ext4 defaults ordered data,5s transaction age,
+and cached dentries/inodes avoid re-decoding hotmetadata. Officialreferences:
+https://www.kernel.org/doc/html/latest/filesystems/vfs.html
+https://www.kernel.org/doc/html/latest/admin-guide/ext4.html
+These code paths establish avoidable work, not measured per-cause attribution
+of the full filesystem gap. No kernel change in this comparison-only turn.
+
+Avoidable filesystem work batch (in progress): added Filesystem::stat_node
+fresh(Stat,Meta)snapshot, portable ext4 implementation inspects stable object
+once. Linux regular fstat/fstat64 and statx AT_EMPTY_PATH use one VFS lock,
+one inode inspection for size/mode/mtime/ownership, preserving VFS inode IDs
+and active-path overrides, ignoring reused-name overrides after unlink.
+Path-oriented backends retain existing fallback; DOS/OS2 fd_info unchanged.
+Second improvement: getdents64 visits borrowed cached entries under one lock
+and resolves directory once per syscall. Previously vfs::readdir resolved
+symlinks,locked and cloned a DirEntry/name separately for EVERY returned entry.
+Keeps existing enumeration/inode policy; no lightweight inode-free backend
+listing introduced yet. Short-buffer rejected entry is not consumed.
+New fd-metadata integration checks live size through second open,chmod,
+utimensat,truncate,rename/replacement,unlink and statx AT_EMPTY_PATH. Linux
+reference uses private temp root; guest native ext4. Unit test checks fresh
+object metadata despite stale cached open fields/no namespace refresh and
+reused-unlinked-name overrides; batch visitor test covers alias,cursor/resume,
+rejected entry and end. One initial unit assertion assumed one backend listing
+but alias traversal legitimately populates two; corrected to assert no extra
+listing on resume.550kernel unit tests and native metadata probe pass.
+
+Final directory copy design: shared existing LinuxState.read_buffer capped64KiB,
+format records from borrowed entries under one VFS lock, release lock then one
+full-width high_memory::copy_to. No user-buffer page fault under VFS lock
+(which would prevent physical cache reclaim); no new retained scratch buffer.
+Native metadata integration extended with small32byte directory batches,
+rewind, duplicate/missing-name checks, and high64-bit page-split output buffer.
+All5target groups pass:550unit,fdmetadata,ext4/FAT/SMB/hostedfilecache,namespace,
+32/64bit proc-fd overSMB/ext4. FinalClippy status in fs-buffer-clippy.log.
+Intermediate direct-user-copy profile23.246/21.100s,status0, vs23.390/22.264s
+baseline; fstat1.0008->0.4941s andgetdents1.7943->0.6460s acrosspair. Saved
+fs-work-direct-copy/ for audit; final buffered-copy timings still pending.
+
+Final buffered-copy verification:550unit,fdmetadata (including32byte directory
+chunks, rewind, high64-bit cross-page output),filecache(all4backends),namespace,
+proc-fd(32/64bit ext4/SMB)pass; Clippy pass. No failed check remains.
+Initial unpinned buffered pair24.560/24.550s was SLOWER than original vdso
+23.390/22.264s despite handler15.333->13.942s/pair, because userexecutionwindow
+increased24.47->29.18s/pair. Saved fs-work-buffer-first/; do not hide this or
+claim that single pair improved wall time. Investigated with alternating
+old/new binaries, matching vCPU placement. First pinning setup was flawed:
+QEMU emulator I/O shared video-core7, causing severe artificial I/O stalls
+(old40.485/27.720s,new39.248/27.830s). Those runs are retained under
+fs-old-pinned/ and fs-new-pinned-io-shared/, NOT representative metal results.
+Corrected setup pins guest CPU0 to host6, video CPU1 tohost7; emulator I/O
+retains affinity to other CPUs0-5,8-13 (excluding both vCPU cores and SMT
+siblings14/15). Verified live host thread masks. Old kernel injected from
+prepared5ad2fd0847da, sha8ce92d236c85cafcf3ffdf1635e6ab255a9d8b6e647934d9f5277f5be49ef65c.
+Then final new kernel runs back-to-back on SAME native ext4 image/commands.
+Corrected old23.976/22.200s vs new22.180/20.763s,allstatus0 (~7% pair speedup).
+Across pair: fstat10682calls/0.999844s ->10631/0.477073s (~52% less time);
+getdents14388/1.781048s ->14382/0.640422s (~64% less time). Allhandler time
+15.432849->13.451843s; heapallocs13107819->10931967 (~2.18m fewer);
+path_resolution137169calls/6.405963s ->91685/5.195311s;
+volume_read3265319calls/1754431029B ->2959071/1592743046B. Backgroundwriteback
+3.689225->3.556309s,pair; durability policy UNCHANGED. Remaining full-inode
+loads while building directory cache and repeated inode/group decoding are
+not addressed by these two changes. Overall Linux gap remains.
+Final data fs-work/ plus matched fs-old-pinned-separate-io/,comparisonJSON
+fs-work-comparison.json and reproducible summarize_fs_work.py. Metadata includes
+kernel SHA and explicit host affinity. Final integration logs copied to fs-work/.
+
+Final corrected per-pair active ledger: old guestwindow25.0595s +kernel21.1388s
+=46.1983s vs measured46.176s; new guestwindow24.0614s +kernel18.9017s
+=42.9631s vs measured42.943s. No nested syscall/I/O totals added twice.
+Release b1001f002559 prepared with these fixes; NOT installed.
+
+2026-11-11: remove repeated filesystem work (current pass)
+Decoded metadata belongs to ext4 Filesystem transaction owner: bounded direct
+indexes of 4096 decoded inodes and256 immutable group inode-table addresses.
+No second file-content cache; allocation lazy/fallible. Updates forget before
+raw mutation and republish decoded successful record; allocation/release
+forget inode reuse; all dirty rollback/remount paths reset both indexes.
+Zero-link orphans deliberately revalidate chain rather than use cached facts.
+Bare Graph APIs remain uncached (callers may supply arbitrary Storage views).
+Validation errors with no overlay edits/free-count changes no longer remount
+and discard warm facts. EEXIST no longer causes that costly cold restart.
+Host modern-image tests24pass, including mutation/rollback/reuse/no-storage-
+read checks, all journal failure/power-loss points, varied block sizes.
+
+Journal pending capacity now derived from actual descriptor tag geometry and
+journal payload space, capped1MiB per transaction rather than arbitrary64
+blocks (about254 blocks for common4KiB/csum3). Five durability barriers per
+committed transaction unchanged. IMPORTANT POLICY CHANGE: periodic ordinary
+writeback100ms->5seconds; explicit fsync/syncfs and clean shutdown still flush.
+New native linux_writeback_shutdown writes70003B, closes without fsync, then
+normal poweroff: exact persisted bytes and clean e2fsck verified. This does
+not promise unsynced data survives abrupt power loss within that interval.
+
+VFS path walk borrows cached directory entries and initial path; only actual
+symlink expansion allocates a replacement path. Alias rewrite uses bounded
+stack buffer. Linux path stat+ownership resolves the name once under one
+VFS lock. Full process-private mount/live namespace behavior retained.
+Per-directory sorted (mount,inode)->entry-position index refreshes writes
+without scanning every file name in every cached directory; duplicate inode
+names/hardlinks retained. Unknown exact-bind identities invalidate as before.
+Directory position/identity stable during listing lifetime; whole replacement
+or removal retires index. Metadata-only index, no copied names/file contents.
+Diagnostic write_refresh/rtc_read scopes added to locate remaining work.
+Latest validation:550kernel units,linux_fd_metadata,linux_file_cache (all four
+backends),linux_namespace_permissions,linux_proc_fd(32/64/ext4/SMB),
+linux_writeback_shutdown allpass; kernel+ext4 Clippy pass. Logs:
+/tmp/retroos-write-index-tests.log and/tmp/retroos-write-index-clippy.log.
+
+Controlled native ext4 KVM analysis fixture, same pinned vCPUs6/7 and separate
+emulator I/O as preceding fs-work baseline; two --batch build --nobuild runs,
+NOT a full compilation. Baseline fs-work wall22.180/20.763s,status0.
+Decoded-only20.923/19.682s; combined before directory-write-index
+no-waste-pass1 wall19.589/18.501s,status0. Across PAIR baseline->pass1:
+kernel active18.9017->13.4711s; synchronous handlers13.45184->11.18582s;
+heap allocations10,931,967->6,625,946; volume reads2,959,071->1,005,755;
+volume bytes1.59274->1.40417GB; path walks91,685/5.19531s->73,118/3.42998s;
+directory_scan3.43081->2.12384s; writeback449/3.55631s->9/0.230612s;
+disk flush1685/3.79521s->385/0.929411s. Nested counters NOT additive.
+Final index-enabled measured run pending below. Linux gap remains; no claim
+all waste eliminated. No installation or commit done in this pass.
+
+Directory-write-index isolated follow-up: no-waste-write-index/ archive,
+wall19.700/17.925s,status0; kernel6.59055s/run vs6.73554 before index.
+Write refresh5088calls/0.11920s,pair. New rtc_read scope exposes11815 full
+CMOS calendar reads/0.92845s,pair: about0.46s/run of needless port I/O.
+Removed per-call RTC hardware reads: wall clock anchors raw firmware epoch
+once and advances via portio monotonic nanoseconds, then applies current
+configured RTC interpretation/offset. No allocation, no per-call calendar
+conversion; preserves second resolution and timezone policy. Unavailable RTC
+is retried, backend monotonic reset reanchors, overflow remains unavailable.
+No guest clock-set API currently implemented; future clock-setting API must
+update the wall-clock anchor. Unit coverage: year rollover/long idle/no second
+hardware read, initial unavailable RTC, monotonic reset, timestamp overflow.
+
+Final no-waste-wallclock/ (also no-waste-final/) controlled pair:
+wall19.530/18.366s,status0 vsbaseline22.180/20.763s (~11.75% pair reduction).
+Mean per run disjoint ACTIVE ledger: user execution window12.77151s,
+syscall handlers5.09974s, background writeback0.09426s,
+remaining kernel1.01150s; total18.97701s. Difference vsmeasured18.948s is
+profile-boundary setup/collection. Kernel6.20550s/run vs9.45085baseline
+(~34.34% reduction); handlers6.72592->5.09974s/run. User window was
+12.03070baseline and is12.77151now, so whole-program speedup is smaller
+than kernel-work improvement. No claims of Linux parity or all waste gone.
+Pair RTC reads11815/0.92845s ->0/0s after boot anchor; indexed write refresh
+5088/0.11064s; device flush380/0.88074s vsbaseline1685/3.79521s.
+Pair allocations10,931,967->6,722,473 (~38.5% fewer). Reproducible report:
+build/ci/native-bazel-analysis/summarize_no_waste.py ->no-waste-comparison.json.
+
+Investigated apparent duplicate flush_handle drains; did NOT retain a reorder.
+Portable ext4 flush drains pending writes, separate sync commits journal and
+barrier. Thus prior commentary suggesting two ext4 journal commits there was
+incorrect. First drain also propagates write failures before set_mtime's bool
+API; removing it risks masking an error. Final code retains existing ordering.
+Clock-enabled final tests552units,fdmetadata,linux_vdso(static/dynamic/fallback),
+shutdown persistence pass; final kernel+ext4 Clippy pass in wallclock logs.
+
+Final restored flush-order source rebuilt and revalidated:552units,
+fdmetadata,filecache(all4backends),vdso(static/dynamic/fallback),shutdown
+persistence allpass. Prior namespace/proc-fd tests pass; ext4 host24 modern
+images and ext4 units pass. Final Clippy pass. Current rebuilt kernel SHA256
+matches measured final binary exactly:
+0147e5de561dbc16b4d767448a9390a158bd7369304f4cdb2e28dd5830d4a364.
+Prepared release84d295a0b771, NOT installed. Durable evidence/logs copied into
+build/ci/native-bazel-analysis/no-waste-final/; comparison includes disjoint
+per-run active ledger and separately labeled nested per-pair I/O counters.

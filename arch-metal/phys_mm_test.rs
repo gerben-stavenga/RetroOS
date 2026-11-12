@@ -63,4 +63,14 @@ fn firmware_holes_high_ram_and_exhaustion() {
     assert_eq!(alloc_phys_page(), Some(258));
     assert_eq!(alloc_phys_page(), None);
     assert_eq!(free_page_count(), 0);
+    static DONATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(258);
+    fn donate() -> Option<u64> {
+        match DONATION.swap(0, core::sync::atomic::Ordering::Relaxed) { 0 => None, page => Some(page) }
+    }
+    set_reclaim(donate);
+    assert_eq!(alloc_phys_page(), Some(258), "reclaim transfers existing ownership");
+    assert_eq!(get_ref_count(258), 1);
+    assert_eq!(alloc_phys_page(), None);
+    free_phys_page(258);
+    assert_eq!(free_page_count(), 1);
 }

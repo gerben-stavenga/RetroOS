@@ -89,6 +89,7 @@ def main():
     parser.add_argument('--reuse-native-home', action='store_true', help='Resume an existing private native home image')
     parser.add_argument('--native-compiler-libs', action='store_true', help='Read installed Rust compiler libraries from a private native ext4 image')
     parser.add_argument('--timeout', type=int, default=14400)
+    parser.add_argument('--gdb-socket', type=Path, help='Expose QEMU GDB control on a private Unix socket')
     args = parser.parse_args()
     if args.native_compiler_libs and (not args.native_home or not args.reuse_repositories):
         parser.error('--native-compiler-libs requires --native-home and --reuse-repositories')
@@ -188,6 +189,8 @@ def main():
     timed_out = False
     with (work / 'klog.txt').open('w') as log:
         qemu_args = ['-m', '4096']
+        if args.gdb_socket:
+            qemu_args += ['-gdb', f'unix:{args.gdb_socket.resolve()},server=on,wait=off']
         if args.native_home:
             qemu_args += ['-drive', f'file={native_image},format=raw,if=none,id=selfbuildhome',
                           '-device', 'nvme,drive=selfbuildhome,serial=SELFBUILD']

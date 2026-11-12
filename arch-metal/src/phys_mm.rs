@@ -96,7 +96,17 @@ pub fn mark_used(low_page: u64, high_page: u64) {
     unsafe { (*pool_ptr()).mark(low_page, high_page); }
 }
 
-pub fn alloc_phys_page() -> Option<u64> { unsafe { (*pool_ptr()).allocate() } }
+// The kernel may donate an exclusively owned cached frame on exhaustion.
+// No pool borrow survives the callback; it may release cache metadata.
+static RECLAIM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+pub fn set_reclaim(callback: fn() -> Option<u64>) { RECLAIM.store(callback as usize, Ordering::Release); }
+pub fn alloc_phys_page() -> Option<u64> {
+    if let Some(page) = unsafe { (*pool_ptr()).allocate() } { return Some(page); }
+    let callback = RECLAIM.load(Ordering::Acquire);
+    if callback == 0 { return None; }
+    let reclaim: fn() -> Option<u64> = unsafe { core::mem::transmute(callback) };
+    reclaim()
+}
 
 pub fn free_phys_page(page: u64) {
     if is_zero_page(page) { return; }

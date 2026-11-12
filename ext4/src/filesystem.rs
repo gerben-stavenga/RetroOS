@@ -89,6 +89,7 @@ impl Filesystem {
     fn commit_blocks(&mut self, storage: &mut dyn Storage, dirty: BlockChanges) -> Result<(), Error> {
         if let Err(error) = self.journal.commit_blocks(&self.graph, storage, dirty) {
             self.graph = Graph::mount(&mut RecoveredStorage::new(storage, &self.journal, &self.pending, self.graph.block_size))?;
+            self.graph.enable_decoded_metadata();
             return Err(error);
         }
         Ok(())
@@ -117,6 +118,7 @@ impl Filesystem {
         let pending = BlockChanges::default();
         let block_size = graph.block_size;
         let graph = Graph::mount(&mut RecoveredStorage::new(storage, &journal, &pending, block_size))?;
+        graph.enable_decoded_metadata();
         Ok(Self { graph, journal, pending, writeback_limit: 0, recover_orphans: true })
     }
 
@@ -220,11 +222,20 @@ impl Filesystem {
         let (result, dirty) = {
             let mut recovered = RecoveredStorage::new(storage, &self.journal, &self.pending, self.graph.block_size);
             let mut overlay = BlockOverlay::new(&mut recovered, self.graph.block_size);
+            let counts_before = (self.graph.free_blocks, self.graph.free_inodes);
             let result = match operation(&mut self.graph, &mut overlay) {
                 Ok(result) => result,
                 Err(error) => {
-                    drop(overlay);
-                    self.graph = Graph::mount(&mut recovered)?;
+                    let dirty = overlay.finish();
+                    // Validation failures such as EEXIST did not mutate the
+                    // graph. Remounting here discarded all warm decoded facts
+                    // and allocation hints for an ordinary unsuccessful lookup.
+                    if !dirty.blocks.is_empty()
+                        || counts_before != (self.graph.free_blocks, self.graph.free_inodes)
+                    {
+                        self.graph = Graph::mount(&mut recovered)?;
+                        self.graph.enable_decoded_metadata();
+                    }
                     return Err(error);
                 }
             };
@@ -243,6 +254,7 @@ impl Filesystem {
                 self.commit_blocks(storage, dirty)?;
             } else if let Err(error) = self.pending.merge(dirty) {
                 self.graph = Graph::mount(&mut RecoveredStorage::new(storage, &self.journal, &self.pending, self.graph.block_size))?;
+                self.graph.enable_decoded_metadata();
                 return Err(error);
             }
         }

@@ -2353,3 +2353,23 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
     invalidate_tlb();
     lib::compact_println!("Kernel hardening complete");
 }
+
+/// Map owned RAM without a permanent kernel alias. Private mappings own a
+/// counted COW reference; shared mappings borrow the cache's pinned ownership.
+pub(crate) fn map_frame(vpage: usize, frame: u64, shared: bool, writable: bool, executable: bool) -> bool {
+    if vpage >= 0xc0000000 / PAGE_SIZE { return false; }
+    if !shared && !crate::phys_mm::inc_shared_count(frame) { return false; }
+    fn map<E: Entry>(entries: &mut [E], vpage: usize, frame: u64, shared: bool, writable: bool, executable: bool) {
+        let mut entry = E::new(frame, shared && writable, true);
+        entry.set_writable(writable);
+        entry.set_no_execute(!executable);
+        entry.set_flag(flags::FOREIGN, shared);
+        replace_mapping(&mut entries[vpage], entry);
+    }
+    match entries() {
+        Entries::E32(e) => map(e, vpage, frame, shared, writable, executable),
+        Entries::E64(e) => map(e, vpage, frame, shared, writable, executable),
+    }
+    crate::x86::invlpg(vpage * PAGE_SIZE);
+    true
+}

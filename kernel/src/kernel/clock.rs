@@ -4,6 +4,25 @@ use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 static RTC_UTC: AtomicBool = AtomicBool::new(false);
 static OFFSET_MINUTES: AtomicI32 = AtomicI32::new(0);
+static WALL_CLOCK: spin::Mutex<WallClock> = spin::Mutex::new(WallClock { anchor: None });
+
+// Keep the raw RTC epoch so changes to the configured timezone still apply.
+// CMOS is only the boot-time wall-clock source; elapsed time comes from the
+// same monotonic clock used by kernel deadlines, including while idle.
+struct WallClock { anchor: Option<(u64, u32)> }
+impl WallClock {
+    fn timestamp(&mut self, now: u64, read_rtc: impl FnOnce() -> Option<u32>) -> Option<u32> {
+        if let Some((start, seconds)) = self.anchor && now >= start {
+            return seconds.checked_add(u32::try_from((now - start) / 1_000_000_000).ok()?);
+        }
+        // Retry unavailable firmware, and reanchor if a backend resets its
+        // monotonic clock. Never cache a failed RTC read as an epoch of zero.
+        self.anchor = None;
+        let seconds = read_rtc()?;
+        self.anchor = Some((now, seconds));
+        Some(seconds)
+    }
+}
 
 fn cmos_read(index: u8) -> u8 {
     crate::kernel::portio::outb(0x70, index);
@@ -63,6 +82,12 @@ fn rtc_time() -> Option<(u8, u8, u8)> {
 
 /// UTC seconds since the Unix epoch, interpreting the RTC using boot policy.
 pub fn rtc_unix_timestamp() -> Option<u32> {
+    let unix = WALL_CLOCK.lock().timestamp(super::portio::now_ns(), read_rtc_timestamp)?;
+    Some(if RTC_UTC.load(Ordering::Relaxed) { unix } else { local_to_unix(unix) })
+}
+
+fn read_rtc_timestamp() -> Option<u32> {
+    let _sample = super::event_profile::FileIoScope::start(super::event_profile::RTC_READ, 0);
     let (year, month, day) = rtc_date()?;
     let (hour, minute, second) = rtc_time()?;
     let (year, month, day) = (year as u32, month as u32, day as u32);
@@ -80,8 +105,7 @@ pub fn rtc_unix_timestamp() -> Option<u32> {
     let days = era * 146097 + (yoe * 365 + yoe / 4 - yoe / 100 + doy) - 719468;
     let seconds = days * 86_400 + hour as i64 * 3600
         + minute as i64 * 60 + second as i64;
-    let unix = u32::try_from(seconds).ok()?;
-    Some(if RTC_UTC.load(Ordering::Relaxed) { unix } else { local_to_unix(unix) })
+    u32::try_from(seconds).ok()
 }
 
 /// Calendar fields: year, month, weekday (Sunday = 0), day, hour, minute,
@@ -188,6 +212,29 @@ pub fn local_to_unix(local: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wall_clock_advances_without_reading_cmos_again() {
+        let mut clock = WallClock { anchor: None };
+        let start = 123_456_789;
+        // Last second of 2023, followed by a year boundary and a long idle.
+        assert_eq!(clock.timestamp(start, || Some(1_704_067_199)), Some(1_704_067_199));
+        for (elapsed, seconds) in [(999_999_999, 0), (1_000_000_000, 1), (86_401_000_000_000, 86_401)] {
+            assert_eq!(clock.timestamp(start + elapsed, || panic!("warm clock reread CMOS")),
+                Some(1_704_067_199 + seconds));
+        }
+    }
+
+    #[test]
+    fn wall_clock_retries_invalid_rtc_and_handles_backend_reset_and_overflow() {
+        let mut clock = WallClock { anchor: None };
+        assert_eq!(clock.timestamp(100, || None), None);
+        assert_eq!(clock.timestamp(200, || Some(1000)), Some(1000));
+        assert_eq!(clock.timestamp(0, || Some(2000)), Some(2000));
+        assert_eq!(clock.timestamp(1_000_000_000, || panic!("warm RTC")), Some(2001));
+        let mut clock = WallClock { anchor: Some((0, u32::MAX)) };
+        assert_eq!(clock.timestamp(1_000_000_000, || panic!("overflow reread RTC")), None);
+    }
 
     #[test]
     fn offsets_validate_and_support_partial_hours() {

@@ -67,21 +67,7 @@ pub struct LoadedElf {
 /// applied here — for dynamically-linked images the interpreter (ld.so) does
 /// that; `load_bias` only places the segments.
 pub(crate) fn load_elf_source<A: crate::Arch>(machine: &mut A, elf_data: &[u8], load_bias: usize, source: Option<&crate::kernel::exec::ExecutableFile>) -> Result<LoadedElf, ElfError> {
-    let metadata = lib::elf::Elf::parse(elf_data)?;
-    let mut file_end = elf_data.len();
-    for segment in metadata.segments() {
-        file_end = file_end.max(segment.file_offset.checked_add(segment.filesz).ok_or(ElfError::InvalidType)?);
-    }
-    let cached = source.map(|file| file.cached_image(machine.free_page_count(), file_end)).transpose()
-        .map_err(|_| ElfError::InvalidType)?.flatten();
-    // The metadata used to select/validate the executable must agree with
-    // the snapshot. Never combine headers from one version with another body.
-    if let Some(bytes) = &cached
-        && bytes.get(..elf_data.len()) != Some(elf_data) { return Err(ElfError::InvalidType); }
-    let elf_data = cached.as_ref().map_or(elf_data, |bytes| bytes.as_slice());
-    let source = if cached.is_some() { None } else { source };
     let elf = lib::elf::Elf::parse(elf_data)?;
-
     // Adjacent PT_LOAD segments may share a page. Allocate the union before
     // copying any payload, so a later segment cannot clear an earlier one.
     let ranges = load_page_ranges(elf.segments().map(|s| (s.vaddr, s.memsz)), load_bias)?;
@@ -110,6 +96,24 @@ pub(crate) fn load_elf_source<A: crate::Arch>(machine: &mut A, elf_data: &[u8], 
         if let Some(source) = source {
             let scratch = scratch.as_mut().unwrap();
             let mut copied = 0;
+            // Full interior pages can alias the unified file cache. Boundary
+            // pages remain private: zeroing BSS must not change cached bytes
+            // or another segment that shares the same destination page.
+            if vaddr % PAGE_SIZE == seg.file_offset % PAGE_SIZE {
+                let prefix = (PAGE_SIZE - vaddr % PAGE_SIZE) % PAGE_SIZE;
+                let first = prefix.min(seg.filesz);
+                if first > 0 {
+                    source.read_exact(seg.file_offset, &mut scratch[..first]).map_err(|_| ElfError::InvalidType)?;
+                    machine.copy_to(vaddr, &scratch[..first]);
+                }
+                copied = first;
+                let full = (seg.filesz - copied) / PAGE_SIZE * PAGE_SIZE;
+                if full > 0 {
+                    source.map_private(machine, seg.file_offset + copied, vaddr + copied, full,
+                        2 | if seg.is_executable() { 4 } else { 0 }).map_err(|_| ElfError::InvalidType)?;
+                    copied += full;
+                }
+            }
             while copied < seg.filesz {
                 let count = (seg.filesz - copied).min(scratch.len());
                 let offset = seg.file_offset.checked_add(copied).ok_or(ElfError::InvalidType)?;

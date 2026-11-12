@@ -100,6 +100,7 @@ pub(crate) fn set_execute_regs(regs: *mut Regs) {
 
 /// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
 pub mod arch_call {
+    pub const FRAME_OPERATION: u64 = 0x129; // EDX=frame request
     pub const HIGH_MEMORY: u64 = 0x128; // EDX=request pointer
     pub const EXECUTE: u64 = 0x100;      // Swap kernel↔user regs
     pub const SWITCH_TO: u64 = 0x101;    // Thread switch: EDX=out_regs, ECX=out_root, EBX=in_regs, ESI=in_root
@@ -302,6 +303,9 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::RELEASE_HEAP => paging2::release_heap_pages(regs.rdx as usize, regs.rcx as usize),
         arch_call::LOAD_LDT => {
             crate::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
+        }
+        arch_call::FRAME_OPERATION => {
+            crate::frames::handle(unsafe { &mut *(regs.rdx as *mut crate::frames::Request) });
         }
         arch_call::MAP_PHYS_RANGE => {
             let vpage_start = regs.rdx as usize;
@@ -1053,6 +1057,11 @@ fn set_page_flags_entry<E: paging2::Entry>(entries: &mut [E], vaddr: usize, writ
         // or fork COW; rebuilding the entry would turn them into owned frames.
         let mut entry = entries[page];
         entry.set_writable(writable);
+        // Hardware must enforce read-only protections. Borrowed shared RAM
+        // can change writability directly; owned RAM retains its COW state.
+        if !writable || entry.raw() & paging2::flags::FOREIGN != 0 {
+            entry.set_hw_writable(writable);
+        }
         entry.set_no_execute(!executable);
         let displaced = paging2::replace_entry(&mut entries[page], entry);
         debug_assert_eq!(displaced.page(), phys);

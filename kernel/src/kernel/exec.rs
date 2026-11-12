@@ -58,8 +58,9 @@ impl Drop for ExecutableFile {
 }
 
 impl ExecutableFile {
-    pub(crate) fn cached_image(&self, free_pages: usize, end: usize) -> Result<Option<alloc::sync::Arc<Vec<u8>>>, i32> {
-        vfs::executable::image(self.handle, free_pages.saturating_mul(4096), end)
+    pub(crate) fn map_private<A: crate::Arch>(&self, machine: &mut A, offset: usize, base: usize,
+        length: usize, protection: u64) -> Result<(), i32> {
+        vfs::mapping::map_private(machine, self.handle, offset, base, length, protection)
     }
 
     pub(crate) fn read_exact(&self, offset: usize, mut bytes: &mut [u8]) -> Result<(), i32> {
