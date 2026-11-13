@@ -2,97 +2,104 @@
 
 Link `//arch-metal:entry` alongside the library and provide the linker layout
 (see `kernel/kernel.ld`) and `boot_kernel(core_id: u32, magic: u32, info: *const u8)`.
-The ELF entry passes logical core ID 0. The 16-bit SIPI trampoline passes the
-caller's nonzero logical ID. Both enter this same Rust function in ring 0,
-with paging and interrupts off, offset CS/DS/SS, a private stack, and working
-GS-based Rust TLS. The AP receives zero for the two Multiboot arguments.
+The ELF entry passes logical core ID 0; the SIPI trampoline passes the caller's
+nonzero logical ID and zero Multiboot arguments. Assembly installs a private
+stack and GS-based Rust TLS before entering Rust.
 
-Call `smp::init_core(core_id)` on both paths. It builds that CPU's page tables,
-GDT, TSS and FPU/syscall state, then switches to flat segments and virtual GS.
-Only `core_id == 0` should initialize devices, shared allocation, or the kernel's
-scheduler. On an AP, call `smp::run_secondary()` after CPU-local initialization;
-it acknowledges startup and invokes the supplied entry function with interrupts
-still disabled. The regular kernel discovers enabled CPUs through ACPI MADT, allocates as many
-as the pre-paging window permits, before allocating DMA buffers, and starts them before shared
-kernel initialization. Secondary CPUs halt with interrupts disabled; they do not
-run scheduler tasks yet. Its boot policy lives in `kernel/src/arch/smp.rs`.
+Call `smp::init_core(core_id)` on both paths. It installs that CPU's paging root,
+GDT, TSS and FPU/syscall state. On an AP, `smp::run_secondary()` acknowledges
+startup and invokes the supplied entry with interrupts disabled. Device setup,
+allocation policy, CPU discovery and scheduling belong to the kernel.
 
-`smp::start_core(apic_id, page_phys, CoreStart { .. }, delay_us)` starts one
-known offline AP. Hardware APIC IDs and logical core IDs are separate. The
-caller discovers CPUs, reserves a 4 KiB startup page below 1 MiB, allocates each
-CPU's stacks and `smp::tls_layout()` bytes, and supplies a calibrated delay.
-Requests are serialized on the BSP with interrupts disabled. Startup works
-with xAPIC and x2APIC senders and has bounded delivery/acknowledgement waits.
+The kernel's boot policy is `kernel/src/arch/smp.rs`. The BSP initializes the
+kernel physical allocator and heap, then allocates and touches resident AP
+stacks/TLS. Each AP receives a 64 KiB kernel stack, a 16 KiB trap stack contained
+within one 64 KiB window, TLS and an initial fault-page reserve. These allocations
+need contiguous virtual addresses, not contiguous physical pages.
 
-The shared low-memory allocator is a **2 MiB array placed last in BSS** by
-`kernel.ld`, using a dedicated `.boot_pool` input section. It is page aligned
-and `NOLOAD`: the ELF reserves its RAM before modules are loaded, without
-storing the zero bytes in the file. `_end` and the ordinary heap follow the
-whole pool, including unused capacity. The linker checks the kernel's physical
-end excluding the pool against **3 MiB + 64 KiB**, and the full reservation
-against the existing high kernel mapping's capacity. Separately, the boot
-allocator limits actual shared bootstrap tables and AP stacks/TLS to physical
-**3.875 MiB**, leaving 128 KiB below 4 MiB. The unused pool tail is not charged
-against this pre-paging limit; DMA can use that tail after paging is active.
+`smp::start_core(apic_id, page_phys, CoreStart { .. }, delay_us)` starts a known,
+stopped AP. Hardware APIC IDs and logical core IDs are separate. Startup requests
+are serialized on the BSP with interrupts disabled, support xAPIC and x2APIC,
+and have bounded delivery and acknowledgement waits. The trampoline borrows the
+BSP's paging root and existing identity mappings. The AP installs private roots
+before acknowledging; the BSP removes its boot identity mapping only after all
+selected APs acknowledge. The below-1-MiB SIPI page is separately reserved.
 
-The startup order is:
+A successful acknowledgement allows reuse of the trampoline page. Keep stacks,
+TLS and completion words alive. After a timeout retain all startup storage:
+a delayed AP may still arrive. The kernel stops boot after a failed startup;
+it must not reclaim bootstrap mappings while that AP's state is uncertain.
 
-1. `smp::init_core(0)` reserves shared boot tables and maps the whole image.
-2. Claim `boot_mem::BootMemory::new()` and allocate **all** AP stacks/TLS.
-3. `finish()` closes AP allocation and opens the pool's remaining tail to
-   permanent allocations. Start the selected APs with `smp::start_core`.
-4. Continue shared kernel initialization on core 0 while APs wait.
+The `.boot_pool` BSS storage supplies bootstrap paging structures and permanent
+contiguous low-memory DMA buffers. AP stacks/TLS use the ordinary resident heap.
+Physical allocation, DMA policy and fault-reserve replenishment live in
+`kernel/src/kernel/phys_mm.rs`; arch has no physical allocator callback.
 
-ISA DMA buffers are allocated per channel on first request from the same pool,
-with 64 KiB alignment/size for 8-bit channels and 128 KiB for 16-bit channels.
-Requests before the AP allocation phase finishes fail. Repeated requests reuse
-the same buffer; exhausted pool space returns unavailable. There is no separate
-768 KiB DMA array. The startup sender's APIC page table also uses the remaining
-pool, so engaging APs needs neither the ordinary heap nor the frame allocator.
+Arch consumes donated pages from a CPU-local `PageSupply` during page faults.
+Five pages cover one data page and up to four table levels. Other mapping
+operations consume explicit `PageInput` batches prepared by
+`kernel/src/kernel/memory.rs`. Returned frames remain owned until the kernel
+drains them. Resident ownership metadata supports atomic references to shared
+data frames without entering the allocator from a fault handler.
 
-All storage needed before the flat-segment switch stays in the original
-physical 0–4 MiB identity window. The remainder is covered by the high mapping. Offset
-segments before paging and flat segments afterward resolve the same stack/TLS
-addresses to the same RAM. The trampoline still only enters protected mode,
-loads stack/GS, and calls Rust. The below-1-MiB SIPI page is separately reserved.
-The kernel stack is 64 KiB; each 16 KiB trap stack fits one 64 KiB window.
+The recursive root, PML4, hardware PAE PDPT, descriptor tables, registers,
+scratch mappings and fault reserves are CPU-local. Kernel leaf tables are
+shared. A canonical kernel-root portion has a lock-protected generation;
+refreshing copies new kernel entries into the local root and invalidates its
+TLB. This mechanism requires an ownership handoff before mappings can be reused;
+it is not a general concurrent kernel-mapping or TLB-shootdown protocol.
 
-The physical allocator reserves the complete image through `_end`, and the
-ordinary heap starts at `heap_base()` = `_end`. Boot allocations are permanent;
-this allocator is not a replacement for the runtime heap or CPU scheduler.
+# Parallel Linux processes
 
-A successful acknowledgement allows reuse of the low startup page: the AP has
-left the trampoline and loaded its own GDT. Keep its stacks, TLS, and completion
-word alive. After a timeout, retain **all** startup storage, including the low
-page: a delayed AP may still arrive. Do not retry or reclaim until the target
-is known to be stopped. Shared devices, allocator and clock state still need
-synchronization before general kernel workloads may run on secondary cores.
+`kernel/src/kernel/parallel.rs` owns the scheduler policy and CPU handoffs.
+Core 1 remains the media worker. With a calibrated TSC and LAPIC timer, remaining
+APs enter ring 1, initialize private local alarms, and consume process loans.
+Without a supported worker timer they stay unavailable and execution falls back
+to the BSP. External device interrupts continue to target the BSP.
 
-`//arch-metal:smp_example` is a minimal consumer with one shared Rust entry. Run
-`python3 test/arch_smp.py` for four-core legacy/PAE tests, or add `--kvm` for xAPIC
-and x2APIC hardware execution. It checks independent stacks, initialized/zeroed
-TLS, GDTs, page roots, startup-page reuse, rejected invalid inputs, and a missing
-CPU timing out. The example verifies both ISA DMA channel sizes use pool space
-following the AP allocations, and that ordinary heap/physical allocations lie
-outside the pool. `bazelisk test //arch-metal:boot_mem_test` checks allocation
-phase ordering, alignment, exhaustion and overflow.
+Independent Linux processes run concurrently, with each process pinned to one
+execution CPU. Threads within one Linux process remain serialized on that CPU.
+A vfork child borrows its parent's CPU/address space until exec or exit. Kernel
+services, process-table updates and device work retain one BSP owner. This first
+implementation rendezvous all process workers before dispatching any returned
+event; it does not provide concurrent kernel syscall execution.
 
-`acpi::processor_ids` reads enabled Local APIC and x2APIC entries without a heap,
-using the Multiboot2 RSDP or the legacy firmware scan. Boot reads temporarily
-borrow and restore one low-memory alias PTE; the identity mapping stays unchanged.
-Malformed/oversized tables are rejected, unknown records skipped, and duplicate
-APIC IDs collapsed. Missing discovery, a safe SIPI page, or a calibrated delay
-leaves the kernel running on the BSP. CPUs requiring x2APIC addressing are skipped
-when the sender is in xAPIC mode. A startup error stops further launch attempts.
-The kernel uses a CPUID TSC frequency or bounded PIT calibration for startup;
-platforms with neither remain single-CPU for now.
+A loan transfers a saved paging root, registers, FPU state, TLS binding and an
+absolute deadline. RUN/DONE release/acquire transitions transfer ownership
+between the BSP and one worker. Workers allocate no heap storage and do not
+access the process table. An IPI ends remaining loans before the BSP handles
+syscalls, exits, signals or mappings. Pending events are dispatched before their
+processes execute again. Scheduling quantum requests survive event draining so
+processes that did not fit in a batch cannot be starved.
 
-Only the recursive root (PD/PDPT), PML4 and 32-byte hardware PAE PDPT are private
-paging roots in TLS. Kernel leaf tables and the invariant mode-toggle mapping
-are initialized once in the boot pool. Scratch/temp buffers remain CPU-local.
-A canonical kernel-root portion has a lock-protected generation; each CPU
-refreshes its private kernel entries and TLB on kernel entry when stale. This
-adds no stale-fault retry. Ownership and allocator synchronization remain
-requirements before allowing concurrent general kernel work. The SMP example
-checks distinct roots/PML4 back-pointers, shared kernel leaf tables, and refresh
-after the BSP adds heap mappings while APs wait.
+Before parallel execution, the kernel asks arch to detach shared page-table
+pages using explicit donated inputs. Data pages remain COW-shared. Consequently
+one CPU's fault handler cannot edit another running process's table metadata.
+Fork invalidates this private-table status; exec builds a new address space.
+Shared kernel mappings remain stable throughout the batch.
+
+The heap has a spin lock. Physical-pool metadata already has a short resident
+critical section and atomic shared references. A supervisor fault that needs
+reserve replenishment while the heap is locked cannot reclaim through the heap.
+The remaining kernel statics continue to rely on BSP ownership rather than
+being exposed to arbitrary concurrent kernel callers.
+
+MCP's disjoint profile is BSP wall time. Parallel preparation and rendezvous
+are charged to scheduler work; worker CPU execution is excluded. Do not interpret
+that ledger as aggregate CPU usage across all processors.
+
+Validation commands (build `//:boot_disk` first):
+
+- `python3 test/linux_parallel.py --cpus 16`: sixteen children across fifteen
+  eligible CPUs, stable affinity, getcpu, shared mappings and high-address COW.
+- `python3 test/linux_parallel.py --cpus 5 --bits 32`: i386 processes and inherited
+  segment TLS across workers.
+- `python3 test/linux_vfork_signal.py --cpus 5`: vfork exit/exec and SIGCHLD.
+- `python3 test/linux_thread_signal.py --cpus 5`: pthreads and directed signals.
+- `python3 test/linux_high_memory.py --cpus 5`: sparse mappings and protections.
+- `python3 test/linux_local_control.py --cpus 5`: in-guest MCP and profile
+  reconciliation, including a Python subprocess.
+
+`//arch-metal:smp_example` is a minimal separate consumer. `test/arch_smp.py`
+checks CPU-local startup state, resident stack/TLS handoffs, invalid inputs and
+startup timeout handling; add `--kvm` for hardware execution.

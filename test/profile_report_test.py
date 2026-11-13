@@ -48,6 +48,23 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(r['directory_cache']['omitted_paths'], 1)
         self.assertEqual(r['directory_cache']['rows'][0]['path'], '/usr/lib')
 
+    def test_worker_cpu_time_has_rubrics_without_changing_wall_accounting(self):
+        p = packet()
+        p['raw']['workers'] = {'ok': True, 'cpus': [{'cpu': 3,
+            'syscalls': [{'abi': 64, 'number': 1, 'calls': 2, 'ns': 150_000_000, 'max_ns': 100_000_000}],
+            'io': [{'stage': 'disk_read', 'calls': 1, 'ns': 90_000_000, 'max_ns': 90_000_000, 'bytes': 4096}]}]}
+        r = make_report(p)
+        self.assertTrue(r['quality']['valid'], r['quality'])
+        self.assertEqual(sum(row['ns'] for row in r['accounting']['categories']), 100_000_000)
+        self.assertFalse(r['workers']['additive_to_wall_time'])
+        worker = r['workers']['cpus'][0]
+        self.assertEqual(worker['cpu'], 3)
+        self.assertEqual(worker['syscall_handler_ns'], 150_000_000)
+        self.assertEqual(worker['syscalls']['rubrics']['file_io']['ns'], 150_000_000)
+        self.assertEqual(worker['syscalls']['rows'][0]['name'], 'write')
+        self.assertFalse(worker['nested_io']['additive'])
+        self.assertEqual(worker['nested_io']['rubrics']['storage_device'][0]['bytes'], 4096)
+
     def test_negative_residual_is_visible_and_invalid(self):
         p = packet(); p['raw']['syscalls']['syscalls'][0]['ns'] = 30_000_000
         r = make_report(p)

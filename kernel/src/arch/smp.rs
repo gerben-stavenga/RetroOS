@@ -1,5 +1,5 @@
 //! BSP boot policy. Core 1 waits for the resident-buffer media worker;
-//! remaining APs park. Allocation and guest execution stay on the BSP.
+//! remaining APs execute pinned Linux processes. Kernel services stay on the BSP.
 use arch::{MultibootMmapEntry, smp, x86};
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -8,10 +8,23 @@ const MAX_CPUS: usize = 64;
 static READY: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 static TICKS_PER_US: AtomicU32 = AtomicU32::new(0);
 static MEDIA_START: AtomicBool = AtomicBool::new(false);
+static WORKER_TIMER: spin::Once<arch::irq::WorkerTimer> = spin::Once::new();
 static MEDIA_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn park(id: u32, _argument: usize) -> ! {
-    if id != 1 { arch::halt_forever(); }
+    if id != 1 {
+        let slot = unsafe { &*(_argument as *const crate::kernel::parallel::Slot<arch::Metal>) };
+        while !crate::kernel::parallel::started() { core::hint::spin_loop(); }
+        arch::paging2::refresh_kernel_mappings();
+        let Some(timer) = WORKER_TIMER.get().copied() else {
+            crate::kernel::parallel::disable(slot);
+            arch::halt_forever();
+        };
+        arch::irq::init_worker_timer(timer);
+        if arch::paging2::is_pae() { arch::paging2::setup_long_mode_tables(); arch::paging2::flush_tlb(); }
+        arch::descriptors::enter_ring1();
+        unsafe { crate::kernel::parallel::worker(arch::Metal, slot) }
+    }
     while !MEDIA_START.load(Ordering::Acquire) { core::hint::spin_loop(); }
     fn refresh() {
         arch::paging2::refresh_kernel_mappings();
@@ -24,6 +37,11 @@ extern "C" fn park(id: u32, _argument: usize) -> ! {
     refresh();
     lib::compact_println!("Media worker: audio and graphics ready");
     unsafe { crate::kernel::media::worker(refresh) }
+}
+
+pub(super) fn enable_parallel() {
+    if let Some(timer) = arch::irq::worker_timer() { WORKER_TIMER.call_once(|| timer); }
+    crate::kernel::parallel::enable();
 }
 
 pub(super) fn enable_media() {
@@ -130,6 +148,7 @@ pub(super) unsafe fn start(
     map: &[MultibootMmapEntry],
     modules: &[Option<crate::multiboot::AcceptedModule>; arch_abi::MAX_BOOT_MODULES],
 ) {
+    let slots = crate::kernel::parallel::provision::<arch::Metal>(MAX_CPUS);
     let mut ids = [0; MAX_CPUS];
     let own = x86::current_apic_id();
     let count = arch::acpi::processor_ids(rsdp, &mut ids)
@@ -175,6 +194,7 @@ pub(super) unsafe fn start(
             let tls = resident(tls);
             let stack = resident(stack);
             let logical = selected + 1;
+            slots[logical].processor.store(id, Ordering::Relaxed);
             starts[selected] = Some((
                 id,
                 smp::CoreStart {
@@ -183,7 +203,7 @@ pub(super) unsafe fn start(
                     trap_stack_top: trap as u32 + 16384 - 16,
                     tls,
                     entry: park,
-                    argument: 0,
+                    argument: &slots[logical] as *const _ as usize,
                     memory: crate::kernel::phys_mm::bootstrap_supply(super::frame_refill_entry as *const () as usize),
                     ready: &READY[logical],
                 },

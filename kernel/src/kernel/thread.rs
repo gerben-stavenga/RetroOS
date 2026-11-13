@@ -184,6 +184,8 @@ pub struct PendingPoll {
 pub enum ThreadState {
     Unused = 0,
     Running,
+    /// Execution state is owned by an AP; this table row is metadata only.
+    OnCpu,
     Ready,
     Blocked,
     Zombie,
@@ -673,6 +675,10 @@ pub struct KernelThread<A: crate::Arch> {
     pub priority: i32,
     pub parent_tid: i32,
     pub state: ThreadState,
+    pub execution_cpu: usize,
+    pub tables_private: bool,
+    pub pending_event: Option<crate::KernelEvent>,
+    pub pending_action: Option<KernelAction>,
     /// Process birth time in milliseconds since boot (unchanged by exec).
     pub time: u64,
     /// Register state + address-space handle for this thread's execution
@@ -748,6 +754,10 @@ impl<A: crate::Arch> KernelThread<A> {
             priority: 0,
             parent_tid: -1,
             state: ThreadState::Unused,
+            execution_cpu: usize::MAX,
+            tables_private: false,
+            pending_event: None,
+            pending_action: None,
             time: 0,
             vcpu: crate::Vcpu::empty(),
             fx_state: Default::default(),
@@ -880,6 +890,7 @@ pub fn get_thread<A: crate::Arch>(threads: &mut [Thread<A>], tid: usize) -> Opti
         return None;
     }
     let thread = &mut threads[tid];
+    assert!(thread.kernel.state != ThreadState::OnCpu, "mutable access to a worker-owned process");
     if thread.kernel.state != ThreadState::Unused {
         Some(thread)
     } else {
@@ -891,6 +902,8 @@ pub fn get_thread<A: crate::Arch>(threads: &mut [Thread<A>], tid: usize) -> Opti
 /// `split_at_mut` — no aliasing, no `unsafe`.
 pub fn get_two_threads<A: crate::Arch>(threads: &mut [Thread<A>], a: usize, b: usize) -> (&mut Thread<A>, &mut Thread<A>) {
     assert!(a != b && a < MAX_THREADS && b < MAX_THREADS);
+    assert!(threads[a].kernel.state != ThreadState::OnCpu && threads[b].kernel.state != ThreadState::OnCpu,
+        "cross-process access without acquiring worker ownership");
     if a < b {
         let (lo, hi) = threads.split_at_mut(b);
         (&mut lo[a], &mut hi[0])
@@ -898,6 +911,24 @@ pub fn get_two_threads<A: crate::Arch>(threads: &mut [Thread<A>], a: usize, b: u
         let (lo, hi) = threads.split_at_mut(a);
         (&mut hi[0], &mut lo[b])
     }
+}
+
+// Advance through process IDs instead of immediately reusing the lowest hole.
+// Process wrappers reap a leader before issuing group cleanup; immediate reuse
+// can turn that cleanup into a signal against a newly launched unrelated job.
+static NEXT_PROCESS_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
+fn vacant_slot<A: crate::Arch>(threads: &[Thread<A>]) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    let start = NEXT_PROCESS_SLOT.load(Ordering::Relaxed);
+    for offset in 0..MAX_THREADS - 1 {
+        let tid = 1 + (start - 1 + offset) % (MAX_THREADS - 1);
+        if threads[tid].kernel.state == ThreadState::Unused
+            && !crate::kernel::linux::process_group::reserved(tid) {
+            NEXT_PROCESS_SLOT.store(1 + tid % (MAX_THREADS - 1), Ordering::Relaxed);
+            return Some(tid);
+        }
+    }
+    None
 }
 
 /// Create a new thread with the given root page table.
@@ -909,14 +940,20 @@ pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut [Thread<A>], machine: 
         }
         None => (0, 0, -1),
     };
-    for (i, t) in threads.iter_mut().enumerate().take(MAX_THREADS) {
-        if t.kernel.state == ThreadState::Unused {
+    let i = vacant_slot(threads)?;
+    let t = &mut threads[i];
+    {
+            crate::kernel::linux::process_group::create(i, parent_tidv);
             let k = &mut t.kernel;
             k.tid = i as i32;
             k.pid = if is_process { i as i32 } else { parent_pid };
             k.priority = parent_prio;
             k.parent_tid = parent_tidv;
             k.state = ThreadState::Ready;
+            k.execution_cpu = usize::MAX;
+            k.tables_private = false;
+            k.pending_event = None;
+            k.pending_action = None;
             k.time = machine.get_ticks();
             k.vcpu = crate::Vcpu::new(Regs::empty(), root);
             k.fx_state = machine.clean_fx_template();
@@ -926,10 +963,8 @@ pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut [Thread<A>], machine: 
             let mut linux = LinuxState::new();
             linux.parent_creator = (parent_tidv >= 0).then_some(parent_tidv);
             t.personality = Personality::Linux(linux);
-            return Some(t);
-        }
+            Some(t)
     }
-    None
 }
 
 /// Reserve the child record while leaving the current address space live.
@@ -944,14 +979,20 @@ pub fn reserve_live_child<'a, A: crate::Arch>(
         let p = &threads[parent_tid].kernel;
         (p.priority, p.tid)
     };
-    for (i, t) in threads.iter_mut().enumerate().take(MAX_THREADS) {
-        if t.kernel.state == ThreadState::Unused {
+    let i = vacant_slot(threads)?;
+    let t = &mut threads[i];
+    {
+            crate::kernel::linux::process_group::create(i, parent_tidv);
             let k = &mut t.kernel;
             k.tid = i as i32;
             k.pid = i as i32;
             k.priority = parent_prio;
             k.parent_tid = parent_tidv;
             k.state = ThreadState::Ready;
+            k.execution_cpu = usize::MAX;
+            k.tables_private = false;
+            k.pending_event = None;
+            k.pending_action = None;
             k.time = machine.get_ticks();
             k.vcpu.regs = Regs::empty();
             k.fx_state = machine.clean_fx_template();
@@ -961,10 +1002,8 @@ pub fn reserve_live_child<'a, A: crate::Arch>(
             let mut linux = LinuxState::new();
             linux.parent_creator = (parent_tidv >= 0).then_some(parent_tidv);
             t.personality = Personality::Linux(linux);
-            return Some(t);
-        }
+            Some(t)
     }
-    None
 }
 
 /// Initialize a thread as a 32-bit user process
@@ -1034,7 +1073,11 @@ pub fn schedule<A: crate::Arch>(threads: &[Thread<A>], current_tid: usize) -> Op
     }
 
     if next_idx == usize::MAX {
-        None
+        // A worker-owned process is live even when no local row is Ready.
+        // Switching acquires just this loan; never report AllDead while APs run.
+        threads.iter().enumerate().skip(1).find_map(|(tid, task)|
+            (tid != current_tid && task.kernel.state == ThreadState::OnCpu
+                && !crate::kernel::sched::vfork_suspended(threads, tid)).then_some(tid))
     } else {
         Some(next_idx)
     }
@@ -1199,8 +1242,10 @@ pub fn exit_thread<A: crate::Arch>(
         linux.release_mappings(machine);
     }
     threads[tid].kernel.state = ThreadState::Zombie;
-    if matches!(threads[tid].personality, Personality::Linux(_))
-        && parent_tid >= 0 && (parent_tid as usize) < threads.len()
+    // A Linux parent's waiters and SIGCHLD survive the child's exec into a
+    // different personality (for example native Turbo C). Notify the parent
+    // based on its personality, not the image the child exits from.
+    if parent_tid >= 0 && (parent_tid as usize) < threads.len()
         && parent_tid as usize != tid {
         crate::kernel::linux::child_exited(&mut threads[parent_tid as usize], tid as i32, exit_code);
     }
@@ -1266,6 +1311,7 @@ pub fn reap<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut A, tid: i32
             // free has, by contract, nothing left to collect from it.
             machine.destroy_space(&mut t.kernel.vcpu.space);
             t.personality = Personality::Linux(LinuxState::new());
+            crate::kernel::linux::process_group::reap(tid as usize);
             t.kernel.state = ThreadState::Unused;
         }
     }

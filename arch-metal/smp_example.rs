@@ -428,7 +428,8 @@ extern "C" fn frame_refill_resume() -> usize {
             for page in &returned[..count] { phys_mm::free_phys_page(*page); }
             if count < returned.len() { break; }
         }
-        phys_mm::replenish_supply(supply);
+        if ALLOC.is_locked() { phys_mm::replenish_supply_without_reclaim(supply); }
+        else { phys_mm::replenish_supply(supply); }
         let ip = (*supply).resume_ip;
         (*supply).resume_ip = 0;
         ip

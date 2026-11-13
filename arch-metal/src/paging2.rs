@@ -374,7 +374,27 @@ pub trait Entry: Copy + Sized + Default + 'static {
 #[inline]
 #[must_use]
 pub(crate) fn replace_entry<E: Entry>(slot: &mut E, incoming: E) -> E {
-    let outgoing = core::mem::replace(slot, incoming);
+    let address = slot as *mut E as usize;
+    // PAE PTEs are 64 bits even in the 32-bit kernel. Publish live mappings
+    // atomically: another CPU's hardware walker must never see a new present
+    // bit paired with half of the old physical address. Saved tables and
+    // stack snapshots have no concurrent hardware reader.
+    let outgoing = if core::mem::size_of::<E>() == 8 && (PAGE_TABLE_BASE..KERNEL_BASE).contains(&address) {
+        let old_low: u32;
+        let old_high: u32;
+        let raw = incoming.raw();
+        unsafe { core::arch::asm!(
+            "mov eax, [edi]", "mov edx, [edi + 4]",
+            "2:", "lock cmpxchg8b [edi]", "jnz 2b",
+            in("edi") slot as *mut E,
+            in("ebx") raw as u32, in("ecx") (raw >> 32) as u32,
+            lateout("eax") old_low, lateout("edx") old_high,
+            options(nostack),
+        ); }
+        let mut outgoing = E::default();
+        outgoing.set_raw(u64::from(old_low) | (u64::from(old_high) << 32));
+        outgoing
+    } else { core::mem::replace(slot, incoming) };
     // The kernel portion of each private root is universal. Lower tables are
     // shared already; publish new root entries for the next entry refresh.
     let (root_va, first) = if core::mem::size_of::<E>() == 8 {
@@ -382,7 +402,6 @@ pub(crate) fn replace_entry<E: Entry>(slot: &mut E, incoming: E) -> E {
     } else {
         (0xc030_0000usize, 769)
     };
-    let address = slot as *mut E as usize;
     if (root_va + first * core::mem::size_of::<E>()..root_va + PAGE_SIZE).contains(&address) {
         let index = (address - root_va) / core::mem::size_of::<E>();
         unsafe { publish_kernel_root(index, incoming); }
@@ -510,6 +529,34 @@ static mut ROOT: RawPage = RawPage([0; PAGE_SIZE]);
 // One canonical kernel portion, copied to private roots on kernel entry.
 // The lock protects both the snapshot and its generation; it never allocates.
 static mut KERNEL_ROOT: *mut RawPage = core::ptr::null_mut();
+// Shared heap PTEs can fault on several CPUs at once. Ring-0 operations
+// serialize the walk and recheck mappings after acquiring the lock. Recursive
+// faults on page-table storage reenter on the owning CPU without deadlocking.
+static KERNEL_MAPPING_OWNER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[thread_local]
+static KERNEL_MAPPING_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+pub(crate) struct KernelMappingGuard;
+impl KernelMappingGuard {
+    pub(crate) fn lock() -> Self {
+        use core::sync::atomic::Ordering;
+        let owner = crate::smp::current_core_id() + 1;
+        if KERNEL_MAPPING_DEPTH.get() == 0 {
+            while KERNEL_MAPPING_OWNER.compare_exchange(0, owner, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                core::hint::spin_loop();
+            }
+        }
+        KERNEL_MAPPING_DEPTH.set(KERNEL_MAPPING_DEPTH.get() + 1);
+        Self
+    }
+}
+impl Drop for KernelMappingGuard {
+    fn drop(&mut self) {
+        let depth = KERNEL_MAPPING_DEPTH.get() - 1;
+        KERNEL_MAPPING_DEPTH.set(depth);
+        if depth == 0 { KERNEL_MAPPING_OWNER.store(0, core::sync::atomic::Ordering::Release); }
+    }
+}
+
 static KERNEL_ROOT_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static KERNEL_GENERATION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[thread_local]
@@ -1044,6 +1091,7 @@ pub fn unmap_kernel_page(vaddr: usize) {
 /// Return unused heap backing without faulting in absent page tables. The
 /// heap retains its virtual range and faults these pages back in on reuse.
 pub fn release_heap_pages(addr: usize, bytes: usize) {
+    let _mapping = KernelMappingGuard::lock();
     assert!(addr >= heap_base() && addr.checked_add(bytes).is_some_and(|end| end <= HEAP_END));
     assert!(addr.is_multiple_of(PAGE_SIZE) && bytes.is_multiple_of(PAGE_SIZE));
     fn present<E: Entry>(entries: &[E], idx: usize) -> bool {
@@ -2405,4 +2453,28 @@ pub(crate) fn map_frame(vpage: usize, frame: u64, shared: bool, writable: bool, 
     }
     crate::x86::invlpg(vpage * PAGE_SIZE);
     true
+}
+
+/// Make page-table pages private; leave read-only data frames COW-shared.
+/// Called while all process execution is quiescent, with kernel-donated inputs.
+pub(crate) fn privatize_user_tables() -> i32 {
+    fn detach<E: Entry>(entries: &mut [E], index: usize) -> Result<(), i32> {
+        if !entries[index].present() || index < PAGE_TABLE_BASE_IDX { return Ok(()); }
+        if crate::memory::get_ref_count(entries[index].page()) > 1 && !crate::memory::input_available() {
+            return Err(-11);
+        }
+        cow_entry(entries, index);
+        let first = (index - PAGE_TABLE_BASE_IDX) * entries_per_page::<E>();
+        for child in first..first + entries_per_page::<E>() { detach(entries, child)?; }
+        Ok(())
+    }
+    let first = root_base();
+    let last = recursive_idx();
+    let result = match entries() {
+        Entries::E32(e) => (first..last).try_for_each(|index| detach(e, index)),
+        Entries::E64(e) => (first..last).try_for_each(|index| detach(e, index)),
+    };
+    flush_tlb();
+    if let Err(error) = result { return error; }
+    crate::high_paging::privatize()
 }

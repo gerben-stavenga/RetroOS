@@ -311,7 +311,8 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
     // The bootloader is alone on the machine — nothing to arbitrate a display
     // against, so it writes to the terminal directly. (It used to construct a
     // "screen licence" here: the sole inhabitant issuing one to itself.)
-    let screen = lib::term::term();
+    let mut screen_guard = lib::term::term();
+    let screen = &mut *screen_guard;
     screen.clear();
     screenln!(screen, "\x1b[92mRetroOS Rust Bootloader\x1b[0m");
 
@@ -453,6 +454,8 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
 
     screenln!(screen, "Starting kernel...");
 
+    drop(screen_guard);
+
     // Jump to kernel with EAX=magic, EBX=info pointer (Multiboot convention)
     unsafe {
         core::arch::asm!(
@@ -471,7 +474,8 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
 /// after this).
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let screen = lib::term::term();
+    let Some(mut screen_guard) = lib::term::try_term() else { halt() };
+    let screen = &mut *screen_guard;
     screenln!(screen);
     screenln!(screen, "\x1b[91m!!! PANIC !!!\x1b[0m");
 

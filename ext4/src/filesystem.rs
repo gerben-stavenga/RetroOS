@@ -339,6 +339,17 @@ impl Filesystem {
         self.create(storage, parent, name, attributes, ObjectKind::Node)
     }
 
+    /// Add an edge to the same blob, atomically with its reference count.
+    pub fn hard_link(&mut self, storage: &mut dyn Storage, parent: Node, name: &[u8], object: Object) -> Result<(), Error> {
+        self.mutate(storage, &mut |graph, storage| {
+            if find(graph, storage, parent, name)?.is_some() { return Err(Error::AlreadyExists); }
+            let retained = graph.retain_blob(storage, object)?;
+            graph.attach(storage, parent, name, retained)?;
+            Ok(None)
+        })?;
+        Ok(())
+    }
+
     #[inline(never)]
     fn create(
         &mut self,

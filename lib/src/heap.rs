@@ -137,16 +137,27 @@ struct Inner {
 /// `#[global_allocator]` and call [`DemandHeap::init`] once after paging is up.
 pub struct DemandHeap {
     inner: UnsafeCell<Inner>,
+    locked: AtomicBool,
 }
+struct HeapGuard<'a>(&'a AtomicBool);
+impl Drop for HeapGuard<'_> { fn drop(&mut self) { self.0.store(false, Release); } }
 
-// Single-threaded kernel: access is serialized by the global allocator lock
-// semantics (one CPU). The `UnsafeCell` is the one raw cell.
+// All mutable allocator state is protected by locked. Fault replenishment
+// uses resident physical metadata and must not reclaim through this heap
+// while the lock is held.
 unsafe impl Send for DemandHeap {}
 unsafe impl Sync for DemandHeap {}
 
 impl DemandHeap {
+    fn lock(&self) -> HeapGuard<'_> {
+        while self.locked.compare_exchange(false, true, Acquire, Relaxed).is_err() { core::hint::spin_loop(); }
+        HeapGuard(&self.locked)
+    }
+    /// Refill policy must avoid recursive heap reclaim while an allocation owns it.
+    pub fn is_locked(&self) -> bool { self.locked.load(Relaxed) }
     pub const fn new() -> Self {
         DemandHeap {
+            locked: AtomicBool::new(false),
             inner: UnsafeCell::new(Inner { free: FreeTree::new(), small_enabled: false, small: [None; SMALL_CLASSES], small_count: [0; SMALL_CLASSES], mapped_end: 0, heap_end: 0, release: None,
                 retained: [EMPTY_RETAINED; RETAINED_RANGES], retained_count: 0, retained_bytes: 0, retain_limit: 0 }),
         }
@@ -156,6 +167,7 @@ impl DemandHeap {
     /// initialization, before this heap is shared. Cached blocks remain backed
     /// and are returned to the coalescing allocator if its window is exhausted.
     pub fn enable_small_cache(&self) {
+        let _guard = self.lock();
         unsafe { (*self.inner.get()).small_enabled = true; }
     }
 
@@ -176,6 +188,7 @@ impl DemandHeap {
     /// excess bytes are released normally. Allocations remove their pages from
     /// this cache before any later free can evict them. No bookkeeping allocates.
     pub fn init_with_cached_release(&self, base: usize, end: usize, release: Option<fn(usize, usize)>, cache_bytes: usize) {
+        let _guard = self.lock();
         let inner = unsafe { &mut *self.inner.get() };
         inner.free = FreeTree::new();
         inner.small_enabled = false;
@@ -314,6 +327,7 @@ impl Inner {
 unsafe impl GlobalAlloc for DemandHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let _sample = ProfileSample::start(0);
+        let _guard = self.lock();
         let inner = unsafe { &mut *self.inner.get() };
 
         let size = align_up(layout.size().max(MIN_BLOCK_SIZE), MIN_BLOCK_SIZE);
@@ -339,6 +353,7 @@ unsafe impl GlobalAlloc for DemandHeap {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let _sample = ProfileSample::start(3);
+        let _guard = self.lock();
         let inner = unsafe { &mut *self.inner.get() };
 
         let size = align_up(layout.size().max(MIN_BLOCK_SIZE), MIN_BLOCK_SIZE);

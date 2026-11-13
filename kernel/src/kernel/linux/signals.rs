@@ -26,8 +26,23 @@ struct Action {
 #[derive(Clone, Copy, Default)]
 struct Local {
     mask: u64,
+    saved_wait_mask: Option<u64>,
     stack: u64,
     size: u64,
+}
+/// pselect installs its mask atomically with entering the wait. Keep the
+/// original mask for normal completion or the signal frame's rt_sigreturn.
+pub(super) fn begin_wait(state: &mut State, tid: i32, mask: Option<u64>) {
+    if let Some(mask) = mask {
+        let local = state.locals.entry(tid).or_default();
+        assert!(local.saved_wait_mask.is_none());
+        local.saved_wait_mask = Some(local.mask);
+        local.mask = mask & !UNBLOCKABLE;
+    }
+}
+pub(super) fn finish_wait(state: &mut State, tid: i32) {
+    if let Some(local) = state.locals.get_mut(&tid)
+        && let Some(mask) = local.saved_wait_mask.take() { local.mask = mask; }
 }
 #[derive(Clone)]
 struct Frame {
@@ -336,14 +351,14 @@ pub(super) fn deliver<A: crate::Arch>(
         regs.frame.cs | (regs.frame.ss << 48),
         if fault { regs.err_code } else { 0 },
         if fault { 14 } else if signal == 4 && code == 2 { 6 } else { 0 },
-        local.mask,
+        local.saved_wait_mask.unwrap_or(local.mask),
         if fault { addr } else { 0 },
     ];
     for (index, value) in general.iter().enumerate() {
         machine.write(base + MC + index * 8, *value);
     }
     machine.write::<u64>(base + MC + 184, (base + FP) as u64);
-    machine.write(base + MASK, local.mask);
+    machine.write(base + MASK, local.saved_wait_mask.unwrap_or(local.mask));
     machine.write::<i32>(base + INFO, signal as i32);
     machine.write::<i32>(base + INFO + 8, code);
     machine.write::<u64>(base + INFO + 16, addr);
@@ -356,6 +371,7 @@ pub(super) fn deliver<A: crate::Arch>(
         base,
         regs: *regs,
     });
+    state.locals.entry(tid).or_default().saved_wait_mask = None;
     state.locals.entry(tid).or_default().mask = (local.mask
         | action.mask
         | if action.flags & SA_NODEFER == 0 {

@@ -146,7 +146,7 @@ impl<A: Arch> Vcpu<A> {
 /// So there is exactly one guest-memory path — the vcpu — and `Arch` is just the
 /// rest of the machine: CPU exec, ports, timer, IRQ lines, the page-table/fork/
 /// LDT/DMA "arch calls", FPU state, and a few x86 segment helpers.
-pub trait Arch: Sized + GuestBytes {
+pub trait Arch: Sized + GuestBytes + 'static {
     /// Backend page-table root type stored in `Vcpu::space` — an OWNED address
     /// space, so it is **not** `Copy`: a parked `Vcpu` moves rather than
     /// duplicating the space. It is an OPAQUE owned handle — **not** a memory
@@ -321,6 +321,12 @@ pub trait Arch: Sized + GuestBytes {
 
     /// COW-fork the current address space into `child` (fills the child root).
     fn user_fork(&mut self, child: &mut Self::PageTable);
+    /// Detach shared page-table metadata before concurrent process execution.
+    /// Consumes explicit backing inputs; -11 requests another input batch.
+    fn private_page_tables(&mut self) -> i32 { 0 }
+    fn refresh_kernel_mappings(&mut self) {}
+    /// Interrupt one processor to end its current CPU loan.
+    fn interrupt_processor(&mut self, _processor: u32) {}
 
     /// Tear down a dead thread's address space entirely. `free_user_pages`
     /// (called at exit, while the space is still active) returns its page

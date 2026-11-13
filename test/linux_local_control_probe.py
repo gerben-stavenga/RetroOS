@@ -50,6 +50,7 @@ request('profile begin')
 assert control.request('profile report')['ok'] is False, 'live snapshots must not look frozen'
 start = time.monotonic_ns()
 time.sleep(.08)
+subprocess.run([sys.executable, '-c', 'sum(range(100000))'], check=True)
 for _ in range(100):
     os.stat('/home/retroos/profile-test')
 fd = os.open('/home/retroos/profile-test/new', os.O_CREAT | os.O_WRONLY, 0o600)
@@ -72,6 +73,22 @@ assert sum(r['hits'] for r in directory_rows) > 0, directory_rows
 assert sum(r['builds'] for r in directory_rows) > 0, directory_rows
 assert sum(r['namespace_invalidations'] for r in directory_rows) > 0, directory_rows
 assert request('profile report') == packet, 'reporting must not change frozen counters'
+details = request('profile workers')
+assert details == packet['raw']['workers']
+assert details['scope'] == 'worker_cpu_time' and details['overlaps_bsp_wall_time'] is True
+assert details['window_id'] == packet['window']['id']
+for row in details['cpus']:
+    assert row['cpu'] >= 2 and any(call['calls'] > 0 for call in row['syscalls'])
+    assert all(call['ns'] >= call['max_ns'] for call in row['syscalls'])
+workers = request('parallel status')
+assert workers['scope'] == 'worker_syscalls_since_boot' and workers['bsp_included'] is False
+assert workers['cpu_mask'] & 1 and not workers['cpu_mask'] & 2
+for row in workers['cpus']:
+    assert row['cpu'] >= 2 and workers['cpu_mask'] & (1 << row['cpu'])
+    assert row['syscalls'] > 0 and row['handler_ns'] >= 0 and row['lock_wait_ns'] >= 0
+if workers['cpu_mask'] != 1:
+    assert workers['cpus'], 'the helper must execute kernel handlers on its worker CPU'
+    assert details['cpus'], 'worker syscalls must be present in the recorded window'
 time.sleep(.01)
 assert request('profile report') == packet, 'stopped counters must not include collection time'
 with open('/home/retroos/capture.json', 'w') as output:
@@ -82,6 +99,7 @@ assert empty['window']['elapsed_ns'] == 0
 assert empty['raw']['execution']['calls'] == 0
 assert empty['raw']['execution']['total'] == 0
 assert empty['raw']['syscalls']['syscalls'] == []
+assert empty['raw']['workers']['cpus'] == []
 assert empty['directories']['total_paths'] == 0
 request('profile begin')
 time.sleep(.01)

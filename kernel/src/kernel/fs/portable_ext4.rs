@@ -712,6 +712,33 @@ impl Filesystem for PortableExt4Fs {
         }) { Ok(_) => 0, Err(Error::AlreadyExists) => -17, Err(_) => -5 }
     }
 
+    fn hard_link(&self, source: &[u8], path: &[u8]) -> i32 {
+        let (Some(source), Some(path)) = (Self::path(source), Self::path(path)) else { return -22 };
+        let info = match self.resolve(source) { Ok(info) => info, Err(_) => return -2 };
+        if info.node().is_some() { return -1; }
+        let Some((parent_path, name)) = Self::split_parent(path) else { return -22 };
+        let parent = match self.resolve(parent_path) { Ok(info) => info, Err(_) => return -2 };
+        let Some(parent) = parent.node() else { return -20 };
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        match filesystem.hard_link(storage, parent, name, info.object) {
+            Ok(()) => 0, Err(Error::AlreadyExists) => -17,
+            Err(Error::TooManyLinks) => -31, Err(_) => -5,
+        }
+    }
+
+    fn link_count(&self, path: &[u8]) -> u32 {
+        Self::path(path).and_then(|path| self.resolve(path).ok()).map_or(1, |info| info.references)
+    }
+
+    fn link_count_node(&self, node: u64) -> Option<u32> {
+        self.flush_pending().ok()?;
+        let object = Object::from_opaque(node)?;
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        Some(filesystem.inspect(storage, object).ok()?.references)
+    }
+
     fn supports_mkdir(&self) -> bool {
         true
     }

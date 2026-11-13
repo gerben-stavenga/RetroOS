@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise sparse long-mode page tables with only 256 MiB of guest RAM."""
 from pathlib import Path
+import argparse
 import subprocess
 import tempfile
 from boot_fixture import prepare_boot
@@ -9,6 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cpus", type=int, default=1)
+    args = parser.parse_args()
     artifacts = ROOT / 'build/ci'
     artifacts.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='retroos-high-memory-') as directory:
@@ -32,7 +36,7 @@ def main():
             log = artifacts / ('high-memory-' + label + '.log')
             with log.open('w') as output:
                 process = subprocess.Popen(['qemu-system-x86_64', '-accel', 'kvm',
-                    '-cpu', 'host', '-m', '256', '-display', 'none', '-serial', 'none',
+                    '-cpu', 'host', '-smp', str(args.cpus), '-m', '256', '-display', 'none', '-serial', 'none',
                     '-no-reboot', '-nic', 'none', '-debugcon', 'stdio',
                     '-drive', f'file={boot},format=raw,snapshot=on',
                     '-drive', f'file={data},format=raw,snapshot=on'],

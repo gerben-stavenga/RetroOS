@@ -267,3 +267,26 @@ pub fn fault(address: u64, error: u64) -> bool {
     paging2::flush_tlb();
     result
 }
+
+pub(crate) fn privatize() -> i32 {
+    fn detach(entry: &mut Entry64, level: u32) -> Result<(), i32> {
+        if level == 0 || !entry.present() { return Ok(()); }
+        let page = table(entry)?;
+        for index in 0..512 {
+            let mut child = read(page, index);
+            let result = detach(&mut child, level - 1);
+            write(page, index, child);
+            result?;
+        }
+        Ok(())
+    }
+    if !paging2::is_pae() { return 0; }
+    for index in 1..256 {
+        let mut entry = root(index);
+        let result = detach(&mut entry, 3);
+        set_root(index, entry);
+        if let Err(error) = result { paging2::flush_tlb(); return error; }
+    }
+    paging2::flush_tlb();
+    0
+}

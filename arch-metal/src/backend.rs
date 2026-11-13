@@ -121,6 +121,17 @@ impl Arch for Metal {
     fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>) { super::calls::arch_set_debug_watch(addrs) }
 
     // ── Arch calls: paging / fork / LDT / DMA ──
+    fn private_page_tables(&mut self) -> i32 {
+        let result: u32;
+        unsafe { core::arch::asm!("int 0x80", inlateout("eax") crate::arch_call::PRIVATE_TABLES as u32 => result); }
+        result as i32
+    }
+    fn refresh_kernel_mappings(&mut self) {
+        unsafe { core::arch::asm!("int 0x80", in("eax") crate::arch_call::REFRESH_KERNEL as u32); }
+    }
+    fn interrupt_processor(&mut self, processor: u32) {
+        unsafe { core::arch::asm!("int 0x80", in("eax") crate::arch_call::INTERRUPT_PROCESSOR as u32, in("edx") processor); }
+    }
     fn user_fork(&mut self, child: &mut RootPageTable) { super::calls::arch_user_fork(child) }
     fn free_user_pages(&mut self) { super::calls::arch_free_user_pages() }
     // The metal "space" is the saved-entries buffer inside the Thread (the

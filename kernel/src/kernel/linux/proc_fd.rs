@@ -7,6 +7,12 @@ pub(super) fn is_dir(path: &[u8]) -> bool {
     PREFIXES.contains(&path)
 }
 fn fd_path(path: &[u8]) -> Option<Option<usize>> {
+    match path {
+        b"dev/stdin" => return Some(Some(0)),
+        b"dev/stdout" => return Some(Some(1)),
+        b"dev/stderr" => return Some(Some(2)),
+        _ => {},
+    }
     for prefix in PREFIXES {
         if let Some(name) = path
             .strip_prefix(prefix)
@@ -32,6 +38,36 @@ fn fd_path(path: &[u8]) -> Option<Option<usize>> {
         }
     }
     None
+}
+
+/// Reopen the pipe object behind a descriptor link, retaining an endpoint
+/// independently of the descriptor that named it. Bash process substitution
+/// uses these opens rather than dup().
+pub(super) fn open_pipe<A: crate::Arch>(
+    kt: &mut thread::KernelThread<A>, path: &[u8], flags: u32,
+) -> Option<i32> {
+    let fd = fd_path(path)?;
+    let Some(kind) = fd.and_then(|fd| kt.fds.get(fd)).copied().filter(|kind| !kind.is_none()) else {
+        return Some(-2);
+    };
+    if flags & 0x20000 != 0 { return Some(-40); } // O_NOFOLLOW: descriptor links are symlinks.
+    if flags & 0xc0 == 0xc0 { return Some(-17); } // O_CREAT | O_EXCL
+    let pipe = match kind {
+        thread::FdKind::PipeRead(pipe) | thread::FdKind::PipeWrite(pipe) => pipe,
+        _ => return None,
+    };
+    if flags & 0x10000 != 0 { return Some(-20); } // O_DIRECTORY
+    let writer = match flags & 3 { 0 => false, 1 => true, _ => return Some(-22) };
+    let Some(newfd) = kt.alloc_fd(3) else { return Some(-24); };
+    if writer {
+        crate::kernel::kpipe::add_writer(pipe);
+        kt.fds[newfd] = thread::FdKind::PipeWrite(pipe);
+    } else {
+        crate::kernel::kpipe::add_reader(pipe);
+        kt.fds[newfd] = thread::FdKind::PipeRead(pipe);
+    }
+    kt.cloexec.set(newfd, flags & 0x80000 != 0);
+    Some(newfd as i32)
 }
 fn absolute(path: &[u8]) -> Vec<u8> {
     [b"/".as_slice(), path].concat()

@@ -93,22 +93,24 @@ fn queue<A: crate::Arch>(task: &mut thread::Thread<A>, signal: u8, sender: i32) 
 }
 
 /// Process-directed kill, including signal zero liveness probes. All Linux
-/// processes currently have the fixed session credentials and a private
-/// process group (the same model exposed by getpgrp/setpgid).
+/// processes currently have the fixed session credentials. Group selection
+/// uses inherited process-group membership, independently of reusable PIDs.
 pub(crate) fn kill<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>],
     caller: usize, regs: &mut Regs, pid: i32, signal: u8) -> Option<thread::KernelAction>
 {
     let mut found = false;
-    for (index, task) in threads.iter_mut().enumerate() {
+    for index in 0..threads.len() {
         let id = index as i32;
         let selected = match pid {
-            0 => index == caller,
+            0 => process_group::group(id) == process_group::group(caller as i32),
             -1 => index != caller && index != 1,
-            n if n < -1 => n.checked_neg() == Some(id),
+            n if n < -1 => n.checked_neg() == Some(process_group::group(id)),
             n => n == id,
         };
-        if !selected || task.kernel.state == thread::ThreadState::Unused
-            || !matches!(task.personality, thread::Personality::Linux(_)) { continue; }
+        if !selected || threads[index].kernel.state == thread::ThreadState::Unused
+            || !matches!(threads[index].personality, thread::Personality::Linux(_)) { continue; }
+        crate::kernel::parallel::take_process(machine, threads, index);
+        let task = &mut threads[index];
         // Zombies still exist until wait reaps them. A signal has no effect.
         found = true;
         if signal != 0 && task.kernel.state != thread::ThreadState::Zombie {
@@ -187,7 +189,7 @@ pub(crate) fn child_exited<A: crate::Arch>(parent: &mut thread::Thread<A>, child
 /// `creator=None` means all threads in the parent process are terminating.
 pub(crate) fn parent_exited<A: crate::Arch>(threads: &mut [thread::Thread<A>], process: usize, creator: Option<i32>) {
     let live_linux = |task: &thread::Thread<A>| matches!(task.personality, thread::Personality::Linux(_))
-        && matches!(task.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked);
+        && matches!(task.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked | thread::ThreadState::OnCpu);
     // PID 1 may be DN, not a Linux init. Adopting a daemon into DN makes
     // its eventual exit schedule DN and take the live Linux console away.
     // Prefer Linux init when present; otherwise use the surviving Linux
@@ -217,6 +219,7 @@ pub(crate) fn parent_exited<A: crate::Arch>(threads: &mut [thread::Thread<A>], p
             }
             if creator.is_none() {
                 task.kernel.parent_tid = adopt;
+                process_group::reparent(task.kernel.tid as usize, adopt);
                 if let thread::Personality::Linux(linux) = &mut task.personality { linux.parent_creator = (adopt >= 0).then_some(adopt); }
             }
         }

@@ -3865,6 +3865,17 @@ impl Ext4 {
         ))
     }
 
+    /// Retain an existing blob for another directory edge. Nodes cannot be
+    /// shared because their back edge defines a unique parent.
+    pub fn retain_blob(&mut self, storage: &mut dyn Storage, object: Object) -> Result<Detached, Error> {
+        if !matches!(object, Object::Blob(_)) { return Err(Error::InvalidArgument); }
+        let inode = self.inode(storage, object.number())?;
+        if inode.object() != object || inode.references == 0 { return Err(Error::NotFound); }
+        if inode.references == u16::MAX { return Err(Error::TooManyLinks); }
+        self.change_references(storage, object, inode.generation, 1)?;
+        Ok(Detached { object, generation: inode.generation })
+    }
+
     pub fn release(&mut self, storage: &mut dyn Storage, object: Detached) -> Result<(), Error> {
         let inode = self.inode(storage, object.object.number())?;
         if inode.generation != object.generation || inode.object() != object.object {

@@ -24,6 +24,18 @@ from typing import Any
 
 TOOLS = [
     {
+        "name": "profile_workers",
+        "description": "Per-worker syscall and nested I/O timings for the current profile window. CPU times overlap each other and BSP wall time; do not add them to profile_totals.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
+        "name": "parallel_status",
+        "description": "Return eligible CPUs and per-worker syscall counts, handler nanoseconds and kernel-service lock wait since boot. These worker CPU counters are separate from the BSP wall-time ledger; CPU 0 is excluded.",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        "annotations": {"readOnlyHint": True},
+    },
+    {
         "name": "profile_begin",
         "description": "Start a fresh whole-system capture on the event-loop CPU: reset every counter and begin recording. Run the workload immediately, then call profile_end. Concurrent processes and MCP bracketing are included.",
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -79,7 +91,7 @@ TOOLS = [
     } for name, description in (
         ("io", "Return nested filesystem, cache, device and outer-loop timings; do not add overlapping stages."),
         ("heap", "Return kernel heap allocation counters."),
-        ("totals", "Return the disjoint coarse kernel execution ledger and profile duration."),
+        ("totals", "Return the disjoint BSP wall-time ledger and profile duration. Parallel worker CPU time is excluded; BSP preparation and rendezvous are scheduler work."),
     )],
     {
         "name": "profile_top",
@@ -404,6 +416,8 @@ def text_content(value: Any) -> list[dict[str, Any]]:
 
 
 def commands_for(name: str, arguments: dict[str, Any]) -> list[str]:
+    if name == "profile_workers": return ["profile workers"]
+    if name == "parallel_status": return ["parallel status"]
     if name == "profile_begin": return ["profile begin"]
     if name == "profile_end": return ["profile end"]
     if name == "profile_report": return ["profile report"]
@@ -459,7 +473,7 @@ def serve(pipe: str | None, sock: str | None, device: str | None = None) -> None
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "retroos-serial", "version": "1.0.0"},
-                    "instructions": "These tools execute in the RetroOS kernel. Inside RetroOS the bridge automatically uses /dev/retroos-control; outside it uses the QEMU COM2 socket or 86Box pipe. profile_totals is a disjoint execution ledger; profile_io stages overlap and must not be added together. profile_dump also writes to the kernel log.",
+                    "instructions": "These tools execute in the RetroOS kernel. Inside RetroOS the bridge automatically uses /dev/retroos-control; outside it uses the QEMU COM2 socket or 86Box pipe. profile_totals is a disjoint BSP wall-time ledger that excludes worker CPU time; profile_io stages overlap and must not be added together. profile_dump also writes to the kernel log.",
                 })
             elif method == "ping": emit(identifier, {})
             elif method == "tools/list": emit(identifier, {"tools": TOOLS})

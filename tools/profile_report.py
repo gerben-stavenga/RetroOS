@@ -113,6 +113,25 @@ def make_report(packet):
             'average_ns': stage['ns'] / stage['calls'] if stage['calls'] else 0})
     for rows_in_group in nested.values():
         rows_in_group.sort(key=lambda row: row['ns'], reverse=True)
+    worker_rows = []
+    for cpu in raw.get('workers', {}).get('cpus', []):
+        calls = []
+        rubrics = {}
+        for call in cpu['syscalls']:
+            number = call['number']
+            name = names.get(call['abi'], {}).get(number, f"syscall_{call['abi']}_{number}")
+            rubric = next((key for key, members in SYSCALL_GROUPS.items() if name in members), 'other')
+            calls.append({**call, 'name': name, 'rubric': rubric,
+                'average_ns': call['ns'] / call['calls'] if call['calls'] else None})
+            group = rubrics.setdefault(rubric, {'calls': 0, 'ns': 0})
+            group['calls'] += call['calls']; group['ns'] += call['ns']
+        io = {}
+        for stage in cpu['io']:
+            rubric = next((key for key, members in IO_GROUPS.items() if stage['stage'] in members), 'other')
+            io.setdefault(rubric, []).append(stage)
+        worker_rows.append({'cpu': cpu['cpu'], 'syscall_handler_ns': sum(c['ns'] for c in calls),
+            'syscalls': {'rubrics': rubrics, 'rows': sorted(calls, key=lambda c: c['ns'], reverse=True)},
+            'nested_io': {'additive': False, 'rubrics': io}})
     directories = packet['directories']
     directory_rows = [{**row, 'path': '/' + bytes.fromhex(row['path_hex']).decode('utf-8', errors='replace').lstrip('/')}
                       for row in directories['rows']]
@@ -126,19 +145,23 @@ def make_report(packet):
     if packet['event_table_overflow']:
         warnings.append('Legacy event-class table overflowed; syscall counters and the coarse ledger are independent of that bounded table.')
     warnings.extend([
-        'This is elapsed time on the event-loop CPU, including all processes and blocking device work; not Linux user/sys CPU accounting.',
+        'This is elapsed time on the event-loop CPU, including blocking device work and parallel process coordination. Worker CPU execution is excluded; not Linux user/sys CPU accounting.',
         'Guest execution window includes IRQ/fault boundaries; nested fault counters must not be added again.',
         'The capture includes MCP bracketing and concurrent work, not an independently timed application interval.',
         'Instrumentation overhead is included, not estimated and subtracted. Compare a separate unprofiled run for observer overhead.',
         'I/O timings are inclusive, nested diagnostics. Neither rows nor rubric totals may be added to the execution ledger.',
     ])
     return {'ok': True, 'schema_version': 1, 'window': window, 'clock': packet['clock'],
-        'accounting': {'unit': 'ns', 'disjoint': True, 'categories': categories,
+        'accounting': {'unit': 'ns', 'disjoint': True, 'scope': 'bsp_wall_time',
+            'worker_cpu_time_included': False, 'categories': categories,
             'active_ns': sum(r['ns'] for r in categories if r['category'] != 'idle') if ns else None,
             'syscall_handler_ns': handlers},
         'syscalls': {'unit': 'ns', 'meaning': 'synchronous handler time; excludes blocked sleep, deferred actions and architecture crossings',
             'rubrics': groups, 'rows': rows},
         'nested_io': {'unit': 'ns', 'additive': False, 'rubrics': nested},
+        'workers': {'unit': 'ns', 'scope': 'worker_cpu_time', 'additive_to_wall_time': False,
+            'meaning': 'per-core handler times overlap each other and the BSP ledger; nested I/O is inclusive',
+            'cpus': worker_rows},
         'directory_cache': {'scope': 'directory-listing cache, including cached negative name lookups',
             'total_paths': directories['total_paths'], 'returned_paths': len(directory_rows),
             'omitted_paths': directories['total_paths'] - len(directory_rows), 'ranked_by': 'build_ns',

@@ -1446,6 +1446,7 @@ fn event_loop<A: crate::Arch>(
     crate::compact_dbg_println!("event_loop entered, tid={}", first_tid);
     crate::kernel::klog::sync_live();
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
+    let mut parallel = crate::kernel::parallel::Parallel::new();
     let mut stats = EventStats::new(machine);
     let mut last_osd_refresh_tick = u64::MAX;
     let mut last_osd_composite_period = u64::MAX;
@@ -1495,6 +1496,7 @@ fn event_loop<A: crate::Arch>(
     let mut blocked_io_service = Periodic::new(last_world_ns, 1_000_000);
     let mut injected_keys = Periodic::new(last_world_ns, 1_000_000);
     let mut quantum = Periodic::new(last_world_ns, 10_000_000);
+    let mut quantum_due = false;
     // Ordinary writes become visible immediately but need not force durability
     // every 100 ms. Full batches apply backpressure; explicit sync and clean
     // shutdown persist sooner. Keep unsynced background transactions bounded.
@@ -1505,6 +1507,7 @@ fn event_loop<A: crate::Arch>(
     let mut hardware_initialized = false;
 
     loop {
+        super::parallel::collect_finished::<A>(threads);
         let prelude_sample = super::event_profile::FileIoScope::start(super::event_profile::LOOP_PRELUDE, 0);
         let world_now_ns = machine.now();
         if !hardware_initialized || hardware_deadline.is_some_and(|end| end <= world_now_ns) {
@@ -1519,8 +1522,9 @@ fn event_loop<A: crate::Arch>(
         let display_due = display_active && display_service.consume(world_now_ns);
         let blocked_io_due = blocked_io_service.consume(world_now_ns);
         let injected_due = injected_keys.consume(world_now_ns);
-        let quantum_due = quantum.consume(world_now_ns);
-        if quantum_due { super::vfs::mapping::reclaim_pressure(); }
+        let quantum_elapsed = quantum.consume(world_now_ns);
+        quantum_due |= quantum_elapsed;
+        if quantum_elapsed { super::vfs::mapping::reclaim_pressure(); }
         // Service synchronous VGA before handling queued kernel events.
         // The linear VBE fallback still uses the guest-memory handoff.
         // Audio DMA and legacy VGA read resident device storage independently.
@@ -1855,7 +1859,7 @@ fn event_loop<A: crate::Arch>(
         }
         let mut blocked_polling = false;
         for (tid, thread) in threads.iter_mut().enumerate() {
-            if matches!(thread.kernel.state, thread::ThreadState::Unused | thread::ThreadState::Zombie) { continue; }
+            if matches!(thread.kernel.state, thread::ThreadState::Unused | thread::ThreadState::Zombie | thread::ThreadState::OnCpu) { continue; }
             if tid != ctx.tid { thread.personality.advance_background_timers(world_now_ns); }
             deadlines.include(thread.personality.next_deadline(world_now_ns, tid == ctx.tid));
             blocked_polling |= thread.kernel.state == thread::ThreadState::Blocked
@@ -1865,17 +1869,28 @@ fn event_loop<A: crate::Arch>(
         drop(deadline_sample);
         if deadlines.immediate() { continue; }
 
-        if quantum_due && let Some(next) = crate::kernel::sched::linux_timeslice_successor(threads, ctx.tid, &mut linux_timeslice_cursor) {
+        if let Some(next) = crate::kernel::parallel::Parallel::pending(threads, ctx.tid) {
             switch_focus_and_run(machine, &mut *bios_workspace, threads, &mut ctx, next,
                 &mut exiting_display, &mut sb_handoff, &mut display, &mut windows);
             continue;
         }
 
+        if threads[ctx.tid].kernel.pending_event.is_none() && quantum_due {
+            // Draining a parallel batch can span the quantum boundary. Keep
+            // that request until pending events are dispatched, or ready
+            // peers that did not fit in the batch can starve indefinitely.
+            quantum_due = false;
+            if let Some(next) = crate::kernel::sched::linux_timeslice_successor(threads, ctx.tid, &mut linux_timeslice_cursor) {
+                switch_focus_and_run(machine, &mut *bios_workspace, threads, &mut ctx, next,
+                    &mut exiting_display, &mut sb_handoff, &mut display, &mut windows);
+                continue;
+            }
+        }
+
         // A blocked thread holds the console but not the CPU: wait for input
         // to unblock it (above) or the F12 window picker to move on.
-        let thread = ctx.thread(threads);
-        if thread.kernel.state == thread::ThreadState::Blocked {
-            let dependency_wait = match &thread.personality {
+        if threads[ctx.tid].kernel.state == thread::ThreadState::Blocked {
+            let dependency_wait = match &threads[ctx.tid].personality {
                 thread::Personality::Linux(linux) => linux.waits_for_record_lock(),
                 thread::Personality::Windows(windows) => windows.waits_for_child(),
                 _ => false,
@@ -1907,11 +1922,11 @@ fn event_loop<A: crate::Arch>(
 
         // Keep servicing input, audio and real-time virtual devices while a
         // DOS client's explicit CPU duty limit delays its next guest slice.
-        let paced = matches!(&thread.personality, thread::Personality::Dos(dos)
+        let paced = matches!(&threads[ctx.tid].personality, thread::Personality::Dos(dos)
             if dos.cpu_pacer.limited());
         let run_started = if paced {
             let now = world_now_ns;
-            if let thread::Personality::Dos(dos) = &thread.personality
+            if let thread::Personality::Dos(dos) = &threads[ctx.tid].personality
                 && !dos.cpu_pacer.ready(now)
             {
                 // Hosted execution normally supplies clock wakeups on return
@@ -1934,14 +1949,19 @@ fn event_loop<A: crate::Arch>(
         let (action, hide_window, old_endpoint) = loop {
             stats.pre_run(machine, &ctx.regs);
             let event_sample = super::event_profile::Sample::start(machine);
-            let kevent = if thread.personality.timer_due(machine.now()) {
+            ctx.device_cycles = 0;
+            let kevent = if threads[ctx.tid].kernel.pending_event.is_some() {
+                parallel.execute(machine, threads, &mut ctx, bios_workspace, loan_deadline.unwrap())
+            } else if threads[ctx.tid].personality.timer_due(machine.now()) {
                 crate::KernelEvent::Irq
             } else {
                 let alarm_sample = super::event_profile::FileIoScope::start(super::event_profile::ALARM_ARM, 0);
                 machine.arm_alarm(loan_deadline);
                 drop(alarm_sample);
-                ctx.run(machine, bios_workspace, &mut thread.personality)
+                parallel.execute(machine, threads, &mut ctx, bios_workspace, loan_deadline.unwrap())
             };
+            let peers_pending = threads.iter().any(|task| task.kernel.pending_event.is_some());
+            let thread = ctx.thread(threads);
             let clock_read = matches!(&thread.personality, thread::Personality::Linux(_))
                 && matches!(kevent, crate::KernelEvent::Syscall | crate::KernelEvent::SoftInt(0x80))
                 && match ctx.regs.mode() {
@@ -1951,16 +1971,17 @@ fn event_loop<A: crate::Arch>(
             if paced && let thread::Personality::Dos(dos) = &mut thread.personality {
                 dos.cpu_pacer.charge(run_started, machine.now());
             }
-            stats.post_run(machine, &kevent, &ctx.regs, ctx.device_cycles);
+            stats.post_run(machine, &kevent, &ctx.regs, ctx.device_cycles, parallel.take_kernel_cycles());
             let event_dispatch = event_sample.returned(machine, &kevent, &ctx.regs, &thread.personality);
             super::media::kernel_entry();
             let had_window = thread.has_primary_window();
-            let action = dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent);
+            let action = if let Some(action) = thread.kernel.pending_action.take() { action }
+                else { dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent) };
             let hide_window = had_window && !thread.has_primary_window();
             let old_endpoint = thread.window_endpoint();
             event_dispatch.finish(machine);
             stats.after_dispatch(machine);
-            if clock_read && matches!(action, thread::KernelAction::Done)
+            if clock_read && !peers_pending && matches!(action, thread::KernelAction::Done)
                 && matches!(thread.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running)
                 && loan_deadline.is_some_and(|end| machine.now() < end)
             {
@@ -1978,11 +1999,12 @@ fn event_loop<A: crate::Arch>(
             crate::kernel::console::restore_from_monitor(
                 machine,
                 &mut *bios_workspace,
-                &mut thread.personality,
+                &mut threads[ctx.tid].personality,
                 &mut display,
             );
         }
 
+        super::parallel::prepare_action(machine, threads, ctx.tid, &action);
         crate::kernel::linux::notify_thread_exits(threads, ctx.tid);
 
         // Ask the scheduler.
@@ -2059,6 +2081,14 @@ fn event_loop<A: crate::Arch>(
                 // The loop's contract: no thread resources survive it —
                 // callers never inherit zombies.
                 thread::reap_all_zombies(threads, machine);
+                if parallel.batches() != 0 {
+                    crate::compact_println!("SMP: Linux batches={} peak_worker_loans={} peak_concurrent_handlers={} parallel_lifecycles={} bsp_events_with_workers={}",
+                        parallel.batches(), crate::kernel::parallel::peak_workers(), crate::kernel::parallel::peak_handlers(), crate::kernel::parallel::parallel_lifecycles(), crate::kernel::parallel::bsp_events_with_workers());
+                    for (cpu, row) in super::parallel::worker_stats::<A>() {
+                        crate::compact_println!("SMP: CPU {} syscalls={} handler_ns={} kernel_lock_wait_ns={}",
+                            cpu, row.syscalls, row.handler_ns, row.lock_wait_ns);
+                    }
+                }
                 // Every owner is gone, so both capabilities are back in this
                 // frame — hand them to whoever runs the next program.
                 {
@@ -2322,7 +2352,7 @@ fn dispatch<A: crate::Arch>(
         // needs the write/read planar logic) is emulated here on hosted
         // backends. Native VGA is handled in ring 0; Voodoo still comes here.
         if matches!(thread.personality, thread::Personality::Linux(_))
-            && crate::kernel::linux::try_vsyscall(machine, regs, addr) {
+            && crate::kernel::linux::try_vsyscall(machine, regs, addr, thread.kernel.execution_cpu) {
             return thread::KernelAction::Done;
         }
         if let thread::Personality::Linux(linux) = &mut thread.personality
@@ -2824,6 +2854,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     {
         let parent = thread::get_thread(threads, parent_tid).unwrap();
         parent.personality.on_suspend(machine);
+        parent.kernel.tables_private = false;
         crate::kernel::memory::fork(machine, &mut parent.kernel.vcpu.space);
     }
 
@@ -3352,7 +3383,7 @@ fn dump_virtual_hw<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>) {
 /// Is cycle profiling on? Written by the F12 monitor, read by the
 /// event loop — the same single-threaded volatile-flag shape as
 /// the window picker's atomic target.
-static mut PROFILE_DUMP: bool = false;
+static PROFILE_DUMP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn reset_profile() {
     lib::heap::profile_reset();
@@ -3370,8 +3401,8 @@ pub fn reset_profile() {
 pub fn set_profile(on: bool) {
     lib::heap::profile_enable(on);
     let was_on = profile_enabled();
-    unsafe { core::ptr::write_volatile(&raw mut PROFILE_DUMP, on) };
     if on && !was_on { reset_profile(); }
+    PROFILE_DUMP.store(on, core::sync::atomic::Ordering::Release);
     crate::compact_println!("[prof] cycle profiling {}", if on { "ON" } else { "off" });
 }
 
@@ -3379,7 +3410,12 @@ pub fn set_profile(on: bool) {
 pub fn toggle_profile() { set_profile(!profile_enabled()); }
 
 pub fn profile_enabled() -> bool {
-    unsafe { core::ptr::read_volatile(&raw const PROFILE_DUMP) }
+    !super::parallel::on_worker() && detail_profile_enabled()
+}
+
+/// Per-core detail counters are CPU time, separate from the BSP wall ledger.
+pub(crate) fn detail_profile_enabled() -> bool {
+    PROFILE_DUMP.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Runtime syscall-trace gate, consulted by both `dos_trace!` (DOS/DPMI) and
@@ -3679,6 +3715,7 @@ impl EventStats {
         _event: &crate::KernelEvent,
         _regs: &Regs,
         device_cycles: u64,
+        parallel_cycles: u64,
     ) {
         if !self.active {
             return;
@@ -3686,7 +3723,9 @@ impl EventStats {
         let now = machine.rdtsc();
         let elapsed = now.wrapping_sub(self.last_tsc);
         let device_cycles = device_cycles.min(elapsed);
-        self.guest_cycles = self.guest_cycles.wrapping_add(elapsed - device_cycles);
+        let parallel_cycles = parallel_cycles.min(elapsed - device_cycles);
+        self.guest_cycles = self.guest_cycles.wrapping_add(elapsed - device_cycles - parallel_cycles);
+        self.kernel_cycles[PROFILE_SCHEDULER] = self.kernel_cycles[PROFILE_SCHEDULER].wrapping_add(parallel_cycles);
         self.kernel_cycles[PROFILE_DISPATCH] = self.kernel_cycles[PROFILE_DISPATCH].wrapping_add(device_cycles);
         self.last_tsc = now;
         if now.wrapping_sub(self.last_publish) >= Self::PUBLISH_CYCLES {

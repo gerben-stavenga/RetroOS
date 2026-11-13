@@ -310,3 +310,48 @@ fn unaligned_window_edges_never_allocate_or_write_beyond_the_window() {
         std::alloc::dealloc(memory, arena);
     }
 }
+
+#[test]
+fn concurrent_allocations_keep_live_buffers_disjoint_and_coalesce() {
+    unsafe {
+        let arena = Layout::from_size_align(2 * 1024 * 1024, PAGE).unwrap();
+        let memory = std::alloc::alloc_zeroed(arena);
+        assert!(!memory.is_null());
+        let heap = DemandHeap::new();
+        heap.init(memory as usize, memory as usize + arena.size());
+        heap.enable_small_cache();
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let heap = &heap;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let mut live = Vec::new();
+                    for step in 0..2000 {
+                        let size = 16 + (step * 173 + worker * 97) % 8192;
+                        let layout = Layout::from_size_align(size, 16).unwrap();
+                        let p = heap.alloc(layout);
+                        assert!(!p.is_null());
+                        let byte = (worker * 29 + step) as u8;
+                        std::ptr::write_bytes(p, byte, size);
+                        live.push((p, layout, byte));
+                        if live.len() >= 8 {
+                            let (p, layout, byte) = live.remove(0);
+                            assert!(std::slice::from_raw_parts(p, layout.size()).iter().all(|&b| b == byte));
+                            heap.dealloc(p, layout);
+                        }
+                    }
+                    for (p, layout, byte) in live {
+                        assert!(std::slice::from_raw_parts(p, layout.size()).iter().all(|&b| b == byte));
+                        heap.dealloc(p, layout);
+                    }
+                });
+            }
+        });
+        let whole = heap.alloc(arena);
+        assert_eq!(whole, memory);
+        heap.dealloc(whole, arena);
+        std::alloc::dealloc(memory, arena);
+    }
+}

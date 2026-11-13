@@ -751,6 +751,7 @@ pub fn refresh_windows<A: crate::Arch>(
         { continue; }
         match k.state {
             thread::ThreadState::Running
+            | thread::ThreadState::OnCpu
             | thread::ThreadState::Ready
             | thread::ThreadState::Blocked => {}
             _ => continue, // Unused / Zombie: not a switch target

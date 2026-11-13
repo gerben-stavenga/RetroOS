@@ -5,10 +5,10 @@
 use super::*;
 use alloc::{
     boxed::Box,
-    rc::{Rc, Weak},
+    sync::{Arc, Weak},
     vec::Vec,
 };
-use core::cell::{Cell, RefCell};
+use spin::Mutex;
 const FIRST_FD: i32 = 1024;
 fn futex_value<A: crate::Arch>(machine: &mut A, address: u64) -> Option<u32> {
     let mut bytes = [0; 4];
@@ -70,23 +70,27 @@ struct Watch {
     enabled: bool,
 }
 struct SocketEnd {
-    read_sequence: Cell<u64>,
-    packets: RefCell<alloc::collections::VecDeque<Vec<u8>>>,
-    peer: RefCell<Weak<SocketEnd>>,
+    read_sequence: u64,
+    packets: alloc::collections::VecDeque<Vec<u8>>,
+    peer: Weak<Mutex<SocketEnd>>,
     packet_mode: bool,
-    nonblock: Cell<bool>,
+    nonblock: bool,
 }
+// Fork and dup share open objects; descriptor tables remain process-owned.
+// Epoll may lock an endpoint while holding its watch list. Release endpoint
+// and event-counter guards before calling reset_edge (which locks epoll).
 #[derive(Clone)]
 enum Descriptor {
-    Socket(Rc<SocketEnd>),
+    Socket(Arc<Mutex<SocketEnd>>),
     Event {
-        count: Rc<Cell<u64>>,
+        count: Arc<Mutex<u64>>,
         semaphore: bool,
     },
-    Epoll(Rc<RefCell<Vec<Watch>>>),
+    Epoll(Arc<Mutex<Vec<Watch>>>),
 }
 #[derive(Default)]
 pub(super) struct State {
+    projected_tasks: usize,
     contexts: Vec<Context>,
     exited_tasks: Vec<i32>,
     next_thread: u32,
@@ -98,9 +102,12 @@ pub(super) struct State {
     cloexec: Vec<bool>,
 }
 pub(super) fn live_task_count(state: &State) -> usize {
+    if state.projected_tasks != 0 { return state.projected_tasks; }
     if state.contexts.is_empty() { 1 }
     else { state.contexts.iter().filter(|context| !matches!(context.wait, Wait::Exited)).count() }
 }
+
+pub(super) fn publish_projection(state: &State, snapshot: &mut State) { snapshot.projected_tasks = live_task_count(state); }
 
 pub(super) fn debug_waits<A: crate::Arch>(kt: &thread::KernelThread<A>, state: &State) {
     let now = crate::kernel::portio::now_ns();
@@ -129,7 +136,7 @@ pub(super) fn debug_waits<A: crate::Arch>(kt: &thread::KernelThread<A>, state: &
     }
     for (index, descriptor) in state.descriptors.iter().enumerate() {
         if let Some(Descriptor::Epoll(watches)) = descriptor {
-            for watch in watches.borrow().iter() {
+            for watch in watches.lock().iter() {
                 crate::compact_dbg_println!("[LINUX EPOLL] pid={} object={} fd={} events={:#x} last={:#x} ready={:#x} enabled={}",
                     kt.tid, index, watch.fd, watch.events, watch.last, ready(kt, state, watch.fd), watch.enabled);
             }
@@ -205,11 +212,13 @@ fn deadline<A: crate::Arch>(machine: &A, ms: i32) -> u64 {
 }
 fn ready<A: crate::Arch>(kt: &thread::KernelThread<A>, s: &State, fd: i32) -> u32 {
     if let Some(Descriptor::Event { count, .. }) = descriptor(s, fd) {
-        return u32::from(count.get() > 0) | if count.get() < u64::MAX - 1 { 4 } else { 0 };
+        let count = *count.lock();
+        return u32::from(count > 0) | if count < u64::MAX - 1 { 4 } else { 0 };
     }
     if let Some(Descriptor::Socket(end)) = descriptor(s, fd) {
-        return u32::from(!end.packets.borrow().is_empty())
-            | if end.peer.borrow().upgrade().is_some() {
+        let end = end.lock();
+        return u32::from(!end.packets.is_empty())
+            | if end.peer.upgrade().is_some() {
                 4
             } else {
                 16
@@ -270,28 +279,20 @@ fn epoll<A: crate::Arch>(
     let Some(Descriptor::Epoll(watches)) = descriptor(s, fd) else {
         return -EBADF;
     };
-    let events: Vec<(u32, u64)> = watches
-        .borrow()
-        .iter()
-        .map(|w| {
-            let sequence = if let Some(Descriptor::Socket(end)) = descriptor(s, w.fd) {
-                end.read_sequence.get()
-            } else {
-                match kt.fds.get(w.fd as usize) {
-                    Some(FdKind::Socket(handle)) => crate::kernel::net::read_sequence(*handle),
-                    _ => 0,
-                }
-            };
-            (ready(kt, s, w.fd), sequence)
-        })
-        .collect();
-    let object_index = object(s, fd).unwrap();
-    let Some(Some(Descriptor::Epoll(watches))) = s.descriptors.get_mut(object_index) else {
-        unreachable!()
-    };
-    let mut watches = watches.borrow_mut();
+    // Hold the watch-list lock through readiness sampling and delivery. A
+    // forked process may change this same epoll object on another CPU.
+    let mut watches = watches.lock();
     let mut n = 0;
-    for (w, (bits, sequence)) in watches.iter_mut().zip(events) {
+    for w in watches.iter_mut() {
+        let sequence = if let Some(Descriptor::Socket(end)) = descriptor(s, w.fd) {
+            end.lock().read_sequence
+        } else {
+            match kt.fds.get(w.fd as usize) {
+                Some(FdKind::Socket(handle)) => crate::kernel::net::read_sequence(*handle),
+                _ => 0,
+            }
+        };
+        let bits = ready(kt, s, w.fd);
         let bits = bits & (w.events | 0x18);
         let deliver = if w.events & (1 << 31) != 0 {
             (bits & !w.last) | if sequence != w.read_sequence { bits & 1 } else { 0 }
@@ -325,7 +326,7 @@ fn reset_edge(s: &mut State, fd: i32) {
     };
     for d in &mut s.descriptors {
         if let Some(Descriptor::Epoll(ws)) = d {
-            for w in ws.borrow_mut().iter_mut() {
+            for w in ws.lock().iter_mut() {
                 if aliases.contains(&w.fd) {
                     w.last = 0;
                 }
@@ -353,13 +354,14 @@ pub(super) fn call<A: crate::Arch>(
         16 if a.a1 as u32 == 0x5421 && matches!(descriptor(s, fd), Some(Descriptor::Socket(_))) => {
             if a.a2 == 0 || a.a2.checked_add(4).is_none_or(|end| end > 0xc0000000) { return Some(SyscallResult::val(-EFAULT)); }
             let Some(Descriptor::Socket(end)) = descriptor(s, fd) else { unreachable!() };
-            end.nonblock.set(machine.read::<i32>(a.a2 as usize) != 0);
+            end.lock().nonblock = machine.read::<i32>(a.a2 as usize) != 0;
             0
         }
         16 if a.a1 as u32 == 0x541b && matches!(descriptor(s, fd), Some(Descriptor::Socket(_))) => {
             if a.a2 == 0 || a.a2.checked_add(4).is_none_or(|end| end > 0xc0000000) { return Some(SyscallResult::val(-EFAULT)); }
             let Some(Descriptor::Socket(end)) = descriptor(s, fd) else { unreachable!() };
-            let queue = end.packets.borrow();
+            let end = end.lock();
+            let queue = &end.packets;
             let count = if end.packet_mode { queue.front().map_or(0, Vec::len) }
                 else { queue.iter().map(Vec::len).sum::<usize>() };
             machine.write::<i32>(a.a2 as usize, count.min(i32::MAX as usize) as i32);
@@ -371,18 +373,18 @@ pub(super) fn call<A: crate::Arch>(
                 -EINVAL
             } else {
                 let make = || {
-                    Rc::new(SocketEnd {
-                        read_sequence: Cell::new(0),
+                    Arc::new(Mutex::new(SocketEnd {
+                        read_sequence: 0,
                         packets: Default::default(),
                         peer: Default::default(),
                         packet_mode: kind == 5,
-                        nonblock: Cell::new(a.a1 & 0x800 != 0),
-                    })
+                        nonblock: a.a1 & 0x800 != 0,
+                    }))
                 };
                 let one = make();
                 let two = make();
-                *one.peer.borrow_mut() = Rc::downgrade(&two);
-                *two.peer.borrow_mut() = Rc::downgrade(&one);
+                one.lock().peer = Arc::downgrade(&two);
+                two.lock().peer = Arc::downgrade(&one);
                 let one = alloc_fd(s, Descriptor::Socket(one));
                 let two = alloc_fd(s, Descriptor::Socket(two));
                 for fd in [one, two] {
@@ -403,7 +405,7 @@ pub(super) fn call<A: crate::Arch>(
                 };
                 match socket_read(machine, &end, a.a1, a.a2 as usize) {
                     Some(n) => n,
-                    None if end.nonblock.get() || (nr == 45 && a.a3 & 0x40 != 0) => -11,
+                    None if end.lock().nonblock || (nr == 45 && a.a3 & 0x40 != 0) => -11,
                     None => {
                         ensure(machine, kt, s, regs);
                         s.contexts[s.active].wait = Wait::Socket(fd, a.a1, a.a2 as usize);
@@ -412,7 +414,7 @@ pub(super) fn call<A: crate::Arch>(
                 }
             } else {
                 let peer = match descriptor(s, fd).unwrap() {
-                    Descriptor::Socket(end) => end.peer.borrow().upgrade(),
+                    Descriptor::Socket(end) => end.lock().peer.upgrade(),
                     _ => unreachable!(),
                 };
                 if let Some(peer) = peer {
@@ -429,11 +431,12 @@ pub(super) fn call<A: crate::Arch>(
                     };
                     let n = data.len() as i32;
                     if !data.is_empty() {
-                        peer.packets.borrow_mut().push_back(data);
+                        let mut peer = peer.lock();
+                        peer.packets.push_back(data);
                         // The reader may drain and refill between epoll waits.
                         // Keep the notification on the shared endpoint so writes
                         // through forked/duplicated descriptors remain visible.
-                        peer.read_sequence.set(peer.read_sequence.get().wrapping_add(1));
+                        peer.read_sequence = peer.read_sequence.wrapping_add(1);
                     }
                     n
                 } else {
@@ -459,7 +462,7 @@ pub(super) fn call<A: crate::Arch>(
                 alloc_fd_cloexec(
                     s,
                     Descriptor::Event {
-                        count: Rc::new(Cell::new(a.a0 as u32 as u64)),
+                        count: Arc::new(Mutex::new(a.a0 as u32 as u64)),
                         semaphore: a.a1 & 1 != 0,
                     },
                     a.a1 & 0x80000 != 0,
@@ -488,7 +491,7 @@ pub(super) fn call<A: crate::Arch>(
                 let object_index = object(s, fd).unwrap();
                 match s.descriptors[object_index].as_mut().unwrap() {
                     Descriptor::Epoll(ws) => {
-                        let mut ws = ws.borrow_mut();
+                        let mut ws = ws.lock();
                         let i = ws.iter().position(|w| w.fd == watched);
                         match (a.a1, i) {
                             (1, None) => {
@@ -559,13 +562,17 @@ pub(super) fn call<A: crate::Arch>(
         },
         270 => match super::select::Request::read(machine, a, true) {
             Err(e) => e,
-            Ok(request) => match request.step(machine, kt) {
-                Some(n) => n,
-                None => {
-                    ensure(machine, kt, s, regs);
-                    s.contexts[s.active].select = Some(Box::new(request));
-                    s.contexts[s.active].wait = Wait::Select;
-                    0
+            Ok(request) => {
+                let tid = current_id(s, kt.tid);
+                super::signals::begin_wait(&mut linux.signals, tid, request.signal_mask);
+                match request.step(machine, kt) {
+                    Some(n) => { super::signals::finish_wait(&mut linux.signals, tid); n },
+                    None => {
+                        ensure(machine, kt, s, regs);
+                        s.contexts[s.active].select = Some(Box::new(request));
+                        s.contexts[s.active].wait = Wait::Select;
+                        0
+                    }
                 }
             },
         },
@@ -593,26 +600,30 @@ pub(super) fn call<A: crate::Arch>(
                 let i = object(s, fd).unwrap();
                 match s.descriptors[i].as_mut().unwrap() {
                     Descriptor::Event { count, semaphore } if nr == 0 => {
-                        if count.get() == 0 {
+                        let mut count = count.lock();
+                        if *count == 0 {
                             -11
                         } else {
-                            let value = if *semaphore { 1 } else { count.get() };
+                            let value = if *semaphore { 1 } else { *count };
                             if !high_memory::copy_to(machine, a.a1, &value.to_le_bytes()) { return Some(SyscallResult::val(-EFAULT)); }
-                            count.set(count.get() - value);
+                            *count -= value;
+                            drop(count);
                             reset_edge(s, fd);
                             8
                         }
                     }
                     Descriptor::Event { count, .. } => {
+                        let mut count = count.lock();
                         let mut bytes = [0; 8];
                         if !high_memory::copy_from(machine, a.a1, &mut bytes) { return Some(SyscallResult::val(-EFAULT)); }
                         let value = u64::from_le_bytes(bytes);
                         if value == u64::MAX {
                             -EINVAL
-                        } else if value >= u64::MAX - count.get() {
+                        } else if value >= u64::MAX - *count {
                             -11
                         } else {
-                            count.set(count.get() + value);
+                            *count += value;
+                            drop(count);
                             // eventfd writes notify epoll even while the counter
                             // is already readable (Mio leaves its waker unread).
                             reset_edge(s, fd);
@@ -667,13 +678,13 @@ pub(super) fn call<A: crate::Arch>(
             }
             4 => {
                 if let Some(Descriptor::Socket(end)) = descriptor(s, fd) {
-                    end.nonblock.set(a.a2 & 0x800 != 0);
+                    end.lock().nonblock = a.a2 & 0x800 != 0;
                 }
                 0
             }
             3 => {
                 if let Some(Descriptor::Socket(end)) = descriptor(s, fd) {
-                    2 | if end.nonblock.get() { 0x800 } else { 0 }
+                    2 | if end.lock().nonblock { 0x800 } else { 0 }
                 } else {
                     0x802
                 }
@@ -902,7 +913,7 @@ pub(super) fn call<A: crate::Arch>(
                 -EINVAL
             } else {
                 machine.zero(a.a2 as usize, a.a1 as usize);
-                machine.write::<u64>(a.a2 as usize, 1);
+                machine.write::<u64>(a.a2 as usize, crate::kernel::parallel::cpu_mask::<A>());
                 8
             }
         }
@@ -922,7 +933,7 @@ pub(super) fn after_io<A: crate::Arch>(kt: &thread::KernelThread<A>, linux: &mut
     let lost = if result == -11 { direction } else { direction & !ready(kt, s, fd) };
     for descriptor in &mut s.descriptors {
         if let Some(Descriptor::Epoll(watches)) = descriptor {
-            for watch in watches.borrow_mut().iter_mut().filter(|w| w.fd == fd) {
+            for watch in watches.lock().iter_mut().filter(|w| w.fd == fd) {
                 watch.last &= !lost;
             }
         }
@@ -1054,6 +1065,9 @@ pub(super) fn schedule<A: crate::Arch>(
             _ => None,
         };
         if let Some(result) = result {
+            if matches!(s.contexts[i].wait, Wait::Select) {
+                super::signals::finish_wait(&mut linux.signals, s.contexts[i].id);
+            }
             s.contexts[i].readv = None;
             s.contexts[i].splice = None;
             s.contexts[i].select = None;
@@ -1082,26 +1096,28 @@ pub(super) fn schedule<A: crate::Arch>(
 
 fn socket_read<A: crate::Arch>(
     machine: &mut A,
-    end: &SocketEnd,
+    end: &Mutex<SocketEnd>,
     out: u64,
     count: usize,
 ) -> Option<i32> {
     if count == 0 {
         return Some(0);
     }
-    let mut packets = end.packets.borrow_mut();
+    let mut end = end.lock();
+    let packet_mode = end.packet_mode;
+    let packets = &mut end.packets;
     if let Some(mut packet) = packets.pop_front() {
         let n = count.min(packet.len());
         if !high_memory::copy_to(machine, out, &packet[..n]) {
             packets.push_front(packet);
             return Some(-EFAULT);
         }
-        if !end.packet_mode && n < packet.len() {
+        if !packet_mode && n < packet.len() {
             packet.drain(..n);
             packets.push_front(packet);
         }
         Some(n as i32)
-    } else if end.peer.borrow().upgrade().is_none() {
+    } else if end.peer.upgrade().is_none() {
         Some(0)
     } else {
         None
@@ -1151,20 +1167,20 @@ mod tests {
     #[test]
     fn fork_shares_socket_endpoints_and_exec_closes_only_cloexec_handles() {
         let make = || {
-            Rc::new(SocketEnd {
-                read_sequence: Cell::new(0),
+            Arc::new(Mutex::new(SocketEnd {
+                read_sequence: 0,
                 packets: Default::default(),
                 peer: Default::default(),
                 packet_mode: true,
-                nonblock: Cell::new(false),
-            })
+                nonblock: false,
+            }))
         };
         let input = make();
         let output = make();
-        *input.peer.borrow_mut() = Rc::downgrade(&output);
-        *output.peer.borrow_mut() = Rc::downgrade(&input);
-        let input_weak = Rc::downgrade(&input);
-        let output_weak = Rc::downgrade(&output);
+        input.lock().peer = Arc::downgrade(&output);
+        output.lock().peer = Arc::downgrade(&input);
+        let input_weak = Arc::downgrade(&input);
+        let output_weak = Arc::downgrade(&output);
         let mut parent = State {
             parked: true,
             ..State::default()
@@ -1185,7 +1201,7 @@ mod tests {
         let fd = alloc_fd(
             &mut child,
             Descriptor::Event {
-                count: Rc::new(Cell::new(0)),
+                count: Arc::new(Mutex::new(0)),
                 semaphore: false,
             },
         );
@@ -1193,7 +1209,7 @@ mod tests {
     }
     #[test]
     fn fork_shares_eventfd_counter() {
-        let count = Rc::new(Cell::new(1));
+        let count = Arc::new(Mutex::new(1));
         let mut parent = State::default();
         let fd = alloc_fd(
             &mut parent,
@@ -1204,11 +1220,11 @@ mod tests {
         );
         let child = fork_state(&parent);
         if let Some(Descriptor::Event { count, .. }) = descriptor(&child, fd) {
-            count.set(7);
+            *count.lock() = 7;
         } else {
             panic!("missing inherited eventfd");
         }
-        assert_eq!(count.get(), 7);
+        assert_eq!(*count.lock(), 7);
     }
 }
 
@@ -1231,6 +1247,7 @@ pub(super) fn needs_poll(state: &State) -> bool {
         | Wait::Flock(..) | Wait::RecordLock(..) | Wait::Read(..) | Wait::ReadV | Wait::Socket(..)))
 }
 
+pub(super) fn has_exited(state: &State) -> bool { !state.exited_tasks.is_empty() }
 pub(super) fn take_exited(state: &mut State) -> Vec<i32> { core::mem::take(&mut state.exited_tasks) }
 
 pub(super) fn has_thread(state: &State, process: i32, target: i32) -> bool {

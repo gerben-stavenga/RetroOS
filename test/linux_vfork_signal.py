@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """A SIGCHLD must not schedule a vfork parent without its address space."""
+import argparse
 import subprocess
 import tempfile
 from pathlib import Path
@@ -7,6 +8,9 @@ from boot_fixture import ROOT, prepare_boot
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cpus", type=int, default=1)
+    args = parser.parse_args()
     artifacts = ROOT / 'build/ci'
     artifacts.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='retroos-vfork-signal-') as directory:
@@ -25,7 +29,7 @@ def main():
         log = artifacts / 'linux-vfork-signal.log'
         with log.open('w') as output:
             process = subprocess.Popen(['qemu-system-x86_64', '-accel', 'kvm',
-                '-cpu', 'host', '-m', '256', '-display', 'none', '-serial', 'none',
+                '-cpu', 'host', '-smp', str(args.cpus), '-m', '256', '-display', 'none', '-serial', 'none',
                 '-no-reboot', '-nic', 'none', '-debugcon', 'stdio',
                 '-drive', f'file={boot},format=raw,snapshot=on',
                 '-drive', f'file={data},format=raw,snapshot=on'],

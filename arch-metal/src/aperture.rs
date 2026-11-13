@@ -3,8 +3,9 @@
 //! The aperture is a fixed virtual window below the framebuffer.  It is
 //! remapped to one 64 KiB physical chunk at a time and is intentionally
 //! exposed only through copy operations, so callers cannot retain a pointer
-//! after the mapping changes. Mapping-cache and exclusion state are CPU-local,
-//! like the active page tables containing the aperture.
+//! after the mapping changes. The lower kernel page tables are shared, so
+//! exclusion and the cached physical base are global. Each CPU flushes its
+//! own translations after another CPU changes the mapping.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -24,14 +25,13 @@ const _: () = {
     assert!(APERTURE_PAGES == 16);
 };
 
-#[thread_local]
 static BUSY: AtomicBool = AtomicBool::new(false);
-#[thread_local]
 static MAPPED_VALID: AtomicBool = AtomicBool::new(false);
-#[thread_local]
 static MAPPED_LOW: AtomicU32 = AtomicU32::new(0);
-#[thread_local]
 static MAPPED_HIGH: AtomicU32 = AtomicU32::new(0);
+static GENERATION: AtomicU32 = AtomicU32::new(0);
+#[thread_local]
+static LOCAL_GENERATION: AtomicU32 = AtomicU32::new(0);
 
 struct ApertureGuard;
 
@@ -124,6 +124,16 @@ fn copy_physical(physical: u64, buffer: *mut u8, len: usize, write: bool) -> boo
                 return false;
             }
             set_cached_base(base);
+            let generation = GENERATION.fetch_add(1, Ordering::Release).wrapping_add(1);
+            LOCAL_GENERATION.store(generation, Ordering::Relaxed);
+        } else {
+            let generation = GENERATION.load(Ordering::Acquire);
+            if LOCAL_GENERATION.load(Ordering::Relaxed) != generation {
+                // This copy API runs at ring 1. Reinstalling the same mapping
+                // crosses through ring 0 and flushes this CPU's stale TLB.
+                if !request_remap(base) { return false; }
+                LOCAL_GENERATION.store(generation, Ordering::Relaxed);
+            }
         }
         unsafe {
             let aperture = (APERTURE_BASE + offset) as *mut u8;

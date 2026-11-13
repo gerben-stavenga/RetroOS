@@ -58,7 +58,7 @@ impl Filesystem for DeviceFs {
             -9
         }
     }
-    fn seek(&self, handle: u64, _offset: i32, whence: i32) -> Option<i32> {
+    fn seek(&self, handle: u64, _offset: i64, whence: i32) -> Option<i64> {
         if handle >= CONTROL { return Some(-29); }
         Some(if !matches!(handle, NULL | RANDOM | URANDOM) {
             -9

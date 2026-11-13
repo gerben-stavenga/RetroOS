@@ -95,6 +95,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
         if new_tid == self.tid {
             return;
         }
+        crate::kernel::parallel::take_process(machine, threads, new_tid);
         let (old, new) = thread::get_two_threads(threads, self.tid, new_tid);
         old.personality.on_suspend(machine);
         verify_kernel_cpu_hash(&new.kernel, "switch-in");

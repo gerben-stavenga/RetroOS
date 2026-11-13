@@ -50,7 +50,7 @@ rust_library(
     rustc_flags = [
         "-Crelocation-model=static",
     ] + panic_strategy(),
-    deps = ["//klog", ":compact_fmt"],
+    deps = ["//klog", ":compact_fmt", "@crates//:spin"],
 )
 
 rust_test(
@@ -130,6 +130,7 @@ rust_test(
 
 rust_test(
     name = "term_test",
+    args = ["--test-threads=1"],
     tags = ["manual"],
     srcs = ["tests/term.rs"],
     crate_name = "term_test",

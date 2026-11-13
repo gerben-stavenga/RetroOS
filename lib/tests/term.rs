@@ -126,3 +126,32 @@ fn terminal_output_does_not_enter_the_debug_log_stream() {
     assert_eq!(DEBUG.load(Ordering::Relaxed), 2);
     assert_eq!(CONSOLE.load(Ordering::Relaxed), redraw.len());
 }
+
+#[test]
+fn shared_terminal_serializes_complete_writes_and_releases_its_guard() {
+    {
+        let mut terminal = lib::term::term();
+        terminal.set_aperture(None);
+        terminal.clear();
+        assert!(lib::term::try_term().is_none());
+    }
+    std::thread::scope(|scope| {
+        for writer in 0..8u8 {
+            scope.spawn(move || {
+                for _ in 0..2 {
+                    let mut terminal = lib::term::term();
+                    for _ in 0..80 { terminal.put_utf8(b'A' + writer); }
+                }
+            });
+        }
+    });
+    let terminal = lib::term::try_term().expect("all writer guards released");
+    let mut counts = [0; 8];
+    for row in terminal.unicode_cells()[..16*80].chunks(80) {
+        let character = row[0].character;
+        assert!(('A'..='H').contains(&character));
+        assert!(row.iter().all(|cell| cell.character == character));
+        counts[character as usize - 'A' as usize] += 1;
+    }
+    assert_eq!(counts, [2; 8]);
+}

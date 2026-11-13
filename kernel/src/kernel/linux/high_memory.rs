@@ -62,6 +62,26 @@ pub fn copy_from<A: crate::Arch>(machine: &mut A, address: u64, bytes: &mut [u8]
     else { crate::kernel::memory::high_copy(machine, address, bytes, false) }
 }
 
+/// Read a guest string without truncating high thread-stack pointers. Stop at
+/// page boundaries so a terminating NUL never requires the following page.
+pub(super) fn copy_cstr<A: crate::Arch>(machine: &mut A, address: u64, bytes: &mut [u8]) -> Result<usize, i32> {
+    if address < START {
+        if !range(address, 1) { return Err(-EFAULT); }
+        let count = bytes.len().min((0xc0000000 - address) as usize);
+        let length = machine.copy_cstr(address as usize, &mut bytes[..count]);
+        return if length == count && count < bytes.len() { Err(-EFAULT) } else { Ok(length) };
+    }
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let pointer = address.checked_add(offset as u64).ok_or(-EFAULT)?;
+        let count = (4096 - (pointer & 4095) as usize).min(bytes.len() - offset);
+        if !copy_from(machine, pointer, &mut bytes[offset..offset + count]) { return Err(-EFAULT); }
+        if let Some(end) = bytes[offset..offset + count].iter().position(|&byte| byte == 0) { return Ok(offset + end); }
+        offset += count;
+    }
+    Ok(offset)
+}
+
 pub fn mmap<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     if a.a0 < START && a.a1 <= 0xc0000000 && a.a0 <= u32::MAX as u64 {
         let low = sys_mmap2(machine, kt, linux, a, a.a5 as usize);

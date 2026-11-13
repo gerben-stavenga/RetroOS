@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Boot a private Python root with no diagnostic UART and test local MCP."""
+import argparse
 import re
 import os
 import shutil
@@ -10,6 +11,9 @@ from boot_fixture import ROOT, prepare_boot
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cpus", type=int, default=1)
+    args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='retroos-local-control-') as directory:
         work = Path(directory)
         tree = work / 'root'
@@ -47,7 +51,7 @@ def main():
         log = ROOT / 'build/ci/linux-local-control.log'
         log.parent.mkdir(parents=True, exist_ok=True)
         with log.open('w') as output:
-            result = subprocess.run(['qemu-system-x86_64', '-accel', 'kvm', '-cpu', 'host',
+            result = subprocess.run(['qemu-system-x86_64', '-accel', 'kvm', '-cpu', 'host', '-smp', str(args.cpus),
                 '-m', '1024', '-display', 'none', '-serial', 'none', '-no-reboot', '-nic', 'none',
                 '-debugcon', 'stdio', '-drive', f'file={boot},format=raw,snapshot=on',
                 '-drive', f'file={data},format=raw'],

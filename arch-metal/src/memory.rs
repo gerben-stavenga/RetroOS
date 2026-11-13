@@ -120,3 +120,7 @@ pub(crate) fn handle_returns(request: &mut Returns) {
         }
     }
 }
+
+pub(crate) fn input_available() -> bool {
+    unsafe { !INPUT.is_null() && (*INPUT).count != 0 }
+}

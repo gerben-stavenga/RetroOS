@@ -75,6 +75,7 @@ pub enum Error {
     InvalidArgument,
     AlreadyExists,
     NotEmpty,
+    TooManyLinks,
 }
 
 impl Error {
@@ -93,7 +94,8 @@ impl PartialEq for Error {
             | (Self::NotDirectory, Self::NotDirectory)
             | (Self::InvalidArgument, Self::InvalidArgument)
             | (Self::AlreadyExists, Self::AlreadyExists)
-            | (Self::NotEmpty, Self::NotEmpty) => true,
+            | (Self::NotEmpty, Self::NotEmpty)
+            | (Self::TooManyLinks, Self::TooManyLinks) => true,
             _ => false,
         }
     }
@@ -113,6 +115,7 @@ impl fmt::Debug for Error {
             Self::InvalidArgument => f.write_str("InvalidArgument"),
             Self::AlreadyExists => f.write_str("AlreadyExists"),
             Self::NotEmpty => f.write_str("NotEmpty"),
+            Self::TooManyLinks => f.write_str("TooManyLinks"),
         }
     }
 }
@@ -129,6 +132,7 @@ impl fmt::Display for Error {
             Self::InvalidArgument => f.write_str("invalid argument"),
             Self::AlreadyExists => f.write_str("edge already exists"),
             Self::NotEmpty => f.write_str("node not empty"),
+            Self::TooManyLinks => f.write_str("too many references"),
         }
     }
 }

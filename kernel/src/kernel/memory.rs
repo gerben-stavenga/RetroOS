@@ -125,3 +125,11 @@ fn allocate_frame() -> Option<u64> {
     }
     phys_mm::alloc_phys_page()
 }
+
+pub fn private_tables<A: Arch>(machine: &mut A) {
+    loop {
+        let result = with_pages(machine, SUPPLY_CAPACITY, |machine| machine.private_page_tables());
+        if result == 0 { break; }
+        assert_eq!(result, -11, "cannot detach process page tables");
+    }
+}

@@ -19,7 +19,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 JVM_DEFAULTS = ['-Xmx512m', '-XX:CompressedClassSpaceSize=64m',
-                '-XX:ReservedCodeCacheSize=64m']
+                '-XX:ReservedCodeCacheSize=64m', '-Djava.io.tmpdir=/home/retroos/build-tmp']
 
 
 def compiler_libraries(work, external):
@@ -78,6 +78,8 @@ def main():
     parser.add_argument('--install-base', type=Path, help='Use an already extracted Bazel runtime')
     parser.add_argument('--jvm-arg', action='append', default=[], help='Pass a host JVM argument to Bazel')
     parser.add_argument('--bazel-command', choices=('build', 'version', 'info'), default='build')
+    parser.add_argument('--trace-processes', action='store_true', help='Trace guest process creation, exec, waits and signals')
+    parser.add_argument('--clean', action='store_true', help='Clean private guest Bazel outputs before building')
     parser.add_argument('--bazel-arg', action='append', default=[], help='Pass a Bazel command argument')
     parser.add_argument('--workspace', type=Path, default=ROOT, help='Guest-visible workspace on the shared host root')
     parser.add_argument('--env', action='append', default=[], metavar='NAME=VALUE', help='Set a guest environment variable')
@@ -85,9 +87,12 @@ def main():
                         help='Read already-extracted repositories from a host Bazel external directory')
     parser.add_argument('--work-dir', type=Path, default=ROOT / 'build/ci/self-build',
                         help='Private guest home and diagnostics directory')
+    parser.add_argument('--home-mib', type=int, default=4096, help='Native home filesystem size in MiB')
     parser.add_argument('--native-home', action='store_true', help='Keep guest outputs on a private native ext4 image')
     parser.add_argument('--reuse-native-home', action='store_true', help='Resume an existing private native home image')
     parser.add_argument('--native-compiler-libs', action='store_true', help='Read installed Rust compiler libraries from a private native ext4 image')
+    parser.add_argument('--cpus', type=int, default=5, help='QEMU logical processors (core 1 is reserved for media)')
+    parser.add_argument('--memory-mib', type=int, default=4096, help='QEMU guest RAM in MiB')
     parser.add_argument('--timeout', type=int, default=14400)
     parser.add_argument('--gdb-socket', type=Path, help='Expose QEMU GDB control on a private Unix socket')
     args = parser.parse_args()
@@ -97,7 +102,9 @@ def main():
         parser.error('--reuse-native-home requires --native-home')
     # Fit the current 3 GiB user address space.
     # Explicit environment/JVM arguments follow these defaults and override them.
-    exports = ['export MALLOC_ARENA_MAX=2\n']
+    # TEMP and /tmp are session RAM overlays with a 32 MiB capacity. Compiler
+    # source extraction needs the writable home filesystem instead.
+    exports = ['export MALLOC_ARENA_MAX=2\n', 'export TMPDIR=/home/retroos/build-tmp\n']
     for setting in args.env:
         name, separator, value = setting.partition('=')
         if not separator or not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', name):
@@ -120,7 +127,7 @@ def main():
         parser.error('this self-build fixture is already running')
     home = work / 'c'
     cache = 'cache-reused' if args.reuse_repositories else 'cache'
-    for child in ('RETROOS', 'TEMP', 'out', cache):
+    for child in ('RETROOS', 'TEMP', 'build-tmp', 'out', cache):
         (home / child).mkdir(parents=True, exist_ok=True)
     shutil.copyfile(ROOT / 'etc/RETROOS.INI', home / 'RETROOS/RETROOS.INI')
     startup_args = []
@@ -141,12 +148,22 @@ def main():
                *['--host_jvm_args=' + arg for arg in JVM_DEFAULTS + args.jvm_arg], args.bazel_command]
     if args.bazel_command == 'build':
         command += ['--spawn_strategy=standalone', '--genrule_strategy=standalone',
-                    '--jobs=1', '--loading_phase_threads=1', '--legacy_globbing_threads=1', '--symlink_prefix=/home/retroos/out/bazel-', *args.bazel_arg, args.target]
+                    '--action_env=TMPDIR=/home/retroos/build-tmp',
+                    f'--jobs={max(1, args.cpus - 1)}', '--loading_phase_threads=1', '--legacy_globbing_threads=1', '--symlink_prefix=/home/retroos/out/bazel-', *args.bazel_arg, args.target]
     else:
         command += args.bazel_arg
+    cleaning = ''
+    if args.clean:
+        if args.bazel_command != 'build': parser.error('--clean requires --bazel-command=build')
+        cleaning = shlex.join(command[:command.index('build')] + ['clean']) + ' > /home/retroos/clean.out 2> /home/retroos/clean.err || exit $?\n'
+    tracing = ''
+    if args.trace_processes:
+        code = f"from importlib.machinery import SourceFileLoader; b=SourceFileLoader('retroos_bridge', {str(ROOT / 'tools/86box_mcp.py')!r}).load_module(); c=b.LocalControl(); print(c.request('trace process')); c.close()"
+        tracing = shlex.join(['/usr/bin/python3', '-c', code]) + '\n'
     (home / 'run.sh').write_text(
         'cd ' + shlex.quote(str(args.workspace.resolve(strict=True))) + ' || exit 1\n' +
-        ''.join(exports) +
+        ''.join(exports) + tracing +
+        "printf '' > /home/retroos/build.out\nprintf '' > /home/retroos/build.err\nprintf '' > /home/retroos/compilers.log\n" + cleaning +
         shlex.join(command) + ' > /home/retroos/build.out 2> /home/retroos/build.err\n'
         'result=$?\nprintf "%s\\n" "$result" > /home/retroos/build.status\n'
         'exit "$result"\n')
@@ -162,6 +179,9 @@ def main():
                 checked = subprocess.run(['e2fsck', '-p', str(native_image)], stdout=output, stderr=subprocess.STDOUT)
             if checked.returncode not in (0, 1, 2):
                 parser.error('native image requires repair; see e2fsck.log')
+            subprocess.run(['debugfs', '-w', '-R', 'mkdir /home/retroos/build-tmp', str(native_image)], capture_output=True, check=True)
+            for field, value in [('uid', os.getuid()), ('gid', os.getgid())]:
+                subprocess.run(['debugfs', '-w', '-R', f'set_inode_field /home/retroos/build-tmp {field} {value}', str(native_image)], capture_output=True, check=True)
             for name in ('run.sh', 'repositories.bazelrc'):
                 if not (home / name).exists(): continue
                 subprocess.run(['debugfs', '-w', '-R', f'rm /home/retroos/{name}', str(native_image)], capture_output=True, check=True)
@@ -172,7 +192,7 @@ def main():
                 staging = Path(directory)
                 shutil.copytree(home, staging / 'home/retroos', symlinks=True)
                 with native_image.open('wb') as image:
-                    image.truncate(4 * 1024**3)
+                    image.truncate(args.home_mib * 1024**2)
                 subprocess.run(['mkfs.ext4', '-q', '-F', '-d', str(staging), str(native_image)], check=True)
         subprocess.run(['debugfs', '-w', '-R', 'rm /home/retroos/build.status', str(native_image)], capture_output=True)
         settings['native_home_image'] = str(native_image)
@@ -188,7 +208,11 @@ def main():
     env['RETROOS_QEMU_LIVE_PROFILE'] = str(profile)
     timed_out = False
     with (work / 'klog.txt').open('w') as log:
-        qemu_args = ['-m', '4096']
+        qmp = work / 'qmp.sock'
+        qmp.unlink(missing_ok=True)
+        qemu_args = ['-m', str(args.memory_mib), '-smp', str(args.cpus),
+                     '-name', 'retroos-self-build,debug-threads=on',
+                     '-qmp', f'unix:{qmp},server=on,wait=off']
         if args.gdb_socket:
             qemu_args += ['-gdb', f'unix:{args.gdb_socket.resolve()},server=on,wait=off']
         if args.native_home:
@@ -210,7 +234,7 @@ def main():
                 process.terminate()
                 process.wait(timeout=15)
     if args.native_home:
-        for name in ('build.out', 'build.err', 'build.status', 'build-profile.json', 'build-events.json'):
+        for name in ('build.out', 'build.err', 'build.status', 'clean.out', 'clean.err', 'compilers.log', 'build-profile.json', 'build-events.json'):
             subprocess.run(['debugfs', '-R', f'dump /home/retroos/{name} {home/name}',
                             str(native_image)], capture_output=True)
     status = home / 'build.status'

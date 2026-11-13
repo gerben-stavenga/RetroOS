@@ -84,3 +84,5 @@ pub mod mount_editor;
 pub use physical_memory as phys_mm;
 
 pub mod memory;
+
+pub mod parallel;

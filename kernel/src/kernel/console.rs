@@ -269,7 +269,7 @@ impl Console {
 
 impl compact_fmt::Write for Console {
     fn write_str(&mut self, text: &str) -> compact_fmt::Result {
-        compact_fmt::Write::write_str(lib::term::term(), text)?;
+        compact_fmt::Write::write_str(&mut *lib::term::term(), text)?;
         crate::kernel::term::mark_dirty();
         Ok(())
     }

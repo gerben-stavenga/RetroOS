@@ -212,11 +212,20 @@ mod tests;
 /// Supply is resident and belongs to the calling CPU. No mutable supply borrow
 /// survives allocation, so nested first-touch faults can use the existing reserve.
 pub unsafe fn replenish_supply(supply: *mut arch_abi::page_supply::PageSupply) {
+    unsafe { replenish(supply, true); }
+}
+/// # Safety
+/// Same as replenish_supply, but the caller may hold the heap lock.
+pub unsafe fn replenish_supply_without_reclaim(supply: *mut arch_abi::page_supply::PageSupply) {
+    unsafe { replenish(supply, false); }
+}
+unsafe fn replenish(supply: *mut arch_abi::page_supply::PageSupply, reclaim: bool) {
     if unsafe { (*supply).count } < arch_abi::page_supply::SUPPLY_CAPACITY {
         unsafe { (*supply).refills += 1; }
     }
     while unsafe { (*supply).count } < arch_abi::page_supply::SUPPLY_CAPACITY {
-        let Some(page) = alloc_phys_page() else {
+        let page = if reclaim { alloc_phys_page() } else { with_pool(|pool| pool.allocate()) };
+        let Some(page) = page else {
             assert!(unsafe { (*supply).count } >= arch_abi::page_supply::FAULT_PAGES,
                 "physical memory exhausted refilling fault reserve");
             break;

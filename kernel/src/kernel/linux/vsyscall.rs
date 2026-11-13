@@ -13,14 +13,14 @@ fn output_ok(pointer: u64, bytes: u64) -> bool {
             .is_some_and(|end| end <= USER_END)
 }
 
-/// RetroOS currently runs guests on one logical CPU and one NUMA node.
-/// Return the guest's placement, independently of host CPU numbering.
-pub(super) fn getcpu<A: crate::Arch>(machine: &mut A, args: &Args) -> SyscallResult {
+/// Return the guest process's execution CPU and the single NUMA node.
+/// Kernel services may be handled by the BSP on behalf of that CPU.
+pub(super) fn getcpu<A: crate::Arch>(machine: &mut A, args: &Args, cpu: usize) -> SyscallResult {
     if !output_ok(args.a0, 4) || !output_ok(args.a1, 4) {
         return SyscallResult::val(-EFAULT);
     }
     if args.a0 != 0 {
-        machine.write::<u32>(args.a0 as usize, 0);
+        machine.write::<u32>(args.a0 as usize, if cpu == usize::MAX { 0 } else { cpu as u32 });
     }
     if args.a1 != 0 {
         machine.write::<u32>(args.a1 as usize, 0);
@@ -44,7 +44,7 @@ fn entry(regs: &Regs, address: u64) -> Option<u32> {
     }
 }
 
-pub(super) fn emulate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, address: u64) -> bool {
+pub(super) fn emulate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, address: u64, cpu: usize) -> bool {
     let Some(number) = entry(regs, address) else {
         return false;
     };
@@ -75,7 +75,7 @@ pub(super) fn emulate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, address:
     let result = match number {
         0 => time::gettimeofday(machine, &args, true),
         1 => time::time(machine, &args, true),
-        _ => getcpu(machine, &args),
+        _ => getcpu(machine, &args, cpu),
     };
     regs.rax = result.retval as u64;
     // The fault happened at the callee entry, after CALL pushed its return IP.

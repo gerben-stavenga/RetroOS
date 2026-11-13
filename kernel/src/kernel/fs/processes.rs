@@ -6,6 +6,9 @@ use crate::kernel::{
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use core::fmt::Write;
 use spin::Mutex;
+#[thread_local]
+static CURRENT_PROCESS: core::cell::Cell<i32> = const { core::cell::Cell::new(0) };
+pub(crate) fn enter_process(pid: i32) { CURRENT_PROCESS.set(pid); }
 
 #[derive(Clone, Copy)]
 struct Info {
@@ -73,7 +76,8 @@ fn stat_text(info: Info) -> Vec<u8> {
     for field in 4..=52 {
         let value: i128 = match field {
             4 => i128::from(parent_pid(info.pid, info.parent)),
-            5 | 6 => i128::from(info.pid),
+            5 => i128::from(crate::kernel::linux::process_group::group(info.pid).max(0)),
+            6 => i128::from(crate::kernel::linux::process_group::session(info.pid).max(0)),
             8 => -1,
             20 => 1,
             22 => i128::from(info.start),
@@ -87,6 +91,7 @@ fn stat_text(info: Info) -> Vec<u8> {
 }
 impl ProcessFs {
     pub fn publish<A: crate::Arch>(&self, threads: &[thread::Thread<A>], current: usize, ticks: u64) {
+        enter_process(current as i32);
         let mut snapshot = self.tasks.lock();
         // Keep the wall-clock boot epoch stable as the RTC advances. Linux
         // procps combines this with each task's USER_HZ start time for lstart.
@@ -116,7 +121,8 @@ impl ProcessFs {
     fn info(&self, name: &[u8]) -> Option<Info> {
         let snapshot = self.tasks.lock();
         let pid = if matches!(name, b"self" | b"thread-self") {
-            snapshot.current
+            let local = CURRENT_PROCESS.get();
+            if local == 0 { snapshot.current } else { local }
         } else {
             numeric(name)?
         };

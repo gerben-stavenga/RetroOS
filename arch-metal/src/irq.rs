@@ -1306,7 +1306,7 @@ const IA32_TSC_DEADLINE: u32 = 0x6e0;
 
 pub fn wake_pending() -> bool {
     let queue = &raw const QUEUE;
-    unsafe { ALARM_MODE && !FIRMWARE_LOAN && (!(*queue).is_empty()
+    unsafe { ALARM_MODE && !FIRMWARE_LOAN && (ALARM_FIRED || !(*queue).is_empty()
         || ALARM_DEADLINE.is_some_and(|end| now(false) >= end)) }
 }
 
@@ -1389,5 +1389,34 @@ fn clock_maintenance_interval() -> Option<u64> {
             Some((u128::from(clock.hpet_mask) * 1_000_000_000
                 / u128::from(clock.hpet_hz.max(1)) / 2).clamp(1, u128::from(u64::MAX)) as u64),
         _ => None,
+    }
+}
+
+/// Immutable BSP calibration for initializing another CPU's local alarm.
+#[derive(Clone, Copy)]
+pub struct WorkerTimer { hz: u64, deadline: bool }
+pub fn worker_timer() -> Option<WorkerTimer> {
+    if !lapic_timer_active() || !matches!(unsafe { CLOCK.source }, ClockSource::Tsc) { return None; }
+    Some(WorkerTimer { hz: unsafe { LAPIC_HZ }, deadline: unsafe { TSC_DEADLINE } })
+}
+/// AP ring-0 bring-up; external device interrupts continue to target the BSP.
+pub fn init_worker_timer(timer: WorkerTimer) {
+    let base = crate::x86::rdmsr(IA32_APIC_BASE);
+    unsafe { LAPIC_X2 = base & APIC_BASE_X2 != 0; LAPIC_HZ = timer.hz; TSC_DEADLINE = timer.deadline; }
+    lapic_write(LAPIC_SVR, LAPIC_SW_ENABLE | LAPIC_SPURIOUS_VECTOR);
+    lapic_write(LAPIC_LVT_LINT0, LVT_MASKED);
+    lapic_write(0x360, LVT_MASKED); // LINT1: no firmware NMI routing on workers.
+    lapic_write(LAPIC_DIV_CONF, LAPIC_DIV_1);
+    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LVT_MASKED);
+    lapic_write(LAPIC_INIT_COUNT, 0);
+    unsafe { LAPIC_TIMER_ACTIVE = true; }
+}
+pub(crate) fn interrupt_processor(processor: u32) {
+    if unsafe { LAPIC_X2 } {
+        unsafe { crate::x86::wrmsr(0x830, (u64::from(processor) << 32) | u64::from(LAPIC_TIMER_VECTOR)); }
+    } else {
+        while lapic_read(0x300) & (1 << 12) != 0 { core::hint::spin_loop(); }
+        lapic_write(0x310, processor << 24);
+        lapic_write(0x300, LAPIC_TIMER_VECTOR);
     }
 }

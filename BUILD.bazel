@@ -339,7 +339,9 @@ _DISK_CMD = """
     truncate -s $$(( EXT4_SECTORS * 512 )) "$$EXT4_IMG"
     mkfs.ext4 -q -b 4096 -L "RetroOS" -d "$$EXTRACT_DIR" "$$EXT4_IMG"
     rm -rf "$$EXTRACT_DIR"
-    dd if="$$EXT4_IMG" of=$@ bs=512 seek=$$EXT4_START conv=notrunc 2>/dev/null
+    # The output was extended with zeros above. Preserve holes and copy in
+    # large blocks rather than issuing millions of sector-sized syscalls.
+    dd if="$$EXT4_IMG" of=$@ bs=1M iflag=fullblock seek=$$(( EXT4_START / 2048 )) conv=notrunc,sparse 2>/dev/null
     rm "$$EXT4_IMG"
 
     # Patch MBR partition table: entry 1 (boot TAR) needs a real size so

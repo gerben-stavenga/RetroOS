@@ -42,6 +42,16 @@ PYIMAGE
 )
 dd if="$IMAGE" of="$STAGE/disk.img" bs=1M iflag=skip_bytes,count_bytes \
     skip="$PART_START" count="$PART_BYTES" conv=sparse status=none
+if [ -c /dev/retroos-control ]; then
+    # RetroOS already provides the DOS execution environment. Use the exact
+    # compiler bytes from the build input in an isolated working directory.
+    # Linux hosts use the interpreter below because they cannot execute MZ.
+    debugfs -R "rdump /TC $STAGE" "$STAGE/disk.img" > "$STAGE/stage.log" 2>&1
+    (
+        cd "$STAGE"
+        PATH=TC ./TC/TCC.EXE $TCC_FLAGS '-ITC\INCLUDE' '-LTC\LIB' "$GUEST_SRC"
+    ) < /dev/null > "$STAGE/run.log" 2>&1 || true
+else
 VOLUME_ID="$(blkid -p -s UUID -o value "$STAGE/disk.img")"
 cat > "$STAGE/BOOT.INI" <<INI
 [bundle]
@@ -63,6 +73,7 @@ EOF
     "$STAGE/disk.img" < /dev/null > "$STAGE/run.log" 2>&1 || true
 debugfs -R "dump /$GUEST_OUT $STAGE/$GUEST_OUT" "$STAGE/disk.img" \
     >> "$STAGE/stage.log" 2>&1
+fi
 
 if [ ! -f "$STAGE/$GUEST_OUT" ]; then
     echo "interp_tcc: TCC did not produce $GUEST_OUT (stage kept: $STAGE)" >&2

@@ -214,6 +214,12 @@ impl compact_fmt::Write for DebugCon {
     }
 }
 
+impl core::fmt::Write for DebugCon {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        compact_fmt::Write::write_str(self, text).map_err(|_| core::fmt::Error)
+    }
+}
+
 /// Platform fatal tail. Controlled fatal diagnostics write their message
 /// directly to the terminal and log, then call this hook for machine-specific
 /// quiescing, stack tracing, final display publication, and halt.
@@ -239,7 +245,11 @@ pub fn finish_fatal() -> ! {
 #[macro_export]
 macro_rules! compact_panic {
     ($($arg:tt)*) => {{
-        let __screen = $crate::term::term();
+        let Some(mut __screen_guard) = $crate::term::try_term() else {
+            $crate::compact_println!($($arg)*);
+            $crate::log::finish_fatal()
+        };
+        let __screen = &mut *__screen_guard;
         __screen.clear();
         let _ = compact_fmt::writeln!(__screen, "\x1b[91m!!! FATAL !!!\x1b[0m");
         let __location = ::core::panic::Location::caller();
@@ -250,6 +260,7 @@ macro_rules! compact_panic {
             __location.line(),
         );
         let _ = compact_fmt::writeln!(__screen, $($arg)*);
+        drop(__screen_guard);
         $crate::log::finish_fatal()
     }};
 }

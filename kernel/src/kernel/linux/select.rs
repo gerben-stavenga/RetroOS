@@ -7,6 +7,7 @@ pub(super) struct Request {
     nfds: usize,
     wide: bool,
     deadline: u64,
+    pub(super) signal_mask: Option<u64>,
 }
 impl Request {
     pub(super) fn deadline(&self) -> Option<u64> { (self.deadline != u64::MAX).then_some(self.deadline) }
@@ -25,6 +26,7 @@ impl Request {
             nfds,
             wide,
             deadline: u64::MAX,
+            signal_mask: None,
         };
         let size = request.size();
         for (index, &pointer) in request.pointers.iter().enumerate() {
@@ -52,7 +54,24 @@ impl Request {
                 .saturating_add((sec as u64).saturating_mul(1_000_000_000))
                 .saturating_add(nsec as u64);
         }
-        // Signal masks follow this personality's existing no-delivery model.
+        if args.a5 != 0 {
+            let mut descriptor = [0u8; 16];
+            let word = if wide { 8 } else { 4 };
+            if !super::high_memory::copy_from(machine, args.a5, &mut descriptor[..word * 2]) {
+                return Err(-super::EFAULT);
+            }
+            let (pointer, length) = if wide {
+                (u64::from_le_bytes(descriptor[..8].try_into().unwrap()), u64::from_le_bytes(descriptor[8..].try_into().unwrap()))
+            } else {
+                (u32::from_le_bytes(descriptor[..4].try_into().unwrap()) as u64, u32::from_le_bytes(descriptor[4..8].try_into().unwrap()) as u64)
+            };
+            if pointer != 0 {
+                if length != 8 { return Err(-EINVAL); }
+                let mut mask = [0u8; 8];
+                if !super::high_memory::copy_from(machine, pointer, &mut mask) { return Err(-super::EFAULT); }
+                request.signal_mask = Some(u64::from_le_bytes(mask));
+            }
+        }
         Ok(request)
     }
     fn size(&self) -> usize {

@@ -223,13 +223,15 @@ fn shutdown<A: crate::Arch>(
         }
     }
 
-    let screen = lib::term::term();
+    let mut screen_guard = lib::term::term();
+    let screen = &mut *screen_guard;
     screen.clear();
     if sync_ok {
         crate::compact_screenln!(screen, "Storage synced. It is now safe to turn off your computer.");
     } else {
         crate::compact_screenln!(screen, "Storage sync failed. Check the disk before using it again.");
     }
+    drop(screen_guard);
     if let thread::Personality::Dos(dos) = &mut threads[tid].personality
         && let DosVideo::Fullscreen(FullscreenVga::Emulated(_, surface)) = &mut dos.pc.vga
     {
@@ -261,7 +263,7 @@ pub(crate) fn focus_request<A: crate::Arch>(threads: &[thread::Thread<A>], tid: 
             && !vfork_suspended(threads, target)
             && matches!(
                 threads[target].kernel.state,
-                thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked
+                thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked | thread::ThreadState::OnCpu
             )
         {
             return Some(target);

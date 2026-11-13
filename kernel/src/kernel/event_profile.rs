@@ -42,6 +42,15 @@ pub(super) const DIRECTORY_FIELDS: [&str; 10] = ["hits", "misses", "builds", "en
     "namespace_invalidations", "metadata_invalidations", "write_invalidations", "dynamic_invalidations", "global_invalidations"];
 static mut DIRECTORIES: alloc::collections::BTreeMap<alloc::vec::Vec<u8>, [u64; 10]> = alloc::collections::BTreeMap::new();
 pub(super) fn directory_event(path: &[u8], field: usize, count: u64) {
+    if super::parallel::on_worker() {
+        if super::startup::detail_profile_enabled() {
+            let mut profile = worker_profile().lock();
+            if !super::startup::detail_profile_enabled() { return; }
+            let row = profile.directories.entry(path.to_vec()).or_default();
+            row[field] = row[field].wrapping_add(count);
+        }
+        return;
+    }
     if !super::startup::profile_enabled() { return; }
     let counters = unsafe { &mut *core::ptr::addr_of_mut!(DIRECTORIES) };
     if let Some(row) = counters.get_mut(path) { row[field] = row[field].wrapping_add(count); }
@@ -64,6 +73,35 @@ pub(super) fn directories_top(limit: usize) -> alloc::vec::Vec<(&'static [u8], [
 }
 pub(super) fn overflow() -> u64 { unsafe { OVERFLOW } }
 
+/// Worker measurements are CPU time and may overlap. They never contribute
+/// to the disjoint BSP wall-time ledger or its nested I/O tables.
+#[derive(Clone)]
+pub(super) struct WorkerProfile {
+    pub reset_ns: u64,
+    pub syscalls: alloc::collections::BTreeMap<(u32, u32), [u64; 3]>,
+    pub io: [[u64; 3]; FILE_IO_NAMES.len()],
+    pub io_max: [u64; FILE_IO_NAMES.len()],
+    pub directories: alloc::collections::BTreeMap<alloc::vec::Vec<u8>, [u64; 10]>,
+}
+impl WorkerProfile {
+    const fn new() -> Self { Self { reset_ns: 0,
+        syscalls: alloc::collections::BTreeMap::new(),
+        io: [[0; 3]; FILE_IO_NAMES.len()], io_max: [0; FILE_IO_NAMES.len()],
+        directories: alloc::collections::BTreeMap::new() } }
+}
+static WORKER_PROFILES: [spin::Mutex<WorkerProfile>; 64] =
+    [const { spin::Mutex::new(WorkerProfile::new()) }; 64];
+fn worker_profile() -> &'static spin::Mutex<WorkerProfile> {
+    &WORKER_PROFILES[super::parallel::profile_cpu()]
+}
+pub(super) fn worker_profiles() -> alloc::vec::Vec<(usize, WorkerProfile)> {
+    WORKER_PROFILES.iter().enumerate().skip(1).filter_map(|(cpu, profile)| {
+        let profile = profile.lock();
+        (!profile.syscalls.is_empty() || profile.io.iter().any(|row| row[0] != 0))
+            .then(|| (cpu, profile.clone()))
+    }).collect()
+}
+
 pub(super) struct FileIoScope { stage: usize, bytes: usize, start: Option<u64> }
 impl FileIoScope {
     pub(super) fn start(stage: usize, bytes: usize) -> Self {
@@ -75,11 +113,21 @@ impl Drop for FileIoScope {
 }
 
 pub(crate) fn file_io_start() -> Option<u64> {
-    super::startup::profile_enabled().then(super::portio::now_ns)
+    super::startup::detail_profile_enabled().then(super::portio::now_ns)
 }
 pub(crate) fn file_io_finish(stage: usize, bytes: usize, start: Option<u64>) {
     if let Some(start) = start {
         let elapsed = super::portio::now_ns().saturating_sub(start);
+        if super::parallel::on_worker() {
+            let mut profile = worker_profile().lock();
+            if start < profile.reset_ns || !super::startup::detail_profile_enabled() { return; }
+            let row = &mut profile.io[stage];
+            row[0] = row[0].wrapping_add(1);
+            row[1] = row[1].wrapping_add(bytes as u64);
+            row[2] = row[2].wrapping_add(elapsed);
+            profile.io_max[stage] = profile.io_max[stage].max(elapsed);
+            return;
+        }
         let counters = unsafe { &mut (*core::ptr::addr_of_mut!(FILE_IO))[stage] };
         counters[0] = counters[0].wrapping_add(1);
         counters[1] = counters[1].wrapping_add(bytes as u64);
@@ -188,9 +236,14 @@ pub(crate) struct SyscallScope { key: (u32, u32), start: Option<u64> }
 impl SyscallScope {
     pub(crate) fn start(number: u32, mode64: bool) -> Self {
         let key = (if mode64 { 64 } else { 32 }, number);
-        let start = if super::startup::profile_enabled() {
+        let start = if super::startup::detail_profile_enabled() {
             // Allocate/lookup outside the measured handler interval.
-            unsafe { (&mut *core::ptr::addr_of_mut!(SYSCALLS)).entry(key).or_default(); }
+            if super::parallel::on_worker() {
+                let mut profile = worker_profile().lock();
+                if !super::startup::detail_profile_enabled() { return Self { key, start: None }; }
+                profile.syscalls.entry(key).or_default();
+            }
+            else { unsafe { (&mut *core::ptr::addr_of_mut!(SYSCALLS)).entry(key).or_default(); } }
             Some(super::portio::now_ns())
         } else { None };
         Self { key, start }
@@ -200,6 +253,15 @@ impl Drop for SyscallScope {
     fn drop(&mut self) {
         let Some(start) = self.start else { return; };
         let elapsed = super::portio::now_ns().saturating_sub(start);
+        if super::parallel::on_worker() {
+            let mut profile = worker_profile().lock();
+            if start < profile.reset_ns || !super::startup::detail_profile_enabled() { return; }
+            let row = profile.syscalls.entry(self.key).or_default();
+            row[0] = row[0].wrapping_add(1);
+            row[1] = row[1].wrapping_add(elapsed);
+            row[2] = row[2].max(elapsed);
+            return;
+        }
         unsafe {
             let counters = (&mut *core::ptr::addr_of_mut!(SYSCALLS)).get_mut(&self.key)
                 .expect("profiled syscall has a counter");
@@ -298,6 +360,11 @@ impl Dispatch {
 }
 
 pub(super) fn reset() {
+    let reset_ns = super::portio::now_ns();
+    for profile in &WORKER_PROFILES {
+        let mut profile = profile.lock();
+        *profile = WorkerProfile { reset_ns, ..WorkerProfile::new() };
+    }
     unsafe {
         (&mut *core::ptr::addr_of_mut!(COUNTERS)).fill(EMPTY);
         OVERFLOW = 0;

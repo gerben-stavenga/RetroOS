@@ -415,9 +415,27 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8], stats: &mut super::star
         rm_profile();
     } else if line.eq_ignore_ascii_case(b"profile execution") {
         execution_profile(machine);
+    } else if line.eq_ignore_ascii_case(b"profile workers") {
+        report::workers();
+    } else if line.eq_ignore_ascii_case(b"parallel status") {
+        send(b"{\"ok\":true,\"scope\":\"worker_syscalls_since_boot\",\"bsp_included\":false,\"cpu_mask\":");
+        send_u64(super::parallel::cpu_mask::<A>());
+        send(b",\"global_kernel_lock\":false,\"parallel_lifecycles\":"); send_u64(super::parallel::parallel_lifecycles() as u64);
+        send(b",\"bsp_events_with_workers\":"); send_u64(super::parallel::bsp_events_with_workers() as u64);
+        send(b",\"peak_concurrent_handlers\":"); send_u64(super::parallel::peak_handlers() as u64);
+        send(b",\"cpus\":[");
+        for (index, (cpu, row)) in super::parallel::worker_stats::<A>().into_iter().enumerate() {
+            if index != 0 { send(b","); }
+            send(b"{\"cpu\":"); send_u64(cpu as u64);
+            send(b",\"syscalls\":"); send_u64(row.syscalls);
+            send(b",\"handler_ns\":"); send_u64(row.handler_ns);
+            send(b",\"lock_wait_ns\":"); send_u64(row.lock_wait_ns);
+            send(b"}");
+        }
+        send(b"]}\n");
     } else if line.eq_ignore_ascii_case(b"profile totals") {
         let totals = super::startup::profile_totals();
-        send(b"{\"ok\":true,\"elapsed_ns\":"); send_u64(totals.elapsed_ns);
+        send(b"{\"ok\":true,\"scope\":\"bsp_wall_time\",\"worker_cpu_time_included\":false,\"elapsed_ns\":"); send_u64(totals.elapsed_ns);
         send(b",\"cycles\":{");
         for (index, (name, cycles)) in super::startup::PROFILE_TOTAL_NAMES.into_iter().zip(totals.cycles).enumerate() {
             if index != 0 { send(b","); }
@@ -441,7 +459,8 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8], stats: &mut super::star
     } else if line.eq_ignore_ascii_case(b"screen memory") {
         // A debugger can sample this stable kernel-owned projection without
         // making the guest transmit 4 KiB of hex through a polling UART.
-        let cells = lib::term::term().cells();
+        let terminal = lib::term::term();
+        let cells = terminal.cells();
         send(b"{\"ok\":true,\"address\":");
         send_u64(cells.as_ptr() as usize as u64);
         send(b",\"bytes\":4000,\"width\":80,\"height\":25}\n");

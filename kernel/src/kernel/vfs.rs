@@ -20,6 +20,7 @@
 //! `fs.open` is safe.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 use crate::kernel::thread::{FdKind, MAX_FDS};
@@ -189,7 +190,7 @@ pub trait Filesystem {
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32;
 
     /// Override file-position behavior for a device; None uses regular-file seek.
-    fn seek(&self, _handle: u64, _offset: i32, _whence: i32) -> Option<i32> { None }
+    fn seek(&self, _handle: u64, _offset: i64, _whence: i32) -> Option<i64> { None }
 
     /// Append up to `max` directory entries to `out`, resuming at `cookie`
     /// (`READDIR_START` begins a fresh enumeration). Returns the cookie to
@@ -243,6 +244,9 @@ pub trait Filesystem {
     fn rename(&self, _path: &[u8], _new_path: &[u8]) -> i32 { -38 }
     /// Create a link without interpreting or requiring its target to exist.
     fn symlink(&self, _target: &[u8], _path: &[u8]) -> i32 { -95 }
+    fn hard_link(&self, _source: &[u8], _path: &[u8]) -> i32 { -95 }
+    fn link_count(&self, _path: &[u8]) -> u32 { 1 }
+    fn link_count_node(&self, _node: u64) -> Option<u32> { None }
     fn supports_directory_mutation(&self) -> bool { false }
     fn flush(&self, _path: &[u8]) -> i32 { 0 }
     /// Persist filesystem-wide buffered data and issue a device barrier.
@@ -391,9 +395,31 @@ fn path_ino(path: &[u8]) -> u64 {
     h | 1
 }
 
+fn node_ino(mount: u8, node: u64) -> u64 {
+    let mut key = [0; 9];
+    key[0] = mount;
+    key[1..].copy_from_slice(&node.to_le_bytes());
+    path_ino(&key)
+}
+
+pub(crate) fn directory_entry_ino(directory: &[u8], entry: &DirEntry) -> u64 {
+    if entry.mode & 0o170000 == 0o140000 { return entry.node; }
+    if entry.node != 0 { return node_ino(entry.mount_idx, entry.node); }
+    let name = &entry.name[..entry.name_len];
+    if name == b"." { return path_ino(directory); }
+    if name == b".." { return path_ino(split_parent_bytes(directory).map_or(b"", |(parent, _)| parent)); }
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in directory.iter().copied().chain((!directory.is_empty()).then_some(b'/')).chain(name.iter().copied()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash | 1
+}
+
 /// An open file in the global file table
 pub struct FileEntry {
     pub vnode: Vnode,
+    io: Arc<Mutex<()>>,
     pub offset: u32,
     /// O_APPEND belongs to the shared open file description.
     append: bool,
@@ -890,13 +916,23 @@ impl Vfs {
     ) -> i32 {
         let index = self.alloc_file_entry();
         let identity = self.mount_fs(mount_idx).file_identity(vnode.handle);
+        // A cache identity need not be the namespace's reported inode. SMB
+        // exposes a server file ID for caching but retains path-based stat.
+        // Native node metadata, when provided, establishes the common ID.
+        let inode = identity.filter(|node| self.mount_fs(mount_idx).stat_node(*node).is_some())
+            .map_or(ino, |node| node_ino(mount_idx, node));
+        let cache_id = identity.unwrap_or_else(|| self.backend_path_id(mount_idx, path));
+        let io = self.file_table.iter().find(|entry|
+            entry.refcount != 0 && entry.mount_idx == mount_idx && entry.cache_id == cache_id)
+            .map(|entry| entry.io.clone()).unwrap_or_else(|| Arc::new(Mutex::new(())));
         let entry = FileEntry {
             vnode,
+            io,
             offset: 0,
             append: false,
             refcount: 1,
-            ino,
-            cache_id: identity.unwrap_or_else(|| self.backend_path_id(mount_idx, path)),
+            ino: inode,
+            cache_id,
             cache_path_based: identity.is_none(),
             mount_idx,
             writable,
@@ -1485,10 +1521,13 @@ impl Vfs {
                 mode: override_mode.unwrap_or(u32::from(entry.mode)) as u16,
                 is_dir: entry.is_dir,
                 is_symlink: entry.is_symlink,
-                ino: if entry.mode & 0o170000 == 0o140000 { entry.node } else { path_ino(path) },
+                ino: if entry.mode & 0o170000 == 0o140000 { entry.node }
+                    else if entry.node != 0 { node_ino(entry.mount_idx, entry.node) } else { path_ino(path) },
             });
         }
-        let mut stat = self.resolve_object(path, ALIAS_DEPTH)?.stat;
+        let object = self.resolve_object(path, ALIAS_DEPTH)?;
+        let mut stat = object.stat;
+        if stat.ino != 0 && stat.mode & 0o170000 != 0o140000 { stat.ino = node_ino(object.mount_idx, stat.ino); }
         if let Some(mode) = override_mode { stat.mode = mode as u16; }
         if stat.ino == 0 { stat.ino = path_ino(path); }
         if let Some(&mtime) = self.mtimes.get(path) { stat.mtime = Some(mtime); }
@@ -1513,6 +1552,39 @@ impl Vfs {
             self.invalidate_path_cache(path, false);
         }
         result
+    }
+
+    fn hard_link(&mut self, source: &[u8], destination: &[u8], follow: bool) -> i32 {
+        let Some(source) = self.resolve_symlinks(source, follow) else { return -2 };
+        let Some(object) = self.resolve_object(&source, ALIAS_DEPTH) else { return -2 };
+        if object.stat.is_dir { return -1; }
+        let Some(destination) = self.resolve_parent_symlinks(destination) else { return -2 };
+        if self.resolve_object(&destination, ALIAS_DEPTH).is_some() { return -17; }
+        let (mount, fs, path) = self.resolve_create_layer(&destination);
+        if object.mount_idx != mount || !core::ptr::eq(object.fs, fs) { return -18; }
+        if matches!(self.mounts[object.mount_idx as usize].access, WriteAccess::None) { return -30; }
+        if matches!(self.mounts[mount as usize].access, WriteAccess::None) { return -30; }
+        if !self.may_write_parent(mount, &path) { return -13; }
+        if let WriteAccess::Granted(grant) = self.mounts[object.mount_idx as usize].access
+            && !object.fs.meta(object.subpath()).is_some_and(|meta| grant.uid() == 0 || grant.uid() == meta.uid) { return -1; }
+        let result = fs.hard_link(object.subpath(), &path);
+        if result >= 0 { self.invalidate_path_cache(&destination, false); }
+        result
+    }
+
+    fn link_count(&mut self, path: &[u8], follow: bool) -> u32 {
+        let Some(path) = self.resolve_symlinks(path, follow) else { return 1 };
+        if let Some((parent, name)) = split_parent_bytes(&path)
+            && let Some(entry) = self.cached_child(parent, name) {
+            return if entry.node == 0 { 1 } else { self.mount_fs(entry.mount_idx).link_count_node(entry.node).unwrap_or(1) };
+        }
+        self.resolve_object(&path, ALIAS_DEPTH).map_or(1, |object| object.fs.link_count(object.subpath()))
+    }
+
+    fn handle_link_count(&self, handle: i32) -> u32 {
+        let Some(entry) = self.file_table.get(handle as usize).filter(|entry| entry.refcount != 0) else { return 1 };
+        let fs = self.mount_fs(entry.mount_idx);
+        fs.file_identity(entry.vnode.handle).and_then(|node| fs.link_count_node(node)).unwrap_or(1)
     }
 
     fn mkdir(&mut self, path: &[u8]) -> i32 {
@@ -1551,7 +1623,10 @@ impl Vfs {
             None => return -2,
         };
         let path = resolved_path.as_slice();
-        let original_ino = path_ino(path);
+        let original_ino = split_parent_bytes(path)
+            .and_then(|(parent, name)| self.cached_child(parent, name))
+            .filter(|entry| entry.node != 0)
+            .map_or_else(|| path_ino(path), |entry| node_ino(entry.mount_idx, entry.node));
         // Try each member of the group in priority order; first hit wins and
         // its mount_idx is recorded (a Replace group = the single backing fs).
         // Every open gets its OWN fid from `fs.open` — fids are never cached or
@@ -1844,12 +1919,14 @@ impl Vfs {
         0
     }
 
-    fn touch_handle(&mut self, handle: i32) {
-        let Some(timestamp) = crate::kernel::clock::rtc_unix_timestamp() else { return };
-        let Some(entry) = self.file_table.get_mut(handle as usize) else { return };
-        if entry.unlinked { return; }
-        self.mtimes.insert(entry.path.clone(), timestamp);
+    fn touch_handle(&mut self, handle: i32) -> bool {
+        let Some(timestamp) = crate::kernel::clock::rtc_unix_timestamp() else { return false };
+        let Some(entry) = self.file_table.get_mut(handle as usize) else { return false };
+        if entry.unlinked { return false; }
         entry.mtime_dirty = true;
+        if self.mtimes.get(&entry.path) == Some(&timestamp) { return false; }
+        self.mtimes.insert(entry.path.clone(), timestamp);
+        true
     }
 
     fn handle_stat(&mut self, handle: i32) -> Option<(Stat, Option<(u32, u32)>)> {
@@ -1891,7 +1968,14 @@ impl Vfs {
     fn set_times(&mut self, path: &[u8], follow: bool, accessed: Option<u32>, modified: Option<u32>) -> i32 {
         let Some(path) = self.resolve_symlinks(path, follow) else { return -2 };
         let Some(object) = self.resolve_object(&path, ALIAS_DEPTH) else { return -2 };
-        if !self.may_write(object.mount_idx, object.subpath()) { return -30; }
+        // Owners may restore archive timestamps after chmod removed write
+        // permission. Timestamp changes do not write the file's contents.
+        match self.mounts[object.mount_idx as usize].access {
+            WriteAccess::None => return -30,
+            WriteAccess::Granted(grant) if !object.fs.meta(object.subpath())
+                .is_some_and(|m| grant.uid() == 0 || grant.uid() == m.uid) => return -1,
+            _ => {},
+        }
         let status = object.fs.set_times(object.subpath(), accessed, modified);
         if status < 0 { return status; }
         if let Some(value) = modified { self.mtimes.insert(path.clone(), value); }
@@ -1976,13 +2060,18 @@ impl Vfs {
             let end = offset.saturating_add(n as u32);
             if end > old_size { self.zero_mapping_growth(handle, old_size, end); }
             self.mapped_write(handle, offset, &data[..n as usize]);
-            for e in &mut self.file_table {
-                if e.refcount != 0 && e.mount_idx == mount_idx && e.cache_id == ino {
-                    e.vnode.size = e.vnode.size.max(end);
+            if end > old_size {
+                for e in &mut self.file_table {
+                    if e.refcount != 0 && e.mount_idx == mount_idx && e.cache_id == ino {
+                        e.vnode.size = e.vnode.size.max(end);
+                    }
                 }
             }
-            self.touch_handle(handle);
-            self.refresh_written_file(handle);
+            let time_changed = self.touch_handle(handle);
+            // Content pages are already coherent through mapped_write. A
+            // fixed-size overwrite with the same observable timestamp does
+            // not change directory metadata or any peer's cached file size.
+            if end > old_size || time_changed { self.refresh_written_file(handle); }
         }
         n
     }
@@ -2024,7 +2113,7 @@ impl Vfs {
         0
     }
 
-    fn seek_by_handle(&mut self, handle: i32, offset: i32, whence: i32) -> i32 {
+    fn seek64_by_handle(&mut self, handle: i32, offset: i64, whence: i32) -> i64 {
         if handle < 0 || (handle as usize) >= self.file_table.len() { return -9; }
         let h = handle as usize;
         if self.file_table[h].refcount == 0 { return -9; }
@@ -2038,15 +2127,17 @@ impl Vfs {
         let size = self.file_table[h].vnode.size;
 
         let cur = self.file_table[h].offset;
-        let new_offset = match whence {
-            0 => offset as i64,
-            1 => cur as i64 + offset as i64,
-            2 => size as i64 + offset as i64,
+        let base = match whence {
+            0 => 0,
+            1 => i64::from(cur),
+            2 => i64::from(size),
             _ => return -22,
         };
+        let Some(new_offset) = base.checked_add(offset) else { return -22; };
         if new_offset < 0 { return -22; }
-        self.file_table[h].offset = new_offset as u32;
-        self.file_table[h].offset as i32
+        let Ok(new_offset) = u32::try_from(new_offset) else { return -75; };
+        self.file_table[h].offset = new_offset;
+        i64::from(new_offset)
     }
 
     fn file_size_by_handle(&self, handle: i32) -> u32 {
@@ -2443,6 +2534,10 @@ pub fn rename(old: &[u8], new: &[u8]) -> i32 { VFS.lock().rename(old, new) }
 /// POSIX replacement, performed atomically by the backing filesystem.
 pub fn rename_replace(old: &[u8], new: &[u8]) -> i32 { VFS.lock().rename_inner(old, new, true) }
 pub fn symlink(target: &[u8], path: &[u8]) -> i32 { VFS.lock().symlink(target, path) }
+
+pub fn hard_link(source: &[u8], destination: &[u8], follow: bool) -> i32 { VFS.lock().hard_link(source, destination, follow) }
+pub fn link_count(path: &[u8], follow: bool) -> u32 { VFS.lock().link_count(path, follow) }
+pub fn handle_link_count(handle: i32) -> u32 { VFS.lock().handle_link_count(handle) }
 #[inline(never)]
 pub fn path_exists(path: &[u8]) -> bool { VFS.lock().path_exists(path) }
 #[inline(never)]
@@ -2793,7 +2888,54 @@ pub fn open_to_handle(path: &[u8]) -> i32 {
 }
 
 /// Read from a VFS file table entry by handle index.
+pub struct FileIo {
+    handle: i32,
+}
+
+impl FileIo {
+    pub fn read(&mut self, bytes: &mut [u8]) -> i32 {
+        read_once(self.handle, bytes)
+    }
+    pub fn write(&mut self, bytes: &[u8]) -> i32 {
+        VFS.lock().write_by_handle(self.handle, bytes)
+    }
+    fn seek(&mut self, offset: i64, whence: i32) -> i64 {
+        VFS.lock().seek64_by_handle(self.handle, offset, whence)
+    }
+    fn resize(&mut self, size: u32) -> i32 {
+        VFS.lock().resize_by_handle(self.handle, size)
+    }
+    fn write_at(&mut self, offset: u32, bytes: &[u8]) -> i32 {
+        VFS.lock().write_at_by_handle(self.handle, offset, bytes)
+    }
+}
+
+impl Drop for FileIo { fn drop(&mut self) { VFS.lock().close_handle(self.handle); } }
+
+/// Serialize a whole transfer on its inode, including independently opened
+/// O_APPEND descriptions. Pin the handle until completion. User copies and
+/// page reclamation run without holding the shared namespace/cache lock.
+pub fn with_file_io<R>(handle: i32, length: usize, operation: impl FnOnce(&mut FileIo) -> R) -> Result<R, i32> {
+    let sample = crate::kernel::event_profile::file_io_start();
+    let serial = {
+        let mut vfs = VFS.lock();
+        let entry = vfs.file_table.get(handle as usize).filter(|entry| entry.refcount != 0).ok_or(-9)?;
+        let serial = entry.io.clone();
+        vfs.add_ref(handle);
+        serial
+    };
+    let mut file = FileIo { handle };
+    let _guard = serial.lock();
+    crate::kernel::event_profile::file_io_finish(11, length, sample);
+    Ok(operation(&mut file))
+}
+
+/// Read from a VFS file table entry by handle index.
 pub fn read_by_handle(handle: i32, buf: &mut [u8]) -> i32 {
+    with_file_io(handle, buf.len(), |file| file.read(buf)).unwrap_or_else(|error| error)
+}
+
+fn read_once(handle: i32, buf: &mut [u8]) -> i32 {
     let sample = crate::kernel::event_profile::file_io_start();
     let mut vfs = VFS.lock();
     crate::kernel::event_profile::file_io_finish(11, buf.len(), sample);
@@ -2809,13 +2951,16 @@ pub fn read_at_by_handle(handle: i32, offset: u32, buf: &mut [u8]) -> i32 {
 /// Write to a VFS file table entry by handle index.
 pub fn write_by_handle<A: crate::Arch>(machine: &mut A, handle: i32, data: &[u8]) -> i32 {
     let _ = machine;
-    VFS.lock().write_by_handle(handle, data)
+    with_file_io(handle, data.len(), |file| file.write(data)).unwrap_or_else(|error| error)
 }
 
 /// A log callback may run while VFS already holds its lock. In that case,
 /// leave the bytes in the ring for the next callback or event-loop pass.
 pub fn try_write_by_handle(handle: i32, data: &[u8]) -> Option<i32> {
-    Some(VFS.try_lock()?.write_by_handle(handle, data))
+    let mut vfs = VFS.try_lock()?;
+    let serial = vfs.file_table.get(handle as usize)?.io.clone();
+    let _guard = serial.try_lock()?;
+    Some(vfs.write_by_handle(handle, data))
 }
 
 pub fn try_flush_by_handle(handle: i32) -> Option<i32> {
@@ -2850,12 +2995,16 @@ pub fn sync_by_handle(handle: i32) -> i32 {
 
 /// Seek on a VFS handle directly.
 pub fn seek_by_handle(handle: i32, offset: i32, whence: i32) -> i32 {
-    VFS.lock().seek_by_handle(handle, offset, whence)
+    with_file_io(handle, 0, |file| file.seek(i64::from(offset), whence)).unwrap_or_else(i64::from) as i32
+}
+
+pub fn seek64_by_handle(handle: i32, offset: i64, whence: i32) -> i64 {
+    with_file_io(handle, 0, |file| file.seek(offset, whence)).unwrap_or_else(i64::from)
 }
 
 /// Get file size by VFS handle.
 pub fn resize_by_handle(handle: i32, size: u32) -> i32 {
-    VFS.lock().resize_by_handle(handle, size)
+    with_file_io(handle, 0, |file| file.resize(size)).unwrap_or_else(|error| error)
 }
 
 pub fn file_size_by_handle(handle: i32) -> u32 {
@@ -3467,9 +3616,25 @@ mod tests {
     }
 
     impl Filesystem for OwnedFs {
+        fn stat(&self, path: &[u8], _: bool) -> Option<super::Stat> {
+            let meta = self.meta(path)?;
+            Some(super::Stat { mtime: None, size: 0, mode: meta.mode as u16,
+                is_dir: path != b"home/file", is_symlink: false, ino: 0 })
+        }
         fn open(&self, _path: &[u8]) -> Option<Vnode> { None }
         fn read(&self, _handle: u64, _offset: u32, _buf: &mut [u8], _size: u32) -> i32 { -5 }
-        fn readdir(&self, _dir: &[u8], _cookie: u64, _out: &mut Vec<DirEntry>, _max: usize) -> Option<u64> { None }
+        fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
+            if cookie != 0 || max == 0 { return None; }
+            let (name, is_dir) = match dir {
+                b"" => (b"home".as_slice(), true),
+                b"home" => (b"file".as_slice(), false),
+                _ => return None,
+            };
+            out.push(DirEntry { name: name.to_vec(), name_len: name.len(),
+                short_name: None, size: 0, is_dir, is_symlink: false,
+                mode: 0o444, dos_attributes: None, mtime: 0, node: 0, mount_idx: 0 });
+            None
+        }
         fn dir_exists(&self, path: &[u8]) -> bool { path == b"home" }
         fn meta(&self, path: &[u8]) -> Option<super::Meta> {
             match path {
@@ -3484,6 +3649,27 @@ mod tests {
             *self.file.lock() = super::Meta { uid, gid, mode };
             true
         }
+        fn set_times(&self, path: &[u8], _: Option<u32>, _: Option<u32>) -> i32 {
+            if path == b"home/file" { 0 } else { -2 }
+        }
+    }
+
+    #[test]
+    fn owners_can_restore_timestamps_on_read_only_files() {
+        use crate::kernel::fs::grant::Grant;
+        let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(OwnedFs {
+            file: spin::Mutex::new(super::Meta { uid: 1000, gid: 999, mode: 0o444 }),
+            fail_set_meta: core::sync::atomic::AtomicBool::new(false),
+        }));
+        let mut vfs = Vfs::new(); vfs.mount(b"", fs);
+        vfs.mounts[0].access = WriteAccess::Granted(Grant::from_home(fs, b"home").unwrap());
+        assert!(!vfs.may_write(0, b"home/file"));
+        assert_eq!(vfs.set_times(b"home/file", true, Some(123), Some(456)), 0);
+        assert_eq!(vfs.mtimes.get(b"home/file".as_slice()), Some(&456));
+        fs.file.lock().uid = 2000;
+        assert_eq!(vfs.set_times(b"home/file", true, None, Some(789)), -1);
+        vfs.mounts[0].access = WriteAccess::None;
+        assert_eq!(vfs.set_times(b"home/file", true, None, Some(789)), -30);
     }
 
     #[test]
@@ -4021,7 +4207,7 @@ pub fn handle_status_flags(handle: i32) -> i32 {
 
 /// Positional writes share file contents and size, but never change fd offsets.
 pub fn write_at_by_handle(handle: i32, offset: u32, data: &[u8]) -> i32 {
-    VFS.lock().write_at_by_handle(handle, offset, data)
+    with_file_io(handle, data.len(), |file| file.write_at(offset, data)).unwrap_or_else(|error| error)
 }
 pub fn sync_directory(handle: i32) -> i32 {
     let mut path = [0; DIR_PATH_MAX];

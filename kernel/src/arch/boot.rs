@@ -261,7 +261,7 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, magic: u32, info: *const u8) 
     // on so its mutable state is borrow-checked rather than global. Lives for
     // the rest of the kernel's life (startup never returns).
     let mut machine = arch::Metal;
-    lib::compact_screenln!(lib::term::term(), "Heap base: {:#x}", arch::heap_base());
+    lib::compact_screenln!(&mut *lib::term::term(), "Heap base: {:#x}", arch::heap_base());
     crate::kernel::startup::startup(&mut machine, config);
 }
 
@@ -345,7 +345,8 @@ unsafe fn prepare_boot(
     // Nothing else is running yet, so there is no display to arbitrate: write
     // to the terminal directly. Once `startup` builds a `Console`, on-screen
     // kernel text needs that value; ambient println! stays log-only throughout.
-    let screen = lib::term::term();
+    let mut screen_guard = lib::term::term();
+    let screen = &mut *screen_guard;
 
     // Only minimal page tables and permanent low-memory DMA use the BSS pool.
     // AP stacks/TLS will use resident heap mappings after allocator setup.
@@ -384,10 +385,11 @@ unsafe fn prepare_boot(
     // VGA framebuffer scanout needs its packed shadow as soon as fbcon is
     // attached below. Paging, phys_mm, and the #PF page-backing are now ready,
     // so the demand-paged heap can safely be enabled here.
-    // Reuse hot temporary buffers without returning and faulting their backing
-    // pages on every allocation. Keep at most 1 MiB, scaled down for small RAM.
-    let heap_cache = (phys_mm::total_page_count() / 128 * PAGE_SIZE).min(1024 * 1024);
-    ALLOCATOR.init_with_cached_release(arch::heap_base(), arch::HEAP_END, Some(arch::release_heap_pages), heap_cache);
+    // Kernel heap backing grows monotonically. Freed objects are reused by
+    // the allocator, but their pages remain mapped to the same frames. This
+    // avoids remapping a reused address while another CPU retains an old TLB
+    // entry. Large file-cache payloads use physical frames outside this heap.
+    ALLOCATOR.init(arch::heap_base(), arch::HEAP_END);
     ALLOCATOR.enable_small_cache();
     phys_mm::complete_initialization();
     arch::memory::configure(phys_mm::ownership(), frame_refill_entry as *const () as usize);
@@ -420,6 +422,10 @@ unsafe fn prepare_boot(
     // compat-mode toggle below reuses, so they survive the switch.
     lib::compact_screenln!(screen, "Boot: framebuffer init");
     crate::fbcon::init(info, screen);
+    drop(screen_guard);
+    crate::fbcon::panic_present();
+    let mut screen_guard = lib::term::term();
+    let screen = &mut *screen_guard;
     lib::compact_screenln!(screen, "Boot: framebuffer ready");
 
     lib::compact_screenln!(screen, "Boot: ACPI timer search");
@@ -506,6 +512,7 @@ unsafe fn prepare_boot(
     smp::enable_media();
     descriptors::enter_ring1();
     irq::timer_delivery_selftest(screen);
+    smp::enable_parallel();
 
     lib::compact_screenln!(screen, "Ring1 entered, paging + interrupts + syscall setup complete");
 
@@ -603,7 +610,11 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // follow the ownership rules — they protect a *running* program's screen,
     // and nothing runs after this. Write straight to the terminal. Its writes
     // mirror to the log stream, so debugcon/klog get every line too.
-    let screen = lib::term::term();
+    let Some(mut screen_guard) = lib::term::try_term() else {
+        let _ = core::fmt::Write::write_fmt(&mut lib::log::DebugCon, format_args!("KERNEL PANIC: {}\n", info));
+        fatal_finish()
+    };
+    let screen = &mut *screen_guard;
     screen.clear();
 
     lib::compact_screenln!(screen, "\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
@@ -614,15 +625,21 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         lib::compact_screenln!(screen, "at <unknown location>");
     }
     let _ = core::fmt::Write::write_fmt(screen, format_args!("{}\n", info.message()));
+    drop(screen_guard);
     fatal_finish()
 }
 
 fn fatal_finish() -> ! {
     crate::kernel::drivers::hda::emergency_quiesce();
-    let screen = lib::term::term();
+    let Some(mut screen_guard) = lib::term::try_term() else {
+        crate::compact_println!("Fatal: console is busy");
+        arch::halt_forever();
+    };
+    let screen = &mut *screen_guard;
     lib::screenln!(screen);
     lib::compact_screenln!(screen, "{}", crate::build_info::VersionBanner);
     crate::kernel::stacktrace::stack_trace(screen);
+    drop(screen_guard);
 
     // Capture any final partial line as well. A panic can occur while VFS is
     // locked or in an interrupt; sync_live uses try_lock and this guard avoids
@@ -674,7 +691,8 @@ extern "C" fn frame_refill_resume() -> usize {
             for page in &returned[..count] { phys_mm::free_phys_page(*page); }
             if count < returned.len() { break; }
         }
-        phys_mm::replenish_supply(supply);
+        if ALLOCATOR.is_locked() { phys_mm::replenish_supply_without_reclaim(supply); }
+        else { phys_mm::replenish_supply(supply); }
         let ip = (*supply).resume_ip;
         (*supply).resume_ip = 0;
         ip

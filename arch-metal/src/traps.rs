@@ -100,6 +100,9 @@ pub(crate) fn set_execute_regs(regs: *mut Regs) {
 
 /// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
 pub mod arch_call {
+    pub const PRIVATE_TABLES: u64 = 0x12B;
+    pub const REFRESH_KERNEL: u64 = 0x12C;
+    pub const INTERRUPT_PROCESSOR: u64 = 0x12D;
     pub const RETURNED_FRAMES: u64 = 0x12A; // EDX=returned-page exchange
     pub const FRAME_OPERATION: u64 = 0x129; // EDX=frame request
     pub const HIGH_MEMORY: u64 = 0x128; // EDX=request pointer
@@ -227,6 +230,9 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
 #[inline(never)]
 fn arch_dispatch(regs: &mut Regs) {
     match regs.rax {
+        arch_call::PRIVATE_TABLES => { regs.rax = paging2::privatize_user_tables() as i64 as u64; }
+        arch_call::REFRESH_KERNEL => { paging2::refresh_kernel_mappings(); x86::flush_tlb(); }
+        arch_call::INTERRUPT_PROCESSOR => { crate::irq::interrupt_processor(regs.rdx as u32); }
         arch_call::HIGH_MEMORY => {
             let request = unsafe { &mut *(regs.rdx as u32 as *mut crate::high_paging::Request) };
             request.result = crate::high_paging::request(request);
@@ -922,6 +928,9 @@ fn isr_handler_ring1(regs: &mut Regs) {
 
 /// Try to handle a page fault. Returns Some(()) if resolved, None if not.
 fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
+    // Other CPUs can grow the shared kernel heap while this CPU executes
+    // userspace. Ownership metadata used below must see those mappings.
+    crate::paging2::refresh_kernel_mappings();
     let _reserve = crate::memory::FaultGuard::enter();
     let _sample = crate::exec_profile::FaultSample::start(error & 4 != 0);
     use crate::paging2::{KERNEL_BASE, PAGE_TABLE_BASE, page_idx};
@@ -1096,6 +1105,13 @@ fn demand_page<E: paging2::Entry>(
 
 /// Demand-page a kernel heap page: allocate a real writable physical page.
 fn demand_page_kernel(fault_addr: usize) {
+    let _mapping = paging2::KernelMappingGuard::lock();
+    paging2::refresh_kernel_mappings();
+    // The fault may predate another CPU installing this shared heap page.
+    if paging2::kernel_page_resident(fault_addr) {
+        x86::invlpg(fault_addr & !(paging2::PAGE_SIZE - 1));
+        return;
+    }
     let phys = crate::memory::take_page()
         .unwrap_or_else(|| panic!("Arch: fault reserve exhausted for kernel heap at {fault_addr:#x}; managed pages={}", crate::memory::total_page_count()));
     let page_index = paging2::page_idx(fault_addr);

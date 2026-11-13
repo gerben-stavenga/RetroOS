@@ -631,16 +631,14 @@ impl core::fmt::Write for Term {
     }
 }
 
-static mut TERM: Term = Term::new(Some(0xB8000));
+static TERM: spin::Mutex<Term> = spin::Mutex::new(Term::new(Some(0xB8000)));
 
-/// Access the global console.
-pub fn term() -> &'static mut Term {
-    // Bind the raw pointer first, then deref the local: `&mut *(&raw mut VGA)`
-    // directly trips clippy::deref_addrof, while `&mut VGA` trips static_mut_refs.
-    // Borrowing through a separate raw-pointer local satisfies both.
-    let p = &raw mut TERM;
-    unsafe { &mut *p }
-}
+/// Access the shared console. Release the guard before publishing a frame or
+/// invoking a flush hook, which may itself read the console.
+pub fn term() -> spin::MutexGuard<'static, Term> { TERM.lock() }
+
+/// Fatal paths must still reach the log if another CPU owns the console.
+pub fn try_term() -> Option<spin::MutexGuard<'static, Term>> { TERM.try_lock() }
 
 /// Post-write console-flush hook (`fn()` as its address; 0 = none). On machines
 /// whose text cells are not themselves the display — a GOP linear framebuffer
@@ -656,6 +654,11 @@ pub fn set_text_flush(f: fn()) {
 
 #[inline]
 pub(crate) fn text_flush() {
+    // Writers may request a flush while borrowing Term. A renderer must not
+    // recursively acquire that same lock. The owning display loop will publish
+    // those writes; unlocked public byte writers can flush immediately.
+    let Some(guard) = TERM.try_lock() else { return; };
+    drop(guard);
     let p = TEXT_FLUSH.load(core::sync::atomic::Ordering::Relaxed);
     if p != 0 {
         let f: fn() = unsafe { core::mem::transmute(p) };

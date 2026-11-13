@@ -148,7 +148,8 @@ fn render_grid(
     }
     let palette_p = &raw const PALETTE;
     pal.sync(unsafe { &*palette_p }, 0xff, content_format, pal_cache);
-    let cells = lib::term::term().unicode_cells();
+    let terminal = lib::term::term();
+    let cells = terminal.unicode_cells();
     lib::unicode_font::render_terminal(cells, 80, cell_w, &pal.lut, content);
 
     const TERMINAL_SURFACE: crate::kernel::gui::SurfaceKey = crate::kernel::gui::SurfaceKey(1);

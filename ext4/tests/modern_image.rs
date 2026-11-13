@@ -17,6 +17,66 @@ fn check_orphan_image(storage: &ModelStorage, label: &str) {
 }
 
 #[test]
+fn hard_links_share_the_blob_and_survive_individual_removal() {
+    use portable_ext4::{Filesystem, Storage};
+    use portable_ext4::ext4::{AttributeUpdate, Object};
+    let mut storage = ModelStorage::new(image());
+    let mut fs = Filesystem::mount(&mut storage).unwrap();
+    let root = fs.root(&mut storage).unwrap();
+    let object = fs.create_blob(&mut storage, root, b"hard-source", AttributeUpdate::default()).unwrap();
+    let Object::Blob(blob) = object else { panic!() };
+    fs.write(&mut storage, blob, 0, b"shared contents").unwrap();
+    fs.hard_link(&mut storage, root, b"hard-twin", object).unwrap();
+    assert_eq!(fs.find(&mut storage, root, b"hard-twin").unwrap().unwrap().1, object);
+    assert_eq!(fs.inspect(&mut storage, object).unwrap().references, 2);
+    assert_eq!(fs.hard_link(&mut storage, root, b"hard-twin", object), Err(Error::AlreadyExists));
+    assert_eq!(fs.inspect(&mut storage, object).unwrap().references, 2);
+    storage.flush().unwrap();
+    check_orphan_image(&storage, "hard-two-names");
+    let source = fs.find(&mut storage, root, b"hard-source").unwrap().unwrap().0;
+    assert_eq!(fs.remove_open(&mut storage, source).unwrap(), None);
+    assert_eq!(fs.inspect(&mut storage, object).unwrap().references, 1);
+    let mut bytes = [0; 15];
+    fs.read(&mut storage, blob, 0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"shared contents");
+    let twin = fs.find(&mut storage, root, b"hard-twin").unwrap().unwrap().0;
+    fs.remove(&mut storage, twin).unwrap();
+    assert!(matches!(fs.inspect(&mut storage, object), Err(Error::NotFound)));
+    storage.flush().unwrap();
+    check_orphan_image(&storage, "hard-final-release");
+}
+
+#[test]
+fn hard_links_publish_the_edge_and_reference_count_atomically() {
+    use portable_ext4::{Filesystem, Storage};
+    use portable_ext4::ext4::AttributeUpdate;
+    use portable_ext4::test_support::EffectKind;
+    let mut prepared = ModelStorage::new(image());
+    let mut fs = Filesystem::mount(&mut prepared).unwrap();
+    let root = fs.root(&mut prepared).unwrap();
+    let object = fs.create_blob(&mut prepared, root, b"hard-source", AttributeUpdate::default()).unwrap();
+    prepared.flush().unwrap();
+    let baseline = prepared.durable_bytes().to_vec();
+    let mut success = ModelStorage::new(baseline.clone());
+    let mut fs = Filesystem::mount(&mut success).unwrap();
+    let start = success.effects().len();
+    fs.hard_link(&mut success, root, b"hard-twin", object).unwrap();
+    let failures: Vec<_> = success.effects()[start..].iter().filter(|effect| effect.kind != EffectKind::Read)
+        .map(|effect| effect.sequence).collect();
+    for sequence in failures {
+        let mut storage = ModelStorage::new(baseline.clone()).with_injection(Inject::PowerLossAt(sequence));
+        let mut fs = Filesystem::mount(&mut storage).unwrap();
+        assert!(fs.hard_link(&mut storage, root, b"hard-twin", object).is_err());
+        let mut recovered = ModelStorage::new(storage.durable_bytes().to_vec());
+        let mut fs = Filesystem::mount(&mut recovered).unwrap();
+        let linked = fs.find(&mut recovered, root, b"hard-twin").unwrap().is_some();
+        assert_eq!(fs.inspect(&mut recovered, object).unwrap().references, if linked { 2 } else { 1 });
+        fs.sync(&mut recovered).unwrap(); recovered.flush().unwrap();
+        check_orphan_image(&recovered, &format!("hard-link-{sequence}"));
+    }
+}
+
+#[test]
 fn open_unlink_retains_data_until_last_close_and_reclaims_orphan_chain() {
     use portable_ext4::{Filesystem, Storage};
     use portable_ext4::ext4::{AttributeUpdate, Object};
