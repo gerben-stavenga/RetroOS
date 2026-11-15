@@ -3,8 +3,7 @@
 //!
 //! There is ONE VGA model: the shared text aperture at phys 0xB8000 (the
 //! kernel console keeps `lib::vga`'s cell base there — LOW_MEM_BASE + 0xB8000 —
-//! the same memory DOS programs and DN write, since `map_low_mem_user` identity-
-//! maps 0xA0-0xBF into every process). This module only maps/describes the
+//! the same memory DOS programs and DN write, through the kernel’s DOS mapping policy). This module only maps/describes the
 //! framebuffer and supplies the shared aperture to `kernel::vga`, which makes
 //! that emulated VGA visible. The kernel above this glue uses the same VGA
 //! console interface as it does on a legacy machine.
@@ -162,7 +161,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
         let stripe_bytes = pitch.saturating_mul(32).min(1 << 20);
         let pages = ((addr & (PAGE_SIZE as u64 - 1)) as usize + stripe_bytes).div_ceil(PAGE_SIZE);
         for i in 0..pages {
-            paging2::map_user_page_phys(
+            paging2::map_kernel_page(
                 paging2::FB_WINDOW_BASE / PAGE_SIZE + i,
                 addr / PAGE_SIZE as u64 + i as u64,
                 paging2::flags::CACHE_DISABLE,
@@ -228,7 +227,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
     );
     let ppage = addr / PAGE_SIZE as u64;
     for i in 0..pages {
-        paging2::map_user_page_phys(
+        paging2::map_kernel_page(
             paging2::FB_WINDOW_BASE / PAGE_SIZE + i,
             ppage + i as u64,
             policy.flags,
@@ -263,13 +262,13 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
     // instead — RAM the console can read/write. This is the singleton VGA text
     // memory; DOS processes map the SAME pages at their guest 0xB8000, so the
     // kernel console and every DOS program share one screen, like VGA hardware.
-    let aperture = paging2::vga_text_aperture_ppage();
+    let aperture = crate::kernel::memory::text_frame();
     for i in 0..8 {
         // Cacheable, FOREIGN: RAM we allocated (not a card's MMIO), shared with
         // every DOS process, so no address space may free or COW it. It was
         // uncached only because CACHE_DISABLE used to double as the
         // "externally owned" marker — see `flags::FOREIGN`.
-        paging2::map_user_page_phys(
+        paging2::map_kernel_page(
             (paging2::LOW_MEM_BASE + 0xB8000) / PAGE_SIZE + i,
             aperture + i as u64,
             paging2::flags::FOREIGN,

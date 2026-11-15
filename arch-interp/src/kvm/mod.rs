@@ -15,7 +15,7 @@ mod shim;
 mod tests;
 
 pub use run::execute;
-pub(crate) use setup::{arm_alarm, kick};
+pub(crate) use setup::kick;
 
 std::thread_local! {
     static TLB_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
@@ -84,7 +84,7 @@ pub fn fpu_pop() {
 }
 
 /// Swap the live guest FPU/SSE state with the thread save area `fx` (metal's
-/// `arch_switch_to` fx semantics: on return `fx` holds the outgoing thread's
+/// `switch_fx` semantics: on return `fx` holds the outgoing thread's
 /// state, the vcpu holds the incoming). The vcpu's FXSAVE image is the first
 /// 512 bytes of its XSAVE area; the XSAVE header is preserved and the
 /// x87+SSE bits forced into XSTATE_BV so the restore actually loads them.

@@ -102,7 +102,7 @@ pub fn mmap<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
     let hint = a.a0 & !4095;
     if hint >= START && hint.checked_add(size).is_some_and(|end| end <= END) {
         let operation = if a.a3 & 0x10 != 0 { 0 } else { 4 };
-        let result = crate::kernel::memory::high_mapping(machine, hint, size, operation, a.a2 as u32);
+        let result = apply(machine, hint, size, operation, a.a2 as u32);
         if result == 0 { linux.high_mappings.reserve(hint, hint + size); return SyscallResult::val64(hint as i64); }
         linux_trace!("[LINUX-HIGH] hint failed {}", result);
         if fixed { return SyscallResult::val(result); }
@@ -111,7 +111,7 @@ pub fn mmap<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
     // The sparse high arena is used for large reservations and explicit hints.
     let Some(base) = linux.high_mappings.allocate(size)
         else { return SyscallResult::val(-ENOMEM); };
-    let result = crate::kernel::memory::high_mapping(machine, base, size, 4, a.a2 as u32);
+    let result = apply(machine, base, size, 4, a.a2 as u32);
     if result == 0 {
         linux.high_mappings.cursor = base;
         linux.high_mappings.reserve(base, base + size);
@@ -125,7 +125,7 @@ pub fn change<A: crate::Arch>(machine: &mut A, a: &Args, operation: u32) -> Sysc
         else { return SyscallResult::val(-EINVAL); };
     if !range(a.a0, length) || a.a0 < START { return SyscallResult::val(-EINVAL); }
     if length == 0 { return SyscallResult::val(if operation == 2 { -EINVAL } else { 0 }); }
-    SyscallResult::val(crate::kernel::memory::high_mapping(machine, a.a0, length, operation, if operation == 1 { a.a2 as u32 } else { 0 }))
+    SyscallResult::val(apply(machine, a.a0, length, operation, if operation == 1 { a.a2 as u32 } else { 0 }))
 }
 
 pub fn unmap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args) -> SyscallResult {
@@ -136,4 +136,60 @@ pub fn unmap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args) 
         if a.a0 == linux.high_mappings.cursor { linux.high_mappings.cursor = end; }
     }
     result
+}
+
+/// Linux reservation/protection/discard policy over architecture mapping data.
+fn apply<A: crate::Arch>(machine: &mut A, address: u64, length: u64, operation: u32, protection: u32) -> i32 {
+    use arch_abi::{UserPage, page_entry::{Backing, PageEntry}};
+    use crate::kernel::memory;
+    let Ok(start) = UserPage::new(address) else { return -EINVAL; };
+    let Ok(count) = usize::try_from(length / 4096) else { return -ENOMEM; };
+    if count == 0 { return 0; }
+    if start.offset(count - 1).is_err() { return -EINVAL; }
+    // MAP_FIXED_NOREPLACE and mprotect validate the whole range before mutation.
+    if matches!(operation, 1 | 3 | 4) {
+        let mut offset = 0;
+        while offset < count {
+            let Ok((entry, run)) = machine.read_mapping_run(start.offset(offset).unwrap(), count - offset) else { return -ENOMEM; };
+            if operation == 4 && entry != PageEntry::Absent { return -17; }
+            if operation != 4 && entry == PageEntry::Absent { return -ENOMEM; }
+            offset += run;
+        }
+    }
+    if matches!(operation, 0 | 2 | 4) {
+        let mapping = memory::zero_mapping(machine, protection & 4 != 0);
+        let entry = if operation == 2 { PageEntry::Absent }
+            else if protection == 0 { PageEntry::NoAccess(mapping) }
+            else if protection & 2 != 0 { PageEntry::CopyOnWrite(mapping) }
+            else { PageEntry::ReadOnly(mapping) };
+        return if unsafe { memory::fill(machine, start, count, entry) }.is_ok() { 0 } else { -ENOMEM };
+    }
+    let mut offset = 0;
+    while offset < count {
+        let page = start.offset(offset).unwrap();
+        let Ok((entry, run)) = machine.read_mapping_run(page, count - offset) else { return -ENOMEM; };
+        let (mut mapping, no_access, writable) = match entry {
+            PageEntry::NoAccess(m) => (m, true, false),
+            PageEntry::ReadOnly(m) => (m, false, false),
+            PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => (m, false, true),
+            _ => return -ENOMEM,
+        };
+        let next = if operation == 3 {
+            let zero = memory::zero_mapping(machine, true);
+            mapping.backing = zero.backing;
+            if no_access { PageEntry::NoAccess(mapping) }
+            else if writable { PageEntry::CopyOnWrite(mapping) } else { PageEntry::ReadOnly(mapping) }
+        } else {
+            mapping.attributes = mapping.attributes.with_executable(memory::mapping_attributes(machine, protection & 4 != 0)
+                .contains(arch_abi::page_entry::Attributes::EXECUTABLE));
+            if protection == 0 { PageEntry::NoAccess(mapping) }
+            else if protection & 2 == 0 { PageEntry::ReadOnly(mapping) }
+            else if matches!(mapping.backing, Backing::Owned(_)) || mapping.backing == memory::zero_mapping(machine, true).backing {
+                PageEntry::CopyOnWrite(mapping)
+            } else { PageEntry::Writable(mapping) }
+        };
+        if unsafe { memory::fill(machine, page, run, next) }.is_err() { return -ENOMEM; }
+        offset += run;
+    }
+    0
 }

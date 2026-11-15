@@ -24,7 +24,7 @@ fn map_code<A: crate::Arch>(machine: &mut A, address: u32, bytes: &[u8]) -> Resu
     if bytes.len() > 4096 { return Err(-8); }
     machine.zero(address as usize, 4096);
     machine.copy_to(address as usize, bytes);
-    machine.set_page_flags(address as usize / 4096, 1, false, true);
+    crate::kernel::memory::protect(machine, address as usize / 4096, 1, false, true);
     Ok(())
 }
 
@@ -41,10 +41,10 @@ pub(super) fn start<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
     windows.stack_size = 256 * 1024;
     windows.stack_base = super::super::STACK_TOP - windows.stack_size;
     machine.zero(windows.stack_base as usize, windows.stack_size as usize);
-    machine.set_page_flags(windows.stack_base as usize / 4096, windows.stack_size as usize / 4096, true, false);
+    crate::kernel::memory::protect(machine, windows.stack_base as usize / 4096, windows.stack_size as usize / 4096, true, false);
     for (address, size) in [(teb, super::super::TEB_SIZE), (peb, super::super::PEB_SIZE), (params, 4096)] {
         machine.zero(address as usize, size);
-        machine.set_page_flags(address as usize / 4096, size / 4096, true, false);
+        crate::kernel::memory::protect(machine, address as usize / 4096, size / 4096, true, false);
     }
     // Wine keeps its default debug-channel options immediately after the PEB.
     machine.write::<u8>((peb + 4096) as usize, 7);
@@ -63,7 +63,7 @@ pub(super) fn start<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
     machine.write::<u32>((peb + 0x64) as usize, 1); // NumberOfProcessors
     machine.write::<u32>((peb + 0x220) as usize, LDT_COPY);
     machine.zero(LDT_COPY as usize, 65536);
-    machine.set_page_flags(LDT_COPY as usize / 4096, 16, true, false);
+    crate::kernel::memory::protect(machine, LDT_COPY as usize / 4096, 16, true, false);
     for (i, &desc) in windows.ldt.iter().enumerate() {
         let base = selector_base_from_ldt(&windows.ldt, i as u16 * 8 + 7).unwrap_or(0);
         let limit = ((desc & 0xffff) | ((desc >> 32) & 0xf0000)) as u32;
@@ -82,9 +82,9 @@ pub(super) fn start<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
             let mut code = image.segment_bytes(segment).map_err(|_| -8)?.to_vec();
             patch_calls(&mut code, normal, registers, flat_cs)?;
             let address = module_segment_base(module.base, number)? as usize;
-            machine.set_page_flags(address / 4096, code.len().div_ceil(4096), true, false);
+            crate::kernel::memory::protect(machine, address / 4096, code.len().div_ceil(4096), true, false);
             machine.copy_to(address, &code);
-            machine.set_page_flags(address / 4096, code.len().div_ceil(4096), false, true);
+            crate::kernel::memory::protect(machine, address / 4096, code.len().div_ceil(4096), false, true);
         }
         // Wine's generated pointer-conversion helpers read the LDT-copy
         // pointer stored in the original PE descriptor's e_res2 field.

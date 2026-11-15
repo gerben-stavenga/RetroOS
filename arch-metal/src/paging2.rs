@@ -317,10 +317,8 @@ pub mod flags {
     /// MMIO branch and mapped the page NOT PRESENT — the console's first write
     /// then faulted.
     pub const FOREIGN: u64 = 1 << 11;
-    /// This leaf temporarily aliases an address-space-owned shadow in place of
-    /// a physical-device mapping. Its remaining flag bits are the original
-    /// mapping's bits, allowing the physical mapping to be restored exactly.
-    pub const REDIRECTED_ALIAS: u64 = 1 << 10;
+    /// Nonpresent leaf retaining a physical frame.
+    pub const NO_ACCESS: u64 = 1 << 10;
     /// Software read-only flag - page is semantically read-only
     /// When set, page can never become writable (e.g., .text, .rodata)
     /// When clear (default), page is semantically writable
@@ -411,8 +409,8 @@ pub(crate) fn replace_entry<E: Entry>(slot: &mut E, incoming: E) -> E {
 
 #[inline]
 fn owns_frame<E: Entry>(entry: E) -> bool {
-    entry.present() && (entry.raw() & flags::REDIRECTED_ALIAS != 0
-        || entry.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0)
+    (entry.present() || entry.raw() & flags::NO_ACCESS != 0)
+        && entry.raw() & flags::FOREIGN == 0
 }
 
 /// Install an already-owned mapping, then release the mapping displaced from
@@ -424,16 +422,6 @@ pub(crate) fn replace_mapping<E: Entry>(slot: &mut E, incoming: E) {
     if owns_frame(outgoing) {
         crate::memory::release_page(outgoing.page());
     }
-}
-
-/// Create the additional allocator reference required before installing a
-/// second PTE containing these bits.
-#[inline]
-fn retain_mapping<E: Entry>(entry: E) -> E {
-    if owns_frame(entry) {
-        let _ = crate::memory::inc_shared_count(entry.page());
-    }
-    entry
 }
 
 #[derive(Copy, Clone, Default)]
@@ -1145,7 +1133,6 @@ pub fn physical_page(vaddr: usize) -> u64 {
     }
 }
 
-
 /// Get current CR3 value (page directory physical address)
 #[allow(dead_code)]
 pub fn current_cr3() -> u64 {
@@ -1830,7 +1817,7 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
     let old_phys = entries[idx].page();
     let ref_count = memory::get_ref_count(old_phys);
 
-    if ref_count == 1 {
+    if ref_count == 1 && entries[idx].raw() & flags::FOREIGN == 0 {
         // Sole owner — just make writable
         entries[idx].set_hw_writable(true);
         if idx < PAGE_TABLE_BASE_IDX { crate::x86::invlpg(idx * PAGE_SIZE); }
@@ -1880,8 +1867,10 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         }
     };
 
-    let user = entries[idx].user();
-    replace_mapping(&mut entries[idx], E::new(new_phys, true, user));
+    let mut incoming = entries[idx];
+    incoming.set_raw((incoming.raw() & !E::ADDR_MASK & !flags::FOREIGN) | (new_phys << 12));
+    incoming.set_hw_writable(true);
+    replace_mapping(&mut entries[idx], incoming);
     crate::x86::invlpg(idx * PAGE_SIZE);
 }
 
@@ -1937,7 +1926,7 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
             if child >= PAGE_TABLE_BASE_IDX {
                 // Intermediate level — recurse
                 free_subtree(entries, child);
-            } else if entries[child].present() {
+            } else if entries[child].present() || entries[child].raw() & flags::NO_ACCESS != 0 {
                 replace_mapping(&mut entries[child], E::default());
             }
         }
@@ -1986,146 +1975,23 @@ pub fn clear_trampoline(saved: u64) {
     crate::x86::flush_tlb();
 }
 
-/// Map the first 1MB of physical memory as user-accessible (for VM86 mode).
-/// Page 0 gets a private COW copy; pages 1-0x9F are demand-paged zero;
-/// 0xA0-0xBF VGA framebuffer; 0xC0-0xFF ROM (read-only).
-pub fn map_low_mem_user() {
-    match entries() {
-        Entries::E32(e) => map_low_mem_user_generic(e),
-        Entries::E64(e) => map_low_mem_user_generic(e),
-    }
-}
+/// Install borrowed physical storage in the privileged window.
+/// Install one page of a privileged physical window.
+pub fn map_kernel_page(vpage: usize, ppage: u64, flags: u64) { map_kernel_physical(vpage, 1, ppage, flags); }
 
-fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
-    // Page 0 (BIOS IVT + BDA): allocate a private copy so each VM86 process
-    // has its own IVT. Copy via temp mapping to avoid null pointer issues.
-    let saved = temp_swap(0); // map physical page 0 at temp VA
-    let mut buf = [0u8; PAGE_SIZE];
-    unsafe {
-        let tp = &raw const TEMP_PAGE;
-        core::ptr::copy_nonoverlapping(
-            (*tp).0.as_ptr(),
-            buf.as_mut_ptr(),
-            PAGE_SIZE,
-        );
-    }
-    let _ = fresh_temp_page();
-    unsafe {
-        let tp = &raw mut TEMP_PAGE;
-        core::ptr::copy_nonoverlapping(
-            buf.as_ptr(),
-            (*tp).0.as_mut_ptr(),
-            PAGE_SIZE,
-        );
-    }
-    replace_mapping(&mut entries[0], E::new(temp_swap(saved), true, true));
-
-    // Pages 1..0x10 (low 64KB excluding page 0): eager-alloc as zero pages
-    // so the A20-disabled HMA wrap (PcMachine::new copies entries[0..0x10]
-    // into HMA_PAGE) reliably aliases across the process lifetime. If these
-    // were left as demand-paged-zero, the first write to virt 0x1000 would
-    // alloc phys X for entries[1] while entries[0x101] still held the
-    // not-present copy from PcMachine::new — a subsequent read of virt
-    // 0x101000 would alloc its OWN phys Y, breaking the alias. Pre-
-    // allocating ensures both PTEs reference the same phys page from the
-    // start.
-    for slot in entries.iter_mut().take(0x10usize).skip(1) {
-        let saved2 = fresh_temp_page();
-        unsafe {
-            let tp = &raw mut TEMP_PAGE;
-            core::ptr::write_bytes(
-                (*tp).0.as_mut_ptr(),
-                0,
-                PAGE_SIZE,
-            );
-        }
-        let new_phys = temp_swap(saved2);
-        replace_mapping(slot, E::new(new_phys, true, true));
-    }
-
-    // Pages 0x10-0x9F: conventional memory — left unmapped (demand-paged zero)
-    // Each process gets private zeroed pages on first access.
-
-    // Pages 0xA0-0xBF: VGA framebuffer — identity mapped RW, cache disabled
-    // PCD (bit 4) must be set so the CPU doesn't cache/combine writes.
-    // VGA Odd/Even addressing relies on seeing individual byte accesses.
-    for (i, slot) in entries.iter_mut().enumerate().take(0xC0usize).skip(0xA0) {
-        let mut e = E::new(i as u64, true, true);
-        e.set_raw(e.raw() | flags::CACHE_DISABLE);
-        replace_mapping(slot, e);
-    }
-
-    // Pages 0xC0-0xFF: ROM/BIOS area — identity mapped RO by default.
-    // UMB and EMS pages are cleared to not-present later by scan_uma().
-    for (i, slot) in entries.iter_mut().enumerate().take(0x100usize).skip(0xC0) {
-        replace_mapping(slot, E::new(i as u64, false, true));
-    }
-
-    // HMA (virt 0x100000..0x10FFFF) is set up by `PcMachine::new` in the DOS
-    // personality, which copies entries[0..16] (user's private low memory)
-    // into HMA_PAGE for the A20-disabled wrap. Seeding HMA_PAGE here with
-    // direct phys 0..15 was a bug: PcMachine::new's first arch_copy_page_entries
-    // moved that mapping into HMA_SHADOW (virt 0x110000..0x11FFFF), where it
-    // remained user-accessible for the process lifetime — every write into
-    // HMA_SHADOW landed at real phys 0..15, corrupting the master BIOS IVT/BDA.
-    // Leaving entries[0x100..] not-present here means HMA_SHADOW also ends up
-    // not-present after PcMachine::new's copy, which is the correct A20-on
-    // state when no extended memory has been allocated.
-
-    flush_tlb();
-}
-
-/// Map a physical page into the user address space.
-pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
-    // MAP_MMIO: an emulated device aperture — present=0 + Cache-Disable (PCD),
-    // the not-present twin of the present+PCD passthrough device mappings. A #PF
-    // here is a device trap the kernel decodes (planar VGA, future emulated
-    // BARs), not demand-paged RAM; try_handle_page_fault recognises the PCD.
-    if extra_flags & arch_abi::MAP_MMIO != 0 {
-        match entries() {
-            Entries::E32(e) => {
-                let mut x = Entry32::default();
-                x.set_raw(flags::CACHE_DISABLE | flags::USER);
-                replace_mapping(&mut e[vpage], x);
-            }
-            Entries::E64(e) => {
-                let mut x = Entry64::default();
-                x.set_raw(flags::CACHE_DISABLE | flags::USER);
-                replace_mapping(&mut e[vpage], x);
-            }
-        }
-        flush_tlb();
-        return;
-    }
-    match entries() {
-        Entries::E32(e) => {
-            let mut entry = Entry32::new(ppage, true, true);
-            entry.set_raw(entry.raw() | extra_flags);
-            replace_mapping(&mut e[vpage], entry);
-        }
-        Entries::E64(e) => {
-            let mut entry = Entry64::new(ppage, true, true);
-            entry.set_raw(entry.raw() | extra_flags);
-            replace_mapping(&mut e[vpage], entry);
-        }
-    }
-    flush_tlb();
-}
-
-/// Map a contiguous user range with a single TLB flush. VGA bank changes
-/// update many PTEs at once; flushing after every page makes each port write
-/// proportional to the window size in expensive CR3 reloads.
-pub fn map_user_range_phys(vpage: usize, count: usize, ppage: u64, extra_flags: u64) {
+pub fn map_kernel_physical(vpage: usize, count: usize, ppage: u64, extra_flags: u64) {
+    assert!(vpage >= 0xc0000000 / PAGE_SIZE);
+    let extra_flags = (extra_flags | flags::FOREIGN) & !flags::USER;
     let mmio = extra_flags & arch_abi::MAP_MMIO != 0;
     match entries() {
         Entries::E32(e) => {
             for i in 0..count {
                 let incoming = if mmio {
                     let mut x = Entry32::default();
-                    x.set_raw(flags::CACHE_DISABLE | flags::USER);
+                    x.set_raw(flags::CACHE_DISABLE);
                     x
                 } else {
-                    let mut x = Entry32::new(ppage + i as u64, true, true);
+                    let mut x = Entry32::new(ppage + i as u64, true, false);
                     x.set_raw(x.raw() | extra_flags);
                     x
                 };
@@ -2136,10 +2002,10 @@ pub fn map_user_range_phys(vpage: usize, count: usize, ppage: u64, extra_flags: 
             for i in 0..count {
                 let incoming = if mmio {
                     let mut x = Entry64::default();
-                    x.set_raw(flags::CACHE_DISABLE | flags::USER);
+                    x.set_raw(flags::CACHE_DISABLE);
                     x
                 } else {
-                    let mut x = Entry64::new(ppage + i as u64, true, true);
+                    let mut x = Entry64::new(ppage + i as u64, true, false);
                     x.set_raw(x.raw() | extra_flags);
                     x
                 };
@@ -2148,236 +2014,6 @@ pub fn map_user_range_phys(vpage: usize, count: usize, ppage: u64, extra_flags: 
         }
     }
     if count != 0 { flush_tlb(); }
-}
-
-/// Alias an allocated kernel RAM range into the active guest. The kernel
-/// allocation owns the frames; guest cleanup and COW must leave them alone.
-pub(crate) fn map_shared_pages_user(vpage: usize, kernel_base: usize, count: usize) {
-    assert!(vpage.checked_add(count).is_some_and(|end| end <= 0xC000_0000 / PAGE_SIZE));
-    assert!(kernel_base.is_multiple_of(PAGE_SIZE) && kernel_base >= heap_base(),
-        "shared backing {:#x}, heap starts {:#x}", kernel_base, heap_base());
-    assert!(count.checked_mul(PAGE_SIZE).and_then(|len| kernel_base.checked_add(len))
-        .is_some_and(|end| end <= HEAP_END));
-    for i in 0..count {
-        let physical = physical_page(kernel_base + i * PAGE_SIZE);
-        map_user_page_phys(vpage + i, physical, flags::FOREIGN);
-    }
-}
-
-/// Physical page base of the shared VGA text aperture (0xB8000-0xBFFFF: 8 pages
-/// of real RAM), allocated once on first call. On a UEFI/GOP machine the legacy
-/// physical 0xB8000 region is unbacked (reads 0xFF), so it cannot serve as the
-/// text screen; this is the dedicated RAM that does. The kernel low-mem window
-/// and every DOS process's guest 0xB8000 are both mapped to these pages, giving
-/// one shared text screen — the emulated equivalent of VGA hardware's video RAM.
-static mut VGA_APERTURE: u64 = 0;
-/// Kernel donates permanent backing; arch only installs its mappings.
-pub fn set_vga_text_aperture(page: u64) {
-    assert!(page != 0);
-    unsafe { let current = VGA_APERTURE; assert_eq!(current, 0); VGA_APERTURE = page; }
-}
-pub fn vga_text_aperture_ppage() -> u64 {
-    let page = unsafe { VGA_APERTURE };
-    assert!(page != 0, "kernel did not supply VGA backing");
-    page
-}
-
-/// Map the current process's VGA color-text aperture (guest 0xB8000-0xBFFFF, 8
-/// pages) onto the shared text aperture, so it writes the one screen the kernel
-/// console + every DOS process share. Unlike the graphics/mono region (which is
-/// per-process via `map_fresh_range`), this is shared and NOT zeroed — on-screen
-/// text (the boot log, a prior program's output) persists, exactly as VGA-text
-/// hardware leaves the shared video RAM intact across programs.
-pub fn map_vga_text_aperture_user() {
-    let ap = vga_text_aperture_ppage();
-    for i in 0..8usize {
-        // Cacheable — this is RAM we allocated, not a card's MMIO — but FOREIGN,
-        // because the same frames are mapped into the kernel window and every
-        // other DOS process: no space may free or copy-on-write them.
-        map_user_page_phys(0xB8000 / PAGE_SIZE + i, ap + i as u64, flags::FOREIGN);
-    }
-}
-
-/// Allocate a physical page, fill it with `data` (zero-padded to PAGE_SIZE),
-/// and map it at user virtual page `page_idx` (writable, user-accessible).
-#[allow(dead_code)]
-pub fn map_user_page(page_idx: usize, data: &[u8]) {
-    assert!(data.len() <= PAGE_SIZE);
-    let saved = fresh_temp_page();
-    unsafe {
-        let tp = &raw mut TEMP_PAGE;
-        let dst = (*tp).0.as_mut_ptr();
-        core::ptr::write_bytes(dst, 0, PAGE_SIZE);
-        core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
-    }
-    let phys = temp_swap(saved);
-    match entries() {
-        Entries::E32(e) => replace_mapping(&mut e[page_idx], Entry32::new(phys, true, true)),
-        Entries::E64(e) => replace_mapping(&mut e[page_idx], Entry64::new(phys, true, true)),
-    }
-    flush_tlb();
-}
-
-/// Set A20 gate state for VM86 mode.
-/// When disabled (default): virtual 0x100000-0x10FFFF → physical 0x00000-0x0FFFF (wrap)
-/// When enabled: virtual 0x100000-0x10FFFF → the thread's saved HMA mappings.
-/// Copy page table entries from src range to dst range.
-pub fn copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
-    match entries() {
-        Entries::E32(e) => { for i in 0..count {
-            let incoming = retain_mapping(e[src_vpage + i]);
-            replace_mapping(&mut e[dst_vpage + i], incoming);
-        }}
-        Entries::E64(e) => { for i in 0..count {
-            let incoming = retain_mapping(e[src_vpage + i]);
-            replace_mapping(&mut e[dst_vpage + i], incoming);
-        }}
-    }
-    flush_tlb();
-}
-
-/// Redirect all aliases of a physical range onto per-address-space shadow
-/// pages, or restore exactly the aliases marked by the redirect. The recursive
-/// walk is deliberately below DOS/DPMI: physical identity, not the API which
-/// created a mapping, determines whether it follows the device ownership.
-pub fn redirect_physical_aliases(
-    physical_ppage: u64,
-    shadow_vpage: usize,
-    count: usize,
-    redirect: bool,
-) {
-    match entries() {
-        Entries::E32(e) => redirect_physical_aliases_generic(
-            e, physical_ppage, shadow_vpage, count, redirect),
-        Entries::E64(e) => redirect_physical_aliases_generic(
-            e, physical_ppage, shadow_vpage, count, redirect),
-    }
-    flush_tlb();
-}
-
-fn redirect_physical_aliases_generic<E: Entry>(
-    entries: &mut [E],
-    physical_ppage: u64,
-    shadow_vpage: usize,
-    count: usize,
-    redirect: bool,
-) {
-    let shadow: alloc::vec::Vec<E> = (0..count)
-        .map(|i| entries[shadow_vpage + i])
-        .collect();
-    let root = root_base();
-    let user_count = recursive_idx() - root;
-    for i in 0..user_count {
-        let idx = root + i;
-        if entries[idx].present() {
-            redirect_aliases_subtree(
-                entries, idx, physical_ppage, shadow_vpage, &shadow, redirect);
-        }
-    }
-}
-
-fn redirect_aliases_subtree<E: Entry>(
-    entries: &mut [E],
-    idx: usize,
-    physical_ppage: u64,
-    shadow_vpage: usize,
-    shadow: &[E],
-    redirect: bool,
-) {
-    if idx >= PAGE_TABLE_BASE_IDX {
-        let child_base = (idx - PAGE_TABLE_BASE_IDX) * entries_per_page::<E>();
-        for child in child_base..child_base + entries_per_page::<E>() {
-            if entries[child].present() {
-                redirect_aliases_subtree(
-                    entries, child, physical_ppage, shadow_vpage, shadow, redirect);
-            }
-        }
-        return;
-    }
-
-    if (shadow_vpage..shadow_vpage + shadow.len()).contains(&idx) {
-        return;
-    }
-    let old = entries[idx];
-    let offset = if redirect {
-        old.page().checked_sub(physical_ppage)
-            .filter(|offset| (*offset as usize) < shadow.len())
-            .map(|offset| offset as usize)
-    } else if old.raw() & flags::REDIRECTED_ALIAS != 0 {
-        shadow.iter().position(|entry| entry.present() && entry.page() == old.page())
-    } else {
-        None
-    };
-    let Some(offset) = offset else { return };
-    if redirect && !shadow[offset].present() {
-        return;
-    }
-
-    let page = if redirect { shadow[offset].page() } else { physical_ppage + offset as u64 };
-    let mut incoming = old;
-    incoming.set_raw((old.raw() & !E::ADDR_MASK) | (page << 12));
-    incoming.set_flag(flags::REDIRECTED_ALIAS, redirect);
-    if redirect {
-        let incoming = retain_mapping(incoming);
-        replace_mapping(&mut entries[idx], incoming);
-    } else {
-        replace_mapping(&mut entries[idx], incoming);
-    }
-}
-
-/// Swap page table entries between two ranges (no refcount changes).
-pub fn swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
-    match entries() {
-        Entries::E32(e) => {
-            for i in 0..count {
-                e.swap(a_vpage + i, b_vpage + i);
-            }
-        }
-        Entries::E64(e) => {
-            for i in 0..count {
-                e.swap(a_vpage + i, b_vpage + i);
-            }
-        }
-    }
-    flush_tlb();
-}
-
-/// Clear page entries to absent (enables demand paging on next access).
-pub fn unmap_range(base_page: usize, num_pages: usize) {
-    match entries() {
-        Entries::E32(e) => {
-            for i in 0..num_pages {
-                replace_mapping(&mut e[base_page + i], Entry32::default());
-            }
-        }
-        Entries::E64(e) => {
-            for i in 0..num_pages {
-                replace_mapping(&mut e[base_page + i], Entry64::default());
-            }
-        }
-    }
-    flush_tlb();
-}
-
-
-/// Replace a range with fresh anonymous user-RW frames. Owned (non-MMIO)
-/// frames currently mapped are freed first; cache-disabled / externally-
-/// owned pages (an aliased DMA buffer) are left intact.
-pub fn map_fresh_range(base_page: usize, num_pages: usize) {
-    let zero = physical_page(&crate::ZERO_PAGE as *const _ as usize);
-    match entries() {
-        Entries::E32(e) => for i in 0..num_pages {
-            replace_mapping(&mut e[base_page + i], Entry32::new(zero, false, true));
-        },
-        Entries::E64(e) => for i in 0..num_pages {
-            replace_mapping(&mut e[base_page + i], Entry64::new(zero, false, true));
-        },
-    }
-    flush_tlb();
-    // First writes fault and consume the per-core reserve, including tables.
-    for i in 0..num_pages {
-        unsafe { core::ptr::write_bytes(((base_page + i) * PAGE_SIZE) as *mut u8, 0, PAGE_SIZE); }
-    }
 }
 
 /// Harden kernel memory permissions
@@ -2433,26 +2069,6 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
 
     invalidate_tlb();
     lib::compact_println!("Kernel hardening complete");
-}
-
-/// Map owned RAM without a permanent kernel alias. Private mappings own a
-/// counted COW reference; shared mappings borrow the cache's pinned ownership.
-pub(crate) fn map_frame(vpage: usize, frame: u64, shared: bool, writable: bool, executable: bool) -> bool {
-    if vpage >= 0xc0000000 / PAGE_SIZE { return false; }
-    if !shared && !crate::memory::inc_shared_count(frame) { return false; }
-    fn map<E: Entry>(entries: &mut [E], vpage: usize, frame: u64, shared: bool, writable: bool, executable: bool) {
-        let mut entry = E::new(frame, shared && writable, true);
-        entry.set_writable(writable);
-        entry.set_no_execute(!executable);
-        entry.set_flag(flags::FOREIGN, shared);
-        replace_mapping(&mut entries[vpage], entry);
-    }
-    match entries() {
-        Entries::E32(e) => map(e, vpage, frame, shared, writable, executable),
-        Entries::E64(e) => map(e, vpage, frame, shared, writable, executable),
-    }
-    crate::x86::invlpg(vpage * PAGE_SIZE);
-    true
 }
 
 /// Make page-table pages private; leave read-only data frames COW-shared.

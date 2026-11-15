@@ -21,6 +21,7 @@ def main():
         subprocess.run(['mkfs.ext4', '-q', '-F', '-d', str(tree), str(data)], check=True)
         boot = prepare_boot(work, data, '[environment]\nTEST=/probe\n')
         log = ROOT / 'build/ci/xmm-context.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
         with log.open('w') as output:
             process = subprocess.Popen(['qemu-system-x86_64', '-accel', 'kvm', '-cpu', 'host',
                 '-m', '256', '-display', 'none', '-serial', 'none', '-no-reboot', '-nic', 'none',

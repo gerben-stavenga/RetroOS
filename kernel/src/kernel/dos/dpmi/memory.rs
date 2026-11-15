@@ -88,9 +88,9 @@ mod tests {
 
     impl Backing for Pool {
         fn free_page_count(&self) -> usize { self.free }
-        fn map_fresh_range(&mut self, _base: usize, count: usize) { self.free -= count; }
-        fn unmap_range(&mut self, _base: usize, count: usize) { self.free += count; }
-        fn swap_page_entries(&mut self, _from: usize, _to: usize, _count: usize) {}
+        fn allocate_pages(&mut self, _base: usize, count: usize) { self.free -= count; }
+        fn discard_pages(&mut self, _base: usize, count: usize) { self.free += count; }
+        fn swap_pages(&mut self, _from: usize, _to: usize, _count: usize) {}
     }
 
     #[test]

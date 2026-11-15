@@ -38,16 +38,16 @@ pub enum Error { BadSize, NoLinear, NoPhysical, NoSlots, BadHandle }
 /// the metal/interpreter page-table implementations.
 pub trait Backing {
     fn free_page_count(&self) -> usize;
-    fn map_fresh_range(&mut self, base: usize, count: usize);
-    fn unmap_range(&mut self, base: usize, count: usize);
-    fn swap_page_entries(&mut self, from: usize, to: usize, count: usize);
+    fn allocate_pages(&mut self, base: usize, count: usize);
+    fn discard_pages(&mut self, base: usize, count: usize);
+    fn swap_pages(&mut self, from: usize, to: usize, count: usize);
 }
 
 impl<A: crate::Arch> Backing for A {
-    fn free_page_count(&self) -> usize { crate::Arch::free_page_count(self) }
-    fn map_fresh_range(&mut self, base: usize, count: usize) { crate::Arch::map_fresh_range(self, base, count); }
-    fn unmap_range(&mut self, base: usize, count: usize) { crate::Arch::unmap_range(self, base, count); }
-    fn swap_page_entries(&mut self, from: usize, to: usize, count: usize) { crate::Arch::swap_page_entries(self, from, to, count); }
+    fn free_page_count(&self) -> usize { arch_abi::Memory::free_page_count(self) }
+    fn allocate_pages(&mut self, base: usize, count: usize) { crate::kernel::memory::fresh(self, base, count); }
+    fn discard_pages(&mut self, base: usize, count: usize) { crate::kernel::memory::reset(self, base, count); }
+    fn swap_pages(&mut self, from: usize, to: usize, count: usize) { crate::kernel::memory::swap(self, from, to, count); }
 }
 
 pub struct DosMemory {
@@ -111,7 +111,7 @@ impl DosMemory {
         let index = self.blocks.iter().position(|b| b.owner == owner && b.base == base)
             .ok_or(Error::BadHandle)?;
         let block = self.blocks.swap_remove(index);
-        machine.unmap_range((block.base / PAGE) as usize, (block.size / PAGE) as usize);
+        machine.discard_pages((block.base / PAGE) as usize, (block.size / PAGE) as usize);
         Ok(())
     }
 
@@ -120,7 +120,7 @@ impl DosMemory {
         while index < self.blocks.len() {
             if self.blocks[index].owner == owner {
                 let block = self.blocks.swap_remove(index);
-                machine.unmap_range((block.base / PAGE) as usize, (block.size / PAGE) as usize);
+                machine.discard_pages((block.base / PAGE) as usize, (block.size / PAGE) as usize);
             } else {
                 index += 1;
             }
@@ -144,7 +144,7 @@ impl DosMemory {
         let old = self.blocks[index];
         if size == old.size { return Ok(old); }
         if size < old.size {
-            machine.unmap_range(((old.base + size) / PAGE) as usize, ((old.size - size) / PAGE) as usize);
+            machine.discard_pages(((old.base + size) / PAGE) as usize, ((old.size - size) / PAGE) as usize);
             self.blocks[index].size = size;
             return Ok(self.blocks[index]);
         }
@@ -163,7 +163,7 @@ impl DosMemory {
         };
         commit(machine, new_base + old.size, growth)?;
         if new_base != old.base {
-            machine.swap_page_entries(
+            machine.swap_pages(
                 (old.base / PAGE) as usize,
                 (new_base / PAGE) as usize,
                 (old.size / PAGE) as usize,
@@ -230,7 +230,7 @@ fn commit<A: Backing>(machine: &mut A, base: u32, size: u32) -> Result<(), Error
     let pages = (size / PAGE) as usize;
     let needed = pages + table_pages(pages) + HOST_RESERVE;
     if needed > machine.free_page_count() { return Err(Error::NoPhysical); }
-    machine.map_fresh_range((base / PAGE) as usize, pages);
+    machine.allocate_pages((base / PAGE) as usize, pages);
     Ok(())
 }
 
@@ -250,19 +250,19 @@ mod tests {
 
     impl Backing for Pool {
         fn free_page_count(&self) -> usize { self.free }
-        fn map_fresh_range(&mut self, base: usize, count: usize) {
+        fn allocate_pages(&mut self, base: usize, count: usize) {
             for page in base..base + count {
                 assert!(self.pages.insert(page, 0).is_none());
             }
             self.free -= count;
         }
-        fn unmap_range(&mut self, base: usize, count: usize) {
+        fn discard_pages(&mut self, base: usize, count: usize) {
             for page in base..base + count {
                 assert!(self.pages.remove(&page).is_some());
             }
             self.free += count;
         }
-        fn swap_page_entries(&mut self, from: usize, to: usize, count: usize) {
+        fn swap_pages(&mut self, from: usize, to: usize, count: usize) {
             for offset in 0..count {
                 let value = self.pages.remove(&(from + offset)).unwrap();
                 assert!(self.pages.insert(to + offset, value).is_none());

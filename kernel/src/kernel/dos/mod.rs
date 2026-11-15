@@ -1196,23 +1196,13 @@ fn handle_event_inner<A: crate::Arch>(
 }
 
 
-/// Load a DOS binary (.COM or .EXE) and initialize the thread for VM86 mode.
-/// Back the legacy VGA memory window (0xA0000-0xBFFFF) with fresh RAM when the
-/// display is the GOP framebuffer rather than a real VGA card.
-///
-/// `map_low_mem` identity-maps that window to the physical legacy aperture,
-/// which a real card backs (and DOS writes there drive the screen). But on a
-/// UEFI machine with no legacy-VGA-backed RAM, the GPU decodes the window yet
-/// stores nothing — reads return 0xFF — so the emulated VGA's text buffer
-/// (0xB8000) and mode-13h/graphics buffer (0xA0000) never retain what the guest
-/// writes, and `display_tick` renders 0xFF (a white screen). Fresh RAM makes the
-/// emulated VGA's memory actually hold data; the kernel renders it to the GOP
-/// framebuffer itself. The planar trap re-maps 0xA0000 as it arms/disarms.
+/// Give a new DOS VGA its own graphics RAM and the managed text backing.
+/// Focus attachment later materializes the virtual device on hardware.
 fn back_vga_window_if_emulated<A: crate::Arch>(machine: &mut A) {
     // Every new DOS VGA starts detached, even on a machine that has a card.
     // Focus attachment later materializes this RAM-backed device on hardware.
-    machine.map_fresh_range(0xA0000 >> 12, 0x18000 >> 12);
-    machine.map_vga_text_aperture();
+    crate::kernel::memory::fresh(machine, 0xA0000 >> 12, 0x18000 >> 12);
+    crate::kernel::memory::map_text_screen(machine);
 }
 
 /// COW source for top-level DOS worlds. It contains only the Rust substitute
@@ -1237,14 +1227,12 @@ impl<A: crate::Arch> DosTemplate<A> {
     }
 
     fn activate_clone(&mut self, machine: &mut A) {
-        let previous = machine.activate(
-            core::mem::take(&mut self.vcpu.space),
-            &mut self.fx,
-            core::ptr::null_mut(),
-        );
+        machine.switch_fx(&mut self.fx);
+        let previous = machine.activate(core::mem::take(&mut self.vcpu.space));
         let mut child = A::PageTable::default();
         crate::kernel::memory::fork(machine, &mut child);
-        self.vcpu.space = machine.activate(child, &mut self.fx, core::ptr::null_mut());
+        machine.switch_fx(&mut self.fx);
+        self.vcpu.space = machine.activate(child);
         let mut previous = previous;
         machine.destroy_space(&mut previous);
     }
@@ -1253,45 +1241,9 @@ impl<A: crate::Arch> DosTemplate<A> {
 /// Construct the kernel's pristine real-mode BIOS/DOS-low-memory template.
 /// This is called exactly once; top-level DOS worlds COW-clone the result.
 pub(crate) fn initialize_dos_template<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
-    crate::kernel::memory::map_low_mem(machine);
+    crate::kernel::memory::map_dos_memory(machine);
     back_vga_window_if_emulated(machine);
     dos::setup_ivt(machine, regs);
-}
-
-/// Point a cleared register set at a two-instruction kernel video-BIOS thunk:
-/// `INT 10h; INT 31h`. The native workspace predates the substitute stub
-/// array, so both instructions are written explicitly into its private driver
-/// address space.
-pub(crate) fn prepare_bios_int10<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
-    const THUNK_SLOT: u8 = 0xFE;
-    let thunk = (usize::from(dos::STUB_SEG) << 4) + usize::from(dos::slot_offset(THUNK_SLOT));
-    machine.write::<[u8; 4]>(thunk, [0xCD, 0x10, 0xCD, 0x31]);
-    *regs = Regs::empty();
-    regs.frame = crate::Frame64 {
-        rip: dos::slot_offset(THUNK_SLOT) as u64,
-        cs: dos::STUB_SEG as u64,
-        rflags: machine::vm86_entry_flags(machine::IOPL_DEFAULT) as u64,
-        rsp: (dos::rm_stack_align_offset() as u32 + dos::rm_stack_size()) as u64,
-        ss: dos::rm_stack_seg() as u64,
-    };
-}
-
-pub(crate) fn bios_thunk_returned(
-    regs: &Regs,
-    event: &crate::KernelEvent,
-    return_ip: u32,
-) -> bool {
-    matches!(event, crate::KernelEvent::SoftInt(0x31))
-        && regs.code_seg() == dos::STUB_SEG
-        && regs.ip32() == return_ip
-}
-
-pub(crate) fn bios_int10_returned(regs: &Regs, event: &crate::KernelEvent) -> bool {
-    bios_thunk_returned(regs, event, bios_int10_return_ip())
-}
-
-pub(crate) const fn bios_int10_return_ip() -> u32 {
-    dos::slot_offset(0xFF) as u32 + 2
 }
 
 /// Handles full address space setup: clean + low mem + IVT + binary load + thread init.
@@ -1302,7 +1254,7 @@ pub(crate) const fn bios_int10_return_ip() -> u32 {
 pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, policy: LaunchPolicy, vga: DosVideo) {
     let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
-    crate::kernel::memory::map_low_mem(machine);
+    crate::kernel::memory::map_dos_memory(machine);
     // The virtual-IF exit map (dpmi::vif) is owned by the DPMI client and made
     // fresh at each `dpmi_enter`, so a new address space starts with an empty
     // one — no global clear needed.
@@ -1766,6 +1718,9 @@ pub fn audio_service<A: crate::Arch>(
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
 pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+    // Recompute VIP from the DOS PIC at this delivery boundary. Deferred
+    // continuations and callbacks must not inherit a stale pending indication.
+    regs.clear_flag32(1 << 20);
     // The host tick only wakes the event loop. A guest-programmed one-shot
     // may expire between ticks, including while an I/O handler runs. Latch
     // that edge before deciding which interrupt the next guest entry sees.
@@ -1793,7 +1748,7 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // way. Only this slot is deferred: every other stub trap is a legitimate
     // delivery point, and deferring them all starves delivery outright on
     // the interp (post-execute boundaries during INT-21h-heavy phases are
-    // always at some stub). The vPIC keeps the line latched; delivery
+    // always at some stub). The vPIC retains the request; delivery
     // happens at the next boundary, once the unwind has resumed real code.
     let resume_park_ip = dos::ctrl_slot_off(dos::SLOT_RESUME_CONTINUATION) as u32;
     let at_resume_park = if regs.mode() == crate::UserMode::VM86 {
@@ -1803,16 +1758,6 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
             && regs.ip32() == resume_park_ip
     };
     if at_resume_park {
-        // Drop the INTR line for this instant instead of leaving it asserted:
-        // the interp stops at a block boundary BEFORE the park's CD 31
-        // executes whenever the line is up and the guest is interruptible, so
-        // deferral + an asserted line re-stops at the same PC with zero
-        // progress, forever (Jazz Jackrabbit hung this way the moment a
-        // keystroke landed mid-chain: guest parked at 0000:0504, keyboard IRQ
-        // pending, block hook re-firing). The vpic still latches the request;
-        // the CD 31 traps within one instruction and the next raise_pending —
-        // guest no longer at the park — re-asserts the line and delivers.
-        machine.set_irq_line(false);
         return;
     }
     // Mouse-callback dispatch (INT 33h AX=000Ch / Function 12), not a
@@ -1836,10 +1781,7 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
         IN_HW_IRQ_CONTEXT.store(true, core::sync::atomic::Ordering::Relaxed);
         mode_transitions::deliver_pm_irq(machine, dos, regs, vec);
     }
-    // Keep the interpreter's CPU INTR line coherent with what's still pending so
-    // its per-block interrupt check keeps firing until everything is delivered
-    // (no-op on metal, where the real 8259 drives INTR).
-    machine.set_irq_line(dos.pc.intr_pending());
+
 }
 
 // ── Block-allocator helpers used by INT 21h handlers in `dos.rs` ────────

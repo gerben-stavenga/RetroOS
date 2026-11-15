@@ -74,7 +74,7 @@ pub(crate) fn load_elf_source<A: crate::Arch>(machine: &mut A, elf_data: &[u8], 
     let sample = crate::kernel::event_profile::file_io_start();
     let mut allocated = 0;
     for (start, end) in ranges {
-        machine.map_fresh_range(start, end - start);
+        crate::kernel::memory::fresh(machine, start, end - start);
         allocated += (end - start) * PAGE_SIZE;
     }
     crate::kernel::event_profile::file_io_finish(6, allocated, sample);
@@ -145,7 +145,7 @@ pub(crate) fn load_elf_source<A: crate::Arch>(machine: &mut A, elf_data: &[u8], 
             let end_page = (vaddr + seg.memsz).div_ceil(PAGE_SIZE);
             let count = end_page - start_page;
             if count > 0 {
-                machine.set_page_flags(start_page, count, seg.is_writable(), executable_pass);
+                crate::kernel::memory::protect(machine, start_page, count, seg.is_writable(), executable_pass);
             }
         }
     }

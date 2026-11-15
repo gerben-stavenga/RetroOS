@@ -57,6 +57,7 @@ fn prepare_startup<A: crate::Arch>(
     boot: &crate::BootConfig,
     out: &mut core::mem::MaybeUninit<StartupState<A>>,
 ) {
+    super::platform::init_user_tsc_clock(boot.user_tsc_clock);
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
@@ -294,7 +295,7 @@ fn prepare_audio<A: crate::Arch>(
         // polls DMA position, so routing its completion line would create a
         // wakeup and acknowledgement path with no accounting purpose.
         if matches!(platform.audio, crate::kernel::platform::Audio::NativeSb) {
-            machine.route_isa_irq(card.irq);
+            machine.isa_enable_irq(card.irq);
             crate::compact_println!("Audio: SB IRQ{} routed", card.irq);
         }
 
@@ -1511,7 +1512,7 @@ fn event_loop<A: crate::Arch>(
         let prelude_sample = super::event_profile::FileIoScope::start(super::event_profile::LOOP_PRELUDE, 0);
         let world_now_ns = machine.now();
         if !hardware_initialized || hardware_deadline.is_some_and(|end| end <= world_now_ns) {
-            hardware_deadline = machine.poll_timed_devices(world_now_ns);
+            hardware_deadline = crate::kernel::drivers::xhci::poll_deadline(world_now_ns);
             hardware_initialized = true;
         }
         let network_active = crate::kernel::net::needs_poll();
@@ -1530,7 +1531,7 @@ fn event_loop<A: crate::Arch>(
         // Audio DMA and legacy VGA read resident device storage independently.
         super::media::kernel_entry();
         crate::kernel::linux::reap_waited_child(machine, threads, ctx.tid);
-        crate::kernel::linux::refresh_system_tasks(threads, ctx.tid, machine.get_ticks());
+        crate::kernel::linux::refresh_system_tasks(threads, ctx.tid, machine.now() / 1_000_000);
         if display.is_none() {
             windows.release_output_buffers();
         }
@@ -1541,7 +1542,7 @@ fn event_loop<A: crate::Arch>(
         }
         drop(prelude_sample);
         stats.slice_begin(machine);
-        pending_events.drain(machine);
+        pending_events.drain();
         stats.part(machine, PROFILE_IRQ);
         let events = &mut pending_events.events;
         // RX IRQs wake the diagnostic UART; injected keys have a service deadline.
@@ -1911,10 +1912,7 @@ fn event_loop<A: crate::Arch>(
                     &mut windows,
                 ),
                 None => {
-                    let alarm_sample = super::event_profile::FileIoScope::start(super::event_profile::ALARM_ARM, 0);
-                    machine.arm_alarm(deadlines.next());
-                    drop(alarm_sample);
-                    stats.idle(machine);
+                    stats.idle(machine, deadlines.next());
                 },
             }
             continue;
@@ -1931,10 +1929,8 @@ fn event_loop<A: crate::Arch>(
             {
                 // Hosted execution normally supplies clock wakeups on return
                 // from a guest slice. There is no slice while pacing it.
-                let alarm_sample = super::event_profile::FileIoScope::start(super::event_profile::ALARM_ARM, 0);
-                machine.arm_alarm(deadlines.next());
-                drop(alarm_sample);
-                stats.idle(machine);
+
+                stats.idle(machine, deadlines.next());
                 continue;
             }
             now
@@ -1955,9 +1951,6 @@ fn event_loop<A: crate::Arch>(
             } else if threads[ctx.tid].personality.timer_due(machine.now()) {
                 crate::KernelEvent::Irq
             } else {
-                let alarm_sample = super::event_profile::FileIoScope::start(super::event_profile::ALARM_ARM, 0);
-                machine.arm_alarm(loan_deadline);
-                drop(alarm_sample);
                 parallel.execute(machine, threads, &mut ctx, bios_workspace, loan_deadline.unwrap())
             };
             let peers_pending = threads.iter().any(|task| task.kernel.pending_event.is_some());
@@ -2160,7 +2153,7 @@ fn apply_sound_mode_request<A: crate::Arch>(
         SoundModeRequest::Native => {
             if let Some(hda) = sink.as_mut().filter(|sink| sink.is_hda()) {
                 let Some(card) = hda.take_parked_sb() else { return; };
-                machine.route_isa_irq(card.irq);
+                machine.isa_enable_irq(card.irq);
                 *sb_handoff = match thread::get_thread(threads, tid) {
                     Some(thread) => thread.personality.adopt_sb(machine, Some(card)),
                     None => Some(card),
@@ -2180,7 +2173,7 @@ fn apply_sound_mode_request<A: crate::Arch>(
                 };
                 let card = hda.take_parked_sb().expect("SB sink carried its card");
                 *sink = Some(hda);
-                machine.route_isa_irq(card.irq);
+                machine.isa_enable_irq(card.irq);
                 *sb_handoff = match thread::get_thread(threads, tid) {
                     Some(thread) => thread.personality.adopt_sb(machine, Some(card)),
                     None => Some(card),
@@ -2191,7 +2184,7 @@ fn apply_sound_mode_request<A: crate::Arch>(
             let Some(card) = sink.take().and_then(crate::kernel::sound::Sink::into_sb) else {
                 return;
             };
-            machine.route_isa_irq(card.irq);
+            machine.isa_enable_irq(card.irq);
             *sb_handoff = match thread::get_thread(threads, tid) {
                 Some(thread) => thread.personality.adopt_sb(machine, Some(card)),
                 None => Some(card),
@@ -2908,7 +2901,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             core::mem::take(&mut parent.kernel.vcpu.space)
         };
         let discarded_child =
-            machine.activate(parent_space, core::ptr::null_mut(), core::ptr::null_mut());
+            machine.activate(parent_space);
         {
             let child = thread::get_thread(threads, child_tid).unwrap();
             child.kernel.vcpu.space = discarded_child;
@@ -3101,7 +3094,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     };
     if suspended {
         let space=core::mem::take(&mut thread::get_thread(threads,parent_tid).unwrap().kernel.vcpu.space);
-        let child_space=machine.activate(space,core::ptr::null_mut(),core::ptr::null_mut());
+        let child_space=machine.activate(space);
         let child=thread::get_thread(threads,child_tid).unwrap();
         child.kernel.vcpu.space=child_space;
         for fd in 3..thread::MAX_FDS { child.kernel.close_fd(fd); }
@@ -3629,8 +3622,8 @@ impl EventStats {
         self.active = false;
     }
 
-    fn new<A: crate::Arch>(machine: &mut A) -> Self {
-        let now = machine.rdtsc();
+    fn new<A: crate::Arch>(_machine: &mut A) -> Self {
+        let now = crate::kernel::event_profile::cycles();
         Self {
             active: false,
             last_tsc: now,
@@ -3649,7 +3642,7 @@ impl EventStats {
             self.active = false;
             return;
         }
-        let now = machine.rdtsc();
+        let now = crate::kernel::event_profile::cycles();
         let reset = PROFILE_RESET.swap(false, core::sync::atomic::Ordering::Relaxed);
         if self.active && !reset {
             self.kernel_cycles[PROFILE_SCHEDULER] = self.kernel_cycles[PROFILE_SCHEDULER]
@@ -3680,18 +3673,19 @@ impl EventStats {
             stopped_ns: self.started_ns.saturating_add(elapsed_ns), cycles }
     }
 
-    fn idle<A: crate::Arch>(&mut self, machine: &mut A) {
-        if !self.active { machine.idle(); return; }
-        let start = machine.rdtsc();
-        machine.idle();
-        self.idle_cycles = self.idle_cycles.wrapping_add(machine.rdtsc().wrapping_sub(start));
+    fn idle<A: crate::Arch>(&mut self, machine: &mut A, deadline: Option<u64>) {
+        let max_time = core::time::Duration::from_nanos(deadline.map_or(1_000_000, |end| end.saturating_sub(machine.now())).min(1_000_000));
+        if !self.active { machine.idle(max_time); return; }
+        let start = crate::kernel::event_profile::cycles();
+        machine.idle(max_time);
+        self.idle_cycles = self.idle_cycles.wrapping_add(crate::kernel::event_profile::cycles().wrapping_sub(start));
     }
 
-    fn mark<A: crate::Arch>(&mut self, machine: &mut A, bucket: usize) {
+    fn mark<A: crate::Arch>(&mut self, _machine: &mut A, bucket: usize) {
         if !self.active {
             return;
         }
-        let now = machine.rdtsc();
+        let now = crate::kernel::event_profile::cycles();
         if PROFILE_REBASE.swap(false, core::sync::atomic::Ordering::Relaxed) {
             self.last_tsc = now;
             return;
@@ -3711,7 +3705,7 @@ impl EventStats {
 
     fn post_run<A: crate::Arch>(
         &mut self,
-        machine: &mut A,
+        _machine: &mut A,
         _event: &crate::KernelEvent,
         _regs: &Regs,
         device_cycles: u64,
@@ -3720,7 +3714,7 @@ impl EventStats {
         if !self.active {
             return;
         }
-        let now = machine.rdtsc();
+        let now = crate::kernel::event_profile::cycles();
         let elapsed = now.wrapping_sub(self.last_tsc);
         let device_cycles = device_cycles.min(elapsed);
         let parallel_cycles = parallel_cycles.min(elapsed - device_cycles);

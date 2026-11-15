@@ -24,7 +24,7 @@ const READ_DETAIL_SLOTS: usize = 64;
 static mut READ_DETAILS: [(u16, u64, u64); READ_DETAIL_SLOTS] = [(0, 0, 0); READ_DETAIL_SLOTS];
 // calls, RM-call setup, DOS vector dispatch, continuation unwind.
 static mut DIRECT_RM_PHASES: [u64; 4] = [0; 4];
-pub(super) const FILE_IO_NAMES: [&str; 50] = ["read_allocate", "read_fetch", "read_copy", "mmap_zero", "mmap_read", "mmap_copy", "elf_allocate", "elf_read", "elf_copy", "ext4_read", "volume_read", "vfs_lock", "vfs_read", "cache_check", "cache_miss", "elf_seek", "cache_insert", "pipe_wait", "pipe_allocate", "disk_read", "disk_write", "disk_flush", "volume_flush", "smb_send", "smb_receive", "smb_sign", "smb_verify", "smb_response_allocate", "smb_read_decode", "smb_encode", "ext4_create", "ext4_set_meta", "ext4_mkdir", "ext4_commit_write", "ext4_unlink", "ext4_rmdir", "ext4_fsync", "ext4_resize", "directory_scan", "path_resolve", "write_permission", "loop_writeback", "loop_klog_sync", "loop_deadlines", "task_snapshot", "loop_network", "write_refresh", "rtc_read", "loop_prelude", "alarm_arm"];
+pub(super) const FILE_IO_NAMES: [&str; 49] = ["read_allocate", "read_fetch", "read_copy", "mmap_zero", "mmap_read", "mmap_copy", "elf_allocate", "elf_read", "elf_copy", "ext4_read", "volume_read", "vfs_lock", "vfs_read", "cache_check", "cache_miss", "elf_seek", "cache_insert", "pipe_wait", "pipe_allocate", "disk_read", "disk_write", "disk_flush", "volume_flush", "smb_send", "smb_receive", "smb_sign", "smb_verify", "smb_response_allocate", "smb_read_decode", "smb_encode", "ext4_create", "ext4_set_meta", "ext4_mkdir", "ext4_commit_write", "ext4_unlink", "ext4_rmdir", "ext4_fsync", "ext4_resize", "directory_scan", "path_resolve", "write_permission", "loop_writeback", "loop_klog_sync", "loop_deadlines", "task_snapshot", "loop_network", "write_refresh", "rtc_read", "loop_prelude"];
 pub(super) const LOOP_WRITEBACK: usize = 41;
 pub(super) const LOOP_KLOG_SYNC: usize = 42;
 pub(super) const LOOP_DEADLINES: usize = 43;
@@ -33,7 +33,6 @@ pub(super) const LOOP_NETWORK: usize = 45;
 pub(super) const WRITE_REFRESH: usize = 46;
 pub(super) const RTC_READ: usize = 47;
 pub(super) const LOOP_PRELUDE: usize = 48;
-pub(super) const ALARM_ARM: usize = 49;
 static mut FILE_IO: [[u64; 3]; FILE_IO_NAMES.len()] = [[0; 3]; FILE_IO_NAMES.len()];
 static mut FILE_IO_MAX: [u64; FILE_IO_NAMES.len()] = [0; FILE_IO_NAMES.len()];
 pub(super) fn file_io_max() -> [u64; FILE_IO_NAMES.len()] { unsafe { *core::ptr::addr_of!(FILE_IO_MAX) } }
@@ -282,15 +281,15 @@ pub(super) struct Sample(Option<u64>);
 pub(super) struct Dispatch(Option<(usize, u64, u64)>);
 
 impl Sample {
-    pub(super) fn start<A: Arch>(machine: &A) -> Self {
-        Self(super::startup::profile_enabled().then(|| machine.rdtsc()))
+    pub(super) fn start<A: Arch>(_machine: &A) -> Self {
+        Self(super::startup::profile_enabled().then(|| crate::kernel::event_profile::cycles()))
     }
 
     pub(super) fn returned<A: Arch>(
         self, machine: &A, event: &KernelEvent, regs: &Regs, personality: &Personality<A>,
     ) -> Dispatch {
         let Some(start) = self.0 else { return Dispatch(None) };
-        let run = machine.rdtsc().wrapping_sub(start);
+        let run = crate::kernel::event_profile::cycles().wrapping_sub(start);
         let site = match personality {
             Personality::Dos(dos) => super::dos::vif_profile_site(dos).unwrap_or(0),
             _ => 0,
@@ -336,7 +335,7 @@ impl Sample {
                     counter.key = key;
                     counter.cs = u32::from(regs.code_seg());
                     counter.ip = regs.ip32();
-                    return Dispatch(Some((index, run, machine.rdtsc())));
+                    return Dispatch(Some((index, run, crate::kernel::event_profile::cycles())));
                 }
             }
             OVERFLOW += 1;
@@ -346,9 +345,9 @@ impl Sample {
 }
 
 impl Dispatch {
-    pub(super) fn finish<A: Arch>(self, machine: &A) {
+    pub(super) fn finish<A: Arch>(self, _machine: &A) {
         let Some((index, run, start)) = self.0 else { return };
-        let elapsed = machine.rdtsc().wrapping_sub(start);
+        let elapsed = crate::kernel::event_profile::cycles().wrapping_sub(start);
         unsafe {
             let counter = &mut (&mut *core::ptr::addr_of_mut!(COUNTERS))[index];
             counter.calls += 1;
@@ -532,4 +531,14 @@ pub(super) fn top(limit: usize) -> alloc::vec::Vec<EventSummary> {
     counters.sort_unstable_by_key(|counter| core::cmp::Reverse(counter.6));
     counters.truncate(limit);
     counters
+}
+
+/// RDTSC is unprivileged; profiling reads it directly, in the same cycle units
+/// as the native execution counters. This is not the scheduler clock.
+#[inline]
+pub fn cycles() -> u64 {
+    #[cfg(target_arch = "x86")]
+    unsafe { core::arch::x86::_rdtsc() }
+    #[cfg(target_arch = "x86_64")]
+    unsafe { core::arch::x86_64::_rdtsc() }
 }

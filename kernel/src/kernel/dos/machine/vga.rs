@@ -124,7 +124,7 @@ impl EmulatedVga {
     ) -> FullscreenVga {
         // Native ownership means the complete VGA aperture is physical in the
         // incoming DOS address space, including B8000 text memory.
-        machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
+        crate::kernel::memory::map_physical(machine, 0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
         match &mut self.state {
             VgaState::Vbe(svga) => {
                 let svga = (**svga).clone();
@@ -166,7 +166,7 @@ impl EmulatedVga {
         machine: &mut A,
         native: crate::kernel::platform::NativeVga,
     ) -> FullscreenVga {
-        machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
+        crate::kernel::memory::map_physical(machine, 0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
         if self.svga_pages != 0 {
             discard_emulated_svga(machine, &mut self);
         }
@@ -219,7 +219,7 @@ impl FullscreenVga {
             Self::Emulated(vga, _) => {
                 materialize_emulated_aperture(vga, machine);
             }
-            Self::Native(_) => machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0),
+            Self::Native(_) => crate::kernel::memory::map_physical(machine, 0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0),
         }
     }
 
@@ -448,7 +448,7 @@ fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine:
     match &mut dev.state {
         VgaState::Legacy(state) => {
             let base = initialize_live_vram(machine, PLANES_LEN >> 12);
-            unsafe { machine.map_shared_pages(VGA_VRAM_BASE >> 12, base, PLANES_LEN >> 12); }
+            unsafe { crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, PLANES_LEN >> 12); }
             // An empty image means this device already resides in LiveVram.
             // `initialize_active_address_space` and the subsequent resume hook
             // may both bind it; rebinding must not erase the resident planes.
@@ -463,8 +463,8 @@ fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine:
             let pages = (svga.config.framebuffer_bytes as usize).div_ceil(crate::PAGE_SIZE);
             let base = initialize_live_vram(machine, pages);
             unsafe {
-                machine.map_shared_pages(VGA_VRAM_BASE >> 12, base, pages);
-                machine.map_shared_pages(SVGA_LFB_BASE >> 12, base, pages);
+                crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, pages);
+                crate::kernel::memory::map_shared_pages(machine, SVGA_LFB_BASE >> 12, base, pages);
             }
             dev.svga_pages = pages;
             if !dev.svga_vram.is_empty() {
@@ -472,7 +472,7 @@ fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine:
                 live_vram_mut(machine).range(0, bytes).copy_from(&dev.svga_vram[..bytes]);
                 dev.svga_vram.clear();
             }
-            machine.copy_page_entries(
+            crate::kernel::memory::alias(machine,
                 (SVGA_LFB_BASE >> 12)
                     + usize::from(svga.bank().map_or(0, |bank| bank)) * WINDOW_PAGES,
                 A0000 >> 12,
@@ -616,12 +616,12 @@ fn aperture_range(aperture: ::vga::CpuAperture) -> Option<::vga::ApertureRange> 
 fn install_aperture<A: crate::Arch>(machine: &mut A, aperture: ::vga::CpuAperture) {
     match aperture {
         ::vga::CpuAperture::None => {}
-        ::vga::CpuAperture::Direct { range, pages } => machine.copy_page_entries(
+        ::vga::CpuAperture::Direct { range, pages } => crate::kernel::memory::alias(machine,
             VGA_VRAM_BASE >> 12,
             usize::from(range.start_page),
             usize::from(pages.min(range.end_page - range.start_page)),
         ),
-        ::vga::CpuAperture::Trapped { range } => machine.map_phys_range(
+        ::vga::CpuAperture::Trapped { range } => crate::kernel::memory::map_physical(machine,
             usize::from(range.start_page),
             usize::from(range.end_page - range.start_page),
             0,
@@ -641,7 +641,7 @@ fn apply_aperture_write<A: crate::Arch>(machine: &mut A, write: ::vga::PortWrite
         if let (::vga::CpuAperture::Direct { range, pages: old_pages, .. },
                 ::vga::CpuAperture::Direct { pages: new_pages, .. }) =
             (write.old_aperture, write.new_aperture) && old_pages > new_pages {
-            machine.map_phys_range(
+            crate::kernel::memory::map_physical(machine,
                 usize::from(range.start_page + new_pages),
                 usize::from(old_pages - new_pages), 0, arch_abi::MAP_MMIO,
             );
@@ -652,7 +652,7 @@ fn apply_aperture_write<A: crate::Arch>(machine: &mut A, write: ::vga::PortWrite
     // When the decoded window moves, release the pages outside the new window
     // before installing its device view.
     if let Some(old) = aperture_range(write.old_aperture) {
-        machine.map_fresh_range(
+        crate::kernel::memory::fresh(machine,
             usize::from(old.start_page),
             usize::from(old.end_page - old.start_page),
         );
@@ -754,7 +754,7 @@ pub fn bios_set_font_map_select(device: &mut DosVideo, select: u8) {
 // ============================================================================
 // VESA SVGA. The framebuffer is the kernel-owned LiveVram store. A
 // real-mode guest reaches one 64 KB bank at a time through the 0xA0000 window,
-// which we *alias* onto the bank (shared frames via copy_page_entries) — guest
+// which we *alias* onto the bank (shared frames via typed mappings) — guest
 // writes land directly in the framebuffer, always coherent, no copy. A
 // protected-mode client reaches the same pages through RetroOS's fixed
 // PhysBasePtr. `display_tick` reads the permanent kernel mapping directly.
@@ -803,7 +803,7 @@ fn map_linear_vbe<A: crate::Arch>(
     let offset = mode.physical_base as usize & (crate::PAGE_SIZE - 1);
     let bytes = mode.framebuffer_bytes as usize;
     let pages = (offset + bytes).div_ceil(crate::PAGE_SIZE);
-    machine.map_phys_range(
+    crate::kernel::memory::map_physical(machine,
         arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE,
         pages,
         u64::from(mode.physical_base) / crate::PAGE_SIZE as u64,
@@ -823,20 +823,20 @@ fn capture_native_vbe<A: crate::Arch>(
     let pages = svga_shadow_pages(bytes);
     let base = initialize_live_vram(machine, pages);
     unsafe {
-        machine.map_shared_pages(VGA_VRAM_BASE >> 12, base, pages);
-        machine.map_shared_pages(SVGA_LFB_BASE >> 12, base, pages);
+        crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, pages);
+        crate::kernel::memory::map_shared_pages(machine, SVGA_LFB_BASE >> 12, base, pages);
     }
 
     let mut scratch = alloc::vec![0; crate::PAGE_SIZE];
     if matches!(svga.access, ::vga::SvgaAccess::Linear) && mode.physical_base != 0 {
         let (address, pages) = map_linear_vbe(machine, mode);
         copy_vbe_memory(machine, address, SVGA_LFB_BASE, bytes, &mut scratch);
-        machine.unmap_range(arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
+        crate::kernel::memory::reset(machine, arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
     } else if let Some(current_bank) = svga.bank() {
         copy_banked_from_card(machine, bios, display, mode, current_bank, &mut scratch);
     }
 
-    machine.copy_page_entries(
+    crate::kernel::memory::alias(machine,
         (SVGA_LFB_BASE >> 12) + usize::from(svga.bank().map_or(0, |bank| bank)) * WINDOW_PAGES,
         A0000 >> 12,
         WINDOW_PAGES,
@@ -868,7 +868,7 @@ fn restore_native_vbe<A: crate::Arch>(
     if !banked && mode.physical_base != 0 {
         let (address, pages) = map_linear_vbe(machine, mode);
         copy_vbe_memory(machine, SVGA_LFB_BASE, address, bytes, &mut scratch);
-        machine.unmap_range(arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
+        crate::kernel::memory::reset(machine, arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
     } else if let ::vga::SvgaAccess::Banked { bank } = svga.access {
         copy_banked_to_card(
             machine, bios, display, mode, bank, &mut scratch,
@@ -952,7 +952,7 @@ fn copy_banked_to_card<A: crate::Arch>(
 }
 
 fn discard_emulated_svga<A: crate::Arch>(machine: &mut A, dev: &mut EmulatedVga) {
-    machine.unmap_range(
+    crate::kernel::memory::reset(machine,
         SVGA_LFB_BASE >> 12,
         dev.svga_pages,
     );
@@ -965,7 +965,7 @@ fn map_native_lfb<A: crate::Arch>(
     pages: usize,
 ) {
     let offset = mode.physical_base as usize & (crate::PAGE_SIZE - 1);
-    machine.map_phys_range(
+    crate::kernel::memory::map_physical(machine,
         SVGA_LFB_BASE >> 12,
         pages,
         u64::from(mode.physical_base) >> 12,
@@ -983,14 +983,14 @@ pub(crate) fn select_native_svga_aperture<A: crate::Arch>(
     if matches!(access, ::vga::SvgaAccess::Linear) && mode.physical_base != 0 {
         map_native_lfb(machine, mode, pages);
     } else {
-        machine.unmap_range(SVGA_LFB_BASE >> 12, pages);
+        crate::kernel::memory::reset(machine, SVGA_LFB_BASE >> 12, pages);
         let physical = if mode.window_segment != 0 {
             usize::from(mode.window_segment) << 4
         } else {
             mode.physical_base as usize
         };
         if physical != 0 {
-            machine.map_phys_range(
+            crate::kernel::memory::map_physical(machine,
                 A0000 >> 12,
                 WINDOW_PAGES,
                 (physical >> 12) as u64,
@@ -1032,8 +1032,8 @@ pub fn svga_set_curated_mode<A: crate::Arch>(
     let pages = (mode.framebuffer_bytes as usize).div_ceil(crate::PAGE_SIZE);
     let base = initialize_live_vram(machine, pages);
     unsafe {
-        machine.map_shared_pages(VGA_VRAM_BASE >> 12, base, pages);
-        machine.map_shared_pages(SVGA_LFB_BASE >> 12, base, pages);
+        crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, pages);
+        crate::kernel::memory::map_shared_pages(machine, SVGA_LFB_BASE >> 12, base, pages);
     }
     if request & 0x8000 == 0 {
         live_vram_mut(machine).range(0, mode.framebuffer_bytes as usize).fill(0);
@@ -1048,7 +1048,7 @@ pub fn svga_set_curated_mode<A: crate::Arch>(
     )));
     dev.svga_pages = pages;
     dev.svga_vram.clear();
-    machine.unmap_range(A0000 >> 12, WINDOW_PAGES);
+    crate::kernel::memory::reset(machine, A0000 >> 12, WINDOW_PAGES);
     if request & 0x4000 == 0 {
         svga_set_bank(machine, pc, 0);
     }
@@ -1072,7 +1072,7 @@ pub fn svga_set_bank<A: crate::Arch>(
     let count = window_bytes.div_ceil(crate::PAGE_SIZE);
     if byte_offset / crate::PAGE_SIZE + count > dev.svga_pages { return; }
     let src = (SVGA_LFB_BASE + byte_offset) >> 12;
-    machine.copy_page_entries(src, aperture >> 12, count);
+    crate::kernel::memory::alias(machine, src, aperture >> 12, count);
     let _ = svga.window(Some(bank));
 }
 
@@ -1086,8 +1086,8 @@ fn svga_leave<A: crate::Arch>(machine: &mut A, dev: &mut EmulatedVga) {
     // Detach the window alias (drops its shared ref on the current bank), then
     // free the framebuffer region — frees the frames and leaves the entries
     // absent, the only sane "free" for an allocated RAM region.
-    machine.map_fresh_range(A0000 >> 12, WINDOW_PAGES);
-    machine.unmap_range(SVGA_LFB_BASE >> 12, pages);
+    crate::kernel::memory::fresh(machine, A0000 >> 12, WINDOW_PAGES);
+    crate::kernel::memory::reset(machine, SVGA_LFB_BASE >> 12, pages);
     dev.state = VgaState::new();
     dev.svga_pages = 0;
     dev.svga_vram.clear();

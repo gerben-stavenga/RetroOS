@@ -2,7 +2,8 @@
 //! analogue of `kernel/src/arch/x86.rs` + the timer/IRQ bits of `irq.rs`.
 
 use arch_abi::Irq;
-use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "tcg")]
+use core::sync::atomic::Ordering;
 #[cfg(feature = "tcg")]
 use core::sync::atomic::AtomicU64;
 
@@ -21,7 +22,7 @@ impl Default for FxState {
 impl FxState {
     pub const fn zeroed() -> Self { Self([0; 512]) }
     /// No-op on the interpreter (FPU state is the software core's; M2 wires the
-    /// real save/restore through `arch_switch_to`).
+    /// real save/restore through `Arch::switch_fx`).
     pub fn save(&mut self) {}
     pub fn restore(&self) {}
 }
@@ -68,20 +69,6 @@ pub fn outsw(port: u16, buf: &[u16]) {
 }
 pub fn outl(port: u16, value: u32) { crate::devices::port_out(port, 4, value); }
 
-/// Monotonic cycle counter. Deterministic stand-in for the TSC (TCG engine).
-#[cfg(feature = "tcg")]
-pub fn rdtsc() -> u64 {
-    static TSC: AtomicU64 = AtomicU64::new(0);
-    TSC.fetch_add(1000, Ordering::Relaxed)
-}
-
-/// The real TSC (KVM engine): guest RDTSC executes natively (CR4.TSD=0), so
-/// the kernel-side reading must come from the same clock to stay coherent.
-#[cfg(feature = "kvm")]
-pub fn rdtsc() -> u64 {
-    unsafe { core::arch::x86_64::_rdtsc() }
-}
-
 /// Power off — exit the host process.
 pub fn shutdown() -> ! {
     if crate::suite_control::enabled() {
@@ -97,236 +84,51 @@ pub fn halt_forever() -> ! {
     std::process::exit(0)
 }
 
-// ── Timer / IRQ queue ────────────────────────────────────────────────────
-//
-// Every backend exposes one high-resolution monotonic `now()`. Alarm
-// delivery merely returns control to the kernel; the event loop derives elapsed
-// time from consecutive samples. The virtual PIT and RTC retain a millisecond
-// compatibility view while their internal contracts are migrated.
-//
-// The interpreter has no PIT ISR. We must NOT derive this clock from wall time:
-// the interpreter runs the guest at full host speed (hundreds of MIPS) with no
-// pacing, so a wall-clock 55 ms tick would span tens of millions of guest
-// instructions — the guest perceives a multi-hundred-MHz CPU and period
-// software overflows its timing loops (Turbo Pascal's CRT delay calibration
-// counts loop iterations between ticks into a 16-bit word, then `DIV`s by it —
-// too many iterations #DEs with "Runtime error 200"). Instead we anchor the
-// clock to *retired guest instructions* (`advance_virtual_time`, called per run
-// slice), modelling a fixed ~VIRT_INSTR_PER_MS MIPS CPU. This both fixes the
-// calibration overflow and makes timing reproducible run-to-run.
-
-/// Virtual CPU speed: guest instructions per millisecond of guest-perceived
-/// time. ~6 MIPS models a mid-range 486 — slow enough that period
-/// delay-calibration loops keep their per-tick counts inside 16 bits (the
-/// real-hardware "Runtime error 200" cliff is Pentium-class, ~100 MIPS),
-/// fast enough that a 206 Hz game timer ISR (Duke3D's OPL music service,
-/// hundreds of port I/Os per tick) completes well within its tick interval.
-/// At the previous 2 MIPS the Duke3D demo loop structurally overran the
-/// interval: every tick landed mid-chain, the excursion nesting only ever
-/// grew, and DOS/4GW died with error 2002 (transfer stack overflow).
-#[cfg(feature = "tcg")]
-const VIRT_INSTR_PER_MS: u64 = 6_000;
-
-/// Retired guest instructions, the source of virtual time.
-#[cfg(feature = "tcg")]
-static VIRT_CYCLES: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "tcg")]
-static VIRT_IDLE_NS: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    static ALARM: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
-    static FIRMWARE_LOAN: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
-}
+// Hosted engines share one monotonic host clock and bounded host wait.
 static INPUT_READY: std::sync::Condvar = std::sync::Condvar::new();
 
-pub fn arm_alarm(deadline: Option<u64>) {
-    ALARM.with(|alarm| alarm.set(deadline));
-    #[cfg(feature = "kvm")]
-    crate::kvm::arm_alarm(deadline);
-}
-pub(crate) fn alarm_deadline() -> Option<u64> { ALARM.with(|alarm| alarm.get()) }
-#[cfg(any(feature = "kvm", test))]
-pub(crate) fn alarm_due() -> bool { !FIRMWARE_LOAN.with(|loan| loan.get()) && alarm_deadline().is_some_and(|end| now() >= end) }
-#[cfg(feature = "tcg")]
-pub(crate) fn instructions_to_alarm() -> usize {
-    if FIRMWARE_LOAN.with(|loan| loan.get()) { return usize::MAX; }
-    alarm_deadline().map_or(usize::MAX, |end|
-        (u128::from(end.saturating_sub(now())) * u128::from(VIRT_INSTR_PER_MS))
-            .div_ceil(1_000_000).min(usize::MAX as u128) as usize)
+pub fn idle(max_time: core::time::Duration) {
+    if max_time.is_zero() { return; }
+    let wake = INPUT_WAKE.lock().unwrap();
+    drop(INPUT_READY.wait_timeout(wake, max_time).unwrap());
 }
 
-/// Wait under the input-queue lock so posting input and entering idle cannot
-/// lose a wakeup. Deterministic idle advances directly to the selected alarm.
-pub fn idle() {
-    #[cfg(feature = "tcg")]
-    {
-        if host_input_pending() { return; }
-        if let Some(end) = alarm_deadline() {
-            let elapsed = end.saturating_sub(now());
-            VIRT_IDLE_NS.fetch_add(elapsed, Ordering::Relaxed);
-            crate::suite_control::advance_idle(elapsed);
-        } else {
-            let queue = INPUT_QUEUE.lock().unwrap();
-            if queue.is_empty() { drop(INPUT_READY.wait(queue).unwrap()); }
-        }
-        std::thread::yield_now();
-    }
-    #[cfg(feature = "kvm")]
-    {
-        let queue = INPUT_QUEUE.lock().unwrap();
-        if !queue.is_empty() { return; }
-        if let Some(end) = alarm_deadline() {
-            let delay = end.saturating_sub(now());
-            if delay != 0 {
-                drop(INPUT_READY.wait_timeout(queue, std::time::Duration::from_nanos(delay)).unwrap());
-            }
-        } else { drop(INPUT_READY.wait(queue).unwrap()); }
-    }
-}
-
-/// Advance virtual time by `instructions` retired in a run slice. Called by the
-/// CPU core (`cpu::execute`) after each `emu_start`.
-#[cfg(feature = "tcg")]
-pub fn advance_virtual_time(instructions: u64) {
-    VIRT_CYCLES.fetch_add(instructions, Ordering::Relaxed);
-    crate::suite_control::advance(instructions);
-}
-
-/// High-resolution deterministic time derived directly from retired guest
-/// instructions. The rational conversion avoids quantizing TCG to 1 ms.
-#[cfg(feature = "tcg")]
-pub fn now() -> u64 {
-    if crate::suite_control::enabled() { return crate::suite_control::now(); }
-    let cycles = VIRT_CYCLES.load(Ordering::Relaxed);
-    ((u128::from(cycles) * 1_000_000 / u128::from(VIRT_INSTR_PER_MS)) as u64).saturating_add(VIRT_IDLE_NS.load(Ordering::Relaxed))
-}
-
-/// Guest-perceived milliseconds on the KVM engine: real elapsed time. The
-/// instruction-anchored rationale above is TCG-specific — TCG throughput is
-/// wildly variable, so wall time there desyncs from retired work. Under KVM
-/// the guest runs at genuine native speed, exactly like metal, where the PIT
-/// counts real milliseconds; DOS calibration loops behave as on real (fast)
-/// hardware.
-#[cfg(feature = "kvm")]
 pub fn now() -> u64 {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos()
         .min(u128::from(u64::MAX)) as u64
 }
 
-// Host-posted input events (keyboard, …) awaiting delivery to the kernel event
-// loop — the interpreter's analogue of metal's `irq.rs` QUEUE that a real
-// keyboard IRQ pushes into. The hosted `main` owns the *source* (a stdin reader
-// that translates terminal bytes to PC scancodes); arch just provides the queue
-// + `drain`, so the kernel sees identical `Irq::Key` events on both backends.
-static INPUT_QUEUE: std::sync::Mutex<std::collections::VecDeque<(Irq, u64)>> =
-    std::sync::Mutex::new(std::collections::VecDeque::new());
-
-// The CPU's INTR line — our `cpu->interrupt_request`. The CPU core's block hook
-// (`cpu::execute`) checks `irq_line()` before each basic block, exactly like
-// QEMU's `cpu_handle_interrupt` before each TB, and bails to the kernel (which
-// injects via `deliver_pm_irq`) when it's asserted and the guest has IF=1.
-//
-// Two independent contributors, each cleared by its owner so neither can wedge
-// the line: host input awaiting `drain` (set by `post_irq`, cleared by `drain` —
-// the only contributor for the Linux/tty path), and the kernel's virtual PIC
-// (set/cleared by `set_irq_line` from DOS `raise_pending`).
-static INPUT_PENDING: AtomicBool = AtomicBool::new(false);
-static VPIC_LINE: AtomicBool = AtomicBool::new(false);
-
-/// Assert/deassert the CPU INTR line from the kernel's virtual PIC.
-pub fn set_irq_line(asserted: bool) {
-    VPIC_LINE.store(asserted, Ordering::Relaxed);
+// Input data is delivered directly to the device owner. Only interruption of
+// a running/waiting CPU belongs to the backend.
+static INPUT_SINK: std::sync::OnceLock<fn(Irq, u64)> = std::sync::OnceLock::new();
+pub fn install_input_sink(sink: fn(Irq, u64)) {
+    assert!(INPUT_SINK.set(sink).is_ok(), "input sink already installed");
 }
+static INPUT_WAKE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Read the INTR line (CPU core, per basic block — two cheap atomic loads).
-#[inline]
-pub(crate) fn host_input_pending() -> bool {
-    !FIRMWARE_LOAN.with(|loan| loan.get()) && INPUT_PENDING.load(Ordering::Relaxed)
-}
-pub(crate) fn firmware_loan(value: bool) -> bool { FIRMWARE_LOAN.with(|loan| loan.replace(value)) }
 
-pub(crate) fn irq_line() -> bool {
-    host_input_pending() || VPIC_LINE.load(Ordering::Relaxed)
-}
+// New host arrivals interrupt TCG at its next block boundary. Each execute
+// snapshots this sequence, so historical input never interrupts a later run.
+#[cfg(feature = "tcg")]
+static INPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "tcg")]
+pub(crate) fn input_sequence() -> u64 { INPUT_SEQUENCE.load(Ordering::Acquire) }
 
 /// Post a hardware-input event from the host side (called off the CPU thread,
 /// e.g. by main's stdin reader). Mirrors a device asserting an IRQ on metal:
-/// queue the event and raise the input line so the CPU bails out to service it.
-/// The flag is set under the queue lock so it stays consistent with `drain`.
+/// deliver the data to its owner and interrupt any running or waiting CPU.
 pub fn post_irq(irq: Irq) {
-    // Entropy samples must use real arrival time, including under TCG where
-    // the guest clock deliberately follows deterministic instruction counts.
-    static INPUT_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let timestamp_ns = INPUT_EPOCH.get_or_init(std::time::Instant::now).elapsed()
-        .as_nanos().min(u128::from(u64::MAX)) as u64;
-    if let Ok(mut q) = INPUT_QUEUE.lock() {
-        q.push_back((irq, timestamp_ns));
-        INPUT_PENDING.store(true, Ordering::Relaxed);
-        INPUT_READY.notify_one();
-        #[cfg(feature = "kvm")]
-        crate::kvm::kick();
-    }
-}
-
-/// Drain queued input events into the kernel event loop. Collect under the lock
-/// then dispatch unlocked, so `f` (kernel keyboard handling) can't deadlock the
-/// poster.
-pub fn drain(mut f: impl FnMut(Irq, u64)) {
-    let events: std::vec::Vec<(Irq, u64)> = match INPUT_QUEUE.lock() {
-        Ok(mut q) => {
-            let v = q.drain(..).collect();
-            // Clear under the lock, atomically with emptying the queue, so a
-            // concurrent `post_irq` can't be lost (it re-asserts under the lock).
-            INPUT_PENDING.store(false, Ordering::Relaxed);
-            v
-        }
-        Err(_) => return,
-    };
-    for (event, timestamp_ns) in events {
-        f(event, timestamp_ns);
-    }
+    let timestamp_ns = now();
+    if let Some(sink) = INPUT_SINK.get() { sink(irq, timestamp_ns); }
+    let _wake = INPUT_WAKE.lock().unwrap();
+    #[cfg(feature = "tcg")]
+    INPUT_SEQUENCE.fetch_add(1, Ordering::Release);
+    INPUT_READY.notify_one();
+    #[cfg(feature = "kvm")]
+    crate::kvm::kick();
 }
 
 /// Physical free-page count, for diagnostic logging only. The interpreter has
 /// no physical frame allocator yet (M3); report 0.
 pub fn free_page_count() -> usize { crate::phys::free_page_count() }
-
-#[cfg(test)]
-mod input_tests {
-    use super::*;
-
-    #[test]
-    fn queued_input_retains_arrival_times_and_callbacks_can_post() {
-        post_irq(Irq::Key(0x1e));
-        post_irq(Irq::Key(0x9e));
-        let expected: std::vec::Vec<_> = INPUT_QUEUE.lock().unwrap()
-            .iter().map(|(_, timestamp)| *timestamp).collect();
-        assert_eq!(expected.len(), 2);
-        let mut received = std::vec::Vec::new();
-        drain(|event, timestamp| {
-            received.push(timestamp);
-            // The queue lock must be released before calling the kernel.
-            if matches!(event, Irq::Key(0x9e)) { post_irq(Irq::Hw(5)); }
-        });
-        assert_eq!(received, expected);
-        assert!(INPUT_PENDING.load(Ordering::Relaxed));
-        let mut next = 0;
-        drain(|event, _| { assert!(matches!(event, Irq::Hw(5))); next += 1; });
-        assert_eq!(next, 1);
-        assert!(!INPUT_PENDING.load(Ordering::Relaxed));
-        #[cfg(feature = "tcg")]
-        {
-            let end = now() + 1_234_567;
-            arm_alarm(Some(end));
-            idle();
-            assert_eq!(now(), end);
-            assert!(alarm_due());
-            assert_eq!(instructions_to_alarm(), 0);
-            arm_alarm(None);
-            assert_eq!(instructions_to_alarm(), usize::MAX);
-        }
-
-
-    }
-}

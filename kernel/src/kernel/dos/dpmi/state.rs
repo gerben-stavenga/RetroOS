@@ -171,7 +171,7 @@ impl DpmiState {
     ) {
         for slot in self.phys_mappings.iter_mut() {
             if let Some(mapping) = slot.take() {
-                machine.unmap_range(
+                crate::kernel::memory::reset(machine,
                     (mapping.virtual_page_base >> 12) as usize,
                     mapping.page_count as usize,
                 );

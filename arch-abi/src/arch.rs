@@ -1,48 +1,312 @@
-//! `trait Arch` — the backend-agnostic *behavioural* contract.
+//! The combined architecture interface and saved CPU context.
 //!
-//! `lib.rs` holds the pure-data types that cross the boundary (`Regs`,
-//! `KernelEvent`, `Irq`, page constants). This module holds the **operations**:
-//! the trait every backend implements (`kernel/src/arch/` for bare metal,
-//! `arch-interp/` for the software CPU) and the kernel programs against.
-//!
-//! The design intent (why a trait, and why `&mut self`):
-//!
-//! * The kernel depends *solely* on this crate. It is generic over `A: Arch`
-//!   and receives its backend by dependency injection — `startup(arch: &mut A)`
-//!   — called either by the metal boot crate or by the hosted `main`. There is
-//!   no `cfg`-selected `extern crate … as arch` and no compile-time backend
-//!   baked into the kernel.
-//!
-//! * Every operation takes `&self`/`&mut self`. The backend's mutable state
-//!   (guest RAM, the live register file, the virtual PIC/PIT, page tables) is
-//!   *owned* by the `Arch` value and reached only through a borrow. Threading a
-//!   single `&mut A` through the kernel is what lets the borrow checker enforce
-//!   that the kernel never aliases that state — it replaces the global `static
-//!   mut`s (and their `unsafe`) the free-function backends rely on today. When
-//!   the kernel goes multi-core, each core drives a distinct `&mut Arch`, and
-//!   Rust keeps the cores honest for free.
-//!
-//! Representation that genuinely differs between backends stays backend-owned
-//! via associated types: `PageTable` (a real page-table root vs a software
-//! address space) and `Fx` (an FXSAVE area vs a host FPU snapshot). The
-//! register/space bundle the kernel stores per thread is `Vcpu<Self>`
-//! — generic over the page-table type but otherwise shared, since both backends
-//! are x86 and share the `Regs` ABI.
+//! Arch owns execution and lifecycle. X86, Memory and Diagnostics
+//! group its supporting capabilities.
 
-use crate::{ExecutionProfile, ExecutionProfileStage, FramebufferMapPolicy, Irq, KernelEvent, Regs};
+use crate::{Regs, KernelEvent, ExecutionProfile, ExecutionProfileStage, FramebufferMapPolicy};
+use crate::page_entry::PageEntry;
+use crate::mapping::{MappingError, MappingFailure, UserPage, validate_batch};
+
+/// Execution and lifecycle of one backend/core, with supporting capabilities
+/// grouped into independently usable traits.
+pub trait Arch: Sized + X86 + Memory + Diagnostics + 'static {
+    /// Run the active space with `regs` until an interruption (IRQ, syscall,
+    /// exception, or monitored instruction), and return that event with the
+    /// post-run registers. The time limit bounds this call only; zero returns
+    /// `Irq` without executing instructions. IRQ data belongs to device drivers.
+    fn execute(&mut self, regs: &mut Regs, io: &crate::IoPolicy, max_time: core::time::Duration) -> KernelEvent;
+
+    /// Halt this core until an interruption or max_time elapses. Zero returns
+    /// immediately. Device data remains with its owner; this returns `Irq`.
+    fn idle(&mut self, max_time: core::time::Duration) -> KernelEvent;
+
+    /// Interrupt one processor to end its current CPU loan.
+    fn interrupt_processor(&mut self, _processor: u32) {}
+
+    /// Monotonic time in nanoseconds.
+    fn now(&self) -> u64;
+
+    /// Power off / leave the host.
+    fn shutdown(&mut self) -> !;
+
+    /// Disable interrupts and halt forever (panic / shutdown failure).
+    fn halt_forever(&mut self) -> !;
+}
+
+/// x86 registers, port I/O, descriptor tables and ISA interrupt control.
+pub trait X86 {
+    // Port I/O
+
+    fn inb(&mut self, port: u16) -> u8;
+
+    fn inw(&mut self, port: u16) -> u16;
+
+    fn inl(&mut self, port: u16) -> u32;
+
+    fn outb(&mut self, port: u16, val: u8);
+
+    fn outw(&mut self, port: u16, val: u16);
+
+    fn outl(&mut self, port: u16, val: u32);
+
+    // Native interrupt-controller operations
+
+    /// Unmask a physical ISA IRQ line left masked after interrupt delivery.
+    /// Physical EOI has already been sent; this does not send another EOI.
+    fn isa_unmask_irq(&mut self, line: u8);
+
+    /// Configure and enable an ISA IRQ line (edge-triggered, active-high).
+    fn isa_enable_irq(&mut self, line: u8) {
+        let _ = line;
+    }
+
+    // Segments and descriptor tables
+
+    /// Load the LDT (write base+limit into the GDT slot and `LLDT`).
+    fn load_ldt(&mut self, ldt: &[u64]);
+
+    /// Notify the backend that the active thread's LDT descriptors changed
+    /// (a DPMI descriptor edit). Metal reads the live hardware LDT, so the
+    /// default is a no-op; the interpreter uses it to re-materialize its
+    /// software copy of the descriptor tables before the next guest entry.
+    fn on_ldt_changed(&mut self) {}
+
+    /// Set a per-thread TLS GDT entry. Returns the GDT index or -1 on error.
+    fn set_tls_entry(&mut self, index: i32, base: u32, limit: u32, limit_in_pages: bool) -> i32;
+
+    /// Linear base of selector `sel` from the current descriptor tables.
+    fn seg_base(sel: u16) -> u32;
+
+    /// Whether selector `sel` is a 32-bit (D=1) segment.
+    fn seg_is_32(sel: u16) -> bool;
+
+    /// Does the VM86 redirection bitmap trap this vector (true), or should the
+    /// monitor reflect it through the real-mode IVT itself (false)?
+    fn int_intercepted(vector: u8) -> bool;
+
+    // FPU/SSE state
+
+    /// Backend FPU/SSE save area (FXSAVE blob on metal; host snapshot on interp).
+    type Fx: Copy + Default + 'static;
+
+    /// Swap the live FPU/SSE image with `fx`, independently of the address space.
+    fn switch_fx(&mut self, fx: &mut Self::Fx);
+
+    /// Standard x86 FXSAVE image for a Linux signal frame, when supported.
+    fn fx_state_bytes(_fx: &Self::Fx) -> Option<&[u8; 512]> { None }
+
+    fn fx_state_bytes_mut(_fx: &mut Self::Fx) -> Option<&mut [u8; 512]> { None }
+
+    /// A clean FPU/SSE save area for a fresh thread.
+    fn clean_fx_template(&self) -> Self::Fx;
+
+    /// The guest's current x87 top-of-stack register, ST(0), as the raw 80-bit
+    /// extended value.
+    ///
+    /// The MMIO instruction decoder needs it: an x87 store (`fstp [mmio]`) to a
+    /// trapped aperture faults like any other write, and the value being stored
+    /// lives nowhere in the general registers. Reading it must not disturb the
+    /// stack — `fpu_pop` is the separate half, for the popping forms.
+    fn fpu_st0(&self) -> [u8; 10];
+
+    /// Pop the guest's x87 stack, discarding ST(0).
+    fn fpu_pop(&mut self);
+
+    // CPU capabilities and native registers
+
+    /// Whether this CPU/backend supports executing 64-bit user code.
+    fn user_64_supported(&self) -> bool;
+
+    /// Arm hardware write-watchpoints at up to two guest-linear addresses
+    /// (`None`/missing entry disables): a `#DB` fires when the guest writes one,
+    /// for catching memory corruption. Real on metal (programs the debug
+    /// registers); a no-op on backends with no debug-register feature.
+    fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>);
+
+    /// Replace both native IDT entries, returning the previous handler pair.
+    /// Backends without a native IDT leave this operation unused.
+    ///
+    /// # Safety
+    /// Each entry must obey its mode's interrupt-frame and return conventions.
+    /// Restore both entries before their code or associated state expires.
+    unsafe fn replace_interrupt_handlers(&mut self, _vector: u8, handlers: crate::InterruptHandlers) -> crate::InterruptHandlers { handlers }
+}
+
+/// Active address spaces, mappings and physical memory.
+pub trait Memory: GuestBytes {
+    /// Backend page-table root type stored in `Vcpu::space` — an OWNED address
+    /// space, so it is **not** `Copy`: a parked `Vcpu` moves rather than
+    /// duplicating the space. It is an OPAQUE owned handle — **not** a memory
+    /// accessor. Guest memory is reached only through the *active* space, so
+    /// `GuestBytes` is a supertrait of `Arch` (the active-space accessor), never
+    /// implemented on `PageTable` or a parked `Vcpu`. `Default` supplies the
+    /// empty placeholder a switch leaves behind in a now-running thread's slot.
+    type PageTable: Default;
+
+    /// Hardware leaf format, including whether execute-disable is available.
+    fn page_format(&self) -> crate::page_entry::X86PteFormat;
+
+    /// Read does not allocate data frames. The result is a snapshot, not an
+    /// owning reference; its backing must stay valid until replacement finishes.
+    fn read_mapping(&mut self, page: UserPage) -> Result<PageEntry, MappingError>;
+
+    /// Return a uniform run starting at `page`, bounded by `maximum` pages.
+    /// This exposes sparse mapping state without expanding its page tables.
+    fn read_mapping_run(&mut self, page: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError> {
+        if maximum == 0 { return Err(MappingError::InvalidAddress); }
+        page.offset(maximum - 1)?;
+        Ok((self.read_mapping(page)?, 1))
+    }
+
+    /// Repeat an entry across a range. Each Owned occurrence retains a reference.
+    /// # Safety
+    /// Same backing lifetime requirements as replace_mapping.
+    unsafe fn fill_mappings(&mut self, start: UserPage, count: usize, entry: PageEntry) -> Result<(), MappingFailure> {
+        validate_batch(start, count)?;
+        for completed in 0..count {
+            unsafe { self.replace_mapping(start.offset(completed).unwrap(), entry) }
+                .map_err(|error| MappingFailure { completed, error })?;
+        }
+        Ok(())
+    }
+
+    /// Retain Owned backing before releasing the displaced mapping's reference.
+    /// Borrowed mappings never retain or release backing.
+    ///
+    /// # Safety
+    /// Supplied frames must be valid; Borrowed backing must outlive every alias.
+    /// Writable aliases must obey the caller's synchronization/ownership rules.
+    /// Serialize mapping changes with other CPUs using the same address space.
+    unsafe fn replace_mapping(&mut self, page: UserPage, entry: PageEntry) -> Result<(), MappingError>;
+
+    fn read_mappings(&mut self, start: UserPage, entries: &mut [PageEntry]) -> Result<(), MappingFailure> {
+        validate_batch(start, entries.len())?;
+        for (completed, entry) in entries.iter_mut().enumerate() {
+            *entry = self.read_mapping(start.offset(completed).unwrap())
+                .map_err(|error| MappingFailure { completed, error })?;
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// Same requirements as replace_mapping, for every supplied entry.
+    unsafe fn replace_mappings(&mut self, start: UserPage, entries: &[PageEntry]) -> Result<(), MappingFailure> {
+        validate_batch(start, entries.len())?;
+        for (completed, &entry) in entries.iter().enumerate() {
+            unsafe { self.replace_mapping(start.offset(completed).unwrap(), entry) }
+                .map_err(|error| MappingFailure { completed, error })?;
+        }
+        Ok(())
+    }
+
+    /// Copy a high user buffer through a backend-owned window. False means EFAULT.
+    fn high_copy(&mut self, _address: u64, _buffer: &mut [u8], _to_user: bool) -> bool { false }
+
+    /// Install `incoming` as the active address space and return the displaced
+    /// one. Registers and FPU state are unchanged.
+    fn activate(&mut self, incoming: Self::PageTable) -> Self::PageTable;
+
+    /// COW-fork the current address space into `child` (fills the child root).
+    fn user_fork(&mut self, child: &mut Self::PageTable);
+
+    /// Detach shared page-table metadata before concurrent process execution.
+    /// Consumes explicit backing inputs; -11 requests another input batch.
+    fn private_page_tables(&mut self) -> i32 { 0 }
+
+    fn refresh_kernel_mappings(&mut self) {}
+
+    /// Tear down a dead thread's address space entirely. `free_user_pages`
+    /// (called at exit, while the space is still active) returns its page
+    /// FRAMES; this releases the space OBJECT itself — on the interpreter
+    /// the host VA reservation + per-page bookkeeping, on metal a no-op
+    /// (the saved-entries buffer lives in the Thread and drops with it).
+    /// Called at reap, after execution has switched away.
+    fn destroy_space(&mut self, root: &mut Self::PageTable);
+
+    /// Free user pages in the current address space (the CLEAN call).
+    fn free_user_pages(&mut self);
+
+    /// Physical-frame mechanisms for kernel-owned storage. No file/cache policy.
+    fn frame_access(&self) -> Option<crate::FrameAccess> { None }
+
+    fn physical_frame_io(&self) -> Option<crate::PhysicalFrameIo> { None }
+
+    fn page_supply(&self) -> Option<*mut crate::page_supply::PageSupply> { None }
+
+    fn set_page_input(&mut self, _input: *mut crate::page_supply::PageInput) -> *mut crate::page_supply::PageInput { core::ptr::null_mut() }
+
+    /// Allocate zeroed, page-aligned RAM with a stable kernel view. Ownership
+    /// passes to the caller; guest aliases do not own the allocation.
+    fn alloc_shared_pages(&mut self, count: usize) -> core::ptr::NonNull<u8>;
+
+    /// Release a shared allocation after removing all guest aliases.
+    ///
+    /// # Safety
+    /// `base` and `count` must describe an allocation from `alloc_shared_pages`;
+    /// no guest mappings or kernel references may remain.
+    unsafe fn free_shared_pages(&mut self, base: core::ptr::NonNull<u8>, count: usize);
+
+    /// Resolve one page of a live alloc_shared_pages allocation to its frame.
+    /// This does not install a guest mapping or retain a frame reference.
+    /// # Safety
+    /// `base` must name a page in a live shared allocation from this backend.
+    unsafe fn shared_page(&mut self, base: core::ptr::NonNull<u8>) -> crate::page_entry::PhysicalFrame;
+
+    /// Install a privileged driver window; user mappings use replace_mapping.
+    fn map_kernel_physical(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64);
+
+    /// Cache/copy policy for a physical linear framebuffer owned by a display
+    /// controller. The conservative default is strong-UC.
+    fn framebuffer_map_policy(&self) -> FramebufferMapPolicy {
+        FramebufferMapPolicy {
+            flags: crate::MAP_PHYS_CACHE_DISABLE | crate::MAP_PHYS_FOREIGN,
+            slow: true,
+            wide: false,
+        }
+    }
+
+    /// Allocate physically contiguous DMA pages from general RAM. Returns the
+    /// starting physical page number, or 0 on failure.
+    fn alloc_phys_contig(&mut self, num_pages: usize) -> u64;
+
+    /// Free a run previously returned by `alloc_phys_contig`.
+    fn free_phys_contig(&mut self, start_page: u64, num_pages: usize);
+
+    /// Physical page of DMA channel `ch`'s permanent ISA-DMA buffer (0 = none).
+    fn dma_channel_buf(&self, ch: usize) -> u64;
+
+    /// Number of currently unallocated 4 KiB frames in the backing allocator.
+    fn free_page_count(&self) -> usize;
+
+    /// Total 4 KiB frames managed by that allocator, if known.
+    fn total_page_count(&self) -> Option<usize> { None }
+}
+
+/// Optional execution profiling and address-space diagnostics.
+pub trait Diagnostics {
+    /// Diagnostic snapshot of the active page tables. A nonzero expected hash
+    /// requests a comparison and mismatch report. Returns zero if unsupported.
+    fn check_address_space(&mut self, _expected: u64) -> u64 { 0 }
+
+    /// Deterministic profiling for the kernel/arch/guest execution boundary.
+    fn execution_profile_set(&mut self, _enabled: bool) {}
+
+    /// Clear execution counters without changing whether recording is enabled.
+    fn execution_profile_reset(&mut self) {}
+
+    fn execution_profile_begin(&mut self) {}
+
+    fn execution_profile_time(&mut self, _stage: ExecutionProfileStage) {}
+
+    fn execution_profile(&self) -> ExecutionProfile { ExecutionProfile::default() }
+}
 
 // =============================================================================
 // GuestBytes — access to guest memory
 // =============================================================================
 
-/// Access to guest memory, implemented for two receivers:
-///
-/// * the backend's page-table handle (`A::PageTable`) — the primitive; the
-///   backend supplies the one real impl (host-pointer deref on metal, guest-RAM
-///   index on the interp), confining the `unsafe` there;
-/// * the running [`Vcpu`] — the kernel already holds `&mut Vcpu` in the DOS /
-///   Linux paths and reaches its address space through it (`regs.read(addr)`);
-///   the blanket impl below forwards to `self.space`.
+/// Byte access to the active address space, implemented by the backend.
+/// Parked page-table handles and Vcpu values do not expose memory access.
 ///
 /// **No method returns a reference into guest memory.** Guest RAM is external,
 /// volatile memory: a DOS guest places live structures at address 0 (the IVT)
@@ -59,7 +323,7 @@ use crate::{ExecutionProfile, ExecutionProfileStage, FramebufferMapPolicy, Irq, 
 ///
 /// `addr` is a guest-linear address as `usize` (the 32-bit kernel addresses all
 /// low guest memory within 4 GiB). High long-mode mappings use
-/// `Arch::high_mapping` and `Arch::high_copy` without narrowing their addresses.
+/// `Memory::read_mapping` and `Memory::high_copy` without narrowing their addresses.
 ///
 /// Soundness note: `read::<T>` reconstructs a `T` from copied bytes, so `T` must
 /// be valid for *all* bit patterns (an integer or a `#[repr(C, packed)]` POD
@@ -92,7 +356,7 @@ pub trait GuestBytes {
 /// space they run in. This is the *parked* form — what a non-running thread
 /// stores. It is deliberately NOT the live/active context: the running thread's
 /// registers live in the event loop (a plain `&mut Regs`) and its address space
-/// is moved *into* the backend as the single active space ([`Arch::activate`]).
+/// is moved *into* the backend as the single active space ([`crate::Memory::activate`]).
 ///
 /// `space` is `A::PageTable` — an OWNED, move-only address-space handle. It is
 /// **not** the guest-memory accessor: guest memory is reached only through the
@@ -105,7 +369,7 @@ pub struct Vcpu<A: Arch> {
     /// Architectural register state (program counter, mode, GPRs).
     pub regs: Regs,
     /// The thread's OWNED address space, dormant while parked. Activated by
-    /// moving it into the backend ([`Arch::activate`]); the displaced space
+    /// moving it into the backend ([`crate::Memory::activate`]); the displaced space
     /// comes back and is re-parked here.
     pub space: A::PageTable,
 }
@@ -131,337 +395,4 @@ impl<A: Arch> Vcpu<A> {
     pub fn empty() -> Self {
         Vcpu { regs: Regs::empty(), space: A::PageTable::default() }
     }
-}
-
-// =============================================================================
-// The backend contract
-// =============================================================================
-
-/// The full kernel→arch boundary. One value implements this per CPU; the kernel
-/// threads `&mut impl Arch` through `startup` and the event loop.
-///
-/// `Arch` is deliberately **not** a memory accessor. Guest memory belongs to the
-/// address space, which the running thread's `Vcpu` carries (`Vcpu::space`); the
-/// kernel reads/writes it through the `Vcpu` it already holds (`regs.read(addr)`).
-/// So there is exactly one guest-memory path — the vcpu — and `Arch` is just the
-/// rest of the machine: CPU exec, ports, timer, IRQ lines, the page-table/fork/
-/// LDT/DMA "arch calls", FPU state, and a few x86 segment helpers.
-pub trait Arch: Sized + GuestBytes + 'static {
-    /// Backend page-table root type stored in `Vcpu::space` — an OWNED address
-    /// space, so it is **not** `Copy`: a parked `Vcpu` moves rather than
-    /// duplicating the space. It is an OPAQUE owned handle — **not** a memory
-    /// accessor. Guest memory is reached only through the *active* space, so
-    /// `GuestBytes` is a supertrait of `Arch` (the active-space accessor), never
-    /// implemented on `PageTable` or a parked `Vcpu`. `Default` supplies the
-    /// empty placeholder a switch leaves behind in a now-running thread's slot.
-    type PageTable: Default;
-    /// Backend FPU/SSE save area (FXSAVE blob on metal; host snapshot on interp).
-    type Fx: Copy + Default + 'static;
-
-    // ── Port I/O ───────────────────────────────────────────────────────────
-
-    fn inb(&mut self, port: u16) -> u8;
-    fn inw(&mut self, port: u16) -> u16;
-    fn inl(&mut self, port: u16) -> u32;
-    fn outb(&mut self, port: u16, val: u8);
-    fn outw(&mut self, port: u16, val: u16);
-    fn outl(&mut self, port: u16, val: u32);
-
-    // ── Execution & scheduling ─────────────────────────────────────────────
-    //
-    // The backend owns THE active context: the one active address space (and the
-    // live FPU). The event loop owns the running thread's *registers* (a plain
-    // `Regs`) and passes `&mut Regs` to `execute`; guest memory is reached
-    // through `self` (the active-space `GuestBytes`). Handlers therefore take
-    // disjoint `(&mut arch, &mut regs)` — registers on one side, machine + active
-    // memory on the other — and there is exactly one guest-memory path, the
-    // active space, so "you can only touch active memory" is enforced by types.
-
-    /// Resume the active space with `regs` and return the next kernel-visible
-    /// event, leaving `regs` holding the post-run register state.
-    fn execute(&mut self, regs: &mut Regs, io: &crate::IoPolicy) -> KernelEvent;
-    /// Execute a bounded, synchronous firmware transaction. Kernel alarms and
-    /// queued input are deferred until its owner returns to the event loop;
-    /// they must not prevent a BIOS helper from finishing after an IRQ exit.
-    fn execute_firmware(&mut self, regs: &mut Regs, io: &crate::IoPolicy) -> KernelEvent {
-        self.execute(regs, io)
-    }
-
-    /// Replace both native IDT entries, returning the previous handler pair.
-    /// Backends without a native IDT leave this operation unused.
-    ///
-    /// # Safety
-    /// Each entry must obey its mode's interrupt-frame and return conventions.
-    /// Restore both entries before their code or associated state expires.
-    unsafe fn replace_interrupt_handlers(&mut self, _vector: u8, handlers: crate::InterruptHandlers) -> crate::InterruptHandlers { handlers }
-
-    /// Sparse high user mappings, independent of the kernel's pointer width.
-    /// Operations: 0=reserve/replace, 1=protect, 2=unmap, 3=discard,
-    /// 4=reserve without replacement. Protection uses Linux R/W/X bits.
-    fn high_mapping(&mut self, _address: u64, _length: u64, _operation: u32, _protection: u32) -> i32 { -12 }
-    /// Copy a high user buffer through a backend-owned window. False means EFAULT.
-    fn high_copy(&mut self, _address: u64, _buffer: &mut [u8], _to_user: bool) -> bool { false }
-
-    /// Whether this backend can run 64-bit user code (`UserMode::Mode64`).
-    /// On metal this is a CPU fact (long mode available); the hosted machine
-    /// model is 32-bit non-PAE, so both hosted engines answer false. Exec
-    /// consults this to refuse a 64-bit ELF with ENOEXEC instead of letting
-    /// x86-64 code be decoded as i386.
-    fn user_64_supported(&self) -> bool;
-
-    /// Make `incoming` the active address space and return the displaced one
-    /// (the previously-active space, now parked). THIS is the switch pivot: the
-    /// scheduler moves a thread's space in and re-parks the old one. On metal it
-    /// loads CR3 / swaps the saved entries; on interp it sets the active pd.
-    /// Also swaps the live FPU with `fx` (in on entry, out on return); `hash_ptr`
-    /// null ⇒ no address-space hashing.
-    fn activate(
-        &mut self,
-        incoming: Self::PageTable,
-        fx_ptr: *mut Self::Fx,
-        hash_ptr: *mut u64,
-    ) -> Self::PageTable;
-
-    /// Swap only the live FPU/SSE image with `fx`.  This is used when process
-    /// creation keeps the current address space live but changes which thread
-    /// owns that live execution context.
-    fn switch_fx(&mut self, fx: &mut Self::Fx);
-
-    /// Standard x86 FXSAVE image for a Linux signal frame, when supported.
-    fn fx_state_bytes(_fx: &Self::Fx) -> Option<&[u8; 512]> { None }
-    fn fx_state_bytes_mut(_fx: &mut Self::Fx) -> Option<&mut [u8; 512]> { None }
-
-    // ── Timer ──────────────────────────────────────────────────────────────
-
-    /// Monotonic time in nanoseconds. A timer alarm is only a wakeup: it
-    /// forces `execute` to return, while this clock remains the sole authority
-    /// for how much time elapsed.
-    fn now(&self) -> u64;
-    /// Optional stable user-readable TSC calibration: epoch and 32.32 ns per
-    /// cycle, exactly matching now(). Valid for every CPU executing user code;
-    /// immutable for the address space lifetime, with user RDTSC enabled.
-    fn user_tsc_clock(&self) -> Option<(u64, u64)> { None }
-    /// Arm one wakeup at an absolute `now()` timestamp, or cancel with None.
-    /// An elapsed deadline must wake promptly, including when it passes during
-    /// programming. The interrupt identifies no logical timer. Called only at
-    /// the event loop's exit; repeated I/O exits must not postpone the deadline.
-    fn arm_alarm(&mut self, _deadline_ns: Option<u64>) {}
-    /// Service architecture-owned polling devices and return their next alarm.
-    /// Also exposes maintenance required by wrapping clock sources.
-    fn poll_timed_devices(&mut self, _now_ns: u64) -> Option<u64> { None }
-    /// No guest thread can run this iteration. Hardware clocks keep ticking;
-    /// deterministic interpreters must also advance idle time without retiring
-    /// synthetic guest instructions. Return promptly to service input/devices.
-    fn idle(&mut self) { core::hint::spin_loop(); }
-    /// Millisecond compatibility view for devices not yet converted to the
-    /// high-resolution timeline.
-    fn get_ticks(&self) -> u64 { self.now() / 1_000_000 }
-    /// Drain hardware events with their arrival timestamps in nanoseconds.
-    /// Capture time at interrupt entry (host input: at posting), before queueing.
-    /// This sampling clock need not share the guest/scheduler clock's epoch;
-    /// it must advance independently of guest instruction execution.
-    fn drain(&mut self, f: &mut dyn FnMut(Irq, u64));
-    /// Read the CPU timestamp counter.
-    fn rdtsc(&self) -> u64;
-
-    /// Deterministic profiling for the kernel/arch/guest execution boundary.
-    fn execution_profile_set(&mut self, _enabled: bool) {}
-    /// Clear execution counters without changing whether recording is enabled.
-    fn execution_profile_reset(&mut self) {}
-    fn execution_profile_begin(&mut self) {}
-    fn execution_profile_time(&mut self, _stage: ExecutionProfileStage) {}
-    fn execution_profile(&self) -> ExecutionProfile { ExecutionProfile::default() }
-
-    // ── IRQ lines ──────────────────────────────────────────────────────────
-
-    /// Assert/deassert the CPU INTR line from the virtual PIC. No-op on metal
-    /// (real 8259 drives INTR); the interp re-checks for a pending IRQ at a
-    /// basic-block boundary.
-    fn set_irq_line(&mut self, asserted: bool);
-    /// Re-arm (re-unmask) an IRQ line that `handle_irq` left masked pending a
-    /// deferred guest-visible device ack.
-    fn rearm_irq(&mut self, line: u8);
-
-    /// Allocate an MSI target for a device that should raise the canonical
-    /// `Irq::Msi(source)` event. Returns the `(message_address, message_data)`
-    /// pair to program into the device's PCI MSI capability, or `None` when
-    /// message-signalled interrupts are unavailable (no local APIC, or a
-    /// backend with no real interrupt hardware). The backend guarantees that a
-    /// write matching the returned pair delivers as `Irq::Msi(source)` through
-    /// the ordinary `drain` path — the caller never learns the vector or APIC
-    /// id, keeping interrupt delivery canonical above the arch boundary.
-    fn msi_alloc(&mut self, source: u8) -> Option<(u64, u32)> {
-        let _ = source;
-        None
-    }
-
-    /// Route and unmask a device's wired interrupt `line` (a PCI INTx line the
-    /// driver read from config space, or a fixed ISA line) so it reaches the CPU
-    /// and arrives via `drain` as `Irq::Hw(line)`. On metal: an IOAPIC entry in
-    /// APIC mode, an 8259 unmask in PIC mode — the same legacy path the fixed ISA
-    /// lines already use. No-op where there is no interrupt hardware.
-    fn route_device_irq(&mut self, line: u8) {
-        let _ = line;
-    }
-
-    /// Route an ISA IRQ line (edge-triggered, active-high). Kept separate from
-    /// PCI INTx because the latter is level-triggered, active-low at the I/O
-    /// APIC; treating both as the same electrical signal loses interrupts.
-    fn route_isa_irq(&mut self, line: u8) {
-        let _ = line;
-    }
-
-    /// Arm hardware write-watchpoints at up to two guest-linear addresses
-    /// (`None`/missing entry disables): a `#DB` fires when the guest writes one,
-    /// for catching memory corruption. Real on metal (programs the debug
-    /// registers); a no-op on backends with no debug-register feature.
-    fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>);
-
-    // ── Arch calls: paging / fork / LDT / DMA ──────────────────────────────
-
-    /// COW-fork the current address space into `child` (fills the child root).
-    fn user_fork(&mut self, child: &mut Self::PageTable);
-    /// Detach shared page-table metadata before concurrent process execution.
-    /// Consumes explicit backing inputs; -11 requests another input batch.
-    fn private_page_tables(&mut self) -> i32 { 0 }
-    fn refresh_kernel_mappings(&mut self) {}
-    /// Interrupt one processor to end its current CPU loan.
-    fn interrupt_processor(&mut self, _processor: u32) {}
-
-    /// Tear down a dead thread's address space entirely. `free_user_pages`
-    /// (called at exit, while the space is still active) returns its page
-    /// FRAMES; this releases the space OBJECT itself — on the interpreter
-    /// the host VA reservation + per-page bookkeeping, on metal a no-op
-    /// (the saved-entries buffer lives in the Thread and drops with it).
-    /// Called at reap, after execution has switched away.
-    fn destroy_space(&mut self, root: &mut Self::PageTable);
-    /// Free user pages in the current address space (the CLEAN call).
-    fn free_user_pages(&mut self);
-    /// Set page permissions for a range (`writable`, `executable`).
-    fn set_page_flags(&mut self, start_vpage: usize, count: usize, writable: bool, executable: bool);
-    /// Map the first 1 MB user-accessible for VM86.
-    fn map_low_mem(&mut self);
-    /// Copy `count` page-table entries `src → dst`.
-    fn copy_page_entries(&mut self, src_vpage: usize, dst_vpage: usize, count: usize);
-    /// Redirect every user mapping of `physical_ppage..+count` onto the
-    /// corresponding pages at `shadow_vpage`, or undo exactly those redirects.
-    /// This is address-space policy: callers need not know which API originally
-    /// created an alias of the physical range.
-    fn redirect_physical_aliases(
-        &mut self,
-        physical_ppage: u64,
-        shadow_vpage: usize,
-        count: usize,
-        redirect: bool,
-    );
-    /// Swap `count` page-table entries between two ranges.
-    fn swap_page_entries(&mut self, a_vpage: usize, b_vpage: usize, count: usize);
-    /// Clear page entries to absent (re-enables demand paging on next access).
-    fn unmap_range(&mut self, base_page: usize, count: usize);
-    /// Replace `count` user pages at `vpage` with fresh anonymous RW frames.
-    fn map_fresh_range(&mut self, vpage: usize, count: usize);
-    /// Map this process's VGA color-text aperture (guest 0xB8000-0xBFFFF) onto
-    /// the single SHARED text screen — the emulated equivalent of VGA hardware's
-    /// shared video RAM, so every DOS process and the kernel console write one
-    /// screen (the boot log persists; a child's output shows under its parent).
-    /// On VGA-text hardware this is implicit (the aperture already is shared
-    /// RAM); this is the GOP/emulated stand-in.
-    fn map_vga_text_aperture(&mut self);
-    /// Physical-frame mechanisms for kernel-owned storage. No file/cache policy.
-    fn frame_access(&self) -> Option<crate::FrameAccess> { None }
-    fn physical_frame_io(&self) -> Option<crate::PhysicalFrameIo> { None }
-    fn page_supply(&self) -> Option<*mut crate::page_supply::PageSupply> { None }
-    fn set_page_input(&mut self, _input: *mut crate::page_supply::PageInput) -> *mut crate::page_supply::PageInput { core::ptr::null_mut() }
-
-    /// Map a retained physical frame. Private writable aliases start COW;
-    /// shared aliases remain coherent across fork. Cache retains its own owner.
-    fn map_frame(&mut self, _vpage: usize, _frame: u64, _shared: bool,
-        _writable: bool, _executable: bool) -> bool { false }
-    /// Allocate zeroed, page-aligned RAM with a stable kernel view. Ownership
-    /// passes to the caller; guest aliases do not own the allocation.
-    fn alloc_shared_pages(&mut self, count: usize) -> core::ptr::NonNull<u8>;
-    /// Release a shared allocation after removing all guest aliases.
-    ///
-    /// # Safety
-    /// `base` and `count` must describe an allocation from `alloc_shared_pages`;
-    /// no guest mappings or kernel references may remain.
-    unsafe fn free_shared_pages(&mut self, base: core::ptr::NonNull<u8>, count: usize);
-    /// Alias kernel-owned RAM into the active guest, shared across fork.
-    ///
-    /// # Safety
-    /// The range must belong to a live `alloc_shared_pages` allocation, which
-    /// must outlive every alias. Kernel access must be serialized with guests.
-    unsafe fn map_shared_pages(&mut self, vpage: usize, base: core::ptr::NonNull<u8>, count: usize);
-    /// Load the LDT (write base+limit into the GDT slot and `LLDT`).
-    fn load_ldt(&mut self, ldt: &[u64]);
-    /// Notify the backend that the active thread's LDT descriptors changed
-    /// (a DPMI descriptor edit). Metal reads the live hardware LDT, so the
-    /// default is a no-op; the interpreter uses it to re-materialize its
-    /// software copy of the descriptor tables before the next guest entry.
-    fn on_ldt_changed(&mut self) {}
-    /// Map a range of physical pages into user virtual space.
-    fn map_phys_range(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64);
-    /// Cache/copy policy for a physical linear framebuffer owned by a display
-    /// controller. The conservative default is strong-UC.
-    fn framebuffer_map_policy(&self) -> FramebufferMapPolicy {
-        FramebufferMapPolicy {
-            flags: crate::MAP_PHYS_CACHE_DISABLE | crate::MAP_PHYS_FOREIGN,
-            slow: true,
-            wide: false,
-        }
-    }
-    /// Allocate physically contiguous DMA pages from general RAM. Returns the
-    /// starting physical page number, or 0 on failure.
-    fn alloc_phys_contig(&mut self, num_pages: usize) -> u64;
-    /// Free a run previously returned by `alloc_phys_contig`.
-    fn free_phys_contig(&mut self, start_page: u64, num_pages: usize);
-    /// Physical page of DMA channel `ch`'s permanent ISA-DMA buffer (0 = none).
-    fn dma_channel_buf(&self, ch: usize) -> u64;
-    /// Set a per-thread TLS GDT entry. Returns the GDT index or -1 on error.
-    fn set_tls_entry(&mut self, index: i32, base: u32, limit: u32, limit_in_pages: bool) -> i32;
-
-    // ── FPU/SSE state ──────────────────────────────────────────────────────
-
-    /// A clean FPU/SSE save area for a fresh thread.
-    fn clean_fx_template(&self) -> Self::Fx;
-
-    /// The guest's current x87 top-of-stack register, ST(0), as the raw 80-bit
-    /// extended value.
-    ///
-    /// The MMIO instruction decoder needs it: an x87 store (`fstp [mmio]`) to a
-    /// trapped aperture faults like any other write, and the value being stored
-    /// lives nowhere in the general registers. Reading it must not disturb the
-    /// stack — `fpu_pop` is the separate half, for the popping forms.
-    fn fpu_st0(&self) -> [u8; 10];
-
-    /// Pop the guest's x87 stack, discarding ST(0).
-    fn fpu_pop(&mut self);
-
-    // ── Diagnostics & power ────────────────────────────────────────────────
-
-    /// Number of currently unallocated 4 KiB frames in the backing allocator.
-    fn free_page_count(&self) -> usize;
-    /// Total 4 KiB frames managed by that allocator, if known.
-    fn total_page_count(&self) -> Option<usize> { None }
-    /// Power off / leave the host.
-    fn shutdown(&mut self) -> !;
-    /// Disable interrupts and halt forever (panic / shutdown failure).
-    fn halt_forever(&mut self) -> !;
-
-    // ── x86 descriptor resolution (DOS personality + the shared monitor) ────
-    //
-    // Associated functions, NOT methods: the descriptor state they read is
-    // ambient to the backend (the live GDT/LDT on metal, the per-thread `desc`
-    // model on interp), not tied to an `Arch` *value*. That is what lets the
-    // shared `monitor` — which runs deep inside `execute()`, holding no `&mut
-    // self` — reach them with only the type parameter `A`, while the kernel
-    // (which does hold `&mut A`) calls them as `A::seg_base(sel)`.
-
-    /// Linear base of selector `sel` from the current descriptor tables.
-    fn seg_base(sel: u16) -> u32;
-    /// Whether selector `sel` is a 32-bit (D=1) segment.
-    fn seg_is_32(sel: u16) -> bool;
-    /// Does the VM86 redirection bitmap trap this vector (true), or should the
-    /// monitor reflect it through the real-mode IVT itself (false)?
-    fn int_intercepted(vector: u8) -> bool;
 }

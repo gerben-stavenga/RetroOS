@@ -30,9 +30,9 @@ pub(super) fn initialize<A: crate::Arch>(machine: &mut A) {
     }
     let page = NonNull::new(backing.pointer as *mut u8).unwrap();
     unsafe {
-        machine.map_shared_pages(ADDRESS / 4096, page, 1);
+        crate::kernel::memory::map_shared_pages(machine, ADDRESS / 4096, page, 1);
     }
-    machine.set_page_flags(ADDRESS / 4096, 1, false, false);
+    crate::kernel::memory::protect(machine, ADDRESS / 4096, 1, false, false);
     drop(backing);
     update(machine);
 }

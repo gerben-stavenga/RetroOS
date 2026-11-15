@@ -228,7 +228,8 @@ def replay(machine, steps, directory):
         kind, values = step["kind"], step["args"]
         try:
             if kind == "Cycles":
-                machine.command(f"cycles {values[0]}")
+                # Imported DOSBox speed directives do not change the host clock.
+                continue
             elif kind == "Focus":
                 if values[0] != 0:
                     raise common.Failure("partner machine unavailable")
@@ -354,7 +355,6 @@ def run_case(case, game, args):
             command[1:1] = ["--suite-cpu", cpu]
         (directory / "command.json").write_text(json.dumps(command, indent=2) + "\n")
         machine = Machine(command, directory, args.timeout or case["timeout"])
-        machine.command("cycles " + config(case["ini"]).get("emulator", "cycles", fallback="6000"))
         result["checkpoints"] = replay(machine, case["steps"], directory)
         expected = args.golden / (case["golden"] or case["name"]).replace("/", "__")
         hashes = [{"kind": c["kind"], "label": c["label"], "sha256": c["sha256"]} for c in result["checkpoints"]]

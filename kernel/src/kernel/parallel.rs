@@ -112,22 +112,21 @@ where A::PageTable: Send, A::Fx: Send {
     slot.state.store(IDLE, Ordering::Release);
     loop {
         if slot.state.load(Ordering::Acquire) != RUN {
-            machine.arm_alarm(None);
-            if slot.state.load(Ordering::Acquire) != RUN { machine.idle(); }
+            machine.idle(core::time::Duration::from_millis(1));
             continue;
         }
         machine.refresh_kernel_mappings();
         let loan = unsafe { &mut *slot.loan.get() };
         let (entry, base, limit, pages) = loan.tls;
         if entry >= 0 { machine.set_tls_entry(entry, base, limit, pages); }
-        let old = machine.activate(core::mem::take(&mut loan.space), &mut loan.fx, core::ptr::null_mut());
-        machine.arm_alarm(Some(loan.deadline));
+        machine.switch_fx(&mut loan.fx);
+        let old = machine.activate(core::mem::take(&mut loan.space));
         let active = ACTIVE.fetch_add(1, Ordering::AcqRel) + 1;
         PEAK.fetch_max(active, Ordering::Relaxed);
         loan.event = run_linux(&mut machine, loan, slot);
         ACTIVE.fetch_sub(1, Ordering::AcqRel);
-        machine.arm_alarm(None);
-        loan.space = machine.activate(old, &mut loan.fx, core::ptr::null_mut());
+        machine.switch_fx(&mut loan.fx);
+        loan.space = machine.activate(old);
         slot.state.store(DONE, Ordering::Release);
     }
 }
@@ -137,7 +136,7 @@ fn run_linux<A: Arch>(machine: &mut A, loan: &mut Loan<A>, slot: &Slot<A>) -> Ke
         if slot.cancel.load(Ordering::Acquire) { return KernelEvent::Irq; }
         machine.refresh_kernel_mappings();
         super::memory::service(machine);
-        let event = machine.execute(&mut loan.regs, &arch_abi::IoPolicy::deny_all());
+        let event = machine.execute(&mut loan.regs, &arch_abi::IoPolicy::deny_all(), core::time::Duration::from_nanos(loan.deadline.saturating_sub(machine.now())));
         if !matches!(event, KernelEvent::Syscall | KernelEvent::SoftInt(0x80) | KernelEvent::Irq) {
             return event;
         }
@@ -221,11 +220,13 @@ impl Parallel {
         collect_finished::<A>(threads);
         let current = ctx.tid;
         if let Some(event) = threads[current].kernel.pending_event.take() { return event; }
+        // Only Linux can be loaned to workers. DOS stays on the BSP, where
+        // native Sound Blaster IRQs must interrupt its execution directly.
         if !self.enabled::<A>() || !matches!(threads[current].personality, thread::Personality::Linux(_)) {
             stop_all(machine, threads);
-            return ctx.run(machine, bios, &mut threads[current].personality);
+            return ctx.run(machine, bios, &mut threads[current].personality, deadline);
         }
-        let started = machine.rdtsc();
+        let started = crate::kernel::event_profile::cycles();
         super::memory::service(machine);
         let mut chosen = [usize::MAX; MAX_CPUS];
         let cpu = self.affinity(threads, current, current);
@@ -241,11 +242,12 @@ impl Parallel {
             if self.available::<A>(cpu) && chosen[cpu] == usize::MAX { chosen[cpu] = tid; }
         }
         if chosen[0] == current && chosen.iter().skip(1).all(|&tid| tid == usize::MAX) {
-            return ctx.run(machine, bios, &mut threads[current].personality);
+            return ctx.run(machine, bios, &mut threads[current].personality, deadline);
         }
         self.batches += 1;
         let mut fx = machine.clean_fx_template();
-        threads[current].kernel.vcpu.space = machine.activate(Default::default(), &mut fx, core::ptr::null_mut());
+        machine.switch_fx(&mut fx);
+        threads[current].kernel.vcpu.space = machine.activate(Default::default());
         threads[current].kernel.vcpu.regs = ctx.regs;
         // The current process can remain parked when its assigned CPU is
         // occupied by a peer. Record this save even when no loan is issued.
@@ -257,10 +259,12 @@ impl Parallel {
             let deferred = matches!(&task.personality, thread::Personality::Linux(linux) if linux.has_deferred_resume());
             if task.kernel.tables_private && !deferred { continue; }
             let mut fx = task.kernel.fx_state;
-            let empty = machine.activate(core::mem::take(&mut task.kernel.vcpu.space), &mut fx, core::ptr::null_mut());
+            machine.switch_fx(&mut fx);
+            let empty = machine.activate(core::mem::take(&mut task.kernel.vcpu.space));
             if !task.kernel.tables_private { super::memory::private_tables(machine); }
             task.personality.on_resume(machine);
-            task.kernel.vcpu.space = machine.activate(empty, &mut fx, core::ptr::null_mut());
+            machine.switch_fx(&mut fx);
+            task.kernel.vcpu.space = machine.activate(empty);
             task.kernel.fx_state = fx;
             task.kernel.tables_private = true;
         }
@@ -296,20 +300,21 @@ impl Parallel {
             slot.state.store(RUN, Ordering::Release);
             machine.interrupt_processor(slot.processor.load(Ordering::Relaxed));
         }
-        let prepared = machine.rdtsc();
+        let prepared = crate::kernel::event_profile::cycles();
         if chosen[0] != usize::MAX {
             let task = &mut threads[chosen[0]];
             let mut fx = task.kernel.fx_state;
-            let empty = machine.activate(core::mem::take(&mut task.kernel.vcpu.space), &mut fx, core::ptr::null_mut());
+            machine.switch_fx(&mut fx);
+            let empty = machine.activate(core::mem::take(&mut task.kernel.vcpu.space));
             task.personality.on_resume(machine);
-            machine.arm_alarm(Some(deadline));
             machine.execution_profile_begin();
-            task.kernel.pending_event = Some(machine.execute(&mut task.kernel.vcpu.regs, &arch_abi::IoPolicy::deny_all()));
-            task.kernel.vcpu.space = machine.activate(empty, &mut fx, core::ptr::null_mut());
+            task.kernel.pending_event = Some(machine.execute(&mut task.kernel.vcpu.regs, &arch_abi::IoPolicy::deny_all(), core::time::Duration::from_nanos(deadline.saturating_sub(machine.now()))));
+            machine.switch_fx(&mut fx);
+            task.kernel.vcpu.space = machine.activate(empty);
             task.kernel.fx_state = fx;
             task.kernel.cpu_hash = thread::hash_regs(&task.kernel.vcpu.regs);
         }
-        let work_finished = if chosen[0] == usize::MAX { prepared } else { machine.rdtsc() };
+        let work_finished = if chosen[0] == usize::MAX { prepared } else { crate::kernel::event_profile::cycles() };
         // A BSP task already returned an event. Dispatch it now instead of
         // waiting for the process which happened to initiate this CPU loan.
         // Linux peers share a presentation endpoint; execution can change
@@ -336,10 +341,11 @@ impl Parallel {
         ctx.tid = resume;
         let task = &mut threads[resume];
         let mut fx = task.kernel.fx_state;
-        let _empty = machine.activate(core::mem::take(&mut task.kernel.vcpu.space), &mut fx, core::ptr::null_mut());
+        machine.switch_fx(&mut fx);
+        let _empty = machine.activate(core::mem::take(&mut task.kernel.vcpu.space));
         task.personality.on_resume(machine);
         ctx.regs = task.kernel.vcpu.regs;
-        self.kernel_cycles = prepared.wrapping_sub(started).wrapping_add(machine.rdtsc().wrapping_sub(work_finished));
+        self.kernel_cycles = prepared.wrapping_sub(started).wrapping_add(crate::kernel::event_profile::cycles().wrapping_sub(work_finished));
         task.kernel.pending_event.take().unwrap_or(KernelEvent::Irq)
     }
 }

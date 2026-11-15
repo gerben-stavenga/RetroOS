@@ -497,8 +497,14 @@ fn apply_guest_debug(k: &mut KvmCpu, step: bool) {
 
 /// Run the current Vcpu (`REGS`) until the next kernel-visible event.
 #[allow(clippy::deref_addrof)] // Form a raw pointer before borrowing the live static.
-pub fn execute() -> KernelEvent {
-    with(|k| loop {
+pub fn execute(max_time: core::time::Duration) -> KernelEvent {
+    if max_time.is_zero() { return KernelEvent::Irq; }
+    // Forget signals handled before this call. Once execution starts, a new
+    // signal must survive guest-state setup and reach KVM_RUN.
+    with(|k| k.vcpu.set_kvm_immediate_exit(0));
+    let max_ns = max_time.as_nanos().min(u64::MAX as u128) as u64;
+    super::setup::arm_alarm(Some(crate::machine::now().saturating_add(max_ns)));
+    let event = with(|k| loop {
         // Off-thread VGA snapshot / live terminal paint (CPU thread only).
         crate::screendump::maybe_dump();
         crate::screendump::maybe_render_live();
@@ -514,12 +520,6 @@ pub fn execute() -> KernelEvent {
         // attributes it to guest, VIF and delay sources. KVM strips TF from
         // guest RFLAGS under GUESTDBG_SINGLESTEP, so the flag drives the ioctl.
         let stepping = arch_abi::monitor::stepping(&vcpu.regs);
-
-        // The INTR-line check (the TCG block hook's analogue): hand the slice
-        // to the kernel when an IRQ is deliverable.
-        if crate::machine::irq_line() && vcpu.flags32() & VIF_FLAG != 0 {
-            return KernelEvent::Irq;
-        }
 
         if trace_on() {
             eprintln!(
@@ -562,18 +562,12 @@ pub fn execute() -> KernelEvent {
             Shutdown,
         }
         let ev = loop {
-            // Clear a previous kick before checking time/input. A signal after
-            // this check sets immediate_exit, covering the check-to-KVM_RUN race.
-            k.vcpu.set_kvm_immediate_exit(0);
-            if !in_shim(k) && (crate::machine::alarm_due() || crate::machine::host_input_pending()
-                || (crate::machine::irq_line() && vcpu.flags32() & VIF_FLAG != 0))
-                && !queued_exception(k) {
-                sync_out(k, vcpu, mode);
-                return KernelEvent::Irq;
-            }
             let kind = match k.vcpu.run() {
                 // Timer kick (or any host signal).
-                Err(e) if e.errno() == libc::EINTR => Kind::Intr,
+                Err(e) if e.errno() == libc::EINTR => {
+                    k.vcpu.set_kvm_immediate_exit(0);
+                    Kind::Intr
+                },
                 Err(e) => panic!("KVM_RUN failed: {e}"),
                 Ok(VcpuExit::IoOut(SHIM_PORT, _)) => Kind::Shim,
                 // An IOPB-allowed port: hardware ran the access with no #GP —
@@ -691,7 +685,9 @@ pub fn execute() -> KernelEvent {
             Some(e) => return e,
             None => continue,
         }
-    })
+    });
+    super::setup::arm_alarm(None);
+    event
 }
 
 /// Route a 64-bit shim-vectored trap. Leaner than the 32-bit ladder: no VM86,
@@ -802,6 +798,12 @@ fn dispatch_shim(
                     && (vcpu.flags32() & VIF_FLAG != 0) != vif_was_on
                 {
                     return Some(KernelEvent::VifWindow { entry_ip, vif_was_on });
+                }
+                // The pending indication belongs to this register frame,
+                // just as it does on native VME/PVI hardware.
+                const VIF_VIP: u32 = (1 << 19) | (1 << 20);
+                if vcpu.flags32() & VIF_VIP == VIF_VIP {
+                    return Some(KernelEvent::Irq);
                 }
                 if stepped {
                     return Some(KernelEvent::EmulatedStep { user_was });

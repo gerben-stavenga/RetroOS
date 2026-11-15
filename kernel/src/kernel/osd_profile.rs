@@ -48,14 +48,14 @@ pub(crate) fn blit(path: Blit, width: usize, height: usize, pixels: usize) {
 pub(crate) struct Sample(Option<u64>);
 
 impl Sample {
-    pub(crate) fn start<A: crate::Arch>(machine: &A) -> Self {
+    pub(crate) fn start<A: crate::Arch>(_machine: &A) -> Self {
         Self((super::startup::profile_enabled() && super::osd::is_open())
-            .then(|| machine.rdtsc()))
+            .then(|| crate::kernel::event_profile::cycles()))
     }
 
-    pub(crate) fn finish<A: crate::Arch>(self, machine: &A, stage: Stage, pixels: usize) {
+    pub(crate) fn finish<A: crate::Arch>(self, _machine: &A, stage: Stage, pixels: usize) {
         let Some(start) = self.0 else { return };
-        let cycles = machine.rdtsc().wrapping_sub(start);
+        let cycles = crate::kernel::event_profile::cycles().wrapping_sub(start);
         // Kernel execution is cooperative: no ISR touches this storage.
         unsafe {
             let counter = &mut (*core::ptr::addr_of_mut!(COUNTERS))[stage as usize];

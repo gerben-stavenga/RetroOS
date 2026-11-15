@@ -75,7 +75,7 @@ class ScriptTest(unittest.TestCase):
             'Keys(["enter", "escape"], 300)', 'Type("TEST\\n")', 'Check(Running)')]
         with tempfile.TemporaryDirectory() as work:
             suite.replay(fake, steps, Path(work))
-        self.assertEqual(fake.calls, [("command", "cycles 300"), ("run", 1000),
+        self.assertEqual(fake.calls, [("run", 1000),
             ("press", "up", 1500, 60), ("press", "ctrl"), ("press", "enter", 60, 240),
             ("press", "escape", 60, 240), ("type", "TEST\n")])
 

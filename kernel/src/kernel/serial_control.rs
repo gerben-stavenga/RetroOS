@@ -55,7 +55,7 @@ pub fn init<A: crate::Arch>(machine: &mut A, port: ComPort) -> bool {
     endpoint.drain_rx();
     PORT.store(match port { ComPort::Com1 => 1, ComPort::Com2 => 2 }, Ordering::Relaxed);
     LIVE.store(true, Ordering::Relaxed);
-    machine.route_isa_irq(endpoint.irq());
+    machine.isa_enable_irq(endpoint.irq());
     endpoint.receive_interrupts(true);
     true
 }
@@ -570,7 +570,7 @@ pub(super) fn poll<A: crate::Arch>(machine: &mut A, events: &mut alloc::vec::Vec
         }
     }
     RX_PENDING.store(pending, Ordering::Relaxed);
-    if receive { machine.rearm_irq(endpoint.irq()); }
+    if receive { machine.isa_unmask_irq(endpoint.irq()); }
     dump
 }
 

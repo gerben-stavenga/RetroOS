@@ -428,7 +428,7 @@ pub(super) fn int_21h<A: crate::Arch>(
                     .then(|| crate::kernel::vfs::seek(handle, 0, 1, &kt.fds));
                 let read_started = machine.now();
                 let fetch_started = crate::kernel::startup::profile_enabled()
-                    .then(|| machine.rdtsc());
+                    .then(|| crate::kernel::event_profile::cycles());
                 let n = crate::kernel::vfs::read(handle, &mut buf, &kt.fds);
                 if let Some(offset) = read_offset {
                     let prefix = (n.max(0) as usize).min(buf.len()).min(16);
@@ -438,7 +438,7 @@ pub(super) fn int_21h<A: crate::Arch>(
                 if let Some(start) = fetch_started {
                     crate::kernel::event_profile::record_dos_read_fetch(
                         count as u16,
-                        machine.rdtsc().wrapping_sub(start),
+                        crate::kernel::event_profile::cycles().wrapping_sub(start),
                     );
                 }
                 if n >= 0 {
@@ -462,12 +462,12 @@ pub(super) fn int_21h<A: crate::Arch>(
                         });
                     } else {
                         let copy_started = crate::kernel::startup::profile_enabled()
-                            .then(|| machine.rdtsc());
+                            .then(|| crate::kernel::event_profile::cycles());
                         finish_file_read(machine, dos, regs, buf_addr, &buf);
                         if let Some(start) = copy_started {
                             crate::kernel::event_profile::record_dos_read_copy(
                                 count as u16,
-                                machine.rdtsc().wrapping_sub(start),
+                                crate::kernel::event_profile::cycles().wrapping_sub(start),
                             );
                         }
                     }

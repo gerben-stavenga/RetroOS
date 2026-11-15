@@ -34,7 +34,7 @@ pub(super) fn sysinfo<A: crate::Arch>(machine: &mut A, args: &Args, wide: bool) 
         return SyscallResult::val(-super::ENOSYS);
     };
     let total = total as u64;
-    let uptime = machine.get_ticks() / 1000;
+    let uptime = (machine.now() / 1_000_000) / 1000;
     machine.zero(pointer, size as usize);
     // No swap or high-memory zone is exposed. Load averages and the breakdown
     // into shared/buffer RAM are not tracked; total/free include all allocations.

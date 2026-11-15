@@ -1,6 +1,6 @@
 //! Linux time structures have ABI-sized words, independent of kernel bitness.
 use super::{Args, EFAULT, EINVAL, SyscallResult, high_memory};
-// Arch::get_ticks is milliseconds (Arch::now / 1_000_000), not 100 Hz.
+// Compatibility timestamps use milliseconds (Arch::now / 1_000_000), not 100 Hz.
 const TICK_NS: u64 = 1_000_000;
 fn monotonic_pair(milliseconds: u64) -> (u64, u64) {
     (milliseconds / 1000, (milliseconds % 1000) * TICK_NS)
@@ -41,7 +41,7 @@ pub(super) fn clock_gettime<A: crate::Arch>(
     let (seconds, nanos) = if matches!(args.a0, 0 | 5) {
         (realtime(), 0)
     } else {
-        monotonic_pair(machine.get_ticks())
+        monotonic_pair(machine.now() / 1_000_000)
     };
     SyscallResult::val(if store(machine, args.a1, seconds, nanos, wide) { 0 } else { -EFAULT })
 }

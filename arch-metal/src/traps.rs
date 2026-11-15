@@ -100,6 +100,10 @@ pub(crate) fn set_execute_regs(regs: *mut Regs) {
 
 /// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
 pub mod arch_call {
+    pub const READ_MAPPINGS: u64 = 0x12E;
+    pub const REPLACE_MAPPINGS: u64 = 0x12F;
+    pub const FILL_MAPPINGS: u64 = 0x130;
+    pub const READ_MAPPING_RUN: u64 = 0x131;
     pub const PRIVATE_TABLES: u64 = 0x12B;
     pub const REFRESH_KERNEL: u64 = 0x12C;
     pub const INTERRUPT_PROCESSOR: u64 = 0x12D;
@@ -107,32 +111,22 @@ pub mod arch_call {
     pub const FRAME_OPERATION: u64 = 0x129; // EDX=frame request
     pub const HIGH_MEMORY: u64 = 0x128; // EDX=request pointer
     pub const EXECUTE: u64 = 0x100;      // Swap kernel↔user regs
-    pub const SWITCH_TO: u64 = 0x101;    // Thread switch: EDX=out_regs, ECX=out_root, EBX=in_regs, ESI=in_root
+    pub const ACTIVATE: u64 = 0x101;     // EDX=in/out page-table root
+    pub const CHECK_ADDRESS_SPACE: u64 = 0x132; // EDX=in/out diagnostic hash
     pub const SWITCH_FX: u64 = 0x102;    // Swap live FPU/SSE with EDX save area
     pub const FORK: u64 = 0x105;         // COW fork. EDX=out RootPageTable. Returns new root phys in EAX.
     pub const CLEAN: u64 = 0x106;        // Free all user pages + flush TLB
-    pub const SET_PAGE_FLAGS: u64 = 0x108; // EDX=start_vpage, ECX=count, EBX=flags (bit0=W, bit1=X)
-    pub const MAP_LOW_MEM: u64 = 0x109;  // Map first 1MB user-accessible for VM86
-    pub const COPY_PAGE_ENTRIES: u64 = 0x10C; // EDX=src_vpage, ECX=dst_vpage, EBX=count — copy entries src→dst
-    pub const SWAP_PAGE_ENTRIES: u64 = 0x10E; // EDX=a_vpage, ECX=b_vpage, EBX=count — swap entries a↔b
-    pub const UNMAP_RANGE: u64 = 0x10F;  // EDX=vpage_start, ECX=count — clear entries to absent
     pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
-    pub const MAP_PHYS_RANGE: u64 = 0x116; // EDX=vpage_start ECX=num_pages EBX=ppage_lo ESI=ppage_hi EDI=flags
+    pub const MAP_KERNEL_PHYSICAL: u64 = 0x116; // EDX=vpage_start ECX=num_pages EBX=ppage_lo ESI=ppage_hi EDI=flags
     pub const SET_TLS_ENTRY: u64 = 0x117; // EDX=index(-1=auto), ECX=base, EBX=limit, ESI=flags. Returns index in EAX.
-    pub const MAP_VGA_TEXT_APERTURE: u64 = 0x118; // map guest 0xB8000-0xBFFFF onto the shared text screen
     #[allow(dead_code)]
     pub const HASH_PHYS_PAGE: u64 = 0x118; // EDX=phys_page_num. Returns FNV-1a u64 hash of that physical page in EAX.
     pub const SET_DEBUG_WATCH: u64 = 0x119; // EBX=count, EDX/ECX=watched linear addrs
-    pub const REARM_IRQ: u64 = 0x11C;         // EDX=irq line — re-unmask a deferred-ack Hw line
-    pub const MAP_FRESH_RANGE: u64 = 0x11E;   // EDX=vpage_start, ECX=count — replace range with fresh anon frames
+    pub const ISA_UNMASK_IRQ: u64 = 0x11C;         // EDX=irq line — re-unmask a deferred-ack Hw line
     pub const HALT: u64 = 0x11F;              // cli + hlt forever at ring 0 (never returns)
-    pub const REDIRECT_PHYSICAL_ALIASES: u64 = 0x120; // ESI:EDX=phys page ECX=shadow vpage EBX=count EDI=redirect
     pub const REMAP_PHYSICAL_APERTURE: u64 = 0x121; // EDX/ECX=physical base low/high
     pub const RELEASE_HEAP: u64 = 0x122; // EDX=heap address, ECX=byte length
-    pub const MAP_SHARED_PAGES: u64 = 0x123; // EDX=guest vpage, ECX=kernel address, EBX=count
-    pub const ARM_ALARM: u64 = 0x125; // EDX=pointer to Option<u64> absolute deadline
-    pub const IDLE: u64 = 0x126; // atomically check pending events and wait
-    pub const POLL_TIMED_DEVICES: u64 = 0x127; // EDX=pointer to now/next deadline
+    pub const IDLE: u64 = 0x126; // EDX:ECX = maximum wait in nanoseconds
     pub const REPLACE_INTERRUPT_HANDLERS: u64 = 0x124; // EDX=in/out handler pair, ECX=vector
 }
 
@@ -230,6 +224,10 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
 #[inline(never)]
 fn arch_dispatch(regs: &mut Regs) {
     match regs.rax {
+        arch_call::READ_MAPPINGS => crate::mapping::read_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Read) }),
+        arch_call::REPLACE_MAPPINGS => crate::mapping::replace_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Replace) }),
+        arch_call::FILL_MAPPINGS => crate::mapping::fill_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Fill) }),
+        arch_call::READ_MAPPING_RUN => crate::mapping::read_mapping_run(unsafe { &mut *(regs.rdx as *mut crate::mapping::ReadRun) }),
         arch_call::PRIVATE_TABLES => { regs.rax = paging2::privatize_user_tables() as i64 as u64; }
         arch_call::REFRESH_KERNEL => { paging2::refresh_kernel_mappings(); x86::flush_tlb(); }
         arch_call::INTERRUPT_PROCESSOR => { crate::irq::interrupt_processor(regs.rdx as u32); }
@@ -238,14 +236,29 @@ fn arch_dispatch(regs: &mut Regs) {
             request.result = crate::high_paging::request(request);
         }
         arch_call::EXECUTE => {
-            if super::irq::wake_pending() {
+            let max_ns = (regs.rdx as u32 as u64) | ((regs.rcx as u32 as u64) << 32);
+            if max_ns == 0 {
                 let (event, extra) = arch_abi::KernelEvent::Irq.encode();
-                regs.rax = u64::from(event);
+                regs.rax = event as u64;
                 regs.rdx = extra as u32 as u64;
                 regs.rcx = extra >> 32;
-            } else { swap_regs(regs); }
+            } else {
+                super::irq::arm_alarm(Some(super::irq::now(false).saturating_add(max_ns)));
+                swap_regs(regs);
+            }
         },
-        arch_call::SWITCH_TO => arch_switch_to(regs),
+        arch_call::ACTIVATE => unsafe {
+            (&mut *(regs.rdx as *mut paging2::RootPageTable)).swap_and_activate();
+        },
+        arch_call::CHECK_ADDRESS_SPACE => {
+            let hash = unsafe { &mut *(regs.rdx as *mut u64) };
+            let actual = paging2::hash_and_record();
+            if *hash != 0 && *hash != actual {
+                lib::compact_println!("HASH MISMATCH expected {:#018x} got {:#018x}", *hash, actual);
+                paging2::print_recorded_diff(*hash, actual);
+            }
+            *hash = actual;
+        },
         arch_call::SWITCH_FX => {
             let fx = regs.rdx as u32 as *mut crate::x86::FxState;
             let mut tmp = crate::x86::FxState::zeroed();
@@ -267,43 +280,6 @@ fn arch_dispatch(regs: &mut Regs) {
             }
         }
         arch_call::CLEAN => paging2::free_user_pages(),
-        arch_call::SET_PAGE_FLAGS => {
-            let start = regs.rdx as usize;
-            let count = regs.rcx as usize;
-            let flags = regs.rbx as u32;
-            let writable = flags & 1 != 0;
-            let executable = flags & 2 != 0;
-            match paging2::entries() {
-                paging2::Entries::E32(e) => {
-                    for i in 0..count {
-                        set_page_flags_entry(e, (start + i) * paging2::PAGE_SIZE, writable, executable);
-                    }
-                }
-                paging2::Entries::E64(e) => {
-                    for i in 0..count {
-                        set_page_flags_entry(e, (start + i) * paging2::PAGE_SIZE, writable, executable);
-                    }
-                }
-            }
-            paging2::flush_tlb();
-        }
-        arch_call::MAP_LOW_MEM => paging2::map_low_mem_user(),
-        arch_call::MAP_VGA_TEXT_APERTURE => paging2::map_vga_text_aperture_user(),
-        arch_call::MAP_SHARED_PAGES => paging2::map_shared_pages_user(
-            regs.rdx as usize, regs.rcx as usize, regs.rbx as usize),
-        arch_call::COPY_PAGE_ENTRIES => {
-            paging2::copy_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);
-        }
-        arch_call::REDIRECT_PHYSICAL_ALIASES => {
-            let physical_ppage = (regs.rdx as u32 as u64)
-                | ((regs.rsi as u32 as u64) << 32);
-            paging2::redirect_physical_aliases(
-                physical_ppage, regs.rcx as usize, regs.rbx as usize, regs.rdi != 0);
-        }
-        arch_call::SWAP_PAGE_ENTRIES => {
-            paging2::swap_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);
-        }
-        arch_call::UNMAP_RANGE => paging2::unmap_range(regs.rdx as usize, regs.rcx as usize),
         arch_call::RELEASE_HEAP => paging2::release_heap_pages(regs.rdx as usize, regs.rcx as usize),
         arch_call::LOAD_LDT => {
             crate::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
@@ -314,14 +290,14 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::FRAME_OPERATION => {
             crate::frames::handle(unsafe { &mut *(regs.rdx as *mut crate::frames::Request) });
         }
-        arch_call::MAP_PHYS_RANGE => {
+        arch_call::MAP_KERNEL_PHYSICAL => {
             let vpage_start = regs.rdx as usize;
             let num_pages = regs.rcx as usize;
             // 64-bit physical page: low 32 in EBX, high 32 in ESI (firmware can
             // place an NVMe BAR above 4 GB on a wide-MAXPHYADDR CPU).
             let ppage_start = (regs.rbx as u32 as u64) | ((regs.rsi as u32 as u64) << 32);
             let flags = regs.rdi;
-            paging2::map_user_range_phys(vpage_start, num_pages, ppage_start, flags);
+            paging2::map_kernel_physical(vpage_start, num_pages, ppage_start, flags);
         }
         arch_call::REMAP_PHYSICAL_APERTURE => {
             let physical_base = (regs.rdx as u32 as u64)
@@ -330,24 +306,16 @@ fn arch_dispatch(regs: &mut Regs) {
         }
         // HALT: the ring-1 kernel cannot `hlt` (CPL-0-only, #GPs); panic and
         // shutdown funnel here to die quietly at ring 0.
-        arch_call::ARM_ALARM => {
-            let deadline = unsafe { *(regs.rdx as *const Option<u64>) };
-            super::irq::arm_alarm(deadline);
-        }
-        arch_call::IDLE => super::irq::idle(),
-        arch_call::POLL_TIMED_DEVICES => {
-            let value = unsafe { &mut *(regs.rdx as *mut Option<u64>) };
-            *value = super::irq::poll_timed_devices(value.unwrap());
+        arch_call::IDLE => {
+            let max_ns = (regs.rdx as u32 as u64) | ((regs.rcx as u32 as u64) << 32);
+            super::irq::idle(max_ns);
         }
         arch_call::HALT => {
             x86::cli();
             loop { x86::hlt(); }
         }
-        arch_call::REARM_IRQ => {
-            crate::irq::rearm_irq(regs.rdx as u8);
-        }
-        arch_call::MAP_FRESH_RANGE => {
-            paging2::map_fresh_range(regs.rdx as usize, regs.rcx as usize);
+        arch_call::ISA_UNMASK_IRQ => {
+            crate::irq::isa_unmask_irq(regs.rdx as u8);
         }
         arch_call::SET_TLS_ENTRY => {
             let index = regs.rdx as i32;
@@ -413,54 +381,6 @@ fn swap_regs(regs: &mut Regs) {
         unsafe { core::mem::swap(regs, &mut (*p).regs); }
     } else {
         unsafe { core::ptr::swap(regs, execute); }
-    }
-}
-
-/// Switch threads: swap live state with pointed-to state.
-/// SWITCH_TO: EDX=regs_ptr, ECX=root_ptr, EBX=hash_ptr (0 = no hashing)
-/// On entry: ptrs hold incoming state. On exit: ptrs hold saved outgoing state.
-fn arch_switch_to(regs: &mut Regs) {
-    let regs_ptr = regs.rdx as u32 as *mut Regs;
-    let root_ptr = regs.rcx as u32 as *mut paging2::RootPageTable;
-    let hash_ptr = regs.rbx as u32 as *mut u64;
-    let fx_ptr   = regs.rsi as u32 as *mut crate::x86::FxState;
-
-    let expected = if !hash_ptr.is_null() {
-        unsafe {
-            let exp = *hash_ptr;
-            *hash_ptr = paging2::hash_and_record();
-            exp
-        }
-    } else { 0 };
-
-    // Swap x87/SSE state eagerly: save outgoing into a temp, load incoming
-    // from the thread's area, then move temp into the thread's area so it
-    // holds the outgoing state on return (mirrors the regs swap semantics).
-    // Null fx_ptr = skip (used by kernel-only transient swaps that never
-    // touch the FPU between entry and exit).
-    if !fx_ptr.is_null() {
-        let mut tmp = crate::x86::FxState::zeroed();
-        tmp.save();
-        unsafe { (*fx_ptr).restore(); }
-        unsafe { *fx_ptr = tmp; }
-    }
-
-    // Swap regs
-    let regs_p = &raw mut REGS;
-    unsafe { core::ptr::swap(regs_ptr, &raw mut (*regs_p).regs); }
-
-    // Log incoming struct PDE[0] before swap
-    let _pre_pde0 = unsafe { (*root_ptr).e32[0].0 };
-
-    // Swap root: swap entries in-place, then reload CR3
-    unsafe { (&mut *root_ptr).swap_and_activate(); }
-
-    if !hash_ptr.is_null() {
-        let new_hash = paging2::hash_and_record();
-        if expected != 0 && expected != new_hash {
-            lib::compact_println!("\x1b[91mHASH MISMATCH expected {:#018x} got {:#018x}\x1b[0m", expected, new_hash);
-            paging2::print_recorded_diff(expected, new_hash);
-        }
     }
 }
 
@@ -892,6 +812,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
         // of VME landing here too).
         _ => KE::SoftInt(int_num as u8),
     };
+    super::irq::arm_alarm(None);
     swap_regs(regs);
     let (event, extra) = kevent.encode();
     regs.rax = event as u64;
@@ -991,7 +912,7 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
         paging2::Entries::E32(e) => {
             if present {
                 handle_protection_fault(e, fault_addr, page_index, write, user, instruction_fetch)?;
-            } else if e[page_index].raw() & paging2::flags::CACHE_DISABLE != 0 {
+            } else if e[page_index].raw() & (paging2::flags::CACHE_DISABLE | paging2::flags::SOFT_RO | paging2::flags::NO_ACCESS) != 0 {
                 return None; // present=0 + PCD = emulated MMIO trap — kernel decodes
             } else {
                 demand_page(e, page_index, false);
@@ -1000,7 +921,7 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
         paging2::Entries::E64(e) => {
             if present {
                 handle_protection_fault(e, fault_addr, page_index, write, user, instruction_fetch)?;
-            } else if e[page_index].raw() & paging2::flags::CACHE_DISABLE != 0 {
+            } else if e[page_index].raw() & (paging2::flags::CACHE_DISABLE | paging2::flags::SOFT_RO | paging2::flags::NO_ACCESS) != 0 {
                 return None;
             } else {
                 demand_page(e, page_index, nx);
@@ -1058,27 +979,6 @@ fn handle_protection_fault<E: paging2::Entry>(
     None // Unexpected, let kernel handle
 }
 
-/// Set final permissions on a page (for SET_PAGE_FLAGS arch call)
-fn set_page_flags_entry<E: paging2::Entry>(entries: &mut [E], vaddr: usize, writable: bool, executable: bool) {
-    let page = paging2::page_idx(vaddr);
-    if entries[page].present() {
-        let phys = entries[page].page();
-        // Changing protection must retain ownership/cache flags. In particular,
-        // FOREIGN aliases are owned by a kernel allocation, not guest cleanup
-        // or fork COW; rebuilding the entry would turn them into owned frames.
-        let mut entry = entries[page];
-        entry.set_writable(writable);
-        // Hardware must enforce read-only protections. Borrowed shared RAM
-        // can change writability directly; owned RAM retains its COW state.
-        if !writable || entry.raw() & paging2::flags::FOREIGN != 0 {
-            entry.set_hw_writable(writable);
-        }
-        entry.set_no_execute(!executable);
-        let displaced = paging2::replace_entry(&mut entries[page], entry);
-        debug_assert_eq!(displaced.page(), phys);
-        x86::invlpg(vaddr & !(paging2::PAGE_SIZE - 1));
-    }
-}
 
 /// Demand page allocation for not-present pages
 fn demand_page<E: paging2::Entry>(

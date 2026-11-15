@@ -364,7 +364,7 @@ pub fn zero_channel_buf<A: crate::Arch>(machine: &mut A, chan: u8) {
     }
     // 64 KB window on an 8-bit channel, 128 KB on a 16-bit one.
     let (pages, fill) = if chan >= 4 { (32usize, 0x00u8) } else { (16usize, 0x80u8) };
-    machine.map_phys_range(DMA_WIN_VA >> 12, pages, page, PTE_CACHE_DISABLE);
+    crate::kernel::memory::map_physical(machine, DMA_WIN_VA >> 12, pages, page, PTE_CACHE_DISABLE);
     unsafe { core::ptr::write_bytes(DMA_WIN_VA as *mut u8, fill, pages * 0x1000) };
 }
 
@@ -404,7 +404,7 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &Sb16) -> Option<u32> {
         return None;
     }
     let pages = RING_BYTES.div_ceil(0x1000);
-    machine.map_phys_range(DMA_WIN_VA >> 12, pages, phys_page, PTE_CACHE_DISABLE);
+    crate::kernel::memory::map_physical(machine, DMA_WIN_VA >> 12, pages, phys_page, PTE_CACHE_DISABLE);
     let dma_phys = (phys_page * 0x1000) as u32;
 
     // Start from silence so the first auto-init lap before prime isn't garbage.

@@ -7,6 +7,21 @@
 
 use alloc::vec::Vec;
 
+/// Frozen during platform setup. Indexes are the source IDs returned in
+/// `Irq::Msi`; missing entries mean that source cannot be routed.
+static MSI_TARGETS: spin::Once<Vec<Option<(u64, u32)>>> = spin::Once::new();
+
+/// Install the platform's MSI routes before PCI drivers initialize.
+pub fn init_msi_targets(targets: impl IntoIterator<Item = Option<(u64, u32)>>) {
+    MSI_TARGETS.call_once(|| targets.into_iter().collect());
+}
+
+/// The address/data pair a PCI device writes to signal `Irq::Msi(source)`.
+/// Platforms without MSI routes, including hosted execution, return `None`.
+pub fn msi_target(source: u8) -> Option<(u64, u32)> {
+    MSI_TARGETS.get()?.get(usize::from(source)).copied().flatten()
+}
+
 const PCI_CFG_ADDR: u16 = 0xCF8;
 const PCI_CFG_DATA: u16 = 0xCFC;
 
@@ -43,7 +58,7 @@ pub fn disable_bus_master(address: (u8, u8, u8)) {
 const CAP_MSI: u8 = 0x05;
 
 /// Program a device's MSI capability with `(addr, data)` (from
-/// [`crate::Arch::msi_alloc`]) and enable it, so the device signals interrupts
+/// [`msi_target`]) and enable it, so the device signals interrupts
 /// by memory write instead of a wired INTx line. Returns false if the device
 /// has no capability list or no MSI capability (caller falls back to INTx /
 /// polling). One vector only (Multiple-Message-Enable forced to 0).

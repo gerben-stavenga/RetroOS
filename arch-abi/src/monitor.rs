@@ -6,7 +6,7 @@
 //! guest memory come from it directly (`vcpu` is [`GuestBytes`](crate::GuestBytes)),
 //! and the three descriptor facts the decoder needs — selector base, operand
 //! size, VM86 interrupt redirection — come from the backend TYPE parameter `A`
-//! as the associated functions [`Arch::seg_base`](crate::Arch::seg_base) etc.
+//! as the associated functions [`X86::seg_base`](crate::X86::seg_base) etc.
 //! No `A` *value* is required, which is what lets the decoder run this deep
 //! inside `execute()` where no `&mut A` handle exists — it needs only the type.
 //!
@@ -19,7 +19,7 @@
 //! IVT reflect) return [`MonitorResult::Resume`]; those needing kernel help
 //! (port emulation, soft INT dispatch, idle) return a typed [`KernelEvent`].
 
-use crate::{Arch, GuestBytes, IoSize, KernelEvent, Regs, UserMode};
+use crate::{X86, GuestBytes, IoSize, KernelEvent, Regs, UserMode};
 
 /// Result of one monitor decode step. `Resume` is the fast path — the caller
 /// returns to ring-3. `Event(e)` carries a typed kernel event to bubble up.
@@ -101,7 +101,7 @@ fn apply_guest_flags(regs: &mut Regs, popped: u32, op32: bool, instruction: Flag
 /// Resolve (linear base, 32-bit?) for the code segment at fault time.
 /// VM86 uses CS*16 and is always 16-bit; PM looks through the descriptor table.
 #[inline]
-fn code_view<A: Arch>(regs: &Regs) -> (u32, bool) {
+fn code_view<A: X86>(regs: &Regs) -> (u32, bool) {
     if regs.mode() == UserMode::VM86 {
         ((regs.code_seg() as u32) << 4, false)
     } else {
@@ -112,7 +112,7 @@ fn code_view<A: Arch>(regs: &Regs) -> (u32, bool) {
 
 /// Resolve (linear base, 32-bit?) for the stack segment at fault time.
 #[inline]
-fn stack_view<A: Arch>(regs: &Regs) -> (u32, bool) {
+fn stack_view<A: X86>(regs: &Regs) -> (u32, bool) {
     if regs.mode() == UserMode::VM86 {
         ((regs.stack_seg() as u32) << 4, false)
     } else {
@@ -237,7 +237,7 @@ fn string_io(regs: &mut Regs, cs_32: bool, advance: u32, rep: bool, addr32: bool
 /// Decode the instruction at CS:IP and either finish it inline (`Resume`) or
 /// return a typed kernel event (`Event`). At entry bit 9 of `regs.flags32()`
 /// holds the guest's virtual interrupt flag.
-pub fn monitor<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
+pub fn monitor<A: X86 + GuestBytes>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
     // `arch` IS the active-space accessor (`Arch: GuestBytes`) plus the segment
     // and int-redirection oracle (its associated fns); `regs` is disjoint.
     monitor_rs::<A>(arch, regs)
@@ -275,8 +275,8 @@ fn vm86_cr0(regs: &mut Regs, opcode: u8, modrm: u8) -> bool {
 
 /// The decode body, in split `(regs, memory)` form — `step_virtual_if` drives
 /// it with the same two borrows. `A` is used only for its static segment/int
-/// resolution (`A::seg_base` etc.); memory is the `A::PageTable` handle.
-fn monitor_rs<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
+/// resolution (`A::seg_base` etc.); memory is accessed through GuestBytes.
+fn monitor_rs<A: X86 + GuestBytes>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
     use KernelEvent as E;
     use MonitorResult::Event;
     let (cs_base, cs_32) = code_view::<A>(regs);

@@ -683,3 +683,12 @@ fn vga_readback_answers() -> bool {
     outb(0x3D4, crtc_index);
     at_index == 0 && at_data != 0
 }
+
+static USER_TSC_CLOCK: spin::Once<Option<(u64, u64)>> = spin::Once::new();
+/// Install immutable clock facts before starting secondary CPUs or user code.
+pub fn init_user_tsc_clock(clock: Option<(u64, u64)>) {
+    USER_TSC_CLOCK.call_once(|| clock);
+}
+pub fn user_tsc_clock() -> Option<(u64, u64)> {
+    USER_TSC_CLOCK.get().copied().flatten()
+}

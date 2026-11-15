@@ -48,7 +48,11 @@ pub(super) fn install_rom_font<A: crate::Arch>(machine: &mut A) {
     let font8 = dos::font_8x8_addr();
     let font14 = dos::font_8x14_addr();
     let font16 = dos::font_8x16_addr();
+    // The substitute BIOS publishes its own font image at the IBM ROM address.
+    // Patch owned RAM, then expose the completed image read-only.
+    crate::kernel::memory::private_copy(machine, ROM_FONT_8X8 / 4096, 1);
     machine.copy_to(ROM_FONT_8X8, &lib::vga_fonts::FONT_8X8[..1024]);
+    crate::kernel::memory::protect(machine, ROM_FONT_8X8 / 4096, 1, false, true);
     let fonts = lib::codepage::current_codepage().fonts();
     machine.copy_to(font8 as usize, fonts.h8);
     machine.copy_to(font14 as usize, fonts.h14);

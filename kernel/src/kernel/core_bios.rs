@@ -8,6 +8,72 @@ use crate::{Arch, Regs, Vcpu};
 use arch_abi::IoSize;
 use alloc::vec::Vec;
 
+// Selected from boot-reported usable conventional RAM, excluding EBDA,
+// reserved ranges and boot modules. The physical allocator excludes all of
+// the first MiB; SMP also excludes this reservation from trampoline selection.
+static NATIVE_SCRATCH: spin::Once<Option<usize>> = spin::Once::new();
+#[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
+pub(crate) fn set_native_scratch(base: Option<usize>) {
+    NATIVE_SCRATCH.call_once(|| base);
+}
+pub(crate) fn native_scratch() -> Option<core::ops::Range<usize>> {
+    NATIVE_SCRATCH.get().copied().flatten().map(|base| base..base + 0x20000)
+}
+/// Choose a segment-aligned area with a full 64 KiB transfer segment.
+#[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
+pub(crate) fn choose_native_scratch(
+    conventional_end: usize,
+    ebda: usize,
+    available: impl Fn(usize, usize) -> bool,
+) -> Option<usize> {
+    let mut ceiling = conventional_end.min(0xa0000);
+    if ebda != 0 { ceiling = ceiling.min(ebda); }
+    (0x10000usize..0x90000).step_by(0x10000).rev().find(|&start| {
+        let end = start + 0x20000;
+        end <= ceiling && available(start, end)
+    })
+}
+
+#[cfg(test)]
+mod native_memory_tests {
+    use super::choose_native_scratch;
+
+    #[test]
+    fn scratch_stays_below_bda_and_relocated_ebda() {
+        assert_eq!(choose_native_scratch(0xa0000, 0x9fc00, |_, _| true), Some(0x70000));
+        assert_eq!(choose_native_scratch(0xa0000, 0x80000, |_, _| true), Some(0x60000));
+        assert_eq!(choose_native_scratch(0x70000, 0x9fc00, |_, _| true), Some(0x50000));
+        assert_eq!(choose_native_scratch(0xa0000, 0, |_, _| true), Some(0x80000));
+    }
+
+    #[test]
+    fn scratch_skips_reserved_memory_and_fails_closed() {
+        assert_eq!(choose_native_scratch(0xa0000, 0x9fc00,
+            |start, end| !(start < 0x71000 && end > 0x70000)), Some(0x50000));
+        assert_eq!(choose_native_scratch(0xa0000, 0, |_, _| false), None);
+        assert_eq!(choose_native_scratch(0x20000, 0, |_, _| true), None);
+        assert_eq!(choose_native_scratch(0, 0, |_, _| true), None);
+    }
+}
+
+fn scratch_base() -> usize {
+    native_scratch().expect("native BIOS scratch reservation").start
+}
+
+fn prepare_bios_int10<A: Arch>(machine: &mut A, regs: &mut Regs) {
+    let base = scratch_base();
+    machine.write::<[u8; 4]>(base, [0xCD, 0x10, 0xCD, 0x31]);
+    *regs = Regs::empty();
+    regs.frame = crate::Frame64 {
+        rip: 0,
+        cs: (base >> 4) as u64,
+        // VM, virtual IF, real IF, and kernel IOPL.
+        rflags: (1 << 17) | (1 << 19) | (1 << 9) | (1 << 12) | 2,
+        rsp: 0xF000,
+        ss: (base >> 4) as u64,
+    };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BiosError {
     NoNativeBios,
@@ -381,7 +447,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn new(machine: &mut A) -> Self {
         let native = (crate::kernel::platform::get().firmware
             == crate::kernel::platform::Firmware::NativeBios)
-            .then(|| NativeBiosWorkspace::new(machine));
+            .then(|| NativeBiosWorkspace::new(machine)).flatten();
         Self { active: PhysicalVideoState::Legacy, native }
     }
 
@@ -466,24 +532,31 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
 impl<A: Arch> NativeBiosWorkspace<A> {
     /// Build the persistent real-mode driver address space from the original
     /// firmware view and park it outside every personality.
-    fn new(machine: &mut A) -> Self {
-        // Snapshot the firmware view before the DOS substitute BIOS replaces
-        // the IVT. This address space is never handed to a personality.
-        crate::kernel::memory::map_low_mem(machine);
+    fn new(machine: &mut A) -> Option<Self> {
+        native_scratch()?;
+        // This is the physical firmware environment, not an image of ROM.
+        // Reserved upper memory may contain writable firmware RAM anywhere;
+        // neither E820 nor an option-ROM signature identifies its permissions.
+        // Borrow it without COW: hardware decoding/write protection continues
+        // to enforce actual ROM semantics, and EBDA/SMM see the same RAM.
+        crate::kernel::memory::map_physical(machine, 0, 0xa0, 0, 0);
+        crate::kernel::memory::map_physical(machine, 0xa0, 0x60, 0xa0,
+            arch_abi::MAP_PHYS_CACHE_DISABLE);
         let mut bios_space = A::PageTable::default();
         crate::kernel::memory::fork(machine, &mut bios_space);
+        machine.free_user_pages();
 
-        Self {
+        Some(Self {
             bios_vcpu: Vcpu::new(Regs::empty(), bios_space),
             fx: machine.clean_fx_template(),
             modes: Vec::new(),
             state_bytes: None,
             state_probed: false,
             nvidia_workarounds: false,
-        }
+        })
     }
 
-    const STATE_BUFFER: usize = 0x70000;
+    fn state_buffer() -> usize { scratch_base() + 0x10000 }
     const MAX_STATE_BYTES: usize = 0x10000;
     // Hardware, DAC and extended-controller state. BIOS data-area state is
     // deliberately excluded: it persists in the native driver's address
@@ -531,13 +604,13 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         regs.rax = 0x4F04;
         regs.rcx = Self::STATE_COMPONENTS;
         regs.rdx = 1;
-        regs.es = (Self::STATE_BUFFER >> 4) as u64;
-        regs.rbx = (Self::STATE_BUFFER & 0xF) as u64;
+        regs.es = (Self::state_buffer() >> 4) as u64;
+        regs.rbx = (Self::state_buffer() & 0xF) as u64;
         self.call_buffer(
             machine,
             display,
             &mut regs,
-            BiosTransfer::InOut(Self::STATE_BUFFER, &mut state),
+            BiosTransfer::InOut(Self::state_buffer(), &mut state),
         ).ok()?;
         (regs.rax as u16 == 0x004F).then_some(FirmwareCheckpoint(state))
     }
@@ -558,13 +631,13 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         regs.rax = 0x4F04;
         regs.rcx = Self::STATE_COMPONENTS;
         regs.rdx = 2;
-        regs.es = (Self::STATE_BUFFER >> 4) as u64;
-        regs.rbx = (Self::STATE_BUFFER & 0xF) as u64;
+        regs.es = (Self::state_buffer() >> 4) as u64;
+        regs.rbx = (Self::state_buffer() & 0xF) as u64;
         self.call_buffer(
             machine,
             display,
             &mut regs,
-            BiosTransfer::Input(Self::STATE_BUFFER, &state.0),
+            BiosTransfer::Input(Self::state_buffer(), &state.0),
         )?;
         let status = regs.rax as u16;
         if status == 0x004F { Ok(()) } else { Err(BiosError::Rejected(status)) }
@@ -610,15 +683,16 @@ impl<A: Arch> NativeBiosWorkspace<A> {
     /// The private firmware BDA must describe EGAFIX's final mode too. The DOS
     /// personality maintains its own BDA separately, after this operation.
     fn fix_legacy_bda(&mut self, machine: &mut A, mode: u8) {
-        let caller = machine.activate(core::mem::take(&mut self.bios_vcpu.space),
-            &mut self.fx, core::ptr::null_mut());
+        machine.switch_fx(&mut self.fx);
+        let caller = machine.activate(core::mem::take(&mut self.bios_vcpu.space));
         let mode = match mode & 0x7F { 0 => 1, 2 => 3, 5 => 4, 0x0F => 0x10, m => m };
         machine.write::<u8>(0x449, mode);
         machine.write::<u16>(0x44A, if matches!(mode, 1 | 4 | 0x0D) { 40 } else { 80 });
         machine.write::<u16>(0x44C, match mode { 1 => 0x800, 3 => 0x1000, 0x10 => 0x8000, _ => 0x4000 });
         machine.write::<u8>(0x484, 24);
         if mode == 0x10 { machine.write::<u16>(0x485, 14); }
-        self.bios_vcpu.space = machine.activate(caller, &mut self.fx, core::ptr::null_mut());
+        machine.switch_fx(&mut self.fx);
+        self.bios_vcpu.space = machine.activate(caller);
     }
 
     /// Set a legacy (00h..FFh) or VBE (100h and above) mode through the
@@ -798,7 +872,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         if state.mode.window_segment == 0 && state.mode.physical_base != 0 {
             let physical = u64::from(state.mode.physical_base)
                 + u64::from(bank) * 64 * 1024;
-            machine.map_phys_range(
+            crate::kernel::memory::map_physical(machine,
                 0xA0000 >> 12,
                 0x10,
                 physical >> 12,
@@ -836,18 +910,12 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         bank: u16,
     ) -> Result<(), BiosError> {
         let mut regs = self.bios_vcpu.regs;
-        let caller_space = machine.activate(
-            core::mem::take(&mut self.bios_vcpu.space),
-            &mut self.fx,
-            core::ptr::null_mut(),
-        );
+        machine.switch_fx(&mut self.fx);
+        let caller_space = machine.activate(core::mem::take(&mut self.bios_vcpu.space));
         let io = crate::kernel::io_policy::bios_display(display);
         let completed = call_bank(machine, &mut regs, bank, &io);
-        self.bios_vcpu.space = machine.activate(
-            caller_space,
-            &mut self.fx,
-            core::ptr::null_mut(),
-        );
+        machine.switch_fx(&mut self.fx);
+        self.bios_vcpu.space = machine.activate(caller_space);
         completed
     }
 
@@ -899,7 +967,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
 
     /// Execute a native video-BIOS palette call with an optional caller buffer.
     /// The ROM can only address its private real-mode workspace, so protected-
-    /// mode DOS buffers are bounced through [`STATE_BUFFER`]. `offset_in_di`
+    /// mode DOS buffers are bounced through the reserved native transfer buffer. `offset_in_di`
     /// selects VBE's ES:DI convention; legacy AH=10h uses ES:DX.
     fn palette_call(
         &mut self,
@@ -927,16 +995,16 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         regs.rcx = input[2];
         regs.rdx = input[3];
         if len != 0 {
-            regs.es = (Self::STATE_BUFFER >> 4) as u64;
+            regs.es = (Self::state_buffer() >> 4) as u64;
             if offset_in_di {
-                regs.rdi = (Self::STATE_BUFFER & 0xF) as u64;
+                regs.rdi = (Self::state_buffer() & 0xF) as u64;
             } else {
-                regs.rdx = (Self::STATE_BUFFER & 0xF) as u64;
+                regs.rdx = (Self::state_buffer() & 0xF) as u64;
             }
         }
         let transfer = match buffer {
-            Some(buffer) if copy_to_bios => BiosTransfer::Input(Self::STATE_BUFFER, buffer),
-            Some(buffer) => BiosTransfer::Output(Self::STATE_BUFFER, buffer),
+            Some(buffer) if copy_to_bios => BiosTransfer::Input(Self::state_buffer(), buffer),
+            Some(buffer) => BiosTransfer::Output(Self::state_buffer(), buffer),
             None => BiosTransfer::None,
         };
         self.call_buffer(machine, display, &mut regs, transfer)?;
@@ -981,9 +1049,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         regs.rcx = input[2];
         regs.rdx = input[3];
         let transfer = if let Some(font) = font {
-            regs.es = (Self::STATE_BUFFER >> 4) as u64;
-            regs.rbp = (Self::STATE_BUFFER & 0xF) as u64;
-            BiosTransfer::Input(Self::STATE_BUFFER, font)
+            regs.es = (Self::state_buffer() >> 4) as u64;
+            regs.rbp = (Self::state_buffer() & 0xF) as u64;
+            BiosTransfer::Input(Self::state_buffer(), font)
         } else {
             BiosTransfer::None
         };
@@ -1106,11 +1174,8 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             return Err(BiosError::InvalidFrame);
         }
 
-        let caller_space = machine.activate(
-            core::mem::take(&mut self.bios_vcpu.space),
-            &mut self.fx,
-            core::ptr::null_mut(),
-        );
+        machine.switch_fx(&mut self.fx);
+        let caller_space = machine.activate(core::mem::take(&mut self.bios_vcpu.space));
         let io = crate::kernel::io_policy::bios_display(display);
 
         let result = (|| {
@@ -1247,11 +1312,8 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             Ok(out_w * out_h)
         })();
 
-        self.bios_vcpu.space = machine.activate(
-            caller_space,
-            &mut self.fx,
-            core::ptr::null_mut(),
-        );
+        machine.switch_fx(&mut self.fx);
+        self.bios_vcpu.space = machine.activate(caller_space);
         result
     }
 
@@ -1280,19 +1342,19 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         } else {
             crate::compact_println!("VGA: WARNING no VBE state service or Cirrus readbacks — full process VGA restore NOT supported");
         }
-        const INFO: usize = 0x9000;
-        const MODE_INFO: usize = 0x9200;
+        let info_address = scratch_base() + 0x1000;
+        let mode_info_address = scratch_base() + 0x1200;
 
         let mut info = VbeControllerInfo::request();
         let mut regs = Regs::empty();
         regs.rax = 0x4F00;
-        regs.es = (INFO >> 4) as u64;
-        regs.rdi = (INFO & 0xF) as u64;
+        regs.es = (info_address >> 4) as u64;
+        regs.rdi = (info_address & 0xF) as u64;
         self.call_buffer(
             machine,
             bios_display,
             &mut regs,
-            BiosTransfer::InOut(INFO, info.bytes_mut()),
+            BiosTransfer::InOut(info_address, info.bytes_mut()),
         ).ok()?;
         if regs.rax as u16 != 0x004F {
             return None;
@@ -1312,13 +1374,13 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             let mut info = VbeModeInfo::empty();
             regs.rax = 0x4F01;
             regs.rcx = u64::from(number);
-            regs.es = (MODE_INFO >> 4) as u64;
-            regs.rdi = (MODE_INFO & 0xF) as u64;
+            regs.es = (mode_info_address >> 4) as u64;
+            regs.rdi = (mode_info_address & 0xF) as u64;
             self.call_buffer(
                 machine,
                 bios_display,
                 &mut regs,
-                BiosTransfer::InOut(MODE_INFO, info.bytes_mut()),
+                BiosTransfer::InOut(mode_info_address, info.bytes_mut()),
             ).ok()?;
             if regs.rax as u16 == 0x004F
                 && let Some(mode) = parse_vbe_mode(&info, number)
@@ -1385,13 +1447,10 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         regs: &mut Regs,
         mut transfer: BiosTransfer<'_>,
     ) -> Result<(), BiosError> {
-        let caller_space = machine.activate(
-            core::mem::take(&mut self.bios_vcpu.space),
-            &mut self.fx,
-            core::ptr::null_mut(),
-        );
+        machine.switch_fx(&mut self.fx);
+        let caller_space = machine.activate(core::mem::take(&mut self.bios_vcpu.space));
         let request = *regs;
-        crate::kernel::dos::prepare_bios_int10(machine, regs);
+        prepare_bios_int10(machine, regs);
         let frame = regs.frame;
         *regs = request;
         regs.frame = frame;
@@ -1410,26 +1469,17 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                 BiosTransfer::None | BiosTransfer::Input(..) => {}
             }
         }
-        self.bios_vcpu.space = machine.activate(
-            caller_space,
-            &mut self.fx,
-            core::ptr::null_mut(),
-        );
+        machine.switch_fx(&mut self.fx);
+        self.bios_vcpu.space = machine.activate(caller_space);
         completed
     }
 
     fn read_workspace(&mut self, machine: &mut A, address: usize, output: &mut [u8]) {
-        let caller_space = machine.activate(
-            core::mem::take(&mut self.bios_vcpu.space),
-            &mut self.fx,
-            core::ptr::null_mut(),
-        );
+        machine.switch_fx(&mut self.fx);
+        let caller_space = machine.activate(core::mem::take(&mut self.bios_vcpu.space));
         machine.copy_from(address, output);
-        self.bios_vcpu.space = machine.activate(
-            caller_space,
-            &mut self.fx,
-            core::ptr::null_mut(),
-        );
+        machine.switch_fx(&mut self.fx);
+        self.bios_vcpu.space = machine.activate(caller_space);
     }
 
 }
@@ -1694,7 +1744,11 @@ fn run_bios_int10<A: Arch>(
     regs: &mut Regs,
     io: &arch_abi::IoPolicy,
 ) -> Result<(), BiosError> {
-    run_bios(machine, regs, io, crate::kernel::dos::bios_int10_returned)
+    run_bios(machine, regs, io, |regs, event| {
+        matches!(event, crate::KernelEvent::SoftInt(0x31))
+            && usize::from(regs.code_seg()) == scratch_base() >> 4
+            && regs.ip32() == 4
+    })
 }
 
 fn run_bios<A: Arch>(
@@ -1705,7 +1759,7 @@ fn run_bios<A: Arch>(
 ) -> Result<(), BiosError> {
     loop {
         crate::kernel::memory::service(machine);
-        let event = machine.execute_firmware(regs, io);
+        let event = machine.execute(regs, io, core::time::Duration::from_millis(10));
         if returned(regs, &event) {
             return Ok(());
         }
@@ -1726,7 +1780,10 @@ fn run_bios<A: Arch>(
                 IoSize::Word => machine.outw(port, regs.rax as u16),
                 IoSize::Dword => machine.outl(port, regs.rax as u32),
             },
-            _ => return Err(BiosError::UnexpectedEvent),
+            _ => {
+                crate::compact_println!("Native BIOS: unexpected {:?} at {:04x}:{:08x}", event, regs.code_seg(), regs.ip32());
+                return Err(BiosError::UnexpectedEvent);
+            },
         }
     }
 }
@@ -1737,7 +1794,7 @@ fn call_bank<A: Arch>(
     bank: u16,
     io: &arch_abi::IoPolicy,
 ) -> Result<(), BiosError> {
-    crate::kernel::dos::prepare_bios_int10(machine, regs);
+    prepare_bios_int10(machine, regs);
     regs.rax = 0x4F05;
     regs.rbx = 0;
     regs.rdx = u64::from(bank);

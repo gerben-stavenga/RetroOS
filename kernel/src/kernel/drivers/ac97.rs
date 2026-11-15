@@ -159,7 +159,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     if phys_page == 0 {
         return None;
     }
-    machine.map_phys_range(DMA_WIN_VA >> 12, pages, phys_page, PTE_CACHE_DISABLE);
+    crate::kernel::memory::map_physical(machine, DMA_WIN_VA >> 12, pages, phys_page, PTE_CACHE_DISABLE);
     let dma_phys = (phys_page * 0x1000) as u32;
 
     let mut d = Ac97 {

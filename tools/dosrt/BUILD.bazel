@@ -105,7 +105,7 @@ genrule(
 # ---- retroos-host: the hosted interpreter backend --------------------------
 # There's no Linux-hosted Turbo C, so TC runs inside RetroOS. Rather than boot
 # the OS in QEMU, we run it on the arch-interp (interpreter) backend as an
-# ordinary host process — deterministic and headless, no VM. A plain Bazel
+# ordinary headless host process, no VM. A plain Bazel
 # rust_binary (unicorn via crate_universe, see MODULE.bazel) — used from
 # `tools`, so it builds in the exec configuration (the host platform).
 alias(

@@ -42,12 +42,12 @@ impl State {
             }
         }
         // All backing pages are ready before MAP_FIXED replaces anything.
-        machine.unmap_range(base / 4096, size / 4096);
+        crate::kernel::memory::reset(machine, base / 4096, size / 4096);
         self.release(machine, base, base + size);
         for (index, &(_, frame)) in pending.iter().enumerate() {
             let address = base + index * 4096;
-            if !machine.map_frame(address / 4096, frame, true, protection & 2 != 0, protection & 4 != 0) {
-                machine.unmap_range(base / 4096, index);
+            if !crate::kernel::memory::map_cached_frame(machine, address / 4096, frame, true, protection & 2 != 0, protection & 4 != 0) {
+                crate::kernel::memory::reset(machine, base / 4096, index);
                 for (key, _) in pending { vfs::mapping::release(machine, key); }
                 return Err(-12);
             }

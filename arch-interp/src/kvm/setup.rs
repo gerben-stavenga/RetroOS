@@ -113,7 +113,6 @@ fn install_alarm(vcpu: &mut VcpuFd) {
         assert_eq!(libc::timer_create(libc::CLOCK_MONOTONIC, &mut sev, &mut timer), 0);
         TIMER.with(|slot| slot.set(Some(timer)));
     }
-    arm_alarm(crate::machine::alarm_deadline());
 }
 pub(crate) fn arm_alarm(deadline: Option<u64>) {
     TIMER.with(|slot| {

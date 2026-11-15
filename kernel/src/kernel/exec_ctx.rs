@@ -68,6 +68,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
         machine: &mut A,
         bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         personality: &mut thread::Personality<A>,
+        deadline: u64,
     ) -> crate::KernelEvent {
         crate::kernel::memory::service(machine);
         machine.execution_profile_begin();
@@ -78,13 +79,19 @@ impl<A: crate::Arch> ExecutionContext<A> {
         }
         machine.execution_profile_time(arch_abi::ExecutionProfileStage::PolicyLookup);
         self.device_cycles = 0;
+        let max_time = core::time::Duration::from_nanos(deadline.saturating_sub(machine.now()));
         if let thread::Personality::Dos(dos) = personality {
+            // Native SB interrupts target the BSP. Its DOS owner must execute
+            // there so a physical IRQ ends the owner's CPU loan directly.
+            assert!(!crate::kernel::parallel::on_worker()
+                || dos.pc.audio.lock().sb.physical().is_none(),
+                "DOS with native Sound Blaster must execute on the BSP");
             let (event, cycles) = crate::kernel::dos::planar::execute(machine, dos,
-                &mut self.regs, &self.io_policy);
+                &mut self.regs, &self.io_policy, max_time);
             self.device_cycles = cycles;
             return event;
         }
-        machine.execute(&mut self.regs, &self.io_policy)
+        machine.execute(&mut self.regs, &self.io_policy, max_time)
     }
 
     /// Execution swap: make `new_tid` the running thread. No-op when it already
@@ -106,14 +113,10 @@ impl<A: crate::Arch> ExecutionContext<A> {
         // space into the live slot and hands back the displaced (outgoing) one.
         let mut swap_fx = new.kernel.fx_state;
         let incoming = core::mem::take(&mut new.kernel.vcpu.space);
-        let old_space = if ASSERT_ADDR_HASH {
-            let mut hash = new.kernel.addr_hash;
-            let s = machine.activate(incoming, &mut swap_fx, &mut hash);
-            old.kernel.addr_hash = hash;
-            s
-        } else {
-            machine.activate(incoming, &mut swap_fx, core::ptr::null_mut())
-        };
+        if ASSERT_ADDR_HASH { old.kernel.addr_hash = machine.check_address_space(0); }
+        machine.switch_fx(&mut swap_fx);
+        let old_space = machine.activate(incoming);
+        if ASSERT_ADDR_HASH { machine.check_address_space(new.kernel.addr_hash); }
         old.kernel.vcpu.space = old_space;
         old.kernel.fx_state = swap_fx;
         old.kernel.cpu_hash = thread::hash_regs(&old.kernel.vcpu.regs);

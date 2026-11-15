@@ -41,7 +41,7 @@ static DECODE16: [u32; 128] = decode_table(false);
 static DECODE32: [u32; 128] = decode_table(true);
 
 pub fn execute<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>,
-    regs: &mut crate::Regs, io: &arch_abi::IoPolicy) -> (crate::KernelEvent, u64) {
+    regs: &mut crate::Regs, io: &arch_abi::IoPolicy, max_time: core::time::Duration) -> (crate::KernelEvent, u64) {
     #[cfg(target_arch = "x86")]
     {
         use super::machine::vga;
@@ -78,7 +78,7 @@ pub fn execute<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>,
                     entry32: device_io_32 as *const () as u32,
                     entry64: device_io_64 as *const () as u64,
                 });
-                let mut event = machine.execute(regs, io);
+                let mut event = machine.execute(regs, io, max_time);
                 machine.replace_interrupt_handlers(13, previous_input);
                 machine.replace_interrupt_handlers(14, previous);
                 ACTIVE = core::ptr::null_mut();
@@ -93,7 +93,7 @@ pub fn execute<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>,
         }
     }
     let _ = dos;
-    (machine.execute(regs, io), 0)
+    (machine.execute(regs, io, max_time), 0)
 }
 
 // This descriptor lives for one CPU loan. Emulated VGA port programming

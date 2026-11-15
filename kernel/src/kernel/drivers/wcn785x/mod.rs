@@ -208,7 +208,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Device> {
         reset::run(&mut soc, &mut stage, chip.hot_reset)?;
         soc.window = None;
         stage = "MSI setup";
-        let (msi_address, msi_data) = machine.msi_alloc(MSI_SOURCE).ok_or(mhi::Error::Registers)?;
+        let (msi_address, msi_data) = pci::msi_target(MSI_SOURCE).ok_or(mhi::Error::Registers)?;
         if !pci::msi_enable(machine, bus, dev, func, msi_address, msi_data) {
             return Err(mhi::Error::Registers.into());
         }

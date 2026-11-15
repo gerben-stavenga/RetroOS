@@ -113,7 +113,7 @@ impl Mmio {
         let offset = (phys as usize) & (crate::PAGE_SIZE - 1);
         let pages = offset.checked_add(bytes)?.div_ceil(crate::PAGE_SIZE);
         let base = reserve(pages)?;
-        machine.map_phys_range(
+        crate::kernel::memory::map_physical(machine,
             base >> 12,
             pages,
             phys >> 12,
@@ -209,7 +209,7 @@ impl Region {
         if suffix != 0 {
             crate::kernel::memory::free_contig(machine, page + pages as u64, suffix);
         }
-        machine.map_phys_range(va >> 12, pages, page, 0);
+        crate::kernel::memory::map_physical(machine, va >> 12, pages, page, 0);
         unsafe { core::ptr::write_bytes(va as *mut u8, 0, bytes) };
         Some(Self { va, phys, bytes })
     }

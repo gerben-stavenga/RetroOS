@@ -135,15 +135,15 @@ pub(in crate::kernel::dos) fn direct_int21_iret<A: crate::Arch>(
         return Some(action);
     }
 
-    let profile_start = crate::kernel::startup::profile_enabled().then(|| machine.rdtsc());
+    let profile_start = crate::kernel::startup::profile_enabled().then(|| crate::kernel::event_profile::cycles());
     let action = call_real_mode_proc_iret(machine, dos, regs);
-    let dispatch_start = profile_start.map(|_| machine.rdtsc());
+    let dispatch_start = profile_start.map(|_| crate::kernel::event_profile::cycles());
     debug_assert!(matches!(&action, thread::KernelAction::Done));
     machine::set_vm86_ip(regs, machine::vm86_ip(regs).wrapping_add(2));
     let action = super::super::dos::rm_vector_dispatch(
         machine, bios_display, kt, dos, regs,
     );
-    let unwind_start = dispatch_start.map(|_| machine.rdtsc());
+    let unwind_start = dispatch_start.map(|_| crate::kernel::event_profile::cycles());
     if !matches!(&action, thread::KernelAction::Done) {
         if let (Some(start), Some(dispatch), Some(after_dispatch)) =
             (profile_start, dispatch_start, unwind_start)
@@ -170,7 +170,7 @@ pub(in crate::kernel::dos) fn direct_int21_iret<A: crate::Arch>(
         crate::kernel::event_profile::record_direct_rm_phases(
             dispatch.wrapping_sub(start),
             unwind.wrapping_sub(dispatch),
-            machine.rdtsc().wrapping_sub(unwind),
+            crate::kernel::event_profile::cycles().wrapping_sub(unwind),
         );
     }
     Some(action)

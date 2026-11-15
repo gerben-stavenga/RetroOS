@@ -613,7 +613,7 @@ pub(in crate::kernel::dos) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &
     }
 
     setup_lol_sft(machine, regs);
-    xms::scan_uma(machine);
+    xms::initialize_uma();
 
     // Force NumLock OFF in the BIOS keyboard-flags byte (40:17 bit 5). The
     // grey arrow keys are E0-stripped down to their numpad twins (Up == 0x48

@@ -13,8 +13,7 @@
 //!   context switch the active space's lazily-mapped pages are dropped, so the
 //!   incoming space re-faults its own pages in.
 //! * A run ends at the first sensitive event (software `INT`, port `IN`/`OUT`,
-//!   an illegal access → `PageFault`) or after `SLICE` instructions retire
-//!   (an absolute deterministic alarm → `Irq`).
+//!   an illegal access → `PageFault`) or the host-time limit (`Irq`).
 
 use crate::sysdesc::{
     ensure_sys_window, if_to_vif, sys_phys, sys_ptr, vif_to_if, ensure_tables, GDT_ADDR, GDT_BYTES,
@@ -24,16 +23,10 @@ use crate::sysdesc::{
 use crate::vcpu;
 use arch_abi::monitor::MonitorResult;
 use arch_abi::{FORCED_TF_SHADOW, IoSize, KernelEvent, Regs, USER_TF_SHADOW, UserMode};
-use core::cell::{Cell, RefCell};
+use core::cell::RefCell;
 use core::ffi::c_void;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Prot};
 use unicorn_engine::{RegisterX86, Unicorn};
-
-// A run budget is derived from the absolute alarm at every entry. I/O traps
-// do not reset the alarm; instruction retirement advances deterministic time.
-thread_local! {
-    static BUDGET: Cell<usize> = const { Cell::new(usize::MAX) };
-}
 
 /// Per-run hook scratch.
 #[derive(Default)]
@@ -53,14 +46,8 @@ struct Ctx {
     /// (faulting) delivery clobbers CR2 — so we snapshot it when the first fault
     /// fires, before the escalation, rather than reading it back afterwards.
     pending_cr2: u32,
-    /// Virtual-time accounting for the in-flight `emu_start`. The block hook
-    /// accumulates retired work into `slice_instr`; `stopped` records whether a
-    /// hook cut the slice short. A slice that runs to its instruction budget
-    /// retires the whole budget (the block hook undercounts a chained-TB loop —
-    /// it fires per TB entry, not per iteration), so on a full retire we charge
-    /// the budget; on an early stop we charge the accumulated work.
-    slice_instr: u64,
-    stopped: bool,
+    input_sequence: u64,
+    deadline: u64,
 }
 
 thread_local! {
@@ -152,7 +139,7 @@ fn build() -> Unicorn<'static, Ctx> {
                 d.pending_err = ((intno >> 16) & 0xFFFF) as u16;
                 d.pending_cr2 = cr2;
             }
-            uc.get_data_mut().stopped = true;
+
             let _ = uc.emu_stop();
             return;
         }
@@ -212,32 +199,18 @@ fn build() -> Unicorn<'static, Ctx> {
         d.pending_intr = Some(vector);
         d.pending_is_int = is_int;
         d.pending_err = ((intno >> 16) & 0xFFFF) as u16;
-        d.stopped = true;
         let _ = uc.emu_stop();
     })
     .expect("intr hook");
 
-    // The CPU's interrupt check, run before every basic block — the analog of
-    // QEMU's `cpu_handle_interrupt` before each TB. If the INTR line is asserted
-    // (a pending vpic IRQ / host input) AND the guest can take it now (IF=1),
-    // stop at this clean block boundary so the kernel's `deliver_pm_irq` injects
-    // here. While the line is clear (the common case) this is just an atomic
-    // load. The IF=0→1 case falls out for free: we skip while IF=0 and stop at
-    // the first block after the guest re-enables interrupts.
-    uc.add_block_hook(1, 0, |uc, _addr, size| {
-        // Accumulate retired work (~3 bytes/instruction) for this slice. This
-        // undercounts a tight chained-TB loop (the hook fires on TB entry, not
-        // per iteration), so the *full-retire* charge in `run_slice` uses the
-        // instruction budget instead; this accumulator is the time source only
-        // for early stops (port-IN / int-heavy loops like DN's `in 0x3DA`
-        // retrace poll, whose VGA phase is derived from this clock).
-        uc.get_data_mut().slice_instr += (size as u64 / 3).max(1);
-        if crate::machine::irq_line() {
-            let flags = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0);
-            if crate::machine::host_input_pending() || flags & 0x200 != 0 {
-                uc.get_data_mut().stopped = true;
-                let _ = uc.emu_stop();
-            }
+    // Host arrivals and the execution deadline interrupt at a CPU block
+    // boundary. DOS virtual interrupt state is carried by the register frame.
+    uc.add_block_hook(1, 0, |uc, addr, _size| {
+        // Host interruption cannot expose the internal ring-transition frame.
+        if (SYS_BASE..SYS_BASE + SYS_SIZE as u64).contains(&addr) { return; }
+        let input_arrived = crate::machine::input_sequence() != uc.get_data().input_sequence;
+        if input_arrived || crate::machine::now() >= uc.get_data().deadline {
+            let _ = uc.emu_stop();
         }
     })
     .expect("block hook");
@@ -246,7 +219,7 @@ fn build() -> Unicorn<'static, Ctx> {
     uc.add_insn_out_hook(|uc, port, size, _val| {
         let d = uc.get_data_mut();
         d.pending = Some(KernelEvent::Out { port: port as u16, size: io_size(size) });
-        d.stopped = true;
+
         let _ = uc.emu_stop();
     })
     .expect("out hook");
@@ -255,7 +228,7 @@ fn build() -> Unicorn<'static, Ctx> {
     uc.add_insn_in_hook(|uc, port, size| {
         let d = uc.get_data_mut();
         d.pending = Some(KernelEvent::In { port: port as u16, size: io_size(size) });
-        d.stopped = true;
+
         let _ = uc.emu_stop();
         0
     })
@@ -269,7 +242,7 @@ fn build() -> Unicorn<'static, Ctx> {
         let cr2 = uc.reg_read(RegisterX86::CR2).unwrap_or(0) as u32;
         let d = uc.get_data_mut();
         d.pending = Some(KernelEvent::PageFault { addr: cr2 as u64 });
-        d.stopped = true;
+
         let _ = uc.emu_stop();
         false
     })
@@ -388,9 +361,13 @@ pub fn fx_switch(fx: &mut crate::machine::FxState) {
 // `&mut *(&raw mut REGS)` is the `&raw`-first form that avoids a
 // `static_mut_refs` reference; clippy's `deref_addrof` rewrite would reintroduce it.
 #[allow(clippy::deref_addrof)]
-pub fn execute() -> KernelEvent {
-    BUDGET.with(|budget| budget.set(crate::machine::instructions_to_alarm()));
+pub fn execute(max_time: core::time::Duration) -> KernelEvent {
+    if max_time.is_zero() { return KernelEvent::Irq; }
+    let deadline = crate::machine::now().saturating_add(max_time.as_nanos().min(u64::MAX as u128) as u64);
+    let input_sequence = crate::machine::input_sequence();
     io_with(|uc| loop {
+        uc.get_data_mut().input_sequence = input_sequence;
+        uc.get_data_mut().deadline = deadline;
         // Service an off-thread VGA-screen snapshot request, and paint the live
         // terminal view if enabled (both read the active guest space here, where
         // it's valid — the CPU thread).
@@ -405,10 +382,9 @@ pub fn execute() -> KernelEvent {
         // The projected TF in `regs` requests one hardware step. The resulting
         // `#DB` is reflected below as `KernelEvent::DebugTrap`; DOS owns source
         // attribution, so the interpreter only needs to let it run.
-        // A trap can consume the last instructions before an alarm. Deliver
-        // the trap first, then the alarm on re-entry; I/O must never postpone
-        // an absolute deadline.
-        if budget_spent() {
+        // Internal resumes share this call's deadline. A new execute call
+        // starts its own limit; no timer state survives the return.
+        if crate::machine::now() >= deadline {
             return KernelEvent::Irq;
         }
         let begin = configure(uc, vcpu, mode);
@@ -426,13 +402,13 @@ pub fn execute() -> KernelEvent {
                 mode, vcpu.code_seg(), vcpu.frame.rip, vcpu.frame.ss as u16, vcpu.frame.rsp,
                 vcpu.ds as u16, vcpu.frame.rflags);
         }
-        let mut run = run_slice(uc, begin, usize::MAX);
+        let mut run = uc.emu_start(begin, 0xFFFF_FFFF, 0, 0);
         // Resolve interp-internal stops without bubbling to the kernel:
         //  * Demand #PF (vector 14): the faulting VA is absent — commit a fresh
         //    frame, flush the TLB (CR3 rewrite), and re-run at the faulting EIP.
         //    A present-page fault (RO write) or illegal VA bubbles as PageFault.
-        //  * Trampoline retire: if the slice budget expired with EIP still inside
-        //    the CPL-0 iretd scratch window (the block hook counts it too), ring-0
+        //  * Trampoline retire: if the time limit expired with EIP still inside
+        //    the CPL-0 iretd scratch window, ring-0
         //    mid-switch state must NOT surface as user vcpu — the kernel would
         //    deliver IRQs onto it and corrupt the client (duke3d/raptor DOS/4GW
         //    wild-jump SEGVs; DN exec-window ffbf panics). Step it out first.
@@ -457,7 +433,7 @@ pub fn execute() -> KernelEvent {
                         d.pending_cr2 = 0;
                     }
                     let eip = uc.reg_read(RegisterX86::EIP).unwrap_or(0);
-                    run = run_slice(uc, eip, usize::MAX);
+                    run = uc.emu_start(eip, 0xFFFF_FFFF, 0, 0);
                     continue;
                 }
                 break; // genuine fault — handled below as PageFault
@@ -469,7 +445,7 @@ pub fn execute() -> KernelEvent {
             {
                 break;
             }
-            run = run_slice(uc, eip, 1);
+            run = uc.emu_start(eip, 0xFFFF_FFFF, 0, 1);
         }
         store_regs(uc, vcpu, mode);
         // A page fault that demand-paging did not resolve is a genuine SEGV: the
@@ -536,6 +512,12 @@ pub fn execute() -> KernelEvent {
                         {
                             return KernelEvent::VifWindow { entry_ip, vif_was_on };
                         }
+                        // Match native VME/PVI: an emulated flag-changing
+                        // instruction made the frame's pending IRQ deliverable.
+                        const VIF_VIP: u32 = (1 << 19) | (1 << 20);
+                        if vcpu.flags32() & VIF_VIP == VIF_VIP {
+                            return KernelEvent::Irq;
+                        }
                         if stepped {
                             return KernelEvent::EmulatedStep { user_was };
                         }
@@ -601,33 +583,6 @@ fn flush_tlb(uc: &mut Unicorn<'static, Ctx>) {
 // monitor), `POPF`/`IRET` silently drop IF at CPL>IOPL (caught by TF stepping).
 // VM86 runs CPL=3/IOPL=1 too: there *every* IF-touching op (and `INT n`) `#GP`s,
 // so the monitor sees them all and no TF stepping is needed.
-
-/// Run up to `count` guest instructions and charge virtual time by what actually
-/// retired. A run that hits its instruction budget (no hook stopped it) retired
-/// the whole `count` — the block hook undercounts a chained-TB loop, so we must
-/// not trust its accumulator there or a tight compute loop freezes virtual time
-/// (the timer never ticks; DOS/4GW's IRQ-dispatch loop waits forever). An early
-/// stop charges the block-accumulated work, which is accurate for the TB-breaking
-/// poll loops (DN's `in 0x3DA`) that the accumulator exists for.
-fn run_slice(uc: &mut Unicorn<'static, Ctx>, begin: u64, max: usize) -> Result<(), uc_error> {
-    let count = BUDGET.with(|b| b.get()).min(max).max(1);
-    {
-        let d = uc.get_data_mut();
-        d.slice_instr = 0;
-        d.stopped = false;
-    }
-    let r = uc.emu_start(begin, 0xFFFF_FFFF, 0, count);
-    let d = uc.get_data();
-    let instr = if d.stopped { d.slice_instr } else { count as u64 };
-    crate::machine::advance_virtual_time(instr.max(1));
-    BUDGET.with(|b| b.set(b.get().saturating_sub(instr as usize)));
-    r
-}
-
-/// Whether the selected alarm boundary was reached.
-fn budget_spent() -> bool {
-    BUDGET.with(|b| b.get()) == 0
-}
 
 /// Invalidate cached translations for a range after an arch call mutated the
 /// active space's page tables. `configure` reloads CR3 at the start of every
@@ -919,5 +874,63 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
         UserMode::Mode64 => {
             r.frame.rflags = rd(uc, RegisterX86::EFLAGS) | tf_shadows;
         }
+    }
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use arch_abi::{Arch as _, GuestBytes, Irq, KernelEvent, Regs};
+
+    static INPUT: std::sync::Mutex<std::vec::Vec<(arch_abi::Irq, u64)>> = std::sync::Mutex::new(std::vec::Vec::new());
+    fn receive_input(event: arch_abi::Irq, timestamp: u64) { INPUT.lock().unwrap().push((event, timestamp)); }
+    fn drain_input(f: &mut dyn FnMut(arch_abi::Irq, u64)) {
+        let events = core::mem::take(&mut *INPUT.lock().unwrap());
+        for (event, timestamp) in events { f(event, timestamp); }
+    }
+
+    #[test]
+    fn execution_returns_interruptions_not_queue_contents() {
+        crate::machine::install_input_sink(receive_input);
+        crate::mmu::init();
+        let mut machine = crate::backend::Interp;
+        crate::backend::check_virtual_irq_frame(&mut machine);
+        machine.copy_to(0x7c00, &[0xcd, 0x31]);
+        machine.copy_to(0x7e00, &[0xeb, 0xfe]);
+        let mut regs = Regs::empty();
+        regs.set_cs32(0);
+        regs.set_ss32(0);
+        regs.set_sp32(0x7000);
+        regs.set_flags32((1 << 17) | (1 << 19) | 2);
+        let io = arch_abi::IoPolicy::deny_all();
+
+        regs.set_ip32(0x7c00);
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::ZERO), KernelEvent::Irq));
+        assert_eq!(regs.ip32(), 0x7c00, "zero budget must not retire instructions");
+        crate::machine::post_irq(Irq::Key(0x2e));
+        regs.set_ip32(0x7c00);
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
+        let mut queued = 0;
+        drain_input(&mut |event, _| {
+            assert!(matches!(event, Irq::Key(0x2e)));
+            queued += 1;
+        });
+        assert_eq!(queued, 1);
+
+        regs.set_ip32(0x7e00);
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(1)), KernelEvent::Irq));
+        regs.set_ip32(0x7c00);
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
+
+
+        let poster = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            crate::machine::post_irq(Irq::Key(0xae));
+        });
+        regs.set_ip32(0x7e00);
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)), KernelEvent::Irq));
+        poster.join().unwrap();
+        regs.set_ip32(0x7c00);
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
+        drain_input(&mut |event, _| assert!(matches!(event, Irq::Key(0xae))));
     }
 }

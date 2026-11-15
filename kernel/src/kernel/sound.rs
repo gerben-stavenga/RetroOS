@@ -694,7 +694,7 @@ impl Engine {
     /// The same mixer, device clocks and permanent DMA buffer on one core.
     /// Hosted backends without an ISA pool read their active guest directly.
     pub fn poll_inline<A: crate::Arch>(&mut self, machine: &mut A, now: u64) {
-        self.advance(now, machine.rdtsc(), |source, now, span| source.mix_guest(machine, now, span));
+        self.advance(now, crate::kernel::event_profile::cycles(), |source, now, span| source.mix_guest(machine, now, span));
     }
     fn advance(&mut self, now: u64, stamp: u64,
         mut mix: impl FnMut(&mut super::dos::AudioDevices, u64, AudioSpan<'_>) -> usize) {

@@ -654,7 +654,7 @@ fn protect_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<()
         }
         let base = (module.base + section.rva) as usize;
         let pages = (base % 4096 + size).div_ceil(4096);
-        machine.set_page_flags(
+        crate::kernel::memory::protect(machine,
             base / 4096,
             pages,
             section.characteristics & 0x8000_0000 != 0,
@@ -719,7 +719,7 @@ fn change_protection<A: crate::Arch>(machine: &mut A, state: &mut WindowsState,
         if memory_protection(state,page).is_none() { return Err(487); }
         if !memory::can_protect(state, page, write, execute) { return Err(5); }
     }
-    machine.set_page_flags(start as usize / 4096, ((limit-start)/4096) as usize, write,execute);
+    crate::kernel::memory::protect(machine, start as usize / 4096, ((limit-start)/4096) as usize, write,execute);
     for page in (start..limit).step_by(4096) {
         if let Some(entry) = state.protections.iter_mut().find(|entry| entry.0 == page) {
             entry.1 = protection;
@@ -827,7 +827,7 @@ fn dll_initializers(modules: &[Module], start: usize) -> Result<Vec<(u32, u32)>,
 fn rollback_modules<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, start: usize) {
     for module in &state.modules[start..] {
         if let Ok(image) = pe::Image::parse(&module.data) {
-            machine.unmap_range(module.base as usize / 4096, (image.header.size_image as usize).div_ceil(4096));
+            crate::kernel::memory::reset(machine, module.base as usize / 4096, (image.header.size_image as usize).div_ceil(4096));
         }
     }
     state.gates.retain(|gate| !state.modules[start..].iter().any(|module|
@@ -910,7 +910,7 @@ fn dll_startup_stub_at<A: crate::Arch>(machine: &mut A, dlls: &[(u32,u32)], exe_
     }
     machine.zero(stub as usize, 4096);
     machine.copy_to(stub as usize, &code);
-    machine.set_page_flags(stub as usize / 4096, 1, false, true);
+    crate::kernel::memory::protect(machine, stub as usize / 4096, 1, false, true);
     Ok(stub)
 }
 
@@ -1112,7 +1112,7 @@ pub fn exec_pe_into<A: crate::Arch>(
         .next_multiple_of(4096);
     let stack_base = STACK_TOP.checked_sub(stack_size).ok_or(8)?;
     machine.zero(stack_base as usize, stack_size as usize);
-    machine.set_page_flags(
+    crate::kernel::memory::protect(machine,
         stack_base as usize / 4096,
         stack_size as usize / 4096,
         true,
@@ -1121,9 +1121,9 @@ pub fn exec_pe_into<A: crate::Arch>(
     machine.zero(PROCESS_DATA as usize, 4096);
     machine.zero(TEB_BASE as usize, TEB_SIZE);
     machine.zero(PEB_BASE as usize, PEB_SIZE);
-    machine.set_page_flags(PROCESS_DATA as usize / 4096, 1, true, false);
-    machine.set_page_flags(TEB_BASE as usize / 4096, TEB_SIZE / 4096, true, false);
-    machine.set_page_flags(PEB_BASE as usize / 4096, PEB_SIZE / 4096, true, false);
+    crate::kernel::memory::protect(machine, PROCESS_DATA as usize / 4096, 1, true, false);
+    crate::kernel::memory::protect(machine, TEB_BASE as usize / 4096, TEB_SIZE / 4096, true, false);
+    crate::kernel::memory::protect(machine, PEB_BASE as usize / 4096, PEB_SIZE / 4096, true, false);
 
     machine.write::<u32>(TEB_BASE as usize, 0xffff_ffff); // SEH end marker
     machine.write::<u32>((TEB_BASE + 4) as usize, STACK_TOP);
@@ -1191,7 +1191,7 @@ pub fn exec_pe_into<A: crate::Arch>(
         state.callback_return=0x7ff6_0000;
         machine.zero(state.callback_return as usize,4096);
         machine.copy_to(state.callback_return as usize,&[0xcd,0x83]);
-        machine.set_page_flags(state.callback_return as usize/4096,1,false,true);
+        crate::kernel::memory::protect(machine, state.callback_return as usize/4096,1,false,true);
         state.gates.push(Gate{return_ip:state.callback_return+2,api:Api::RetroWndProcReturn,arg_bytes:0,name:b"RetroWndProcReturn"});
     }
     if main_header.subsystem == 3 {
@@ -1512,7 +1512,7 @@ fn dispatch<A: crate::Arch>(
                 return 0xc0000017;
             }
             machine.copy_to(base as usize, &data);
-            machine.set_page_flags(base as usize / 4096, size as usize / 4096, false, false);
+            crate::kernel::memory::protect(machine, base as usize / 4096, size as usize / 4096, false, false);
             machine.write::<u32>(base_out as usize, base);
             machine.write::<u32>(size_out as usize, data.len() as u32);
             0

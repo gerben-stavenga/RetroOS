@@ -294,14 +294,14 @@ fn sync_selectors<A: crate::Arch>(machine: &mut A, windows: &WindowsState, old_l
     let pages = (windows.ldt.len()*8).div_ceil(4096);
     let old_pages = (old_len*8).div_ceil(4096);
     if pages > old_pages { machine.zero(TABLE+old_pages*4096,(pages-old_pages)*4096); }
-    machine.set_page_flags(TABLE/4096,pages,true,false);
+    crate::kernel::memory::protect(machine, TABLE/4096,pages,true,false);
     for (i,&desc) in windows.ldt.iter().enumerate() {
         let base = selector_base_from_ldt(&windows.ldt,i as u16*8+7).unwrap_or(0);
         let limit = ((desc&0xffff)|((desc>>32)&0xf0000)) as u32;
         machine.write::<u32>(TABLE+i*8,base);
         machine.write::<u32>(TABLE+i*8+4,limit);
     }
-    machine.set_page_flags(TABLE/4096,pages,false,false);
+    crate::kernel::memory::protect(machine, TABLE/4096,pages,false,false);
     if let Ok(config) = super::export_address(&windows.modules,b"USER32",b"Retro16Config") {
         machine.write::<u32>(config as usize+24,windows.ldt.len() as u32);
     }
@@ -749,7 +749,7 @@ pub(super) fn exec<A: crate::Arch>(
             usize::from(header.heap_size).saturating_add(usize::from(header.stack_size))
         } else { 0 };
         let size = segment.alloc_size.saturating_add(extra).min(0x10000);
-        machine.set_page_flags(
+        crate::kernel::memory::protect(machine,
             segment_base(number)? as usize / 4096,
             size.div_ceil(4096),
             !segment.is_code(),
@@ -760,7 +760,7 @@ pub(super) fn exec<A: crate::Arch>(
         let module_image = ne::Image::parse(&loaded.data).map_err(|_| -8)?;
         for number in 1..=module_image.header.segment_count {
             let segment = module_image.segment(number).map_err(|_| -8)?;
-            machine.set_page_flags(
+            crate::kernel::memory::protect(machine,
                 module_segment_base(loaded.base, number)? as usize / 4096,
                 module_segment_size(&module_image, number)?.div_ceil(4096),
                 !segment.is_code(),
@@ -768,9 +768,9 @@ pub(super) fn exec<A: crate::Arch>(
             );
         }
     }
-    machine.set_page_flags(PSP_BASE as usize / 4096, 1, true, false);
-    machine.set_page_flags(ENV_BASE as usize / 4096, 1, true, false);
-    machine.set_page_flags(RESOURCE_BASE as usize / 4096, 16, true, false);
+    crate::kernel::memory::protect(machine, PSP_BASE as usize / 4096, 1, true, false);
+    crate::kernel::memory::protect(machine, ENV_BASE as usize / 4096, 1, true, false);
+    crate::kernel::memory::protect(machine, RESOURCE_BASE as usize / 4096, 16, true, false);
 
     // The legacy bridge creates its own PE main-module record.
     if !wine { windows.modules.clear(); }
@@ -922,7 +922,7 @@ fn init_bridge<A: crate::Arch>(
     machine.zero(teb as usize, 4096);
     machine.write::<u32>((teb + 0x18) as usize, teb);
     machine.write::<u32>((teb + 0x24) as usize, tid as u32 + 1);
-    machine.set_page_flags(teb as usize / 4096, 1, true, false);
+    crate::kernel::memory::protect(machine, teb as usize / 4096, 1, true, false);
     let teb_selector = selector(&mut windows.ldt, teb, 4096, false)?;
     const TABLE: u32 = 0x7ff8_0000;
     let table_size = (windows.ldt.len() * 8).next_multiple_of(4096);
@@ -934,15 +934,15 @@ fn init_bridge<A: crate::Arch>(
         machine.write::<u32>(TABLE as usize + i * 8, base);
         machine.write::<u32>(TABLE as usize + i * 8 + 4, limit);
     }
-    machine.set_page_flags(TABLE as usize / 4096, table_size / 4096, false, false);
+    crate::kernel::memory::protect(machine, TABLE as usize / 4096, table_size / 4096, false, false);
     windows.stack_size = 256 * 1024;
     windows.stack_base = super::STACK_TOP - windows.stack_size;
     // A read-only guard catches downward stack writes beyond the guest reserve.
     let guard = windows.stack_base as usize - 4096;
     machine.zero(guard, 4096);
-    machine.set_page_flags(guard / 4096, 1, false, false);
+    crate::kernel::memory::protect(machine, guard / 4096, 1, false, false);
     machine.zero(windows.stack_base as usize, windows.stack_size as usize);
-    machine.set_page_flags(
+    crate::kernel::memory::protect(machine,
         windows.stack_base as usize / 4096,
         windows.stack_size as usize / 4096,
         true,
@@ -952,7 +952,7 @@ fn init_bridge<A: crate::Arch>(
     let image_pages = image_data.len().div_ceil(4096);
     machine.zero(RESOURCE_IMAGE as usize, image_pages * 4096);
     machine.copy_to(RESOURCE_IMAGE as usize, image_data);
-    machine.set_page_flags(RESOURCE_IMAGE as usize / 4096, image_pages, false, false);
+    crate::kernel::memory::protect(machine, RESOURCE_IMAGE as usize / 4096, image_pages, false, false);
     for (i, value) in [
         flat.ds as u32,
         u32::from(teb_selector),
@@ -984,12 +984,12 @@ fn init_bridge<A: crate::Arch>(
             .map_err(|_| -8)?
             .alloc_size
             .div_ceil(4096);
-        machine.set_page_flags(base as usize / 4096, pages, true, false);
+        crate::kernel::memory::protect(machine, base as usize / 4096, pages, true, false);
         machine.write::<u32>((base + u32::from(offset)) as usize, entry);
         machine.write::<u16>((base + u32::from(offset) + 4) as usize, flat.code_seg());
         machine.write::<u32>((base + u32::from(offset) + 6) as usize, back);
         machine.write::<u16>((base + u32::from(offset) + 10) as usize, flat.code_seg());
-        machine.set_page_flags(base as usize / 4096, pages, false, true);
+        crate::kernel::memory::protect(machine, base as usize / 4096, pages, false, true);
     }
     Ok(())
 }
@@ -1347,7 +1347,7 @@ fn dispatch<A: crate::Arch>(
                         // global memory. Keep its data alias writable too.
                         let base = selector_base(windows, dest).unwrap() as usize;
                         let limit = ((desc & 0xffff) | ((desc >> 32) & 0xf0000)) as usize;
-                        machine.set_page_flags(base / 4096, ((base % 4096) + limit + 1).div_ceil(4096), true, true);
+                        crate::kernel::memory::protect(machine, base / 4096, ((base % 4096) + limit + 1).div_ceil(4096), true, true);
                     }
                     u32::from(dest)
                 }
@@ -1797,7 +1797,7 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
                 let base = module_segment_base(module_base, n)?;
                 let size = module_segment_size(&image, n)?;
                 mapped.push((base as usize / 4096, size.div_ceil(4096)));
-                machine.set_page_flags(base as usize/4096, size.div_ceil(4096), true, false);
+                crate::kernel::memory::protect(machine, base as usize/4096, size.div_ceil(4096), true, false);
                 machine.zero(base as usize, size);
                 machine.copy_to(base as usize, image.segment_bytes(segment).map_err(|_| -8)?);
                 selectors.push(segment_selector(&mut windows.ldt, base, size, segment)?);
@@ -1825,7 +1825,7 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
             }
             for n in 1..=image.header.segment_count {
                 let seg = image.segment(n).map_err(|_| -8)?;
-                machine.set_page_flags(module_segment_base(m.base,n)? as usize/4096, module_segment_size(&image, n)?.div_ceil(4096), !seg.is_code(), seg.is_code());
+                crate::kernel::memory::protect(machine, module_segment_base(m.base,n)? as usize/4096, module_segment_size(&image, n)?.div_ceil(4096), !seg.is_code(), seg.is_code());
             }
         }
         // Extend the guest selector translation table without reinitializing USER state.
@@ -1833,20 +1833,20 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
         let pages = (windows.ldt.len()*8).div_ceil(4096);
         let old_pages = (old_ldt*8).div_ceil(4096);
         if pages > old_pages { machine.zero(TABLE+old_pages*4096, (pages-old_pages)*4096); }
-        machine.set_page_flags(TABLE/4096, pages, true, false);
+        crate::kernel::memory::protect(machine, TABLE/4096, pages, true, false);
         for i in old_ldt..windows.ldt.len() {
             let desc = windows.ldt[i];
             let base = selector_base(windows, i as u16*8+7).ok_or(-8)?;
             machine.write::<u32>(TABLE+i*8, base);
             machine.write::<u32>(TABLE+i*8+4, ((desc&0xffff)|((desc>>32)&0xf0000)) as u32);
         }
-        machine.set_page_flags(TABLE/4096, pages, false, false);
+        crate::kernel::memory::protect(machine, TABLE/4096, pages, false, false);
         let config = super::export_address(&windows.modules, b"USER32", b"Retro16Config")?;
         machine.write::<u32>(config as usize+24, windows.ldt.len() as u32);
         Ok(state.modules[start].selectors[0])
     })();
     if result.is_err() {
-        for (base, count) in mapped { machine.unmap_range(base, count); }
+        for (base, count) in mapped { crate::kernel::memory::reset(machine, base, count); }
         super::rollback_modules(machine, windows, old_pe_modules);
         state.modules.truncate(start);
         state.gates.truncate(old_gates);
@@ -1944,7 +1944,7 @@ pub(super) fn heap_alloc<A: crate::Arch>(machine: &mut A, state: &mut WindowsSta
     let first_page = (addr as usize).div_ceil(4096);
     let end_page = (end as usize).div_ceil(4096);
     if end_page > first_page {
-        machine.set_page_flags(first_page, end_page - first_page, true, false);
+        crate::kernel::memory::protect(machine, first_page, end_page - first_page, true, false);
     }
     state.blocks.push(Block { addr, size, used: true });
     addr

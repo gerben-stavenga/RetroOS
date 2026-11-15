@@ -75,11 +75,11 @@ pub use calls::*;
 pub mod suite_control;
 
 pub use machine::{
-    clean_fx_template, drain, free_page_count, halt_forever, inb, inl, insw, inw, now, outb, outl,
-    outsw, outw, post_irq, rdtsc, set_irq_line, shutdown, FxState,
+    clean_fx_template, install_input_sink, free_page_count, halt_forever, inb, inl, insw, inw, now, outb, outl,
+    outsw, outw, post_irq, shutdown, FxState,
 };
 // Interactive console (hosted `main` drives input): raw terminal mode; key
-// events are posted via `post_irq` and surface to the kernel through `drain`.
+// events are delivered by `post_irq` to the entry-installed device sink.
 pub use tty::enter_raw_mode;
 pub use space::{KernelPages, RootPageTable};
 pub use vcpu::{mem, GuestMem, Vcpu, REGS};

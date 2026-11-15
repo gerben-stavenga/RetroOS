@@ -55,6 +55,8 @@ fn main() {
     kernel::kernel::klog::init();
     lib::log::set_debug_sink(log_byte);
 
+    arch::install_input_sink(kernel::kernel::irq_dispatch::post);
+
     // CPU/kernel worker: interpreter state is thread-local, so the platform is
     // composed here, on the thread that will run it.
     std::thread::spawn(move || {
@@ -68,10 +70,7 @@ fn main() {
         // is never detected (Diskless — and with no root there is no C:\RETROOS,
         // so no shell either).
         kernel::install_portio(kernel::PortIo {
-            now_ns: || {
-                static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
-            },
+            now_ns: arch::now,
             inb: arch::inb,
             inw: arch::inw,
             inl: arch::inl,

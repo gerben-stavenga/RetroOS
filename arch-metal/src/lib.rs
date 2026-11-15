@@ -165,14 +165,7 @@ pub fn halt_forever() -> ! {
 pub use x86::{inb, outb, inw, outw, inl, outl, insw, outsw};
 pub use x86::{rdtsc, current_apic_id};
 pub use x86::{FxState, clean_fx_template};
-pub use irq::{now, drain};
-
-/// Assert/deassert the CPU INTR line from the virtual PIC. On metal the real
-/// 8259 drives INTR in hardware, so this is a no-op; the interpreter backend
-/// uses it to make its software CPU re-check for a pending IRQ at a basic-block
-/// boundary (see `retroos_arch_interp::set_irq_line`).
-#[inline]
-pub fn set_irq_line(_asserted: bool) {}
+pub use irq::now;
 
 /// Physical free-page count, maintained by the RAM pool in constant time.
 pub fn free_page_count() -> usize {
@@ -180,3 +173,4 @@ pub fn free_page_count() -> usize {
 }
 
 mod frames;
+mod mapping;

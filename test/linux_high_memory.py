@@ -48,6 +48,10 @@ def main():
                         process.terminate()
                         process.wait(timeout=5)
             text = log.read_text()
+            # This fixture boots SeaBIOS with QEMU's standard VGA. Firmware
+            # mapping errors must not pass unnoticed through video fallback.
+            assert 'Native BIOS: unexpected' not in text, text
+            assert 'VBE: selected mode ' in text, text
             expected = '[mem] exit tid=1 code=' + ('-11' if failure else '0')
             assert process.returncode == 0 and expected in text and 'PANIC' not in text, text[-4500:]
             print('PASS: high-memory ' + label, flush=True)

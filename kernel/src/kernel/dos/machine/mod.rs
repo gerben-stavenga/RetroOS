@@ -519,7 +519,7 @@ impl PcMachine {
         if let Some(voodoo) = self.voodoo.as_mut()
             && (voodoo_bar..voodoo_bar + vvoodoo::BAR_SIZE).contains(&physical)
         {
-            machine.map_phys_range(
+            crate::kernel::memory::map_physical(machine,
                 (virtual_base >> 12) as usize,
                 page_count as usize,
                 0,
@@ -534,7 +534,7 @@ impl PcMachine {
             // either LiveVram or the native card depending on display
             // ownership, so a DPMI mapping aliases the canonical range rather
             // than exposing a machine-specific bus address.
-            machine.copy_page_entries(
+            crate::kernel::memory::alias(machine,
                 (physical as usize & !0xFFF) >> 12,
                 (virtual_base >> 12) as usize,
                 page_count as usize,
@@ -542,19 +542,12 @@ impl PcMachine {
             return;
         }
 
-        machine.map_phys_range(
+        crate::kernel::memory::map_physical(machine,
             (virtual_base >> 12) as usize,
             page_count as usize,
             u64::from(physical & !0xFFF) >> 12,
             arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
         );
-    }
-
-    /// Whether a hardware IRQ or mouse callback is pending delivery — drives the
-    /// interpreter's CPU INTR line via `arch::set_irq_line`, so its per-block
-    /// interrupt check keeps firing until everything has been delivered.
-    pub fn intr_pending(&self) -> bool {
-        self.vpic.has_deliverable() || (self.mouse.cb_mask & self.mouse.pending_cond != 0)
     }
 
     /// Built straight into its heap slot: the struct is far too large to pass
@@ -569,7 +562,7 @@ impl PcMachine {
         // neither a real HMA (XMS reports none) nor unreal mode, so the gate has
         // nothing to toggle. Dropping it removes the shadow region, the page
         // swap, and the local/global ref-counting that used to track it.
-        machine.copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
+        crate::kernel::memory::alias(machine, 0, HMA_PAGE, HMA_PAGE_COUNT);
         // `Box::new(Self { .. })` is not an in-place construction guarantee:
         // rustc may assemble the complete aggregate on the kernel stack before
         // copying it to the allocation. PcMachine is large enough that a tiny

@@ -72,7 +72,7 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args
             if a.a2 == 4 {
                 // Drop only this address space's frames. Fork siblings retain
                 // their COW references; a later access gets a fresh zero page.
-                machine.unmap_range(start / 4096, (end - start) / 4096);
+                crate::kernel::memory::reset(machine, start / 4096, (end - start) / 4096);
             }
             // MADV_FREE is lazy: retaining contents until pressure is valid.
             SyscallResult::val(0)

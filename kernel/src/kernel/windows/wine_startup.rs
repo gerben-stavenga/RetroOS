@@ -57,9 +57,9 @@ pub(super) fn bootstrap<A: crate::Arch>(
     }
     machine.zero(NAMES as usize, 65536);
     machine.copy_to(NAMES as usize, &names);
-    machine.set_page_flags(NAMES as usize / 4096, 16, false, false);
+    crate::kernel::memory::protect(machine, NAMES as usize / 4096, 16, false, false);
     machine.zero(BOOTSTRAP as usize, 4096);
     machine.copy_to(BOOTSTRAP as usize, &code);
-    machine.set_page_flags(BOOTSTRAP as usize / 4096, 1, false, true);
+    crate::kernel::memory::protect(machine, BOOTSTRAP as usize / 4096, 1, false, true);
     Ok(BOOTSTRAP)
 }

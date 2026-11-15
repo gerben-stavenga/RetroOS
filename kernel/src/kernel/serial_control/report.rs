@@ -10,7 +10,7 @@ pub(super) fn write(machine: &mut impl crate::Arch, stats: &mut crate::kernel::s
     send(b",\"stopped_ns\":"); send_u64(totals.stopped_ns);
     send(b",\"elapsed_ns\":"); send_u64(totals.elapsed_ns);
     send(b"},\"clock\":{\"time_unit\":\"nanoseconds\",\"cycle_conversion\":");
-    if let Some((_, multiplier)) = machine.user_tsc_clock() {
+    if let Some((_, multiplier)) = crate::kernel::platform::user_tsc_clock() {
         send(b"{\"source\":\"stable_tsc\",\"ns_per_cycle_fp32\":"); send_u64(multiplier); send(b"}");
     } else { send(b"null"); }
     send(b"},\"raw\":{");

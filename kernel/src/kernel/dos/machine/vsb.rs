@@ -299,7 +299,7 @@ impl SoundBlaster {
     /// Complete the guest IRQ acknowledgement on a passed-through card.
     pub fn acknowledge_irq<A: crate::Arch>(&self, machine: &mut A, irq: u8) {
         if irq == self.blaster.irq && let SbDevice::Native { pt, .. } = &self.device {
-            machine.rearm_irq(pt.card.irq);
+            machine.isa_unmask_irq(pt.card.irq);
         }
     }
 

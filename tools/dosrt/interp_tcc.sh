@@ -1,7 +1,7 @@
 #!/bin/bash
 # Bazel genrule ACTION (not run by hand): compile a Turbo C source into a DOS
 # binary by running TCC inside RetroOS on the *interpreter* backend
-# (retroos-host) — headless, deterministic, no QEMU.
+# (retroos-host) — headless, no QEMU.
 #
 #   interp_tcc.sh <retroos-host> <image.bin> <src.c> <out> [tcc flags…]
 #

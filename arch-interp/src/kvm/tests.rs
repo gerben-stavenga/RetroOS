@@ -7,11 +7,18 @@
 //! phys memfd, so everything runs inside ONE #[test] (Rust runs tests on
 //! separate threads; a second REGS user would race).
 
-use arch_abi::Arch;
+use arch_abi::{Memory as _, Arch as _};
 use super::*;
 use crate::space::RootPageTable;
 use crate::sysdesc::{VIF_FLAG, VM_FLAG};
 use arch_abi::{GuestBytes, KernelEvent, Regs, USER_CS, USER_DS};
+
+static INPUT: std::sync::Mutex<std::vec::Vec<(arch_abi::Irq, u64)>> = std::sync::Mutex::new(std::vec::Vec::new());
+fn receive_input(event: arch_abi::Irq, timestamp: u64) { INPUT.lock().unwrap().push((event, timestamp)); }
+fn drain_input(f: &mut dyn FnMut(arch_abi::Irq, u64)) {
+    let events = core::mem::take(&mut *INPUT.lock().unwrap());
+    for (event, timestamp) in events { f(event, timestamp); }
+}
 
 fn kvm_available() -> bool {
     kvm_ioctls::Kvm::new().is_ok()
@@ -20,7 +27,7 @@ fn kvm_available() -> bool {
 /// Run until a non-Irq event, allowing unrelated wakeups to interleave.
 fn run_to_event() -> KernelEvent {
     for _ in 0..10_000 {
-        match execute() {
+        match execute(core::time::Duration::from_millis(100)) {
             KernelEvent::Irq => continue,
             ev => return ev,
         }
@@ -51,6 +58,7 @@ fn kvm_engine_proofs() {
     }
     crate::mmu::init();
     let mut mem = crate::backend::Interp;
+    crate::backend::check_virtual_irq_frame(&mut mem);
 
     // ── VM86: `int 0x31` (the trapped DPMI stub vector) from real-mode code.
     // The INT is IOPL-sensitive at IOPL=1 → #GP → shim → shared monitor →
@@ -76,51 +84,61 @@ fn kvm_engine_proofs() {
     assert!(r.flags32() & (VM_FLAG as u32) != 0, "still VM86 after the trap");
 
     // Absolute one-shot alarms must preempt guest-only computation. An
-    // elapsed alarm before KVM_RUN must also return without retiring code.
+    // interruption is supplied by the host timer, not a deadline pre-check.
+    crate::machine::install_input_sink(receive_input);
     mem.copy_to(0x7E00, &[0xeb, 0xfe]);
     let mut spinning = r;
     spinning.set_ip32(0x7E00);
     set_regs(spinning);
     let end = mem.now() + 3_000_000;
-    mem.arm_alarm(Some(end + 100_000_000));
-    mem.arm_alarm(None);
-    mem.arm_alarm(Some(end));
+
+
+
     let mut wakes = 0;
     loop {
-        assert!(matches!(execute(), KernelEvent::Irq));
+        assert!(matches!(execute(core::time::Duration::from_nanos(end.saturating_sub(mem.now()))), KernelEvent::Irq));
         wakes += 1;
         if mem.now() >= end { break; }
         assert!(wakes < 3, "an unrequested periodic heartbeat is still running");
     }
     assert!(mem.now() - end < 200_000_000, "one-shot alarm was excessively late");
-    mem.arm_alarm(Some(mem.now()));
-    set_regs(spinning);
-    assert!(matches!(execute(), KernelEvent::Irq));
-    assert_eq!(regs().ip32(), spinning.ip32());
-    // A synchronous firmware loan can finish while the kernel's alarm is
-    // pending. Its ignored IRQ exit must not turn into an endless re-entry loop.
+
+    // A queued event is historical data, not an execution interruption.
     mem.copy_to(0x7E10, &[0xcd, 0x31]);
-    let mut firmware = r;
-    firmware.set_ip32(0x7E10);
-    let mut finished = false;
-    for _ in 0..4 {
-        match mem.execute_firmware(&mut firmware, &arch_abi::IoPolicy::deny_all()) {
-            KernelEvent::Irq => {},
-            KernelEvent::SoftInt(0x31) => { finished = true; break; },
-            event => panic!("firmware loan: {event:?}"),
-        }
-    }
-    assert!(finished, "pending alarm starved a synchronous firmware loan");
-    mem.arm_alarm(None);
+    crate::machine::post_irq(arch_abi::Irq::Key(0x2e));
+    // Let the host signal arrive while outside KVM_RUN.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let mut resumed = r;
+    resumed.set_ip32(0x7E10);
+    set_regs(resumed);
+    assert!(matches!(execute(core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
+    let mut count = 0;
+    drain_input(&mut |event, _| {
+        assert!(matches!(event, arch_abi::Irq::Key(0x2e)));
+        count += 1;
+    });
+    assert_eq!(count, 1, "execution must leave queued data alone");
+
+    // A fresh host interrupt while code is running still returns Irq.
+    set_regs(spinning);
+    let poster = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        crate::machine::post_irq(arch_abi::Irq::Key(0xae));
+    });
+    assert!(matches!(execute(core::time::Duration::from_millis(100)), KernelEvent::Irq));
+    poster.join().unwrap();
+    set_regs(resumed);
+    assert!(matches!(execute(core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
+    drain_input(&mut |event, _| assert!(matches!(event, arch_abi::Irq::Key(0xae))));
     // Input must wake an idle CPU even with the timer completely disarmed.
     let poster = std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_millis(3));
         crate::machine::post_irq(arch_abi::Irq::Key(0x1e));
     });
-    mem.idle();
+    mem.idle(core::time::Duration::from_millis(100));
     poster.join().unwrap();
     let mut input = false;
-    mem.drain(&mut |event, _| input |= matches!(event, arch_abi::Irq::Key(0x1e)));
+    drain_input(&mut |event, _| input |= matches!(event, arch_abi::Irq::Key(0x1e)));
     assert!(input, "input was lost during the idle transition");
 
     // A VM86 POPF with reserved bit 15 set must behave like a hardware
@@ -184,7 +202,18 @@ fn kvm_engine_proofs() {
     // fetches too. Keep both frames alive and exchange their mappings so the
     // allocator cannot accidentally reuse the original physical page.
     mem.copy_to(0x8C00, &[0xB8, 0x78, 0x56, 0xCD, 0x31]);
-    crate::mmu::swap_entries(7, 8, 1);
+    let first_page = arch_abi::UserPage::new(0x7000).unwrap();
+    let second_page = arch_abi::UserPage::new(0x8000).unwrap();
+    let first = mem.read_mapping(first_page).unwrap();
+    let second = mem.read_mapping(second_page).unwrap();
+    let arch_abi::page_entry::PageEntry::Writable(first_mapping) = first else { panic!("expected owned RAM") };
+    let arch_abi::page_entry::Backing::Owned(frame) = first_mapping.backing else { panic!("expected owned RAM") };
+    crate::phys::inc_ref(frame.number());
+    unsafe {
+        mem.replace_mapping(first_page, second).unwrap();
+        mem.replace_mapping(second_page, first).unwrap();
+    }
+    crate::phys::free_frames(frame.number(), 1);
     let mut remapped = r;
     remapped.set_ip32(0x7C00);
     set_regs(remapped);
@@ -252,7 +281,7 @@ fn kvm_engine_proofs() {
         ev => panic!("COW child: expected SoftInt(0x80), got {ev:?}"),
     }
     assert_eq!(child_mem.read::<u32>(data as usize), 0x1111_1112, "child sees its increment");
-    crate::backend::Interp.activate(RootPageTable(parent), core::ptr::null_mut(), core::ptr::null_mut());
+    crate::backend::Interp.activate(RootPageTable(parent));
     set_regs(Regs::empty());
     assert_eq!(
         mem.read::<u32>(data as usize),
@@ -303,7 +332,7 @@ fn kvm_engine_proofs() {
     reset_io_bitmap();
 
     // ── FPU switch: fx_switch swaps the vcpu's live x87/SSE state with a
-    // thread save area (metal's arch_switch_to semantics). Thread A parks a
+    // thread save area (metal's switch_fx semantics). Thread A parks a
     // marker in XMM0; a switch to a clean thread B clobbers XMM0; switching
     // back must restore A's marker — through the XSAVE round-trip.
     // A: mov eax, 0x11223344; movd xmm0, eax; int 0x80
@@ -312,6 +341,14 @@ fn kvm_engine_proofs() {
     r.init_user_process(code, stack);
     set_regs(r);
     assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+    // Address-space activation must not exchange FPU or register state.
+    // The XMM0 assertion below observes the marker across this round-trip.
+    let before_activation = regs();
+    let previous = mem.activate(RootPageTable::default());
+    let mut empty = mem.activate(previous);
+    mem.destroy_space(&mut empty);
+    assert_eq!(regs().frame.rip, before_activation.frame.rip);
+    assert_eq!(regs().rax, before_activation.rax);
     let mut slot = crate::machine::clean_fx_template();
     fx_switch(&mut slot); // A out (slot = A's state), clean B in
     assert_eq!(
@@ -349,7 +386,10 @@ fn kvm_engine_proofs() {
     // a stale queued exception at the new MOV/JMP must never escape as #UD.
     let entries = [0x0060_0000usize, 0x0060_1000];
     for &entry in &entries {
-        mem.copy_to(entry, &[0xb8, 24, 0, 0, 0, 0x0f, 0x05, 0xeb, 0xf7]);
+        // syscall; then spend time in guest computation before the next one.
+        // The timer must interrupt KVM_RUN, not merely expire in host code.
+        mem.copy_to(entry, &[0xb8, 24, 0, 0, 0, 0x0f, 0x05,
+            0xb9, 0x40, 0x42, 0x0f, 0, 0xff, 0xc9, 0x75, 0xfc, 0xeb, 0xee]);
     }
     let mut contexts = [Regs::empty(); 2];
     for (i, context) in contexts.iter_mut().enumerate() {
@@ -368,19 +408,17 @@ fn kvm_engine_proofs() {
         events.exception.has_error_code = 0;
         k.vcpu.set_vcpu_events(&events).unwrap();
     });
-    mem.arm_alarm(Some(mem.now()));
-    assert!(matches!(execute(), KernelEvent::Syscall), "drain the queued syscall before returning an alarm");
+
+    assert!(matches!(execute(core::time::Duration::from_nanos(1)), KernelEvent::Syscall), "drain the queued syscall before returning an alarm");
     let mut active = 0;
     let mut syscalls = 0;
     let mut alarms = 0;
     let start = std::time::Instant::now();
-    mem.arm_alarm(Some(mem.now() + 100_000));
     set_regs(contexts[active]);
     while start.elapsed() < std::time::Duration::from_millis(100) {
-        match execute() {
+        match execute(core::time::Duration::from_micros(100)) {
             KernelEvent::Irq => {
                 alarms += 1;
-                mem.arm_alarm(Some(mem.now() + 100_000));
             },
             KernelEvent::Syscall => { syscalls += 1; },
             event => panic!("64-bit context switch yielded {event:?}"),
@@ -391,6 +429,6 @@ fn kvm_engine_proofs() {
     }
     assert!(syscalls > 100, "64-bit syscall contexts made progress");
     assert!(alarms > 10, "context switches exercised real alarm preemption");
-    mem.arm_alarm(None);
+
 
 }

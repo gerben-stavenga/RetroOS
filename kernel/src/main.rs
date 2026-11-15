@@ -80,8 +80,7 @@ fn main() {
             // ports are unpopulated and the kernel sound path is inert.
             "--wav" => wav = args.next(),
             "--suite-control" => suite_control = true,
-            // Same input protocol without the TCG retired-instruction clock;
-            // useful for KVM applications blocked in native event waits.
+            // Same input protocol without pausing execution at the suite gate.
             "--input-control" => input_control = true,
             "--suite-cpu" => {
                 let name = args.next().unwrap_or_default();
@@ -226,11 +225,9 @@ fn main() {
 /// (for the deep driver call sites that never see the `&mut Arch`) and the
 /// host-environment facts the platform probe reads.
 fn install_hosted_backend() {
+    arch::install_input_sink(kernel::kernel::irq_dispatch::post);
     kernel::install_portio(kernel::PortIo {
-        now_ns: || {
-            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-            EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
-        },
+        now_ns: arch::now,
         inb: arch::inb,
         inw: arch::inw,
         inl: arch::inl,
@@ -289,10 +286,6 @@ fn spawn_suite_control() {
                         else { std::thread::sleep(std::time::Duration::from_millis(ms.min(1000))); }
                     },
                     None => { println!("ERROR invalid run"); continue; }
-                },
-                Some("cycles") => match words.next().and_then(|s| s.parse::<u64>().ok()) {
-                    Some(n) if n > 0 => arch::suite_control::cycles(n),
-                    _ => { println!("ERROR invalid cycles"); continue; }
                 },
                 Some("scan") => {
                     for word in words {

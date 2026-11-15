@@ -619,7 +619,7 @@ fn protect_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<()
         let first = base / 4096;
         let pages = (base % 4096 + object.size as usize).div_ceil(4096);
         if pages != 0 {
-            machine.set_page_flags(
+            crate::kernel::memory::protect(machine,
                 first,
                 pages,
                 object.flags & lx::OBJ_WRITABLE != 0,
@@ -731,14 +731,14 @@ pub fn exec_lx_into<A: crate::Arch>(
         if size >= STACK_TOP as usize { return Err(8); }
         let base = STACK_TOP as usize - size;
         machine.zero(base, size);
-        machine.set_page_flags(base / 4096, size.div_ceil(4096), true, false);
+        crate::kernel::memory::protect(machine, base / 4096, size.div_ceil(4096), true, false);
         STACK_TOP
     };
 
     // OS/2 loader process data: a TIB selected by FS, followed by TIB2, PIB,
     // environment and the two-string command block expected by Open Watcom.
     machine.zero(PROCESS_DATA as usize, 8192);
-    machine.set_page_flags(PROCESS_DATA as usize / 4096, 2, true, false);
+    crate::kernel::memory::protect(machine, PROCESS_DATA as usize / 4096, 2, true, false);
     let tib = PROCESS_DATA;
     let tib2 = tib + 0x40;
     let pib = tib + 0x80;
@@ -805,7 +805,7 @@ pub fn exec_lx_into<A: crate::Arch>(
     state.ldt = ldt;
     register_gates(&mut state, &modules);
     machine.copy_to((PROCESS_DATA + 0x300) as usize, &[0xcd, GATE_VECTOR]);
-    machine.set_page_flags(PROCESS_DATA as usize / 4096, 1, true, true);
+    crate::kernel::memory::protect(machine, PROCESS_DATA as usize / 4096, 1, true, true);
     state.gates.push(Gate { cs: arch_abi::USER_CS, return_ip: PROCESS_DATA+0x302, api: Api::DllReturn, far16_args: 0 });
     machine.copy_to((PROCESS_DATA+0x310) as usize,&[0xf4,0xcd,GATE_VECTOR]);
     state.gates.push(Gate {cs:arch_abi::USER_CS,return_ip:PROCESS_DATA+0x313,api:Api::WaitReturn,far16_args:0});
@@ -1230,7 +1230,7 @@ fn write_pm_message<A: crate::Arch>(machine: &mut A, address: usize, message: Pm
     machine.write::<u32>(address + 4, message.message);
     machine.write::<u32>(address + 8, message.mp1);
     machine.write::<u32>(address + 12, message.mp2);
-    machine.write::<u32>(address + 16, machine.get_ticks() as u32);
+    machine.write::<u32>(address + 16, (machine.now() / 1_000_000) as u32);
     machine.write::<u32>(address + 20, 0);
     machine.write::<u32>(address + 24, 0);
 }
@@ -1318,7 +1318,7 @@ fn alloc_os2_memory<A: crate::Arch>(machine: &mut A, state: &mut Os2State, out: 
     let base = state.heap_next;
     state.heap_next = end;
     machine.zero(base as usize, size as usize);
-    machine.set_page_flags(base as usize / 4096, size as usize / 4096, true, false);
+    crate::kernel::memory::protect(machine, base as usize / 4096, size as usize / 4096, true, false);
     state.allocations.push((base, size));
     machine.write::<u32>(out, base);
     NO_ERROR
@@ -1544,7 +1544,7 @@ fn dispatch_api<A: crate::Arch>(
                 let index = first + i as u32;
                 let value = match index {
                     1 => 260, 5 => 3, 10 => 4096, 11 => 20, 12 => 45,
-                    13 => 0, 14 => machine.get_ticks() as u32, 17 | 19 | 20 => 256 * 1024 * 1024,
+                    13 => 0, 14 => (machine.now() / 1_000_000) as u32, 17 | 19 | 20 => 256 * 1024 * 1024,
                     26 => 1, _ => 0,
                 };
                 machine.write::<u32>(out + i * 4, value);

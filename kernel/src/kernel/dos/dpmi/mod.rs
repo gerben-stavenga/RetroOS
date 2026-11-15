@@ -943,7 +943,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 regs.rax = (regs.rax & !0xFFFF) | 0x8021;
                 return thread::KernelAction::Done;
             };
-            machine.unmap_range(
+            crate::kernel::memory::reset(machine,
                 (mapping.virtual_page_base >> 12) as usize,
                 mapping.page_count as usize,
             );

@@ -8,7 +8,7 @@
 /// words. Decoding stays outside this wrapper so its cost can be measured
 /// independently from the privilege transition and guest run.
 #[inline(never)]
-pub fn do_arch_execute_raw() -> (u32, u64) {
+pub fn do_arch_execute_raw(max_ns: u64) -> (u32, u64) {
     let event: u32;
     let extra: u32;
     let extra_high: u32;
@@ -16,8 +16,8 @@ pub fn do_arch_execute_raw() -> (u32, u64) {
         core::arch::asm!(
             "int 0x80",
             inout("eax") crate::arch_call::EXECUTE as u32 => event,
-            out("edx") extra,
-            out("ecx") extra_high,
+            inout("edx") max_ns as u32 => extra,
+            inout("ecx") (max_ns >> 32) as u32 => extra_high,
             out("ebx") _,
             out("edi") _,
         );
@@ -37,32 +37,25 @@ pub fn arch_replace_interrupt_handlers(vector: u8, mut handlers: arch_abi::Inter
     handlers
 }
 
-/// Switch threads: swap live state with pointed-to state.
-/// On entry: ptrs hold incoming state. On exit: ptrs hold saved outgoing state.
-/// hash_ptr: null = no hashing. Non-null: on entry = expected hash (0=don't check),
-/// on exit = old address space hash.
-pub fn arch_switch_to(
-    vcpu: &mut crate::Vcpu,
-    hash_ptr: *mut u64,
-    fx_ptr: *mut crate::FxState,
-) {
-    // The arch call still takes two separate pointers (regs in EDX, page-table
-    // root in ECX); the Vcpu bundle is purely kernel-side, so we hand the
-    // handler `&mut vcpu.regs` and `&mut vcpu.space` exactly as before.
-    // LLVM reserves ESI/EDI for its own use in inline asm on x86, so we
-    // can't name them directly. Stash fx_ptr in ESI around the int 0x80.
+/// Exchange the active address space with `space`.
+pub fn arch_activate(space: &mut super::RootPageTable) {
     unsafe {
-        core::arch::asm!(
-            "xchg esi, {fx}",
-            "int 0x80",
-            "xchg esi, {fx}",
-            fx = inout(reg) fx_ptr as u32 => _,
-            in("eax") crate::arch_call::SWITCH_TO as u32,
-            in("edx") &mut vcpu.regs as *mut _ as u32,
-            in("ecx") &mut vcpu.space as *mut _ as u32,
-            in("ebx") hash_ptr as u32,
+        core::arch::asm!("int 0x80",
+            in("eax") crate::arch_call::ACTIVATE as u32,
+            in("edx") space as *mut super::RootPageTable as u32,
         );
     }
+}
+
+/// Record the current page-table hash and optionally compare it to a snapshot.
+pub fn arch_check_address_space(mut expected: u64) -> u64 {
+    unsafe {
+        core::arch::asm!("int 0x80",
+            in("eax") crate::arch_call::CHECK_ADDRESS_SPACE as u32,
+            in("edx") &mut expected as *mut u64 as u32,
+        );
+    }
+    expected
 }
 
 pub fn arch_switch_fx(fx: &mut crate::FxState) {
@@ -96,108 +89,6 @@ pub fn arch_user_clean() {
     }
 }
 
-
-
-/// Set page permissions for a range. flags: bit 0 = writable, bit 1 = executable.
-pub fn arch_set_page_flags(start_vpage: usize, count: usize, writable: bool, executable: bool) {
-    let flags = (writable as u32) | ((executable as u32) << 1);
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch_call::SET_PAGE_FLAGS as u32,
-            in("edx") start_vpage as u32,
-            in("ecx") count as u32,
-            in("ebx") flags,
-        );
-    }
-}
-
-/// Map first 1MB user-accessible for VM86.
-pub fn arch_map_low_mem() {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch_call::MAP_LOW_MEM as u32,
-        );
-    }
-}
-
-/// Map this process's VGA color-text aperture onto the shared text screen.
-pub fn arch_map_shared_pages(vpage: usize, kernel_base: usize, count: usize) {
-    unsafe {
-        core::arch::asm!("int 0x80", in("eax") crate::arch_call::MAP_SHARED_PAGES as u32,
-            in("edx") vpage, in("ecx") kernel_base, in("ebx") count);
-    }
-}
-
-pub fn arch_map_vga_text_aperture() {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch_call::MAP_VGA_TEXT_APERTURE as u32,
-        );
-    }
-}
-
-/// Copy page table entries from src to dst.
-pub fn arch_copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch_call::COPY_PAGE_ENTRIES as u32,
-            in("edx") src_vpage as u32,
-            in("ecx") dst_vpage as u32,
-            in("ebx") count as u32,
-        );
-    }
-}
-
-pub fn arch_redirect_physical_aliases(
-    physical_ppage: u64,
-    shadow_vpage: usize,
-    count: usize,
-    redirect: bool,
-) {
-    unsafe {
-        core::arch::asm!(
-            "push esi",
-            "mov esi, {hi:e}",
-            "int 0x80",
-            "pop esi",
-            hi = in(reg) (physical_ppage >> 32) as u32,
-            in("eax") crate::arch_call::REDIRECT_PHYSICAL_ALIASES as u32,
-            in("edx") physical_ppage as u32,
-            in("ecx") shadow_vpage as u32,
-            in("ebx") count as u32,
-            in("edi") redirect as u32,
-        );
-    }
-}
-
-pub fn arch_swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch_call::SWAP_PAGE_ENTRIES as u32,
-            in("edx") a_vpage as u32,
-            in("ecx") b_vpage as u32,
-            in("ebx") count as u32,
-        );
-    }
-}
-
-/// Clear page entries to absent (enables demand paging on next access).
-pub fn arch_unmap_range(base_page: usize, count: usize) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch_call::UNMAP_RANGE as u32,
-            in("edx") base_page as u32,
-            in("ecx") count as u32,
-        );
-    }
-}
-
 /// Heap release hook, usable during ring-0 boot and ring-1 kernel execution.
 /// Does not allocate or call back into the heap.
 pub fn release_heap_pages(addr: usize, bytes: usize) {
@@ -217,9 +108,6 @@ pub fn release_heap_pages(addr: usize, bytes: usize) {
     }
 }
 
-
-
-
 /// Load the LDT: write base+limit into GDT[12] and execute LLDT. Takes the LDT
 /// as a slice so base and limit travel together; the metal backend splits it
 /// into the `edx`/`ecx` register pair for the trap (the kernel address fits
@@ -238,7 +126,7 @@ pub fn arch_load_ldt(ldt: &[u64]) {
 }
 
 /// Map a range of physical pages into user virtual space.
-pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
+pub fn arch_map_kernel_physical(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
     unsafe {
         // EBX holds only the low 32 bits of the physical page; pages above 4 GB
         // (an NVMe BAR placed >4 GB by firmware on a wide-MAXPHYADDR CPU) need
@@ -250,7 +138,7 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
             "int 0x80",
             "pop esi",
             hi = in(reg) (ppage_start >> 32) as u32,
-            in("eax") crate::arch_call::MAP_PHYS_RANGE as u32,
+            in("eax") crate::arch_call::MAP_KERNEL_PHYSICAL as u32,
             in("edx") vpage_start as u32,
             in("ecx") num_pages as u32,
             in("ebx") ppage_start as u32,
@@ -262,24 +150,12 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
 /// Re-arm (re-unmask) an IRQ line that `handle_irq` left masked because
 /// its ack is deferred to the guest. Call once the guest's device-ack
 /// has passed through, so the next interrupt on that line can fire.
-pub fn arch_rearm_irq(line: u8) {
+pub fn arch_isa_unmask_irq(line: u8) {
     unsafe {
         core::arch::asm!(
             "int 0x80",
-            in("eax") crate::arch_call::REARM_IRQ as u32,
+            in("eax") crate::arch_call::ISA_UNMASK_IRQ as u32,
             in("edx") line as u32,
-        );
-    }
-}
-
-/// Replace `count` user pages at `vpage` with fresh anonymous RW frames.
-pub fn arch_map_fresh_range(vpage: usize, count: usize) {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch_call::MAP_FRESH_RANGE as u32,
-            in("edx") vpage as u32,
-            in("ecx") count as u32,
         );
     }
 }
@@ -330,19 +206,8 @@ pub fn arch_set_debug_watch(addrs: Option<(u32, u32)>) {
     }
 }
 
-/// Program an absolute alarm from the ring-1 event-loop exit.
-pub fn arch_arm_alarm(deadline: Option<u64>) {
-    unsafe { core::arch::asm!("int 0x80",
-        in("eax") crate::arch_call::ARM_ALARM as u32,
-        in("edx") &deadline as *const Option<u64> as u32); }
-}
-pub fn arch_idle() {
-    unsafe { core::arch::asm!("int 0x80", in("eax") crate::arch_call::IDLE as u32); }
-}
-pub fn arch_poll_timed_devices(now: u64) -> Option<u64> {
-    let mut next = Some(now);
-    unsafe { core::arch::asm!("int 0x80",
-        in("eax") crate::arch_call::POLL_TIMED_DEVICES as u32,
-        in("edx") &mut next as *mut Option<u64> as u32); }
-    next
+/// Wait for an interruption, bounded by this call's duration.
+pub fn arch_idle(max_ns: u64) {
+    unsafe { core::arch::asm!("int 0x80", in("eax") crate::arch_call::IDLE as u32,
+        in("edx") max_ns as u32, in("ecx") (max_ns >> 32) as u32); }
 }

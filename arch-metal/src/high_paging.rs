@@ -8,14 +8,13 @@ use crate::paging2::flags::*;
 pub const START: u64 = 1 << 39;
 pub const END: u64 = 1 << 47;
 const RESERVED: u64 = 1 << 10;
-const ACCESS: u64 = 1 << 11;
+const BLOCKED: u64 = 1 << 8; // software: uniform NoAccess mapping
 
 #[repr(C)]
 pub(crate) struct Request {
     pub address: u64,
     pub length: u64,
-    pub operation: u32,
-    pub protection: u32,
+    pub to_user: bool,
     pub buffer: usize,
     pub result: i32,
 }
@@ -87,7 +86,8 @@ fn allocate(fill: Entry64) -> Result<u64, i32> {
     Ok(page)
 }
 fn release(entry: Entry64, level: u32) {
-    if !entry.present() { return; }
+    if !entry.present() && !(level == 0 && entry.raw() & RESERVED != 0) { return; }
+    if level == 0 && entry.raw() & FOREIGN != 0 { return; }
     if level > 0 && crate::memory::get_ref_count(entry.page()) == 1 {
         for index in 0..512 { release(read(entry.page(), index), level - 1); }
     }
@@ -111,7 +111,7 @@ fn table(entry: &mut Entry64) -> Result<u64, i32> {
         let page = allocate(Entry64(0))?;
         for index in 0..512 {
             let mut child = read(entry.page(), index);
-            if child.present() {
+            if (child.present() || child.raw() & RESERVED != 0) && child.raw() & FOREIGN == 0 {
                 child.set_hw_writable(false);
                 crate::memory::inc_shared_count(child.page());
                 write(entry.page(), index, child);
@@ -123,126 +123,28 @@ fn table(entry: &mut Entry64) -> Result<u64, i32> {
     } else { entry.set_hw_writable(true); }
     Ok(entry.page())
 }
-fn marker(protection: u32) -> Entry64 {
-    Entry64(RESERVED | if protection & 7 != 0 { ACCESS } else { 0 }
-        | if protection & 2 != 0 { READ_WRITE } else { SOFT_RO }
-        | if protection & 4 == 0 && paging2::nx_enabled() { NO_EXECUTE } else { 0 })
-}
-fn occupied(entry: Entry64, level: u32, base: u64, start: u64, end: u64) -> bool {
-    if entry.raw() == 0 { return false; }
-    if !entry.present() || level == 0 { return true; }
-    let span = 1u64 << (12 + 9 * (level - 1));
-    let first = ((start.max(base) - base) / span) as usize;
-    let last = ((end.min(base + span * 512) - base).div_ceil(span)) as usize;
-    (first..last).any(|i| occupied(read(entry.page(), i), level - 1, base + i as u64 * span, start, end))
-}
 
-fn update(entry: &mut Entry64, level: u32, base: u64, start: u64, end: u64, op: u32, prot: u32) -> Result<(), i32> {
-    let span = 1u64 << (12 + 9 * level);
-    let full = start <= base && end >= base + span;
-    if (full || level == 0) && matches!(op, 0 | 2 | 4) {
-        let old = *entry;
-        *entry = if op == 2 { Entry64(0) } else { marker(prot) };
-        release(old, level);
-        return Ok(());
-    }
-    if entry.raw() == 0 && matches!(op, 1 | 3) { return Err(-12); }
-    if !entry.present() && full && op == 1 { *entry = marker(prot); return Ok(()); }
-    if !entry.present() && op == 3 { return Ok(()); }
-    if level == 0 {
-        if op == 3 {
-            let old = *entry;
-            let prot = if !old.user() { 0 } else {
-                (if old.writable() { 3 } else { 1 }) | if old.raw() & NO_EXECUTE == 0 { 4 } else { 0 }
-            };
-            *entry = marker(prot);
-            release(old, 0);
-        } else {
-            // Keep committed data through PROT_NONE. USER controls visibility;
-            // semantic permissions survive fork independently of hardware COW.
-            entry.set_user(prot & 7 != 0);
-            entry.set_writable(prot & 2 != 0);
-            entry.set_hw_writable(prot & 2 != 0 && crate::memory::get_ref_count(entry.page()) == 1);
-            entry.set_no_execute(prot & 4 == 0);
-        }
-        return Ok(());
-    }
-    if op == 2 && entry.raw() == 0 { return Ok(()); }
-    let page = table(entry)?;
-    let child_span = span / 512;
-    let first = ((start.max(base) - base) / child_span) as usize;
-    let last = ((end.min(base + span) - base).div_ceil(child_span)) as usize;
-    for index in first..last {
-        let mut child = read(page, index);
-        let result = update(&mut child, level - 1, base + index as u64 * child_span, start, end, op, prot);
-        write(page, index, child);
-        result?;
-    }
-    Ok(())
-}
 
-pub fn request(request: &Request) -> i32 {
-    if !supported() { return -12; }
-    let start = request.address;
-    let Some(end) = start.checked_add(request.length).filter(|end| start >= START && *end <= END) else { return -22; };
-    if request.operation >= 5 {
-        if request.operation > 6 { return -22; }
-        let mut offset = 0;
-        while offset < request.length {
-            let address = start + offset;
-            let Some(page) = resolve(address, request.operation == 6, false) else { return -14; };
-            let at = (address & 4095) as usize;
-            let count = (request.length - offset).min((4096 - at) as u64) as usize;
-            with_frame(page, |p| unsafe {
-                let buffer = (request.buffer as *mut u8).add(offset as usize);
-                if request.operation == 6 { core::ptr::copy_nonoverlapping(buffer, p.add(at), count); }
-                else { core::ptr::copy_nonoverlapping(p.add(at), buffer, count); }
-            });
-            offset += count as u64;
-        }
-        paging2::flush_tlb();
-        return 0;
-    }
-    if start & 4095 != 0 || end & 4095 != 0 || start == end || request.protection & !7 != 0 { return -22; }
-    if request.operation == 4 {
-        for index in (start >> 39) as usize..end.div_ceil(1 << 39) as usize {
-            if occupied(root(index), 3, (index as u64) << 39, start, end) { return -17; }
-        }
-    }
-    let mut result = Ok(());
-    for index in (start >> 39) as usize..end.div_ceil(1 << 39) as usize {
-        let mut entry = root(index);
-        result = update(&mut entry, 3, (index as u64) << 39, start, end, request.operation, request.protection);
-        set_root(index, entry);
-        if result.is_err() { break; }
-    }
-    paging2::flush_tlb();
-    result.err().unwrap_or(0)
-}
 
 fn resolve(address: u64, write_access: bool, execute: bool) -> Option<u64> {
     if !(START..END).contains(&address) { return None; }
     fn walk(entry: &mut Entry64, level: u32, address: u64, write_access: bool, execute: bool) -> Option<u64> {
         if entry.raw() == 0 { return None; }
-        if !entry.present() && (entry.raw() & ACCESS == 0 || write_access && !entry.hw_writable()
-            || execute && entry.raw() & NO_EXECUTE != 0) { return None; }
         if level == 0 {
-            if entry.present() && (!entry.user() || write_access && !entry.writable()
-                || execute && entry.raw() & NO_EXECUTE != 0) { return None; }
             if !entry.present() {
-                let old = *entry;
-                let page = allocate(Entry64(0)).ok()?;
-                *entry = Entry64::new(page, old.hw_writable(), true);
-                entry.set_writable(old.hw_writable());
-                entry.set_no_execute(old.raw() & NO_EXECUTE != 0);
-            } else if write_access {
-                if crate::memory::get_ref_count(entry.page()) > 1 {
+                if entry.raw() & RESERVED == 0 || entry.raw() & BLOCKED != 0 { return None; }
+                entry.0 = (entry.0 & !RESERVED) | PRESENT;
+            }
+            if !entry.user() || write_access && !entry.writable()
+                || execute && entry.raw() & NO_EXECUTE != 0 { return None; }
+            if write_access && !entry.hw_writable() {
+                if entry.raw() & FOREIGN != 0 || crate::memory::get_ref_count(entry.page()) > 1 {
                     let page = allocate(Entry64(0)).ok()?;
                     let scratch = (&raw mut crate::SCRATCH).cast::<u8>();
                     with_frame(entry.page(), |p| unsafe { core::ptr::copy_nonoverlapping(p, scratch, 4096); });
                     with_frame(page, |p| unsafe { core::ptr::copy_nonoverlapping(scratch, p, 4096); });
-                    crate::memory::release_page(entry.page());
-                    entry.0 = (entry.0 & !Entry64::ADDR_MASK) | (page << 12);
+                    if entry.raw() & FOREIGN == 0 { crate::memory::release_page(entry.page()); }
+                    entry.0 = (entry.0 & !Entry64::ADDR_MASK & !FOREIGN) | (page << 12);
                 }
                 entry.set_hw_writable(true);
             }
@@ -289,4 +191,126 @@ pub(crate) fn privatize() -> i32 {
     }
     paging2::flush_tlb();
     0
+}
+
+
+
+/// Byte access is independent of mapping policy.
+pub fn request(request: &Request) -> i32 {
+    if !supported() { return -12; }
+    let Some(end) = request.address.checked_add(request.length) else { return -22; };
+    if request.address < START || end > END { return -22; }
+    let mut offset = 0;
+    while offset < request.length {
+        let address = request.address + offset;
+        let Some(page) = resolve(address, request.to_user, false) else { return -14; };
+        let at = (address & 4095) as usize;
+        let count = (request.length - offset).min((4096 - at) as u64) as usize;
+        with_frame(page, |p| unsafe {
+            let buffer = (request.buffer as *mut u8).add(offset as usize);
+            if request.to_user { core::ptr::copy_nonoverlapping(buffer, p.add(at), count); }
+            else { core::ptr::copy_nonoverlapping(p.add(at), buffer, count); }
+        });
+        offset += count as u64;
+    }
+    paging2::flush_tlb();
+    0
+}
+
+use arch_abi::{MappingError, MappingFailure, UserPage, page_entry::{Backing, PageEntry}};
+fn decode_uniform(entry: Entry64) -> Result<PageEntry, MappingError> {
+    if entry.raw() == 0 { return Ok(PageEntry::Absent); }
+    if entry.raw() & RESERVED == 0 { return Ok(PageEntry::Intercepted); }
+    let decoded = crate::mapping::decode(Entry64((entry.raw() & !RESERVED & !BLOCKED) | PRESENT), false)?;
+    if entry.raw() & BLOCKED != 0 {
+        match decoded {
+            PageEntry::ReadOnly(m) | PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => Ok(PageEntry::NoAccess(m)),
+            _ => Err(MappingError::InvalidFrame),
+        }
+    } else { Ok(decoded) }
+}
+fn encode_uniform(page: UserPage, entry: PageEntry) -> Result<Entry64, MappingError> {
+    let mut encoded = crate::mapping::encode::<Entry64>(page, entry)?;
+    match entry {
+        PageEntry::Absent => encoded.0 = 0,
+        PageEntry::Intercepted => (),
+        _ => {
+            encoded.set_present(false); encoded.set_flag(RESERVED, true);
+            encoded.set_flag(BLOCKED, matches!(entry, PageEntry::NoAccess(_)));
+        }
+    }
+    Ok(encoded)
+}
+
+pub(crate) fn read_run(page: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError> {
+    if !supported() { return Err(MappingError::Unsupported); }
+    let address = page.address();
+    let mut entry = root((address >> 39) as usize);
+    let mut inherited_cow = false;
+    for level in (0..=3).rev() {
+        if !entry.present() {
+            let span = 1u64 << (12 + 9 * level);
+            let remaining = ((span - (address & (span - 1))) / 4096).min(maximum as u64) as usize;
+            let mut decoded = decode_uniform(entry)?;
+            if inherited_cow {
+                if let PageEntry::Writable(m) = decoded {
+                    if matches!(m.backing, Backing::Owned(_)) { decoded = PageEntry::CopyOnWrite(m); }
+                }
+            }
+            return Ok((decoded, remaining));
+        }
+        if level == 0 { return Ok((crate::mapping::decode(entry, inherited_cow)?, 1)); }
+        inherited_cow |= !entry.hw_writable();
+        let index = ((address >> (12 + 9 * (level - 1))) & 511) as usize;
+        entry = read(entry.page(), index);
+    }
+    unreachable!()
+}
+
+/// Repeated borrowed leaves can be represented by a nonpresent uniform subtree.
+/// Owned leaves retain one reference per occurrence, so they expand to leaves.
+/// The mapping trap invalidates translations after the entire operation,
+/// including any committed prefix on failure.
+pub(crate) fn fill(page: UserPage, count: usize, incoming: PageEntry) -> Result<(), MappingFailure> {
+    let fail = |error| MappingFailure { completed: 0, error };
+    if !supported() { return Err(fail(MappingError::Unsupported)); }
+    let encoded = encode_uniform(page, incoming).map_err(fail)?;
+    let owned = match incoming {
+        PageEntry::NoAccess(m) | PageEntry::ReadOnly(m) | PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) =>
+            if let Backing::Owned(frame) = m.backing { Some(frame.number()) } else { None },
+        _ => None,
+    };
+    fn update(entry: &mut Entry64, level: u32, base: u64, start: u64, end: u64,
+        encoded: Entry64, owned: Option<u64>, completed: &mut usize) -> Result<(), MappingError>
+    {
+        let span = 1u64 << (12 + 9 * level);
+        if level == 0 || owned.is_none() && start <= base && end >= base + span {
+            if let Some(frame) = owned {
+                if !crate::memory::inc_shared_count(frame) { return Err(MappingError::InvalidFrame); }
+            }
+            let old = *entry; *entry = encoded; release(old, level);
+            *completed = ((end.min(base + span) - start) / 4096) as usize;
+            return Ok(());
+        }
+        let table_page = table(entry).map_err(|_| MappingError::NeedPages)?;
+        let child_span = span / 512;
+        let first = ((start.max(base) - base) / child_span) as usize;
+        let last = ((end.min(base + span) - base).div_ceil(child_span)) as usize;
+        for index in first..last {
+            let mut child = read(table_page, index);
+            let result = update(&mut child, level - 1, base + index as u64 * child_span,
+                start, end, encoded, owned, completed);
+            write(table_page, index, child); result?;
+        }
+        Ok(())
+    }
+    let start = page.address(); let end = start + count as u64 * 4096;
+    let mut completed = 0;
+    for index in (start >> 39) as usize..end.div_ceil(1 << 39) as usize {
+        let mut entry = root(index);
+        let result = update(&mut entry, 3, (index as u64) << 39, start, end, encoded, owned, &mut completed);
+        set_root(index, entry);
+        result.map_err(|error| MappingFailure { completed, error })?;
+    }
+    Ok(())
 }

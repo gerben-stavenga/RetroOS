@@ -954,7 +954,7 @@ pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut [Thread<A>], machine: 
             k.tables_private = false;
             k.pending_event = None;
             k.pending_action = None;
-            k.time = machine.get_ticks();
+            k.time = machine.now() / 1_000_000;
             k.vcpu = crate::Vcpu::new(Regs::empty(), root);
             k.fx_state = machine.clean_fx_template();
             k.exit_code = 0;
@@ -993,7 +993,7 @@ pub fn reserve_live_child<'a, A: crate::Arch>(
             k.tables_private = false;
             k.pending_event = None;
             k.pending_action = None;
-            k.time = machine.get_ticks();
+            k.time = machine.now() / 1_000_000;
             k.vcpu.regs = Regs::empty();
             k.fx_state = machine.clean_fx_template();
             k.exit_code = 0;

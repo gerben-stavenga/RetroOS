@@ -127,6 +127,9 @@ fn trampoline(
             if end > ceiling {
                 return false;
             }
+            if crate::kernel::bios_display::native_scratch().is_some_and(|scratch| {
+                start < scratch.end as u64 && end > scratch.start as u64
+            }) { return false; }
             let available = map
                 .iter()
                 .any(|m| m.typ == 1 && m.base <= start && m.base.saturating_add(m.length) >= end);

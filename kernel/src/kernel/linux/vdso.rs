@@ -8,14 +8,14 @@ const PAGE: usize = 4096;
 pub(super) fn install<A: crate::Arch>(machine: &mut A, floor: usize,
     occupied: &mut alloc::vec::Vec<(usize, usize)>) -> Option<usize>
 {
-    let (epoch, multiplier) = machine.user_tsc_clock()?;
+    let (epoch, multiplier) = crate::kernel::platform::user_tsc_clock()?;
     let base = super::file_mapping::allocate_below(
         super::elf::USER_STACK_TOP - 0x0100_0000, floor, PAGE, occupied)?;
-    machine.map_fresh_range(base / PAGE, 1);
+    crate::kernel::memory::fresh(machine, base / PAGE, 1);
     machine.copy_to(base, IMAGE);
     machine.write::<u64>(base + CLOCK_DATA, epoch);
     machine.write::<u64>(base + CLOCK_DATA + 8, multiplier);
-    machine.set_page_flags(base / PAGE, 1, false, true);
+    crate::kernel::memory::protect(machine, base / PAGE, 1, false, true);
     occupied.push((base, base + PAGE));
     Some(base)
 }

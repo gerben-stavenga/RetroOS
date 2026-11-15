@@ -1,24 +1,16 @@
-//! arch-abi — the backend-agnostic contract shared by the kernel and every
-//! `arch` backend (bare-metal x86 in `kernel/src/arch/`, and the software
-//! interpreter in `arch-interp/`).
+//! Shared architecture contract for native x86 and hosted backends.
 //!
-//! This crate holds only the *pure-data* types that cross the arch↔kernel
-//! boundary: the register/frame layout, the execution mode, the canonical
-//! `KernelEvent` a run produces, port-I/O sizes, the IRQ event, the raw page
-//! blob, and the guest-visible selector/size constants. It is `no_std`, has
-//! zero dependencies, and builds identically under both the Bazel freestanding
-//! toolchain (metal) and the host build (interp).
-//!
-//! Backend-internal types (`RootPageTable`, `KernelPages`, `FxState`, `Vcpu`,
-//! `GuestMem`) deliberately do NOT live here — each backend defines its own,
-//! because their representation (real page tables / FXSAVE vs a software
-//! address space) genuinely differs. Both backends are x86, so they share this
-//! one register ABI rather than inventing two.
+//! `Arch` owns execution and lifecycle and combines supporting traits. Register
+//! frames, events, mappings and other boundary values remain ordinary data.
+//! Backend-specific page-table and FPU representations are associated types.
 
 #![no_std]
 
 mod arch;
-pub use arch::{Arch, GuestBytes, Vcpu};
+pub use arch::{Arch, X86, Memory, Diagnostics, GuestBytes, Vcpu};
+pub mod page_entry;
+pub mod mapping;
+pub use mapping::{MappingError, MappingFailure, UserPage};
 
 /// Native interrupt entries for protected mode and long mode.
 #[repr(C)]
@@ -227,6 +219,8 @@ pub struct BootConfig {
     pub boot_modules: [Option<BootModule>; MAX_BOOT_MODULES],
     /// Metal's temporary physical-memory access. Hosted entries leave this empty.
     pub boot_physical_io: Option<BootPhysicalIo>,
+    /// Stable user TSC: epoch and 32.32 nanoseconds per cycle, matching now().
+    pub user_tsc_clock: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -247,6 +241,7 @@ impl BootConfig {
             mcp_port: None,
             boot_modules: [None; MAX_BOOT_MODULES],
             boot_physical_io: None,
+            user_tsc_clock: None,
         };
         // Default C: root = "home/retroos/".
         let d = *b"home/retroos/";
@@ -475,7 +470,7 @@ pub const FORCED_TF_SHADOW: u64 = 1 << 33;
 /// mode IRQ handler temporarily runs with strict interrupt semantics.
 pub const PVI_POLICY_SHADOW: u64 = 1 << 34;
 
-/// `Arch::map_phys_range` flag: map the range as an **emulated MMIO aperture** —
+/// Legacy physical-window flag: map the range as an **emulated MMIO aperture** —
 /// present=0 with the regular Cache-Disable (PCD) attribute the kernel already
 /// uses for device memory (NVMe BARs, AC'97/SB DMA map present+PCD). The
 /// present=0 + PCD pair is the *trapped* twin: a guest access faults to the
@@ -486,11 +481,11 @@ pub const PVI_POLICY_SHADOW: u64 = 1 << 34;
 /// meaning.
 pub const MAP_MMIO: u64 = 1 << 10;
 
-/// `Arch::map_phys_range` flag: disable caching for a present physical-device
+/// Legacy physical-window flag: disable caching for a present physical-device
 /// mapping. This is the safe baseline for BARs and linear framebuffers.
 pub const MAP_PHYS_CACHE_DISABLE: u64 = 1 << 4;
 
-/// `Arch::map_phys_range` flag: the mapped physical frames are externally
+/// Legacy physical-window flag: the mapped physical frames are externally
 /// owned and must not be returned to RetroOS's page allocator on unmap,
 /// address-space teardown, or replacement.
 pub const MAP_PHYS_FOREIGN: u64 = 1 << 11;
@@ -1068,7 +1063,7 @@ pub enum Irq {
     /// An unmasked hardware IRQ line. IRQ0 is the kernel clock-resample
     /// wakeup; other lines are forwarded to their device owner.
     Hw(u8),
-    /// A message-signalled interrupt allocated by [`Arch::msi_alloc`].
+    /// A message-signalled interrupt identified by its platform-configured source.
     ///
     /// This is deliberately distinct from [`Irq::Hw`]: an MSI source is a
     /// kernel-owned vector identity, not an ISA IRQ/GSI line. Conflating the
@@ -1081,6 +1076,8 @@ pub enum Irq {
 /// Callbacks run in task context, except reclaim, which may run on allocation.
 #[derive(Clone, Copy)]
 pub struct FrameAccess {
+    /// Retain a live allocator frame while rearranging mapping references.
+    pub retain: fn(u64) -> bool,
     pub allocate: fn() -> Option<u64>,
     pub release: fn(u64),
     pub read: fn(u64, usize, &mut [u8]),

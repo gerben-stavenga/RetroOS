@@ -363,6 +363,30 @@ unsafe fn prepare_boot(
     assert!(info.flags & (1 << 6) != 0, "No Multiboot memory map");
     let mmap_entries: &[MultibootMmapEntry] = &mmap_buf[..mmap_count];
 
+    // Reserve a 128 KiB real-mode call area in actual conventional RAM.
+    // BDA/EBDA further restrict E820: firmware may reserve its runtime data
+    // there even when a loader's memory map describes a larger usable range.
+    let conventional_end = unsafe {
+        ((paging2::LOW_MEM_BASE + 0x413) as *const u16).read_unaligned()
+    } as usize * 1024;
+    let ebda = unsafe {
+        ((paging2::LOW_MEM_BASE + 0x40e) as *const u16).read_unaligned()
+    } as usize * 16;
+    let scratch = crate::kernel::bios_display::choose_native_scratch(
+        conventional_end, ebda, |start, end| {
+            let available = mmap_entries.iter().any(|m| m.typ == 1
+                && m.base <= start as u64 && m.base.saturating_add(m.length) >= end as u64);
+            let reserved = mmap_entries.iter().any(|m| m.typ != 1
+                && m.base < end as u64 && m.base.saturating_add(m.length) > start as u64);
+            let mut module = false;
+            crate::multiboot::reserve_modules(&boot_modules_raw, |lo, hi| {
+                module |= lo < (end / 4096) as u64 && hi > (start / 4096) as u64;
+            });
+            available && !reserved && !module
+        },
+    );
+    crate::kernel::bios_display::set_native_scratch(scratch);
+
     phys_mm::init_phys_mm(
         mmap_entries.iter().map(|entry| phys_mm::MemoryRegion {
             base: entry.base, length: entry.length, usable: entry.typ == 1,
@@ -376,7 +400,7 @@ unsafe fn prepare_boot(
         phys_mm::mark_reserved(start, end)
     });
     install_physical_memory();
-    paging2::set_vga_text_aperture(phys_mm::alloc_contig(8).expect("no VGA backing pages"));
+    crate::kernel::memory::set_text_frame(phys_mm::alloc_contig(8).expect("no VGA backing pages"));
     lib::compact_println!(
         "ISA DMA: reserved buffer pages ch1={:#x} ch5={:#x}",
         phys_mm::dma_channel_buf(1), phys_mm::dma_channel_buf(5),
@@ -450,12 +474,12 @@ unsafe fn prepare_boot(
     use crate::kernel::drivers::xhci;
     irq::init_interrupts(hpet_base, |stage| {
         lib::compact_screenln!(screen, "Boot: IRQ {}", stage);
-    }, xhci::poll_deadline);
+    }, crate::kernel::irq_dispatch::post);
     lib::compact_screenln!(screen, "Boot: USB controller initialization");
     xhci::init(xhci::Platform {
         inl: crate::kernel::portio::inl,
         outl: crate::kernel::portio::outl,
-        map_uncached: |vpage, page| paging2::map_user_page_phys(
+        map_uncached: |vpage, page| paging2::map_kernel_page(
             vpage, page, paging2::flags::CACHE_DISABLE),
         allocate_dma: phys_mm::alloc_contig,
         allocate_permanent: |layout| arch::boot_mem::allocate_permanent(layout).map_err(|_| ()),
@@ -463,6 +487,7 @@ unsafe fn prepare_boot(
         push_key: irq::push_key,
         push_mouse: irq::push_mouse,
     });
+    crate::kernel::pci::init_msi_targets((0..irq::MSI_SOURCE_COUNT).map(irq::msi_target));
     lib::compact_screenln!(screen, "Interrupts initialized");
 
     // The compat-mode switch was a test harness to force the experimental
@@ -498,6 +523,7 @@ unsafe fn prepare_boot(
     // Complete the boot configuration with loader-owned module data now that
     // the later handoff has produced it.
     config.boot_modules = boot_modules;
+    config.user_tsc_clock = irq::user_tsc_clock();
     if config.boot_modules.iter().any(Option::is_some) {
         config.boot_physical_io = Some(arch_abi::BootPhysicalIo {
             read: arch::aperture::copy_from_physical,

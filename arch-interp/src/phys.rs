@@ -129,7 +129,7 @@ pub fn alloc_frames(count: usize) -> u64 {
 /// interp creates is the A20-wrap (HMA pages aliased onto low memory), but the
 /// model is general. A frame absent here has an implicit refcount of 1; a frame
 /// present here is shared and is reclaimed only when its last extra reference is
-/// released. Mirrors metal's `phys_mm` shared-frame count so `copy_page_entries`
+/// released. Mirrors metal's `phys_mm` shared-frame count so mapping aliases
 /// can alias instead of snapshot.
 fn shared() -> &'static Mutex<HashMap<u64, u32>> {
     static S: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
@@ -257,7 +257,7 @@ fn write_owned(page: u64, offset: usize, bytes: &[u8]) {
 }
 fn references_owned(page: u64) -> usize { shared().lock().unwrap().get(&page).copied().unwrap_or(1) as usize }
 pub(crate) fn frame_access() -> arch_abi::FrameAccess {
-    arch_abi::FrameAccess { allocate: allocate_owned, release: release_owned,
+    arch_abi::FrameAccess { retain: |frame| { inc_ref(frame); true }, allocate: allocate_owned, release: release_owned,
         read: read_owned, write: write_owned, free: free_page_count,
         total: || PHYS_SIZE / PAGE, references: references_owned, set_reclaim }
 }

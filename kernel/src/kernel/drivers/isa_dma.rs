@@ -57,9 +57,9 @@ impl Binding {
         // Shared aliases leave the permanent channel frames out of COW and
         // teardown. This is software DMA: normal coherent RAM avoids turning
         // sound-buffer setup and neighbouring guest accesses into UC traffic.
-        machine.unmap_range(vpage, pages);
+        crate::kernel::memory::reset(machine, vpage, pages);
         unsafe {
-            machine.map_shared_pages(vpage, base, pages);
+            crate::kernel::memory::map_shared_pages(machine, vpage, base, pages);
         }
         machine.copy_to(vpage * 4096, &saved);
         Some(Self { buffer, channel, guest, bytes, offset, vpage, pages })
@@ -71,7 +71,7 @@ impl Binding {
     pub(crate) fn unbind<A: Arch>(self, machine: &mut A) {
         let mut saved = alloc::vec![0; self.pages * 4096];
         machine.copy_from(self.vpage * 4096, &mut saved);
-        machine.map_fresh_range(self.vpage, self.pages);
+        crate::kernel::memory::fresh(machine, self.vpage, self.pages);
         machine.copy_to(self.vpage * 4096, &saved);
     }
 }

@@ -17,13 +17,13 @@ use arch_abi::{GuestBytes, Regs};
 /// old "VA is a contiguous host pointer" model: under real paging the frames a
 /// VA range lands on are scattered, so every guest access is page-split here.
 #[inline]
-fn for_chunks(addr: usize, len: usize, mut on_chunk: impl FnMut(*mut u8, usize, usize)) {
+fn for_chunks(addr: usize, len: usize, write: bool, mut on_chunk: impl FnMut(*mut u8, usize, usize)) {
     let mut off = 0;
     while off < len {
         let a = addr + off;
         let page_off = a & 0xFFF;
         let chunk = core::cmp::min(len - off, 4096 - page_off);
-        let host = paging::space_resolve(a as u32);
+        let host = if write { paging::space_resolve_write(a as u32) } else { paging::space_resolve(a as u32) };
         on_chunk(host, off, chunk);
         off += chunk;
     }
@@ -51,7 +51,7 @@ impl GuestBytes for crate::backend::Interp {
         let size = core::mem::size_of::<T>();
         let mut v = core::mem::MaybeUninit::<T>::uninit();
         let dst = v.as_mut_ptr() as *mut u8;
-        for_chunks(addr, size, |host, off, n| unsafe {
+        for_chunks(addr, size, false, |host, off, n| unsafe {
             for i in 0..n { dst.add(off + i).write((host as *const u8).add(i).read_volatile()); }
         });
         unsafe { v.assume_init() }
@@ -59,18 +59,18 @@ impl GuestBytes for crate::backend::Interp {
     fn write<T: Copy>(&mut self, addr: usize, val: T) {
         let size = core::mem::size_of::<T>();
         let src = &val as *const T as *const u8;
-        for_chunks(addr, size, |host, off, n| unsafe {
+        for_chunks(addr, size, true, |host, off, n| unsafe {
             for i in 0..n { host.add(i).write_volatile(src.add(off + i).read()); }
         });
         crate::engine::invalidate_code_range(addr as u32, size as u32);
     }
     fn copy_from(&self, addr: usize, dst: &mut [u8]) {
-        for_chunks(addr, dst.len(), |host, off, n| unsafe {
+        for_chunks(addr, dst.len(), false, |host, off, n| unsafe {
             for i in 0..n { dst[off + i] = (host as *const u8).add(i).read_volatile(); }
         });
     }
     fn copy_to(&mut self, addr: usize, src: &[u8]) {
-        for_chunks(addr, src.len(), |host, off, n| unsafe {
+        for_chunks(addr, src.len(), true, |host, off, n| unsafe {
             for i in 0..n { host.add(i).write_volatile(src[off + i]); }
         });
         crate::engine::invalidate_code_range(addr as u32, src.len() as u32);
@@ -86,7 +86,7 @@ impl GuestBytes for crate::backend::Interp {
         n
     }
     fn zero(&mut self, addr: usize, len: usize) {
-        for_chunks(addr, len, |host, _off, n| unsafe {
+        for_chunks(addr, len, true, |host, _off, n| unsafe {
             core::ptr::write_bytes(host, 0, n);
         });
         crate::engine::invalidate_code_range(addr as u32, len as u32);
@@ -98,12 +98,12 @@ impl GuestBytes for crate::backend::Interp {
         if dst > src {
             for i in (0..len).rev() {
                 let b = unsafe { (paging::space_resolve((src + i) as u32) as *const u8).read_volatile() };
-                unsafe { paging::space_resolve((dst + i) as u32).write_volatile(b); }
+                unsafe { paging::space_resolve_write((dst + i) as u32).write_volatile(b); }
             }
         } else {
             for i in 0..len {
                 let b = unsafe { (paging::space_resolve((src + i) as u32) as *const u8).read_volatile() };
-                unsafe { paging::space_resolve((dst + i) as u32).write_volatile(b); }
+                unsafe { paging::space_resolve_write((dst + i) as u32).write_volatile(b); }
             }
         }
         crate::engine::invalidate_code_range(dst as u32, len as u32);

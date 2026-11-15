@@ -1,6 +1,5 @@
 //! Programmable Interrupt Controller (8259 PIC) and IRQ handling
 
-use lib::pipe::Pipe;
 use crate::x86::{inb, outb};
 use arch_abi::Regs;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -31,11 +30,11 @@ pub use arch_abi::Irq;
 pub const MSI_VECTOR_BASE: u8 = 0xF8;
 pub const MSI_SOURCE_COUNT: u8 = 8;
 
-/// CPU-local queue for discrete events (keyboard and device IRQs).
-/// Entries retain their arrival timestamp; timer alarms never enter the queue.
-/// Hashing and entropy estimation happen later in the kernel event loop.
+/// Device-owned input sink installed during boot. Arch retains no input data.
 #[thread_local]
-static mut QUEUE: Pipe<(Irq, u64), 256> = Pipe::new((Irq::Hw(0), 0));
+static mut INPUT_SINK: fn(Irq, u64) = |_, _| {};
+
+fn post(event: Irq, timestamp: u64) { unsafe { INPUT_SINK(event, timestamp); } }
 #[thread_local]
 static IRQ0_HANDLED: AtomicU32 = AtomicU32::new(0);
 const PIT_INPUT_HZ: u64 = 1_193_182;
@@ -78,36 +77,6 @@ static mut CLOCK: Clock = Clock {
 static mut MOUSE_PACKET: [u8; 3] = [0; 3];
 static mut MOUSE_PACKET_IDX: u8 = 0;
 
-/// Drain all queued IRQ events, calling f for each.
-pub fn drain(mut f: impl FnMut(Irq, u64)) {
-    // The ring-0 interrupt top half writes QUEUE while the ring-1 kernel drains
-    // it. Move into a local under a short interrupt mask, then restore IF before
-    // invoking arbitrary kernel callbacks. Keep the scratch uninitialized:
-    // this path runs after every guest exit, while the queue is almost always
-    // empty. Initializing 256 fake entries per exit made a polling guest
-    // write gigabytes of dead stack traffic per second.
-    let mut events = [core::mem::MaybeUninit::<(Irq, u64)>::uninit(); 256];
-    let restore_if = crate::x86::interrupts_enabled();
-    crate::x86::cli();
-    let q = &raw mut QUEUE;
-    let mut n = 0;
-    unsafe {
-        while n < events.len() {
-            let Some(event) = (*q).pop() else { break };
-            events[n].write(event);
-            n += 1;
-        }
-    }
-    if restore_if {
-        crate::x86::sti();
-    }
-    for event in &events[..n] {
-        // Every element below `n` was initialized by the pop loop above.
-        let (irq, timestamp_ns) = unsafe { event.assume_init_read() };
-        f(irq, timestamp_ns);
-    }
-}
-
 /// Snapshot the master PIC without leaving its OCW3 selector in IRR mode.
 /// The short IF mask keeps the ISR/IRR/IMR readings in one interrupt epoch.
 fn master_pic_state() -> (u8, u8, u8) {
@@ -128,16 +97,14 @@ fn master_pic_state() -> (u8, u8, u8) {
 /// controller cannot recover when the USB report originally arrived. This is
 /// the same sink as i8042 IRQ1, so the kernel sees one uniform key stream.
 pub fn push_key(sc: u8) {
-    let q = &raw mut QUEUE;
-    unsafe { (*q).push((Irq::Key(sc), now(false))); }
+    { post(Irq::Key(sc), now(false)); }
 }
 
 /// Push one already-decoded pointing-device report. USB HID and i8042 use the
 /// same canonical event, so focus routing and the DOS INT 33h implementation do
 /// not depend on which physical bus supplied the mouse.
 pub fn push_mouse(dx: i16, dy: i16, buttons: u8) {
-    let q = &raw mut QUEUE;
-    unsafe { (*q).push((Irq::Mouse { dx, dy, buttons }, now(false))); }
+    { post(Irq::Mouse { dx, dy, buttons }, now(false)); }
 }
 
 // ============================================================================
@@ -283,7 +250,7 @@ fn lapic_read(off: u32) -> u32 {
 }
 
 fn map_mmio_page(va: usize, phys: u64) {
-    crate::paging2::map_user_page_phys(
+    crate::paging2::map_kernel_page(
         va / crate::paging2::PAGE_SIZE,
         phys / crate::paging2::PAGE_SIZE as u64,
         crate::paging2::flags::CACHE_DISABLE,
@@ -621,10 +588,6 @@ fn legacy_intr_and_pit() {
 const IOAPIC_PHYS: u64 = 0xFEC0_0000;
 const IOAPIC_MMIO_VA: usize = 0xFFF0_2000; // next page after LAPIC (F0000)/HPET (F1000)
 static mut IOAPIC_READY: bool = false;
-/// GSI lines configured as level-triggered PCI INTx. Their redirection entries
-/// are masked in the top half until the kernel driver clears the device source.
-static mut IOAPIC_LEVEL_LINES: u32 = 0;
-
 /// Indirect register access: select the register via IOREGSEL (+0x00), then
 /// read/write its value through IOWIN (+0x10).
 fn ioapic_write(reg: u32, val: u32) {
@@ -634,22 +597,18 @@ fn ioapic_write(reg: u32, val: u32) {
     }
 }
 
-fn ioapic_read(reg: u32) -> u32 {
-    unsafe {
-        core::ptr::write_volatile(IOAPIC_MMIO_VA as *mut u32, reg);
-        core::ptr::read_volatile((IOAPIC_MMIO_VA + 0x10) as *const u32)
-    }
-}
-
-fn ioapic_mask(gsi: u8, masked: bool) {
+/// Change only the mask on an established ISA route. Protect the indirect
+/// register selection from interrupts on this CPU, as in `ioapic_route`.
+fn ioapic_set_mask(irq: u8, masked: bool) {
     let restore_if = crate::x86::interrupts_enabled();
     crate::x86::cli();
-    let idx = 0x10 + 2 * gsi as u32;
-    let low = ioapic_read(idx);
-    ioapic_write(
-        idx,
-        if masked { low | (1 << 16) } else { low & !(1 << 16) },
-    );
+    let reg = 0x10 + 2 * u32::from(irq);
+    unsafe {
+        core::ptr::write_volatile(IOAPIC_MMIO_VA as *mut u32, reg);
+        let entry = core::ptr::read_volatile((IOAPIC_MMIO_VA + 0x10) as *const u32);
+        let entry = if masked { entry | (1 << 16) } else { entry & !(1 << 16) };
+        ioapic_write(reg, entry);
+    }
     if restore_if {
         crate::x86::sti();
     }
@@ -672,7 +631,7 @@ fn bsp_apic_id() -> u32 {
 /// destination, edge-triggered, active-high, unmasked. ISA IRQs map 1:1 to GSIs
 /// for the keyboard (1) and mouse (12); the timer (often overridden to GSI2) is
 /// not routed here — the LAPIC timer owns alarm delivery.
-fn ioapic_route(gsi: u8, vector: u8, level_low: bool) {
+fn ioapic_route(gsi: u8, vector: u8) {
     let restore_if = crate::x86::interrupts_enabled();
     crate::x86::cli();
     unsafe {
@@ -684,10 +643,8 @@ fn ioapic_route(gsi: u8, vector: u8, level_low: bool) {
     let idx = 0x10 + 2 * gsi as u32;
     // High dword: destination APIC ID in bits 56-63 (bits 24-31 of this word).
     ioapic_write(idx + 1, bsp_apic_id() << 24);
-    // Low dword: vector, fixed/physical delivery, unmasked. PCI INTx uses
-    // polarity-low (bit13) + level-triggered (bit15); ISA uses edge/high.
-    let electrical = if level_low { (1 << 13) | (1 << 15) } else { 0 };
-    ioapic_write(idx, vector as u32 | electrical);
+    // Fixed delivery, active-high, edge-triggered and unmasked.
+    ioapic_write(idx, vector as u32);
     if restore_if {
         crate::x86::sti();
     }
@@ -705,11 +662,10 @@ fn i8042_present() -> bool {
 pub fn init_interrupts(
     hpet_base: Option<u64>,
     mut progress: impl FnMut(&str),
-    poll_devices: fn(u64) -> Option<u64>,
+    input_sink: fn(Irq, u64),
 ) {
-    // Published during single-CPU boot before interrupts are enabled. Only the
-    // boot CPU runs this polling path; device state retains its existing owner.
-    unsafe { DEVICE_POLL = Some(poll_devices); }
+    // Installed before enabling BSP device interrupts.
+    unsafe { INPUT_SINK = input_sink; }
     progress("PIC setup");
     lib::compact_println!("IRQ: PIC");
     remap_pic();
@@ -768,7 +724,7 @@ pub fn init_interrupts(
         let _ = inb(0x60);
     }
     if apic {
-        ioapic_route(1, IRQ_OFFSET + 1, false); // keyboard GSI1
+        ioapic_route(1, IRQ_OFFSET + 1); // keyboard GSI1
     } else {
         unmask_irq(1);
     }
@@ -777,11 +733,11 @@ pub fn init_interrupts(
     if init_mouse() {
         lib::compact_println!("IRQ: mouse ready");
         // Only the mouse's own line. A device's interrupt is enabled by
-        // whoever probed that device (`route_isa_irq`), never as a side
+        // whoever probed that device (`isa_enable_irq`), never as a side
         // effect of an unrelated probe — the SB lines used to be unmasked
         // here on the theory that a PS/2 mouse implies a legacy ISA machine.
         if apic {
-            ioapic_route(12, IRQ_OFFSET + 12, false); // mouse GSI12
+            ioapic_route(12, IRQ_OFFSET + 12); // mouse GSI12
         } else {
             unmask_irq(12);
         }
@@ -1000,10 +956,7 @@ pub fn handle_irq(regs: &mut Regs) {
     let vector = regs.int_num as u8;
     if vector >= MSI_VECTOR_BASE {
         let source = vector - MSI_VECTOR_BASE;
-        unsafe {
-            let q = &raw mut QUEUE;
-            (*q).push((Irq::Msi(source), timestamp_ns));
-        }
+        { post(Irq::Msi(source), timestamp_ns); }
         // MSI is LAPIC-delivered and edge-triggered.
         lapic_write(LAPIC_EOI, 0);
         return;
@@ -1011,7 +964,6 @@ pub fn handle_irq(regs: &mut Regs) {
     let irq = vector - IRQ_OFFSET;
     if irq == 0 {
         IRQ0_HANDLED.fetch_add(1, Ordering::Relaxed);
-        unsafe { ALARM_FIRED = true; }
         // Before the event loop owns alarms, only a wrapping clock needs
         // another interrupt. The initial delivery-test alarm otherwise ends.
         if !unsafe { ALARM_MODE } && let Some(interval) = clock_maintenance_interval() {
@@ -1027,29 +979,24 @@ pub fn handle_irq(regs: &mut Regs) {
 
     // APIC mode: alarms use the LAPIC timer (vector 0x20 from the local APIC)
     // and keyboard/mouse arrive through the I/O APIC — the 8259 is bypassed
-    // entirely. Read the device inline and ack with a single LAPIC EOI; none of
-    // the PIC mask/ack dance below applies. (`lapic_timer_active()` is the
+    // entirely. Deferred device IRQs stay masked until their consumer calls
+    // `isa_unmask_irq`, just as on the 8259 path. (`lapic_timer_active()` is the
     // APIC-mode flag: it is set iff setup_lapic_timer succeeded.)
     if lapic_timer_active() {
-        let level_line = irq < 32
-            && unsafe { core::ptr::read_volatile(&raw const IOAPIC_LEVEL_LINES) }
-                & (1u32 << irq) != 0;
-        if level_line {
-            // Prevent a level source from immediately retriggering after EOI;
-            // the deferred kernel driver clears it, then `rearm_irq` unmasks.
-            ioapic_mask(irq, true);
-        }
-        match irq {
-            0 => {}, // pure wakeup; the execution trap returns to the kernel
-            1 => unsafe { let q = &raw mut QUEUE; (*q).push((Irq::Key(inb(0x60)), timestamp_ns)); },
-            12 => {
-                if let Some(e) = mouse_packet_byte(inb(0x60)) {
-                    unsafe { let q = &raw mut QUEUE; (*q).push((e, timestamp_ns)); }
-                }
-            }
-            _ => unsafe { let q = &raw mut QUEUE; (*q).push((Irq::Hw(irq), timestamp_ns)); },
+        if !matches!(irq, 0 | 1 | 12) {
+            ioapic_set_mask(irq, true);
         }
         lapic_write(LAPIC_EOI, 0);
+        match irq {
+            0 => {}, // pure wakeup; the execution trap returns to the kernel
+            1 => { post(Irq::Key(inb(0x60)), timestamp_ns); },
+            12 => {
+                if let Some(e) = mouse_packet_byte(inb(0x60)) {
+                    { post(e, timestamp_ns); }
+                }
+            }
+            _ => { post(Irq::Hw(irq), timestamp_ns); },
+        }
         return;
     }
 
@@ -1085,8 +1032,7 @@ pub fn handle_irq(regs: &mut Regs) {
     };
 
     if let Some(e) = event {
-        let q = &raw mut QUEUE;
-        unsafe { (*q).push((e, timestamp_ns)); }
+        { post(e, timestamp_ns); }
     }
 
     // Re-unmask only lines whose device was acked inline above. Generic
@@ -1098,20 +1044,16 @@ pub fn handle_irq(regs: &mut Regs) {
     }
 }
 
-/// Re-arm an IRQ line previously left masked by `handle_irq` (a deferred-
-/// ack `Irq::Hw` line). Called from the kernel once the guest has acked
-/// the device so the next interrupt can be delivered.
-pub fn rearm_irq(irq: u8) {
+/// Unmask an ISA IRQ previously left masked by `handle_irq`. The device
+/// consumer calls this after servicing the interrupt; for passed-through SB,
+/// that completion is the guest's virtual PIC EOI. Physical EOI was sent
+/// immediately by `handle_irq` on either controller.
+pub fn isa_unmask_irq(irq: u8) {
     if lapic_timer_active() {
-        if irq < 32
-            && unsafe { core::ptr::read_volatile(&raw const IOAPIC_LEVEL_LINES) }
-                & (1u32 << irq) != 0
-        {
-            ioapic_mask(irq, false);
-        }
-        return;
+        ioapic_set_mask(irq, false);
+    } else {
+        unmask_irq(irq);
     }
-    unmask_irq(irq);
 }
 
 /// Build an MSI `(message_address, message_data)` that delivers `source` as a
@@ -1133,35 +1075,10 @@ pub fn msi_target(source: u8) -> Option<(u64, u32)> {
     Some((addr, data))
 }
 
-/// Route and unmask a PCI INTx line. INTx is level-triggered, active-low at the
-/// I/O APIC. The top half masks it before EOI; the deferred driver clears the
-/// device source and calls `rearm_irq` to unmask it.
-pub fn route_device_irq(line: u8) {
-    if lapic_timer_active() {
-        ioapic_route(line, IRQ_OFFSET + line, true);
-        if line < 32 {
-            unsafe {
-                let p = &raw mut IOAPIC_LEVEL_LINES;
-                core::ptr::write_volatile(p, core::ptr::read_volatile(p) | (1u32 << line));
-            }
-        }
-    } else {
-        // PCI-to-ISA bridges present INTx to the 8259 as a level-triggered IRQ.
-        // Program the Edge/Level Control Register before unmasking it.
-        let (elcr, bit) = if line < 8 {
-            (0x4D0, line)
-        } else {
-            (0x4D1, line - 8)
-        };
-        outb(elcr, inb(elcr) | (1 << bit));
-        unmask_irq(line);
-    }
-}
-
 /// Route and unmask an ISA edge-triggered, active-high line.
-pub fn route_isa_irq(line: u8) {
+pub fn isa_enable_irq(line: u8) {
     if lapic_timer_active() {
-        ioapic_route(line, IRQ_OFFSET + line, false);
+        ioapic_route(line, IRQ_OFFSET + line);
     } else {
         unmask_irq(line);
     }
@@ -1298,28 +1215,18 @@ static mut LAPIC_HZ: u64 = 0;
 static mut TSC_DEADLINE: bool = false;
 #[thread_local]
 static mut ALARM_MODE: bool = false;
-#[thread_local]
-static mut ALARM_DEADLINE: Option<u64> = None;
-#[thread_local]
-static mut ALARM_FIRED: bool = false;
 const IA32_TSC_DEADLINE: u32 = 0x6e0;
-
-pub fn wake_pending() -> bool {
-    let queue = &raw const QUEUE;
-    unsafe { ALARM_MODE && !FIRMWARE_LOAN && (ALARM_FIRED || !(*queue).is_empty()
-        || ALARM_DEADLINE.is_some_and(|end| now(false) >= end)) }
-}
 
 #[inline(never)]
 pub fn arm_alarm(deadline: Option<u64>) {
-    // Do not restart an unchanged countdown on every guest I/O exit.
-    unsafe {
-        if ALARM_MODE && ALARM_DEADLINE == deadline && !ALARM_FIRED { return; }
-        ALARM_MODE = true;
-        ALARM_DEADLINE = deadline;
-        ALARM_FIRED = false;
-    }
+    unsafe { ALARM_MODE = true; }
     let current = now(false);
+    // Clock wrap maintenance stays internal to the clock driver.
+    let deadline = match (deadline, clock_maintenance_interval()) {
+        (Some(end), Some(interval)) => Some(end.min(current.saturating_add(interval))),
+        (None, Some(interval)) => Some(current.saturating_add(interval)),
+        (deadline, None) => deadline,
+    };
     if lapic_timer_active() {
         if unsafe { TSC_DEADLINE } {
             lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | (2 << 17));
@@ -1352,33 +1259,12 @@ pub fn arm_alarm(deadline: Option<u64>) {
     }
 }
 
-pub fn idle() {
-    // INT 80 entered with IF clear. STI's interrupt shadow makes check/wait
-    // atomic: a pending interrupt is delivered at HLT instead of being lost.
-    if !wake_pending() {
-        unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)); }
-    }
-}
-
-static mut DEVICE_POLL: Option<fn(u64) -> Option<u64>> = None;
-
-#[inline(never)]
-pub fn poll_timed_devices(current: u64) -> Option<u64> {
-    let mut next = unsafe { DEVICE_POLL }.and_then(|poll| poll(current));
-    // Every iteration samples now(), extending the wrapping clock. When the
-    // CPU becomes idle it still needs an alarm before an ambiguous wrap.
-    let maintenance = clock_maintenance_interval();
-    if let Some(interval) = maintenance {
-        let end = current.saturating_add(interval);
-        next = Some(next.map_or(end, |old| old.min(end)));
-    }
-    next
-}
-
-#[thread_local]
-static mut FIRMWARE_LOAN: bool = false;
-pub(crate) fn firmware_loan(value: bool) -> bool {
-    unsafe { let previous = FIRMWARE_LOAN; FIRMWARE_LOAN = value; previous }
+pub fn idle(max_ns: u64) {
+    if max_ns == 0 { return; }
+    arm_alarm(Some(now(false).saturating_add(max_ns)));
+    // INT 80 entered with IF clear; STI/HLT accepts an IRQ atomically.
+    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)); }
+    arm_alarm(None);
 }
 
 fn clock_maintenance_interval() -> Option<u64> {

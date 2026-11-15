@@ -168,9 +168,9 @@ fn execute<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32
         let requested = machine.read::<u32>(out as usize);
         let base = memory::call(machine,state,Api::MemoryReserve,requested,length,0);
         if base == 0 {return Err(0xc0000018);}
-        unsafe {machine.map_shared_pages(base as usize/4096,NonNull::new((backing.address+a as usize) as *mut u8).unwrap(),length as usize/4096);}
+        unsafe {crate::kernel::memory::map_shared_pages(machine, base as usize/4096,NonNull::new((backing.address+a as usize) as *mut u8).unwrap(),length as usize/4096);}
         let permissions = (c == 4) as u32;
-        machine.set_page_flags(base as usize/4096,length as usize/4096,c == 4,false);
+        crate::kernel::memory::protect(machine, base as usize/4096,length as usize/4096,c == 4,false);
         memory::adopt_shared(state,base,permissions);
         state.threads.named.views.push((base,object.clone()));
         machine.write::<u32>(out as usize,base);machine.write::<u32>(out as usize+4,length);return Ok(0);

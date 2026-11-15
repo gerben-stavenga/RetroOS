@@ -195,7 +195,7 @@ fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) ->
                 let base = s.heap_next;
                 s.heap_next += 0x10000;
                 m.zero(base as usize, 0x10000);
-                m.set_page_flags(base as usize / 4096, 16, true, false);
+                crate::kernel::memory::protect(m, base as usize / 4096, 16, true, false);
                 s.video.buffer = base;
                 s.video.selector = push_descriptor(&mut s.ldt, base, 65536, false, false);
                 s.on_resume(m);
@@ -932,7 +932,7 @@ pub(super) fn dispatch<A: crate::Arch>(
             }
             // Module pages are committed by the loader. Changing protection
             // or recommitting an existing allocation preserves its contents.
-            m.set_page_flags(
+            crate::kernel::memory::protect(m,
                 address as usize / 4096,
                 (address as usize % 4096 + size as usize).div_ceil(4096),
                 flags & 2 != 0,

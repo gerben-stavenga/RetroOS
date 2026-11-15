@@ -20,7 +20,7 @@ vs `std` are incompatible targets. The contract maps as:
 | software `INT n` → Syscall/SoftInt | IDT vector → ring-1 handler | `add_intr_hook` |
 | `IN`/`OUT` → Port event | I/O-bitmap trap | `add_insn_out`/`in_hook` |
 | page fault → demand-page / COW | `#PF` handler | `add_mem_hook(MEM_UNMAPPED)` → map + retry |
-| timer/HW IRQ | real PIC/PIT/APIC trap | slice boundary (instruction-counted ⇒ deterministic) |
+| timer/HW IRQ | real PIC/PIT/APIC trap | host interruption or execution time limit |
 | `arch::calls::*` (switch_to, fork, map…) | `int 0x80` stubs | direct functions over software page tables |
 
 ## Status

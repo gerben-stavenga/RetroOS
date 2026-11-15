@@ -39,41 +39,6 @@ pub fn active_id() -> u32 {
     paging::active_id()
 }
 
-/// Replace `count` pages at `vpage` with fresh zeroed RW frames.
-pub fn map_fresh(vpage: usize, count: usize) {
-    paging::space_map_fresh(vpage, count);
-}
-
-/// Set writability over a range of present pages.
-pub fn set_flags(vpage: usize, count: usize, writable: bool) {
-    paging::space_set_writable(vpage, count, writable);
-}
-
-/// Clear entries to absent (next access demand-faults).
-pub fn unmap(vpage: usize, count: usize) {
-    paging::space_unmap(vpage, count);
-}
-
-/// Copy page-table entries src→dst (fresh-frame content copy).
-pub fn copy_entries(src: usize, dst: usize, count: usize) {
-    paging::space_copy_entries(src, dst, count);
-}
-
-/// Swap page-table entries a↔b (PTE swap).
-pub fn swap_entries(a: usize, b: usize, count: usize) {
-    paging::space_swap_entries(a, b, count);
-}
-
-/// Alias `count` guest pages at `vpage` onto physical frames at `ppage`.
-pub fn map_phys(vpage: usize, count: usize, ppage: u64) {
-    paging::space_map_phys(vpage, count, ppage, true);
-}
-
-/// Map the first 1 MB user-accessible (VM86/DOS low memory).
-pub fn map_low_mem() {
-    paging::space_map_low_mem();
-}
-
 /// Free every user page in the active space (arch CLEAN).
 pub fn clean() {
     paging::space_clean();

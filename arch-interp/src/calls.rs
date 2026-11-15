@@ -9,41 +9,26 @@
 #![allow(unused_variables)]
 
 use crate::space::RootPageTable;
-use arch_abi::KernelEvent;
 
 /// Arch call numbers — kept identical to the metal backend (`traps::arch_call`)
 /// for surface parity. The interpreter dispatches by calling the functions
 /// below directly, so these are not used as a wire protocol here.
 pub mod arch_call {
     pub const EXECUTE: u64 = 0x100;
-    pub const SWITCH_TO: u64 = 0x101;
+    pub const ACTIVATE: u64 = 0x101;
     pub const FORK: u64 = 0x105;
     pub const CLEAN: u64 = 0x106;
-    pub const SET_PAGE_FLAGS: u64 = 0x108;
-    pub const MAP_LOW_MEM: u64 = 0x109;
-    pub const COPY_PAGE_ENTRIES: u64 = 0x10C;
-    pub const SWAP_PAGE_ENTRIES: u64 = 0x10E;
-    pub const UNMAP_RANGE: u64 = 0x10F;
     pub const LOAD_LDT: u64 = 0x115;
-    pub const MAP_PHYS_RANGE: u64 = 0x116;
+    pub const MAP_KERNEL_PHYSICAL: u64 = 0x116;
     pub const SET_TLS_ENTRY: u64 = 0x117;
     #[allow(dead_code)]
     pub const HASH_PHYS_PAGE: u64 = 0x118;
     pub const SET_DEBUG_WATCH: u64 = 0x119;
     pub const ALLOC_PHYS_CONTIG: u64 = 0x11A;
     pub const FREE_PHYS_CONTIG: u64 = 0x11B;
-    pub const REARM_IRQ: u64 = 0x11C;
+    pub const ISA_UNMASK_IRQ: u64 = 0x11C;
     pub const DMA_CHANNEL_BUF: u64 = 0x11D;
-    pub const MAP_FRESH_RANGE: u64 = 0x11E;
-    pub const REDIRECT_PHYSICAL_ALIASES: u64 = 0x120;
 }
-
-/// Resume the current Vcpu on the software core and return the next event.
-/// Runs `emu_start` in instruction-counted slices; hooks surface the event.
-pub fn do_arch_execute() -> KernelEvent {
-    crate::engine::execute()
-}
-
 
 /// Fork the current address space into `child_root`. M4 will make this COW;
 /// for now it is a full copy (correct, just not lazy).
@@ -63,78 +48,9 @@ pub fn arch_free_user_pages() {
     arch_user_clean();
 }
 
-/// Set page permissions (bit0=W, bit1=X) over a range.
-pub fn arch_set_page_flags(start_vpage: usize, count: usize, writable: bool, _executable: bool) {
-    crate::mmu::set_flags(start_vpage, count, writable);
-    crate::engine::invalidate_pages(start_vpage, count);
-}
-
-/// Map the first 1MB user-accessible.
-///
-/// No BIOS is installed here anymore: firmware is the DOS *personality's*
-/// concern, not the backend's. The kernel's `dos::bios` (Rust services behind
-/// a per-vector stub array) detects the absence of a native ROM and installs
-/// itself — on this interpreter exactly as on a UEFI-booted metal machine.
-pub fn arch_map_low_mem() {
-    crate::mmu::map_low_mem();
-    crate::engine::invalidate_pages(0, 0x100);
-}
-
-/// Copy page-table entries src→dst.
-pub fn arch_copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
-    crate::mmu::copy_entries(src_vpage, dst_vpage, count);
-    crate::engine::invalidate_pages(dst_vpage, count);
-}
-
-pub fn arch_redirect_physical_aliases(
-    physical_ppage: u64,
-    shadow_vpage: usize,
-    count: usize,
-    redirect: bool,
-) {
-    crate::paging::space_redirect_physical_aliases(
-        physical_ppage, shadow_vpage, count, redirect);
-    crate::engine::flush();
-}
-
-/// Swap page-table entries a↔b.
-pub fn arch_swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
-    crate::mmu::swap_entries(a_vpage, b_vpage, count);
-    crate::engine::invalidate_pages(a_vpage, count);
-    crate::engine::invalidate_pages(b_vpage, count);
-}
-
-/// Clear entries to absent (enables demand paging on next access).
-pub fn arch_unmap_range(base_page: usize, count: usize) {
-    crate::mmu::unmap(base_page, count);
-    crate::engine::invalidate_pages(base_page, count);
-}
-
-/// Replace `count` user pages with fresh anonymous RW frames.
-pub fn arch_map_fresh_range(vpage: usize, count: usize) {
-    crate::mmu::map_fresh(vpage, count);
-    crate::engine::invalidate_pages(vpage, count);
-}
-
-/// VGA color-text aperture (guest 0xB8000-0xBFFFF, 8 pages). The hosted backend
-/// has no shared singleton yet, so this maps fresh pages — same as before this
-/// split (per-process). Metal shares it across processes; interp parity is a
-/// follow-up.
-pub fn arch_map_vga_text_aperture() {
-    crate::mmu::map_fresh(0xB8000 >> 12, 8);
-    crate::engine::invalidate_pages(0xB8000 >> 12, 8);
-}
-
-/// Map a range of physical pages into user virtual space.
-pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
-    // Honour map flags like metal does — ignoring them silently diverges the
-    // moment a flag carries meaning. MAP_MMIO maps a present=0 trap window.
-    if flags & arch_abi::MAP_MMIO != 0 {
-        crate::paging::space_map_mmio(vpage_start, num_pages);
-    } else {
-        crate::mmu::map_phys(vpage_start, num_pages, ppage_start);
-    }
-    crate::engine::invalidate_pages(vpage_start, num_pages);
+/// Install a privileged physical driver window.
+pub fn arch_map_kernel_physical(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
+    crate::paging::map_kernel_physical(vpage_start, num_pages, ppage_start, flags);
 }
 
 /// Load the LDT base+limit (the active descriptor table for PM selector
@@ -169,6 +85,6 @@ pub fn arch_dma_channel_buf(_ch: usize) -> u64 {
 }
 
 /// Re-arm a deferred-ack IRQ line. (M2 virtual device layer)
-pub fn arch_rearm_irq(line: u8) {
+pub fn arch_isa_unmask_irq(line: u8) {
     unimplemented!("M2: virtual IRQ rearm")
 }

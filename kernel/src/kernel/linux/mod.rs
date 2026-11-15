@@ -1354,7 +1354,7 @@ pub(crate) fn handle_fork<A: crate::Arch>(
     if shared_until_exec {
         // Park the live shared space in the child. The ordinary switch will
         // save an empty space in the suspended parent, preserving one owner.
-        child.kernel.vcpu.space = machine.activate(A::PageTable::default(), core::ptr::null_mut(), core::ptr::null_mut());
+        child.kernel.vcpu.space = machine.activate(A::PageTable::default());
     }
     foreground_console(child_tid);
     on_done(vcpu, child_tid as i32);
@@ -1370,7 +1370,7 @@ pub(crate) fn release_vfork<A: crate::Arch>(machine: &mut A, threads: &mut [thre
         _ => None,
     };
     let Some(parent_tid) = parent_tid else { return; };
-    let shared = machine.activate(A::PageTable::default(), core::ptr::null_mut(), core::ptr::null_mut());
+    let shared = machine.activate(A::PageTable::default());
     let (child, parent) = thread::get_two_threads(threads, tid, parent_tid);
     // The inherited CPU was required only while borrowing the parent's image.
     // An exec creates an independent process which the scheduler can balance.
@@ -2452,7 +2452,7 @@ fn sys_brk<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args) ->
         // Returning whole heap pages must discard their contents. Allocators
         // rely on newly grown brk pages being zero, including after a trim.
         // The retained partial page keeps its bytes, as on Linux.
-        machine.unmap_range(new_page_end / 4096, (old_page_end - new_page_end) / 4096);
+        crate::kernel::memory::reset(machine, new_page_end / 4096, (old_page_end - new_page_end) / 4096);
         linux.anonymous_mappings.remove(new_page_end, old_page_end);
     }
     linux.heap_end = new_end;
@@ -2639,7 +2639,7 @@ fn sys_munmap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args)
     if addr & 0xfff != 0 || length == 0 { return SyscallResult::val(-EINVAL); }
     let Some(end) = addr.checked_add(length).and_then(|v| v.checked_add(4095)).map(|v| v & !4095) else { return SyscallResult::val(-EINVAL); };
     if end > elf::USER_STACK_TOP { return SyscallResult::val(-EINVAL); }
-    machine.unmap_range(addr / 4096, (end - addr) / 4096);
+    crate::kernel::memory::reset(machine, addr / 4096, (end - addr) / 4096);
     linux.shared_mappings.release(machine, addr, end);
     linux.anonymous_mappings.remove(addr, end);
     // Reuse a just-freed region at the current downward allocation frontier.
@@ -3095,7 +3095,7 @@ fn sys_mmap2<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
         return SyscallResult::val64(base as i64);
     }
     if flags & MAP_FIXED != 0 {
-        machine.unmap_range(base / 4096, alloc_size / 4096);
+        crate::kernel::memory::reset(machine, base / 4096, alloc_size / 4096);
         linux.shared_mappings.release(machine, base, base + alloc_size);
         linux.anonymous_mappings.remove(base, base + alloc_size);
     }
@@ -3104,11 +3104,11 @@ fn sys_mmap2<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     // aliases start copy-on-write; cached contents survive process exit.
     if let Some(handle) = file_handle {
         if let Err(error) = vfs::mapping::map_private(machine, handle, offset_bytes, base, length, a.a2) {
-            machine.unmap_range(base / 4096, alloc_size / 4096);
+            crate::kernel::memory::reset(machine, base / 4096, alloc_size / 4096);
             return SyscallResult::val(error);
         }
     } else if flags & MAP_FIXED == 0 {
-        machine.unmap_range(base / 4096, alloc_size / 4096);
+        crate::kernel::memory::reset(machine, base / 4096, alloc_size / 4096);
     }
 
     if flags & MAP_FIXED != 0 { linux.occupied_ranges.push((base, base + alloc_size)); }
@@ -3125,7 +3125,7 @@ fn sys_mprotect<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args) -
     if let Err(error) = linux.shared_mappings.protect(a.a0 as usize, end as usize, a.a2 & 2 != 0) {
         return SyscallResult::val(error);
     }
-    machine.set_page_flags(a.a0 as usize / 4096, (end - a.a0) as usize / 4096,
+    crate::kernel::memory::protect(machine, a.a0 as usize / 4096, (end - a.a0) as usize / 4096,
         a.a2 & 2 != 0, a.a2 & 4 != 0);
     SyscallResult::val(0)
 }

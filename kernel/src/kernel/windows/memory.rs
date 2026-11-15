@@ -133,7 +133,7 @@ pub(super) fn call<A: crate::Arch>(
             .retain(|&(page, _)| page < base || page >= end);
         for (i, backed) in region.pages.into_iter().enumerate() {
             if backed.is_some() {
-                machine.unmap_range(base as usize / 4096 + i, 1);
+                crate::kernel::memory::reset(machine, base as usize / 4096 + i, 1);
             }
         }
         return 1;
@@ -166,11 +166,11 @@ pub(super) fn call<A: crate::Arch>(
             // Recommitting a page must preserve its contents and protection.
             if region.pages[i].is_none() {
                 machine.zero(address, 4096);
-                machine.set_page_flags(address / 4096, 1, flags & 1 != 0, flags & 2 != 0);
+                crate::kernel::memory::protect(machine, address / 4096, 1, flags & 1 != 0, flags & 2 != 0);
                 region.pages[i] = Some(flags);
             }
         } else if region.pages[i].is_some() {
-            machine.unmap_range(address / 4096, 1);
+            crate::kernel::memory::reset(machine, address / 4096, 1);
             region.pages[i] = None;
         }
     }

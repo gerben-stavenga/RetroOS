@@ -409,13 +409,13 @@ pub fn map_private<A: crate::Arch>(machine: &mut A, handle: i32, offset: usize,
         for index in 0..count {
             let address = base + (page + index) * 4096;
             if at + index * 4096 >= file_size {
-                machine.map_fresh_range(address / 4096, 1);
-                machine.set_page_flags(address / 4096, 1, protection & 2 != 0, protection & 4 != 0);
+                crate::kernel::memory::fresh(machine, address / 4096, 1);
+                crate::kernel::memory::protect(machine, address / 4096, 1, protection & 2 != 0, protection & 4 != 0);
                 continue;
             }
             let key = vfs.mapping_key(handle, (at + index * 4096) as u32)?;
             let frame = vfs.file_pages.get(&key).and_then(|p| p.data.physical()).ok_or(-12)?;
-            if !machine.map_frame(address / 4096, frame, false, protection & 2 != 0, protection & 4 != 0) {
+            if !crate::kernel::memory::map_cached_frame(machine, address / 4096, frame, false, protection & 2 != 0, protection & 4 != 0) {
                 return Err(-12);
             }
         }

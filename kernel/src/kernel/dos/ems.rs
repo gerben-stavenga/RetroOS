@@ -1,6 +1,6 @@
 //! EMS 4.0 (Expanded Memory Specification) emulation via INT 67h.
 //!
-//! 64KB page-frame in upper memory (set up by `scan_uma`), 256 logical pages
+//! 64KB page-frame in upper memory (set up by `initialize_uma`), 256 logical pages
 //! of 16KB each (4MB total) allocated from the DOS personality's common
 //! committed extended-memory pool.
 
@@ -21,7 +21,7 @@ const EMS_PAGE_BYTES: u32 = 16 * 1024;
 /// Dummy file handle returned for device "EMMXXXX0" (EMS detection)
 pub(crate) const EMS_DEVICE_HANDLE: u16 = 0xFE;
 
-/// EMS page frame segment — set dynamically by `scan_uma()`.
+/// EMS page frame segment — reserved by `initialize_uma()`.
 pub fn ems_frame_seg() -> u16 {
     (EMS_BASE_PAGE.load(core::sync::atomic::Ordering::Relaxed) as u16) * 0x100
 }
@@ -35,9 +35,9 @@ fn ems_base_page() -> usize {
 fn map_ems_window<A: crate::Arch>(machine: &mut A, window: usize, backing: Option<usize>) {
     let frame = ems_base_page() + window * 4;
     if let Some(backing) = backing {
-        machine.copy_page_entries(backing, frame, 4);
+        crate::kernel::memory::alias(machine, backing, frame, 4);
     } else {
-        machine.unmap_range(frame, 4);
+        crate::kernel::memory::reset(machine, frame, 4);
     }
 }
 

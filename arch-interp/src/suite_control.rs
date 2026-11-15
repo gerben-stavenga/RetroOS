@@ -1,12 +1,10 @@
 //! Opt-in synchronous control for game regression tests. Ordinary hosted
 //! execution never takes the gate or changes its clock.
 use std::sync::{Condvar, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::atomic::AtomicI32;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
-static TIME: AtomicU64 = AtomicU64::new(0);
-static SPEED: AtomicU64 = AtomicU64::new(6000);
 static CPU_MODEL: AtomicI32 = AtomicI32::new(-1);
 pub fn set_cpu_model(name: &str) -> bool {
     // Values of Unicorn 2.1's X86CpuModel::{Model_486, PENTIUM}. Keeping
@@ -21,16 +19,11 @@ pub(crate) fn cpu_model() -> Option<i32> {
     let model = CPU_MODEL.load(Ordering::Relaxed);
     (model >= 0).then_some(model)
 }
-static CLOCK_REMAINDER: Mutex<u64> = Mutex::new(0);
 struct State { until: u64, paused: bool, snapshot: bool }
 static STATE: Mutex<State> = Mutex::new(State { until: 0, paused: false, snapshot: false });
 static CHANGED: Condvar = Condvar::new();
 
 pub fn enable() {
-    if !cfg!(feature = "tcg") {
-        eprintln!("--suite-control requires the TCG engine (retired-instruction clock)");
-        std::process::exit(2);
-    }
     ENABLED.store(true, Ordering::SeqCst);
 }
 pub fn enabled() -> bool { ENABLED.load(Ordering::Relaxed) }
@@ -41,24 +34,7 @@ pub fn disable() {
     state.until = u64::MAX;
     CHANGED.notify_all();
 }
-pub fn now() -> u64 { TIME.load(Ordering::Relaxed) }
-pub fn cycles(value: u64) {
-    assert!(value > 0);
-    SPEED.store(value, Ordering::Relaxed);
-    *CLOCK_REMAINDER.lock().unwrap() = 0;
-}
-pub fn advance(instructions: u64) {
-    if !enabled() { return; }
-    let speed = SPEED.load(Ordering::Relaxed);
-    let mut remainder = CLOCK_REMAINDER.lock().unwrap();
-    let numerator = u128::from(instructions) * 1_000_000 + u128::from(*remainder);
-    TIME.fetch_add((numerator / u128::from(speed)) as u64, Ordering::Relaxed);
-    *remainder = (numerator % u128::from(speed)) as u64;
-}
-/// Idle time is real emulated time, but does not consume an instruction budget.
-pub fn advance_idle(nanoseconds:u64) {
-    if enabled() {TIME.fetch_add(nanoseconds,Ordering::Relaxed);}
-}
+pub fn now() -> u64 { crate::machine::now() }
 /// Called on the CPU thread between kernel event-loop iterations.
 pub fn gate() {
     if !enabled() { return; }

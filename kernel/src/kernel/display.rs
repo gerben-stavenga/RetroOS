@@ -427,7 +427,7 @@ impl Display {
     ) -> Self {
         native.bios_set_mode(machine, bios, mode.number);
         let policy = machine.framebuffer_map_policy();
-        machine.map_phys_range(
+        crate::kernel::memory::map_physical(machine,
             arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE,
             pages,
             u64::from(mode.physical_base) / crate::PAGE_SIZE as u64,
@@ -609,7 +609,7 @@ impl Display {
                         crate::kernel::drivers::vga_hw::restore(&native, &saved);
                     }
                     VgaScanout::VbeLinear { pages, .. } => {
-                        machine.unmap_range(arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
+                        crate::kernel::memory::reset(machine, arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
                     }
                     VgaScanout::VbeBanked { .. } => {}
                 }

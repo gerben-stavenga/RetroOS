@@ -31,7 +31,6 @@ const ENTRY_FLAGS: u32 = PRESENT | WRITABLE | USER;
 const COW: u32 = 1 << 9;
 /// Physical-device alias temporarily redirected onto an owned shadow page.
 /// The other PTE flags remain unchanged so the mapping can be restored.
-const REDIRECTED_ALIAS: u32 = 1 << 10;
 /// Shared writable RAM: fork retains this mapping instead of making it COW.
 const SHARED: u32 = 1 << 11;
 
@@ -102,30 +101,6 @@ pub fn map_page(pd: u64, vaddr: u32, paddr_ppage: u64, writable: bool) {
 /// memory, but the interp has no cache so it's inert there).
 pub const CACHE_DISABLE: u32 = 1 << 4;
 
-/// Map `count` pages at `vpage` as an MMIO trap window: present=0 + PCD, so
-/// guest accesses fault to the kernel (the page is not backed — `ppage` is
-/// irrelevant). The metal twin maps the same present=0 + `CACHE_DISABLE`.
-pub fn space_map_mmio(vpage: usize, count: usize) {
-    with_active_pd(|pd| {
-        for i in 0..count {
-            let vaddr = ((vpage + i) * 4096) as u32;
-            let pde_i = pde_index(vaddr);
-            let pde = read_entry(pd, pde_i);
-            let pt = if pde & PRESENT != 0 {
-                (pde >> 12) as u64
-            } else {
-                let pt = alloc_table();
-                write_entry(pd, pde_i, ((pt as u32) << 12) | ENTRY_FLAGS);
-                pt
-            };
-            let old = read_entry(pt, pte_index(vaddr));
-            if old & PRESENT != 0 {
-                phys::free_frames((old >> 12) as u64, 1);
-            }
-            write_entry(pt, pte_index(vaddr), CACHE_DISABLE); // present=0 + PCD
-        }
-    });
-}
 
 /// Raw leaf PTE for `vaddr` (0 if its page table is absent) — lets the fault
 /// path peek software markers on a not-present page.
@@ -139,7 +114,8 @@ fn pte_raw(pd: u64, vaddr: u32) -> u32 {
 
 /// Clear the mapping for `vaddr` (page granularity). Leaves the page table
 /// frame in place (cheap; reclaimed only when the whole space is freed).
-pub fn unmap_page(pd: u64, vaddr: u32) {
+#[cfg(test)]
+fn unmap_page(pd: u64, vaddr: u32) {
     let pde = read_entry(pd, pde_index(vaddr));
     if pde & PRESENT != 0 {
         write_entry((pde >> 12) as u64, pte_index(vaddr), 0);
@@ -419,6 +395,7 @@ thread_local! {
 
 /// Create the boot address space (id 0) and make it active.
 pub fn space_init() {
+    let _ = zero_frame();
     SPACES.with(|s| {
         let mut s = s.borrow_mut();
         if s.pd.is_empty() {
@@ -467,98 +444,9 @@ pub fn active_id() -> u32 {
 }
 
 
-/// Map `count` pages at `vpage` to fresh zeroed frames (the memfd reads zero
-/// for never-written frames, and the bump allocator never reuses one).
-pub fn space_map_fresh(vpage: usize, count: usize) {
-    with_active_pd(|pd| {
-        for i in 0..count {
-            let v = ((vpage + i) * 4096) as u32;
-            let frame = phys::alloc_frames(1);
-            if let Some(old) = translate(pd, v) {
-                phys::free_frames(u64::from(old >> 12), 1);
-            }
-            map_page(pd, v, frame, true);
-        }
-    });
-}
 
-/// Map `count` guest pages at `vpage` onto physical frames at `ppage`.
-pub fn space_map_phys(vpage: usize, count: usize, ppage: u64, writable: bool) {
-    with_active_pd(|pd| {
-        for i in 0..count {
-            map_page(pd, ((vpage + i) * 4096) as u32, ppage + i as u64, writable);
-        }
-    });
-}
 
-/// Map an externally retained allocation. Each guest alias holds a reference;
-/// the allocation's original reference keeps the kernel view alive after exit.
-pub fn space_map_shared(vpage: usize, count: usize, ppage: u64) {
-    with_active_pd(|pd| {
-        for i in 0..count {
-            let v = ((vpage + i) * 4096) as u32;
-            phys::inc_ref(ppage + i as u64);
-            if let Some(old) = translate(pd, v) {
-                phys::free_frames(u64::from(old >> 12), 1);
-            }
-            map_page(pd, v, ppage + i as u64, true);
-            let pt = u64::from(read_entry(pd, pde_index(v)) >> 12);
-            write_entry(pt, pte_index(v), pte_raw(pd, v) | SHARED);
-        }
-    });
-}
 
-/// Alias one externally-owned RAM frame, retaining a PTE owner. Private
-/// writable mappings start COW; mprotect also accounts for retained owners.
-pub fn space_map_frame(vpage: usize, frame: u64, shared: bool, writable: bool) {
-    with_active_pd(|pd| {
-        let address = (vpage * 4096) as u32;
-        phys::inc_ref(frame);
-        if let Some(old) = translate(pd, address) { phys::free_frames(u64::from(old >> 12), 1); }
-        if shared || !writable { map_page(pd, address, frame, writable); }
-        else { map_page_cow(pd, address, frame); }
-        let pt = u64::from(read_entry(pd, pde_index(address)) >> 12);
-        let mut entry = pte_raw(pd, address);
-        if shared { entry |= SHARED; }
-        write_entry(pt, pte_index(address), entry);
-    });
-}
-
-/// Set writability across `count` present pages.
-pub fn space_set_writable(vpage: usize, count: usize, writable: bool) {
-    with_active_pd(|pd| {
-        for i in 0..count {
-            let v = ((vpage + i) * 4096) as u32;
-            let pde = read_entry(pd, pde_index(v));
-            if pde & PRESENT == 0 {
-                continue;
-            }
-            let pt = (pde >> 12) as u64;
-            let pte = read_entry(pt, pte_index(v));
-            if pte & PRESENT == 0 {
-                continue;
-            }
-            let nf = if !writable { pte & !(WRITABLE | COW) }
-            else if pte & SHARED == 0 && phys::is_shared(u64::from(pte >> 12)) {
-                (pte | COW) & !WRITABLE
-            } else { (pte | WRITABLE) & !COW };
-            write_entry(pt, pte_index(v), nf);
-        }
-    });
-}
-
-/// Clear `count` pages to absent (next access demand-faults).
-pub fn space_unmap(vpage: usize, count: usize) {
-    with_active_pd(|pd| {
-        for i in 0..count {
-            let v = ((vpage + i) * 4096) as u32;
-            if let Some(old) = translate(pd, v) {
-                phys::free_frames(u64::from(old >> 12), 1);
-            }
-            unmap_page(pd, v);
-        }
-    });
-}
 
 /// Translate a guest virtual address in the active space.
 pub fn space_translate(vaddr: u32) -> Option<u32> {
@@ -607,13 +495,18 @@ pub fn space_fork(src: u32) -> u32 {
                 // frame. Marking src is idempotent when it's already COW — the
                 // point is to never demote a COW page to plain-RO, or a
                 // grandchild's legitimate write would fault unresolved.
-                write_entry(src_pt, pte_i, ((frame as u32) << 12) | PRESENT | USER | COW);
+                let incoming = (pte & !WRITABLE) | COW;
+                write_entry(src_pt, pte_i, incoming);
                 map_page_cow(dst_pd, v, frame);
+                let child_pt = u64::from(read_entry(dst_pd, pde_index(v)) >> 12);
+                write_entry(child_pt, pte_i, incoming);
             } else {
                 // Genuinely read-only (code/rodata): share as-is, no COW needed.
                 map_page(dst_pd, v, frame, false);
+                let child_pt = u64::from(read_entry(dst_pd, pde_index(v)) >> 12);
+                write_entry(child_pt, pte_i, pte);
             }
-            if pte & PRESENT != 0 { phys::inc_ref(frame); }
+            if owns_mapping(pte) { phys::inc_ref(frame); }
         }
     }
     dst
@@ -650,17 +543,18 @@ pub fn space_cow_fault(vaddr: u32) -> bool {
             return false;
         }
         let frame = (pte >> 12) as u64;
-        if phys::is_shared(frame) {
+        let borrowed = pte & TYPED != 0 && pte & SHARED != 0;
+        if borrowed || phys::is_shared(frame) {
             // Still aliased by another space — copy into a private frame.
             let new = phys::alloc_frames(1);
             unsafe {
                 core::ptr::copy_nonoverlapping(phys::frame_ptr(frame), phys::frame_ptr(new), 4096);
             }
-            write_entry(pt, pte_i, ((new as u32) << 12) | ENTRY_FLAGS);
-            phys::free_frames(frame, 1); // drop this space's reference
+            write_entry(pt, pte_i, ((new as u32) << 12) | ((pte & 0xfff & !COW & !SHARED) | WRITABLE));
+            if !borrowed { phys::free_frames(frame, 1); }
         } else {
             // Sole owner — no copy; just re-enable write and clear COW.
-            write_entry(pt, pte_i, ((frame as u32) << 12) | ENTRY_FLAGS);
+            write_entry(pt, pte_i, (pte & !COW) | WRITABLE);
         }
         true
     })
@@ -724,6 +618,9 @@ pub fn space_resolve(vaddr: u32) -> *mut u8 {
 /// windowed DN #GP'ing on its first INT 21h read a stale space's IVT → wild
 /// `0xFFFFFFFE` jump; headless (single space) never diverged.
 pub fn resolve_in(pd: u64, vaddr: u32) -> *mut u8 {
+    let raw = pte_raw(pd, vaddr);
+    assert!(raw & PRESENT != 0 || raw & TYPED == 0 && raw != ABSENT,
+        "guest access to an absent or inaccessible mapping");
     let pa = match translate(pd, vaddr) {
         Some(pa) => pa,
         None => {
@@ -733,6 +630,17 @@ pub fn resolve_in(pd: u64, vaddr: u32) -> *mut u8 {
         }
     };
     unsafe { phys::frame_ptr((pa >> 12) as u64).add((pa & 0xFFF) as usize) }
+}
+
+/// Kernel writes to typed mappings obey the same leaf permissions as guests.
+pub(crate) fn space_resolve_write(vaddr: u32) -> *mut u8 {
+    let raw = pte_raw(active_pd(), vaddr);
+    if raw & TYPED != 0 {
+        if raw & COW != 0 && raw & PRESENT != 0 { assert!(space_cow_fault(vaddr)); }
+        assert!(pte_raw(active_pd(), vaddr) & (PRESENT | WRITABLE) == PRESENT | WRITABLE,
+            "guest write to a protected mapping");
+    }
+    space_resolve(vaddr)
 }
 
 /// Guest-fault resolve from the software CPU (#PF, no EIP progress + CR2). Returns
@@ -747,7 +655,7 @@ pub fn space_demand(vaddr: u32) -> bool {
     }
     // MMIO/device aperture (present=0 + PCD, e.g. the planar VGA window mapped
     // with MAP_MMIO): trap to the kernel, never demand-commit RAM.
-    if pte_raw(pd, vaddr) & CACHE_DISABLE != 0 {
+    if pte_raw(pd, vaddr) & (CACHE_DISABLE | TYPED) != 0 {
         return false;
     }
     if vaddr < NULL_GUARD || (vaddr as usize) >= 0xC000_0000 {
@@ -758,124 +666,9 @@ pub fn space_demand(vaddr: u32) -> bool {
     true
 }
 
-/// Copy `count` page mappings src→dst with fresh frames (content copy — the
-/// interp owns a frame per VA, same observable result as a refcount-shared PTE).
-pub fn space_copy_entries(src: usize, dst: usize, count: usize) {
-    with_active_pd(|pd| {
-        for i in 0..count {
-            let sv = ((src + i) * 4096) as u32;
-            let dv = ((dst + i) * 4096) as u32;
-            // Drop the reference dst currently holds before clobbering it, or the
-            // old frame leaks (mirror metal's copy_page_entries / unmap).
-            if let Some(old_pa) = translate(pd, dv) {
-                phys::free_frames((old_pa >> 12) as u64, 1);
-            }
-            match translate(pd, sv) {
-                Some(spa) => {
-                    // ALIAS dst onto src's physical frame — do NOT snapshot it
-                    // into a fresh frame. The sole caller is the A20-wrap setup
-                    // (HMA pages onto low memory), where the two ranges are the
-                    // SAME storage on real hardware (A20 forces address bit 20
-                    // to 0). A content copy froze HMA at boot, so writes through
-                    // low memory never appeared via the wrap and DN/COMMAND read
-                    // stale code (the ffbf garbage-execution crash on panel
-                    // launch). Metal copies the PTE + bumps a shared refcount;
-                    // match that so the two views truly share storage.
-                    let frame = (spa >> 12) as u64;
-                    let pde = read_entry(pd, pde_index(sv));
-                    let pte = read_entry((pde >> 12) as u64, pte_index(sv));
-                    map_page(pd, dv, frame, pte & WRITABLE != 0);
-                    let dst_pt = u64::from(read_entry(pd, pde_index(dv)) >> 12);
-                    write_entry(dst_pt, pte_index(dv), pte);
-                    phys::inc_ref(frame);
-                }
-                None => unmap_page(pd, dv),
-            }
-        }
-    });
-}
 
-/// Redirect aliases by their physical frames rather than by the higher-level
-/// API which happened to create them. Tagged aliases can later be restored
-/// without disturbing unrelated aliases of the shadow pages.
-pub fn space_redirect_physical_aliases(
-    physical_ppage: u64,
-    shadow_vpage: usize,
-    count: usize,
-    redirect: bool,
-) {
-    with_active_pd(|pd| {
-        let shadow: Vec<u32> = (0..count)
-            .map(|i| pte_raw(pd, ((shadow_vpage + i) * 4096) as u32))
-            .collect();
-        for pde_i in 0..768 {
-            let pde = read_entry(pd, pde_i);
-            if pde & PRESENT == 0 { continue; }
-            let pt = (pde >> 12) as u64;
-            for pte_i in 0..1024 {
-                let vpage = pde_i * 1024 + pte_i;
-                if (shadow_vpage..shadow_vpage + count).contains(&vpage) {
-                    continue;
-                }
-                let old = read_entry(pt, pte_i);
-                if old & PRESENT == 0 { continue; }
-                let old_page = (old >> 12) as u64;
-                let offset = if redirect {
-                    old_page.checked_sub(physical_ppage)
-                        .filter(|offset| (*offset as usize) < count)
-                        .map(|offset| offset as usize)
-                } else if old & REDIRECTED_ALIAS != 0 {
-                    shadow.iter().position(|entry| {
-                        entry & PRESENT != 0 && u64::from(entry >> 12) == old_page
-                    })
-                } else {
-                    None
-                };
-                let Some(offset) = offset else { continue };
-                if redirect && shadow[offset] & PRESENT == 0 { continue; }
 
-                if redirect {
-                    let frame = u64::from(shadow[offset] >> 12);
-                    phys::inc_ref(frame);
-                    write_entry(pt, pte_i,
-                        (old & 0xFFF) | ((frame as u32) << 12) | REDIRECTED_ALIAS);
-                } else {
-                    write_entry(pt, pte_i,
-                        (old & 0xFFF & !REDIRECTED_ALIAS)
-                            | (((physical_ppage + offset as u64) as u32) << 12));
-                    phys::free_frames(old_page, 1);
-                }
-            }
-        }
-    });
-}
 
-/// Swap `count` page mappings a↔b (PTE swap — no content move needed since each
-/// VA already owns its frame).
-pub fn space_swap_entries(a: usize, b: usize, count: usize) {
-    with_active_pd(|pd| {
-        for i in 0..count {
-            let av = ((a + i) * 4096) as u32;
-            let bv = ((b + i) * 4096) as u32;
-            let (apde, bpde) = (read_entry(pd, pde_index(av)), read_entry(pd, pde_index(bv)));
-            // Ensure both PDEs have a page table so we can write either slot.
-            let apt = if apde & PRESENT != 0 { (apde >> 12) as u64 } else {
-                let pt = alloc_table(); write_entry(pd, pde_index(av), ((pt as u32) << 12) | ENTRY_FLAGS); pt };
-            let bpt = if bpde & PRESENT != 0 { (bpde >> 12) as u64 } else {
-                let pt = alloc_table(); write_entry(pd, pde_index(bv), ((pt as u32) << 12) | ENTRY_FLAGS); pt };
-            let (ae, be) = (read_entry(apt, pte_index(av)), read_entry(bpt, pte_index(bv)));
-            write_entry(apt, pte_index(av), be);
-            write_entry(bpt, pte_index(bv), ae);
-        }
-    });
-}
-
-/// Map the first 1 MB of the active space as fresh RW (VM86/DOS low memory:
-/// IVT, BDA, BIOS, PSPs). The metal call splits this into BIOS/VGA/ROM regions;
-/// the interp's emulated devices don't need that split here.
-pub fn space_map_low_mem() {
-    space_map_fresh(0, 0x100);
-}
 
 /// Free every user page in the active space (arch CLEAN): drop the PTEs and
 /// return the frames to the allocator. Kernel windows (high) are left intact.
@@ -892,10 +685,8 @@ fn free_user_frames(pd: u64) {
         let pt = (pde >> 12) as u64;
         for pte_i in 0..1024usize {
             let pte = read_entry(pt, pte_i);
-            if pte & PRESENT != 0 {
-                phys::free_frames((pte >> 12) as u64, 1);
-                write_entry(pt, pte_i, 0);
-            }
+            release_mapping(pte);
+            write_entry(pt, pte_i, 0);
         }
     }
 }
@@ -1073,18 +864,41 @@ fn translate64(pml4: u64, vaddr: u64) -> Option<u64> {
 #[cfg(test)]
 mod space_ops {
     use super::*;
+    use arch_abi::{UserPage, page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFrame}};
+
+    #[test]
+    fn typed_fault_states_do_not_demand_allocate() {
+        space_init(); space_switch(space_new());
+        let page = UserPage::new(0x41000000).unwrap();
+        for entry in [PageEntry::Absent, PageEntry::Intercepted] {
+            replace_user_mapping(page, entry).unwrap();
+            assert!(!space_demand(page.address() as u32));
+            assert_eq!(read_mapping(page).unwrap(), entry);
+        }
+        let frame = phys::alloc_frames(1);
+        let mapping = Mapping { backing: Backing::Owned(PhysicalFrame::new(frame).unwrap()),
+            attributes: Attributes::EXECUTABLE | Attributes::CACHE_DISABLE };
+        replace_user_mapping(page, PageEntry::NoAccess(mapping)).unwrap();
+        assert!(phys::is_shared(frame));
+        assert!(!space_demand(page.address() as u32));
+        space_clean();
+        assert!(!phys::is_shared(frame));
+        phys::free_frames(frame, 1);
+    }
 
     #[test]
     fn cached_frame_private_protection_and_cow_preserve_backing_owner() {
         space_init(); let parent = space_new(); space_switch(parent);
         let frame = phys::alloc_frames(1);
         unsafe { *phys::frame_ptr(frame) = 0x42; }
-        space_map_frame(0x41000, frame, false, false);
+        replace_user_mapping(UserPage::new(0x41000000).unwrap(), PageEntry::ReadOnly(Mapping {
+            backing: Backing::Owned(PhysicalFrame::new(frame).unwrap()), attributes: Attributes::EXECUTABLE,
+        })).unwrap();
         assert_eq!(space_translate(0x41000000), Some((frame * 4096) as u32));
         assert!(!space_cow_fault(0x41000000), "read-only protection denies writes");
         let child = space_fork(parent); space_switch(child);
         assert!(!space_cow_fault(0x41000000));
-        space_set_writable(0x41000, 1, true);
+        test_protect(0x41000, 1, true);
         assert!(space_cow_fault(0x41000000));
         let copy = space_translate(0x41000000).unwrap();
         assert_ne!(u64::from(copy >> 12), frame);
@@ -1100,9 +914,15 @@ mod space_ops {
         let parent = space_new();
         space_switch(parent);
         let backing = phys::alloc_frames(64);
-        space_map_shared(0x41000, 64, backing);
-        space_copy_entries(0x41000, 0xA0, 16);
-        space_map_mmio(0xB0, 8);
+        for i in 0..64 {
+            replace_user_mapping(UserPage::new(0x41000000 + i * 4096).unwrap(), PageEntry::Writable(Mapping {
+                backing: Backing::Borrowed(PhysicalFrame::new(backing + i).unwrap()), attributes: Attributes::EXECUTABLE,
+            })).unwrap();
+        }
+        test_alias(0x41000, 0xA0, 16);
+        for i in 0..8 {
+            replace_user_mapping(UserPage::new(0xB0000 + i * 4096).unwrap(), PageEntry::Intercepted).unwrap();
+        }
         unsafe { *phys::frame_ptr(backing).add(23) = 0x31; }
         assert_eq!(space_translate(0xA0017), Some((backing as u32 * 4096) + 23));
         let child = space_fork(parent);
@@ -1119,8 +939,8 @@ mod space_ops {
         assert_eq!(unsafe { *phys::frame_ptr(backing).add(23) }, 0x72);
         // Mode changes replace/unmap direct windows. They must drop their
         // alias references while retaining the permanent kernel allocation.
-        space_map_fresh(0xA0, 8);
-        space_unmap(0xA8, 8);
+        test_ram(0xA0, 8);
+        test_remove(0xA8, 8);
         space_clean();
         space_switch(parent);
         assert_eq!(space_translate(0xA0017), Some(guest));
@@ -1137,7 +957,7 @@ mod space_ops {
         space_init();
         let s = space_new();
         space_switch(s);
-        space_map_fresh(0x10, 2);
+        test_ram(0x10, 2);
         let pml4 = active_pml4();
         assert_eq!(
             translate64(pml4, 0x10_000),
@@ -1147,7 +967,7 @@ mod space_ops {
         assert_eq!(translate64(pml4, 0x12_000), None, "unmapped stays unmapped");
         assert_eq!(active_pml4(), pml4, "no mutation → same twin, no rebuild");
         // Mutate the source tree → the twin refreshes on next request.
-        space_map_fresh(0x12, 1);
+        test_ram(0x12, 1);
         let pml4b = active_pml4();
         assert_eq!(
             translate64(pml4b, 0x12_000),
@@ -1155,43 +975,19 @@ mod space_ops {
             "rebuilt twin sees the new page"
         );
         // Read-only source PTE mirrors as read-only (W bit clear).
-        space_set_writable(0x10, 1, false);
+        test_protect(0x10, 1, false);
         let pml4c = active_pml4();
         let pa = translate64(pml4c, 0x10_000).expect("still mapped");
         assert_eq!(pa >> 12, space_translate(0x10_000).unwrap() as u64 >> 12);
     }
 
-    #[test]
-    fn physical_aliases_follow_shadow_and_restore_exactly() {
-        space_init();
-        let s = space_new();
-        space_switch(s);
-        let physical = phys::alloc_frames(2);
-        space_map_phys(0x20, 2, physical, true);
-        space_map_fresh(0x40, 2);
-        space_copy_entries(0x40, 0x30, 2); // unrelated aliases of the shadow
-        let shadow = [
-            space_translate(0x40_000).unwrap() >> 12,
-            space_translate(0x41_000).unwrap() >> 12,
-        ];
-
-        space_redirect_physical_aliases(physical, 0x40, 2, true);
-        assert_eq!(space_translate(0x20_000).unwrap() >> 12, shadow[0]);
-        assert_eq!(space_translate(0x21_000).unwrap() >> 12, shadow[1]);
-
-        space_redirect_physical_aliases(physical, 0x40, 2, false);
-        assert_eq!(space_translate(0x20_000).unwrap() as u64 >> 12, physical);
-        assert_eq!(space_translate(0x21_000).unwrap() as u64 >> 12, physical + 1);
-        assert_eq!(space_translate(0x30_000).unwrap() >> 12, shadow[0]);
-        assert_eq!(space_translate(0x31_000).unwrap() >> 12, shadow[1]);
-    }
 
     #[test]
     fn map_fork_translate() {
         space_init();
         let s = space_new();
         space_switch(s);
-        space_map_fresh(0x10, 2); // vpages 0x10,0x11
+        test_ram(0x10, 2); // vpages 0x10,0x11
         let p = space_translate(0x10_000).expect("mapped");
         // Write a marker through the frame and confirm fork copies it.
         unsafe { *phys::frame_ptr((p >> 12) as u64) = 0x7E };
@@ -1209,11 +1005,11 @@ mod space_ops {
         unsafe { *phys::frame_ptr((cp >> 12) as u64) = 0x11 };
         assert_eq!(unsafe { *phys::frame_ptr((p >> 12) as u64) }, 0x7E, "parent unchanged");
 
-        space_set_writable(0x10, 1, false);
+        test_protect(0x10, 1, false);
         let pde = read_entry(active_pd(), pde_index(0x10_000));
         let pte = read_entry((pde >> 12) as u64, pte_index(0x10_000));
         assert_eq!(pte & WRITABLE, 0);
-        space_unmap(0x10, 1);
+        test_remove(0x10, 1);
         assert_eq!(space_translate(0x10_000), None);
     }
 }
@@ -1353,7 +1149,7 @@ mod proof64 {
 
         // Code page at virtual 0x40_0000, backed by whatever frame the space
         // allocator picked (non-identity by construction).
-        space_map_fresh(0x400, 1);
+        test_ram(0x400, 1);
         let code_pa = space_translate(0x40_0000).expect("mapped");
         // movabs rax, 0x1122334455667788 ; jmp $
         let code: [u8; 12] = [0x48, 0xB8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0xEB, 0xFE];
@@ -1393,4 +1189,132 @@ mod proof64 {
             "64-bit code at virtual 0x400000 should run through the twin's walk"
         );
     }
+}
+
+// Typed mappings coexist with historical entries during caller migration.
+// Bit 10 tags new entries so borrowed lifetime is distinct from old SHARED
+// mappings, which retained an allocator reference. It is software-only.
+const TYPED: u32 = 1 << 10;
+const ABSENT: u32 = CACHE_DISABLE | COW;
+fn owns_mapping(entry: u32) -> bool {
+    (entry & PRESENT != 0 || entry & TYPED != 0)
+        && !(entry & TYPED != 0 && entry & SHARED != 0)
+}
+fn release_mapping(entry: u32) {
+    if owns_mapping(entry) { phys::free_frames(u64::from(entry >> 12), 1); }
+}
+fn zero_frame() -> u64 {
+    static ZERO: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ZERO.get_or_init(|| phys::alloc_frames(1))
+}
+
+pub(crate) fn read_mapping(page: arch_abi::UserPage) -> Result<arch_abi::page_entry::PageEntry, arch_abi::MappingError> {
+    use arch_abi::{MappingError, page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFrame, X86PteFormat}};
+    if page.address() >= 0xc000_0000 { return Err(MappingError::Unsupported); }
+    let address = page.address() as u32;
+    let raw = pte_raw(active_pd(), address);
+    if raw & TYPED != 0 {
+        let encoded = if raw & PRESENT != 0 { raw & !TYPED } else { raw };
+        return Ok(PageEntry::decode(u64::from(encoded), X86PteFormat::Legacy32, page.address())?);
+    }
+    if raw == ABSENT { return Ok(PageEntry::Absent); }
+    if raw == 0 {
+        return Ok(PageEntry::CopyOnWrite(Mapping { backing: Backing::Borrowed(PhysicalFrame::new(zero_frame())?),
+            attributes: Attributes::EXECUTABLE }));
+    }
+    if raw & PRESENT == 0 { return Ok(PageEntry::Intercepted); }
+    let mut attributes = Attributes::EXECUTABLE;
+    for (mask, flag) in [(8, Attributes::WRITE_THROUGH), (16, Attributes::CACHE_DISABLE), (128, Attributes::PAT)] {
+        if raw & mask != 0 { attributes = attributes | flag; }
+    }
+    let m = Mapping { backing: Backing::Owned(PhysicalFrame::new(u64::from(raw >> 12))?), attributes };
+    Ok(if raw & COW != 0 { PageEntry::CopyOnWrite(m) }
+        else if raw & WRITABLE != 0 { PageEntry::Writable(m) }
+        else { PageEntry::ReadOnly(m) })
+}
+
+pub(crate) fn replace_user_mapping(page: arch_abi::UserPage, entry: arch_abi::page_entry::PageEntry) -> Result<(), arch_abi::MappingError> {
+    use arch_abi::{MappingError, page_entry::{Backing, PageEntry, X86PteFormat}};
+    if page.address() >= 0xc000_0000 { return Err(MappingError::Unsupported); }
+    let mut raw = entry.encode(X86PteFormat::Legacy32, page.address())? as u32;
+    let mapping = match entry {
+        PageEntry::Absent => { raw = ABSENT; None }
+        PageEntry::Intercepted => { raw = CACHE_DISABLE; None }
+        PageEntry::NoAccess(m) | PageEntry::ReadOnly(m) | PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => {
+            if m.backing.frame().number() >= (phys::PHYS_SIZE / 4096) as u64 { return Err(MappingError::InvalidFrame); }
+            raw |= TYPED;
+            Some(m)
+        }
+    };
+    let address = page.address() as u32;
+    with_active_pd(|pd| {
+        let pde = read_entry(pd, pde_index(address));
+        let pt = if pde & PRESENT != 0 { u64::from(pde >> 12) } else {
+            let pt = alloc_table(); write_entry(pd, pde_index(address), ((pt as u32) << 12) | ENTRY_FLAGS); pt
+        };
+        if let Some(m) = mapping {
+            if let Backing::Owned(frame) = m.backing { phys::inc_ref(frame.number()); }
+        }
+        let old = read_entry(pt, pte_index(address));
+        write_entry(pt, pte_index(address), raw);
+        release_mapping(old);
+    });
+    crate::engine::invalidate_pages(address as usize / 4096, 1);
+    Ok(())
+}
+
+#[cfg(test)]
+fn test_ram(base: usize, count: usize) {
+    use arch_abi::{UserPage, page_entry::{PageEntry, Mapping, Backing, PhysicalFrame, Attributes}};
+    for i in 0..count {
+        let frame = phys::alloc_frames(1);
+        unsafe { core::ptr::write_bytes(phys::frame_ptr(frame), 0, 4096); }
+        replace_user_mapping(UserPage::new(((base + i) * 4096) as u64).unwrap(), PageEntry::Writable(Mapping {
+            backing: Backing::Owned(PhysicalFrame::new(frame).unwrap()), attributes: Attributes::EXECUTABLE,
+        })).unwrap();
+        phys::free_frames(frame, 1);
+    }
+}
+#[cfg(test)]
+fn test_protect(base: usize, count: usize, writable: bool) {
+    use arch_abi::{UserPage, page_entry::PageEntry};
+    for i in 0..count {
+        let page = UserPage::new(((base + i) * 4096) as u64).unwrap();
+        let m = match read_mapping(page).unwrap() {
+            PageEntry::ReadOnly(m) | PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => m,
+            _ => panic!("backing expected"),
+        };
+        replace_user_mapping(page, if writable { PageEntry::CopyOnWrite(m) } else { PageEntry::ReadOnly(m) }).unwrap();
+    }
+}
+#[cfg(test)]
+fn test_remove(base: usize, count: usize) {
+    for i in 0..count {
+        replace_user_mapping(arch_abi::UserPage::new(((base + i) * 4096) as u64).unwrap(), arch_abi::page_entry::PageEntry::Absent).unwrap();
+    }
+}
+#[cfg(test)]
+fn test_alias(source: usize, destination: usize, count: usize) {
+    for i in 0..count {
+        let entry = read_mapping(arch_abi::UserPage::new(((source + i) * 4096) as u64).unwrap()).unwrap();
+        replace_user_mapping(arch_abi::UserPage::new(((destination + i) * 4096) as u64).unwrap(), entry).unwrap();
+    }
+}
+
+/// Physical driver windows are supervisor-only and borrow their storage.
+pub(crate) fn map_kernel_physical(vpage: usize, count: usize, physical: u64, flags: u64) {
+    assert!(vpage >= 0xc0000000 / 4096);
+    assert!(vpage.checked_add(count).is_some_and(|end| end <= 1 << 20));
+    with_active_pd(|pd| {
+        for i in 0..count {
+            let address = ((vpage + i) * 4096) as u32;
+            map_page(pd, address, physical + i as u64, true);
+            let table = u64::from(read_entry(pd, pde_index(address)) >> 12);
+            let raw = if flags & arch_abi::MAP_MMIO != 0 { CACHE_DISABLE } else {
+                (((physical + i as u64) as u32) << 12) | PRESENT | WRITABLE | TYPED | SHARED | (flags as u32 & (8 | 16 | 128))
+            };
+            write_entry(table, pte_index(address), raw);
+        }
+    });
+    crate::engine::invalidate_pages(vpage, count);
 }
