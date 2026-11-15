@@ -71,10 +71,7 @@ def main():
         (root / 'CHECK.BAT').write_bytes(b'LIMITED.COM\r\nNORMAL.COM\r\n')
 
         def run(command):
-            result = subprocess.run([
-                'python3', 'test/disk_fixture.py', '--root', raw, '--',
-                'bazel-bin/kernel/retroos-host-kvm', '--cmd', command,
-            ], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            result = subprocess.run(['bazel-bin/kernel/retroos-host-kvm', '--cmd', command, raw], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, timeout=60)
             text = result.stdout.decode(errors='replace')
             ticks = [int(n, 16) for n in re.findall(r'PACING TICKS=([0-9A-F]{4})', text)]

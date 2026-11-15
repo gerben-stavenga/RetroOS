@@ -12,10 +12,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-IMG=bazel-bin/image.bin          # the open-source image carries the committed games
+ROOT_DIR=$(mktemp -d /tmp/retroos-games-root.XXXXXX)
+trap 'rm -rf "$ROOT_DIR"' EXIT
+tar -xf bazel-bin/root_module_base_tar.tar -C "$ROOT_DIR"
+tar -xf bazel-bin/root_module_showcase_tar.tar -C "$ROOT_DIR"
+chmod -R u+w "$ROOT_DIR"
 source test/lib/hosted_common.sh
 
-PY="python3 test/hosted_test.py --host-bin $HOST_BIN --image $IMG"
+PY="python3 test/hosted_test.py --host-bin $HOST_BIN --directory $ROOT_DIR"
 fail=0
 run() { local label="$1"; shift; echo "=== $label ==="; $PY "$@" || { fail=1; echo "  ^ FAILED: $label"; }; }
 

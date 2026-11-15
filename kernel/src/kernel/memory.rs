@@ -73,18 +73,6 @@ pub fn high_copy<A: Arch>(machine: &mut A, mut address: u64, mut bytes: &mut [u8
     }
     true
 }
-pub fn alloc_contig<A: Arch>(machine: &mut A, pages: usize) -> u64 {
-    if machine.page_supply().is_some() { service(machine); phys_mm::alloc_contig(pages).unwrap_or(0) }
-    else { machine.alloc_phys_contig(pages) }
-}
-pub fn free_contig<A: Arch>(machine: &mut A, page: u64, pages: usize) {
-    if machine.page_supply().is_some() { phys_mm::free_phys_contig(page, pages); }
-    else { machine.free_phys_contig(page, pages); }
-}
-pub fn dma_channel<A: Arch>(machine: &A, channel: usize) -> u64 {
-    if machine.page_supply().is_some() { phys_mm::dma_channel_buf(channel) }
-    else { machine.dma_channel_buf(channel) }
-}
 pub fn cache_access(io: arch_abi::PhysicalFrameIo) -> arch_abi::FrameAccess {
     install_io(io);
     arch_abi::FrameAccess {

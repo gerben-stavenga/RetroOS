@@ -30,11 +30,7 @@ def main():
             ('/COMMAND.COM /C C:\\GUARD.COM A', 1),
             ('/COMMAND.COM /E C:\\GUARD.COM A', 1),
         ):
-            result = subprocess.run([
-                'python3', 'test/disk_fixture.py', '--root', directory, '--',
-                'bazel-bin/kernel/retroos-host', '--c-root', '/',
-                '--cmd', command, '--cwd', '/',
-            ], cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            result = subprocess.run(['bazel-bin/kernel/retroos-host', '--c-root', '/', '--cmd', command, '--cwd', '/', directory], cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, timeout=60)
             log = result.stdout
             if (result.returncode or log.count('IVT0 PROBE PASS') != expected

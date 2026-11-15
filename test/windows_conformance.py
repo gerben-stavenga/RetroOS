@@ -85,8 +85,7 @@ def run_guest(target, program, unit, out, timeout):
         shutil.copyfile(program, drive / program.name)
         (drive / "WINDOWS/SYSTEM").mkdir(parents=True)
         (drive / "WINDOWS/REGEDIT.EXE").write_bytes(b"")
-        args = ["python3", str(ROOT / "test/disk_fixture.py"), "--root", directory, "--",
-                str(ROOT / "bazel-bin/kernel" / target), "--c-root", "/", "--cmd", f"/{program.name} {unit}"]
+        args = [str(ROOT / "bazel-bin/kernel" / target), "--c-root", "/", "--cmd", f"/{program.name} {unit}", directory]
         with (out / f"{unit}.log").open("w") as log:
             process = subprocess.Popen(args, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                                        start_new_session=True)

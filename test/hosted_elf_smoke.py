@@ -15,10 +15,7 @@ def main():
         root = Path(directory)
         for name in ('hello', 'outlive_composite'):
             shutil.copyfile(ROOT / f'bazel-bin/tests/hosted_{name}.elf', root / (name + '.elf'))
-            result = subprocess.run([
-                'python3', str(ROOT / 'test/disk_fixture.py'), '--root', str(root), '--',
-                str(ROOT / 'bazel-bin/kernel' / target), '--cmd', '/' + name + '.elf',
-            ], capture_output=True, text=True, timeout=30)
+            result = subprocess.run([str(ROOT / 'bazel-bin/kernel' / target), '--cmd', '/' + name + '.elf', str(root)], capture_output=True, text=True, timeout=30)
             output = result.stdout + result.stderr
             assert result.returncode == 0, output
             assert 'Hello from an interpreted 32-bit Linux ELF!' in output, output

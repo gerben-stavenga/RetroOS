@@ -3,15 +3,12 @@
 //! The kernel drives hardware through `arch::inb/inw/outb`; on the interpreter
 //! those land here. Devices implement the [`PortIo`] trait and are `register`ed
 //! for an inclusive port range, so the hosted `main` composes the platform by
-//! hooking ports — a disk image on the ATA ports, the
-//! debug console on 0xE9. Ports with no registered device read the ISA "no
+//! hooking ports such as the debug console on 0xE9. Ports with no registered device read the ISA "no
 //! device" value 0xFF and drop writes.
 
 use std::cell::RefCell;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-
-const SECTOR: usize = 512;
+use std::io::{Seek, SeekFrom, Write};
 
 /// A device that responds to port I/O. `width` is the access size in bytes.
 pub trait PortIo {
@@ -92,190 +89,6 @@ pub fn register_debugcon_file(path: &str) {
     register(0xE9, 0xE9, Box::new(Debugcon { sink }));
 }
 
-// ── ATA disk (primary controller, LBA28 PIO) ────────────────────────────────
-
-const ATA_BASE: u16 = 0x1F0;
-const ATA_DATA: u16 = 0x1F0;
-const ATA_SECCOUNT: u16 = 0x1F2;
-const ATA_LBA_0_7: u16 = 0x1F3;
-const ATA_LBA_8_15: u16 = 0x1F4;
-const ATA_LBA_16_23: u16 = 0x1F5;
-const ATA_LBA_24_27: u16 = 0x1F6;
-const ATA_STATUS_CMD: u16 = 0x1F7;
-
-const ST_DRDY: u32 = 0x40;
-const ST_DRQ: u32 = 0x08;
-const CMD_READ_SECTORS: u32 = 0x20;
-const CMD_WRITE_SECTORS: u32 = 0x30;
-const CMD_CACHE_FLUSH: u32 = 0xE7;
-const CMD_IDENTIFY: u32 = 0xEC;
-
-struct Ata {
-    file: File,
-    seccount: u8,
-    lba: u32,
-    buf: Vec<u8>,
-    pos: usize,
-    /// True between a WRITE SECTORS command and its buffer draining to the
-    /// file: the data port ACCEPTS words instead of yielding them. DRQ means
-    /// the same thing either way — "the sector buffer isn't done" — so the
-    /// status bit is shared; only the data-port direction flips.
-    writing: bool,
-    /// Selected drive from bit 4 of the drive/head register. Only the master
-    /// (0) exists here — one image file, one drive. A real controller reports
-    /// status 0x00 for an absent drive, which is how the guest tells a missing
-    /// slave from a present one (the status register alone can't: the master
-    /// drives the bus on the slave's behalf).
-    drive: u8,
-    /// Capacity in sectors, from the image file's length — answered by
-    /// IDENTIFY so the guest can size the disk.
-    sectors: u64,
-}
-
-impl Ata {
-    fn new(file: File) -> Ata {
-        let sectors = file.metadata().map(|m| m.len() / SECTOR as u64).unwrap_or(0);
-        Ata { file, seccount: 0, lba: 0, buf: Vec::new(), pos: 0, writing: false, drive: 0, sectors }
-    }
-
-    fn status(&self) -> u32 {
-        if self.drive != 0 {
-            return 0; // no slave on this channel
-        }
-        // Reads/writes are synchronous → never BSY; DRQ while the sector buffer
-        // still has data to yield (read) or room to accept (write).
-        ST_DRDY | if self.pos < self.buf.len() { ST_DRQ } else { 0 }
-    }
-
-    /// IDENTIFY DEVICE: publish the geometry the guest needs. Only words 0, 49
-    /// and 60-61 matter to us — device type, LBA support, and the LBA28
-    /// capacity that sizes the disk.
-    fn identify(&mut self) {
-        let mut buf = vec![0u8; SECTOR];
-        let mut word = |n: usize, v: u16| buf[n * 2..n * 2 + 2].copy_from_slice(&v.to_le_bytes());
-        word(0, 0x0040); // non-removable ATA device
-        word(49, 0x0200); // LBA supported
-        let lba28 = self.sectors.min((1 << 28) - 1) as u32;
-        word(60, lba28 as u16);
-        word(61, (lba28 >> 16) as u16);
-        self.buf = buf;
-        self.pos = 0;
-    }
-
-    /// Begin a WRITE SECTORS: size the buffer to the request and assert DRQ so
-    /// the guest streams `count * 256` words in through the data port.
-    fn begin_write(&mut self) {
-        let count = if self.seccount == 0 { 256 } else { self.seccount as usize };
-        self.buf = vec![0u8; count * SECTOR];
-        self.pos = 0;
-        self.writing = true;
-    }
-
-    /// Accept one data word during a write; flush the whole buffer to the file
-    /// once the last word lands (mirrors `read_sectors`' seek+transfer).
-    fn write_data_word(&mut self, val: u32) {
-        if self.pos + 1 < self.buf.len() {
-            self.buf[self.pos] = val as u8;
-            self.buf[self.pos + 1] = (val >> 8) as u8;
-        }
-        self.pos = (self.pos + 2).min(self.buf.len());
-        if self.pos >= self.buf.len() && self.writing {
-            if self.file.seek(SeekFrom::Start(self.lba as u64 * SECTOR as u64)).is_ok() {
-                let _ = self.file.write_all(&self.buf);
-                let _ = self.file.flush();
-            }
-            self.buf.clear();
-            self.pos = 0;
-            self.writing = false;
-        }
-    }
-
-    fn read_sectors(&mut self) {
-        let count = if self.seccount == 0 { 256 } else { self.seccount as usize };
-        let mut buf = vec![0u8; count * SECTOR];
-        if self.file.seek(SeekFrom::Start(self.lba as u64 * SECTOR as u64)).is_ok() {
-            let mut filled = 0;
-            while filled < buf.len() {
-                match self.file.read(&mut buf[filled..]) {
-                    Ok(0) => break,
-                    Ok(n) => filled += n,
-                    Err(_) => break,
-                }
-            }
-        }
-        self.buf = buf;
-        self.pos = 0;
-    }
-
-    fn data_word(&mut self) -> u32 {
-        let lo = self.buf.get(self.pos).copied().unwrap_or(0) as u32;
-        let hi = self.buf.get(self.pos + 1).copied().unwrap_or(0) as u32;
-        self.pos = (self.pos + 2).min(self.buf.len());
-        lo | (hi << 8)
-    }
-}
-
-impl PortIo for Ata {
-    fn read(&mut self, port: u16, _width: u8) -> u32 {
-        if port == ATA_DATA {
-            self.data_word()
-        } else {
-            self.status() // status/alt-status and other registers report ready
-        }
-    }
-
-    fn write(&mut self, port: u16, _width: u8, val: u32) {
-        match port {
-            ATA_DATA if self.writing => self.write_data_word(val),
-            ATA_SECCOUNT => self.seccount = val as u8,
-            ATA_LBA_0_7 => self.lba = (self.lba & 0xFFFF_FF00) | (val & 0xFF),
-            ATA_LBA_8_15 => self.lba = (self.lba & 0xFFFF_00FF) | ((val & 0xFF) << 8),
-            ATA_LBA_16_23 => self.lba = (self.lba & 0xFF00_FFFF) | ((val & 0xFF) << 16),
-            ATA_LBA_24_27 => {
-                self.lba = (self.lba & 0x00FF_FFFF) | ((val & 0x0F) << 24);
-                self.drive = ((val >> 4) & 1) as u8;
-            }
-            ATA_STATUS_CMD if val == CMD_IDENTIFY => self.identify(),
-            ATA_STATUS_CMD if val == CMD_READ_SECTORS => self.read_sectors(),
-            ATA_STATUS_CMD if val == CMD_WRITE_SECTORS => self.begin_write(),
-            ATA_STATUS_CMD if val == CMD_CACHE_FLUSH => {} // synchronous writes: nothing buffered
-            _ => {} // features / other commands: no-op
-        }
-    }
-}
-
-/// Hook a host image file onto the primary ATA ports — `hdd::read_sectors`
-/// reads it and `hdd::write_sectors` writes it back through the interpreted
-/// PIO. Opened read-write so the backing-file overlay persists; falls back to
-/// read-only if the image isn't writable (writes then silently no-op, same as
-/// a write-protected disk).
-pub fn attach_disk(path: &str) -> std::io::Result<()> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .or_else(|_| File::open(path))?;
-    register(ATA_BASE, ATA_STATUS_CMD, Box::new(Ata::new(file)));
-    Ok(())
-}
-
-/// A second ATA channel supplies freshly built boot files alongside the data disk.
-struct SecondaryAta(Ata);
-impl PortIo for SecondaryAta {
-    fn read(&mut self, port: u16, width: u8) -> u32 {
-        self.0.read(port + 0x80, width)
-    }
-    fn write(&mut self, port: u16, width: u8, val: u32) {
-        self.0.write(port + 0x80, width, val);
-    }
-}
-
-pub fn attach_boot_disk(path: &str) -> std::io::Result<()> {
-    let file = File::open(path)?;
-    register(0x170, 0x177, Box::new(SecondaryAta(Ata::new(file))));
-    Ok(())
-}
-
 // ── QEMU fw_cfg (headless program selection) ────────────────────────────────
 //
 // `kernel::startup` reads `opt/cmdline` (which DOS program to run, then shut
@@ -354,7 +167,7 @@ impl PortIo for FwCfg {
 //
 // The kernel's sound layer (`kernel/src/kernel/sound.rs`) canonicalizes every
 // PCM source to signed-16 interleaved stereo and streams it here via `arch.outw`
-// on a private port window — the audio analogue of the ATA disk: a device below
+// on a private port window: a device below
 // the arch boundary, driven through ordinary port I/O, not a bespoke arch call.
 // The host side (where `std` lives) writes a RIFF/WAVE file so the produced
 // audio can be verified offline (e.g. the `modplay` MOD player).

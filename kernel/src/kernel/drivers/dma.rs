@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT: AtomicUsize = AtomicUsize::new(arch_abi::DEVICE_WINDOW_BASE);
 
-fn reserve(pages: usize) -> Option<usize> {
+pub(crate) fn reserve(pages: usize) -> Option<usize> {
     reserve_from(&NEXT, pages)
 }
 
@@ -141,12 +141,12 @@ impl Mmio {
 pub struct Region {
     pub va: usize,
     pub phys: u64,
-    bytes: usize,
+    pub(crate) bytes: usize,
 }
 
 // Return an aligned subrange and the unused prefix/suffix of an allocation.
 // All quantities are pages. The caller owns the whole raw allocation.
-fn aligned_span(first: u64, pages: usize, align: usize) -> Option<(u64, usize, usize)> {
+pub(crate) fn aligned_span(first: u64, pages: usize, align: usize) -> Option<(u64, usize, usize)> {
     if pages == 0 || !align.is_power_of_two() {
         return None;
     }
@@ -162,56 +162,6 @@ fn aligned_span(first: u64, pages: usize, align: usize) -> Option<(u64, usize, u
 impl Region {
     pub fn size_bytes(&self) -> usize {
         self.bytes
-    }
-
-    pub fn allocate<A: crate::Arch>(
-        machine: &mut A,
-        pages: usize,
-        address_bits: u32,
-    ) -> Option<Self> {
-        Self::allocate_aligned(machine, pages, 1, address_bits)
-    }
-
-    /// Physically align a DMA range; the CPU mapping only requires page alignment.
-    /// Unused padding is freed before the range is mapped or exposed to a device.
-    pub fn allocate_aligned<A: crate::Arch>(
-        machine: &mut A,
-        pages: usize,
-        alignment_pages: usize,
-        address_bits: u32,
-    ) -> Option<Self> {
-        if pages == 0 || !alignment_pages.is_power_of_two() {
-            return None;
-        }
-        let bytes = pages.checked_mul(crate::PAGE_SIZE)?;
-        let raw_pages = pages.checked_add(alignment_pages - 1)?;
-        let raw = crate::kernel::memory::alloc_contig(machine, raw_pages);
-        if raw == 0 {
-            return None;
-        }
-        let span = (|| {
-            let (page, prefix, suffix) = aligned_span(raw, pages, alignment_pages)?;
-            let phys = page.checked_mul(crate::PAGE_SIZE as u64)?;
-            let end = phys.checked_add(bytes as u64)?;
-            if address_bits < 64 && end > (1u64 << address_bits) {
-                return None;
-            }
-            let va = reserve(pages)?;
-            Some((page, prefix, suffix, phys, va))
-        })();
-        let Some((page, prefix, suffix, phys, va)) = span else {
-            crate::kernel::memory::free_contig(machine, raw, raw_pages);
-            return None;
-        };
-        if prefix != 0 {
-            crate::kernel::memory::free_contig(machine, raw, prefix);
-        }
-        if suffix != 0 {
-            crate::kernel::memory::free_contig(machine, page + pages as u64, suffix);
-        }
-        crate::kernel::memory::map_physical(machine, va >> 12, pages, page, 0);
-        unsafe { core::ptr::write_bytes(va as *mut u8, 0, bytes) };
-        Some(Self { va, phys, bytes })
     }
 
     /// # Safety

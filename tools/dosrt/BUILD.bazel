@@ -117,18 +117,16 @@ alias(
 )
 
 # ---- stub: Turbo C MZ EXE, compiled by running RetroOS on the interpreter ---
-# `interp_tcc.sh` stages source and output on a private ext4 volume.
+# `interp_tcc.sh` stages source and output on a private host directory.
 genrule(
     name = "stub_exe",
     srcs = [
         "stub/stub.c",
-        # Minimal dosrt-free boot image: booting //:image (which now
-        # bundles modplay_exe) here would be a build cycle.
-        "//:image_min",
+        "//:tc_tar",
     ],
     outs = ["STUB.EXE"],
     tools = ["interp_tcc.sh", ":interp_host"],
-    cmd = "$(location interp_tcc.sh) $(location :interp_host) $(location //:image_min) $(location stub/stub.c) $@",
+    cmd = "$(location interp_tcc.sh) $(location :interp_host) $(location //:tc_tar) $(location stub/stub.c) $@",
     # Packed onto by dosrt payloads (hello, //test/dos/modplay, …).
     visibility = ["//visibility:public"],
 )

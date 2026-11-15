@@ -150,7 +150,7 @@ fn probe_controller<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8,
         if !stopped(CR) { continue; }
         regs.write(port + CMD, regs.read(port + CMD) & !FRE);
         if !stopped(FR) { continue; }
-        let Some(dma) = Region::allocate(machine, 1 + BOUNCE_PAGES, address_bits) else { continue };
+        let Some(dma) = crate::kernel::platform::dma_buffer(machine, 1 + BOUNCE_PAGES, 1, address_bits) else { continue };
         regs.write64(port + CLB, dma.phys);
         regs.write64(port + FB, dma.phys + 0x400);
         regs.write(port + IE, 0);

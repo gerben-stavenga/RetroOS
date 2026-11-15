@@ -29,8 +29,7 @@ def main():
             shutil.copyfile(ROOT / f'bazel-bin/test/windows/win16/{name}.DLL', root / f'{name}.DLL')
         for program in ('bridge', 'window', 'fpmath', 'civ_apis', 'initializers', 'multimedia', 'mmio', 'text', 'clipping', 'dos_files'):
             shutil.copyfile(ROOT / f'bazel-bin/test/windows/win16/{program}.exe', root / 'BRIDGE.EXE')
-            process = subprocess.Popen(['python3', str(ROOT/'test/disk_fixture.py'), '--root', directory, '--',
-                str(ROOT/f'bazel-bin/kernel/{host}'), '--c-root', '/', '--cmd', '/BRIDGE.EXE probe' if program == 'window' else '/BRIDGE.EXE'],
+            process = subprocess.Popen([str(ROOT/f'bazel-bin/kernel/{host}'), '--c-root', '/', '--cmd', '/BRIDGE.EXE probe' if program == 'window' else '/BRIDGE.EXE', directory],
                 cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
             try:
                 log, _ = process.communicate(timeout=40)
@@ -46,9 +45,7 @@ def main():
         shutil.copyfile(ROOT / 'bazel-bin/test/windows/win16/bridge.exe', root / 'BRIDGE.EXE')
         (root / 'LAUNCH/SUBDIR').mkdir(parents=True)
         for cwd in ('/', '/LAUNCH/SUBDIR'):
-            result = subprocess.run(['python3', str(ROOT/'test/disk_fixture.py'), '--root', directory, '--',
-                str(ROOT/f'bazel-bin/kernel/{host}'), '--c-root', '/', '--cwd', cwd,
-                '--cmd', '/RETROOS/COMMAND.COM /C C:\\BRIDGE.EXE'],
+            result = subprocess.run([str(ROOT/f'bazel-bin/kernel/{host}'), '--c-root', '/', '--cwd', cwd, '--cmd', '/RETROOS/COMMAND.COM /C C:\\BRIDGE.EXE', directory],
                 cwd=ROOT, capture_output=True, text=True, timeout=40)
             log = result.stdout + result.stderr
             if result.returncode or 'WIN16 BRIDGE PASS' not in log or any(x in log for x in ('PANIC', 'SEGV', ' FAIL')):
@@ -58,8 +55,7 @@ def main():
         (system / 'USER.DLL').rename(system / 'USER.saved')
         # Failed launch leaves the desktop running. Bound this negative test
         # and terminate the fixture and guest together, without orphaning either.
-        process = subprocess.Popen(['python3', str(ROOT/'test/disk_fixture.py'), '--root', directory, '--',
-            str(ROOT/f'bazel-bin/kernel/{host}'), '--c-root', '/', '--cmd', '/BRIDGE.EXE'],
+        process = subprocess.Popen([str(ROOT/f'bazel-bin/kernel/{host}'), '--c-root', '/', '--cmd', '/BRIDGE.EXE', directory],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         try:
             log, _ = process.communicate(timeout=5)

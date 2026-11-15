@@ -292,7 +292,7 @@ def replay(machine, steps, directory):
     return checkpoints
 
 
-def prepare_disk(source, case, directory, support):
+def prepare_directory(source, case, directory, support):
     drive = directory / "c"
     shutil.copytree(source, drive)
     # RustDOS exposes its built-in Ultrasound software on a synthetic drive.
@@ -310,24 +310,16 @@ def prepare_disk(source, case, directory, support):
         path.write_bytes(bytes(data))
     runtime = drive / "RETROOS"
     runtime.mkdir(exist_ok=True)
-    for name in ("BOOT.INI", "RETROOS.INI"):
-        shutil.copyfile(ROOT / "etc" / name, runtime / name)
+    shutil.copyfile(ROOT / "etc/RETROOS.INI", runtime / "RETROOS.INI")
     shutil.copyfile(ROOT / "bazel-bin/tools/command/COMMAND.COM", runtime / "COMMAND.COM")
     # ConfigParser cannot represent command-only INI sections. Preserve the
     # lines verbatim rather than treating commands as option names.
     autoexec = case["ini"].split("[autoexec]\n", 1)[1]
     (drive / "SUITE.BAT").write_text("@echo off\n" + autoexec + "\necho RETROOS-SUITE-DONE\n")
-    image = directory / "c.img"
-    occupied = sum(p.stat().st_size for p in drive.rglob("*") if p.is_file())
-    with image.open("wb") as stream:
-        stream.truncate(max(64 * 1024 * 1024, occupied * 2 + 32 * 1024 * 1024))
-    with (directory / "format.log").open("wb") as log:
-        subprocess.run(["mkfs.ext4", "-q", "-F", "-d", str(drive), str(image)],
-                       stdout=log, stderr=log, check=True)
     manifest = {str(p.relative_to(drive)): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in sorted(drive.rglob("*")) if p.is_file()}
     (directory / "inputs.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    return image
+    return drive
 
 
 def run_case(case, game, args):
@@ -345,11 +337,11 @@ def run_case(case, game, args):
         source = installed(game, args.cache)
         if not source.is_dir():
             raise common.Failure(f"game not installed: {source}; run --fetch")
-        image = prepare_disk(source, case, directory,
+        drive = prepare_directory(source, case, directory,
                              args.reference_checkout / "crates/gus/assets/ultrasnd")
         command = [str(args.host_bin), "--suite-control", "--cmd", "RETROOS/COMMAND.COM /B SUITE.BAT",
                    "--cwd", "/", "--screenshot", str(directory / "screen.txt"),
-                   "--wav", str(directory / "audio.wav"), str(image)]
+                   "--wav", str(directory / "audio.wav"), str(drive)]
         cpu = config(case["ini"]).get("emulator", "cpu", fallback="486")
         if cpu in {"486", "pentium"}:
             command[1:1] = ["--suite-cpu", cpu]

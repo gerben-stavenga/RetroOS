@@ -17,8 +17,7 @@ def main():
         root = Path(directory)
         install(root)
         shutil.copyfile(ROOT / 'bazel-bin/test/windows/callbacks/wine_wave.exe', root / 'TEST.EXE')
-        result = subprocess.run(['python3', str(ROOT / 'test/disk_fixture.py'), '--root', directory, '--',
-            str(ROOT / 'bazel-bin/kernel' / host), '--c-root', '/', '--cmd', '/TEST.EXE'],
+        result = subprocess.run([str(ROOT / 'bazel-bin/kernel' / host), '--c-root', '/', '--cmd', '/TEST.EXE', directory],
             cwd=ROOT, capture_output=True, text=True, timeout=30)
         log = result.stdout + result.stderr
         if result.returncode or 'WAVE PASS' not in log or any(s in log for s in ('WAVE FAIL', 'PANIC', 'not implemented', 'SEGV')):

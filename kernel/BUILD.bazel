@@ -217,6 +217,22 @@ genrule(
 # Hosted entry binaries: link the SAME kernel rlib against arch-interp.
 # ============================================================================
 
+rust_library(
+    name = "hosted",
+    srcs = ["hosted.rs"],
+    crate_name = "hosted",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Crelocation-model=static"],
+    visibility = ["//visibility:public"],
+    deps = [":kernel", "@crates//:libc"],
+)
+
+rust_test(
+    name = "hosted_test",
+    crate = ":hosted",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests", "-Crelocation-model=static"],
+)
+
 rust_binary(
     name = "retroos-host",
     srcs = ["src/main.rs"],
@@ -229,6 +245,7 @@ rust_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":kernel",
+        ":hosted",
         "//arch-interp",
         "//lib",
         "//lib:vga",
@@ -248,6 +265,7 @@ rust_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":kernel",
+        ":hosted",
         "//arch-interp:arch-interp-kvm",
         "//lib",
         "//lib:vga",

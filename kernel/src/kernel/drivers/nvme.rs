@@ -153,7 +153,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     let registers = Mmio::map(machine, bar_phys, DOORBELL_BASE)?;
     let stride = 4usize << (registers.read(R_CAP_HI) & 0xF);
     let regs = Mmio::map(machine, bar_phys, DOORBELL_BASE + 3 * stride + 4)?;
-    let dma = Region::allocate(machine, DMA_PAGES, 64)?;
+    let dma = crate::kernel::platform::dma_buffer(machine, DMA_PAGES, 1, 64)?;
     let dma_phys = dma.phys;
 
     // Doorbell stride: CAP.DSTRD (bits 35:32), in units of 4 bytes.

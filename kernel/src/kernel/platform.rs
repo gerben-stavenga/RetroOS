@@ -692,3 +692,49 @@ pub fn init_user_tsc_clock(clock: Option<(u64, u64)>) {
 pub fn user_tsc_clock() -> Option<(u64, u64)> {
     USER_TSC_CLOCK.get().copied().flatten()
 }
+
+/// Allocate permanent PCI DMA storage during device setup. Native boot has
+/// already supplied the physical RAM map. Hosted has no PCI bus-master devices.
+/// This allocation does not depend on the active user address space.
+pub(crate) fn dma_pages(pages: usize) -> Option<u64> {
+    super::phys_mm::alloc_contig(pages)
+}
+
+/// Prepare a mapped DMA buffer before constructing the runtime device.
+/// The driver retains the result for the boot lifetime. Only failed setup and
+/// unused alignment padding are released, before hardware sees the buffer.
+pub(crate) fn dma_buffer<A: crate::Arch>(
+    machine: &mut A, pages: usize, alignment_pages: usize, address_bits: u32,
+) -> Option<super::drivers::dma::Region> {
+    use super::{drivers::dma::{self, Region}, phys_mm};
+    if pages == 0 || !alignment_pages.is_power_of_two() { return None; }
+    let bytes = pages.checked_mul(crate::PAGE_SIZE)?;
+    let raw_pages = pages.checked_add(alignment_pages - 1)?;
+    let raw = dma_pages(raw_pages)?;
+    let span = (|| {
+        let (page, prefix, suffix) = dma::aligned_span(raw, pages, alignment_pages)?;
+        let phys = page.checked_mul(crate::PAGE_SIZE as u64)?;
+        let end = phys.checked_add(bytes as u64)?;
+        if address_bits < 64 && end > (1u64 << address_bits) { return None; }
+        let va = dma::reserve(pages)?;
+        Some((page, prefix, suffix, phys, va))
+    })();
+    let Some((page, prefix, suffix, phys, va)) = span else {
+        phys_mm::free_phys_contig(raw, raw_pages);
+        return None;
+    };
+    if prefix != 0 { phys_mm::free_phys_contig(raw, prefix); }
+    if suffix != 0 { phys_mm::free_phys_contig(page + pages as u64, suffix); }
+    super::memory::map_physical(machine, va >> 12, pages, page, 0);
+    unsafe { core::ptr::write_bytes(va as *mut u8, 0, bytes) };
+    Some(Region { va, phys, bytes })
+}
+
+/// Reserve the final physical channels once wiring is settled. The card carries
+/// these buffers through mixer/DOS ownership changes; runtime only looks up data.
+pub(crate) fn prepare_sb_dma(card: &mut super::drivers::sb16::Sb16) {
+    let low = super::phys_mm::dma_channel_buf(usize::from(card.dma8));
+    let high = card.dma16.map_or(0, |channel| super::phys_mm::dma_channel_buf(usize::from(channel)));
+    card.set_dma_buffers(low, high);
+    crate::compact_println!("Audio: ISA DMA pages DMA{}={:#x} HDMA={:#x}", card.dma8, low, high);
+}

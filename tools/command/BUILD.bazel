@@ -9,18 +9,16 @@ exports_files(
 )
 
 # `-mt -lt`: tiny model + TLINK /t → a .COM image (the same flags the boot
-# self-build used). Builds on //:image_min, which carries the bare kernel
-# (no embedded bootfs) — that is what keeps image → bootfs → COMMAND.COM →
-# image_min acyclic.
+# self-build used). The compiler archive is extracted into a host directory.
 genrule(
     name = "command_com",
     srcs = [
         "command.c",
-        "//:image_min",
+        "//:tc_tar",
     ],
     outs = ["COMMAND.COM"],
     tools = ["//tools/dosrt:interp_tcc.sh", "//tools/dosrt:interp_host"],
     cmd = "$(location //tools/dosrt:interp_tcc.sh) $(location //tools/dosrt:interp_host) " +
-          "$(location //:image_min) $(location command.c) $@ -mt -lt",
+          "$(location //:tc_tar) $(location command.c) $@ -mt -lt",
     visibility = ["//visibility:public"],
 )

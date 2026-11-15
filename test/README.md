@@ -117,10 +117,9 @@ BIOS covers both 386 and 686 CPU configurations; UEFI covers x64. CI publishes t
 all required checks pass. `dpmi_hdpmi_pvi` is a local reference test requiring
 an installed FreeDOS disk; it is optional in CI.
 
-Hosted tests that need writable fixture files use `test/disk_fixture.py`.
-It creates a private ext4 disk with explicit BOOT.INI mounts and copies guest
-changes back after exit. This requires `mkfs.ext4` and `debugfs`; it does not
-mount a host directory inside the kernel. Live network-sharing tests use SMB.
+Hosted tests pass their temporary directory directly to `retroos-host` or
+`retroos-host-kvm`. Guest reads and writes use the host filesystem immediately;
+there is no image preparation or copy-back. Live network-sharing tests use SMB.
 
 `bazelisk test //tests:arch_smp` boots the small `//arch-metal:smp_example` kernel on
 four CPUs in legacy and PAE modes. It checks the common BSP/AP Rust entry,

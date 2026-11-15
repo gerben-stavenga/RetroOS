@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-IMG=bazel-bin/image.bin
+ROOT_DIR=$(mktemp -d /tmp/retroos-diff-root.XXXXXX)
 TCG=bazel-bin/kernel/retroos-host
 KVM=bazel-bin/kernel/retroos-host-kvm
 
@@ -20,10 +20,14 @@ fi
 
 shot_tcg=$(mktemp /tmp/retroos-diff-tcg.XXXX.txt)
 shot_kvm=$(mktemp /tmp/retroos-diff-kvm.XXXX.txt)
-trap 'rm -f "$shot_tcg" "$shot_kvm"' EXIT
+trap 'rm -f "$shot_tcg" "$shot_kvm"; rm -rf "$ROOT_DIR"' EXIT
 
 boot() { # boot <host-bin> <shot-file>
-    python3 test/hosted_test.py --host-bin "$1" --image "$IMG" --keys "" \
+    local directory="$ROOT_DIR/$(basename "$1")"
+    mkdir "$directory"
+    tar -xf bazel-bin/root_module_base_tar.tar -C "$directory"
+    chmod -R u+w "$directory"
+    python3 test/hosted_test.py --host-bin "$1" --directory "$directory" --keys "" \
         --settle 12 --timeout 25 --screenshot "$2" \
         --expect-screen "free bytes on drive"
 }

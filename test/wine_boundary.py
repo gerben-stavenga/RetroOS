@@ -39,8 +39,7 @@ def main():
         shutil.copyfile(ROOT / "bazel-bin/test/windows/ntdll/portable.exe", probe_dir / "PROBE.EXE")
         for name in ("FORWARD.DLL", "RELAY.DLL"):
             shutil.copyfile(ROOT / "bazel-bin/test/windows/ntdll" / name, probe_dir / name)
-        process = subprocess.Popen(["python3", str(ROOT / "test/disk_fixture.py"), "--root", directory,
-            "--", str(ROOT / f"bazel-bin/kernel/{host}"), "--c-root", "/", "--cmd", "/PROBE/PROBE.EXE"],
+        process = subprocess.Popen([str(ROOT / f"bazel-bin/kernel/{host}"), "--c-root", "/", "--cmd", "/PROBE/PROBE.EXE", directory],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             stdout, stderr = process.communicate(timeout=30)

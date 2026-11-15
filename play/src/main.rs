@@ -1,6 +1,6 @@
-//! retroos-play — boot a RetroOS disk image with a live SDL window.
+//! retroos-play — boot a host directory with a live SDL window.
 //!
-//!   ./run.sh hosted -i proprietary \
+//!   ./run.sh hosted --directory /path/to/root \
 //!       --cmd "GAMES/SKYROADS/SKYROADS.EXE" --cwd "GAMES/SKYROADS/"
 //!
 //! Threading: the SDL window (event pump + present) owns the MAIN thread; the
@@ -14,11 +14,12 @@
 mod display;
 
 use retroos_arch_interp as arch;
+use kernel::kernel::vfs::Filesystem;
 use std::io::Write;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: retroos-play DISK_IMAGE [--cmd \"PROG ARGS\"] [--cwd DIR] [--wav FILE]"
+        "usage: retroos-play DIRECTORY [--cmd \"PROG ARGS\"] [--cwd DIR] [--wav FILE]"
     );
     std::process::exit(2);
 }
@@ -30,25 +31,23 @@ fn log_byte(b: u8) {
 }
 
 fn main() {
-    let mut boot_disk: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut c_root: Option<String> = None;
     let mut wav: Option<String> = None;
-    let mut image: Option<String> = None;
+    let mut directory: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--boot-disk" => boot_disk = args.next(),
             "--cmd" => cmd = args.next(),
             "--cwd" => cwd = args.next(),
             "--c-root" => c_root = args.next(),
             "--wav" => wav = args.next(),
-            _ if image.is_none() && !a.starts_with('-') => image = Some(a),
+            _ if directory.is_none() && !a.starts_with('-') => directory = Some(a),
             _ => usage(),
         }
     }
-    if image.is_none() {
+    if directory.is_none() {
         usage();
     }
 
@@ -62,13 +61,8 @@ fn main() {
     std::thread::spawn(move || {
         kernel::host_console_init();
         // Inject the interp backend into the backend-agnostic kernel: the port
-        // I/O hooks (the deep driver call sites — `hdd::probe`, the vPIC/PIT —
-        // reach the interp's port bus through these, never via `&mut Arch`) and
-        // the host-environment facts the platform probe reads. `retroos-host`
-        // does the identical injection in `install_hosted_backend`; without it
-        // the port hooks stay `NONE`, `hdd::probe` reads garbage, and the disk
-        // is never detected (Diskless — and with no root there is no C:\RETROOS,
-        // so no shell either).
+        // I/O hooks and the host-environment facts the platform probe reads.
+        // Storage is supplied directly as host directories below.
         kernel::install_portio(kernel::PortIo {
             now_ns: arch::now,
             inb: arch::inb,
@@ -111,18 +105,11 @@ fn main() {
             arch::attach_audio(path); // canonical audio → WAV (offline check)
         }
         arch::init_guest_ram(0);
-        if let Some(path) = &boot_disk {
-            arch::attach_boot_disk(path).unwrap_or_else(|e| {
-                eprintln!("cannot attach boot disk {path}: {e}");
-                std::process::exit(1);
-            });
-        }
-        if let Some(image) = &image {
-            arch::attach_disk(image).unwrap_or_else(|e| {
-                eprintln!("retroos-play: cannot attach disk {image}: {e}");
-                std::process::exit(1);
-            });
-        }
+        let root = hosted::HostFs::new(directory.as_deref().unwrap_or(".")).unwrap_or_else(|e| {
+            eprintln!("cannot open host directory: {e}");
+            std::process::exit(1);
+        });
+
         let mut config = kernel::BootConfig::empty();
         config.is_qemu = true; // no real VGA raster: fabricate 0x3DA, like QEMU
         if let Some(c) = &cmd {
@@ -131,11 +118,9 @@ fn main() {
         if let Some(c) = &cwd {
             config.set_cwd(c.as_bytes());
         }
-        if let Some(c) = &c_root {
-            config.set_c_root(c.as_bytes());
-        }
+        config.set_c_root(c_root.as_deref().unwrap_or(if root.dir_exists(b"home/retroos") { "/home/retroos" } else { "/" }).as_bytes());
         let mut machine = arch::Interp;
-        kernel::startup(&mut machine, &config);
+        kernel::startup(&mut machine, &config, kernel::kernel::startup::Storage::Root(Box::leak(Box::new(root))));
     });
 
     display::run() // main thread: SDL loop; exits the process on window close

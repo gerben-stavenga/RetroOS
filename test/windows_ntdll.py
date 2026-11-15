@@ -21,8 +21,7 @@ def main():
         shutil.copyfile(ROOT / "bazel-bin/test/windows/ntdll/probe.exe", root / "PROBE.EXE")
         for name in ("FORWARD.DLL", "RELAY.DLL", "LAZY.DLL", "INITDEP.DLL", "REJECT.DLL"):
             shutil.copyfile(ROOT / "bazel-bin/test/windows/ntdll" / name, root / name)
-        result = subprocess.run(["python3", str(ROOT / "test/disk_fixture.py"), "--root", directory,
-            "--", str(ROOT / f"bazel-bin/kernel/{host}"), "--c-root", "/", "--cmd", "/PROBE.EXE"],
+        result = subprocess.run([str(ROOT / f"bazel-bin/kernel/{host}"), "--c-root", "/", "--cmd", "/PROBE.EXE", directory],
             cwd=ROOT, capture_output=True, text=True, timeout=30)
         log = result.stdout + result.stderr
         if result.returncode or "NTDLL PASS" not in log or any(x in log for x in ("PANIC", "SEGV", "NTDLL FAIL")):

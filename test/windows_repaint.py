@@ -23,11 +23,7 @@ def main():
         system.mkdir(parents=True)
         install_windows_runtime(root)
         shutil.copyfile(ROOT / "bazel-bin/test/windows/callbacks/repaint.exe", root / "REPAINT.EXE")
-        machine = Machine([
-            "python3", str(ROOT / "test/disk_fixture.py"), "--root", str(root), "--",
-            str(ROOT / "bazel-bin/kernel" / target), "--input-control",
-            "--screenshot", str(work / "screen.txt"), "--c-root", "/", "--cmd", "/REPAINT.EXE",
-        ], work, 45)
+        machine = Machine([str(ROOT / "bazel-bin/kernel" / target), "--input-control", "--screenshot", str(work / "screen.txt"), "--c-root", "/", "--cmd", "/REPAINT.EXE", str(root)], work, 45)
         try:
             for _ in range(80 if engine == "tcg" else 20):
                 machine.run(250)

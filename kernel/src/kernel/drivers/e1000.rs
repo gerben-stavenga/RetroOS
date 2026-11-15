@@ -4,7 +4,7 @@
 //! https://github.com/qemu/qemu/blob/master/hw/net/e1000x_regs.h
 //! https://www.intel.com/content/dam/doc/datasheet/82574l-gbe-controller-datasheet.pdf
 
-use super::dma::{Mmio, Region};
+use super::dma::Mmio;
 use crate::kernel::{net::EthernetDevice, pci, portio};
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
@@ -47,10 +47,10 @@ struct Ring {
 }
 impl Ring {
     fn allocate<A: crate::Arch>(machine: &mut A) -> Option<Self> {
-        let memory = Region::allocate(
+        let memory = crate::kernel::platform::dma_buffer(
             machine,
             (PACKETS + DEPTH * BUFFER).div_ceil(crate::PAGE_SIZE),
-            64,
+            1, 64,
         )?;
         Some(Self {
             va: memory.va,

@@ -30,7 +30,7 @@ def main():
             ('COMMAND.COM /C CHECK.BAT', 2),
         ):
             result = subprocess.run(
-                ['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', tmp, '--', 'bazel-bin/kernel/retroos-host', '--cmd', command],
+                ['bazel-bin/kernel/retroos-host', '--cmd', command, tmp],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, timeout=60)
             output = result.stdout.decode(errors='replace')

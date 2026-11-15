@@ -17,7 +17,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="retroos-rmexception-") as directory:
         shutil.copyfile(ROOT / "bazel-bin/test/dos/rmexception/RMEXCEPT.COM",
                         Path(directory) / "RMEXCEPT.COM")
-        result = subprocess.run(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', directory, '--', str(ROOT / "bazel-bin/kernel" / target), "--c-root", "/", "--cmd", "/RMEXCEPT.COM"], cwd=ROOT, capture_output=True, text=True, timeout=30)
+        result = subprocess.run([str(ROOT / "bazel-bin/kernel" / target), "--c-root", "/", "--cmd", "/RMEXCEPT.COM", directory], cwd=ROOT, capture_output=True, text=True, timeout=30)
         log = result.stdout + result.stderr
         if (result.returncode != 0 or "RMEXCEPT PASS" not in log
                 or any(marker in log for marker in

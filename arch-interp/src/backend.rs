@@ -131,16 +131,6 @@ impl Memory for Interp {
         crate::calls::arch_map_kernel_physical(vpage_start, num_pages, ppage_start, flags)
     }
 
-    fn alloc_phys_contig(&mut self, num_pages: usize) -> u64 {
-        crate::calls::arch_alloc_phys_contig(num_pages)
-    }
-
-    fn free_phys_contig(&mut self, start_page: u64, num_pages: usize) {
-        crate::calls::arch_free_phys_contig(start_page, num_pages)
-    }
-
-    fn dma_channel_buf(&self, ch: usize) -> u64 { crate::calls::arch_dma_channel_buf(ch) }
-
     fn free_page_count(&self) -> usize { crate::machine::free_page_count() }
 
     fn total_page_count(&self) -> Option<usize> { Some(crate::phys::PHYS_SIZE / 4096 - 1) }

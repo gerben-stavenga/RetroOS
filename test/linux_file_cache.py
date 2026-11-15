@@ -67,11 +67,24 @@ def main():
         # The interpreter's shared frames are distinct from ordinary heap
         # allocations, so exercise promotion and release there as well.
         log = ROOT / 'build/ci/file-cache-hosted.log'
-        with log.open('w') as output:
-            result = subprocess.run(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', str(work / 'root'), '--', str(ROOT / 'bazel-bin/kernel/retroos-host-kvm'), '--cmd', '/home/retroos/probe', '--cwd', '/home/retroos'], stdin=subprocess.DEVNULL,
-                stdout=output, stderr=subprocess.STDOUT, timeout=90)
-        assert result.returncode == 0 and '[mem] exit tid=1 code=0' in log.read_text(), log.read_text()[-4000:]
-        print('PASS: hosted file cache and architecture frame promotion', flush=True)
+        (home / 'cache-ready').unlink(missing_ok=True)
+        (home / 'cache-external').write_bytes(b'original')
+        stop.clear()
+        changed.clear()
+        thread = threading.Thread(target=writer)
+        thread.start()
+        try:
+            with log.open('w') as output:
+                result = subprocess.run([str(ROOT / 'bazel-bin/kernel/retroos-host-kvm'),
+                    '--cmd', '/home/retroos/probe external', '--cwd', '/home/retroos',
+                    str(work / 'root')], stdin=subprocess.DEVNULL,
+                    stdout=output, stderr=subprocess.STDOUT, timeout=90)
+            assert result.returncode == 0 and '[mem] exit tid=1 code=0' in log.read_text(), log.read_text()[-4000:]
+            assert changed.is_set(), 'host filesystem writer did not run'
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+        print('PASS: host filesystem freshness, file cache and architecture frame promotion', flush=True)
 
 
 if __name__ == '__main__':

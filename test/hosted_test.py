@@ -71,8 +71,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cmd", help="DOS program to launch headless (else boots to DN)")
     ap.add_argument("--cwd", help="working directory on the guest disk")
-    ap.add_argument("--image", default="bazel-bin/image.bin",
-                    help="disk image (default: the open-source image)")
+    ap.add_argument("--directory", default="build/hosted-root",
+                    help="host directory to mount as root")
     ap.add_argument("--keys", default="",
                     help="comma-separated key script, e.g. 'DOWN,wait:1,ENTER'")
     ap.add_argument("--settle", type=float, default=2.0,
@@ -101,9 +101,6 @@ def main():
         sys.exit(f"hosted_test: {host_bin} not built — "
                  "declare the hosted binary on the Bazel test target")
 
-    # IMPORTANT: retroos-host treats the FIRST positional as the disk image and
-    # slurps every following arg into the guest program's argv — so all flags
-    # MUST come before the image path.
     shot = args.screenshot or "/tmp/retroos-hosted-shot.txt"
     # A stale screenshot from a previous run must never satisfy --expect-screen
     # (it once masked a binary that crashed on startup).
@@ -113,7 +110,7 @@ def main():
     if args.cmd:
         cmdline += ["--cmd", args.cmd]
         cmdline += ["--cwd", args.cwd or (os.path.dirname(args.cmd) + "/")]
-    cmdline.append(args.image)
+    cmdline.append(args.directory)
 
     # Drive keys on stdin; capture the kernel log from stderr (the 0xE9 sink).
     proc = subprocess.Popen(cmdline, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,

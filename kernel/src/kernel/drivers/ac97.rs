@@ -4,10 +4,8 @@
 //! (`dos/machine/vsb.rs`) produces canonical PCM and the kernel `sound` layer
 //! needs somewhere to play it. This driver is that sink on metal: `sound::play`
 //! dispatches here when [`probe`] discovered a codec at boot (PCI class 04:01).
-//! It uses only machine *primitives* — 32-bit port I/O (`inl`/`outl`, for PCI
-//! config + the AC'97 bus-master registers), `alloc_phys_contig` (a dedicated
-//! contiguous DMA buffer), and `map_phys_range` (to map that buffer into kernel
-//! space) — never any machine-side driver logic.
+//! Port I/O controls PCI and bus-master registers. Platform setup supplies
+//! the dedicated contiguous DMA backing and the driver maps it into kernel space.
 //!
 //! ## DMA buffer (TEMPORARY placement — see the load-bearing note below)
 //!
@@ -155,7 +153,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     // Map a dedicated PCI DMA buffer into the stolen low-mem window VA so the
     // kernel can write PCM into it; the codec reads it by physical address.
     let pages = (BDL_BYTES + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
-    let phys_page = crate::kernel::memory::alloc_contig(machine, pages);
+    let phys_page = crate::kernel::platform::dma_pages(pages).unwrap_or(0);
     if phys_page == 0 {
         return None;
     }

@@ -9,12 +9,19 @@ use crate::kernel::{
     vfs,
 };
 
+/// Storage supplied by platform setup: native devices or an already-open root.
+pub enum Storage {
+    Disks(alloc::vec::Vec<&'static dyn crate::kernel::block::Disk>),
+    Root(&'static dyn vfs::Filesystem),
+}
+
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
 /// Each phase is a named function below; this stays short enough to read as
 /// the boot story. Called from enter_ring1 — we are already at ring 1.
-pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
+pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig,
+    storage: Storage) -> ! {
     let mut state = core::mem::MaybeUninit::<StartupState<A>>::uninit();
-    prepare_startup(machine, boot, &mut state);
+    prepare_startup(machine, boot, storage, &mut state);
     let StartupState {
         ref master_env,
         ref mut bios_workspace,
@@ -55,6 +62,7 @@ struct StartupState<A: crate::Arch> {
 fn prepare_startup<A: crate::Arch>(
     machine: &mut A,
     boot: &crate::BootConfig,
+    storage: Storage,
     out: &mut core::mem::MaybeUninit<StartupState<A>>,
 ) {
     super::platform::init_user_tsc_clock(boot.user_tsc_clock);
@@ -76,8 +84,6 @@ fn prepare_startup<A: crate::Arch>(
     let early_config = modules.boot_config.as_ref().map(|bytes|
         crate::kernel::mount_config::Config::parse_boot(bytes)
             .unwrap_or_else(|e| lib::compact_panic!("BOOT.INI: {}", e)));
-    let disks = discover_disks(machine);
-
     // Probe the machine ONCE and freeze the result; all hardware policy
     // (VGA passthrough, BIOS choice, audio, console, IOPB) derives from this.
     // It no longer touches storage — the mount decision is made below, from
@@ -95,7 +101,6 @@ fn prepare_startup<A: crate::Arch>(
     let mut screen = select_display(machine, &mut bios_workspace, display);
     screen.present(machine, &mut bios_workspace);
 
-    let disks = apply_disk_policy(disks, boot.ram_overlay, &mut screen);
     // The thread table is a plain owned Vec now (fixed MAX_THREADS slots,
     // reused) — startup owns it and threads `&mut threads` down through run →
     // run_program → event_loop. No global; no `&'static mut`.
@@ -103,14 +108,21 @@ fn prepare_startup<A: crate::Arch>(
     crate::compact_screenln!(&mut screen, "Threading initialized");
     screen.present(machine, &mut bios_workspace);
 
-    prepare_storage(
-        machine,
-        boot,
-        disks,
-        BootMounts { modules, config: early_config },
-        &mut screen,
-        &mut bios_workspace,
-    );
+    match storage {
+        Storage::Disks(disks) => {
+            let disks = apply_disk_policy(disks, boot.ram_overlay, &mut screen);
+            prepare_storage(machine, boot, disks, BootMounts { modules, config: early_config },
+                &mut screen, &mut bios_workspace);
+        }
+        Storage::Root(root) => {
+            vfs::mount(b"", root);
+            crate::kernel::dos::set_c_root(boot.c_root());
+            crate::kernel::dos::configure_drive(b'C', crate::kernel::dos::c_root());
+            mount_kernel_log_fs();
+            crate::kernel::fs::cdrom::init();
+            crate::kernel::fs::floppy::init();
+        }
+    }
     screen.present(machine, &mut bios_workspace);
 
     let PreparedAudio {
@@ -225,11 +237,6 @@ fn prepare_audio<A: crate::Arch>(
     // "correcting" it would break the games whose own configs agree with
     // RETROOS.INI.
     let mut sb_card = sb_card;
-    if sb_card.is_some() {
-        crate::compact_println!(
-            "Audio: ISA DMA buffer pages ch1={:#x} ch5={:#x} (0 means unavailable)",
-            crate::kernel::memory::dma_channel(machine, 1), crate::kernel::memory::dma_channel(machine, 5));
-    }
     if platform.audio == crate::kernel::platform::Audio::NativeSb
         && let Some(card) = sb_card.as_mut()
     {
@@ -314,6 +321,9 @@ fn prepare_audio<A: crate::Arch>(
     // the card travels — into whichever DOS thread holds the console, and back
     // out when that thread gives up focus or exits, exactly as the display
     // token does.
+    if let Some(card) = sb_card.as_mut() {
+        crate::kernel::platform::prepare_sb_dma(card);
+    }
     let for_sink = matches!(platform.audio,
         crate::kernel::platform::Audio::SbSink
             | crate::kernel::platform::Audio::EmulatedHda)
@@ -397,23 +407,6 @@ fn start_serial_control<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfi
     } else {
         crate::compact_println!("serial-control: {:?} unavailable", port);
     }
-}
-
-/// Discover physical disks without letting controller-specific probe and
-/// cleanup paths become part of the startup conductor.
-#[inline(never)]
-fn discover_disks<A: crate::Arch>(
-    machine: &mut A,
-) -> alloc::vec::Vec<&'static dyn crate::kernel::block::Disk> {
-    let disks = crate::kernel::block::probe(machine);
-    for disk in &disks {
-        crate::compact_println!("Storage: {} ({} MB)", disk.name(), disk.sectors() / 2048);
-    }
-    if disks.is_empty() {
-        crate::compact_println!("Storage: none detected");
-    }
-    crate::compact_println!("Block devices initialized");
-    disks
 }
 
 /// Freeze the machine facts before any subsystem derives policy from them.

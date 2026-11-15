@@ -7,7 +7,8 @@ cd "$SCRIPT_DIR"
 usage() {
     cat <<'HELP'
 Usage: ./run.sh [qemu|bochs|86box|unipcemu|rust-dos|rust-dos-games|hosted] [options] [-- emulator arguments]
-  --data-image PATH       Persistent disk (default: build/data.bin)
+  --data-image PATH       Persistent disk for VM backends (default: build/data.bin)
+  --directory PATH        Hosted filesystem root (default: build/hosted-root)
   --firmware bios|uefi    Default: UEFI for QEMU, BIOS elsewhere
   --freedos               Boot FreeDOS from the same data disk (BIOS only)
   --arch 386|686|x64      CPU selection (default: 386, UniPCemu: 686)
@@ -23,7 +24,7 @@ Usage: ./run.sh [qemu|bochs|86box|unipcemu|rust-dos|rust-dos-games|hosted] [opti
   --screenshot, -s PATH   Hosted screenshot
   --trace, -t             Hosted instruction trace
 
-The boot image is built on every launch. The data image is built and copied
+Hosted reads and writes --directory directly. VM boot images are built on every launch. The data image is built and copied
 only when missing; subsequent launches use it directly, preserving writes.
 rust-dos-games instead builds a disposable FAT16 C: from the packaged files;
 changes made in that mode are discarded when it exits.
@@ -39,6 +40,7 @@ fail() { echo "run.sh: $*" >&2; exit 1; }
 BACKEND=qemu FIRMWARE= SOUND= ARCH=386 ARCH_EXPLICIT=0 FREEDOS=0 HEADLESS=0 KVM=0
 COMMAND= WAV= SHOT= TRACE=0 SB_AUDIO= HD=
 NETWORK= LIVE=auto DATA_EXPLICIT=0
+HOST_DIRECTORY="${RETROOS_HOST_DIRECTORY:-$SCRIPT_DIR/build/hosted-root}"
 LIVE_PROFILE="${RETROOS_QEMU_LIVE_PROFILE:-$SCRIPT_DIR/build/qemu-live.json}"
 [ -z "${RETROOS_DATA_IMAGE:-}" ] || DATA_EXPLICIT=1
 DATA_IMAGE="${RETROOS_DATA_IMAGE:-$SCRIPT_DIR/build/data.bin}"
@@ -50,10 +52,11 @@ esac
 while [ $# -gt 0 ]; do
     case "$1" in
         --help) usage; exit 0 ;;
-        --backend|--data-image|--firmware|--arch|--hd|--sound|--net|--sb-audio|--cmd|-c|-r|--wav|-w|--screenshot|-s)
+        --backend|--directory|--data-image|--firmware|--arch|--hd|--sound|--net|--sb-audio|--cmd|-c|-r|--wav|-w|--screenshot|-s)
             [ $# -ge 2 ] || fail "$1 needs a value"
             case "$1" in
                 --backend) BACKEND="$2" ;; --data-image) DATA_IMAGE="$2"; DATA_EXPLICIT=1 ;;
+                --directory) HOST_DIRECTORY="$2" ;;
                 --firmware) FIRMWARE="$2" ;;
                 --hd) HD="$2" ;;
                 --arch) ARCH="$2"; ARCH_EXPLICIT=1 ;;
@@ -146,8 +149,20 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 run_vm() { "$@" <&0 & VM_PID=$!; local status=0; wait "$VM_PID" || status=$?; VM_PID=; return "$status"; }
 
-# Build outputs never serve as the writable disk. Publish a complete seed once.
-if [ "$BACKEND" = rust-dos-games ]; then
+# Hosted mounts an ordinary persistent directory; VM backends use disks.
+if [ "$BACKEND" = hosted ]; then
+    [ "$DATA_EXPLICIT" = 0 ] || fail "hosted uses --directory, not --data-image"
+    HOST_DIRECTORY=$(realpath -m "$HOST_DIRECTORY")
+    if [ ! -e "$HOST_DIRECTORY" ]; then
+        build_artifacts //:root_module_base_tar //:root_module_showcase_tar
+        mkdir -p "$HOST_DIRECTORY"
+        tar -xf bazel-bin/root_module_base_tar.tar -C "$HOST_DIRECTORY"
+        tar -xf bazel-bin/root_module_showcase_tar.tar -C "$HOST_DIRECTORY"
+        chmod -R u+w "$HOST_DIRECTORY"
+    fi
+    [ -d "$HOST_DIRECTORY" ] || fail "not a directory: $HOST_DIRECTORY"
+    echo "Host filesystem: $HOST_DIRECTORY"
+elif [ "$BACKEND" = rust-dos-games ]; then
     GAMES_TARGET=rust_dos_games_disk
     [ ! -d apps-proprietary ] || GAMES_TARGET=rust_dos_games_disk_proprietary
     build_artifacts "//:$GAMES_TARGET"

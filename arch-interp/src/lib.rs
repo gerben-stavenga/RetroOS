@@ -87,13 +87,12 @@ pub use vcpu::{mem, GuestMem, Vcpu, REGS};
 // Interpreter-specific host bring-up (not part of the metal surface):
 // `init_guest_ram` creates the initial address space; `new_space` allocates a
 // fresh one (until the kernel's thread/fork path drives this in M4);
-// `attach_disk` backs the interpreted ATA ports with a host image file.
 pub use vcpu::init_guest_ram;
 pub use mmu::new_space;
 // Platform device composition (the hosted `main` hooks ports): the PortIo trait
 // + `register` for custom devices, and convenience hooks for the built-ins.
 pub use devices::{
-    attach_audio, attach_boot_disk, attach_disk, attach_fw_cfg, register, register_debugcon,
+    attach_audio, attach_fw_cfg, register, register_debugcon,
     register_debugcon_file, register_rtc, PortIo,
 };
 // Native socket backend (hosted "punch-through"): `install_native_sockets`

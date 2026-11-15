@@ -98,6 +98,7 @@ pkg_tar(
 
 pkg_tar(
     name = "tc_tar",
+    visibility = ["//tools/command:__pkg__", "//tools/dosrt:__pkg__"],
     files = {":" + s: "TC/" + s[len("showcase-bundle/TC/"):].upper() for s in _TC_SRCS},
 )
 

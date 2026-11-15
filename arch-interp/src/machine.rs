@@ -42,7 +42,7 @@ pub fn clean_fx_template() -> FxState {
 // ── Port I/O ───────────────────────────────────────────────────────────────
 //
 // On metal these reach real hardware. The interpreter routes them to its device
-// layer (`devices.rs`) — e.g. the ATA disk — so the kernel's own port I/O (the
+// layer (`devices.rs`), so the kernel's own port I/O (the
 // `hdd.rs` PIO disk driver) works and `kernel::startup()` runs unchanged. Ports
 // with no device behind them read the ISA "no device" value 0xFF and drop
 // writes. (Guest-side IN/OUT is a different path — it surfaces as a

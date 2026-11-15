@@ -368,7 +368,10 @@ regeneration instructions are in [lib/fonts/uni-vga](lib/fonts/uni-vga/README.md
 Host-directory sharing uses authenticated SMB mounts configured in
 `RETROOS/RETROOS.INI`; see [SMB network mounts](BOOTING.md#smb-network-mounts).
 The deprecated `--host DIR` launcher shortcut and serial file-sharing backend
-setup have been removed. Both QEMU and hosted launches use the disk images.
+setup have been removed. Hosted mounts a host directory directly through VFS:
+`./run.sh hosted --directory /path/to/root`. With no directory specified, the
+launcher seeds `build/hosted-root` once from the packaged files. Changes persist
+immediately in that directory. QEMU uses disks or configured SMB mounts.
 `--cmd` is supported on QEMU and hosted; the launcher does not inject
 temporary commands or serial settings into the persistent disk.
 The old `-i` image modes, installer flow, and `--gpt` assembly are removed.

@@ -66,24 +66,6 @@ pub fn arch_set_tls_entry(index: i32, base: u32, limit: u32, _limit_in_pages: bo
     crate::desc::set_tls_entry(index, base, limit)
 }
 
-/// Allocate physically contiguous DMA pages; returns start page or 0.
-pub fn arch_alloc_phys_contig(num_pages: usize) -> u64 {
-    // The phys backing is a sparse memfd with a bump allocator.
-    crate::phys::alloc_frames(num_pages)
-}
-
-/// Free a contiguous run from `arch_alloc_phys_contig`.
-pub fn arch_free_phys_contig(start_page: u64, num_pages: usize) {
-    crate::phys::free_frames(start_page, num_pages);
-}
-
-/// Physical page of DMA channel `ch`'s permanent ISA-DMA buffer (0 = none).
-pub fn arch_dma_channel_buf(_ch: usize) -> u64 {
-    // Hosted execution has no physical ISA DMA pool. Return the Arch
-    // contract's "unavailable" value; inline mixing reads active guest RAM.
-    0
-}
-
 /// Re-arm a deferred-ack IRQ line. (M2 virtual device layer)
 pub fn arch_isa_unmask_irq(line: u8) {
     unimplemented!("M2: virtual IRQ rearm")

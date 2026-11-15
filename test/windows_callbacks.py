@@ -23,10 +23,7 @@ def main():
         for program in ("callbacks", "dynamic", "lifecycle", "messages", "events", "regions", "bitmap_profile", "frame", "popup", "multimedia", "mmio", "text"):
             shutil.copyfile(ROOT / f"bazel-bin/test/windows/callbacks/{program}.exe", root / "CALLBACK.EXE")
             try:
-                result = subprocess.run([
-                    "python3", str(ROOT / "test/disk_fixture.py"), "--root", directory, "--",
-                    str(ROOT / "bazel-bin/kernel" / target), "--c-root", "/", "--cmd", "/CALLBACK.EXE",
-                ], cwd=ROOT, capture_output=True, text=True, timeout=30)
+                result = subprocess.run([str(ROOT / "bazel-bin/kernel" / target), "--c-root", "/", "--cmd", "/CALLBACK.EXE", directory], cwd=ROOT, capture_output=True, text=True, timeout=30)
             except subprocess.TimeoutExpired as error:
                 raise SystemExit(f"USER32 callback test timed out: {error.stdout!r} {error.stderr!r}")
             log = result.stdout + result.stderr

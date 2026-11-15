@@ -289,9 +289,9 @@ impl NativeSb {
         // The buffer still holds this program's last lap — `unbind` copied it
         // back to the guest, it did not clear it — and an auto-init transfer
         // has no LVI gate, so it would simply play again.
-        crate::kernel::drivers::sb16::zero_channel_buf(machine, self.card.dma8);
+        crate::kernel::drivers::sb16::zero_channel_buf(machine, &self.card, self.card.dma8);
         if let Some(d16) = self.card.dma16 {
-            crate::kernel::drivers::sb16::zero_channel_buf(machine, d16);
+            crate::kernel::drivers::sb16::zero_channel_buf(machine, &self.card, d16);
         }
         self.suspended = false;
         self.last_gen = [0; 8];
@@ -397,7 +397,7 @@ impl NativeSb {
     pub fn arm<A: crate::Arch>(&mut self, machine: &mut A,
            chan: usize, host: usize, is16: bool,
            gpa: u32, len: u32, mode: u8) -> bool {
-        let bufpage = crate::kernel::memory::dma_channel(machine, host);
+        let bufpage = self.card.dma_page(host);
         if bufpage == 0 { return false; }        // no reserved buffer
         // The buffer sits at `off` inside its channel's 64 KB / 128 KB
         // window; the channel buffer is window-aligned, so the same `off`

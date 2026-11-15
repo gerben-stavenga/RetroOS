@@ -51,7 +51,7 @@ cp850 db 'CP850', 13, 10, '$'
         def boot(label, extra=(), repeated=True):
             log = work / (label + '.log')
             with log.open('wb') as output:
-                proc = subprocess.Popen(['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', str(work), '--', str(ROOT / 'bazel-bin/kernel/retroos-host'), *extra],
+                proc = subprocess.Popen([str(ROOT / 'bazel-bin/kernel/retroos-host'), *extra, str(work)],
                                         stdin=subprocess.DEVNULL, stdout=output,
                                         stderr=subprocess.STDOUT)
                 try:

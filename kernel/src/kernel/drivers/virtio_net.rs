@@ -2,7 +2,7 @@
 //! No offloads, merged RX buffers, packed rings, MSI, or legacy-only transport.
 //! Reference: https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html
 
-use super::dma::{Mmio, Region};
+use super::dma::Mmio;
 use crate::kernel::{net::EthernetDevice, pci, portio};
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
@@ -171,10 +171,10 @@ fn make_queue<A: crate::Arch>(
     if notify_offset % 2 != 0 || notify_offset.checked_add(2)? > notify.length {
         return None;
     }
-    let dma = Region::allocate(
+    let dma = crate::kernel::platform::dma_buffer(
         machine,
         (PACKETS + usize::from(size) * BUFFER).div_ceil(crate::PAGE_SIZE),
-        64,
+        1, 64,
     )?;
     let q = Queue {
         va: dma.va,

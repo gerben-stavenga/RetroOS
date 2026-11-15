@@ -19,9 +19,7 @@ def main():
         for binary, marker in (("callbacks/wine_surface.exe", "SURFACE PASS"),
                                ("win16/clipping.exe", "WIN16 CLIPPING PASS")):
             shutil.copyfile(ROOT / "bazel-bin/test/windows" / binary, root / "PROBE.EXE")
-            run = subprocess.run(["python3", str(ROOT / "test/disk_fixture.py"), "--root", directory,
-                                  "--", str(ROOT / "bazel-bin/kernel" / host), "--c-root", "/",
-                                  "--cmd", "/PROBE.EXE"], cwd=ROOT, capture_output=True, text=True, timeout=60)
+            run = subprocess.run([str(ROOT / "bazel-bin/kernel" / host), "--c-root", "/", "--cmd", "/PROBE.EXE", directory], cwd=ROOT, capture_output=True, text=True, timeout=60)
             log = run.stdout + run.stderr
             if run.returncode or marker not in log or any(s in log for s in (" FAIL", "PANIC", "SEGV", "not implemented")):
                 raise SystemExit(log)

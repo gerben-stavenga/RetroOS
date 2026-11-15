@@ -22,8 +22,7 @@ def main():
         probe_dir=root / "PROBE"
         probe_dir.mkdir()
         shutil.copyfile(ROOT / "bazel-bin/test/windows/ntdll/fonts.exe", probe_dir / "PROBE.EXE")
-        process = subprocess.Popen(["python3", str(ROOT / "test/disk_fixture.py"), "--root", directory,
-            "--", str(ROOT / f"bazel-bin/kernel/{host}"), "--c-root", "/", "--cmd", "/PROBE/PROBE.EXE"],
+        process = subprocess.Popen([str(ROOT / f"bazel-bin/kernel/{host}"), "--c-root", "/", "--cmd", "/PROBE/PROBE.EXE", directory],
             cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         try:
             stdout, stderr = process.communicate(timeout=60)

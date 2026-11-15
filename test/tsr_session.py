@@ -20,7 +20,7 @@ def main():
             (root / 'SESSION.BAT').write_bytes(
                 f'TSRSESS.COM {mode}\r\nCOMMAND.COM /C TSRSESS.COM C\r\n'.encode())
             result = subprocess.run(
-                ['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', tmp, '--', 'bazel-bin/kernel/retroos-host', '--cmd', 'COMMAND.COM /B SESSION.BAT', '--cwd', '.'],
+                ['bazel-bin/kernel/retroos-host', '--cmd', 'COMMAND.COM /B SESSION.BAT', '--cwd', '.', tmp],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, timeout=30)
             output = result.stdout.decode(errors='replace')
@@ -29,7 +29,7 @@ def main():
             print(f'PASS: nested COMMAND.COM sees {"INT 27h" if mode == "L" else "AH=31h"} TSR')
 
         result = subprocess.run(
-            ['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', tmp, '--', 'bazel-bin/kernel/retroos-host', '--cmd', 'COMMAND.COM /C COMMAND.COM /C TSRSESS.COM I', '--cwd', '.'],
+            ['bazel-bin/kernel/retroos-host', '--cmd', 'COMMAND.COM /C COMMAND.COM /C TSRSESS.COM I', '--cwd', '.', tmp],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, timeout=30)
         output = result.stdout.decode(errors='replace')

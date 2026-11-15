@@ -173,7 +173,7 @@ integration_test(
     command = ["bash", "test/hosted_games.sh"],
     sources = ["//:integration_sources"],
     host = ["//kernel:retroos-host"],
-    metal = ["//:image"],
+    metal = ["//:root_module_base_tar", "//:root_module_showcase_tar"],
     env = {"ENGINE": "tcg"},
     tags = ["dos"],
 )
@@ -335,7 +335,7 @@ integration_test(
     command = ["bash", "test/hosted_games.sh"],
     sources = ["//:integration_sources"],
     host = ["//kernel:retroos-host-kvm"],
-    metal = ["//:image"],
+    metal = ["//:root_module_base_tar", "//:root_module_showcase_tar"],
     env = {"ENGINE": "kvm"},
     tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
 )
@@ -353,7 +353,7 @@ integration_test(
     name = "vbe_pm",
     command = ["python3", "test/vbe_pm.py"],
     sources = ["//:integration_sources"],
-    metal = ["//:boot_disk", "//test/dos/svgaprobe:vbe_pm_com"],
+    metal = ["//test/dos/svgaprobe:vbe_pm_com"],
     host = ["//kernel:retroos-host-kvm"],
     tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
 )
@@ -561,16 +561,9 @@ integration_test(
     name = "hosted_diff",
     command = ["bash", "test/hosted_diff.sh"],
     sources = ["//:integration_sources"],
-    metal = ["//:image"],
+    metal = ["//:root_module_base_tar"],
     host = ["//kernel:retroos-host", "//kernel:retroos-host-kvm"],
     tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
-)
-
-integration_test(
-    name = "disk_fixture",
-    command = ["python3", "test/disk_fixture_test.py"],
-    sources = ["//:integration_sources"],
-    tags = ["unit"],
 )
 
 integration_test(

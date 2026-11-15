@@ -10,8 +10,7 @@
 //! live 8237 cursor for accounting and leaves the DSP completion IRQ masked.
 //!
 //! Only machine *primitives* are used — port I/O (`inb`/`outb`, for the DSP,
-//! mixer, and the 8237), `dma_channel_buf` (the permanent contiguous channel-5
-//! buffer, ISA-DMA-safe), and `map_phys_range` (to map it into kernel space) —
+//! mixer, and the 8237), the card's setup-provided ISA DMA buffer, and `map_phys_range` (to map it into kernel space) —
 //! never any machine-side driver logic. The DMA window is shared with the
 //! ac97/hda sinks (only one sink is ever active), see `ac97.rs`.
 
@@ -73,6 +72,8 @@ pub struct Sb16 {
     pub dma8: u8,
     /// The physical 16-bit DMA channel, absent on pre-SB16 hardware.
     pub dma16: Option<u8>,
+    dma8_page: u64,
+    dma16_page: u64,
 }
 
 /// Physical-SB state that exists only while the kernel mixer owns the card.
@@ -106,6 +107,16 @@ pub struct Sb16Output {
 /// the one path that could have lied about a 16-bit channel is closed where
 /// the truth was known — and it is exactly the mixer sink's precondition.
 impl Sb16 {
+    pub(crate) fn set_dma_buffers(&mut self, low: u64, high: u64) {
+        self.dma8_page = low;
+        self.dma16_page = high;
+    }
+    pub(crate) fn dma_page(&self, channel: usize) -> u64 {
+        if channel == usize::from(self.dma8) { self.dma8_page }
+        else if self.dma16.is_some_and(|high| channel == usize::from(high)) { self.dma16_page }
+        else { 0 }
+    }
+
     pub fn has_ct1745(&self) -> bool { self.is_sb16 }
 
     /// Set the CT1745's stereo master level using its compatibility register.
@@ -246,6 +257,7 @@ fn identify<A: crate::Arch>(machine: &mut A, base: u16, declared: Option<SbWirin
         ),
     }
     Some(Sb16 {
+        dma8_page: 0, dma16_page: 0,
         pnp,
         is_sb16,
         base,
@@ -357,8 +369,8 @@ fn dsp_read_at<A: crate::Arch>(machine: &mut A, base: u16) -> u8 {
 /// The fill is NOT zero on both channels. An 8-bit SB transfer is unsigned
 /// with a 0x80 bias, so zeroing it writes full-scale negative DC — a rail, not
 /// silence. 16-bit transfers are signed, where zero is exactly silence.
-pub fn zero_channel_buf<A: crate::Arch>(machine: &mut A, chan: u8) {
-    let page = crate::kernel::memory::dma_channel(machine, chan as usize);
+pub fn zero_channel_buf<A: crate::Arch>(machine: &mut A, card: &Sb16, chan: u8) {
+    let page = card.dma_page(chan as usize);
     if page == 0 {
         return;
     }
@@ -398,7 +410,7 @@ pub fn open_output<A: crate::Arch>(machine: &mut A, device: &Sb16) -> Option<Sb1
 fn open_ring<A: crate::Arch>(machine: &mut A, card: &Sb16) -> Option<u32> {
     // Map the permanent contiguous channel-5 buffer into the stolen low-mem
     // window so the kernel can write PCM; the DSP reads it by physical address.
-    let phys_page = crate::kernel::memory::dma_channel(machine, DMA_CHANNEL);
+    let phys_page = card.dma_page(DMA_CHANNEL);
     if phys_page == 0 {
         crate::compact_println!("sb16: no channel-{} DMA buffer — output is silent", DMA_CHANNEL);
         return None;

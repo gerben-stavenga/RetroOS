@@ -28,7 +28,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='retroos-wine-keyboard-') as directory:
         work=Path(directory);root=work/'root';root.mkdir();install(root)
         shutil.copyfile(ROOT/('bazel-bin/test/windows/'+target.replace(':','/')+'.exe'),root/'KEY.EXE')
-        m=Machine(['python3',str(ROOT/'test/disk_fixture.py'),'--root',str(root),'--',str(ROOT/'bazel-bin/kernel'/host),'--input-control','--c-root','/','--cmd','/KEY.EXE'],work,90)
+        m=Machine([str(ROOT/'bazel-bin/kernel'/host), '--input-control', '--c-root', '/', '--cmd', '/KEY.EXE', str(root)],work,90)
         try:
             for _ in range(240):
                 m.run(250)

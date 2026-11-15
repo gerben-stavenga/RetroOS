@@ -1,15 +1,16 @@
 //! Hosted RetroOS entry. Exists only under the `hosted` feature (the metal build
 //! is `#![no_main]` and boots via `entry.asm` → `boot_kernel`). A regular
 //! `fn main()` that composes the interpreter's platform — hooking its device
-//! ports (0xE9→stdout, ATA→image, sockets→host networking) — then hands off to the
+//! services (host directories, sockets→host networking) — then hands off to the
 //! same `kernel::startup()` the metal crt0 calls.
 //!
-//!   retroos-host disk.img                  # boot the real kernel
-//!   retroos-host --cmd "PROG ARGS" disk.img  # boot straight into PROG, then halt
+//!   retroos-host DIRECTORY                  # boot the real kernel
+//!   retroos-host --cmd "PROG ARGS" DIRECTORY  # boot straight into PROG, then halt
 //! (build: bazelisk build //kernel:retroos-host --platforms=@platforms//host)
 
 use retroos_arch_interp as arch;
 use std::io::Read;
+use kernel::kernel::vfs::Filesystem;
 
 /// Optional log file for the kernel debug sink (`--console` mode routes logs
 /// here to keep them off the terminal showing the live VGA render). When unset,
@@ -47,7 +48,6 @@ fn log_line() -> *mut lib::log::LineBuffer { LOG_LINE.with(|line| line.get()) }
 fn main() {
     unsafe { lib::log::set_line_context(log_line); }
 
-    let mut boot_disk: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut c_root: Option<String> = None;
@@ -56,12 +56,10 @@ fn main() {
     let mut live_console = false;
     let mut suite_control = false;
     let mut input_control = false;
-    // Positional args: [0] = program/disk, [1..] = the program's own argv tail.
-    let mut positional: Vec<String> = Vec::new();
+    let mut input: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--boot-disk" => boot_disk = args.next(),
             // Live-render the guest's VGA text screen to this terminal (for
             // driving a full-screen DOS TUI like DN). 0xE9 debug → retroos.log.
             "--console" => live_console = true,
@@ -95,17 +93,16 @@ fn main() {
                 std::process::exit(2);
             }
             option if option.starts_with('-') => {
-                eprintln!("retroos-host: unknown option {option}; use a disk image with BOOT.INI and SMB mounts");
+                eprintln!("retroos-host: unknown option {option}; use a host directory");
                 std::process::exit(2);
             }
-            // First positional ends flag parsing; the rest are the program's argv.
+            _ if input.is_none() => input = Some(a),
             _ => {
-                positional.push(a);
-                positional.extend(args.by_ref());
+                eprintln!("usage: retroos-host [--cmd COMMAND] DIRECTORY");
+                std::process::exit(2);
             }
         }
     }
-    let input = positional.first().cloned();
 
     let raw_console = !live_console && shot.is_none();
     // Arm VGA-screen snapshotting: a watcher thread flips the request flag every
@@ -156,45 +153,17 @@ fn main() {
     if shot_armed {
         kernel::kernel::display::set_host_present_sink(arch::publish_frame);
     }
-    // Sniff the ELF magic from the header alone — a disk image is attached by
-    // path and streamed (`attach_disk`), so slurping it whole here just to read
-    // four bytes put its entire size in RAM (a 200 GiB test disk OOM'd).
-    let mut magic = [0u8; 4];
-    if let Some(path) = &input {
-        std::fs::File::open(path)
-            .map(|mut f| {
-                let _ = f.read(&mut magic); // short file → stays zeroed, not ELF
-            })
-            .unwrap_or_else(|e| {
-                eprintln!("retroos-host: cannot read {path}: {e}");
-                std::process::exit(1);
-            });
-    }
-    if magic == *b"\x7fELF" {
-        eprintln!("retroos-host: supply a disk image and use --cmd for a guest executable");
-        std::process::exit(2);
-    }
-
     if let Some(path) = wav {
         arch::attach_audio(&path); // canonical audio device → WAV file
     }
 
-    // Otherwise boot the same kernel::startup() the metal crt0 calls — with
-    // the image's ATA disk attached when one was given, diskless otherwise
-    // Storage policy comes from BOOT.INI on the boot disk.
+    // Supply the host filesystem directly to shared startup.
     arch::init_guest_ram(0);
-    if let Some(path) = &input {
-        arch::attach_disk(path).unwrap_or_else(|e| {
-            eprintln!("retroos-host: cannot attach disk {path}: {e}");
-            std::process::exit(1);
-        });
-    }
-    if let Some(path) = &boot_disk {
-        arch::attach_boot_disk(path).unwrap_or_else(|e| {
-            eprintln!("cannot attach boot disk {path}: {e}");
-            std::process::exit(1);
-        });
-    }
+    let root = hosted::HostFs::new(input.as_deref().unwrap_or(".")).unwrap_or_else(|e| {
+        eprintln!("cannot open host directory: {e}");
+        std::process::exit(1);
+    });
+
     // Drive the booted OS (DOS shell, DN) from the terminal: raw mode + the
     // stdin→keyboard pump. Keys reach the guest via the kernel's IRQ1 path and
     // the C BIOS INT 9/16h. Harmless headless (raw mode skips a non-TTY).
@@ -213,12 +182,12 @@ fn main() {
     config.is_qemu = true;
     if let Some(c) = &cmd { config.set_cmdline(c.as_bytes()); }
     if let Some(c) = &cwd { config.set_cwd(c.as_bytes()); }
-    if let Some(c) = &c_root { config.set_c_root(c.as_bytes()); }
+    config.set_c_root(c_root.as_deref().unwrap_or(if root.dir_exists(b"home/retroos") { "/home/retroos" } else { "/" }).as_bytes());
 
     let mut machine = arch::Interp;
     // Hosted has no display to arbitrate until `startup` builds a Console;
     // mirroring the metal boot_kernel — one per boot, moved into startup.
-    kernel::startup(&mut machine, &config);
+    kernel::startup(&mut machine, &config, kernel::kernel::startup::Storage::Root(Box::leak(Box::new(root))));
 }
 
 /// Inject the interp backend into the backend-agnostic kernel: its port I/O
@@ -325,8 +294,7 @@ fn spawn_suite_control() {
 }
 
 fn spawn_keyboard() {
-    use std::io::Read;
-    std::thread::spawn(|| {
+        std::thread::spawn(|| {
         let mut stdin = std::io::stdin();
         let mut byte = [0u8; 1];
         while stdin.read_exact(&mut byte).is_ok() {
@@ -386,8 +354,7 @@ const GRAY_KEYS: [u8; 10] = [0x47, 0x48, 0x49, 0x4B, 0x4D, 0x4F, 0x50, 0x51, 0x5
 /// or None for a bare ESC / unrecognized sequence. The tty delivers a sequence
 /// atomically, so the blocking reads here complete immediately.
 fn read_escape_seq(stdin: &mut std::io::Stdin) -> Option<u8> {
-    use std::io::Read;
-    let mut b = [0u8; 1];
+        let mut b = [0u8; 1];
     if stdin.read_exact(&mut b).is_err() {
         return None;
     }

@@ -262,7 +262,8 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, magic: u32, info: *const u8) 
     // the rest of the kernel's life (startup never returns).
     let mut machine = arch::Metal;
     lib::compact_screenln!(&mut *lib::term::term(), "Heap base: {:#x}", arch::heap_base());
-    crate::kernel::startup::startup(&mut machine, config);
+    let disks = crate::kernel::block::probe(&mut machine);
+    crate::kernel::startup::startup(&mut machine, config, crate::kernel::startup::Storage::Disks(disks));
 }
 
 /// Finish all one-shot metal boot work and return only the configuration that
@@ -401,10 +402,6 @@ unsafe fn prepare_boot(
     });
     install_physical_memory();
     crate::kernel::memory::set_text_frame(phys_mm::alloc_contig(8).expect("no VGA backing pages"));
-    lib::compact_println!(
-        "ISA DMA: reserved buffer pages ch1={:#x} ch5={:#x}",
-        phys_mm::dma_channel_buf(1), phys_mm::dma_channel_buf(5),
-    );
 
     // VGA framebuffer scanout needs its packed shadow as soon as fbcon is
     // attached below. Paging, phys_mm, and the #PF page-backing are now ready,

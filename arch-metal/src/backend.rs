@@ -174,16 +174,6 @@ impl Memory for Metal {
         super::paging2::framebuffer_map_policy()
     }
 
-    fn alloc_phys_contig(&mut self, num_pages: usize) -> u64 {
-        panic!("kernel must supply contiguous backing ({num_pages} pages)")
-    }
-
-    fn free_phys_contig(&mut self, start_page: u64, num_pages: usize) {
-        panic!("kernel must release contiguous backing ({start_page}, {num_pages})")
-    }
-
-    fn dma_channel_buf(&self, ch: usize) -> u64 { panic!("kernel must supply ISA channel {ch}") }
-
     fn free_page_count(&self) -> usize { super::memory::free_page_count() }
 
     fn total_page_count(&self) -> Option<usize> { Some(super::memory::total_page_count()) }

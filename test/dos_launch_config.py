@@ -35,11 +35,7 @@ def main():
             'COPY EMPTY.INI C:\\RETROOS\\RETROOS.INI\n'
             'PROBE.COM\n'
             'ECHO LAUNCH-CONFIG-PASS\n')
-        process = subprocess.Popen([
-            'python3', 'test/disk_fixture.py', '--root', directory, '--',
-            str(ROOT / f'bazel-bin/kernel/{host}'), '--c-root', '/',
-            '--cmd', '/COMMAND.COM /B C:\\CHECK.BAT', '--cwd', '/',
-        ], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        process = subprocess.Popen([str(ROOT / f'bazel-bin/kernel/{host}'), '--c-root', '/', '--cmd', '/COMMAND.COM /B C:\\CHECK.BAT', '--cwd', '/', directory], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             start_new_session=True)
         try:
             log, _ = process.communicate(timeout=60)

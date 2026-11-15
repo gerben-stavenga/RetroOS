@@ -150,8 +150,7 @@ def main():
 
         def run(batch):
             (root / 'CHECK.BAT').write_bytes(batch)
-            result = subprocess.run(['python3', 'test/disk_fixture.py', '--root', raw,
-                '--', 'bazel-bin/kernel/' + target, '--cmd', 'COMMAND.COM /C CHECK.BAT'],
+            result = subprocess.run(['bazel-bin/kernel/' + target, '--cmd', 'COMMAND.COM /C CHECK.BAT', raw],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=90)
             text = result.stdout.decode(errors='replace')
             assert result.returncode == 0 and 'panicked' not in text, text

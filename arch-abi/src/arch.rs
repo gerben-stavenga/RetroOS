@@ -265,16 +265,6 @@ pub trait Memory: GuestBytes {
         }
     }
 
-    /// Allocate physically contiguous DMA pages from general RAM. Returns the
-    /// starting physical page number, or 0 on failure.
-    fn alloc_phys_contig(&mut self, num_pages: usize) -> u64;
-
-    /// Free a run previously returned by `alloc_phys_contig`.
-    fn free_phys_contig(&mut self, start_page: u64, num_pages: usize);
-
-    /// Physical page of DMA channel `ch`'s permanent ISA-DMA buffer (0 = none).
-    fn dma_channel_buf(&self, ch: usize) -> u64;
-
     /// Number of currently unallocated 4 KiB frames in the backing allocator.
     fn free_page_count(&self) -> usize;
 

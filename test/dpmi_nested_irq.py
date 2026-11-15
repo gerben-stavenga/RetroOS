@@ -13,11 +13,7 @@ def main():
         for name, marker in [('NESTIRQ', 'NESTED-IRQ'), ('IRQREGS', 'IRQ-REGS')]:
             shutil.copyfile(ROOT / f'bazel-bin/test/dos/rmexception/{name}.COM',
                             Path(directory) / f'{name}.COM')
-            result = subprocess.run([
-                'python3', str(ROOT / 'test/disk_fixture.py'), '--root', directory, '--',
-                str(ROOT / 'bazel-bin/kernel/retroos-host-kvm'),
-                '--c-root', '/', '--cmd', f'/{name}.COM',
-            ], cwd=ROOT, capture_output=True, text=True, timeout=30)
+            result = subprocess.run([str(ROOT / 'bazel-bin/kernel/retroos-host-kvm'), '--c-root', '/', '--cmd', f'/{name}.COM', directory], cwd=ROOT, capture_output=True, text=True, timeout=30)
             log = result.stdout + result.stderr
             assert result.returncode == 0, log
             assert f'{marker} PASS' in log and '[mem] exit tid=1 code=0' in log, log

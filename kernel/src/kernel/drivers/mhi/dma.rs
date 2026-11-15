@@ -13,7 +13,7 @@ impl Dma {
         if bytes == 0 {
             return None;
         }
-        Region::allocate(machine, bytes.div_ceil(crate::PAGE_SIZE), address_bits).map(Self)
+        crate::kernel::platform::dma_buffer(machine, bytes.div_ceil(crate::PAGE_SIZE), 1, address_bits).map(Self)
     }
     /// Match the physical alignment guaranteed by coherent DMA allocation:
     /// the smallest power-of-two page order large enough for the buffer.
@@ -27,7 +27,7 @@ impl Dma {
         }
         let pages = bytes.div_ceil(crate::PAGE_SIZE);
         let alignment = pages.checked_next_power_of_two()?;
-        Region::allocate_aligned(machine, pages, alignment, address_bits).map(Self)
+        crate::kernel::platform::dma_buffer(machine, pages, alignment, address_bits).map(Self)
     }
     fn address(&self, offset: usize, count: usize) -> usize {
         assert!(

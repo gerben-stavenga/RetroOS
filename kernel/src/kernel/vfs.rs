@@ -386,6 +386,15 @@ pub struct DirEntry {
     pub(crate) mount_idx: u8,
 }
 
+impl DirEntry {
+    /// A path-based backend entry; VFS assigns its mount and node identity.
+    pub fn new(name: Vec<u8>, stat: Stat) -> Self {
+        Self { name_len: name.len(), name, short_name: None, size: stat.size,
+            is_dir: stat.is_dir, is_symlink: stat.is_symlink, mode: stat.mode,
+            dos_attributes: None, mtime: stat.mtime.unwrap_or(0), node: 0, mount_idx: 0 }
+    }
+}
+
 /// Stable inode from a path (FNV-1a, forced nonzero). Same path → same ino,
 /// distinct paths → distinct ino (modulo hash collisions) — enough for the
 /// dynamic linker's object dedup.

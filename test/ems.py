@@ -45,7 +45,7 @@ def main():
             root = work / 'home/retroos'
             root.mkdir(parents=True)
             shutil.copyfile(probe, root / 'EMSPROBE.COM')
-            command = ['python3', str(Path(__file__).resolve().parent / 'disk_fixture.py'), '--root', tmp, '--', f'bazel-bin/kernel/{target}', '--cmd', 'EMSPROBE.COM']
+            command = [f'bazel-bin/kernel/{target}', '--cmd', 'EMSPROBE.COM', tmp]
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 start_new_session=True)
