@@ -180,8 +180,7 @@ fn apply<A: crate::Arch>(machine: &mut A, address: u64, length: u64, operation: 
             if no_access { PageEntry::NoAccess(mapping) }
             else if writable { PageEntry::CopyOnWrite(mapping) } else { PageEntry::ReadOnly(mapping) }
         } else {
-            mapping.attributes = mapping.attributes.with_executable(memory::mapping_attributes(machine, protection & 4 != 0)
-                .contains(arch_abi::page_entry::Attributes::EXECUTABLE));
+            mapping.attributes = mapping.attributes.with_executable(protection & 4 != 0);
             if protection == 0 { PageEntry::NoAccess(mapping) }
             else if protection & 2 == 0 { PageEntry::ReadOnly(mapping) }
             else if matches!(mapping.backing, Backing::Owned(_)) || mapping.backing == memory::zero_mapping(machine, true).backing {

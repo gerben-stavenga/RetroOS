@@ -119,7 +119,8 @@ pub static mut REGS: Vcpu = Vcpu::new(Regs::empty(), RootPageTable::empty());
 /// # Safety
 /// The contiguous PAGING_PAGES frames must be zeroed, resident and exclusively
 /// owned for the lifetime of this CPU.
-pub unsafe fn init_guest_ram(storage: u64) {
+pub unsafe fn init_guest_ram(storage: u64, ownership: arch_abi::page_supply::FrameOwnership) {
+    crate::phys::configure(ownership);
     unsafe { paging::initialize(storage); }
 }
 

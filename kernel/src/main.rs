@@ -160,7 +160,7 @@ fn main() {
     // Supply the host filesystem directly to shared startup.
     let (ram, bytes) = arch::physical_ram();
     unsafe { kernel::kernel::phys_mm::init_direct_ram(ram, bytes); }
-    unsafe { arch::init_guest_ram(kernel::kernel::phys_mm::alloc_backed_pages(arch::PAGING_PAGES)); }
+    unsafe { arch::init_guest_ram(kernel::kernel::phys_mm::alloc_backed_pages(arch::PAGING_PAGES), kernel::kernel::phys_mm::ownership()); }
 
     let root = hosted::HostFs::new(input.as_deref().unwrap_or(".")).unwrap_or_else(|e| {
         eprintln!("cannot open host directory: {e}");

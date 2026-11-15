@@ -132,17 +132,14 @@ pub fn init_test_ram() {
     use std::cell::Cell;
     READY.with(|ready| {
         if ready.replace(true) { return; }
-        unsafe { crate::vcpu::init_guest_ram(test_memory::alloc_backed_pages(crate::paging::PAGING_PAGES)); }
-        unsafe {
-            (*supply()).ownership = test_memory::ownership();
-            test_memory::replenish_supply(supply());
-        }
-        let mut input = Box::new(arch_abi::page_supply::PageInput::new());
+        unsafe { crate::vcpu::init_guest_ram(test_memory::alloc_backed_pages(crate::paging::PAGING_PAGES), test_memory::ownership()); }
+        refill_test_reserve();
+        let mut input = PageInput::new();
         for _ in 0..64 {
             input.pages[input.count] = test_memory::alloc_backed_pages(1);
             input.count += 1;
         }
-        set_input(Box::into_raw(input));
+        INPUT.with(|p| p.replace(input));
     });
 }
 
@@ -152,13 +149,38 @@ use crate::test_memory;
 use arch_abi::page_supply::{PageSupply, PageInput, FAULT_PAGES};
 thread_local! {
     static SUPPLY: core::cell::UnsafeCell<PageSupply> = const { core::cell::UnsafeCell::new(PageSupply::new()) };
-    static INPUT: core::cell::Cell<*mut PageInput> = const { core::cell::Cell::new(core::ptr::null_mut()) };
+    static INPUT: core::cell::RefCell<PageInput> = const { core::cell::RefCell::new(PageInput::new()) };
 }
-pub(crate) fn supply() -> *mut PageSupply { SUPPLY.with(|s| s.get()) }
-pub(crate) fn set_input(input: *mut PageInput) -> *mut PageInput { INPUT.with(|p| p.replace(input)) }
+fn supply() -> *mut PageSupply { SUPPLY.with(|s| s.get()) }
+pub(crate) fn with_input<R>(pages: PageInput, operation: impl FnOnce() -> R) -> (R, PageInput) {
+    struct Restore(PageInput);
+    impl Drop for Restore {
+        fn drop(&mut self) { INPUT.with(|p| *p.borrow_mut() = core::mem::take(&mut self.0)); }
+    }
+    let _restore = Restore(INPUT.with(|p| p.replace(pages)));
+    let result = operation();
+    (result, INPUT.with(|p| p.take()))
+}
+pub(crate) fn configure(ownership: arch_abi::page_supply::FrameOwnership) {
+    unsafe { (*supply()).ownership = ownership; }
+}
+pub(crate) fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
+    let state = unsafe { &mut *supply() };
+    while state.count < state.pages.len() {
+        let Some(page) = pages.take() else { break; };
+        state.donate(page);
+    }
+    while pages.count < pages.pages.len() && state.returned_head != 0 {
+        let page = state.returned_head;
+        state.returned_head = unsafe { frame_ptr(page).cast::<u64>().read() };
+        state.returned_count -= 1;
+        pages.push(page);
+    }
+    (state.pages.len() - state.count, pages)
+}
 pub(crate) fn can_fault() -> bool { unsafe { (*supply()).count >= FAULT_PAGES } }
 pub(crate) fn take_input() -> Option<u64> {
-    INPUT.with(|p| unsafe { p.get().as_mut().and_then(PageInput::take) }).map(zero)
+    INPUT.with(|p| p.borrow_mut().take()).map(zero)
 }
 pub(crate) fn take_fault() -> Option<u64> {
     unsafe {
@@ -189,4 +211,14 @@ pub(crate) fn release(page: u64) {
             state.returned_count += 1;
         }
     }
+}
+
+
+#[cfg(test)]
+pub(crate) fn refill_test_reserve() {
+    let (needed, mut returned) = supply_pages(PageInput::new());
+    while let Some(page) = returned.take() { test_memory::free_phys_page(page); }
+    let mut pages = PageInput::new();
+    for _ in 0..needed { pages.push(test_memory::alloc_backed_pages(1)); }
+    assert_eq!(supply_pages(pages).1.count, 0);
 }

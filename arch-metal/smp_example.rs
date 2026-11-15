@@ -348,10 +348,10 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
     }
     print("SMP DMA separate from heap AP resources\n");
     // Publish new kernel tables after AP startup, with no heap page faults.
-    let faults = unsafe { (*arch::memory::supply()).fault_pages_used };
+    let faults = arch::memory::fault_pages_used();
     back_heap(arch::heap_base() + 2 * 1024 * 1024, arch::heap_base() + 8 * 1024 * 1024);
     let shared = alloc::vec![0x5au8; 3 * 1024 * 1024];
-    assert_eq!(unsafe { (*arch::memory::supply()).fault_pages_used }, faults);
+    assert_eq!(arch::memory::fault_pages_used(), faults);
     print("SMP RESIDENT HEAP PASS\n");
     SHARED_ADDRESS.store(shared.as_ptr() as u32, Ordering::Release);
     GO.store(1, Ordering::Release);
@@ -410,5 +410,8 @@ fn install_physical_memory() {
     };
     phys_mm::install_low_dma_memory(&DMA);
     arch::memory::configure(phys_mm::ownership());
-    unsafe { phys_mm::replenish_supply(arch::memory::supply()); }
+    let (needed, returned) = arch::memory::supply_pages(Default::default());
+    assert_eq!(returned.count, 0);
+    let (_, unused) = arch::memory::supply_pages(phys_mm::page_batch(needed));
+    assert_eq!(unused.count, 0);
 }

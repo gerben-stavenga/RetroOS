@@ -67,14 +67,14 @@ impl X86 for Interp {
 }
 
 impl Memory for Interp {
-    fn page_format(&self) -> arch_abi::page_entry::X86PteFormat { arch_abi::page_entry::X86PteFormat::Legacy32 }
-
     fn read_mapping(&mut self, page: arch_abi::UserPage) -> Result<arch_abi::page_entry::PageEntry, arch_abi::MappingError> {
         crate::paging::read_mapping(page)
     }
 
-    unsafe fn replace_mapping(&mut self, page: arch_abi::UserPage, entry: arch_abi::page_entry::PageEntry) -> Result<(), arch_abi::MappingError> {
-        crate::paging::replace_user_mapping(page, entry)
+    unsafe fn replace_mapping(&mut self, page: arch_abi::UserPage, entry: arch_abi::page_entry::PageEntry, pages: arch_abi::page_supply::PageInput) -> (Result<(), arch_abi::MappingError>, arch_abi::page_supply::PageInput) {
+        crate::phys::with_input(pages, || {
+            crate::paging::replace_user_mapping(page, entry)
+        })
     }
 
     type PageTable = RootPageTable;
@@ -85,12 +85,19 @@ impl Memory for Interp {
         crate::desc::mark_ldt_dirty();
         old
     }
-    fn private_page_tables(&mut self) -> i32 { crate::paging::private_tables() }
-    fn page_supply(&self) -> Option<*mut arch_abi::page_supply::PageSupply> { Some(crate::phys::supply()) }
-    fn set_page_input(&mut self, input: *mut arch_abi::page_supply::PageInput) -> *mut arch_abi::page_supply::PageInput {
-        crate::phys::set_input(input)
+    fn private_page_tables(&mut self, pages: arch_abi::page_supply::PageInput) -> (i32, arch_abi::page_supply::PageInput) {
+        crate::phys::with_input(pages, || {
+            crate::paging::private_tables()
+        })
     }
-    fn user_fork(&mut self, child: &mut RootPageTable) { crate::calls::arch_user_fork(child) }
+    fn supply_pages(&self, pages: arch_abi::page_supply::PageInput) -> (usize, arch_abi::page_supply::PageInput) {
+        crate::phys::supply_pages(pages)
+    }
+    fn user_fork(&mut self, child: &mut RootPageTable, pages: arch_abi::page_supply::PageInput) -> ((), arch_abi::page_supply::PageInput) {
+        crate::phys::with_input(pages, || {
+            crate::calls::arch_user_fork(child)
+        })
+    }
 
     fn free_user_pages(&mut self) { crate::calls::arch_free_user_pages() }
 

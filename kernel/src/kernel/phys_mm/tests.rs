@@ -47,30 +47,12 @@ fn firmware_holes_high_ram_and_exhaustion() {
     assert_eq!(alloc_phys_page(), None);
     free_phys_page(258);
     assert_eq!(free_page_count(), 1);
-    // Reclaim can return a page through the cache and independently fill the
-    // fault reserve by releasing kernel mappings. Do not overfill or lose either.
-    let small = [MemoryRegion { base: 0, length: 260 * 4096, usable: true }];
-    init_phys_mm(small.into_iter(), 1 << 24, 256, 258, 0);
-    complete_initialization();
-    prepare_fault_metadata();
-    assert_eq!(alloc_phys_page(), Some(258));
-    assert_eq!(alloc_phys_page(), Some(259));
-    let mut reserve = arch_abi::page_supply::PageSupply::new();
-    for page in 1000..1063 { reserve.donate(page); }
-    static REFILL: core::sync::atomic::AtomicPtr<arch_abi::page_supply::PageSupply> =
-        core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
-    fn return_during_reclaim() -> Option<u64> {
-        let pointer = REFILL.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
-        if pointer.is_null() { return None; }
-        unsafe { (*pointer).donate(259); }
-        Some(258)
-    }
-    REFILL.store(&mut reserve, core::sync::atomic::Ordering::Relaxed);
-    set_reclaim(return_during_reclaim);
-    unsafe { replenish_supply(&mut reserve); }
-    assert_eq!(reserve.count, arch_abi::page_supply::SUPPLY_CAPACITY);
-    assert_eq!(get_ref_count(258), 0, "surplus donation returned to allocator");
-    assert_eq!(get_ref_count(259), 1, "reserve keeps ownership of returned frame");
+    // Owned batches stop at exhaustion and leave transfer/rejection to arch.
+    let mut pages = page_batch(64);
+    assert_eq!(pages.count, 1);
+    assert_eq!(pages.take(), Some(258));
+    assert_eq!(page_batch(1).count, 0);
+    free_phys_page(258);
 
 }
 

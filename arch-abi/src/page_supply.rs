@@ -90,14 +90,13 @@ pub struct PageSupply {
     pub fault_pages_used: usize,
     pub fault_pages_current: usize,
     pub fault_pages_peak: usize,
-    pub refills: usize,
     pub ownership: FrameOwnership,
 }
 impl PageSupply {
     pub const fn new() -> Self { Self { pages: [0; SUPPLY_CAPACITY], count: 0,
         returned_head: 0, returned_count: 0,
         fault_depth: 0, fault_pages_used: 0, fault_pages_current: 0,
-        fault_pages_peak: 0, refills: 0, ownership: FrameOwnership::EMPTY } }
+        fault_pages_peak: 0, ownership: FrameOwnership::EMPTY } }
     pub fn take(&mut self) -> Option<u64> {
         if self.count == 0 { return None; }
         self.count -= 1;
@@ -121,6 +120,11 @@ pub struct PageBootstrap {
 /// Explicitly owned backing pages for one kernel-to-arch mapping operation.
 pub struct PageInput { pub pages: [u64; SUPPLY_CAPACITY], pub count: usize }
 impl PageInput {
+    pub fn push(&mut self, page: u64) {
+        assert!(page != 0 && self.count < SUPPLY_CAPACITY);
+        self.pages[self.count] = page;
+        self.count += 1;
+    }
     pub const fn new() -> Self { Self { pages: [0; SUPPLY_CAPACITY], count: 0 } }
     pub fn take(&mut self) -> Option<u64> {
         if self.count == 0 { None } else { self.count -= 1; Some(self.pages[self.count]) }

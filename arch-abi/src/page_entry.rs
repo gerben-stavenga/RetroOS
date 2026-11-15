@@ -91,7 +91,6 @@ pub enum X86PteFormat {
 pub enum EncodingError {
     InvalidPhysicalWidth,
     FrameOutOfRange,
-    ExecuteDisableUnavailable,
     InvalidVirtualAddress,
     InvalidEncoding,
 }
@@ -137,7 +136,8 @@ fn user_bit(address: u64, format: X86PteFormat) -> Result<u64, EncodingError> {
 
 impl PageEntry {
     /// Encode a leaf for a page-aligned virtual address. This does not install
-    /// it, retain a frame, or invalidate translations.
+    /// it, retain a frame, or invalidate translations. Execute-disable requests
+    /// are ignored when this format cannot enforce them.
     pub fn encode(self, format: X86PteFormat, address: u64) -> Result<u64, EncodingError> {
         use Attributes as F;
         let (mask, nx) = format.layout()?;
@@ -151,7 +151,6 @@ impl PageEntry {
         if frame > mask >> 12 { return Err(EncodingError::FrameOutOfRange); }
         let f = mapping.attributes;
         let executable = f.contains(F::EXECUTABLE);
-        if !executable && !nx { return Err(EncodingError::ExecuteDisableUnavailable); }
         let state = match self {
             Self::NoAccess(_) => NO_ACCESS,
             Self::ReadOnly(_) => P,
@@ -159,7 +158,7 @@ impl PageEntry {
             Self::CopyOnWrite(_) => P | COW,
             _ => unreachable!(),
         };
-        Ok((frame << 12) | state | user | flag(!executable, NX)
+        Ok((frame << 12) | state | user | flag(nx && !executable, NX)
             | flag(matches!(mapping.backing, Backing::Borrowed(_)), BORROWED)
             | flag(f.contains(F::WRITE_THROUGH), PWT) | flag(f.contains(F::CACHE_DISABLE), PCD)
             | flag(f.contains(F::PAT), PAT))
@@ -269,6 +268,32 @@ mod tests {
     }
 
     #[test]
+    fn execute_disable_is_enforced_only_when_available() {
+        let m = Mapping { backing: Backing::Owned(PhysicalFrame::new(7).unwrap()),
+            attributes: Attributes::CACHE_DISABLE };
+        for entry in [PageEntry::ReadOnly(m), PageEntry::Writable(m),
+            PageEntry::CopyOnWrite(m), PageEntry::NoAccess(m)] {
+            for format in [X86PteFormat::Legacy32,
+                X86PteFormat::Wide { physical_address_bits: 36, nx: false }] {
+                let raw = entry.encode(format, USER_PAGE).unwrap();
+                assert_eq!(raw & NX, 0);
+                let executable = Mapping { attributes: m.attributes.with_executable(true), ..m };
+                let expected = match entry {
+                    PageEntry::ReadOnly(_) => PageEntry::ReadOnly(executable),
+                    PageEntry::Writable(_) => PageEntry::Writable(executable),
+                    PageEntry::CopyOnWrite(_) => PageEntry::CopyOnWrite(executable),
+                    PageEntry::NoAccess(_) => PageEntry::NoAccess(executable),
+                    _ => unreachable!(),
+                };
+                assert_eq!(PageEntry::decode(raw, format, USER_PAGE), Ok(expected));
+            }
+            let raw = entry.encode(WIDE, USER_PAGE).unwrap();
+            assert_ne!(raw & NX, 0);
+            assert_eq!(PageEntry::decode(raw, WIDE, USER_PAGE), Ok(entry));
+        }
+    }
+
+    #[test]
     fn rejects_out_of_range_and_malformed_entries() {
         assert_eq!(PhysicalFrame::new(1 << 40), Err(EncodingError::FrameOutOfRange));
         assert_eq!(PageEntry::Absent.encode(X86PteFormat::Wide { physical_address_bits: 64, nx: true }, USER_PAGE),
@@ -276,8 +301,6 @@ mod tests {
         let m = Mapping { backing: Backing::Owned(PhysicalFrame::new(1 << 20).unwrap()), attributes: Attributes::EXECUTABLE };
         assert_eq!(PageEntry::ReadOnly(m).encode(X86PteFormat::Legacy32, USER_PAGE), Err(EncodingError::FrameOutOfRange));
         assert!(PageEntry::ReadOnly(m).encode(WIDE, USER_PAGE).is_ok());
-        let nx = Mapping { backing: Backing::Owned(PhysicalFrame::new(0).unwrap()), attributes: Attributes::default() };
-        assert_eq!(PageEntry::ReadOnly(nx).encode(X86PteFormat::Legacy32, USER_PAGE), Err(EncodingError::ExecuteDisableUnavailable));
         for raw in [NX | P | US, 1 << 32, TRAP | US, NO_ACCESS | RW | US,
             NO_ACCESS | COW | US, P | COW | RW | US, P | NO_ACCESS | US, P | (1 << 8) | US] {
             assert_eq!(PageEntry::decode(raw, X86PteFormat::Legacy32, USER_PAGE), Err(EncodingError::InvalidEncoding));

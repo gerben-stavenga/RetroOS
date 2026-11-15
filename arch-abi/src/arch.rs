@@ -3,6 +3,7 @@
 //! Arch owns execution and lifecycle. X86, Memory and Diagnostics
 //! group its supporting capabilities.
 
+use crate::page_supply::PageInput;
 use crate::{Regs, KernelEvent, ExecutionProfile, ExecutionProfileStage};
 use crate::page_entry::PageEntry;
 use crate::mapping::{MappingError, MappingFailure, UserPage, validate_batch};
@@ -143,9 +144,6 @@ pub trait Memory {
     /// empty placeholder a switch leaves behind in a now-running thread's slot.
     type PageTable: Default;
 
-    /// Hardware leaf format, including whether execute-disable is available.
-    fn page_format(&self) -> crate::page_entry::X86PteFormat;
-
     /// Read does not allocate data frames. The result is a snapshot, not an
     /// owning reference; its backing must stay valid until replacement finishes.
     fn read_mapping(&mut self, page: UserPage) -> Result<PageEntry, MappingError>;
@@ -161,13 +159,14 @@ pub trait Memory {
     /// Repeat an entry across a range. Each Owned occurrence retains a reference.
     /// # Safety
     /// Same backing lifetime requirements as replace_mapping.
-    unsafe fn fill_mappings(&mut self, start: UserPage, count: usize, entry: PageEntry) -> Result<(), MappingFailure> {
-        validate_batch(start, count)?;
+    unsafe fn fill_mappings(&mut self, start: UserPage, count: usize, entry: PageEntry, mut pages: PageInput) -> (Result<(), MappingFailure>, PageInput) {
+        if let Err(error) = validate_batch(start, count) { return (Err(error), pages); }
         for completed in 0..count {
-            unsafe { self.replace_mapping(start.offset(completed).unwrap(), entry) }
-                .map_err(|error| MappingFailure { completed, error })?;
+            let (result, unused) = unsafe { self.replace_mapping(start.offset(completed).unwrap(), entry, pages) };
+            pages = unused;
+            if let Err(error) = result { return (Err(MappingFailure { completed, error }), pages); }
         }
-        Ok(())
+        (Ok(()), pages)
     }
 
     /// Retain Owned backing before releasing the displaced mapping's reference.
@@ -177,7 +176,7 @@ pub trait Memory {
     /// Supplied frames must be valid; Borrowed backing must outlive every alias.
     /// Writable aliases must obey the caller's synchronization/ownership rules.
     /// Serialize mapping changes with other CPUs using the same address space.
-    unsafe fn replace_mapping(&mut self, page: UserPage, entry: PageEntry) -> Result<(), MappingError>;
+    unsafe fn replace_mapping(&mut self, page: UserPage, entry: PageEntry, pages: PageInput) -> (Result<(), MappingError>, PageInput);
 
     fn read_mappings(&mut self, start: UserPage, entries: &mut [PageEntry]) -> Result<(), MappingFailure> {
         validate_batch(start, entries.len())?;
@@ -190,13 +189,14 @@ pub trait Memory {
 
     /// # Safety
     /// Same requirements as replace_mapping, for every supplied entry.
-    unsafe fn replace_mappings(&mut self, start: UserPage, entries: &[PageEntry]) -> Result<(), MappingFailure> {
-        validate_batch(start, entries.len())?;
+    unsafe fn replace_mappings(&mut self, start: UserPage, entries: &[PageEntry], mut pages: PageInput) -> (Result<(), MappingFailure>, PageInput) {
+        if let Err(error) = validate_batch(start, entries.len()) { return (Err(error), pages); }
         for (completed, &entry) in entries.iter().enumerate() {
-            unsafe { self.replace_mapping(start.offset(completed).unwrap(), entry) }
-                .map_err(|error| MappingFailure { completed, error })?;
+            let (result, unused) = unsafe { self.replace_mapping(start.offset(completed).unwrap(), entry, pages) };
+            pages = unused;
+            if let Err(error) = result { return (Err(MappingFailure { completed, error }), pages); }
         }
-        Ok(())
+        (Ok(()), pages)
     }
 
     /// Install `incoming` as the active address space and return the displaced
@@ -204,11 +204,11 @@ pub trait Memory {
     fn activate(&mut self, incoming: Self::PageTable) -> Self::PageTable;
 
     /// COW-fork the current address space into `child` (fills the child root).
-    fn user_fork(&mut self, child: &mut Self::PageTable);
+    fn user_fork(&mut self, child: &mut Self::PageTable, pages: PageInput) -> ((), PageInput);
 
     /// Detach shared page-table metadata before concurrent process execution.
     /// Consumes explicit backing inputs; -11 requests another input batch.
-    fn private_page_tables(&mut self) -> i32 { 0 }
+    fn private_page_tables(&mut self, pages: PageInput) -> (i32, PageInput) { (0, pages) }
 
     /// Tear down a dead thread's address space entirely. `free_user_pages`
     /// (called at exit, while the space is still active) returns its page
@@ -221,9 +221,11 @@ pub trait Memory {
     /// Free user pages in the current address space (the CLEAN call).
     fn free_user_pages(&mut self);
 
-    fn page_supply(&self) -> Option<*mut crate::page_supply::PageSupply> { None }
+    /// Transfer owned pages into this core's private fault reserve.
+    /// Returns its remaining capacity and a batch of rejected or retired pages.
+    /// Call again with an empty batch to drain further retired pages.
+    fn supply_pages(&self, pages: PageInput) -> (usize, PageInput);
 
-    fn set_page_input(&mut self, _input: *mut crate::page_supply::PageInput) -> *mut crate::page_supply::PageInput { core::ptr::null_mut() }
 }
 
 /// Optional execution profiling and address-space diagnostics.
@@ -279,7 +281,7 @@ pub trait Diagnostics {
 /// at page boundaries and replenish their PageSupply between calls.
 pub trait GuestBytes {
     /// Copy a high user buffer through a backend-owned window. False means EFAULT.
-    fn high_copy(&mut self, _address: u64, _buffer: &mut [u8], _to_user: bool) -> bool { false }
+    fn high_copy(&mut self, _address: u64, _buffer: &mut [u8], _to_user: bool, pages: PageInput) -> (bool, PageInput) { (false, pages) }
 
     /// Read a `T` at `addr` (volatile, unaligned, bytewise into a local).
     fn read<T: Copy>(&self, addr: usize) -> T;

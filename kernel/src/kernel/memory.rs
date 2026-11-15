@@ -1,98 +1,67 @@
-//! Kernel-owned physical page supply and explicit inputs to arch operations.
+//! Kernel-owned physical pages supplied to arch as owned batches.
 use crate::Arch;
 use super::phys_mm;
-use arch_abi::page_supply::{PageInput, PageSupply, SUPPLY_CAPACITY};
+use arch_abi::page_supply::{PageInput, SUPPLY_CAPACITY, FAULT_PAGES};
 #[thread_local]
 static mut SPARES: PageInput = PageInput::new();
-#[thread_local]
-static mut CURRENT: *mut PageSupply = core::ptr::null_mut();
-fn spares_ptr() -> *mut PageInput { &raw mut SPARES }
 
-pub fn install_supply(supply: *mut PageSupply) { unsafe { CURRENT = supply; } }
-
-/// # Safety
-/// Supply belongs to this core. Its metadata is resident.
-pub unsafe fn replenish(supply: *mut PageSupply) {
-    // Drain pages returned by arch before requesting new backing from the pool.
-    while unsafe { (*supply).returned_head } != 0 {
-        let page = unsafe { (*supply).returned_head };
-        let mut next = [0; 8];
-        super::platform::read_physical_frame(page, 0, &mut next);
-        unsafe { (*supply).returned_head = u64::from_ne_bytes(next); (*supply).returned_count -= 1; }
-        phys_mm::free_phys_page(page);
-    }
-    unsafe { phys_mm::replenish_supply(supply); }
+fn release(mut pages: PageInput) {
+    while let Some(page) = pages.take() { phys_mm::free_phys_page(page); }
 }
-pub fn service<A: arch_abi::Arch>(machine: &A) {
-    if let Some(supply) = machine.page_supply() {
-        install_supply(supply);
-        unsafe { replenish(supply); }
+
+/// Drain retired frames before asking the allocator for more backing.
+fn collect<A: arch_abi::Memory>(machine: &A) -> usize {
+    loop {
+        let (needed, returned) = machine.supply_pages(PageInput::new());
+        let empty = returned.count == 0;
+        release(returned);
+        if empty { return needed; }
     }
 }
 
-/// Mapping operations receive owned pages as data, never allocator callbacks.
-pub fn with_pages<A: Arch, R>(machine: &mut A, count: usize, operation: impl FnOnce(&mut A) -> R) -> R {
-    if machine.page_supply().is_none() { return operation(machine); }
+pub fn service<A: arch_abi::Memory>(machine: &A) {
+    let needed = collect(machine);
+    let pages = phys_mm::page_batch(needed);
+    assert!(SUPPLY_CAPACITY - needed + pages.count >= FAULT_PAGES,
+        "physical memory exhausted refilling fault reserve");
+    let (_, returned) = machine.supply_pages(pages);
+    release(returned);
+}
+
+/// Each operation owns its input batch and returns the unused frames.
+pub fn with_pages<A: Arch, R>(machine: &mut A, count: usize,
+    operation: impl FnOnce(&mut A, PageInput) -> (R, PageInput)) -> R
+{
     assert!(count <= SUPPLY_CAPACITY);
     service(machine);
     let mut input = PageInput::new();
     for _ in 0..count {
-        let spare = unsafe { (*spares_ptr()).take() };
-        let page = spare.or_else(phys_mm::alloc_phys_page)
-            .expect("out of physical memory preparing arch input");
-        input.pages[input.count] = page;
-        input.count += 1;
+        let spare = unsafe { (*(&raw mut SPARES)).take() };
+        input.push(spare.or_else(phys_mm::alloc_phys_page)
+            .expect("out of physical memory preparing arch input"));
     }
-    let previous = machine.set_page_input(&mut input);
-    let result = operation(machine);
-    machine.set_page_input(previous);
-    while let Some(page) = input.take() {
-        unsafe {
-            let spares = &mut *spares_ptr();
-            assert!(spares.count < SUPPLY_CAPACITY);
-            spares.pages[spares.count] = page;
-            spares.count += 1;
-        }
+    let (result, mut unused) = operation(machine, input);
+    while let Some(page) = unused.take() {
+        unsafe { (*(&raw mut SPARES)).push(page); }
     }
+    collect(machine);
     result
 }
 pub fn fork<A: Arch>(machine: &mut A, child: &mut A::PageTable) {
-    with_pages(machine, 3, |machine| machine.user_fork(child));
+    with_pages(machine, 3, |machine, pages| machine.user_fork(child, pages));
 }
 
-pub(crate) fn allocate_frame() -> Option<u64> {
-    let supply = unsafe { CURRENT };
-    if !supply.is_null() {
-        // A large unmap may have returned many frames since the last event-loop
-        // boundary. Reclaim them before treating the RAM pool as exhausted.
-        unsafe {
-            while (*supply).returned_head != 0 {
-                let page = (*supply).returned_head;
-                let mut next = [0; 8];
-                super::platform::read_physical_frame(page, 0, &mut next);
-                (*supply).returned_head = u64::from_ne_bytes(next);
-                (*supply).returned_count -= 1;
-                phys_mm::free_phys_page(page);
-            }
-        }
-    }
+pub(crate) fn allocate_frame<A: arch_abi::Memory>(machine: &A) -> Option<u64> {
+    collect(machine);
     phys_mm::alloc_phys_page()
 }
 
 pub fn private_tables<A: Arch>(machine: &mut A) {
     loop {
-        let result = with_pages(machine, SUPPLY_CAPACITY, |machine| machine.private_page_tables());
+        let result = with_pages(machine, SUPPLY_CAPACITY, |machine, pages| machine.private_page_tables(pages));
         if result == 0 { break; }
         assert_eq!(result, -11, "cannot detach process page tables");
     }
-}
-
-/// Construct supported x86 permissions. Legacy paging cannot enforce NX.
-pub fn mapping_attributes<A: Arch>(machine: &A, executable: bool) -> arch_abi::page_entry::Attributes {
-    use arch_abi::page_entry::{Attributes, X86PteFormat};
-    if executable || !matches!(machine.page_format(), X86PteFormat::Wide { nx: true, .. }) {
-        Attributes::EXECUTABLE
-    } else { Attributes::default() }
 }
 
 /// Install one mapping with explicit table backing and retry only uncompleted work.
@@ -102,7 +71,7 @@ pub unsafe fn replace<A: Arch>(machine: &mut A, page: arch_abi::UserPage,
     entry: arch_abi::page_entry::PageEntry) -> Result<(), arch_abi::MappingError>
 {
     loop {
-        let result = with_pages(machine, 5, |machine| unsafe { machine.replace_mapping(page, entry) });
+        let result = with_pages(machine, 5, |machine, pages| unsafe { machine.replace_mapping(page, entry, pages) });
         if result != Err(arch_abi::MappingError::NeedPages) { return result; }
     }
 }
@@ -114,7 +83,7 @@ pub unsafe fn replace_batch<A: Arch>(machine: &mut A, mut page: arch_abi::UserPa
     mut entries: &[arch_abi::page_entry::PageEntry]) -> Result<(), arch_abi::MappingError>
 {
     while !entries.is_empty() {
-        match with_pages(machine, 5, |machine| unsafe { machine.replace_mappings(page, entries) }) {
+        match with_pages(machine, 5, |machine, pages| unsafe { machine.replace_mappings(page, entries, pages) }) {
             Ok(()) => return Ok(()),
             Err(failure) if failure.error == arch_abi::MappingError::NeedPages => {
                 page = page.offset(failure.completed)?;
@@ -136,7 +105,7 @@ pub fn map_cached_frame<A: Arch>(machine: &mut A, vpage: usize, frame: u64,
     let Ok(page) = UserPage::new(address) else { return false; };
     let Ok(frame) = PhysicalFrame::new(frame) else { return false; };
     let mapping = Mapping { backing: if shared { Backing::Borrowed(frame) } else { Backing::Owned(frame) },
-        attributes: mapping_attributes(machine, executable) };
+        attributes: Attributes::default().with_executable(executable) };
     let entry = if !writable { PageEntry::ReadOnly(mapping) }
         else if shared { PageEntry::Writable(mapping) } else { PageEntry::CopyOnWrite(mapping) };
     unsafe { replace(machine, page, entry) }.is_ok()
@@ -204,11 +173,11 @@ fn unpin(entry: PageEntry) {
 static ZERO_FRAME: spin::Once<PhysicalFrame> = spin::Once::new();
 pub fn zero_mapping<A: Arch>(machine: &A, executable: bool) -> Mapping {
     let frame = *ZERO_FRAME.call_once(|| {
-        let frame = allocate_frame().expect("zero frame allocation");
+        let frame = allocate_frame(machine).expect("zero frame allocation");
         super::platform::write_physical_frame(frame, 0, &[0; 4096]);
         PhysicalFrame::new(frame).unwrap()
     });
-    Mapping { backing: Backing::Borrowed(frame), attributes: mapping_attributes(machine, executable) }
+    Mapping { backing: Backing::Borrowed(frame), attributes: Attributes::default().with_executable(executable) }
 }
 
 /// Personality policy: discard contents and allow subsequent anonymous writes.
@@ -224,10 +193,10 @@ pub fn fresh<A: Arch>(machine: &mut A, vpage: usize, count: usize) {
     let start = page(vpage); start.offset(count - 1).unwrap();
     for index in 0..count {
         service(machine);
-        let frame = allocate_frame().expect("anonymous frame allocation");
+        let frame = allocate_frame(machine).expect("anonymous frame allocation");
         super::platform::write_physical_frame(frame, 0, &[0; 4096]);
         let entry = PageEntry::Writable(Mapping { backing: Backing::Owned(PhysicalFrame::new(frame).unwrap()),
-            attributes: mapping_attributes(machine, true) });
+            attributes: Attributes::EXECUTABLE });
         let result = unsafe { replace(machine, start.offset(index).unwrap(), entry) };
         phys_mm::free_phys_page(frame);
         result.expect("map anonymous RAM");
@@ -246,14 +215,14 @@ pub fn protect<A: Arch>(machine: &mut A, vpage: usize, count: usize, writable: b
             && !ZERO_FRAME.get().is_some_and(|f| *f == mapping.backing.frame()) {
             // ReadOnly has no hidden future-write policy. A borrowed private
             // snapshot becomes normal owned RAM before losing its COW state.
-            let frame = allocate_frame().expect("private protection backing");
+            let frame = allocate_frame(machine).expect("private protection backing");
             let mut bytes = [0; 4096];
             super::platform::read_physical_frame(mapping.backing.frame().number(), 0, &mut bytes);
             super::platform::write_physical_frame(frame, 0, &bytes);
             mapping.backing = Backing::Owned(PhysicalFrame::new(frame).unwrap());
             temporary = Some(frame);
         }
-        mapping.attributes = mapping.attributes.with_executable(mapping_attributes(machine, executable).contains(Attributes::EXECUTABLE));
+        mapping.attributes = mapping.attributes.with_executable(executable);
         let entry = if !writable { PageEntry::ReadOnly(mapping) }
             else if matches!(old, PageEntry::CopyOnWrite(_)) || matches!(mapping.backing, Backing::Owned(_)) || ZERO_FRAME.get().is_some_and(|f| *f == mapping.backing.frame()) {
                 PageEntry::CopyOnWrite(mapping)
@@ -274,7 +243,7 @@ pub fn alias<A: Arch>(machine: &mut A, source: usize, destination: usize, count:
         let mut entry = machine.read_mapping(at).expect("read alias source");
         if let PageEntry::CopyOnWrite(mut mapping) = entry {
             service(machine);
-            let frame = allocate_frame().expect("alias backing allocation");
+            let frame = allocate_frame(machine).expect("alias backing allocation");
             let mut bytes = [0; 4096];
             super::platform::read_physical_frame(mapping.backing.frame().number(), 0, &mut bytes);
             super::platform::write_physical_frame(frame, 0, &bytes);
@@ -306,7 +275,7 @@ pub fn swap<A: Arch>(machine: &mut A, a: usize, b: usize, count: usize) {
 /// Same backing lifetime requirements as Arch::fill_mappings.
 pub unsafe fn fill<A: Arch>(machine: &mut A, mut start: UserPage, mut count: usize, entry: PageEntry) -> Result<(), arch_abi::MappingError> {
     while count != 0 {
-        match with_pages(machine, 5, |machine| unsafe { machine.fill_mappings(start, count, entry) }) {
+        match with_pages(machine, 5, |machine, pages| unsafe { machine.fill_mappings(start, count, entry, pages) }) {
             Ok(()) => return Ok(()),
             Err(failure) if failure.error == arch_abi::MappingError::NeedPages => {
                 start = start.offset(failure.completed)?; count -= failure.completed;
@@ -341,7 +310,7 @@ pub fn private_copy<A: Arch>(machine: &mut A, first: usize, count: usize) {
         let at = page(first + index);
         let mut mapping = backing(machine.read_mapping(at).expect("read image mapping")).expect("image backing");
         service(machine);
-        let frame = allocate_frame().expect("private image allocation");
+        let frame = allocate_frame(machine).expect("private image allocation");
         let mut bytes = [0; 4096];
         super::platform::read_physical_frame(mapping.backing.frame().number(), 0, &mut bytes);
         super::platform::write_physical_frame(frame, 0, &bytes);
@@ -404,7 +373,7 @@ impl<A: arch_abi::Arch + arch_abi::GuestBytes> GuestBytes for A {
         while !bytes.is_empty() {
             let n = bytes.len().min(4096 - (address as usize & 4095));
             let (part, rest) = bytes.split_at_mut(n);
-            if !with_pages(self, 5, |machine| arch_abi::GuestBytes::high_copy(machine, address, part, to_user)) {
+            if !with_pages(self, 5, |machine, pages| arch_abi::GuestBytes::high_copy(machine, address, part, to_user, pages)) {
                 return false;
             }
             address += n as u64;

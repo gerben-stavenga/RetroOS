@@ -8,7 +8,7 @@
 
 use crate::mapping::{Read, Replace, Fill, ReadRun, invoke};
 use arch_abi::{MappingError, MappingFailure, UserPage};
-use arch_abi::page_entry::{PageEntry, X86PteFormat};
+use arch_abi::page_entry::PageEntry;
 use super::paging2::RootPageTable;
 use super::x86::FxState;
 use arch_abi::{X86, Memory, Arch, Diagnostics, ExecutionProfile, ExecutionProfileStage, KernelEvent, Regs};
@@ -76,16 +76,15 @@ impl X86 for Metal {
 }
 
 impl Memory for Metal {
-    fn page_format(&self) -> X86PteFormat { crate::mapping::format() }
-
     fn read_mapping(&mut self, page: UserPage) -> Result<PageEntry, MappingError> {
         let mut entry = PageEntry::Absent;
         self.read_mappings(page, core::slice::from_mut(&mut entry)).map_err(|failure| failure.error)?;
         Ok(entry)
     }
 
-    unsafe fn replace_mapping(&mut self, page: UserPage, entry: PageEntry) -> Result<(), MappingError> {
-        unsafe { self.replace_mappings(page, core::slice::from_ref(&entry)) }.map_err(|failure| failure.error)
+    unsafe fn replace_mapping(&mut self, page: UserPage, entry: PageEntry, pages: arch_abi::page_supply::PageInput) -> (Result<(), MappingError>, arch_abi::page_supply::PageInput) {
+        let (result, pages) = unsafe { self.replace_mappings(page, core::slice::from_ref(&entry), pages) };
+        (result.map_err(|failure| failure.error), pages)
     }
 
     fn read_mappings(&mut self, page: UserPage, entries: &mut [PageEntry]) -> Result<(), MappingFailure> {
@@ -94,10 +93,12 @@ impl Memory for Metal {
         arguments.result
     }
 
-    unsafe fn replace_mappings(&mut self, page: UserPage, entries: &[PageEntry]) -> Result<(), MappingFailure> {
-        let mut arguments = Replace { page, entries, result: Ok(()) };
-        unsafe { invoke(crate::arch_call::REPLACE_MAPPINGS, &mut arguments); }
-        arguments.result
+    unsafe fn replace_mappings(&mut self, page: UserPage, entries: &[PageEntry], pages: arch_abi::page_supply::PageInput) -> (Result<(), MappingFailure>, arch_abi::page_supply::PageInput) {
+        crate::memory::with_input(pages, || {
+            let mut arguments = Replace { page, entries, result: Ok(()) };
+            unsafe { invoke(crate::arch_call::REPLACE_MAPPINGS, &mut arguments); }
+            arguments.result
+        })
     }
 
     fn read_mapping_run(&mut self, page: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError> {
@@ -106,10 +107,12 @@ impl Memory for Metal {
         arguments.result
     }
 
-    unsafe fn fill_mappings(&mut self, page: UserPage, count: usize, entry: PageEntry) -> Result<(), MappingFailure> {
-        let mut arguments = Fill { page, count, entry, result: Ok(()) };
-        unsafe { invoke(crate::arch_call::FILL_MAPPINGS, &mut arguments); }
-        arguments.result
+    unsafe fn fill_mappings(&mut self, page: UserPage, count: usize, entry: PageEntry, pages: arch_abi::page_supply::PageInput) -> (Result<(), MappingFailure>, arch_abi::page_supply::PageInput) {
+        crate::memory::with_input(pages, || {
+            let mut arguments = Fill { page, count, entry, result: Ok(()) };
+            unsafe { invoke(crate::arch_call::FILL_MAPPINGS, &mut arguments); }
+            arguments.result
+        })
     }
 
     type PageTable = RootPageTable;
@@ -119,23 +122,27 @@ impl Memory for Metal {
         incoming
     }
 
-    fn private_page_tables(&mut self) -> i32 {
-        let result: u32;
-        unsafe { core::arch::asm!("int 0x80", inlateout("eax") crate::arch_call::PRIVATE_TABLES as u32 => result); }
-        result as i32
+    fn private_page_tables(&mut self, pages: arch_abi::page_supply::PageInput) -> (i32, arch_abi::page_supply::PageInput) {
+        crate::memory::with_input(pages, || {
+            let result: u32;
+            unsafe { core::arch::asm!("int 0x80", inlateout("eax") crate::arch_call::PRIVATE_TABLES as u32 => result); }
+            result as i32
+        })
     }
 
-    fn user_fork(&mut self, child: &mut RootPageTable) { super::calls::arch_user_fork(child) }
+    fn user_fork(&mut self, child: &mut RootPageTable, pages: arch_abi::page_supply::PageInput) -> ((), arch_abi::page_supply::PageInput) {
+        crate::memory::with_input(pages, || {
+            super::calls::arch_user_fork(child)
+        })
+    }
 
     fn free_user_pages(&mut self) { super::calls::arch_free_user_pages() }
 
     fn destroy_space(&mut self, _root: &mut RootPageTable) {}
 
 
-    fn page_supply(&self) -> Option<*mut arch_abi::page_supply::PageSupply> { Some(crate::memory::supply()) }
-
-    fn set_page_input(&mut self, input: *mut arch_abi::page_supply::PageInput) -> *mut arch_abi::page_supply::PageInput {
-        crate::memory::set_input(input)
+    fn supply_pages(&self, pages: arch_abi::page_supply::PageInput) -> (usize, arch_abi::page_supply::PageInput) {
+        crate::memory::supply_pages(pages)
     }
 }
 

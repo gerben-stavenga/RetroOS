@@ -696,7 +696,7 @@ mod space_ops {
                         exhausted = true;
                         assert_eq!(regs.frame.rip, code as u64 + 10);
                         assert!(space_translate(regs.rax as u32).is_none(), "uncompleted store must remain unmapped");
-                        unsafe { test_memory::replenish_supply(phys::supply()); }
+                        phys::refill_test_reserve();
                     }
                 }
                 KernelEvent::SoftInt(0x80) | KernelEvent::Syscall => { finished = true; break; }

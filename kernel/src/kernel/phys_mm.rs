@@ -210,30 +210,15 @@ pub fn total_page_count() -> usize { with_pool(|pool| pool.managed_pages()) }
 #[path = "phys_mm/tests.rs"]
 mod tests;
 
-/// # Safety
-/// Supply is resident and belongs to the calling CPU. No mutable supply borrow
-/// survives reclamation, which may return more frames to this supply.
-pub unsafe fn replenish_supply(supply: *mut arch_abi::page_supply::PageSupply) {
-    unsafe { replenish(supply); }
-}
-unsafe fn replenish(supply: *mut arch_abi::page_supply::PageSupply) {
-    if unsafe { (*supply).count } < arch_abi::page_supply::SUPPLY_CAPACITY {
-        unsafe { (*supply).refills += 1; }
+/// Allocate a bounded batch. A short batch means the RAM pool is exhausted.
+pub fn page_batch(count: usize) -> arch_abi::page_supply::PageInput {
+    assert!(count <= arch_abi::page_supply::SUPPLY_CAPACITY);
+    let mut pages = arch_abi::page_supply::PageInput::new();
+    for _ in 0..count {
+        let Some(page) = alloc_phys_page() else { break; };
+        pages.push(page);
     }
-    while unsafe { (*supply).count } < arch_abi::page_supply::SUPPLY_CAPACITY {
-        let page = alloc_phys_page();
-        let Some(page) = page else {
-            assert!(unsafe { (*supply).count } >= arch_abi::page_supply::FAULT_PAGES,
-                "physical memory exhausted refilling fault reserve");
-            break;
-        };
-        // Reclaim may have released kernel mappings into this same reserve.
-        if unsafe { (*supply).count } == arch_abi::page_supply::SUPPLY_CAPACITY {
-            free_phys_page(page);
-            break;
-        }
-        unsafe { (*supply).donate(page); }
-    }
+    pages
 }
 pub fn bootstrap_supply() -> arch_abi::page_supply::PageBootstrap {
     let mut pages = [0; arch_abi::page_supply::FAULT_PAGES];

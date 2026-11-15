@@ -23,7 +23,7 @@ impl Frame {
     pub fn new(bytes: &[u8]) -> Result<Self, i32> {
         assert_eq!(bytes.len(), 4096);
         if installed() {
-            let physical = super::memory::allocate_frame().ok_or(-12)?;
+            let physical = super::phys_mm::alloc_phys_page().ok_or(-12)?;
             super::platform::write_physical_frame(physical, 0, bytes);
             Ok(Self { physical: Some(physical), bytes: None })
         } else {

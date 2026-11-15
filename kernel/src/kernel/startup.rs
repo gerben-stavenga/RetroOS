@@ -69,10 +69,7 @@ fn prepare_startup<A: crate::Arch>(
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
-    if let Some(supply) = machine.page_supply() {
-        unsafe { (*supply).ownership = super::phys_mm::ownership(); }
-        crate::kernel::memory::install_supply(supply);
-    }
+    super::memory::service(machine);
     crate::kernel::cache::install(vfs::mapping::reclaim_frame);
     crate::compact_println!("{}", crate::build_info::VersionBanner);
 

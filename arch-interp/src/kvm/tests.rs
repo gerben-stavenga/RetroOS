@@ -214,8 +214,8 @@ fn kvm_engine_proofs() {
     let arch_abi::page_entry::Backing::Owned(frame) = first_mapping.backing else { panic!("expected owned RAM") };
     assert!(unsafe { test_memory::ownership().retain(frame.number()) });
     unsafe {
-        mem.replace_mapping(first_page, second).unwrap();
-        mem.replace_mapping(second_page, first).unwrap();
+        mem.replace_mapping(first_page, second, test_memory::input(5)).0.unwrap();
+        mem.replace_mapping(second_page, first, test_memory::input(5)).0.unwrap();
     }
     test_memory::free_phys_page(frame.number());
     let mut remapped = r;

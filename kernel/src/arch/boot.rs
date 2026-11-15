@@ -730,5 +730,8 @@ fn install_physical_memory() {
     };
     phys_mm::install_low_dma_memory(&DMA);
     arch::memory::configure(phys_mm::ownership());
-    unsafe { phys_mm::replenish_supply(arch::memory::supply()); }
+    let (needed, returned) = arch::memory::supply_pages(Default::default());
+    assert_eq!(returned.count, 0);
+    let (_, unused) = arch::memory::supply_pages(phys_mm::page_batch(needed));
+    assert_eq!(unused.count, 0);
 }

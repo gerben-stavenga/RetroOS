@@ -4,9 +4,9 @@ use crate::paging2;
 #[thread_local]
 static mut SUPPLY: PageSupply = PageSupply::new();
 #[thread_local]
-static mut INPUT: *mut PageInput = core::ptr::null_mut();
+static mut INPUT: PageInput = PageInput::new();
 
-pub fn supply() -> *mut PageSupply { &raw mut SUPPLY }
+fn supply() -> *mut PageSupply { &raw mut SUPPLY }
 /// Kernel supplies resident ownership metadata, never executable callbacks.
 pub fn configure(ownership: FrameOwnership) {
     unsafe { (*supply()).ownership = ownership; }
@@ -15,9 +15,35 @@ pub fn bootstrap(boot: PageBootstrap) {
     configure(boot.ownership);
     for page in boot.pages { unsafe { (*supply()).donate(page); } }
 }
-pub fn set_input(input: *mut PageInput) -> *mut PageInput {
-    unsafe { let old = INPUT; INPUT = input; old }
+/// Only owned page numbers enter the operation; no caller storage is retained.
+pub(crate) fn with_input<R>(pages: PageInput, operation: impl FnOnce() -> R) -> (R, PageInput) {
+    struct Restore(PageInput);
+    impl Drop for Restore {
+        fn drop(&mut self) { unsafe { *(&raw mut INPUT) = core::mem::take(&mut self.0); } }
+    }
+    let _restore = Restore(unsafe { core::mem::replace(&mut *(&raw mut INPUT), pages) });
+    let result = operation();
+    let unused = unsafe { core::mem::take(&mut *(&raw mut INPUT)) };
+    (result, unused)
 }
+pub fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
+    let state = unsafe { &mut *supply() };
+    assert!(state.fault_depth == 0);
+    while state.count < state.pages.len() {
+        let Some(page) = pages.take() else { break; };
+        state.donate(page);
+    }
+    while pages.count < pages.pages.len() && state.returned_head != 0 {
+        let page = state.returned_head;
+        let mut next = [0; 8];
+        crate::frames::read(page, 0, &mut next);
+        state.returned_head = u64::from_ne_bytes(next);
+        state.returned_count -= 1;
+        pages.push(page);
+    }
+    (state.pages.len() - state.count, pages)
+}
+pub fn fault_pages_used() -> usize { unsafe { (*supply()).fault_pages_used } }
 pub fn can_fault() -> bool {
     unsafe { (*supply()).fault_depth != 0 || (*supply()).count >= FAULT_PAGES }
 }
@@ -52,7 +78,7 @@ pub fn take_page() -> Option<u64> {
             if page.is_some() { (*supply()).fault_pages_current += 1; (*supply()).fault_pages_used += 1; }
             page
         }
-        else if INPUT.is_null() { None } else { (*INPUT).take() }
+        else { (*(&raw mut INPUT)).take() }
     }
 }
 pub fn get_ref_count(page: u64) -> u8 {
@@ -86,5 +112,5 @@ pub fn physical_page_limit() -> u64 {
 }
 
 pub(crate) fn input_available() -> bool {
-    unsafe { !INPUT.is_null() && (*INPUT).count != 0 }
+    unsafe { (*(&raw const INPUT)).count != 0 }
 }
