@@ -46,9 +46,8 @@ struct Ring {
     phys: u64,
 }
 impl Ring {
-    fn allocate<A: crate::Arch>(machine: &mut A) -> Option<Self> {
+    fn allocate() -> Option<Self> {
         let memory = crate::kernel::platform::dma_buffer(
-            machine,
             (PACKETS + DEPTH * BUFFER).div_ceil(crate::PAGE_SIZE),
             1, 64,
         )?;
@@ -130,7 +129,7 @@ impl IntelEthernet {
         // Enable MMIO, suppress INTx and stop firmware DMA before resetting.
         let disabled = (command | 2 | (1 << 10)) & !4;
         pci::write32(machine, b, d, f, 4, disabled);
-        let registers = Mmio::map(machine, base, BAR_BYTES)?;
+        let registers = Mmio::map(base, BAR_BYTES)?;
         let hardware = Hardware {
             registers,
             controller,
@@ -139,8 +138,8 @@ impl IntelEthernet {
             hardware.reset()?;
             let mac = hardware.mac_address()?;
             hardware.setup_link()?;
-            let rx = Ring::allocate(machine)?;
-            let tx = Ring::allocate(machine)?;
+            let rx = Ring::allocate()?;
+            let tx = Ring::allocate()?;
             rx.initialize(true);
             tx.initialize(false);
             // One untagged frame per legacy descriptor. No checksum offload,

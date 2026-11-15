@@ -109,11 +109,11 @@ impl Mmio {
         assert!(offset.is_multiple_of(2) && offset + 2 <= self.len);
         unsafe { core::ptr::write_volatile((self.base + offset) as *mut u16, value) }
     }
-    pub fn map<A: crate::Arch>(machine: &mut A, phys: u64, bytes: usize) -> Option<Self> {
+    pub fn map(phys: u64, bytes: usize) -> Option<Self> {
         let offset = (phys as usize) & (crate::PAGE_SIZE - 1);
         let pages = offset.checked_add(bytes)?.div_ceil(crate::PAGE_SIZE);
         let base = reserve(pages)?;
-        crate::kernel::memory::map_physical(machine,
+        crate::kernel::platform::map_kernel_physical(
             base >> 12,
             pages,
             phys >> 12,

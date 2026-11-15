@@ -178,7 +178,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Device> {
     };
     let mut stage = "PCI BAR mapping";
     let result: core::result::Result<Device, wlanfw::Error> = (|| {
-        let registers = Mmio::map(machine, base, chip.bar_bytes).ok_or(mhi::Error::Registers)?;
+        let registers = Mmio::map(base, chip.bar_bytes).ok_or(mhi::Error::Registers)?;
         let mut soc = Soc {
             registers,
             window: None,
@@ -198,12 +198,12 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Device> {
         }
         stage = "firmware DMA allocation";
         let image =
-            Image::allocate(machine, &bytes, chip.dma_bits).ok_or(mhi::Error::Allocation)?;
+            Image::allocate(&bytes, chip.dma_bits).ok_or(mhi::Error::Allocation)?;
         stage = "MHI context allocation";
-        let mut contexts = Dma::allocate(machine, mhi::CONTEXT_BYTES, chip.dma_bits)
+        let mut contexts = Dma::allocate(mhi::CONTEXT_BYTES, chip.dma_bits)
             .ok_or(mhi::Error::Allocation)?;
         stage = "IPCR packet allocation";
-        let packets = Dma::allocate(machine, mhi::PACKET_STORAGE, chip.dma_bits)
+        let packets = Dma::allocate(mhi::PACKET_STORAGE, chip.dma_bits)
             .ok_or(mhi::Error::Allocation)?;
         reset::run(&mut soc, &mut stage, chip.hot_reset)?;
         soc.window = None;
@@ -257,7 +257,6 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Device> {
         transport.send(&router.lookup())?;
         crate::kernel::wifi::report("WCN785x firmware booted; discovering WLAN control service");
         let initialized = wlanfw::initialize(
-            machine,
             &mut transport,
             &mut router,
             chip,
@@ -283,7 +282,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Device> {
         stage = "packet engine DMA allocation";
         let needed = super::qca_dp::Bootstrap::<Dma>::required_bytes(chip.packet_engine)?;
         let memory =
-            Dma::allocate_aligned(machine, needed, chip.dma_bits).ok_or(mhi::Error::Allocation)?;
+            Dma::allocate_aligned(needed, chip.dma_bits).ok_or(mhi::Error::Allocation)?;
         let mut packet_engine = super::qca_dp::Bootstrap::new(chip.packet_engine, memory, needed)?;
         stage = "packet engine rings";
         packet_engine.start(&mut transport.io)?;
@@ -291,14 +290,14 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Device> {
             stage = "packet engine cookie table";
             let cmem = boot.cmem.ok_or(mhi::Error::Registers)?;
             let needed = super::qca_dp::cookie::Table::<Dma>::required_bytes(chip.cookies)?;
-            let memory = Dma::allocate_aligned(machine, needed, chip.dma_bits)
+            let memory = Dma::allocate_aligned(needed, chip.dma_bits)
                 .ok_or(mhi::Error::Allocation)?;
             let cookies = super::qca_dp::cookie::Table::new(chip.cookies, memory, needed, cmem)?;
             packet_engine.install_cookies(&mut transport.io, cookies)?;
             stage = "receive buffer allocation";
             let needed = super::qca_dp::rx::Receive::<Dma>::required_bytes(chip.receive)?;
             let memory =
-                Dma::allocate(machine, needed, chip.dma_bits).ok_or(mhi::Error::Allocation)?;
+                Dma::allocate(needed, chip.dma_bits).ok_or(mhi::Error::Allocation)?;
             let receive = super::qca_dp::rx::Receive::new(
                 chip.receive,
                 memory,
@@ -306,7 +305,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Device> {
                 chip.cookies.rx_range()?,
             )?;
             stage = "station frame DMA allocation";
-            let frames = Dma::allocate(machine, super::qca_dp::frames::BYTES, chip.dma_bits)
+            let frames = Dma::allocate(super::qca_dp::frames::BYTES, chip.dma_bits)
                 .ok_or(mhi::Error::Allocation)?;
             let frames = super::qca_dp::frames::Frames::new(frames);
             control::Control::start(

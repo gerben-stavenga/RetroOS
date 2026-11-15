@@ -703,8 +703,8 @@ pub(crate) fn dma_pages(pages: usize) -> Option<u64> {
 /// Prepare a mapped DMA buffer before constructing the runtime device.
 /// The driver retains the result for the boot lifetime. Only failed setup and
 /// unused alignment padding are released, before hardware sees the buffer.
-pub(crate) fn dma_buffer<A: crate::Arch>(
-    machine: &mut A, pages: usize, alignment_pages: usize, address_bits: u32,
+pub(crate) fn dma_buffer(
+    pages: usize, alignment_pages: usize, address_bits: u32,
 ) -> Option<super::drivers::dma::Region> {
     use super::{drivers::dma::{self, Region}, phys_mm};
     if pages == 0 || !alignment_pages.is_power_of_two() { return None; }
@@ -725,7 +725,7 @@ pub(crate) fn dma_buffer<A: crate::Arch>(
     };
     if prefix != 0 { phys_mm::free_phys_contig(raw, prefix); }
     if suffix != 0 { phys_mm::free_phys_contig(page + pages as u64, suffix); }
-    super::memory::map_physical(machine, va >> 12, pages, page, 0);
+    map_kernel_physical(va >> 12, pages, page, 0);
     unsafe { core::ptr::write_bytes(va as *mut u8, 0, bytes) };
     Some(Region { va, phys, bytes })
 }
@@ -737,4 +737,70 @@ pub(crate) fn prepare_sb_dma(card: &mut super::drivers::sb16::Sb16) {
     let high = card.dma16.map_or(0, |channel| super::phys_mm::dma_channel_buf(usize::from(channel)));
     card.set_dma_buffers(low, high);
     crate::compact_println!("Audio: ISA DMA pages DMA{}={:#x} HDMA={:#x}", card.dma8, low, high);
+}
+
+/// Privileged device windows belong to platform code, never a user address space.
+/// Hosted platforms have no physical device windows.
+pub(crate) fn map_kernel_physical(vpage: usize, pages: usize, physical: u64, flags: u64) {
+    assert!(vpage >= 0xc000_0000 / crate::PAGE_SIZE);
+    assert!(vpage.checked_add(pages).is_some_and(|end| end <= 1 << 20));
+    #[cfg(target_arch = "x86")]
+    crate::arch::arch_map_kernel_physical(vpage, pages, physical, flags);
+    #[cfg(not(target_arch = "x86"))]
+    {
+        let _ = (physical, flags);
+        panic!("physical device windows are unavailable on this platform");
+    }
+}
+
+pub(crate) fn unmap_kernel_pages(vpage: usize, pages: usize) {
+    map_kernel_physical(vpage, pages, 0, arch_abi::MAP_MMIO);
+}
+
+/// # Safety
+/// The pointer names a live, resident, page-aligned shared allocation.
+pub(crate) unsafe fn physical_frame(base: core::ptr::NonNull<u8>) -> arch_abi::page_entry::PhysicalFrame {
+    #[cfg(target_arch = "x86")]
+    let frame = crate::arch::kernel_frame(base.as_ptr() as usize);
+    #[cfg(not(target_arch = "x86"))]
+    let frame = super::phys_mm::direct_frame(base);
+    arch_abi::page_entry::PhysicalFrame::new(frame).unwrap()
+}
+
+/// Used by the native multicore scheduler after ownership handoffs.
+pub(crate) fn refresh_kernel_mappings() {
+    #[cfg(target_arch = "x86")]
+    crate::arch::arch_refresh_kernel_mappings();
+    #[cfg(not(target_arch = "x86"))]
+    panic!("native kernel mapping synchronization is unavailable on this platform");
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FramebufferMapPolicy {
+    pub flags: u64,
+    pub slow: bool,
+    pub wide: bool,
+}
+
+/// One policy for boot and runtime physical framebuffers.
+pub(crate) fn framebuffer_map_policy() -> FramebufferMapPolicy {
+    #[cfg(target_arch = "x86")]
+    {
+        use crate::arch::{paging2, x86};
+        let (_, hv_ebx, _, _) = x86::cpuid(0x4000_0000);
+        let (_, _, ecx, edx) = x86::cpuid(1);
+        let hypervisor = ecx & (1 << 31) != 0;
+        let qemu_tcg = hypervisor && hv_ebx == 0x5447_4354;
+        let wc = paging2::wc_pat_enabled();
+        let cache = if wc && !qemu_tcg { paging2::flags::WRITE_COMBINE }
+            else { paging2::flags::CACHE_DISABLE };
+        FramebufferMapPolicy {
+            flags: cache | paging2::flags::FOREIGN,
+            slow: qemu_tcg,
+            // The wide blitter needs SSE2, not merely PAT support.
+            wide: wc && edx & (1 << 26) != 0 && !hypervisor,
+        }
+    }
+    #[cfg(not(target_arch = "x86"))]
+    panic!("physical framebuffer policy is unavailable on this platform");
 }

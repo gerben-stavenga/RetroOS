@@ -168,5 +168,5 @@ pub use x86::{FxState, clean_fx_template};
 pub use irq::now;
 
 mod frames;
-pub use frames::map_heap_page;
+pub use frames::{map_heap_page, physical as kernel_frame};
 mod mapping;

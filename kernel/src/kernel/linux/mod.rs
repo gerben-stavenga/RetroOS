@@ -1959,7 +1959,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     let focused_dos = (replacing_dos || starting_dos) && crate::kernel::focus::focused() == tid;
     let exec_display = if focused_dos {
         Some(match display.take() {
-            Some(surface) => crate::kernel::display::DisplayHandoff::from_surface(surface, machine),
+            Some(surface) => crate::kernel::display::DisplayHandoff::from_surface(surface),
             None => thread::get_thread(threads, tid).unwrap()
                 .personality.release_display(machine, bios_workspace),
         })

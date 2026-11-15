@@ -99,16 +99,9 @@ impl Memory for Interp {
         crate::engine::flush();
     }
 
-    unsafe fn physical_frame(&mut self, base: core::ptr::NonNull<u8>) -> arch_abi::page_entry::PhysicalFrame {
-        arch_abi::page_entry::PhysicalFrame::new(crate::phys::kernel_frame(base, 1)).unwrap()
-    }
-
     fn physical_frame_io(&self) -> Option<arch_abi::PhysicalFrameIo> { Some(crate::phys::io()) }
 
-    fn map_kernel_physical(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
-        assert!(vpage_start >= 0xc0000000 / 4096);
-        crate::calls::arch_map_kernel_physical(vpage_start, num_pages, ppage_start, flags)
-    }
+
 }
 
 impl Arch for Interp {

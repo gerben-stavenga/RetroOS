@@ -132,7 +132,7 @@ fn capabilities<A: crate::Arch>(
                 if (kind == 1 && offset % 4 != 0) || (kind == 2 && offset % 2 != 0) {
                     return None;
                 }
-                let registers = Mmio::map(machine, base.checked_add(u64::from(offset))?, len)?;
+                let registers = Mmio::map(base.checked_add(u64::from(offset))?, len)?;
                 match kind {
                     1 if len >= 56 => common = Some(registers),
                     2 if (head >> 16) as u8 >= 20 && cursor <= 0xEC => {
@@ -152,8 +152,7 @@ fn capabilities<A: crate::Arch>(
     Some((common?, notify?, config?))
 }
 
-fn make_queue<A: crate::Arch>(
-    machine: &mut A,
+fn make_queue(
     common: Mmio,
     notify: &Cap,
     number: u16,
@@ -172,7 +171,6 @@ fn make_queue<A: crate::Arch>(
         return None;
     }
     let dma = crate::kernel::platform::dma_buffer(
-        machine,
         (PACKETS + usize::from(size) * BUFFER).div_ceil(crate::PAGE_SIZE),
         1, 64,
     )?;
@@ -255,8 +253,8 @@ impl VirtioNet {
         };
         let result = (|| {
             let (mac, _) = initialize()?;
-            let rx = make_queue(machine, common, &notify, 0)?;
-            let tx = make_queue(machine, common, &notify, 1)?;
+            let rx = make_queue(common, &notify, 0)?;
+            let tx = make_queue(common, &notify, 1)?;
             let mut nic = Self {
                 common,
                 rx,

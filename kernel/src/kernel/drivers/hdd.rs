@@ -474,7 +474,7 @@ impl BusMaster {
         let bar = pci::read32(machine, bus, dev, func, 0x20);
         if bar & 1 == 0 || bar & 0xfffffff0 == 0 || bar > 0xffff { return None; }
         let base = (bar as u16 & !0xf) + if secondary { 8 } else { 0 };
-        let dma = crate::kernel::platform::dma_buffer(machine, 33, 1, 32)?;
+        let dma = crate::kernel::platform::dma_buffer(33, 1, 32)?;
         let command = pci::read32(machine, bus, dev, func, 4);
         pci::write32(machine, bus, dev, func, 4, (command & 0xffff) | 5);
         // Program MWDMA2 timings (ISP=2, RTC=3), retaining PIO0 for

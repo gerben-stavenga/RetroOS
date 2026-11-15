@@ -1255,30 +1255,6 @@ pub fn wc_pat_enabled() -> bool {
     unsafe { WC_PAT_ENABLED }
 }
 
-/// One authoritative cache/copy policy for every metal linear framebuffer,
-/// whether supplied by the loader or acquired later through VBE.
-pub fn framebuffer_map_policy() -> arch_abi::FramebufferMapPolicy {
-    let (_, hv_ebx, _, _) = crate::x86::cpuid(0x4000_0000);
-    let (_, _, cpuid1_ecx, cpuid1_edx) = crate::x86::cpuid(1);
-    let hypervisor = (cpuid1_ecx >> 31) & 1 != 0;
-    let qemu_tcg = hypervisor && hv_ebx == 0x5447_4354; // "TCGT"
-    // `retroos_fb_copy32_wide` uses MOVDQU and MOVNTDQ, both SSE2. PAT
-    // predates SSE2 on P6 CPUs, and 86Box deliberately exposes combinations
-    // such as Pentium III + PAT where selecting the wide path from PAT alone
-    // raises #UD as soon as an OSD-sized blit reaches it.
-    let sse2 = cpuid1_edx & (1 << 26) != 0;
-    let cache = if wc_pat_enabled() && !qemu_tcg {
-        flags::WRITE_COMBINE
-    } else {
-        flags::CACHE_DISABLE
-    };
-    arch_abi::FramebufferMapPolicy {
-        flags: cache | flags::FOREIGN,
-        slow: qemu_tcg,
-        wide: wc_pat_enabled() && sse2 && !hypervisor,
-    }
-}
-
 /// Reprogram PAT entry 4 (PAT=1, PCD=0, PWT=0) from its default WB to
 /// Write-Combining, so a 4 KB leaf PTE carrying `flags::WRITE_COMBINE` maps WC.
 ///

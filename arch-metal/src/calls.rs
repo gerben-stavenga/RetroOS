@@ -211,3 +211,8 @@ pub fn arch_idle(max_ns: u64) {
     unsafe { core::arch::asm!("int 0x80", in("eax") crate::arch_call::IDLE as u32,
         in("edx") max_ns as u32, in("ecx") (max_ns >> 32) as u32); }
 }
+
+/// Synchronize this core's privileged mappings with platform updates.
+pub fn arch_refresh_kernel_mappings() {
+    unsafe { core::arch::asm!("int 0x80", in("eax") crate::arch_call::REFRESH_KERNEL as u32); }
+}

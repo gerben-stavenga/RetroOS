@@ -12,7 +12,6 @@ pub mod arch_call {
     pub const FORK: u64 = 0x105;
     pub const CLEAN: u64 = 0x106;
     pub const LOAD_LDT: u64 = 0x115;
-    pub const MAP_KERNEL_PHYSICAL: u64 = 0x116;
     pub const SET_TLS_ENTRY: u64 = 0x117;
     #[allow(dead_code)]
     pub const HASH_PHYS_PAGE: u64 = 0x118;
@@ -34,11 +33,6 @@ pub fn arch_user_clean() {
 /// Free user pages in the current address space (arch CLEAN).
 pub fn arch_free_user_pages() {
     arch_user_clean();
-}
-
-/// Install a privileged physical driver window.
-pub fn arch_map_kernel_physical(vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
-    crate::paging::map_kernel_physical(vpage_start, num_pages, ppage_start, flags);
 }
 
 /// Load the LDT base+limit (the active descriptor table for PM selector

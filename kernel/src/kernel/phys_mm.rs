@@ -276,6 +276,16 @@ pub fn direct_pointer(page: u64) -> *mut u8 {
     (DIRECT_BASE.load(Ordering::Acquire) + offset) as *mut u8
 }
 
+/// Translate a pointer within the caller's permanent hosted RAM view.
+pub fn direct_frame(base: core::ptr::NonNull<u8>) -> u64 {
+    let start = DIRECT_BASE.load(Ordering::Acquire);
+    assert_ne!(start, 0, "direct RAM not initialized");
+    let offset = (base.as_ptr() as usize).checked_sub(start).expect("pointer outside direct RAM");
+    assert!(offset.is_multiple_of(PAGE_SIZE));
+    assert!(offset.checked_add(PAGE_SIZE).is_some_and(|end| end <= DIRECT_BYTES.load(Ordering::Acquire)));
+    (offset / PAGE_SIZE) as u64
+}
+
 pub fn alloc_shared_pages(count: usize) -> core::ptr::NonNull<u8> {
     assert!(count != 0);
     if DIRECT_BASE.load(Ordering::Acquire) != 0 {

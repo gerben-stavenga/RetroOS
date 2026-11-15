@@ -57,6 +57,7 @@ fn write_entry(ppage: u64, i: usize, v: u32) {
 }
 
 /// Consume and zero one caller-supplied table frame.
+#[cfg(test)]
 fn take_table() -> u64 {
     let ppage = phys::take_input().expect("page table needs supplied input");
     unsafe { core::ptr::write_bytes(phys::frame_ptr(ppage), 0, 4096) };
@@ -73,6 +74,7 @@ pub fn new_page_dir() -> u64 {
 /// Map virtual page `vaddr` (page-aligned) to physical frame `paddr_ppage` in
 /// the address space rooted at page directory `pd`. Allocates the intermediate
 /// page table on first use. `writable` clears the W bit when false (read-only).
+#[cfg(test)]
 pub fn map_page(pd: u64, vaddr: u32, paddr_ppage: u64, writable: bool) {
     let pde_i = pde_index(vaddr);
     let pde = read_entry(pd, pde_i);
@@ -1131,22 +1133,4 @@ fn test_alias(source: usize, destination: usize, count: usize) {
         let entry = read_mapping(arch_abi::UserPage::new(((source + i) * 4096) as u64).unwrap()).unwrap();
         replace_user_mapping(arch_abi::UserPage::new(((destination + i) * 4096) as u64).unwrap(), entry).unwrap();
     }
-}
-
-/// Physical driver windows are supervisor-only and borrow their storage.
-pub(crate) fn map_kernel_physical(vpage: usize, count: usize, physical: u64, flags: u64) {
-    assert!(vpage >= 0xc0000000 / 4096);
-    assert!(vpage.checked_add(count).is_some_and(|end| end <= 1 << 20));
-    with_active_pd(|pd| {
-        for i in 0..count {
-            let address = ((vpage + i) * 4096) as u32;
-            map_page(pd, address, physical + i as u64, true);
-            let table = u64::from(read_entry(pd, pde_index(address)) >> 12);
-            let raw = if flags & arch_abi::MAP_MMIO != 0 { CACHE_DISABLE } else {
-                (((physical + i as u64) as u32) << 12) | PRESENT | WRITABLE | TYPED | SHARED | (flags as u32 & (8 | 16 | 128))
-            };
-            write_entry(table, pte_index(address), raw);
-        }
-    });
-    crate::engine::invalidate_pages(vpage, count);
 }

@@ -653,10 +653,9 @@ fn download_request(
     Ok(body)
 }
 
-/// Called while Arch is available for requested DMA allocations. All mappings
+/// Allocate firmware DMA storage during device setup. All mappings
 /// remain reserved for boot lifetime even when a subsequent RPC fails.
-pub(super) fn initialize<A: crate::Arch, R: Registers>(
-    machine: &mut A,
+pub(super) fn initialize<R: Registers>(
     transport: &mut mhi::Transport<R, Dma>,
     router: &mut qrtr::Router,
     chip: &Chip,
@@ -706,7 +705,7 @@ pub(super) fn initialize<A: crate::Arch, R: Registers>(
     let mut responses = Vec::new();
     for segment in segments {
         let address = if matches!(segment.kind, 1 | 3 | 4 | 8 | 9) {
-            let region = Dma::allocate_aligned(machine, segment.size as usize, chip.dma_bits)
+            let region = Dma::allocate_aligned(segment.size as usize, chip.dma_bits)
                 .ok_or(Error::Memory)?;
             let physical = region.physical();
             crate::compact_println!(
@@ -773,7 +772,7 @@ pub(super) fn initialize<A: crate::Arch, R: Registers>(
         return Err(Error::Firmware);
     }
     let mut region =
-        Dma::allocate_aligned(machine, m3.len(), chip.dma_bits).ok_or(Error::Memory)?;
+        Dma::allocate_aligned(m3.len(), chip.dma_bits).ok_or(Error::Memory)?;
     region.copy_in(0, &m3);
     let mut body = Vec::new();
     qmi::tlv(&mut body, 1, &region.physical().to_le_bytes())?;
@@ -796,7 +795,7 @@ pub(super) fn initialize<A: crate::Arch, R: Registers>(
     }
     *stage = "CE DMA allocation";
     let bytes = ce::Engine::<Dma>::required_bytes(chip.ce)?;
-    let region = Dma::allocate_aligned(machine, bytes, chip.dma_bits).ok_or(Error::Memory)?;
+    let region = Dma::allocate_aligned(bytes, chip.dma_bits).ok_or(Error::Memory)?;
     let mut ce = ce::Engine::new(chip.ce, region, bytes)?;
     let started = (|| -> Result<()> {
         *stage = "QMI CE pipe configuration";
@@ -818,7 +817,7 @@ pub(super) fn initialize<A: crate::Arch, R: Registers>(
     started?;
     *stage = "firmware crash dump allocation";
     let bytes = mhi::dump::CrashDump::<Dma>::required_bytes(chip.dump_bytes)?;
-    let region = Dma::allocate_aligned(machine, bytes, chip.dma_bits).ok_or(Error::Memory)?;
+    let region = Dma::allocate_aligned(bytes, chip.dma_bits).ok_or(Error::Memory)?;
     let mut dump = mhi::dump::CrashDump::new(region, bytes, chip.dump_bytes)?;
     dump.arm(&mut session.transport.io, layout)?;
     if let Some(read) = &chip.assertion_read

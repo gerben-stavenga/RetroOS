@@ -115,7 +115,7 @@ where A::PageTable: Send, A::Fx: Send {
             machine.idle(core::time::Duration::from_millis(1));
             continue;
         }
-        machine.refresh_kernel_mappings();
+        super::platform::refresh_kernel_mappings();
         let loan = unsafe { &mut *slot.loan.get() };
         let (entry, base, limit, pages) = loan.tls;
         if entry >= 0 { machine.set_tls_entry(entry, base, limit, pages); }
@@ -134,7 +134,7 @@ where A::PageTable: Send, A::Fx: Send {
 fn run_linux<A: Arch>(machine: &mut A, loan: &mut Loan<A>, slot: &Slot<A>) -> KernelEvent {
     loop {
         if slot.cancel.load(Ordering::Acquire) { return KernelEvent::Irq; }
-        machine.refresh_kernel_mappings();
+        super::platform::refresh_kernel_mappings();
         super::memory::service(machine);
         let event = machine.execute(&mut loan.regs, &arch_abi::IoPolicy::deny_all(), core::time::Duration::from_nanos(loan.deadline.saturating_sub(machine.now())));
         if !matches!(event, KernelEvent::Syscall | KernelEvent::SoftInt(0x80) | KernelEvent::Irq) {
@@ -142,7 +142,7 @@ fn run_linux<A: Arch>(machine: &mut A, loan: &mut Loan<A>, slot: &Slot<A>) -> Ke
         }
         let _handler = HandlerGuard::enter();
         let entered = machine.now();
-        machine.refresh_kernel_mappings();
+        super::platform::refresh_kernel_mappings();
         let action = super::linux::handle_event(machine, &mut loan.kernel, &mut loan.linux, &mut loan.regs, event);
         if matches!(event, KernelEvent::Syscall | KernelEvent::SoftInt(0x80)) {
             loan.stats.syscalls += 1;
@@ -331,7 +331,7 @@ impl Parallel {
             }
         }
         collect_finished::<A>(threads);
-        machine.refresh_kernel_mappings();
+        super::platform::refresh_kernel_mappings();
         if resume != current && super::focus::focused() == current {
             // Same Linux presentation: update its execution owner without a
             // framebuffer/display handoff, matching an ordinary tty switch.
@@ -396,7 +396,7 @@ pub(crate) fn take_process<A: Arch>(machine: &mut A, threads: &mut [Thread<A>], 
     }
     wait_for_slot(machine, slot, machine.now());
     collect_finished::<A>(threads);
-    machine.refresh_kernel_mappings();
+    super::platform::refresh_kernel_mappings();
 }
 pub(crate) fn stop_all<A: Arch>(machine: &mut A, threads: &mut [Thread<A>]) {
     for tid in 1..threads.len() { take_process(machine, threads, tid); }

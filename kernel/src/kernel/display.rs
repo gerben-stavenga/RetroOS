@@ -197,11 +197,11 @@ impl DisplayHandoff {
         }
     }
 
-    pub fn from_surface<A: crate::Arch>(display: Display, machine: &mut A) -> Self {
+    pub fn from_surface(display: Display) -> Self {
         // The next owner may draw only a centered VGA picture. Clear the old
         // desktop immediately so its windows cannot remain in the margins.
         display.clear_visible_framebuffer();
-        match display.into_native_capability(machine) {
+        match display.into_native_capability() {
             Ok(native) => Self::Vga(native),
             Err(display) => Self::Surface(display),
         }
@@ -426,8 +426,8 @@ impl Display {
         pages: usize,
     ) -> Self {
         native.bios_set_mode(machine, bios, mode.number);
-        let policy = machine.framebuffer_map_policy();
-        crate::kernel::memory::map_physical(machine,
+        let policy = crate::kernel::platform::framebuffer_map_policy();
+        crate::kernel::platform::map_kernel_physical(
             arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE,
             pages,
             u64::from(mode.physical_base) / crate::PAGE_SIZE as u64,
@@ -597,10 +597,7 @@ impl Display {
     }
     // Callers keep the existing display when native VGA is unavailable.
     #[allow(clippy::result_large_err)]
-    pub fn into_native_capability<A: crate::Arch>(
-        self,
-        machine: &mut A,
-    ) -> Result<crate::kernel::platform::VgaCap, Self> {
+    pub fn into_native_capability(self) -> Result<crate::kernel::platform::VgaCap, Self> {
         self.wait_presentation();
         match self.backend {
             Backend::Vga { native, scanout } => {
@@ -609,7 +606,7 @@ impl Display {
                         crate::kernel::drivers::vga_hw::restore(&native, &saved);
                     }
                     VgaScanout::VbeLinear { pages, .. } => {
-                        crate::kernel::memory::reset(machine, arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
+                        crate::kernel::platform::unmap_kernel_pages(arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
                     }
                     VgaScanout::VbeBanked { .. } => {}
                 }

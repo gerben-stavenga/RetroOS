@@ -51,7 +51,7 @@ fn kernel_owned_shared_pages_are_coherent_across_guest_fork() {
         let start = UserPage::new(HI as u64).unwrap();
         for i in 0..3 {
             let pointer = core::ptr::NonNull::new_unchecked(memory.as_ptr().add(i * 4096));
-            let frame = machine.physical_frame(pointer);
+            let frame = PhysicalFrame::new(test_memory::direct_frame(pointer)).unwrap();
             machine.replace_mapping(start.offset(i).unwrap(), PageEntry::Writable(Mapping {
                 backing: Backing::Borrowed(frame), attributes: Attributes::EXECUTABLE,
             })).unwrap();
@@ -119,7 +119,7 @@ fn borrowed_cow_copies_and_batch_failure_reports_progress() {
     let mut machine = arch::Interp;
     let start = UserPage::new(HI as u64).unwrap();
     let memory = test_memory::alloc_shared_pages(1);
-    let frame = unsafe { machine.physical_frame(memory) };
+    let frame = PhysicalFrame::new(test_memory::direct_frame(memory)).unwrap();
     let mapping = Mapping { backing: Backing::Borrowed(frame), attributes: Attributes::EXECUTABLE };
     unsafe {
         *memory.as_ptr() = 0x42;
@@ -268,6 +268,9 @@ pub mod test_memory {
                 (*supply).donate(alloc_backed_pages(1));
             }
         }
+    }
+    pub fn direct_frame(base: std::ptr::NonNull<u8>) -> u64 {
+        ((base.as_ptr() as usize - pool().base) / 4096) as u64
     }
     pub fn alloc_shared_pages(count: usize) -> std::ptr::NonNull<u8> {
         let frame = alloc_backed_pages(count);

@@ -214,7 +214,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
     // hardware (continuous scanout) both see WC fine. Detect plain QEMU-TCG via
     // its hypervisor signature ("TCGTCGTCGTCG") and use strong-UC there, where
     // every write is a dirty-tracked device access the display picks up.
-    let policy = paging2::framebuffer_map_policy();
+    let policy = crate::kernel::platform::framebuffer_map_policy();
     if policy.slow {
         lib::compact_screenln!(screen, "fbcon: QEMU-TCG detected — strong-UC framebuffer (WC not scanned)");
     }

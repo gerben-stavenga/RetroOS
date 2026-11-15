@@ -150,10 +150,10 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     let bar_hi = if is_64 { pci::read32(machine, bus, dev, func, 0x14) } else { 0 };
     let bar_phys = ((bar_hi as u64) << 32) | (bar0 & 0xFFFF_FFF0) as u64;
 
-    let registers = Mmio::map(machine, bar_phys, DOORBELL_BASE)?;
+    let registers = Mmio::map(bar_phys, DOORBELL_BASE)?;
     let stride = 4usize << (registers.read(R_CAP_HI) & 0xF);
-    let regs = Mmio::map(machine, bar_phys, DOORBELL_BASE + 3 * stride + 4)?;
-    let dma = crate::kernel::platform::dma_buffer(machine, DMA_PAGES, 1, 64)?;
+    let regs = Mmio::map(bar_phys, DOORBELL_BASE + 3 * stride + 4)?;
+    let dma = crate::kernel::platform::dma_buffer(DMA_PAGES, 1, 64)?;
     let dma_phys = dma.phys;
 
     // Doorbell stride: CAP.DSTRD (bits 35:32), in units of 4 bytes.

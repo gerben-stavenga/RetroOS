@@ -612,7 +612,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
         crate::compact_println!("hda: {:02x}:{:02x}.{} skipped: no BAR", bus, dev, func);
         return None;
     }
-    crate::kernel::memory::map_physical(machine,
+    crate::kernel::platform::map_kernel_physical(
         BAR_WIN_VA >> 12,
         BAR_PAGES,
         bar_phys >> 12,
@@ -633,7 +633,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
         crate::compact_println!("hda: {:02x}:{:02x}.{} failed: no DMA buffer", bus, dev, func);
         return None;
     }
-    crate::kernel::memory::map_physical(machine, DMA_WIN_VA >> 12, DMA_PAGES, phys_page, PTE_CACHE_DISABLE);
+    crate::kernel::platform::map_kernel_physical(DMA_WIN_VA >> 12, DMA_PAGES, phys_page, PTE_CACHE_DISABLE);
     let dma_phys = (phys_page * 0x1000) as u32;
 
     let mut d = Hda {

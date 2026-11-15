@@ -188,7 +188,7 @@ impl EmulatedVga {
         display: crate::kernel::display::Display,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> FullscreenVga {
-        match display.into_native_capability(machine) {
+        match display.into_native_capability() {
             Ok(native) => {
                 let needs_software_lfb = self.state.svga().is_some_and(|svga| {
                     matches!(svga.access, ::vga::SvgaAccess::Linear)
@@ -789,19 +789,28 @@ fn copy_vbe_memory<A: crate::Arch>(
 ) {
     for offset in (0..bytes).step_by(scratch.len()) {
         let count = scratch.len().min(bytes - offset);
-        machine.copy_from(source + offset, &mut scratch[..count]);
-        machine.copy_to(destination + offset, &scratch[..count]);
+        if source >= 0xc000_0000 {
+            for (i, byte) in scratch[..count].iter_mut().enumerate() {
+                *byte = unsafe { ((source + offset + i) as *const u8).read_volatile() };
+            }
+        } else {
+            machine.copy_from(source + offset, &mut scratch[..count]);
+        }
+        if destination >= 0xc000_0000 {
+            for (i, &byte) in scratch[..count].iter().enumerate() {
+                unsafe { ((destination + offset + i) as *mut u8).write_volatile(byte); }
+            }
+        } else {
+            machine.copy_to(destination + offset, &scratch[..count]);
+        }
     }
 }
 
-fn map_linear_vbe<A: crate::Arch>(
-    machine: &mut A,
-    mode: crate::kernel::platform::VbeMode,
-) -> (usize, usize) {
+fn map_linear_vbe(mode: crate::kernel::platform::VbeMode) -> (usize, usize) {
     let offset = mode.physical_base as usize & (crate::PAGE_SIZE - 1);
     let bytes = mode.framebuffer_bytes as usize;
     let pages = (offset + bytes).div_ceil(crate::PAGE_SIZE);
-    crate::kernel::memory::map_physical(machine,
+    crate::kernel::platform::map_kernel_physical(
         arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE,
         pages,
         u64::from(mode.physical_base) / crate::PAGE_SIZE as u64,
@@ -827,9 +836,9 @@ fn capture_native_vbe<A: crate::Arch>(
 
     let mut scratch = alloc::vec![0; crate::PAGE_SIZE];
     if matches!(svga.access, ::vga::SvgaAccess::Linear) && mode.physical_base != 0 {
-        let (address, pages) = map_linear_vbe(machine, mode);
+        let (address, pages) = map_linear_vbe(mode);
         copy_vbe_memory(machine, address, SVGA_LFB_BASE, bytes, &mut scratch);
-        crate::kernel::memory::reset(machine, arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
+        crate::kernel::platform::unmap_kernel_pages(arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
     } else if let Some(current_bank) = svga.bank() {
         copy_banked_from_card(machine, bios, display, mode, current_bank, &mut scratch);
     }
@@ -864,9 +873,9 @@ fn restore_native_vbe<A: crate::Arch>(
     let bytes = mode.framebuffer_bytes as usize;
     let mut scratch = alloc::vec![0; crate::PAGE_SIZE];
     if !banked && mode.physical_base != 0 {
-        let (address, pages) = map_linear_vbe(machine, mode);
+        let (address, pages) = map_linear_vbe(mode);
         copy_vbe_memory(machine, SVGA_LFB_BASE, address, bytes, &mut scratch);
-        crate::kernel::memory::reset(machine, arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
+        crate::kernel::platform::unmap_kernel_pages(arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
     } else if let ::vga::SvgaAccess::Banked { bank } = svga.access {
         copy_banked_to_card(
             machine, bios, display, mode, bank, &mut scratch,

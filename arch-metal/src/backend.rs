@@ -131,10 +131,6 @@ impl Memory for Metal {
         result as i32
     }
 
-    fn refresh_kernel_mappings(&mut self) {
-        unsafe { core::arch::asm!("int 0x80", in("eax") crate::arch_call::REFRESH_KERNEL as u32); }
-    }
-
     fn user_fork(&mut self, child: &mut RootPageTable) { super::calls::arch_user_fork(child) }
 
     fn free_user_pages(&mut self) { super::calls::arch_free_user_pages() }
@@ -147,19 +143,6 @@ impl Memory for Metal {
 
     fn set_page_input(&mut self, input: *mut arch_abi::page_supply::PageInput) -> *mut arch_abi::page_supply::PageInput {
         crate::memory::set_input(input)
-    }
-
-    unsafe fn physical_frame(&mut self, base: core::ptr::NonNull<u8>) -> arch_abi::page_entry::PhysicalFrame {
-        arch_abi::page_entry::PhysicalFrame::new(crate::frames::physical(base.as_ptr() as usize)).unwrap()
-    }
-
-    fn map_kernel_physical(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
-        assert!(vpage_start >= 0xc0000000 / 4096);
-        super::calls::arch_map_kernel_physical(vpage_start, num_pages, ppage_start, flags)
-    }
-
-    fn framebuffer_map_policy(&self) -> arch_abi::FramebufferMapPolicy {
-        super::paging2::framebuffer_map_policy()
     }
 }
 

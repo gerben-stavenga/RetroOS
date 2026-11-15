@@ -3,7 +3,7 @@
 //! Arch owns execution and lifecycle. X86, Memory and Diagnostics
 //! group its supporting capabilities.
 
-use crate::{Regs, KernelEvent, ExecutionProfile, ExecutionProfileStage, FramebufferMapPolicy};
+use crate::{Regs, KernelEvent, ExecutionProfile, ExecutionProfileStage};
 use crate::page_entry::PageEntry;
 use crate::mapping::{MappingError, MappingFailure, UserPage, validate_batch};
 
@@ -132,7 +132,7 @@ pub trait X86 {
     unsafe fn replace_interrupt_handlers(&mut self, _vector: u8, handlers: crate::InterruptHandlers) -> crate::InterruptHandlers { handlers }
 }
 
-/// Active address spaces, mappings and physical memory.
+/// User address spaces, their mappings and supplied backing storage.
 pub trait Memory {
     /// Backend page-table root type stored in `Vcpu::space` — an OWNED address
     /// space, so it is **not** `Copy`: a parked `Vcpu` moves rather than
@@ -213,8 +213,6 @@ pub trait Memory {
     /// Consumes explicit backing inputs; -11 requests another input batch.
     fn private_page_tables(&mut self) -> i32 { 0 }
 
-    fn refresh_kernel_mappings(&mut self) {}
-
     /// Tear down a dead thread's address space entirely. `free_user_pages`
     /// (called at exit, while the space is still active) returns its page
     /// FRAMES; this releases the space OBJECT itself — on the interpreter
@@ -231,26 +229,6 @@ pub trait Memory {
     fn page_supply(&self) -> Option<*mut crate::page_supply::PageSupply> { None }
 
     fn set_page_input(&mut self, _input: *mut crate::page_supply::PageInput) -> *mut crate::page_supply::PageInput { core::ptr::null_mut() }
-
-    /// Translate a page-aligned kernel address to its backing physical frame.
-    /// # Safety
-    /// The address must refer to live mapped RAM.
-    unsafe fn physical_frame(&mut self, base: core::ptr::NonNull<u8>) -> crate::page_entry::PhysicalFrame;
-
-    /// Install a privileged driver window; user mappings use replace_mapping.
-    fn map_kernel_physical(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64);
-
-    /// Cache/copy policy for a physical linear framebuffer owned by a display
-    /// controller. The conservative default is strong-UC.
-    fn framebuffer_map_policy(&self) -> FramebufferMapPolicy {
-        FramebufferMapPolicy {
-            flags: crate::MAP_PHYS_CACHE_DISABLE | crate::MAP_PHYS_FOREIGN,
-            slow: true,
-            wide: false,
-        }
-    }
-
-
 }
 
 /// Optional execution profiling and address-space diagnostics.

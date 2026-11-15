@@ -438,7 +438,7 @@ fn select_display<A: crate::Arch>(
         bios_workspace.curated_modes(),
         !display.is_headless(),
     );
-    let display = match display.into_native_capability(machine) {
+    let display = match display.into_native_capability() {
         Ok(native) => crate::kernel::display::Display::new_selected(
             machine,
             bios_workspace,
@@ -2058,7 +2058,7 @@ fn event_loop<A: crate::Arch>(
                     && let Some(surface) = display.take()
                 {
                     let handoff =
-                        crate::kernel::display::DisplayHandoff::from_surface(surface, machine);
+                        crate::kernel::display::DisplayHandoff::from_surface(surface);
                     thread.personality.acquire_display_restore(
                         machine,
                         &mut *bios_workspace,
@@ -2446,7 +2446,7 @@ fn switch_focus_and_run<A: crate::Arch>(
         }
         let owner = thread::get_thread(threads, focused).expect("focus handoff: owner");
         let handoff = match display.take() {
-            Some(display) => crate::kernel::display::DisplayHandoff::from_surface(display, machine),
+            Some(display) => crate::kernel::display::DisplayHandoff::from_surface(display),
             None => owner.personality.release_display(machine, bios_workspace),
         };
         let card = owner.personality.release_sb(machine);
@@ -2530,7 +2530,7 @@ fn switch_focus_and_run<A: crate::Arch>(
         assert!(exiting_display.is_none(), "stale exiting display");
         let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
         let handoff = match display.take() {
-            Some(display) => crate::kernel::display::DisplayHandoff::from_surface(display, machine),
+            Some(display) => crate::kernel::display::DisplayHandoff::from_surface(display),
             None => old.personality.release_display(machine, bios_workspace),
         };
         let card = old.personality.release_sb(machine);
@@ -2581,7 +2581,7 @@ fn switch_focus_and_run<A: crate::Arch>(
         && matches!(new.personality, thread::Personality::Dos(_))
         && let Some(surface) = display.take()
     {
-        let handoff = crate::kernel::display::DisplayHandoff::from_surface(surface, machine);
+        let handoff = crate::kernel::display::DisplayHandoff::from_surface(surface);
         new.personality
             .acquire_display_restore(machine, bios_workspace, handoff);
     }
@@ -2612,7 +2612,7 @@ fn apply_current_presentation<A: crate::Arch>(
     } else if matches!(personality, thread::Personality::Dos(_))
         && let Some(surface) = display.take()
     {
-        let handoff = crate::kernel::display::DisplayHandoff::from_surface(surface, machine);
+        let handoff = crate::kernel::display::DisplayHandoff::from_surface(surface);
         personality.acquire_display_restore(machine, bios_workspace, handoff);
     }
 }
@@ -2755,7 +2755,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     // the only physical display ownership during construction; the parent's
     // record is now a complete emulated recovery image.
     let fork_display = parent_was_focused.then(|| match event_display.take() {
-        Some(display) => crate::kernel::display::DisplayHandoff::from_surface(display, machine),
+        Some(display) => crate::kernel::display::DisplayHandoff::from_surface(display),
         None => {
             let parent = thread::get_thread(threads, parent_tid).unwrap();
             parent.personality.release_display(machine, bios_workspace)

@@ -169,20 +169,15 @@ pub unsafe fn map_shared_pages<A: Arch>(machine: &mut A, vpage: usize,
     if count != 0 { start.offset(count - 1).unwrap(); }
     for index in 0..count {
         let pointer = unsafe { core::ptr::NonNull::new_unchecked(base.as_ptr().add(index * 4096)) };
-        let frame = unsafe { machine.physical_frame(pointer) };
+        let frame = unsafe { super::platform::physical_frame(pointer) };
         let entry = PageEntry::Writable(Mapping { backing: Backing::Borrowed(frame), attributes: Attributes::EXECUTABLE });
         unsafe { replace(machine, start.offset(index).unwrap(), entry) }.expect("cannot map shared backing");
     }
 }
 
-/// Compatibility composition for existing physical-window callers. User
-/// entries borrow physical storage; privileged driver windows remain separate.
+/// Borrow physical backing into user mappings.
 pub fn map_physical<A: Arch>(machine: &mut A, vpage: usize, count: usize, physical: u64, flags: u64) {
     use arch_abi::{UserPage, page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFrame}};
-    if vpage >= 0xc0000000 / 4096 {
-        machine.map_kernel_physical(vpage, count, physical, flags);
-        return;
-    }
     let start = UserPage::new((vpage as u64).checked_mul(4096).expect("mapping address overflow")).unwrap();
     if count != 0 { start.offset(count - 1).unwrap(); }
     let mut attributes = Attributes::EXECUTABLE;
@@ -236,13 +231,8 @@ pub fn zero_mapping<A: Arch>(machine: &A, executable: bool) -> Mapping {
 }
 
 /// Personality policy: discard contents and allow subsequent anonymous writes.
-/// Device windows in the privileged region are invalidated, not turned into RAM.
 pub fn reset<A: Arch>(machine: &mut A, vpage: usize, count: usize) {
     if count == 0 { return; }
-    if vpage >= 0xc0000000 / 4096 {
-        machine.map_kernel_physical(vpage, count, 0, arch_abi::MAP_MMIO);
-        return;
-    }
     let entry = PageEntry::CopyOnWrite(zero_mapping(machine, true));
     unsafe { fill(machine, page(vpage), count, entry) }.expect("reset mappings");
 }

@@ -131,7 +131,7 @@ fn probe_controller<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8,
     if bar & 1 != 0 || bar & 0xfffffff0 == 0 { return; }
     let command = pci::read32(machine, bus, dev, func, 4);
     pci::write32(machine, bus, dev, func, 4, (command & 0xffff) | 6);
-    let Some(regs) = Mmio::map(machine, (bar & 0xfffffff0) as u64, 0x1100) else { return };
+    let Some(regs) = Mmio::map((bar & 0xfffffff0) as u64, 0x1100) else { return };
     // BIOS/OS handoff before changing any port's DMA addresses.
     if regs.read(0x24) & 1 != 0 {
         regs.write(0x28, regs.read(0x28) | 2);
@@ -150,7 +150,7 @@ fn probe_controller<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8,
         if !stopped(CR) { continue; }
         regs.write(port + CMD, regs.read(port + CMD) & !FRE);
         if !stopped(FR) { continue; }
-        let Some(dma) = crate::kernel::platform::dma_buffer(machine, 1 + BOUNCE_PAGES, 1, address_bits) else { continue };
+        let Some(dma) = crate::kernel::platform::dma_buffer(1 + BOUNCE_PAGES, 1, address_bits) else { continue };
         regs.write64(port + CLB, dma.phys);
         regs.write64(port + FB, dma.phys + 0x400);
         regs.write(port + IE, 0);

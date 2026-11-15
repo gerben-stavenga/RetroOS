@@ -167,7 +167,7 @@ pub fn restore_from_monitor<A: crate::Arch>(
         assert!(matches!(personality, thread::Personality::Dos(_)),
             "non-DOS OSD borrowed a fullscreen scanout lease");
         let display = display.take().expect("closing OSD without compositor display");
-        let handoff = crate::kernel::display::DisplayHandoff::from_surface(display, machine);
+        let handoff = crate::kernel::display::DisplayHandoff::from_surface(display);
         personality.acquire_display_restore(
             machine, bios_workspace, handoff,
         );
