@@ -64,12 +64,14 @@ fn batch(page: UserPage, count: usize, mut apply: impl FnMut(UserPage, usize) ->
     Ok(())
 }
 pub(crate) fn read_mappings(arguments: &mut Read<'_>) {
+    let _paging = paging2::PagingGuard::lock();
     arguments.result = batch(arguments.page, arguments.entries.len(), |page, index| {
         arguments.entries[index] = read_run(page, 1)?.0;
         Ok(())
     });
 }
 pub(crate) fn replace_mappings(arguments: &mut Replace<'_>) {
+    let _paging = paging2::PagingGuard::lock();
     arguments.result = batch(arguments.page, arguments.entries.len(), |page, index| {
         replace_page(page, arguments.entries[index])
     });
@@ -77,6 +79,7 @@ pub(crate) fn replace_mappings(arguments: &mut Replace<'_>) {
     paging2::flush_tlb();
 }
 pub(crate) fn fill_mappings(arguments: &mut Fill) {
+    let _paging = paging2::PagingGuard::lock();
     let Fill { page, count, entry, result } = arguments;
     *result = validate_range(*page, *count).and_then(|()| {
         if *count == 0 { return Ok(()); }
@@ -87,6 +90,7 @@ pub(crate) fn fill_mappings(arguments: &mut Fill) {
     paging2::flush_tlb();
 }
 pub(crate) fn read_mapping_run(arguments: &mut ReadRun) {
+    let _paging = paging2::PagingGuard::lock();
     arguments.result = if arguments.maximum == 0 { Err(MappingError::InvalidAddress) }
         else {
             arguments.page.offset(arguments.maximum - 1)

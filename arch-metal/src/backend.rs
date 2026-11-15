@@ -122,14 +122,6 @@ impl Memory for Metal {
         incoming
     }
 
-    fn private_page_tables(&mut self, pages: arch_abi::page_supply::PageInput) -> (i32, arch_abi::page_supply::PageInput) {
-        crate::memory::with_input(pages, || {
-            let result: u32;
-            unsafe { core::arch::asm!("int 0x80", inlateout("eax") crate::arch_call::PRIVATE_TABLES as u32 => result); }
-            result as i32
-        })
-    }
-
     fn user_fork(&mut self, child: &mut RootPageTable, pages: arch_abi::page_supply::PageInput) -> ((), arch_abi::page_supply::PageInput) {
         crate::memory::with_input(pages, || {
             super::calls::arch_user_fork(child)

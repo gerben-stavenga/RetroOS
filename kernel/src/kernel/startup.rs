@@ -2837,7 +2837,6 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     {
         let parent = thread::get_thread(threads, parent_tid).unwrap();
         parent.personality.on_suspend(machine);
-        parent.kernel.tables_private = false;
         crate::kernel::memory::fork(machine, &mut parent.kernel.vcpu.space);
     }
 

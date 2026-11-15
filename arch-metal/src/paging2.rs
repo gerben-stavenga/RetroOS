@@ -166,6 +166,7 @@ impl RootPageTable {
     /// Saves current user entries from the constant root.
     /// Save user entries from the constant root into this struct.
     pub fn save(&mut self) {
+        let _paging = PagingGuard::lock();
         crate::high_paging::save(self);
         match cpu_mode() {
             CpuMode::Legacy => {
@@ -197,6 +198,7 @@ impl RootPageTable {
     /// Does NOT reload CR3 — call activate() for that, or use with
     /// toggle_cr3() when a mode switch follows.
     pub fn load_entries(&self) {
+        let _paging = PagingGuard::lock();
         crate::high_paging::load(self);
         match cpu_mode() {
             CpuMode::Legacy => {
@@ -224,6 +226,7 @@ impl RootPageTable {
     /// Swap user entries between self and the constant root page, then reload CR3.
     /// On return, self holds the old root entries and the constant root has self's former entries.
     pub fn swap_and_activate(&mut self) {
+        let _paging = PagingGuard::lock();
         crate::high_paging::swap(self);
         match cpu_mode() {
             CpuMode::Legacy => {
@@ -517,31 +520,34 @@ static mut ROOT: RawPage = RawPage([0; PAGE_SIZE]);
 // One canonical kernel portion, copied to private roots on kernel entry.
 // The lock protects both the snapshot and its generation; it never allocates.
 static mut KERNEL_ROOT: *mut RawPage = core::ptr::null_mut();
-// Shared heap PTEs can fault on several CPUs at once. Ring-0 operations
-// serialize the walk and recheck mappings after acquiring the lock. Recursive
-// faults on page-table storage reenter on the owning CPU without deadlocking.
-static KERNEL_MAPPING_OWNER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+// Paging transitions involving shared tables are serialized as a whole:
+// observe ownership, retain/copy children, publish the private parent, release
+// old backing. Atomic reference counts alone cannot order these steps.
+// The lock is released before guest execution; different CPUs still run guests
+// concurrently. A synchronous fault through the recursive view reenters on
+// the owning CPU and consumes that CPU's supplied fault pages.
+static PAGING_OWNER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[thread_local]
-static KERNEL_MAPPING_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
-pub(crate) struct KernelMappingGuard;
-impl KernelMappingGuard {
+static PAGING_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+pub(crate) struct PagingGuard;
+impl PagingGuard {
     pub(crate) fn lock() -> Self {
         use core::sync::atomic::Ordering;
         let owner = crate::smp::current_core_id() + 1;
-        if KERNEL_MAPPING_DEPTH.get() == 0 {
-            while KERNEL_MAPPING_OWNER.compare_exchange(0, owner, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        if PAGING_DEPTH.get() == 0 {
+            while PAGING_OWNER.compare_exchange(0, owner, Ordering::Acquire, Ordering::Relaxed).is_err() {
                 core::hint::spin_loop();
             }
         }
-        KERNEL_MAPPING_DEPTH.set(KERNEL_MAPPING_DEPTH.get() + 1);
+        PAGING_DEPTH.set(PAGING_DEPTH.get() + 1);
         Self
     }
 }
-impl Drop for KernelMappingGuard {
+impl Drop for PagingGuard {
     fn drop(&mut self) {
-        let depth = KERNEL_MAPPING_DEPTH.get() - 1;
-        KERNEL_MAPPING_DEPTH.set(depth);
-        if depth == 0 { KERNEL_MAPPING_OWNER.store(0, core::sync::atomic::Ordering::Release); }
+        let depth = PAGING_DEPTH.get() - 1;
+        PAGING_DEPTH.set(depth);
+        if depth == 0 { PAGING_OWNER.store(0, core::sync::atomic::Ordering::Release); }
     }
 }
 
@@ -901,13 +907,22 @@ impl PageTree {
         }
     }
 
+    // This core exclusively owns its root. Siblings can clear inherited COW
+    // write bits, but cannot replace its mappings. Snapshot individual entries
+    // under the paging lock; never allocate diagnostic storage while holding
+    // it, since heap growth itself enters paging.
+    fn snapshot<E: Entry>(ents: &[E], index: usize) -> E {
+        let _paging = PagingGuard::lock();
+        ents[index]
+    }
+
     fn collect_walk<E: Entry>(ents: &[E]) -> Self {
         let root = root_base();
         let user_count = recursive_idx() - root;
         let mut ctx = CollectCtx::new();
         let mut nodes = alloc::vec::Vec::new();
         for i in 0..user_count {
-            if ents[root + i].present() {
+            if Self::snapshot(ents, root + i).present() {
                 nodes.push((i as u16, Self::collect_node(ents, root + i, &mut ctx)));
             }
         }
@@ -915,7 +930,7 @@ impl PageTree {
     }
 
     fn collect_node<E: Entry>(ents: &[E], idx: usize, ctx: &mut CollectCtx) -> Node {
-        let raw = ents[idx].raw();
+        let raw = Self::snapshot(ents, idx).raw();
         let bits = ctx.canon_bits(raw);
         if idx < PAGE_TABLE_BASE_IDX {
             let dh = if raw & (flags::WRITE_THROUGH | flags::CACHE_DISABLE) == 0 {
@@ -927,7 +942,7 @@ impl PageTree {
             let child_base = (idx - PAGE_TABLE_BASE_IDX) * epp;
             let mut children = alloc::vec::Vec::new();
             for j in 0..epp {
-                if ents[child_base + j].present() {
+                if Self::snapshot(ents, child_base + j).present() {
                     children.push((j as u16, Self::collect_node(ents, child_base + j, ctx)));
                 }
             }
@@ -1068,6 +1083,7 @@ pub const fn page_idx(vaddr: usize) -> usize {
 /// Both stack guards and DMA storage live in the permanently owned kernel
 /// image; dropping the allocator reference would let another device reuse it.
 pub fn unmap_kernel_page(vaddr: usize) {
+    let _paging = PagingGuard::lock();
     let idx = page_idx(vaddr);
     match entries() {
         Entries::E32(e) => { let _ = replace_entry(&mut e[idx], Entry32(0)); }
@@ -1079,7 +1095,7 @@ pub fn unmap_kernel_page(vaddr: usize) {
 /// Return unused heap backing without faulting in absent page tables. The
 /// heap retains its virtual range and faults these pages back in on reuse.
 pub fn release_heap_pages(addr: usize, bytes: usize) {
-    let _mapping = KernelMappingGuard::lock();
+    let _mapping = PagingGuard::lock();
     assert!(addr >= heap_base() && addr.checked_add(bytes).is_some_and(|end| end <= HEAP_END));
     assert!(addr.is_multiple_of(PAGE_SIZE) && bytes.is_multiple_of(PAGE_SIZE));
     fn present<E: Entry>(entries: &[E], idx: usize) -> bool {
@@ -1126,6 +1142,7 @@ pub(crate) fn kernel_page_resident(address: usize) -> bool {
 
 /// Get physical page number for a virtual address
 pub fn physical_page(vaddr: usize) -> u64 {
+    let _paging = PagingGuard::lock();
     let idx = page_idx(vaddr);
     match entries() {
         Entries::E32(e) => e[idx].page(),
@@ -1536,6 +1553,7 @@ pub(crate) fn map_boot_mmio(va: usize, phys: u64) -> bool {
 
 /// Ensure the recursive page-table view can represent a kernel virtual range.
 pub(crate) fn prepare_kernel_mapping(vpage_start: usize, count: usize, table: u64) -> bool {
+    let _paging = PagingGuard::lock();
     let end = vpage_start.checked_add(count).expect("kernel mapping range overflow");
     assert!(end <= NUM_PAGES, "kernel mapping range outside page tables");
     match entries() {
@@ -1577,6 +1595,7 @@ pub(crate) fn map_kernel_foreign_range(
     ppage_start: u64,
     count: usize,
 ) -> bool {
+    let _paging = PagingGuard::lock();
     match vpage_start.checked_add(count) {
         Some(end) if end <= NUM_PAGES => {}
         _ => return false,
@@ -1705,6 +1724,7 @@ pub fn pde_index<E: Entry>(page: usize) -> usize {
 /// Marks parent user entries R/O, increments ref counts, and fills
 /// `child_root` with the child's user root entries.
 pub fn fork_current(child_root: &mut RootPageTable) {
+    let _paging = PagingGuard::lock();
     crate::high_paging::fork(child_root);
     let user_count = recursive_idx() - root_base();
     // Use a stack buffer for the full root page copy.
@@ -1765,6 +1785,9 @@ fn fork_generic<E: Entry>(entries: &mut [E], dst: &mut [E]) {
 
 /// COW-share a page table page: mark each present non-MMIO entry R/O
 /// in `src`, increment its ref count, and write the R/O copy to `dst`.
+/// PagingGuard covers the entire transition. Other roots sharing this table
+/// already have a read-only ancestor, so clearing child write bits cannot
+/// invalidate a writable translation in a running sibling.
 fn share_and_copy<E: Entry>(src: &mut [E], dst: &mut [E]) {
     use crate::memory;
 
@@ -1791,6 +1814,7 @@ fn share_and_copy<E: Entry>(src: &mut [E], dst: &mut [E]) {
 /// copies the old contents, and updates the entry. For page table entries,
 /// also marks children R/O and increments their ref counts.
 pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
+    let _paging = PagingGuard::lock();
     use crate::memory;
 
     debug_assert!(idx < recursive_idx(),
@@ -1880,6 +1904,7 @@ fn free_generic<E: Entry>(entries: &mut [E]) {
 /// Sole-owned subtrees are walked and freed page by page.
 /// Free all user-space pages and page tables.
 pub fn free_user_pages() {
+    let _paging = PagingGuard::lock();
     crate::high_paging::clean();
     match entries() {
         Entries::E32(e) => free_generic(e),
@@ -1960,7 +1985,7 @@ pub fn clear_trampoline(saved: u64) {
 /// Map one heap page using only caller-supplied data and table storage.
 pub(crate) fn map_heap_page(address: usize, frame: u64, table: u64) -> bool {
     assert!(address % PAGE_SIZE == 0 && (heap_base()..HEAP_END).contains(&address));
-    let _guard = KernelMappingGuard::lock();
+    let _guard = PagingGuard::lock();
     refresh_kernel_mappings();
     fn install<E: Entry>(e: &mut [E], address: usize, frame: u64, table: u64) -> bool {
         let index = page_idx(address);
@@ -1997,6 +2022,7 @@ pub(crate) fn map_heap_page(address: usize, frame: u64, table: u64) -> bool {
 pub fn map_kernel_page(vpage: usize, ppage: u64, flags: u64) { map_kernel_physical(vpage, 1, ppage, flags); }
 
 pub fn map_kernel_physical(vpage: usize, count: usize, ppage: u64, extra_flags: u64) {
+    let _paging = PagingGuard::lock();
     assert!(vpage >= 0xc0000000 / PAGE_SIZE);
     let extra_flags = (extra_flags | flags::FOREIGN) & !flags::USER;
     let mmio = extra_flags & arch_abi::MAP_MMIO != 0;
@@ -2086,28 +2112,4 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
 
     invalidate_tlb();
     lib::compact_println!("Kernel hardening complete");
-}
-
-/// Make page-table pages private; leave read-only data frames COW-shared.
-/// Called while all process execution is quiescent, with kernel-donated inputs.
-pub(crate) fn privatize_user_tables() -> i32 {
-    fn detach<E: Entry>(entries: &mut [E], index: usize) -> Result<(), i32> {
-        if !entries[index].present() || index < PAGE_TABLE_BASE_IDX { return Ok(()); }
-        if crate::memory::get_ref_count(entries[index].page()) > 1 && !crate::memory::input_available() {
-            return Err(-11);
-        }
-        cow_entry(entries, index);
-        let first = (index - PAGE_TABLE_BASE_IDX) * entries_per_page::<E>();
-        for child in first..first + entries_per_page::<E>() { detach(entries, child)?; }
-        Ok(())
-    }
-    let first = root_base();
-    let last = recursive_idx();
-    let result = match entries() {
-        Entries::E32(e) => (first..last).try_for_each(|index| detach(e, index)),
-        Entries::E64(e) => (first..last).try_for_each(|index| detach(e, index)),
-    };
-    flush_tlb();
-    if let Err(error) = result { return error; }
-    crate::high_paging::privatize()
 }

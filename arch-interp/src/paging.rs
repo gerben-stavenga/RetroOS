@@ -9,6 +9,26 @@ use crate::test_memory;
 
 use crate::phys;
 
+// Serializes shared-table ownership transitions across hosted CPU threads.
+// Nested resolvers on this thread do not acquire the mutex twice.
+static PAGING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+thread_local! {
+    static PAGING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+struct PagingGuard { _lock: Option<std::sync::MutexGuard<'static, ()>> }
+impl PagingGuard {
+    fn lock() -> Self {
+        let lock = if PAGING_DEPTH.with(|depth| depth.get() == 0) {
+            Some(PAGING_LOCK.lock().expect("paging operation panicked"))
+        } else { None };
+        PAGING_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        Self { _lock: lock }
+    }
+}
+impl Drop for PagingGuard {
+    fn drop(&mut self) { PAGING_DEPTH.with(|depth| depth.set(depth.get() - 1)); }
+}
+
 /// 32-bit non-PAE page-table format. A page directory and each page table are
 /// one physical frame of 1024 × 4-byte entries. We address frames by physical
 /// page number (ppage); the entry stores the target ppage in bits 31:12.
@@ -120,6 +140,7 @@ fn unmap_page(pd: u64, vaddr: u32) {
 /// or `None` if unmapped. Used by the kernel's guest-memory accessors (the
 /// kernel is host code; it can't lean on the CPU MMU like the metal kernel).
 pub fn translate(pd: u64, vaddr: u32) -> Option<u32> {
+    let _paging = PagingGuard::lock();
     let pde = read_entry(pd, pde_index(vaddr));
     if pde & PRESENT == 0 {
         return None;
@@ -397,6 +418,7 @@ pub fn active_pd() -> u64 {
 fn with_active_pd<R>(f: impl FnOnce(u64) -> R) -> R { f(active_pd()) }
 
 pub fn activate(mut incoming: RootPageTable) -> RootPageTable {
+    let _paging = PagingGuard::lock();
     let pd = active_pd();
     for (i, entry) in incoming.0.iter_mut().enumerate() {
         let old = read_entry(pd, i);
@@ -410,6 +432,7 @@ pub fn space_translate(vaddr: u32) -> Option<u32> { translate(active_pd(), vaddr
 /// Share table storage. Leaf references belong to the tables, so retaining a
 /// table does not walk its leaves. Detachment establishes new leaf references.
 pub fn space_fork(child: &mut RootPageTable) {
+    let _paging = PagingGuard::lock();
     assert!(child.0.iter().all(|&e| e == 0));
     let pd = active_pd();
     for (i, entry) in child.0.iter_mut().enumerate() {
@@ -441,13 +464,7 @@ fn private_table(pd: u64, index: usize, fault: bool) -> Option<u64> {
     write_entry(pd, index, ((fresh as u32) << 12) | ENTRY_FLAGS);
     Some(fresh)
 }
-pub fn private_tables() -> i32 {
-    let pd = active_pd();
-    for i in 0..768 {
-        if read_entry(pd, i) & COW != 0 && private_table(pd, i, false).is_none() { return -11; }
-    }
-    0
-}
+
 fn release_table(table: u64) {
     if !phys::shared(table) {
         for i in 0..1024 { release_mapping(read_entry(table, i)); }
@@ -455,6 +472,7 @@ fn release_table(table: u64) {
     phys::release(table);
 }
 pub fn destroy(root: &mut RootPageTable) {
+    let _paging = PagingGuard::lock();
     for entry in &mut root.0 {
         if *entry & PRESENT != 0 { release_table(u64::from(*entry >> 12)); }
         *entry = 0;
@@ -466,6 +484,7 @@ pub fn destroy(root: &mut RootPageTable) {
 /// and clear the COW mark. Returns false if `vaddr` isn't a COW page — a
 /// genuine read-only/illegal write the kernel must surface as a fault.
 pub fn space_cow_fault(vaddr: u32) -> bool {
+    let _paging = PagingGuard::lock();
     if !phys::can_fault() { return false; }
     let pd = active_pd();
     let pde = read_entry(pd, pde_index(vaddr));
@@ -498,6 +517,7 @@ pub fn space_resolve(vaddr: u32) -> *mut u8 {
 
 /// Resolve bytes through the executing CPU's directory.
 pub fn resolve_in(pd: u64, vaddr: u32) -> *mut u8 {
+    let _paging = PagingGuard::lock();
     let raw = pte_raw(pd, vaddr);
     assert!(raw & PRESENT != 0 || raw & TYPED == 0 && raw != ABSENT,
         "guest access to an absent or inaccessible mapping");
@@ -516,6 +536,7 @@ pub fn resolve_in(pd: u64, vaddr: u32) -> *mut u8 {
 
 /// Kernel writes to typed mappings obey the same leaf permissions as guests.
 pub(crate) fn space_resolve_write(vaddr: u32) -> *mut u8 {
+    let _paging = PagingGuard::lock();
     let pd = active_pd();
     let raw = pte_raw(pd, vaddr);
     if raw & PRESENT != 0 {
@@ -532,6 +553,7 @@ pub(crate) fn space_resolve_write(vaddr: u32) -> *mut u8 {
 /// illegal access (null guard / out of range) that must bubble as `PageFault`.
 const NULL_GUARD: u32 = 0x1_0000;
 pub fn space_demand(vaddr: u32) -> bool {
+    let _paging = PagingGuard::lock();
     let page = vaddr & !0xFFF;
     let pd = active_pd();
     if translate(pd, vaddr).is_some() {
@@ -559,6 +581,7 @@ pub fn space_demand(vaddr: u32) -> bool {
 /// Free every user page in the active space (arch CLEAN): drop the PTEs and
 /// return the frames to the allocator. Kernel windows (high) are left intact.
 pub fn space_clean() {
+    let _paging = PagingGuard::lock();
     let mut old = activate(RootPageTable::empty());
     destroy(&mut old);
 }
@@ -638,6 +661,7 @@ fn build_long_twin(pd: u64) -> u64 {
 /// slice of the ACTIVE space: the lazily (re)built 4-level twin.
 #[allow(dead_code)]
 pub fn active_pml4() -> u64 {
+    let _paging = PagingGuard::lock();
     let generation = LONG_GEN.with(Cell::get);
     LONG_BUILT.with(|built| {
         if built.get() != generation {
@@ -1040,6 +1064,7 @@ fn release_mapping(entry: u32) {
 fn zero_frame() -> u64 { active_pd() + 2 }
 
 pub(crate) fn read_mapping(page: arch_abi::UserPage) -> Result<arch_abi::page_entry::PageEntry, arch_abi::MappingError> {
+    let _paging = PagingGuard::lock();
     use arch_abi::{MappingError, page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFrame, X86PteFormat}};
     if page.address() >= 0xc000_0000 { return Err(MappingError::Unsupported); }
     let address = page.address() as u32;
@@ -1070,6 +1095,7 @@ pub(crate) fn read_mapping(page: arch_abi::UserPage) -> Result<arch_abi::page_en
 }
 
 pub(crate) fn replace_user_mapping(page: arch_abi::UserPage, entry: arch_abi::page_entry::PageEntry) -> Result<(), arch_abi::MappingError> {
+    let _paging = PagingGuard::lock();
     use arch_abi::{MappingError, page_entry::{Backing, PageEntry, X86PteFormat}};
     if page.address() >= 0xc000_0000 { return Err(MappingError::Unsupported); }
     let mut raw = entry.encode(X86PteFormat::Legacy32, page.address())? as u32;

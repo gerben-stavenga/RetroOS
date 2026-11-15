@@ -110,7 +110,3 @@ pub fn physical_page_limit() -> u64 {
     let bits = if max >= 0x8000_0008 { crate::x86::cpuid(0x8000_0008).0 & 255 } else { 36 };
     (1u64 << bits.clamp(32, 52)) / PAGE_SIZE as u64
 }
-
-pub(crate) fn input_available() -> bool {
-    unsafe { (*(&raw const INPUT)).count != 0 }
-}

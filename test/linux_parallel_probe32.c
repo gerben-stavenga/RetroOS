@@ -7,6 +7,7 @@ static long call(word nr, word a, word b, word c) {
 }
 static void quit(word code) { call(1, code, 0, 0); for (;;) {} }
 static void check(int ok) { if (!ok) quit(99); }
+static volatile unsigned char sparse[3*4*1024*1024] __attribute__((aligned(4096)));
 static volatile unsigned tls_value = 0x1234;
 static unsigned tls_read(void) { unsigned value; __asm__ volatile("mov %%fs:0,%0" : "=r"(value)); return value; }
 void _start(void) {
@@ -15,6 +16,7 @@ void _start(void) {
     unsigned short selector = (descriptor.entry << 3) | 3;
     __asm__ volatile("mov %0,%%fs" :: "r"(selector));
     check(tls_read() == 0x1234);
+    for (word page=0; page<sizeof(sparse); page+=4*1024*1024) sparse[page] = 17;
     for (word child = 0; child < 16; ++child) {
         long pid = call(2, 0, 0, 0);
         check(pid >= 0);
@@ -26,6 +28,16 @@ void _start(void) {
             unsigned cpu = b >> 24, reported = 999;
             for (volatile unsigned n = 0; n < 100000; ++n) check(tls_read() == 100 + child);
             check(call(318, (word)&reported, 0, 0) == 0 && reported == cpu);
+            for (word page=0; page<sizeof(sparse); page+=4*1024*1024) {
+                check(sparse[page] == 17);
+                sparse[page] = 100 + child;
+                check(call(125, (word)&sparse[page], 4096, 1) == 0);
+                check(sparse[page] == 100 + child);
+                check(call(125, (word)&sparse[page], 4096, 3) == 0);
+                sparse[page] = 150 + child;
+                check(sparse[page] == 150 + child);
+                check(call(91, (word)&sparse[page], 4096, 0) == 0);
+            }
             quit(cpu + 1);
         }
     }
@@ -37,6 +49,7 @@ void _start(void) {
         mask |= 1U << ((status >> 8) - 1);
     }
     check(tls_value == 0x1234 && tls_read() == 0x1234);
+    for (word page=0; page<sizeof(sparse); page+=4*1024*1024) check(sparse[page] == 17);
     unsigned count = 0;
     while (mask) { count += mask & 1; mask >>= 1; }
     check(count >= EXPECTED);

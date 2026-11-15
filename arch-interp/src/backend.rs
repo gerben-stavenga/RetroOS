@@ -85,11 +85,7 @@ impl Memory for Interp {
         crate::desc::mark_ldt_dirty();
         old
     }
-    fn private_page_tables(&mut self, pages: arch_abi::page_supply::PageInput) -> (i32, arch_abi::page_supply::PageInput) {
-        crate::phys::with_input(pages, || {
-            crate::paging::private_tables()
-        })
-    }
+
     fn supply_pages(&self, pages: arch_abi::page_supply::PageInput) -> (usize, arch_abi::page_supply::PageInput) {
         crate::phys::supply_pages(pages)
     }

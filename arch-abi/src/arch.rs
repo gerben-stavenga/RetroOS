@@ -134,6 +134,13 @@ pub trait X86 {
 }
 
 /// User address spaces, their mappings and supplied backing storage.
+///
+/// Each address space has one active owner. Different cores may concurrently
+/// operate on different spaces, including spaces sharing COW tables and frames.
+/// The backend synchronizes table ownership transitions; callers need neither
+/// detach tables before scheduling nor stop other spaces to change mappings.
+/// Synchronizing accesses to explicitly shared writable data remains the caller's
+/// responsibility.
 pub trait Memory {
     /// Backend page-table root type stored in `Vcpu::space` — an OWNED address
     /// space, so it is **not** `Copy`: a parked `Vcpu` moves rather than
@@ -205,10 +212,6 @@ pub trait Memory {
 
     /// COW-fork the current address space into `child` (fills the child root).
     fn user_fork(&mut self, child: &mut Self::PageTable, pages: PageInput) -> ((), PageInput);
-
-    /// Detach shared page-table metadata before concurrent process execution.
-    /// Consumes explicit backing inputs; -11 requests another input batch.
-    fn private_page_tables(&mut self, pages: PageInput) -> (i32, PageInput) { (0, pages) }
 
     /// Tear down a dead thread's address space entirely. `free_user_pages`
     /// (called at exit, while the space is still active) returns its page

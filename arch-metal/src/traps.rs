@@ -104,7 +104,6 @@ pub mod arch_call {
     pub const REPLACE_MAPPINGS: u64 = 0x12F;
     pub const FILL_MAPPINGS: u64 = 0x130;
     pub const READ_MAPPING_RUN: u64 = 0x131;
-    pub const PRIVATE_TABLES: u64 = 0x12B;
     pub const REFRESH_KERNEL: u64 = 0x12C;
     pub const INTERRUPT_PROCESSOR: u64 = 0x12D;
     pub const FRAME_OPERATION: u64 = 0x129; // EDX=frame request
@@ -227,7 +226,6 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::REPLACE_MAPPINGS => crate::mapping::replace_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Replace) }),
         arch_call::FILL_MAPPINGS => crate::mapping::fill_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Fill) }),
         arch_call::READ_MAPPING_RUN => crate::mapping::read_mapping_run(unsafe { &mut *(regs.rdx as *mut crate::mapping::ReadRun) }),
-        arch_call::PRIVATE_TABLES => { regs.rax = paging2::privatize_user_tables() as i64 as u64; }
         arch_call::REFRESH_KERNEL => { paging2::refresh_kernel_mappings(); x86::flush_tlb(); }
         arch_call::INTERRUPT_PROCESSOR => { crate::irq::interrupt_processor(regs.rdx as u32); }
         arch_call::HIGH_MEMORY => {
@@ -838,6 +836,7 @@ fn isr_handler_ring1(regs: &mut Regs) {
 
 /// Try to handle a page fault. Returns Some(()) if resolved, None if not.
 fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
+    let _paging = paging2::PagingGuard::lock();
     // Other CPUs can grow the shared kernel heap while this CPU executes
     // userspace. Ownership metadata used below must see those mappings.
     crate::paging2::refresh_kernel_mappings();

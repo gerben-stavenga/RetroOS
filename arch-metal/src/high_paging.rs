@@ -38,14 +38,17 @@ fn set_root(index: usize, entry: Entry64) {
 // The save area still fits in the union's legacy 768-dword storage.
 const _: () = assert!(core::mem::size_of::<RootPageTable>() == 768 * 4);
 pub fn save(space: &mut RootPageTable) {
+    let _paging = paging2::PagingGuard::lock();
     if !paging2::is_pae() { return; }
     for index in 1..256 { unsafe { space.e64[index + 3] = root(index); } }
 }
 pub fn load(space: &RootPageTable) {
+    let _paging = paging2::PagingGuard::lock();
     if !paging2::is_pae() { return; }
     for index in 1..256 { set_root(index, unsafe { space.e64[index + 3] }); }
 }
 pub fn swap(space: &mut RootPageTable) {
+    let _paging = paging2::PagingGuard::lock();
     if !paging2::is_pae() { return; }
     for index in 1..256 {
         let old = root(index);
@@ -54,6 +57,7 @@ pub fn swap(space: &mut RootPageTable) {
     }
 }
 pub fn fork(space: &mut RootPageTable) {
+    let _paging = paging2::PagingGuard::lock();
     if !paging2::is_pae() { return; }
     for index in 1..256 {
         let mut entry = root(index);
@@ -94,6 +98,7 @@ fn release(entry: Entry64, level: u32) {
     crate::memory::release_page(entry.page());
 }
 pub fn clean() {
+    let _paging = paging2::PagingGuard::lock();
     if !paging2::is_pae() { return; }
     for index in 1..256 {
         let entry = root(index);
@@ -164,39 +169,15 @@ fn resolve(address: u64, write_access: bool, execute: bool) -> Option<u64> {
     result
 }
 pub fn fault(address: u64, error: u64) -> bool {
+    let _paging = paging2::PagingGuard::lock();
     if !supported() || error & 8 != 0 { return false; }
     let result = resolve(address, error & 2 != 0, error & 16 != 0).is_some();
     paging2::flush_tlb();
     result
 }
-
-pub(crate) fn privatize() -> i32 {
-    fn detach(entry: &mut Entry64, level: u32) -> Result<(), i32> {
-        if level == 0 || !entry.present() { return Ok(()); }
-        let page = table(entry)?;
-        for index in 0..512 {
-            let mut child = read(page, index);
-            let result = detach(&mut child, level - 1);
-            write(page, index, child);
-            result?;
-        }
-        Ok(())
-    }
-    if !paging2::is_pae() { return 0; }
-    for index in 1..256 {
-        let mut entry = root(index);
-        let result = detach(&mut entry, 3);
-        set_root(index, entry);
-        if let Err(error) = result { paging2::flush_tlb(); return error; }
-    }
-    paging2::flush_tlb();
-    0
-}
-
-
-
 /// Byte access is independent of mapping policy.
 pub fn request(request: &Request) -> i32 {
+    let _paging = paging2::PagingGuard::lock();
     if !supported() { return -12; }
     let Some(end) = request.address.checked_add(request.length) else { return -22; };
     if request.address < START || end > END { return -22; }
@@ -243,6 +224,7 @@ fn encode_uniform(page: UserPage, entry: PageEntry) -> Result<Entry64, MappingEr
 }
 
 pub(crate) fn read_run(page: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError> {
+    let _paging = paging2::PagingGuard::lock();
     if !supported() { return Err(MappingError::Unsupported); }
     let address = page.address();
     let mut entry = root((address >> 39) as usize);
@@ -272,6 +254,7 @@ pub(crate) fn read_run(page: UserPage, maximum: usize) -> Result<(PageEntry, usi
 /// The mapping trap invalidates translations after the entire operation,
 /// including any committed prefix on failure.
 pub(crate) fn fill(page: UserPage, count: usize, incoming: PageEntry) -> Result<(), MappingFailure> {
+    let _paging = paging2::PagingGuard::lock();
     let fail = |error| MappingFailure { completed: 0, error };
     if !supported() { return Err(fail(MappingError::Unsupported)); }
     let encoded = encode_uniform(page, incoming).map_err(fail)?;

@@ -12,6 +12,8 @@ def main():
     parser.add_argument('--cpus', type=int, default=5)
     parser.add_argument('--boot-image', type=Path, help='Validate a supplied self-built boot disk')
     parser.add_argument('--bits', type=int, choices=(32,64), default=64)
+    parser.add_argument('--accel', choices=('kvm', 'tcg'), default='kvm')
+    parser.add_argument('--cpu', default='host')
     args = parser.parse_args()
     expected=min(16,max(1,args.cpus-1)) if args.cpus>=3 else 1
     artifacts = ROOT/'build/ci/linux-parallel'
@@ -30,7 +32,7 @@ def main():
         boot=prepare_boot(work,image,f'[environment]\nTEST=/probe {expected}\n', boot_image=args.boot_image)
         log=artifacts/f'cpus-{args.cpus}-bits-{args.bits}.log'
         with log.open('w') as out:
-            result=subprocess.run(['qemu-system-x86_64','-accel','kvm','-cpu','host','-smp',str(args.cpus),'-m','512',
+            result=subprocess.run(['qemu-system-x86_64','-accel',args.accel,'-cpu',args.cpu,'-smp',str(args.cpus),'-m','512',
                 '-display','none','-serial','none','-monitor',f'unix:{artifacts}/cpus-{args.cpus}-bits-{args.bits}.monitor,server=on,wait=off','-no-reboot','-nic','none','-debugcon','stdio',
                 '-drive',f'file={boot},format=raw,snapshot=on','-drive',f'file={image},format=raw,snapshot=on'],
                 stdout=out,stderr=subprocess.STDOUT,timeout=90)

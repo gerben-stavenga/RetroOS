@@ -256,16 +256,14 @@ impl Parallel {
             if tid == usize::MAX { continue; }
             let task = &mut threads[tid];
             let deferred = matches!(&task.personality, thread::Personality::Linux(linux) if linux.has_deferred_resume());
-            if task.kernel.tables_private && !deferred { continue; }
+            if !deferred { continue; }
             let mut fx = task.kernel.fx_state;
             machine.switch_fx(&mut fx);
             let empty = machine.activate(core::mem::take(&mut task.kernel.vcpu.space));
-            if !task.kernel.tables_private { super::memory::private_tables(machine); }
             task.personality.on_resume(machine);
             machine.switch_fx(&mut fx);
             task.kernel.vcpu.space = machine.activate(empty);
             task.kernel.fx_state = fx;
-            task.kernel.tables_private = true;
         }
         let all = slots::<A>();
         for (cpu, &tid) in chosen.iter().enumerate().skip(1) {

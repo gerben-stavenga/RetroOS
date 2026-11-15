@@ -56,14 +56,6 @@ pub(crate) fn allocate_frame<A: arch_abi::Memory>(machine: &A) -> Option<u64> {
     phys_mm::alloc_phys_page()
 }
 
-pub fn private_tables<A: Arch>(machine: &mut A) {
-    loop {
-        let result = with_pages(machine, SUPPLY_CAPACITY, |machine, pages| machine.private_page_tables(pages));
-        if result == 0 { break; }
-        assert_eq!(result, -11, "cannot detach process page tables");
-    }
-}
-
 /// Install one mapping with explicit table backing and retry only uncompleted work.
 /// # Safety
 /// The entry's backing must satisfy Arch::replace_mapping's requirements.

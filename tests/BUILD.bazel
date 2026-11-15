@@ -2101,3 +2101,27 @@ integration_test(
     env = {"DOSBOX_PROBE_DIR": "build/dosbox-probe"},
     tags = ["manual", "desktop", "external"],
 )
+
+integration_test(
+    name = "linux_parallel",
+    command = ["python3", "test/linux_parallel.py"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_parallel32",
+    command = ["python3", "test/linux_parallel.py", "--bits", "32"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)
+
+integration_test(
+    name = "linux_parallel_legacy",
+    command = ["python3", "test/linux_parallel.py", "--bits", "32", "--accel", "tcg", "--cpu", "pentium3,-pae"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression"],
+)

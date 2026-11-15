@@ -676,7 +676,6 @@ pub struct KernelThread<A: crate::Arch> {
     pub parent_tid: i32,
     pub state: ThreadState,
     pub execution_cpu: usize,
-    pub tables_private: bool,
     pub pending_event: Option<crate::KernelEvent>,
     pub pending_action: Option<KernelAction>,
     /// Process birth time in milliseconds since boot (unchanged by exec).
@@ -755,7 +754,6 @@ impl<A: crate::Arch> KernelThread<A> {
             parent_tid: -1,
             state: ThreadState::Unused,
             execution_cpu: usize::MAX,
-            tables_private: false,
             pending_event: None,
             pending_action: None,
             time: 0,
@@ -951,7 +949,6 @@ pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut [Thread<A>], machine: 
             k.parent_tid = parent_tidv;
             k.state = ThreadState::Ready;
             k.execution_cpu = usize::MAX;
-            k.tables_private = false;
             k.pending_event = None;
             k.pending_action = None;
             k.time = machine.now() / 1_000_000;
@@ -990,7 +987,6 @@ pub fn reserve_live_child<'a, A: crate::Arch>(
             k.parent_tid = parent_tidv;
             k.state = ThreadState::Ready;
             k.execution_cpu = usize::MAX;
-            k.tables_private = false;
             k.pending_event = None;
             k.pending_action = None;
             k.time = machine.now() / 1_000_000;

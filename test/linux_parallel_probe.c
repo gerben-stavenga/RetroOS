@@ -45,6 +45,21 @@ int main(int argc, char **argv) {
             private_value = 100+i;
             for (unsigned n=0; n<2*1024*1024; n+=4096) { assert(high[n] == 17); high[n] = 100+i; }
             for (unsigned n=0; n<2*1024*1024; n+=4096) assert(high[n] == 100+i);
+            // Siblings still execute through shared table ancestry while each
+            // child protects, removes and replaces its own leaves.
+            for (unsigned n=0; n<2*1024*1024; n+=8*4096) {
+                void *page = (void *)(high+n);
+                assert(mprotect(page, 4096, PROT_READ) == 0);
+                assert(high[n] == 100+i);
+                assert(mprotect(page, 4096, PROT_READ|PROT_WRITE) == 0);
+                high[n] = 150+i;
+                assert(munmap((void *)(high+n+4096), 4096) == 0);
+                assert(mmap((void *)(high+n+4096), 4096, PROT_READ|PROT_WRITE,
+                    MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0) == (void *)(high+n+4096));
+                assert(high[n+4096] == 0);
+                high[n+4096] = 200+i;
+                assert(high[n] == 150+i && high[n+4096] == 200+i);
+            }
             s->result[i] = x;
             s->end_cpu[i] = cpu();
             unsigned reported = 999;

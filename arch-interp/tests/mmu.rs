@@ -252,6 +252,72 @@ fn retired_pages_are_drained_in_bounded_batches() {
     assert!(expected.is_empty());
 }
 
+#[test]
+fn concurrent_forks_detach_replace_and_destroy_shared_tables() {
+    init();
+    let mut machine = arch::Interp;
+    const STRIDE: usize = 4 * 1024 * 1024;
+    for index in 0..4 {
+        arch::mem().write::<u8>(HI + index * STRIDE, 17);
+        arch::mem().write::<u8>(HI + index * STRIDE + 4096, 29);
+    }
+    let mut roots = Vec::new();
+    for _ in 0..4 {
+        let mut root = arch::RootPageTable::default();
+        machine.user_fork(&mut root, test_memory::input(5));
+        roots.push(root);
+    }
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for (worker, root) in roots.into_iter().enumerate() {
+            let barrier = &barrier;
+            scope.spawn(move || {
+                init();
+                let mut machine = arch::Interp;
+                machine.activate(root);
+                for round in 0..16 {
+                    test_memory::refill(&machine);
+                    let mut child = arch::RootPageTable::default();
+                    machine.user_fork(&mut child, test_memory::input(5));
+                    let parent = machine.activate(child);
+                    barrier.wait();
+                    for index in 0..4 {
+                        let address = HI + index * STRIDE;
+                        assert_eq!(arch::mem().read::<u8>(address), 17);
+                        arch::mem().write::<u8>(address, (worker * 16 + round + 32) as u8);
+                        let page = UserPage::new((address + 4096) as u64).unwrap();
+                        let (result, _) = unsafe { machine.replace_mapping(page, PageEntry::Absent, test_memory::input(5)) };
+                        result.unwrap();
+                        assert_eq!(machine.read_mapping(page).unwrap(), PageEntry::Absent);
+                    }
+                    // One CPU may release the last old table while another
+                    // CPU is retaining its leaves for a private replacement.
+                    machine.free_user_pages();
+                    let mut empty = machine.activate(parent);
+                    machine.destroy_space(&mut empty);
+                    for index in 0..4 {
+                        assert_eq!(arch::mem().read::<u8>(HI + index * STRIDE), 17);
+                        assert_eq!(arch::mem().read::<u8>(HI + index * STRIDE + 4096), 29);
+                    }
+                }
+                machine.free_user_pages();
+                test_memory::refill(&machine);
+            });
+        }
+    });
+    for index in 0..4 {
+        let address = HI + index * STRIDE;
+        assert_eq!(arch::mem().read::<u8>(address), 17);
+        let entry = machine.read_mapping(UserPage::new(address as u64).unwrap()).unwrap();
+        let mapping = match entry {
+            PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => m,
+            _ => panic!("expected RAM"),
+        };
+        assert_eq!(unsafe { test_memory::ownership().references(mapping.backing.frame().number()) }, 1);
+    }
+    machine.free_user_pages();
+}
+
 fn init() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| { let (base, bytes) = arch::physical_ram();

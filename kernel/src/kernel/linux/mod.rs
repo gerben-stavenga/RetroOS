@@ -1193,7 +1193,6 @@ fn exec_elf_source_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
     }
 
     process_group::exec(current.kernel.tid);
-    current.kernel.tables_private = false;
     let sp = setup_user_stack(machine, &mut current.kernel.vcpu, args, want_64, &extra_auxv, environment);
     if want_64 {
         thread::init_process_thread_64(current, cpu_entry, sp as u64);
@@ -1301,7 +1300,6 @@ pub(crate) fn handle_fork<A: crate::Arch>(
     on_done: fn(&mut Regs, i32),
 ) -> Option<usize> {
     let mut child_root = A::PageTable::default();
-    threads[parent_tid].kernel.tables_private = false;
     if !shared_until_exec { crate::kernel::memory::fork(machine, &mut child_root); }
 
     let child_tid = match thread::create_thread(threads, machine, Some(parent_tid), child_root, true) {
