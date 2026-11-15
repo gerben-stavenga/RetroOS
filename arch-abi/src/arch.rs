@@ -199,9 +199,6 @@ pub trait Memory {
         Ok(())
     }
 
-    /// Copy a high user buffer through a backend-owned window. False means EFAULT.
-    fn high_copy(&mut self, _address: u64, _buffer: &mut [u8], _to_user: bool) -> bool { false }
-
     /// Install `incoming` as the active address space and return the displaced
     /// one. Registers and FPU state are unchanged.
     fn activate(&mut self, incoming: Self::PageTable) -> Self::PageTable;
@@ -223,8 +220,6 @@ pub trait Memory {
 
     /// Free user pages in the current address space (the CLEAN call).
     fn free_user_pages(&mut self);
-
-    fn physical_frame_io(&self) -> Option<crate::PhysicalFrameIo> { None }
 
     fn page_supply(&self) -> Option<*mut crate::page_supply::PageSupply> { None }
 
@@ -272,7 +267,7 @@ pub trait Diagnostics {
 ///
 /// `addr` is a guest-linear address as `usize` (the 32-bit kernel addresses all
 /// low guest memory within 4 GiB). High long-mode mappings use
-/// `Memory::read_mapping` and `Memory::high_copy` without narrowing their addresses.
+/// `Memory::read_mapping` and `GuestBytes::high_copy` without narrowing their addresses.
 ///
 /// Soundness note: `read::<T>` reconstructs a `T` from copied bytes, so `T` must
 /// be valid for *all* bit patterns (an integer or a `#[repr(C, packed)]` POD
@@ -283,6 +278,9 @@ pub trait Diagnostics {
 /// sufficient fault backing for all pages touched. Kernel bulk transfers split
 /// at page boundaries and replenish their PageSupply between calls.
 pub trait GuestBytes {
+    /// Copy a high user buffer through a backend-owned window. False means EFAULT.
+    fn high_copy(&mut self, _address: u64, _buffer: &mut [u8], _to_user: bool) -> bool { false }
+
     /// Read a `T` at `addr` (volatile, unaligned, bytewise into a local).
     fn read<T: Copy>(&self, addr: usize) -> T;
     /// Write a `T` at `addr` (volatile, unaligned, bytewise from a local).

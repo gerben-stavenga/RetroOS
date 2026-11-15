@@ -804,3 +804,30 @@ pub(crate) fn framebuffer_map_policy() -> FramebufferMapPolicy {
     #[cfg(not(target_arch = "x86"))]
     panic!("physical framebuffer policy is unavailable on this platform");
 }
+
+
+/// Copy bytes from resident physical RAM, independently of the active user space.
+/// The caller keeps the frame alive and synchronizes accesses to its contents.
+pub(crate) fn read_physical_frame(page: u64, offset: usize, bytes: &mut [u8]) {
+    assert!(offset <= crate::PAGE_SIZE && bytes.len() <= crate::PAGE_SIZE - offset);
+    #[cfg(target_arch = "x86")]
+    crate::arch::read_physical_frame(page, offset, bytes);
+    #[cfg(not(target_arch = "x86"))]
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            super::phys_mm::direct_pointer(page).add(offset), bytes.as_mut_ptr(), bytes.len());
+    }
+}
+
+/// Copy bytes into resident physical RAM. Same lifetime and synchronization
+/// requirements as read_physical_frame.
+pub(crate) fn write_physical_frame(page: u64, offset: usize, bytes: &[u8]) {
+    assert!(offset <= crate::PAGE_SIZE && bytes.len() <= crate::PAGE_SIZE - offset);
+    #[cfg(target_arch = "x86")]
+    crate::arch::write_physical_frame(page, offset, bytes);
+    #[cfg(not(target_arch = "x86"))]
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytes.as_ptr(), super::phys_mm::direct_pointer(page).add(offset), bytes.len());
+    }
+}

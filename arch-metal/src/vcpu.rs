@@ -101,6 +101,11 @@ unsafe fn rep_stosb(dst: *mut u8, val: u8, len: usize) {
 /// `self` (the page-table root) is not consulted — the access reaches the active
 /// mapping (single-core; one space is live at a time).
 impl GuestBytes for crate::backend::Metal {
+    fn high_copy(&mut self, address: u64, buffer: &mut [u8], to_user: bool) -> bool {
+        super::high_paging::invoke(super::high_paging::Request {
+            address, length: buffer.len() as u64, to_user, buffer: buffer.as_mut_ptr() as usize, result: 0,
+        }) == 0
+    }
     fn read<T: Copy>(&self, addr: usize) -> T {
         let mut v = core::mem::MaybeUninit::<T>::uninit();
         let dst = v.as_mut_ptr() as *mut u8;

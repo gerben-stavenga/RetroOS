@@ -60,20 +60,19 @@ pub struct Slot<A: Arch> {
     state: AtomicU32,
     cancel: AtomicBool,
     pub processor: AtomicU32,
-    supply: AtomicUsize,
     tid: AtomicUsize,
     loan: UnsafeCell<Loan<A>>,
 }
 // One BSP producer and one CPU consumer. RUN transfers the whole loan; DONE
 // transfers it back after the worker removes all user entries from its root.
-// Only cancel/state/processor/supply atomics are accessed by the BSP during
+// Only cancel/state/processor atomics are accessed by the BSP during
 // execution. Shared Linux descriptors have their own Arc/Mutex protection;
 // each process owns its remaining mutable Linux state.
 unsafe impl<A: Arch> Sync for Slot<A> where A::PageTable: Send, A::Fx: Send {}
 impl<A: Arch> Slot<A> {
     fn new() -> Self { Self {
         state: AtomicU32::new(PARKED), cancel: AtomicBool::new(false),
-        processor: AtomicU32::new(0), supply: AtomicUsize::new(0), tid: AtomicUsize::new(0),
+        processor: AtomicU32::new(0), tid: AtomicUsize::new(0),
         loan: UnsafeCell::new(Loan { space: Default::default(), fx: Default::default(),
             regs: Regs::empty(), event: KernelEvent::Irq, deadline: 0, tls: (-1, 0, 0, false),
             kernel: thread::KernelThread::empty(), linux: super::linux::LinuxState::new(), stats: WorkerStats::default() }),
@@ -108,7 +107,6 @@ pub unsafe fn worker<A: Arch>(mut machine: A, slot: &'static Slot<A>) -> !
 where A::PageTable: Send, A::Fx: Send {
     unsafe { ON_WORKER = true; }
     PROFILE_CPU.set(slots::<A>().iter().position(|s| core::ptr::eq(s, slot)).expect("unknown worker slot"));
-    slot.supply.store(machine.page_supply().expect("worker has no page reserve") as usize, Ordering::Relaxed);
     slot.state.store(IDLE, Ordering::Release);
     loop {
         if slot.state.load(Ordering::Acquire) != RUN {
@@ -116,6 +114,7 @@ where A::PageTable: Send, A::Fx: Send {
             continue;
         }
         super::platform::refresh_kernel_mappings();
+        super::memory::service(&machine);
         let loan = unsafe { &mut *slot.loan.get() };
         let (entry, base, limit, pages) = loan.tls;
         if entry >= 0 { machine.set_tls_entry(entry, base, limit, pages); }
@@ -272,8 +271,6 @@ impl Parallel {
         for (cpu, &tid) in chosen.iter().enumerate().skip(1) {
             if tid == usize::MAX { continue; }
             let slot = &all[cpu];
-            let supply = slot.supply.load(Ordering::Acquire) as *mut arch_abi::page_supply::PageSupply;
-            unsafe { super::memory::replenish(supply); }
             let task = &mut threads[tid];
             let thread::Personality::Linux(linux) = &task.personality else { unreachable!() };
             let loan = unsafe { &mut *slot.loan.get() };

@@ -114,12 +114,6 @@ impl Memory for Metal {
 
     type PageTable = RootPageTable;
 
-    fn high_copy(&mut self, address: u64, buffer: &mut [u8], to_user: bool) -> bool {
-        super::high_paging::invoke(super::high_paging::Request {
-            address, length: buffer.len() as u64, to_user, buffer: buffer.as_mut_ptr() as usize, result: 0,
-        }) == 0
-    }
-
     fn activate(&mut self, mut incoming: RootPageTable) -> RootPageTable {
         super::calls::arch_activate(&mut incoming);
         incoming
@@ -137,7 +131,6 @@ impl Memory for Metal {
 
     fn destroy_space(&mut self, _root: &mut RootPageTable) {}
 
-    fn physical_frame_io(&self) -> Option<arch_abi::PhysicalFrameIo> { Some(crate::frames::io()) }
 
     fn page_supply(&self) -> Option<*mut arch_abi::page_supply::PageSupply> { Some(crate::memory::supply()) }
 

@@ -1665,6 +1665,7 @@ mod bios_memory_tests {
     }
 
     impl GuestBytes for Memory {
+        fn high_copy(&mut self, _address: u64, _bytes: &mut [u8], _to_user: bool) -> bool { false }
         fn read<T: Copy>(&self, addr: usize) -> T {
             let mut value = core::mem::MaybeUninit::<T>::uninit();
             unsafe {

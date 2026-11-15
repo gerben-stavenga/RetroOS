@@ -122,18 +122,6 @@ mod tests {
     }
 }
 
-fn read_owned(page: u64, offset: usize, bytes: &mut [u8]) {
-    assert!(offset <= PAGE && bytes.len() <= PAGE - offset);
-    unsafe { core::ptr::copy_nonoverlapping(frame_ptr(page).add(offset), bytes.as_mut_ptr(), bytes.len()); }
-}
-fn write_owned(page: u64, offset: usize, bytes: &[u8]) {
-    assert!(offset <= PAGE && bytes.len() <= PAGE - offset);
-    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), frame_ptr(page).add(offset), bytes.len()); }
-}
-pub(crate) fn io() -> arch_abi::PhysicalFrameIo {
-    arch_abi::PhysicalFrameIo { read: read_owned, write: write_owned }
-}
-
 pub fn ram() -> (*mut u8, usize) { (region_base(), PHYS_SIZE) }
 
 #[cfg(test)]

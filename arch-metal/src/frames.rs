@@ -24,13 +24,12 @@ pub fn map_heap_page(address: usize, frame: u64, table: u64) -> bool {
     request.result != 0
 }
 
-fn read(page: u64, offset: usize, bytes: &mut [u8]) {
+pub fn read(page: u64, offset: usize, bytes: &mut [u8]) {
     assert!(crate::aperture::copy_from_physical(page * 4096 + offset as u64, bytes));
 }
-fn write(page: u64, offset: usize, bytes: &[u8]) {
+pub fn write(page: u64, offset: usize, bytes: &[u8]) {
     assert!(crate::aperture::copy_to_physical(page * 4096 + offset as u64, bytes));
 }
-pub fn io() -> arch_abi::PhysicalFrameIo { arch_abi::PhysicalFrameIo { read, write } }
 pub fn physical(address: usize) -> u64 { invoke(4, 0, address, 0) }
 pub(crate) fn handle(request: &mut Request) {
     request.result = match request.operation {

@@ -3,15 +3,15 @@
 use alloc::boxed::Box;
 use spin::Once;
 
-static ACCESS: Once<arch_abi::PhysicalFrameIo> = Once::new();
-pub(crate) fn install(access: arch_abi::PhysicalFrameIo, reclaim: fn() -> Option<u64>) {
-    ACCESS.call_once(|| access);
+static INSTALLED: Once<()> = Once::new();
+pub(crate) fn install(reclaim: fn() -> Option<u64>) {
+    INSTALLED.call_once(|| ());
     super::phys_mm::set_reclaim(reclaim);
 }
-pub(crate) fn access() -> Option<&'static arch_abi::PhysicalFrameIo> { ACCESS.get() }
+pub(crate) fn installed() -> bool { INSTALLED.get().is_some() }
 
 pub(crate) fn reserve() -> usize {
-    access().map_or(0, |_| (super::phys_mm::total_page_count() / 32).clamp(64, 8192))
+    if installed() { (super::phys_mm::total_page_count() / 32).clamp(64, 8192) } else { 0 }
 }
 
 pub(crate) struct Frame {
@@ -22,9 +22,9 @@ pub(crate) struct Frame {
 impl Frame {
     pub fn new(bytes: &[u8]) -> Result<Self, i32> {
         assert_eq!(bytes.len(), 4096);
-        if let Some(a) = access() {
+        if installed() {
             let physical = super::memory::allocate_frame().ok_or(-12)?;
-            (a.write)(physical, 0, bytes);
+            super::platform::write_physical_frame(physical, 0, bytes);
             Ok(Self { physical: Some(physical), bytes: None })
         } else {
             Ok(Self { physical: None, bytes: Some(bytes.into()) })
@@ -33,12 +33,12 @@ impl Frame {
     pub fn physical(&self) -> Option<u64> { self.physical }
     pub fn read(&self, offset: usize, bytes: &mut [u8]) {
         assert!(offset <= 4096 && bytes.len() <= 4096 - offset);
-        if let Some(page) = self.physical { (access().unwrap().read)(page, offset, bytes); }
+        if let Some(page) = self.physical { super::platform::read_physical_frame(page, offset, bytes); }
         else { bytes.copy_from_slice(&self.bytes.as_ref().unwrap()[offset..offset + bytes.len()]); }
     }
     pub fn write(&mut self, offset: usize, bytes: &[u8]) {
         assert!(offset <= 4096 && bytes.len() <= 4096 - offset);
-        if let Some(page) = self.physical { (access().unwrap().write)(page, offset, bytes); }
+        if let Some(page) = self.physical { super::platform::write_physical_frame(page, offset, bytes); }
         else { self.bytes.as_mut().unwrap()[offset..offset + bytes.len()].copy_from_slice(bytes); }
     }
     pub fn into_reclaimed(mut self) -> Option<u64> {

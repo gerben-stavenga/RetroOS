@@ -93,10 +93,9 @@ fn typed_mapping_ownership_and_protection() {
     init();
     let mut machine = arch::Interp;
     let page = UserPage::new(HI as u64).unwrap();
-    let frames = machine.physical_frame_io().unwrap();
     let frame = PhysicalFrame::new(test_memory::alloc_phys_page().unwrap()).unwrap();
     let mapping = Mapping { backing: Backing::Owned(frame), attributes: Attributes::EXECUTABLE };
-    (frames.write)(frame.number(), 0, &[0x42]);
+    unsafe { arch::physical_ram().0.add(frame.number() as usize * 4096).write(0x42); }
     unsafe {
         machine.replace_mapping(page, PageEntry::Writable(mapping)).unwrap();
         // Transfer lifetime to the mapping by dropping the allocation reference.

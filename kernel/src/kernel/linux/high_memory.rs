@@ -53,13 +53,13 @@ pub fn copy_to<A: crate::Arch>(machine: &mut A, address: u64, bytes: &[u8]) -> b
     else {
         // Keep the Arch interface mutable-buffer-only without exposing a guest reference.
         let mut buffer = bytes.to_vec();
-        crate::kernel::memory::high_copy(machine, address, &mut buffer, true)
+        machine.high_copy(address, &mut buffer, true)
     }
 }
 pub fn copy_from<A: crate::Arch>(machine: &mut A, address: u64, bytes: &mut [u8]) -> bool {
     if !range(address, bytes.len() as u64) { return false; }
     if address < START { machine.copy_from(address as usize, bytes); true }
-    else { crate::kernel::memory::high_copy(machine, address, bytes, false) }
+    else { machine.high_copy(address, bytes, false) }
 }
 
 /// Read a guest string without truncating high thread-stack pointers. Stop at

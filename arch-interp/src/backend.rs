@@ -99,7 +99,6 @@ impl Memory for Interp {
         crate::engine::flush();
     }
 
-    fn physical_frame_io(&self) -> Option<arch_abi::PhysicalFrameIo> { Some(crate::phys::io()) }
 
 
 }

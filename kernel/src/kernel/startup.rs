@@ -73,10 +73,7 @@ fn prepare_startup<A: crate::Arch>(
         unsafe { (*supply).ownership = super::phys_mm::ownership(); }
         crate::kernel::memory::install_supply(supply);
     }
-    if let Some(access) = machine.physical_frame_io() {
-        crate::kernel::memory::install_io(access);
-        crate::kernel::cache::install(access, vfs::mapping::reclaim_frame);
-    }
+    crate::kernel::cache::install(vfs::mapping::reclaim_frame);
     crate::compact_println!("{}", crate::build_info::VersionBanner);
 
     // GRUB config is available before physical storage discovery.
