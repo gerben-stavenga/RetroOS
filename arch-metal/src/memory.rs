@@ -7,12 +7,12 @@ static mut SUPPLY: PageSupply = PageSupply::new();
 static mut INPUT: *mut PageInput = core::ptr::null_mut();
 
 pub fn supply() -> *mut PageSupply { &raw mut SUPPLY }
-/// Kernel supplies resident metadata and its fault-resume entry, never an allocator.
-pub fn configure(ownership: FrameOwnership, refill_ip: usize) {
-    unsafe { (*supply()).ownership = ownership; (*supply()).refill_ip = refill_ip; }
+/// Kernel supplies resident ownership metadata, never executable callbacks.
+pub fn configure(ownership: FrameOwnership) {
+    unsafe { (*supply()).ownership = ownership; }
 }
 pub fn bootstrap(boot: PageBootstrap) {
-    configure(boot.ownership, boot.refill_ip);
+    configure(boot.ownership);
     for page in boot.pages { unsafe { (*supply()).donate(page); } }
 }
 pub fn set_input(input: *mut PageInput) -> *mut PageInput {
@@ -20,14 +20,6 @@ pub fn set_input(input: *mut PageInput) -> *mut PageInput {
 }
 pub fn can_fault() -> bool {
     unsafe { (*supply()).fault_depth != 0 || (*supply()).count >= FAULT_PAGES }
-}
-pub fn defer_fault(ip: &mut u64) {
-    unsafe {
-        let state = &mut *supply();
-        assert!(state.refill_ip != 0 && state.resume_ip == 0, "recursive frame replenishment");
-        state.resume_ip = *ip as usize;
-        *ip = state.refill_ip as u64;
-    }
 }
 pub struct FaultGuard;
 impl FaultGuard {
@@ -83,8 +75,6 @@ pub fn release_page(page: u64) {
         state.returned_count += 1;
     }
 }
-pub fn free_page_count() -> usize { unsafe { (*supply()).ownership.free_pages() } }
-pub fn total_page_count() -> usize { unsafe { (*supply()).ownership.active } }
 
 /// Physical page-number ceiling imposed by the active x86 paging mode/CPU.
 pub fn physical_page_limit() -> u64 {
@@ -93,32 +83,6 @@ pub fn physical_page_limit() -> u64 {
     let (max, _, _, _) = crate::x86::cpuid(0x8000_0000);
     let bits = if max >= 0x8000_0008 { crate::x86::cpuid(0x8000_0008).0 & 255 } else { 36 };
     (1u64 << bits.clamp(32, 52)) / PAGE_SIZE as u64
-}
-
-#[repr(C)]
-pub(crate) struct Returns { output: *mut u64, capacity: usize, count: usize }
-pub fn collect_returns(output: &mut [u64]) -> usize {
-    let mut request = Returns { output: output.as_mut_ptr(), capacity: output.len(), count: 0 };
-    let cs: u16;
-    unsafe { core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags)); }
-    if cs & 3 == 0 { handle_returns(&mut request); }
-    else { unsafe { core::arch::asm!("int 0x80", in("eax") crate::arch_call::RETURNED_FRAMES as u32,
-        in("edx") &mut request as *mut Returns as usize); } }
-    request.count
-}
-pub(crate) fn handle_returns(request: &mut Returns) {
-    unsafe {
-        let state = &mut *supply();
-        while state.returned_head != 0 && request.count < request.capacity {
-            let page = state.returned_head;
-            let saved = paging2::temp_swap(page);
-            state.returned_head = (&raw const paging2::TEMP_PAGE).cast::<u64>().read();
-            let _ = paging2::temp_swap(saved);
-            state.returned_count -= 1;
-            request.output.add(request.count).write(page);
-            request.count += 1;
-        }
-    }
 }
 
 pub(crate) fn input_available() -> bool {

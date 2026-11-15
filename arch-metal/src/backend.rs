@@ -149,19 +149,7 @@ impl Memory for Metal {
         crate::memory::set_input(input)
     }
 
-    fn alloc_shared_pages(&mut self, count: usize) -> core::ptr::NonNull<u8> {
-        assert!(count != 0);
-        let layout = alloc::alloc::Layout::from_size_align(count.checked_mul(4096).unwrap(), 4096).unwrap();
-        let base = unsafe { alloc::alloc::alloc_zeroed(layout) };
-        core::ptr::NonNull::new(base).unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout))
-    }
-
-    unsafe fn free_shared_pages(&mut self, base: core::ptr::NonNull<u8>, count: usize) {
-        let layout = alloc::alloc::Layout::from_size_align(count.checked_mul(4096).unwrap(), 4096).unwrap();
-        unsafe { alloc::alloc::dealloc(base.as_ptr(), layout); }
-    }
-
-    unsafe fn shared_page(&mut self, base: core::ptr::NonNull<u8>) -> arch_abi::page_entry::PhysicalFrame {
+    unsafe fn physical_frame(&mut self, base: core::ptr::NonNull<u8>) -> arch_abi::page_entry::PhysicalFrame {
         arch_abi::page_entry::PhysicalFrame::new(crate::frames::physical(base.as_ptr() as usize)).unwrap()
     }
 
@@ -173,10 +161,6 @@ impl Memory for Metal {
     fn framebuffer_map_policy(&self) -> arch_abi::FramebufferMapPolicy {
         super::paging2::framebuffer_map_policy()
     }
-
-    fn free_page_count(&self) -> usize { super::memory::free_page_count() }
-
-    fn total_page_count(&self) -> Option<usize> { Some(super::memory::total_page_count()) }
 }
 
 impl Arch for Metal {

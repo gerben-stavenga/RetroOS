@@ -208,7 +208,7 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
             // A guest-installed RM handler can recover from the fault using
             // the ordinary 16-bit interrupt frame. NDN probes Virtual PC
             // with an illegal instruction and advances IP in its INT 6 hook.
-            arch_abi::monitor::sw_reflect_vm86_int(regs, machine, exc_num as u8);
+            machine.reflect_vm86_int(regs, exc_num as u8);
             return thread::KernelAction::Done;
         }
         // Per DPMI 0.9: software-INT exceptions (0/3/4 = #DE/#BP/#OF) reflect

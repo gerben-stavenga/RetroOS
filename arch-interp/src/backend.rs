@@ -1,10 +1,4 @@
-//! `Interp` — the interpreter's `arch_abi::Arch` implementor.
-//!
-//! For now every method delegates to the existing free functions / statics (the
-//! surface the hosted kernel still calls directly). Threading `&mut Interp`
-//! through the kernel (and moving the statics into this struct to drop their
-//! `unsafe`) is the later stage; defining the impl now validates the trait
-//! against this backend and is the value the kernel will be injected with.
+//! Hosted implementation of the shared arch-abi traits.
 
 use crate::space::RootPageTable;
 use crate::vcpu::{self};
@@ -85,55 +79,36 @@ impl Memory for Interp {
 
     type PageTable = RootPageTable;
 
-    #[allow(clippy::deref_addrof)]
-    fn activate(&mut self, mut incoming: RootPageTable) -> RootPageTable {
-        if incoming.0 == u32::MAX { incoming = RootPageTable(crate::mmu::new_space()); }
-        // Move `incoming` into the single active-space slot and return the
-        // displaced one. Then make the new active space live (drop the outgoing
-        // space's lazy Unicorn mappings).
-        let live = unsafe { &mut *(&raw mut vcpu::REGS) };
-        let old = core::mem::replace(&mut live.space, incoming);
+    fn activate(&mut self, incoming: RootPageTable) -> RootPageTable {
+        let old = crate::paging::activate(incoming);
         crate::engine::flush();
-        crate::mmu::switch_to(live.space.0);
-        // A swap changes the active thread ⇒ its descriptor tables must be
-        // re-materialized before the next entry (catch-all for DOS and Linux).
         crate::desc::mark_ldt_dirty();
         old
     }
-
+    fn private_page_tables(&mut self) -> i32 { crate::paging::private_tables() }
+    fn page_supply(&self) -> Option<*mut arch_abi::page_supply::PageSupply> { Some(crate::phys::supply()) }
+    fn set_page_input(&mut self, input: *mut arch_abi::page_supply::PageInput) -> *mut arch_abi::page_supply::PageInput {
+        crate::phys::set_input(input)
+    }
     fn user_fork(&mut self, child: &mut RootPageTable) { crate::calls::arch_user_fork(child) }
 
     fn free_user_pages(&mut self) { crate::calls::arch_free_user_pages() }
 
     fn destroy_space(&mut self, root: &mut Self::PageTable) {
-        crate::mmu::destroy_space(root.0);
+        crate::paging::destroy(root);
         crate::engine::flush();
     }
 
-    fn frame_access(&self) -> Option<arch_abi::FrameAccess> { Some(crate::phys::frame_access()) }
-
-    fn alloc_shared_pages(&mut self, count: usize) -> core::ptr::NonNull<u8> {
-        assert!(count != 0);
-        let base = crate::phys::frame_ptr(crate::phys::alloc_frames(count));
-        core::ptr::NonNull::new(base).unwrap()
-    }
-
-    unsafe fn free_shared_pages(&mut self, base: core::ptr::NonNull<u8>, count: usize) {
-        crate::phys::free_frames(crate::phys::kernel_frame(base, count), count);
-    }
-
-    unsafe fn shared_page(&mut self, base: core::ptr::NonNull<u8>) -> arch_abi::page_entry::PhysicalFrame {
+    unsafe fn physical_frame(&mut self, base: core::ptr::NonNull<u8>) -> arch_abi::page_entry::PhysicalFrame {
         arch_abi::page_entry::PhysicalFrame::new(crate::phys::kernel_frame(base, 1)).unwrap()
     }
+
+    fn physical_frame_io(&self) -> Option<arch_abi::PhysicalFrameIo> { Some(crate::phys::io()) }
 
     fn map_kernel_physical(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
         assert!(vpage_start >= 0xc0000000 / 4096);
         crate::calls::arch_map_kernel_physical(vpage_start, num_pages, ppage_start, flags)
     }
-
-    fn free_page_count(&self) -> usize { crate::machine::free_page_count() }
-
-    fn total_page_count(&self) -> Option<usize> { Some(crate::phys::PHYS_SIZE / 4096 - 1) }
 }
 
 impl Arch for Interp {
@@ -142,7 +117,7 @@ impl Arch for Interp {
         crate::suite_control::gate();
         crate::engine::install_io_policy(io);
         // Bridge the loop-owned registers to the backend's live frame for the
-        // run (the active SPACE already lives in `REGS.space`), then read them
+        // run, then read them
         // back. Swap, not copy — `Regs` is Copy but swap keeps a single source.
         let live = unsafe { &mut *(&raw mut vcpu::REGS) };
         core::mem::swap(&mut live.regs, regs);

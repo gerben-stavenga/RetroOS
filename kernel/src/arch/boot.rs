@@ -15,15 +15,58 @@ use paging2::{PAGE_SIZE, LOW_MEM_BASE};
 /// Kernel physical load address (must match KERNEL_PHYS in kernel.ld)
 pub const KERNEL_PHYS: usize = 0x0010_0000;
 
-/// The kernel's global allocator on metal: the freestanding demand-paged heap
-/// algorithm (`lib::heap::DemandHeap`), bound here in the binary-side boot glue.
-/// Hosted builds don't compile `boot.rs` at all and use std's allocator, so the
-/// kernel crate itself stays allocator-agnostic (no `#[global_allocator]`, no
-/// `cfg`). The heap VA window and its first-touch `#PF` page-backing are
-/// arch-owned (`arch::{heap_base, HEAP_END}` + the metal `#PF` handler); this is
-/// only the binding and its one-time `init()` call site (below, before startup).
+/// Heap growth belongs to the kernel. Arch only installs supplied frames.
+struct KernelHeap {
+    heap: lib::heap::Heap,
+    growing: core::sync::atomic::AtomicBool,
+    end: core::sync::atomic::AtomicUsize,
+}
 #[global_allocator]
-static ALLOCATOR: lib::heap::DemandHeap = lib::heap::DemandHeap::new();
+static ALLOCATOR: KernelHeap = KernelHeap {
+    heap: lib::heap::Heap::new(),
+    growing: core::sync::atomic::AtomicBool::new(false),
+    end: core::sync::atomic::AtomicUsize::new(0),
+};
+
+unsafe impl core::alloc::GlobalAlloc for KernelHeap {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        use core::sync::atomic::Ordering::{Acquire, Release, Relaxed};
+        let result = unsafe { self.heap.alloc(layout) };
+        if !result.is_null() { return result; }
+        while self.growing.compare_exchange(false, true, Acquire, Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        // Another CPU may have grown the heap while we waited.
+        let mut result = unsafe { self.heap.alloc(layout) };
+        if result.is_null() {
+            let start = self.end.load(Relaxed);
+            let wanted = layout.size().saturating_add(layout.align()).max(16 * 1024);
+            let limit = start.saturating_add(wanted).saturating_add(4095) & !4095;
+            let limit = limit.min(arch::HEAP_END);
+            let mut end = start;
+            let mut table = None;
+            while start != 0 && end < limit {
+                if table.is_none() { table = phys_mm::alloc_resident_page(); }
+                let Some(spare) = table else { break; };
+                let Some(frame) = phys_mm::alloc_resident_page() else { break; };
+                if arch::map_heap_page(end, frame, spare) { table = None; }
+                end += 4096;
+            }
+            // The spare is exclusive and never had reference metadata.
+            if let Some(table) = table { phys_mm::free_phys_page(table); }
+            if end != start {
+                unsafe { self.heap.add_region(start, end); }
+                self.end.store(end, Relaxed);
+                result = unsafe { self.heap.alloc(layout) };
+            }
+        }
+        self.growing.store(false, Release);
+        result
+    }
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: core::alloc::Layout) {
+        unsafe { self.heap.dealloc(pointer, layout); }
+    }
+}
 
 // Boot configuration is immutable after the one-shot handoff and needed for
 // the kernel's lifetime.  Keeping it here avoids retaining its 4 KiB command
@@ -403,20 +446,16 @@ unsafe fn prepare_boot(
     install_physical_memory();
     crate::kernel::memory::set_text_frame(phys_mm::alloc_contig(8).expect("no VGA backing pages"));
 
-    // VGA framebuffer scanout needs its packed shadow as soon as fbcon is
-    // attached below. Paging, phys_mm, and the #PF page-backing are now ready,
-    // so the demand-paged heap can safely be enabled here.
-    // Kernel heap backing grows monotonically. Freed objects are reused by
-    // the allocator, but their pages remain mapped to the same frames. This
-    // avoids remapping a reused address while another CPU retains an old TLB
-    // entry. Large file-cache payloads use physical frames outside this heap.
-    ALLOCATOR.init(arch::heap_base(), arch::HEAP_END);
-    ALLOCATOR.enable_small_cache();
+    // All heap pages are mapped before donation to the allocator. Backing
+    // stays resident across frees, so other CPUs never retain recycled mappings.
+    ALLOCATOR.end.store(arch::heap_base(), core::sync::atomic::Ordering::Relaxed);
+    ALLOCATOR.heap.enable_small_cache();
     phys_mm::complete_initialization();
-    arch::memory::configure(phys_mm::ownership(), frame_refill_entry as *const () as usize);
+    arch::memory::configure(phys_mm::ownership());
     phys_mm::prepare_fault_metadata();
     crate::kernel::klog::init();
-    arch::aperture::init();
+    let table = phys_mm::alloc_phys_page().expect("physical aperture table");
+    if !arch::aperture::init(table) { phys_mm::free_phys_page(table); }
 
     // APs borrow the BSP bootstrap root, then acknowledge their private roots.
     // Retain the existing identity mapping until every startup has completed.
@@ -690,34 +729,6 @@ fn install_physical_memory() {
         unmap: paging2::unmap_kernel_page,
     };
     phys_mm::install_low_dma_memory(&DMA);
-    arch::memory::configure(phys_mm::ownership(), frame_refill_entry as *const () as usize);
+    arch::memory::configure(phys_mm::ownership());
     unsafe { phys_mm::replenish_supply(arch::memory::supply()); }
-}
-
-
-#[unsafe(naked)]
-unsafe extern "C" fn frame_refill_entry() -> ! {
-    core::arch::naked_asm!(
-        "lea esp, [esp - 4]", "pushfd", "pushad", "mov ebp, esp",
-        "and esp, -16", "call {refill}", "mov esp, ebp",
-        "mov [esp + 36], eax", "popad", "popfd", "ret",
-        refill = sym frame_refill_resume,
-    );
-}
-extern "C" fn frame_refill_resume() -> usize {
-    let supply = arch::memory::supply();
-    // Normal allocation touches only resident bitmap/refcount metadata.
-    unsafe {
-        let mut returned = [0; arch_abi::page_supply::SUPPLY_CAPACITY];
-        loop {
-            let count = arch::memory::collect_returns(&mut returned);
-            for page in &returned[..count] { phys_mm::free_phys_page(*page); }
-            if count < returned.len() { break; }
-        }
-        if ALLOCATOR.is_locked() { phys_mm::replenish_supply_without_reclaim(supply); }
-        else { phys_mm::replenish_supply(supply); }
-        let ip = (*supply).resume_ip;
-        (*supply).resume_ip = 0;
-        ip
-    }
 }

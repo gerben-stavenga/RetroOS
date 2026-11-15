@@ -199,9 +199,9 @@ pub(super) fn call<A: crate::Arch>(
             return 0xc0000008;
         };
         let id = user_objects::next_id();
-        let offset = session::allocate_object(machine, id);
+        let offset = session::allocate_object(id);
         let input_id = user_objects::next_id();
-        let input_offset = session::allocate_object(machine, input_id);
+        let input_offset = session::allocate_object(input_id);
         let event = threads::create_event(state, true, false);
         state.user_queues.queues.push(Queue {
             tid,

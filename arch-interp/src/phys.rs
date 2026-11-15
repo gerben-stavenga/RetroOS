@@ -1,23 +1,5 @@
-//! Guest physical memory model for the interpreter.
-//!
-//! Metal has real physical frames: two virtual mappings can point at the same
-//! frame (the VGA A0000 window aliasing a plane, a COW page shared by parent
-//! and child, an MMIO BAR). The interpreter had no such namespace — each
-//! address space was its own flat anonymous arena, so `map_phys_range` could
-//! only hand back fresh zeroed RAM and `alloc_phys_contig` was unimplemented.
-//!
-//! This backs "guest physical RAM" with a single `memfd`: a physical frame is
-//! an offset into it. Aliasing is then ordinary `mmap(MAP_FIXED, …, memfd,
-//! off)` — map the same file page at two guest VAs (or into the kernel's own
-//! view) and they share storage, exactly like a real frame mapped by two PTEs.
-//! The fd is sparse, so the large reservation costs only the frames actually
-//! touched. This is the substrate the kernel's phys allocator, the VGA
-//! plane-aliasing, and COW fork all build on; on metal the same kernel code
-//! drives real frames through `map_phys_range`.
-
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+//! Hosted physical RAM backing: one shared mapping addressed by frame number.
+//! The kernel owns allocation, accounting, reference counts and reclamation.
 
 const PAGE: usize = 4096;
 
@@ -30,6 +12,7 @@ pub const PHYS_SIZE: usize = 512 << 20; // 512 MiB
 /// of the whole thing (the interpreter "kernel" is this host process, so its
 /// view of a frame is just a host pointer into this mapping).
 struct Phys {
+    #[cfg(test)]
     fd: i32,
     view: *mut u8,
 }
@@ -39,21 +22,6 @@ unsafe impl Sync for Phys {}
 unsafe impl Send for Phys {}
 
 static PHYS: std::sync::OnceLock<Phys> = std::sync::OnceLock::new();
-
-/// High-water mark over the phys backing; reclaimed frames are reused first.
-/// Frame 0 is reserved (a null-ish sentinel so 0 reads as "unallocated").
-static NEXT_FRAME: AtomicUsize = AtomicUsize::new(1);
-
-/// Reclaimed single frames available for reuse before the bump pointer advances.
-/// `free_frames` punch-holes the backing storage (so the frame re-reads zero)
-/// and returns it here; with real reuse, sequential program runs (DN → game →
-/// exit → next game) no longer march `NEXT_FRAME` to exhaustion.
-static FREE_LIST: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-
-pub fn free_page_count() -> usize {
-    (PHYS_SIZE / PAGE).saturating_sub(NEXT_FRAME.load(Ordering::Relaxed))
-        + FREE_LIST.lock().unwrap().len()
-}
 
 /// Base of the persistent kernel-side mapping of the whole guest-physical memfd.
 /// This is the single region handed to unicorn (`mem_map_ptr(0, PHYS_SIZE, …)`):
@@ -90,7 +58,9 @@ fn phys() -> &'static Phys {
             )
         };
         assert!(view != libc::MAP_FAILED, "kernel-view mmap of guest phys failed");
-        Phys { fd, view: view as *mut u8 }
+        #[cfg(not(test))]
+        unsafe { libc::close(fd); }
+        Phys { #[cfg(test)] fd, view: view as *mut u8 }
     })
 }
 
@@ -101,84 +71,6 @@ pub fn frame_ptr(ppage: u64) -> *mut u8 {
     let off = (ppage as usize) * PAGE;
     assert!(off < PHYS_SIZE, "phys frame {ppage:#x} out of range");
     unsafe { phys().view.add(off) }
-}
-
-/// Allocate `count` contiguous frames; returns the starting page. A single-frame
-/// request reuses a freed frame when one is available (the common case: page
-/// tables, demand pages, fork copies); multi-frame contiguous requests always
-/// bump (the free list holds only isolated frames).
-pub fn alloc_frames(count: usize) -> u64 {
-    if count == 1 {
-        if let Some(f) = FREE_LIST.lock().unwrap().pop() {
-            return f;
-        }
-    }
-    if count == 1 && NEXT_FRAME.load(Ordering::Relaxed) >= PHYS_SIZE / PAGE {
-        let callback = RECLAIM.load(Ordering::Acquire);
-        if callback != 0 {
-            let reclaim: fn() -> Option<u64> = unsafe { core::mem::transmute(callback) };
-            if let Some(frame) = reclaim() { return frame; }
-        }
-    }
-    let start = NEXT_FRAME.fetch_add(count, Ordering::Relaxed);
-    assert!((start + count) * PAGE <= PHYS_SIZE, "guest phys exhausted");
-    start as u64
-}
-
-/// Frames referenced by more than one PTE — the only intra-space aliasing the
-/// interp creates is the A20-wrap (HMA pages aliased onto low memory), but the
-/// model is general. A frame absent here has an implicit refcount of 1; a frame
-/// present here is shared and is reclaimed only when its last extra reference is
-/// released. Mirrors metal's `phys_mm` shared-frame count so mapping aliases
-/// can alias instead of snapshot.
-fn shared() -> &'static Mutex<HashMap<u64, u32>> {
-    static S: OnceLock<Mutex<HashMap<u64, u32>>> = OnceLock::new();
-    S.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Add a reference to `frame` (a second PTE now maps it). The frame survives the
-/// next `free_frames` and is reclaimed only when references drop back to 1.
-pub fn inc_ref(frame: u64) {
-    *shared().lock().unwrap().entry(frame).or_insert(1) += 1;
-}
-
-/// Is `frame` referenced by more than one PTE (refcount > 1)? COW uses this to
-/// decide copy-vs-reuse: a sole owner can take the page writable without a copy.
-pub fn is_shared(frame: u64) -> bool {
-    shared().lock().unwrap().contains_key(&frame)
-}
-
-/// Return `count` frames at `start` to the allocator. A shared (aliased) frame
-/// just drops a reference. The last reference hole-punches it (host RAM
-/// reclaimed; the frame re-reads zero on next touch) and pushes it to the free
-/// list for reuse. Frame 0 is never freed (the null sentinel).
-pub fn free_frames(start: u64, count: usize) {
-    let mut free = FREE_LIST.lock().unwrap();
-    let mut sh = shared().lock().unwrap();
-    for i in 0..count as u64 {
-        let f = start + i;
-        if f == 0 {
-            continue;
-        }
-        if let Some(rc) = sh.get_mut(&f) {
-            // Shared frame: drop one reference; once it falls back to 1 it's no
-            // longer aliased and the next free will reclaim it for real.
-            *rc -= 1;
-            if *rc <= 1 {
-                sh.remove(&f);
-            }
-            continue;
-        }
-        unsafe {
-            libc::fallocate(
-                phys().fd,
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                (f as libc::off_t) * PAGE as libc::off_t,
-                PAGE as libc::off_t,
-            );
-        }
-        free.push(f);
-    }
 }
 
 /// Alias `count` pages of physical memory (starting at `ppage`) into the host
@@ -209,11 +101,12 @@ mod tests {
 
     #[test]
     fn alias_shares_storage() {
+        crate::phys::init_test_ram();
         // Two frames; write via the kernel view, alias into a scratch
         // reservation, and confirm the alias sees the same bytes (and writes
         // back through it land in the kernel view) — i.e. one physical frame,
         // two mappings.
-        let base = alloc_frames(2);
+        let base = test_memory::alloc_backed_pages(2);
         unsafe {
             *frame_ptr(base) = 0xAB;
             *frame_ptr(base + 1) = 0xCD;
@@ -238,26 +131,83 @@ mod tests {
     }
 }
 
-static RECLAIM: AtomicUsize = AtomicUsize::new(0);
-fn set_reclaim(callback: fn() -> Option<u64>) { RECLAIM.store(callback as usize, Ordering::Release); }
-fn allocate_owned() -> Option<u64> {
-    if free_page_count() == 0 {
-        let callback = RECLAIM.load(Ordering::Acquire);
-        if callback == 0 { return None; }
-        return unsafe { core::mem::transmute::<usize, fn() -> Option<u64>>(callback) }();
-    }
-    Some(alloc_frames(1))
-}
-fn release_owned(page: u64) { free_frames(page, 1); }
 fn read_owned(page: u64, offset: usize, bytes: &mut [u8]) {
+    assert!(offset <= PAGE && bytes.len() <= PAGE - offset);
     unsafe { core::ptr::copy_nonoverlapping(frame_ptr(page).add(offset), bytes.as_mut_ptr(), bytes.len()); }
 }
 fn write_owned(page: u64, offset: usize, bytes: &[u8]) {
+    assert!(offset <= PAGE && bytes.len() <= PAGE - offset);
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), frame_ptr(page).add(offset), bytes.len()); }
 }
-fn references_owned(page: u64) -> usize { shared().lock().unwrap().get(&page).copied().unwrap_or(1) as usize }
-pub(crate) fn frame_access() -> arch_abi::FrameAccess {
-    arch_abi::FrameAccess { retain: |frame| { inc_ref(frame); true }, allocate: allocate_owned, release: release_owned,
-        read: read_owned, write: write_owned, free: free_page_count,
-        total: || PHYS_SIZE / PAGE, references: references_owned, set_reclaim }
+pub(crate) fn io() -> arch_abi::PhysicalFrameIo {
+    arch_abi::PhysicalFrameIo { read: read_owned, write: write_owned }
+}
+
+pub fn ram() -> (*mut u8, usize) { (region_base(), PHYS_SIZE) }
+
+#[cfg(test)]
+pub fn init_test_ram() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| unsafe { test_memory::init_direct_ram(region_base(), PHYS_SIZE); });
+    thread_local! { static READY: Cell<bool> = const { Cell::new(false) }; }
+    use std::cell::Cell;
+    READY.with(|ready| {
+        if ready.replace(true) { return; }
+        unsafe { crate::vcpu::init_guest_ram(test_memory::alloc_backed_pages(crate::paging::PAGING_PAGES)); }
+        unsafe {
+            (*supply()).ownership = test_memory::ownership();
+            test_memory::replenish_supply(supply());
+        }
+        let mut input = Box::new(arch_abi::page_supply::PageInput::new());
+        for _ in 0..64 {
+            input.pages[input.count] = test_memory::alloc_backed_pages(1);
+            input.count += 1;
+        }
+        set_input(Box::into_raw(input));
+    });
+}
+
+#[cfg(test)]
+use crate::test_memory;
+
+use arch_abi::page_supply::{PageSupply, PageInput, FAULT_PAGES};
+thread_local! {
+    static SUPPLY: core::cell::UnsafeCell<PageSupply> = const { core::cell::UnsafeCell::new(PageSupply::new()) };
+    static INPUT: core::cell::Cell<*mut PageInput> = const { core::cell::Cell::new(core::ptr::null_mut()) };
+}
+pub(crate) fn supply() -> *mut PageSupply { SUPPLY.with(|s| s.get()) }
+pub(crate) fn set_input(input: *mut PageInput) -> *mut PageInput { INPUT.with(|p| p.replace(input)) }
+pub(crate) fn can_fault() -> bool { unsafe { (*supply()).count >= FAULT_PAGES } }
+pub(crate) fn take_input() -> Option<u64> {
+    INPUT.with(|p| unsafe { p.get().as_mut().and_then(PageInput::take) }).map(zero)
+}
+pub(crate) fn take_fault() -> Option<u64> {
+    unsafe {
+        let state = &mut *supply();
+        let page = state.take()?;
+        state.fault_pages_used += 1;
+        Some(zero(page))
+    }
+}
+fn zero(page: u64) -> u64 {
+    unsafe { core::ptr::write_bytes(frame_ptr(page), 0, PAGE); }
+    page
+}
+pub(crate) fn retain(page: u64) {
+    assert!(unsafe { (*supply()).ownership.retain(page) });
+}
+pub(crate) fn shared(page: u64) -> bool {
+    unsafe { (*supply()).ownership.references(page) > 1 }
+}
+pub(crate) fn release(page: u64) {
+    unsafe {
+        let state = &mut *supply();
+        if !state.ownership.release_shared(page) { return; }
+        if state.count < state.pages.len() { state.donate(page); }
+        else {
+            frame_ptr(page).cast::<u64>().write(state.returned_head);
+            state.returned_head = page;
+            state.returned_count += 1;
+        }
+    }
 }

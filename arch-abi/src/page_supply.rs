@@ -1,6 +1,6 @@
 //! Resident frame ownership metadata and explicitly donated per-CPU pages.
 //! No allocator or reclaim operation crosses this boundary.
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 pub const FAULT_PAGES: usize = 5; // data + up to four x86 page-table levels
 pub const SUPPLY_CAPACITY: usize = 64;
@@ -18,13 +18,12 @@ pub struct FrameOwnership {
     pub bitmap: *const u8,
     pub blocks: *const *mut u8,
     pub active: usize,
-    pub free: *const AtomicUsize,
     pub zero_page: u64,
 }
 impl FrameOwnership {
     pub const EMPTY: Self = Self { regions: core::ptr::null(), regions_len: 0,
         bitmap: core::ptr::null(), blocks: core::ptr::null(), active: 0,
-        free: core::ptr::null(), zero_page: u64::MAX };
+        zero_page: u64::MAX };
     unsafe fn index(&self, page: u64) -> Option<usize> {
         if self.regions_len == 0 { return None; }
         let regions = unsafe { core::slice::from_raw_parts(self.regions, self.regions_len) };
@@ -77,11 +76,7 @@ impl FrameOwnership {
         });
         result.is_err()
     }
-    /// # Safety
-    /// The descriptor's free counter must be resident and valid if non-null.
-    pub unsafe fn free_pages(&self) -> usize {
-        if self.free.is_null() { 0 } else { unsafe { &*self.free }.load(Ordering::Relaxed) }
-    }
+
 }
 
 /// Owner-core-only exchange state. Kernel supplies owned pages; arch consumes
@@ -91,8 +86,6 @@ pub struct PageSupply {
     pub count: usize,
     pub returned_head: u64,
     pub returned_count: usize,
-    pub resume_ip: usize,
-    pub refill_ip: usize,
     pub fault_depth: usize,
     pub fault_pages_used: usize,
     pub fault_pages_current: usize,
@@ -102,7 +95,7 @@ pub struct PageSupply {
 }
 impl PageSupply {
     pub const fn new() -> Self { Self { pages: [0; SUPPLY_CAPACITY], count: 0,
-        returned_head: 0, returned_count: 0, resume_ip: 0, refill_ip: 0,
+        returned_head: 0, returned_count: 0,
         fault_depth: 0, fault_pages_used: 0, fault_pages_current: 0,
         fault_pages_peak: 0, refills: 0, ownership: FrameOwnership::EMPTY } }
     pub fn take(&mut self) -> Option<u64> {
@@ -123,7 +116,6 @@ impl Default for PageSupply { fn default() -> Self { Self::new() } }
 pub struct PageBootstrap {
     pub ownership: FrameOwnership,
     pub pages: [u64; FAULT_PAGES],
-    pub refill_ip: usize,
 }
 
 /// Explicitly owned backing pages for one kernel-to-arch mapping operation.
@@ -145,14 +137,13 @@ mod tests {
         let counts: [AtomicU8; REF_BLOCK_PAGES] = core::array::from_fn(|_| AtomicU8::new(0));
         let region = [FrameRegion { first: 256, end: 320, offset: 0 }];
         let bitmap = [255u8; 8];
-        let free = AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 scope.spawn(|| {
                     let blocks = [counts.as_ptr().cast_mut().cast::<u8>()];
                     let refs = FrameOwnership { regions: region.as_ptr(), regions_len: 1,
                         bitmap: bitmap.as_ptr(), blocks: blocks.as_ptr(), active: 64,
-                        free: &free, zero_page: 0 };
+                        zero_page: 0 };
                     for _ in 0..1000 {
                         assert!(unsafe { refs.retain(256) });
                         assert!(!unsafe { refs.release_shared(256) });

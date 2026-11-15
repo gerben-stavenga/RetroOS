@@ -3,15 +3,15 @@
 use alloc::boxed::Box;
 use spin::Once;
 
-static ACCESS: Once<arch_abi::FrameAccess> = Once::new();
-pub(crate) fn install(access: arch_abi::FrameAccess, reclaim: fn() -> Option<u64>) {
+static ACCESS: Once<arch_abi::PhysicalFrameIo> = Once::new();
+pub(crate) fn install(access: arch_abi::PhysicalFrameIo, reclaim: fn() -> Option<u64>) {
     ACCESS.call_once(|| access);
-    (access.set_reclaim)(reclaim);
+    super::phys_mm::set_reclaim(reclaim);
 }
-pub(crate) fn access() -> Option<&'static arch_abi::FrameAccess> { ACCESS.get() }
+pub(crate) fn access() -> Option<&'static arch_abi::PhysicalFrameIo> { ACCESS.get() }
 
 pub(crate) fn reserve() -> usize {
-    access().map_or(0, |a| ((a.total)() / 32).clamp(64, 8192))
+    access().map_or(0, |_| (super::phys_mm::total_page_count() / 32).clamp(64, 8192))
 }
 
 pub(crate) struct Frame {
@@ -23,7 +23,7 @@ impl Frame {
     pub fn new(bytes: &[u8]) -> Result<Self, i32> {
         assert_eq!(bytes.len(), 4096);
         if let Some(a) = access() {
-            let physical = (a.allocate)().ok_or(-12)?;
+            let physical = super::memory::allocate_frame().ok_or(-12)?;
             (a.write)(physical, 0, bytes);
             Ok(Self { physical: Some(physical), bytes: None })
         } else {
@@ -43,13 +43,13 @@ impl Frame {
     }
     pub fn into_reclaimed(mut self) -> Option<u64> {
         let page = self.physical?;
-        if (access().unwrap().references)(page) != 1 { return None; }
+        if usize::from(super::phys_mm::get_ref_count(page)) != 1 { return None; }
         self.physical.take()
     }
 }
 impl Drop for Frame {
     fn drop(&mut self) {
-        if let Some(page) = self.physical { (access().unwrap().release)(page); }
+        if let Some(page) = self.physical { super::phys_mm::free_phys_page(page); }
     }
 }
 

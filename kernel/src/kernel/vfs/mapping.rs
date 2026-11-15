@@ -174,8 +174,8 @@ impl Vfs {
     }
 
     fn make_page_room(&mut self) -> bool {
-        if let Some(a) = cache::access() {
-            while (a.free)() <= cache::reserve() {
+        if cache::access().is_some() {
+            while crate::kernel::phys_mm::free_page_count() <= cache::reserve() {
                 let Some(frame) = self.evict_clean_page() else { return false; };
                 drop(frame);
             }

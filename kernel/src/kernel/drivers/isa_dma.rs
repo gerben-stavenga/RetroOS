@@ -8,7 +8,7 @@ static BUFFERS: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 #[derive(Clone, Copy)]
 struct Buffer { address: usize, bytes: usize }
 impl Buffer {
-    fn get<A: Arch>(machine: &mut A, channel: usize) -> Option<Self> {
+    fn get(channel: usize) -> Option<Self> {
         let slot = BUFFERS.get(channel)?;
         let bytes = if channel < 4 { 65536 } else { 131072 };
         let mut address = slot.load(Ordering::Acquire);
@@ -16,7 +16,7 @@ impl Buffer {
             // Only the guest core creates bindings; the media core receives
             // the already-published buffer and performs volatile reads only.
             let pages = bytes / 4096;
-            address = machine.alloc_shared_pages(pages).as_ptr() as usize;
+            address = crate::kernel::phys_mm::alloc_shared_pages(pages).as_ptr() as usize;
             slot.store(address, Ordering::Release);
         }
         Some(Self { address, bytes })
@@ -45,7 +45,7 @@ impl Binding {
         self.channel == channel && self.guest == guest && self.bytes == bytes
     }
     pub(crate) fn new<A: Arch>(machine: &mut A, channel: usize, guest: usize, bytes: usize) -> Option<Self> {
-        let buffer = Buffer::get(machine, channel)?;
+        let buffer = Buffer::get(channel)?;
         let offset = guest & (buffer.bytes - 1);
         if bytes == 0 || offset.checked_add(bytes)? > buffer.bytes { return None; }
         let vpage = guest / 4096;

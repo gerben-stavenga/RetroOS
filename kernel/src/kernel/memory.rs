@@ -27,7 +27,7 @@ pub unsafe fn replenish(supply: *mut PageSupply) {
     }
     unsafe { phys_mm::replenish_supply(supply); }
 }
-pub fn service<A: Arch>(machine: &mut A) {
+pub fn service<A: arch_abi::Arch>(machine: &A) {
     if let Some(supply) = machine.page_supply() {
         install_supply(supply);
         unsafe { replenish(supply); }
@@ -73,19 +73,8 @@ pub fn high_copy<A: Arch>(machine: &mut A, mut address: u64, mut bytes: &mut [u8
     }
     true
 }
-pub fn cache_access(io: arch_abi::PhysicalFrameIo) -> arch_abi::FrameAccess {
-    install_io(io);
-    arch_abi::FrameAccess {
-        retain: phys_mm::inc_shared_count,
-        allocate: allocate_frame, release: phys_mm::free_phys_page,
-        read: io.read, write: io.write, free: phys_mm::free_page_count,
-        total: phys_mm::total_page_count,
-        references: |page| usize::from(phys_mm::get_ref_count(page)),
-        set_reclaim: phys_mm::set_reclaim,
-    }
-}
 
-fn allocate_frame() -> Option<u64> {
+pub(crate) fn allocate_frame() -> Option<u64> {
     let supply = unsafe { CURRENT };
     if !supply.is_null() {
         // A large unmap may have returned many frames since the last event-loop
@@ -180,7 +169,7 @@ pub unsafe fn map_shared_pages<A: Arch>(machine: &mut A, vpage: usize,
     if count != 0 { start.offset(count - 1).unwrap(); }
     for index in 0..count {
         let pointer = unsafe { core::ptr::NonNull::new_unchecked(base.as_ptr().add(index * 4096)) };
-        let frame = unsafe { machine.shared_page(pointer) };
+        let frame = unsafe { machine.physical_frame(pointer) };
         let entry = PageEntry::Writable(Mapping { backing: Backing::Borrowed(frame), attributes: Attributes::EXECUTABLE });
         unsafe { replace(machine, start.offset(index).unwrap(), entry) }.expect("cannot map shared backing");
     }
@@ -216,8 +205,8 @@ pub fn map_physical<A: Arch>(machine: &mut A, vpage: usize, count: usize, physic
 
 use arch_abi::{UserPage, page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFrame}};
 
-fn frames<A: Arch>(machine: &A) -> arch_abi::FrameAccess {
-    machine.frame_access().unwrap_or_else(|| cache_access(machine.physical_frame_io().expect("physical frame access")))
+fn frames<A: Arch>(machine: &A) -> arch_abi::PhysicalFrameIo {
+    machine.physical_frame_io().expect("physical frame access")
 }
 fn page(vpage: usize) -> UserPage { UserPage::new((vpage as u64).checked_mul(4096).unwrap()).unwrap() }
 fn backing(entry: PageEntry) -> Option<Mapping> {
@@ -226,20 +215,20 @@ fn backing(entry: PageEntry) -> Option<Mapping> {
         _ => None,
     }
 }
-fn pin(access: arch_abi::FrameAccess, entry: PageEntry) {
+fn pin(entry: PageEntry) {
     if let Some(Mapping { backing: Backing::Owned(frame), .. }) = backing(entry) {
-        assert!((access.retain)(frame.number()), "invalid mapping reference");
+        assert!(phys_mm::inc_shared_count(frame.number()), "invalid mapping reference");
     }
 }
-fn unpin(access: arch_abi::FrameAccess, entry: PageEntry) {
-    if let Some(Mapping { backing: Backing::Owned(frame), .. }) = backing(entry) { (access.release)(frame.number()); }
+fn unpin(entry: PageEntry) {
+    if let Some(Mapping { backing: Backing::Owned(frame), .. }) = backing(entry) { phys_mm::free_phys_page(frame.number()); }
 }
 
 static ZERO_FRAME: spin::Once<PhysicalFrame> = spin::Once::new();
 pub fn zero_mapping<A: Arch>(machine: &A, executable: bool) -> Mapping {
     let frame = *ZERO_FRAME.call_once(|| {
         let access = frames(machine);
-        let frame = (access.allocate)().expect("zero frame allocation");
+        let frame = allocate_frame().expect("zero frame allocation");
         (access.write)(frame, 0, &[0; 4096]);
         PhysicalFrame::new(frame).unwrap()
     });
@@ -265,12 +254,12 @@ pub fn fresh<A: Arch>(machine: &mut A, vpage: usize, count: usize) {
     let access = frames(machine);
     for index in 0..count {
         service(machine);
-        let frame = (access.allocate)().expect("anonymous frame allocation");
+        let frame = allocate_frame().expect("anonymous frame allocation");
         (access.write)(frame, 0, &[0; 4096]);
         let entry = PageEntry::Writable(Mapping { backing: Backing::Owned(PhysicalFrame::new(frame).unwrap()),
             attributes: mapping_attributes(machine, true) });
         let result = unsafe { replace(machine, start.offset(index).unwrap(), entry) };
-        (access.release)(frame);
+        phys_mm::free_phys_page(frame);
         result.expect("map anonymous RAM");
     }
 }
@@ -288,12 +277,12 @@ pub fn protect<A: Arch>(machine: &mut A, vpage: usize, count: usize, writable: b
             // ReadOnly has no hidden future-write policy. A borrowed private
             // snapshot becomes normal owned RAM before losing its COW state.
             let access = frames(machine);
-            let frame = (access.allocate)().expect("private protection backing");
+            let frame = allocate_frame().expect("private protection backing");
             let mut bytes = [0; 4096];
             (access.read)(mapping.backing.frame().number(), 0, &mut bytes);
             (access.write)(frame, 0, &bytes);
             mapping.backing = Backing::Owned(PhysicalFrame::new(frame).unwrap());
-            temporary = Some((access, frame));
+            temporary = Some(frame);
         }
         mapping.attributes = mapping.attributes.with_executable(mapping_attributes(machine, executable).contains(Attributes::EXECUTABLE));
         let entry = if !writable { PageEntry::ReadOnly(mapping) }
@@ -301,7 +290,7 @@ pub fn protect<A: Arch>(machine: &mut A, vpage: usize, count: usize, writable: b
                 PageEntry::CopyOnWrite(mapping)
             } else { PageEntry::Writable(mapping) };
         let result = unsafe { replace(machine, page, entry) };
-        if let Some((access, frame)) = temporary { (access.release)(frame); }
+        if let Some(frame) = temporary { phys_mm::free_phys_page(frame); }
         result.expect("set protection");
     }
 }
@@ -317,32 +306,31 @@ pub fn alias<A: Arch>(machine: &mut A, source: usize, destination: usize, count:
         let mut entry = machine.read_mapping(at).expect("read alias source");
         if let PageEntry::CopyOnWrite(mut mapping) = entry {
             service(machine);
-            let frame = (access.allocate)().expect("alias backing allocation");
+            let frame = allocate_frame().expect("alias backing allocation");
             let mut bytes = [0; 4096];
             (access.read)(mapping.backing.frame().number(), 0, &mut bytes);
             (access.write)(frame, 0, &bytes);
             mapping.backing = Backing::Owned(PhysicalFrame::new(frame).unwrap());
             entry = PageEntry::Writable(mapping);
             let result = unsafe { replace(machine, at, entry) };
-            (access.release)(frame);
+            phys_mm::free_phys_page(frame);
             result.expect("materialize alias source");
         }
-        pin(access, entry); entries.push(entry);
+        pin(entry); entries.push(entry);
     }
     let result = unsafe { replace_batch(machine, page(destination), &entries) };
-    for entry in entries { unpin(access, entry); }
+    for entry in entries { unpin(entry); }
     result.expect("install aliases");
 }
 
 /// Swap each pair while holding both references across replacement.
 pub fn swap<A: Arch>(machine: &mut A, a: usize, b: usize, count: usize) {
-    let access = frames(machine);
     for index in 0..count {
         let a = page(a + index); let b = page(b + index);
         let left = machine.read_mapping(a).unwrap(); let right = machine.read_mapping(b).unwrap();
-        pin(access, left); pin(access, right);
+        pin(left); pin(right);
         unsafe { replace(machine, a, right).unwrap(); replace(machine, b, left).unwrap(); }
-        unpin(access, left); unpin(access, right);
+        unpin(left); unpin(right);
     }
 }
 
@@ -386,13 +374,80 @@ pub fn private_copy<A: Arch>(machine: &mut A, first: usize, count: usize) {
         let at = page(first + index);
         let mut mapping = backing(machine.read_mapping(at).expect("read image mapping")).expect("image backing");
         service(machine);
-        let frame = (access.allocate)().expect("private image allocation");
+        let frame = allocate_frame().expect("private image allocation");
         let mut bytes = [0; 4096];
         (access.read)(mapping.backing.frame().number(), 0, &mut bytes);
         (access.write)(frame, 0, &bytes);
         mapping.backing = Backing::Owned(PhysicalFrame::new(frame).unwrap());
         let result = unsafe { replace(machine, at, PageEntry::Writable(mapping)) };
-        (access.release)(frame);
+        phys_mm::free_phys_page(frame);
         result.expect("install private image");
+    }
+}
+
+/// Kernel transfers replenish user backing between page-bounded arch accesses.
+pub trait GuestBytes {
+    fn copy_from(&self, address: usize, bytes: &mut [u8]);
+    fn copy_to(&mut self, address: usize, bytes: &[u8]);
+    fn read<T: Copy>(&self, address: usize) -> T {
+        let mut value = core::mem::MaybeUninit::<T>::uninit();
+        unsafe {
+            self.copy_from(address, core::slice::from_raw_parts_mut(
+                value.as_mut_ptr().cast(), core::mem::size_of::<T>()));
+            value.assume_init()
+        }
+    }
+    fn write<T: Copy>(&mut self, address: usize, value: T) {
+        unsafe { self.copy_to(address, core::slice::from_raw_parts(
+            (&value as *const T).cast(), core::mem::size_of::<T>())); }
+    }
+    fn copy_cstr(&self, address: usize, bytes: &mut [u8]) -> usize {
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            let value = self.read::<u8>(address + i);
+            if value == 0 { return i; }
+            *byte = value;
+        }
+        bytes.len()
+    }
+    fn zero(&mut self, mut address: usize, mut length: usize) {
+        let zeros = [0; 4096];
+        while length != 0 {
+            let n = length.min(4096);
+            self.copy_to(address, &zeros[..n]);
+            address += n;
+            length -= n;
+        }
+    }
+    fn copy_within(&mut self, src: usize, dst: usize, len: usize) {
+        let mut buffer = [0; 4096];
+        let mut remaining = len;
+        while remaining != 0 {
+            let n = remaining.min(buffer.len());
+            let offset = if dst > src { remaining - n } else { len - remaining };
+            self.copy_from(src + offset, &mut buffer[..n]);
+            self.copy_to(dst + offset, &buffer[..n]);
+            remaining -= n;
+        }
+    }
+}
+impl<A: arch_abi::Arch + arch_abi::GuestBytes> GuestBytes for A {
+    fn copy_from(&self, mut address: usize, mut bytes: &mut [u8]) {
+        while !bytes.is_empty() {
+            service(self);
+            let n = bytes.len().min(4096 - (address & 4095));
+            let (part, rest) = bytes.split_at_mut(n);
+            arch_abi::GuestBytes::copy_from(self, address, part);
+            address += n;
+            bytes = rest;
+        }
+    }
+    fn copy_to(&mut self, mut address: usize, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            service(self);
+            let n = bytes.len().min(4096 - (address & 4095));
+            arch_abi::GuestBytes::copy_to(self, address, &bytes[..n]);
+            address += n;
+            bytes = &bytes[n..];
+        }
     }
 }

@@ -703,6 +703,7 @@ fn dispatch_shim64(
     // #PF: resolve against the 2-level source tree (demand-commit / COW); the
     // twin refreshes on re-entry via the generation bump the fix caused.
     if n == 14 {
+        if !crate::phys::can_fault() { return Some(KernelEvent::Irq); }
         let cr2 = k.vcpu.get_sregs().expect("KVM_GET_SREGS").cr2;
         let resolved = cr2 <= u32::MAX as u64 && {
             let a = cr2 as u32;
@@ -760,6 +761,7 @@ fn dispatch_shim(
     // present VA → a write to a read-only page (COW to privatise, else
     // genuine). Only an unresolvable fault bubbles (SEGV).
     if n == 14 {
+        if !crate::phys::can_fault() { return Some(KernelEvent::Irq); }
         let cr2 = {
             let sregs = _k.vcpu.get_sregs().expect("KVM_GET_SREGS");
             sregs.cr2 as u32
@@ -785,6 +787,7 @@ fn dispatch_shim(
     // e.g. a selector-load fault) is a genuine #GP, typed Exception(13) below
     // with the error code preserved.
     if n == 13 {
+        if !crate::phys::can_fault() { return Some(KernelEvent::Irq); }
         // Where the faulting instruction lives, and whether virtual IF was on
         // before it ran: a PM CLI/STI that toggles virtual IF is a window
         // boundary, reflected to `dpmi::vif` (which owns the per-space policy).

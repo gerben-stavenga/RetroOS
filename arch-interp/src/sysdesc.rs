@@ -117,13 +117,11 @@ pub(crate) fn gdt_desc(base: u32, limit: u32, access: u8, flags4: u8) -> u64 {
         | (((base as u64 >> 24) & 0xFF) << 56)
 }
 
-/// The contiguous guest-physical frames backing the SYS window (GDT, LDT,
-/// trampoline, ring-0 stack), shared by every address space. Allocated once;
-/// `register_kernel_window` maps `SYS_BASE` onto them in every page directory.
-static SYS_FRAMES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+// Caller-owned resident SYS storage, shared by every address space.
+thread_local! { static SYS_FRAMES: core::cell::Cell<u64> = const { core::cell::Cell::new(u64::MAX) }; }
 
 pub(crate) fn sys_base_frame() -> u64 {
-    *SYS_FRAMES.get().expect("SYS window not initialized")
+    SYS_FRAMES.with(|f| { assert_ne!(f.get(), u64::MAX, "SYS window not initialized"); f.get() })
 }
 
 /// Host pointer to a SYS-window linear address (the frames are contiguous, so
@@ -141,14 +139,11 @@ pub(crate) fn sys_phys(linear: u64) -> u64 {
 
 /// Allocate the SYS frames, seed the `iretd` trampoline byte, and register the
 /// window so every page directory (existing and future) maps it. Idempotent.
-pub(crate) fn ensure_sys_window() {
-    SYS_FRAMES.get_or_init(|| {
-        let frames = crate::phys::alloc_frames(SYS_SIZE / 4096);
-        unsafe { *crate::phys::frame_ptr(frames).add((TRAMP_ADDR - SYS_BASE) as usize) = 0xCF; }
-        crate::paging::register_kernel_window((SYS_BASE / 4096) as usize, frames, SYS_SIZE / 4096);
-        frames
-    });
+pub(crate) fn initialize(frames: u64) {
+    SYS_FRAMES.with(|f| f.set(frames));
+    unsafe { *crate::phys::frame_ptr(frames).add((TRAMP_ADDR - SYS_BASE) as usize) = 0xCF; }
 }
+pub(crate) fn ensure_sys_window() { let _ = sys_base_frame(); }
 
 /// Refresh the GDT (flat ring-0/ring-3 + BDA alias + present TLS slots) and the
 /// LDT (the kernel's active table) in the SYS-window frames. Returns the LDT

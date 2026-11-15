@@ -1366,7 +1366,7 @@ fn dispatch<A: crate::Arch>(
             if drive>=26 || !crate::kernel::dos::drive_available(b'A'+drive as u8) {0}
             else {match drive {0|1=>2,3|8=>4,_=>3}}
         }
-        (Module::Kernel, 25 | 169) => machine.free_page_count().saturating_mul(4096).min(u32::MAX as usize) as u32,
+        (Module::Kernel, 25 | 169) => crate::kernel::phys_mm::free_page_count().saturating_mul(4096).min(u32::MAX as usize) as u32,
         (Module::Kernel, 23 | 24 | 30 | 52) => 1,
         (Module::Kernel, 47) => {
             let p = stack_u32(machine, windows, regs, 4).unwrap_or(0);

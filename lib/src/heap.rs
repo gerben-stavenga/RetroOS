@@ -1,16 +1,6 @@
-//! Demand-paged heap allocator with an indexed free-space tree (freestanding).
-//!
-//! A generic `GlobalAlloc` that carves allocations out of a fixed virtual
-//! address window `[base, end)`. It is *demand-paged*: `extend_heap` only claims
-//! virtual address space (bumps a cursor toward `end`) and never maps a page
-//! itself — it assumes that touching an address in the window gets backed by the
-//! platform (a `#PF` handler on bare metal). An optional embedder callback
-//! returns whole free pages to that platform on deallocation. The allocator
-//! otherwise knows only the two window bounds supplied via [`DemandHeap::init`].
-//! Free-space indexing and page reclamation live here with `lib`'s other
-//! freestanding primitives. Allocations round to a header-sized power of two
-//! (32 bytes on the kernel target), keeping splits representable without
-//! hidden headers on live allocations.
+//! Allocator over explicitly supplied resident memory.
+//! The owner maps storage before donating it with `Heap::add_region`.
+//! Allocation never extends virtual memory or invokes a backing callback.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -18,16 +8,10 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::{Acquire, Release, Relaxed}};
 
 const PAGE_SIZE: usize = 4096;
-const RETAINED_RANGES: usize = 64;
-
-#[derive(Clone, Copy)]
-struct Retained { start: usize, end: usize }
-const EMPTY_RETAINED: Retained = Retained { start: 0, end: 0 };
-
 /// Large-allocation instrumentation (≥ 100 KB), for diagnostic logging.
 static LARGE_ALLOCS: AtomicU32 = AtomicU32::new(0);
 static LARGE_FREES: AtomicU32 = AtomicU32::new(0);
-static LARGE_REUSE: AtomicU32 = AtomicU32::new(0); // satisfied from free list (no extend)
+static LARGE_REUSE: AtomicU32 = AtomicU32::new(0); // satisfied without draining small caches
 static ALLOCATIONS: AtomicU32 = AtomicU32::new(0);
 static DEALLOCATIONS: AtomicU32 = AtomicU32::new(0);
 
@@ -121,89 +105,56 @@ struct Inner {
     small_enabled: bool,
     small: [Option<NonNull<FreeBlock>>; SMALL_CLASSES],
     small_count: [u8; SMALL_CLASSES],
-    /// Top of the virtual range claimed so far (grows toward `heap_end`).
-    mapped_end: usize,
-    /// Ceiling of the heap window (set in `init`).
-    heap_end: usize,
-    /// Return whole, unused pages to the platform's demand-paging pool.
-    release: Option<fn(usize, usize)>,
-    retained: [Retained; RETAINED_RANGES],
-    retained_count: usize,
-    retained_bytes: usize,
-    retain_limit: usize,
 }
 
-/// Demand-paged heap over a `[base, end)` virtual window. Install as the
-/// `#[global_allocator]` and call [`DemandHeap::init`] once after paging is up.
-pub struct DemandHeap {
+/// An allocator whose free regions are already resident.
+pub struct Heap {
     inner: UnsafeCell<Inner>,
     locked: AtomicBool,
 }
 struct HeapGuard<'a>(&'a AtomicBool);
 impl Drop for HeapGuard<'_> { fn drop(&mut self) { self.0.store(false, Release); } }
 
-// All mutable allocator state is protected by locked. Fault replenishment
-// uses resident physical metadata and must not reclaim through this heap
-// while the lock is held.
-unsafe impl Send for DemandHeap {}
-unsafe impl Sync for DemandHeap {}
+// All mutable allocator state is protected by locked.
+unsafe impl Send for Heap {}
+unsafe impl Sync for Heap {}
 
-impl DemandHeap {
+impl Heap {
     fn lock(&self) -> HeapGuard<'_> {
         while self.locked.compare_exchange(false, true, Acquire, Relaxed).is_err() { core::hint::spin_loop(); }
         HeapGuard(&self.locked)
     }
-    /// Refill policy must avoid recursive heap reclaim while an allocation owns it.
-    pub fn is_locked(&self) -> bool { self.locked.load(Relaxed) }
     pub const fn new() -> Self {
-        DemandHeap {
+        Heap {
             locked: AtomicBool::new(false),
-            inner: UnsafeCell::new(Inner { free: FreeTree::new(), small_enabled: false, small: [None; SMALL_CLASSES], small_count: [0; SMALL_CLASSES], mapped_end: 0, heap_end: 0, release: None,
-                retained: [EMPTY_RETAINED; RETAINED_RANGES], retained_count: 0, retained_bytes: 0, retain_limit: 0 }),
+            inner: UnsafeCell::new(Inner { free: FreeTree::new(), small_enabled: false, small: [None; SMALL_CLASSES], small_count: [0; SMALL_CLASSES] }),
         }
     }
 
     /// Retain a bounded set of rounded-size scratch allocations. Call during
     /// initialization, before this heap is shared. Cached blocks remain backed
-    /// and are returned to the coalescing allocator if its window is exhausted.
+    /// and are returned to the coalescing allocator on allocation pressure.
     pub fn enable_small_cache(&self) {
         let _guard = self.lock();
         unsafe { (*self.inner.get()).small_enabled = true; }
     }
 
-    /// Initialize the allocator over `[base, end)`. Call once, after the
-    /// platform can back accesses in that window.
-    pub fn init(&self, base: usize, end: usize) {
-        self.init_with_release(base, end, None);
-    }
-
-    /// As `init`, with an optional callback receiving a page-aligned address
-    /// and byte length on deallocation. It must not allocate or reenter this
-    /// heap, and accesses to released pages must be demand-backed again.
-    pub fn init_with_release(&self, base: usize, end: usize, release: Option<fn(usize, usize)>) {
-        self.init_with_cached_release(base, end, release, 0);
-    }
-
-    /// Retain at most `cache_bytes` of free backing for reuse. Old ranges and
-    /// excess bytes are released normally. Allocations remove their pages from
-    /// this cache before any later free can evict them. No bookkeeping allocates.
-    pub fn init_with_cached_release(&self, base: usize, end: usize, release: Option<fn(usize, usize)>, cache_bytes: usize) {
+    /// Donate resident writable storage. Regions must be disjoint from all
+    /// previous donations and remain valid for this heap's lifetime.
+    ///
+    /// # Safety
+    /// The caller exclusively owns the entire region and guarantees residency.
+    pub unsafe fn add_region(&self, base: usize, end: usize) {
+        let start = align_up(base, MIN_BLOCK_SIZE);
+        let end = end & !(MIN_BLOCK_SIZE - 1);
+        if end <= start { return; }
         let _guard = self.lock();
-        let inner = unsafe { &mut *self.inner.get() };
-        inner.free = FreeTree::new();
-        inner.small_enabled = false;
-        inner.small = [None; SMALL_CLASSES];
-        inner.small_count = [0; SMALL_CLASSES];
-        inner.heap_end = end & !(MIN_BLOCK_SIZE - 1);
-        inner.mapped_end = align_up(base, MIN_BLOCK_SIZE).min(inner.heap_end);
-        inner.release = release;
-        inner.retained_count = 0;
-        inner.retained_bytes = 0;
-        inner.retain_limit = cache_bytes & !(PAGE_SIZE - 1);
+        unsafe { (*self.inner.get()).add_free_region(start, end - start); }
     }
+
 }
 
-impl Default for DemandHeap {
+impl Default for Heap {
     fn default() -> Self { Self::new() }
 }
 
@@ -240,75 +191,7 @@ impl Inner {
     }
 
     fn free_region(&mut self, addr: usize, size: usize) {
-        let (merged, length) = self.add_free_region(addr, size);
-        if self.release.is_some() {
-            // Keep live boundaries and the surviving free-list header backed.
-            let start = align_up(merged + MIN_BLOCK_SIZE, PAGE_SIZE).max(addr & !(PAGE_SIZE - 1));
-            let end = ((merged + length) & !(PAGE_SIZE - 1))
-                .min(align_up(addr + size + MIN_BLOCK_SIZE, PAGE_SIZE));
-            if start < end { self.cache_or_release(start, end); }
-        }
-    }
-
-    fn remove_retained(&mut self, index: usize) -> Retained {
-        let range = self.retained[index];
-        self.retained_bytes -= range.end - range.start;
-        self.retained.copy_within(index + 1..self.retained_count, index);
-        self.retained_count -= 1;
-        range
-    }
-
-    fn release_range(&self, start: usize, end: usize) {
-        if start < end && let Some(release) = self.release { release(start, end - start); }
-    }
-
-    fn append_retained(&mut self, start: usize, end: usize) {
-        if start == end { return; }
-        if self.retained_count == RETAINED_RANGES {
-            self.release_range(start, end);
-        } else {
-            self.retained[self.retained_count] = Retained { start, end };
-            self.retained_count += 1;
-            self.retained_bytes += end - start;
-        }
-    }
-
-    /// Remove allocated pages AND the new remainder's free-list header page.
-    /// Only the untouched free fragments may subsequently be evicted.
-    fn forget_retained(&mut self, start: usize, end: usize) {
-        let mut i = 0;
-        while i < self.retained_count {
-            let range = self.retained[i];
-            if start >= range.end || end <= range.start { i += 1; continue; }
-            self.remove_retained(i);
-            if range.start < start { self.append_retained(range.start, start); }
-            if range.end > end { self.append_retained(end, range.end); }
-        }
-    }
-
-    fn cache_or_release(&mut self, start: usize, end: usize) {
-        if self.release.is_none() { return; }
-        let keep = (end - start).min(self.retain_limit);
-        if keep == 0 { self.release_range(start, end); return; }
-        while self.retained_bytes + keep > self.retain_limit || self.retained_count == RETAINED_RANGES {
-            let old = self.remove_retained(0);
-            self.release_range(old.start, old.end);
-        }
-        self.append_retained(start, start + keep);
-        self.release_range(start + keep, end);
-    }
-
-    /// Claim virtual address space (physical pages are demand-backed on access).
-    fn extend_heap(&mut self, min_size: usize) -> bool {
-        let pages_needed = min_size.div_ceil(PAGE_SIZE).max(4);
-        let wanted = pages_needed.saturating_mul(PAGE_SIZE);
-        let region_start = self.mapped_end;
-        self.mapped_end = self.mapped_end.saturating_add(wanted).min(self.heap_end);
-        let bytes = self.mapped_end - region_start;
-        if bytes > 0 {
-            self.add_free_region(region_start, bytes);
-        }
-        bytes >= wanted
+        self.add_free_region(addr, size);
     }
 
     /// Insert and coalesce in address order without scanning free blocks.
@@ -318,13 +201,12 @@ impl Inner {
 
     fn alloc_from_tree(&mut self, size: usize, align: usize) -> Option<*mut u8> {
         let address = self.free.allocate(size, align.max(MIN_BLOCK_SIZE))?;
-        self.forget_retained(address & !(PAGE_SIZE - 1), align_up(address + size + MIN_BLOCK_SIZE, PAGE_SIZE));
         Some(address as *mut u8)
     }
 
 }
 
-unsafe impl GlobalAlloc for DemandHeap {
+unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let _sample = ProfileSample::start(0);
         let _guard = self.lock();
@@ -340,9 +222,7 @@ unsafe impl GlobalAlloc for DemandHeap {
         }
 
         if size >= 100_000 { LARGE_ALLOCS.fetch_add(1, Relaxed); }
-        if !inner.extend_heap(size + align) {
-            inner.drain_small();
-        }
+        inner.drain_small();
 
         let ptr = inner.alloc_from_tree(size, align).unwrap_or(core::ptr::null_mut());
         if !ptr.is_null() {

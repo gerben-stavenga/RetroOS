@@ -29,7 +29,7 @@ def main():
             continue
         assert result.returncode == 1 and 'SMP PASS:' in output, output
         assert 'SMP DMA separate from heap AP resources' in output, output
-        assert 'SMP FAULT RESERVE PASS' in output, output
+        assert 'SMP RESIDENT HEAP PASS' in output, output
         assert output.count('SMP AP initialized') == 3, output
         if command:
             assert 'SMP x2APIC sender' in output, output

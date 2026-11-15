@@ -167,10 +167,6 @@ pub use x86::{rdtsc, current_apic_id};
 pub use x86::{FxState, clean_fx_template};
 pub use irq::now;
 
-/// Physical free-page count, maintained by the RAM pool in constant time.
-pub fn free_page_count() -> usize {
-    memory::free_page_count()
-}
-
 mod frames;
+pub use frames::map_heap_page;
 mod mapping;

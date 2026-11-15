@@ -133,7 +133,7 @@ pub trait X86 {
 }
 
 /// Active address spaces, mappings and physical memory.
-pub trait Memory: GuestBytes {
+pub trait Memory {
     /// Backend page-table root type stored in `Vcpu::space` — an OWNED address
     /// space, so it is **not** `Copy`: a parked `Vcpu` moves rather than
     /// duplicating the space. It is an OPAQUE owned handle — **not** a memory
@@ -226,31 +226,16 @@ pub trait Memory: GuestBytes {
     /// Free user pages in the current address space (the CLEAN call).
     fn free_user_pages(&mut self);
 
-    /// Physical-frame mechanisms for kernel-owned storage. No file/cache policy.
-    fn frame_access(&self) -> Option<crate::FrameAccess> { None }
-
     fn physical_frame_io(&self) -> Option<crate::PhysicalFrameIo> { None }
 
     fn page_supply(&self) -> Option<*mut crate::page_supply::PageSupply> { None }
 
     fn set_page_input(&mut self, _input: *mut crate::page_supply::PageInput) -> *mut crate::page_supply::PageInput { core::ptr::null_mut() }
 
-    /// Allocate zeroed, page-aligned RAM with a stable kernel view. Ownership
-    /// passes to the caller; guest aliases do not own the allocation.
-    fn alloc_shared_pages(&mut self, count: usize) -> core::ptr::NonNull<u8>;
-
-    /// Release a shared allocation after removing all guest aliases.
-    ///
+    /// Translate a page-aligned kernel address to its backing physical frame.
     /// # Safety
-    /// `base` and `count` must describe an allocation from `alloc_shared_pages`;
-    /// no guest mappings or kernel references may remain.
-    unsafe fn free_shared_pages(&mut self, base: core::ptr::NonNull<u8>, count: usize);
-
-    /// Resolve one page of a live alloc_shared_pages allocation to its frame.
-    /// This does not install a guest mapping or retain a frame reference.
-    /// # Safety
-    /// `base` must name a page in a live shared allocation from this backend.
-    unsafe fn shared_page(&mut self, base: core::ptr::NonNull<u8>) -> crate::page_entry::PhysicalFrame;
+    /// The address must refer to live mapped RAM.
+    unsafe fn physical_frame(&mut self, base: core::ptr::NonNull<u8>) -> crate::page_entry::PhysicalFrame;
 
     /// Install a privileged driver window; user mappings use replace_mapping.
     fn map_kernel_physical(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64);
@@ -265,11 +250,7 @@ pub trait Memory: GuestBytes {
         }
     }
 
-    /// Number of currently unallocated 4 KiB frames in the backing allocator.
-    fn free_page_count(&self) -> usize;
 
-    /// Total 4 KiB frames managed by that allocator, if known.
-    fn total_page_count(&self) -> Option<usize> { None }
 }
 
 /// Optional execution profiling and address-space diagnostics.
@@ -319,6 +300,10 @@ pub trait Diagnostics {
 /// be valid for *all* bit patterns (an integer or a `#[repr(C, packed)]` POD
 /// struct of integers). Reading a `bool`/`char`/fieldless-enum out of guest
 /// memory would be UB; the kernel never does.
+///
+/// These are raw transfers over the active space. The caller must supply
+/// sufficient fault backing for all pages touched. Kernel bulk transfers split
+/// at page boundaries and replenish their PageSupply between calls.
 pub trait GuestBytes {
     /// Read a `T` at `addr` (volatile, unaligned, bytewise into a local).
     fn read<T: Copy>(&self, addr: usize) -> T;

@@ -207,7 +207,7 @@ pub(super) unsafe fn start(
                     tls,
                     entry: park,
                     argument: &slots[logical] as *const _ as usize,
-                    memory: crate::kernel::phys_mm::bootstrap_supply(super::frame_refill_entry as *const () as usize),
+                    memory: crate::kernel::phys_mm::bootstrap_supply(),
                     ready: &READY[logical],
                 },
             ));

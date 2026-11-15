@@ -16,7 +16,7 @@ static BACKING: spin::Mutex<Backing> = spin::Mutex::new(Backing {
 pub(super) fn initialize<A: crate::Arch>(machine: &mut A) {
     let mut backing = BACKING.lock();
     if backing.pointer == 0 {
-        let page = machine.alloc_shared_pages(1);
+        let page = crate::kernel::phys_mm::alloc_shared_pages(1);
         backing.pointer = page.as_ptr() as usize;
         unsafe {
             core::ptr::write_bytes(page.as_ptr(), 0, 4096);

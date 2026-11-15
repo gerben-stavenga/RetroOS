@@ -1,11 +1,4 @@
-//! The kernel-facing arch call surface — the calls the kernel makes *into* the
-//! arch layer. On metal each is an `int 0x80` stub; here they are direct
-//! functions over the software MMU / address spaces. Signatures match
-//! `kernel/src/arch/calls.rs` exactly so the kernel is backend-blind.
-//!
-//! Milestone 1: the execution and memory-management calls are `unimplemented!()`
-//! stubs (filled in M2–M4). The call-number constants are kept for surface
-//! parity with the metal backend.
+//! Direct hosted implementations of the shared architecture operations.
 #![allow(unused_variables)]
 
 use crate::space::RootPageTable;
@@ -24,22 +17,17 @@ pub mod arch_call {
     #[allow(dead_code)]
     pub const HASH_PHYS_PAGE: u64 = 0x118;
     pub const SET_DEBUG_WATCH: u64 = 0x119;
-    pub const ALLOC_PHYS_CONTIG: u64 = 0x11A;
-    pub const FREE_PHYS_CONTIG: u64 = 0x11B;
     pub const ISA_UNMASK_IRQ: u64 = 0x11C;
-    pub const DMA_CHANNEL_BUF: u64 = 0x11D;
 }
 
-/// Fork the current address space into `child_root`. M4 will make this COW;
-/// for now it is a full copy (correct, just not lazy).
+/// Share the current user page tables into the caller-owned child root.
 pub fn arch_user_fork(child_root: &mut RootPageTable) {
-    let parent = crate::mmu::active_id();
-    *child_root = RootPageTable(crate::mmu::fork_copy(parent));
+    crate::paging::space_fork(child_root);
 }
 
 /// Free all user pages in the current address space.
 pub fn arch_user_clean() {
-    crate::mmu::clean();
+    crate::paging::space_clean();
     crate::engine::flush();
 }
 

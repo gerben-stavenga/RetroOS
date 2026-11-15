@@ -10,12 +10,12 @@ package(default_visibility = ["//tests:__pkg__"])
 
 rust_library(
     name = "arch-interp",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(["src/**/*.rs", "tests/mmu.rs"]),
     crate_name = "retroos_arch_interp",
     # Engine selection is per-target: exactly one of tcg/kvm.
     crate_features = ["tcg"],
     edition = "2021",
-    # abort matches //lib and //arch-abi (see //kernel:kernel).
+    # abort matches //lib and //arch-abi.
     rustc_flags = [
         "-Cpanic=abort",
         # //lib + //arch-abi are -Crelocation-model=static (non-PIC, their
@@ -33,7 +33,7 @@ rust_library(
 
 rust_library(
     name = "arch-interp-kvm",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(["src/**/*.rs", "tests/mmu.rs"]),
     crate_name = "retroos_arch_interp",
     crate_features = ["kvm"],
     edition = "2021",

@@ -12,7 +12,15 @@ use core::alloc::Layout;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 #[global_allocator]
-static ALLOC: lib::heap::DemandHeap = lib::heap::DemandHeap::new();
+static ALLOC: lib::heap::Heap = lib::heap::Heap::new();
+fn back_heap(start: usize, end: usize) {
+    for address in (start..end).step_by(4096) {
+        let table = phys_mm::alloc_resident_page().unwrap();
+        let frame = phys_mm::alloc_resident_page().unwrap();
+        if !arch::map_heap_page(address, frame, table) { phys_mm::free_phys_page(table); }
+    }
+    unsafe { ALLOC.add_region(start, end); }
+}
 static READY: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 static DONE: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
 static ROOTS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
@@ -173,7 +181,7 @@ fn allocate_core(
         trap_stack_top: trap as u32 + 16384 - 16,
         entry: secondary,
         argument: 0xabcdef,
-        memory: phys_mm::bootstrap_supply(frame_refill_entry as *const () as usize),
+        memory: phys_mm::bootstrap_supply(),
         ready,
     }
 }
@@ -266,9 +274,9 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
         paging2::physical_page(&arch::ZERO_PAGE as *const _ as usize),
     );
     install_physical_memory();
-    ALLOC.init(arch_metal::heap_base(), arch_metal::HEAP_END);
+    back_heap(arch::heap_base(), arch::heap_base() + 2 * 1024 * 1024);
     phys_mm::complete_initialization();
-    arch::memory::configure(phys_mm::ownership(), frame_refill_entry as *const () as usize);
+    arch::memory::configure(phys_mm::ownership());
     phys_mm::prepare_fault_metadata();
     let missing = if missing_test {
         Some(allocate_core(4, &MISSING_READY))
@@ -339,15 +347,12 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
         }
     }
     print("SMP DMA separate from heap AP resources\n");
-    // Demand paging creates kernel root entries after AP startup. A generation
-    // refresh must bring them into every private root before kernel access.
+    // Publish new kernel tables after AP startup, with no heap page faults.
+    let faults = unsafe { (*arch::memory::supply()).fault_pages_used };
+    back_heap(arch::heap_base() + 2 * 1024 * 1024, arch::heap_base() + 8 * 1024 * 1024);
     let shared = alloc::vec![0x5au8; 3 * 1024 * 1024];
-    unsafe {
-        let supply = &*arch::memory::supply();
-        assert!(supply.refills > 1 && supply.fault_pages_used > 64);
-        assert!(supply.fault_pages_peak <= 5);
-    }
-    print("SMP FAULT RESERVE PASS\n");
+    assert_eq!(unsafe { (*arch::memory::supply()).fault_pages_used }, faults);
+    print("SMP RESIDENT HEAP PASS\n");
     SHARED_ADDRESS.store(shared.as_ptr() as u32, Ordering::Release);
     GO.store(1, Ordering::Release);
     for id in 1..4 {
@@ -404,34 +409,6 @@ fn install_physical_memory() {
         unmap: paging2::unmap_kernel_page,
     };
     phys_mm::install_low_dma_memory(&DMA);
-    arch::memory::configure(phys_mm::ownership(), frame_refill_entry as *const () as usize);
+    arch::memory::configure(phys_mm::ownership());
     unsafe { phys_mm::replenish_supply(arch::memory::supply()); }
-}
-
-
-#[unsafe(naked)]
-unsafe extern "C" fn frame_refill_entry() -> ! {
-    core::arch::naked_asm!(
-        "lea esp, [esp - 4]", "pushfd", "pushad", "mov ebp, esp",
-        "and esp, -16", "call {refill}", "mov esp, ebp",
-        "mov [esp + 36], eax", "popad", "popfd", "ret",
-        refill = sym frame_refill_resume,
-    );
-}
-extern "C" fn frame_refill_resume() -> usize {
-    let supply = arch::memory::supply();
-    // Normal allocation touches only resident bitmap/refcount metadata.
-    unsafe {
-        let mut returned = [0; 64];
-        loop {
-            let count = arch::memory::collect_returns(&mut returned);
-            for page in &returned[..count] { phys_mm::free_phys_page(*page); }
-            if count < returned.len() { break; }
-        }
-        if ALLOC.is_locked() { phys_mm::replenish_supply_without_reclaim(supply); }
-        else { phys_mm::replenish_supply(supply); }
-        let ip = (*supply).resume_ip;
-        (*supply).resume_ip = 0;
-        ip
-    }
 }

@@ -106,7 +106,7 @@ pub(super) fn call<A: crate::Arch>(
         atom
     };
     let id = user_objects::next_id();
-    let offset = session::allocate_object(machine, id);
+    let offset = session::allocate_object(id);
     let mut data = vec![0u8; 544 + p[7] as usize];
     for (i, n) in [
         base_atom,

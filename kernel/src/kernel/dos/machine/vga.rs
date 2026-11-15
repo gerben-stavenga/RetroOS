@@ -447,7 +447,7 @@ fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine:
     rebind_scanout();
     match &mut dev.state {
         VgaState::Legacy(state) => {
-            let base = initialize_live_vram(machine, PLANES_LEN >> 12);
+            let base = initialize_live_vram(PLANES_LEN >> 12);
             unsafe { crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, PLANES_LEN >> 12); }
             // An empty image means this device already resides in LiveVram.
             // `initialize_active_address_space` and the subsequent resume hook
@@ -461,7 +461,7 @@ fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine:
         }
         VgaState::Vbe(svga) => {
             let pages = (svga.config.framebuffer_bytes as usize).div_ceil(crate::PAGE_SIZE);
-            let base = initialize_live_vram(machine, pages);
+            let base = initialize_live_vram(pages);
             unsafe {
                 crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, pages);
                 crate::kernel::memory::map_shared_pages(machine, SVGA_LFB_BASE >> 12, base, pages);
@@ -501,8 +501,8 @@ fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine:
 pub(in crate::kernel::dos) const PLANES_LEN: usize = 4 * 0x10000;
 const A0000: usize = 0xA0000;
 
-// The DOS VGA device owns the singleton, its size and its lifetime. Backends
-// only allocate/map generic shared RAM; they know nothing about this device.
+// The DOS VGA device owns the singleton, its size and its lifetime. The kernel allocates shared RAM; backends
+// only map it; they know nothing about this device.
 static LIVE_VRAM: core::sync::atomic::AtomicPtr<u8> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 static LIVE_VRAM_PAGES: core::sync::atomic::AtomicUsize =
@@ -511,19 +511,17 @@ static LIVE_VRAM_PAGES: core::sync::atomic::AtomicUsize =
 /// Commit the largest framebuffer this machine's DOS VBE boundary can expose
 /// before XMS/EMS/DPMI report free memory. A native BIOS supplies its exact
 /// curated capacity; the firmware-independent VBE uses RetroOS's own aperture.
-pub(crate) fn reserve_live_vram<A: crate::Arch>(
-    machine: &mut A,
+pub(crate) fn reserve_live_vram(
     native_modes: Option<&[crate::kernel::platform::VbeMode]>,
 ) {
     let bytes = native_modes.map_or(SVGA_LFB_MAX_BYTES, |modes| {
         modes.iter().map(|mode| mode.framebuffer_bytes as usize)
             .max().unwrap_or(PLANES_LEN)
     });
-    initialize_live_vram(machine, bytes.max(PLANES_LEN).div_ceil(crate::PAGE_SIZE));
+    initialize_live_vram(bytes.max(PLANES_LEN).div_ceil(crate::PAGE_SIZE));
 }
 
-fn initialize_live_vram<A: crate::Arch>(
-    machine: &mut A,
+fn initialize_live_vram(
     required_pages: usize,
 ) -> core::ptr::NonNull<u8> {
     use core::sync::atomic::Ordering;
@@ -534,7 +532,7 @@ fn initialize_live_vram<A: crate::Arch>(
         return base;
     }
     // Only the single-threaded kernel event loop constructs VGA owners.
-    let base = machine.alloc_shared_pages(required_pages);
+    let base = crate::kernel::phys_mm::alloc_shared_pages(required_pages);
     if let Some(old) = core::ptr::NonNull::new(LIVE_VRAM.load(Ordering::Relaxed)) {
         let old_bytes = pages * crate::PAGE_SIZE;
         unsafe { core::ptr::copy_nonoverlapping(old.as_ptr(), base.as_ptr(), old_bytes); }
@@ -821,7 +819,7 @@ fn capture_native_vbe<A: crate::Arch>(
 ) -> usize {
     let bytes = mode.framebuffer_bytes as usize;
     let pages = svga_shadow_pages(bytes);
-    let base = initialize_live_vram(machine, pages);
+    let base = initialize_live_vram(pages);
     unsafe {
         crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, pages);
         crate::kernel::memory::map_shared_pages(machine, SVGA_LFB_BASE >> 12, base, pages);
@@ -1030,7 +1028,7 @@ pub fn svga_set_curated_mode<A: crate::Arch>(
     let Some(dev) = pc.vga.emulated_mut() else { return };
     svga_leave(machine, dev);
     let pages = (mode.framebuffer_bytes as usize).div_ceil(crate::PAGE_SIZE);
-    let base = initialize_live_vram(machine, pages);
+    let base = initialize_live_vram(pages);
     unsafe {
         crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, pages);
         crate::kernel::memory::map_shared_pages(machine, SVGA_LFB_BASE >> 12, base, pages);
@@ -1210,7 +1208,7 @@ pub fn set_emulated_mode<A: crate::Arch>(
 /// in the page-backed planes. Used when a linear alias can't model the access —
 /// write mode 1 (Mode X latched copy), write modes 2/3, or a multi-plane EGA
 /// write. Latches must have been loaded by a prior `vram_read`.
-pub fn vram_write<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaState, off: u32, byte: u8) {
+pub fn vram_write<A: crate::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaState, off: u32, byte: u8) {
     if let Some(base) = live_vram_ptr_if_initialized() {
         let planes = unsafe { ::vga::memory::Memory::mapped(base.as_ptr(), PLANES_LEN) };
         vram_write_live(planes, vga, off, byte);
@@ -1273,7 +1271,7 @@ pub(in crate::kernel::dos) fn vram_write_live(planes: ::vga::memory::Memory<'_>,
 /// file/device data straight into video memory; on a real VGA those CPU stores
 /// still honour map mask/write-mode/latches, while the emulated path has the aperture
 /// unmapped so raw `machine.copy_to` would fault in the kernel.
-pub fn copy_to_guest<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut DosVideo, addr: usize, src: &[u8]) {
+pub fn copy_to_guest<A: crate::GuestBytes>(machine: &mut A, vga: &mut DosVideo, addr: usize, src: &[u8]) {
     let Some(vga) = vga.emulated_mut() else {
         machine.copy_to(addr, src);
         return;
@@ -1326,7 +1324,7 @@ pub fn copy_to_guest<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut DosVide
 
 /// Trapped planar VRAM read: load the 4 latches from the planes at A0000 offset
 /// `off` and return the byte the CPU sees (read map select, or color compare).
-pub fn vram_read<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaState, off: u32) -> u8 {
+pub fn vram_read<A: crate::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaState, off: u32) -> u8 {
     if let Some(base) = live_vram_ptr_if_initialized() {
         let planes = unsafe { ::vga::memory::Memory::mapped(base.as_ptr(), PLANES_LEN) };
         return vram_read_live(planes, vga, off);
@@ -1354,7 +1352,7 @@ fn finish_read(vga: &mut LegacyVgaState, read_plane: usize, cur: [u8; 4]) -> u8 
 }
 
 /// Read video memory through its kernel backing, including VGA latch effects.
-fn read_guest_byte<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVideo, addr: usize) -> u8 {
+fn read_guest_byte<A: crate::GuestBytes>(machine: &mut A, device: &mut DosVideo, addr: usize) -> u8 {
     if let Some(dev) = device.emulated_mut()
         && let Some(vga) = dev.state.legacy_mut()
         && let Some(range) = aperture_range(vga.cpu_aperture())
@@ -1370,7 +1368,7 @@ fn read_guest_byte<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVid
 
 /// BIOS text reads must use the VGA CPU view too: a program can leave the
 /// text aperture trapped by changing GC registers without updating the BDA.
-pub(in crate::kernel::dos) fn read_video_word<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVideo, addr: usize) -> u16 {
+pub(in crate::kernel::dos) fn read_video_word<A: crate::GuestBytes>(machine: &mut A, device: &mut DosVideo, addr: usize) -> u16 {
     u16::from_le_bytes([
         read_guest_byte(machine, device, addr),
         read_guest_byte(machine, device, addr + 1),
@@ -1380,7 +1378,7 @@ pub(in crate::kernel::dos) fn read_video_word<A: arch_abi::GuestBytes>(machine: 
 /// BIOS mode-set clearing after the new aperture has been installed. EGA/VGA
 /// planar modes were already cleared in set_emulated_mode; the other modes use their
 /// CPU-visible windows, which may be direct or trapped (notably CGA mode 6).
-pub fn bios_clear_framebuffer<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVideo, mode: u8) {
+pub fn bios_clear_framebuffer<A: crate::GuestBytes>(machine: &mut A, device: &mut DosVideo, mode: u8) {
     if matches!(mode, 0x0D..=0x12) { return; }
     let (base, len) = if mode == 0x13 { (0xA0000, 320 * 200) } else { (0xB8000, 32768) };
     let mut blank = [0u8; 512];
@@ -1409,7 +1407,7 @@ pub fn bios_clear_framebuffer<A: arch_abi::GuestBytes>(machine: &mut A, device: 
 /// adapter directly and can therefore leave the BDA stale. A native card has
 /// no shadow register file; its BIOS mode byte selects the CPU-visible legacy
 /// aperture, whose packed mode-4/6 and mode-13 layouts are standardized.
-pub fn bios_draw_glyph<A: arch_abi::GuestBytes>(
+pub fn bios_draw_glyph<A: crate::GuestBytes>(
     machine: &mut A,
     device: &mut DosVideo,
     bios_mode: u8,
@@ -1537,7 +1535,7 @@ pub fn bios_draw_glyph<A: arch_abi::GuestBytes>(
 mod bios_memory_tests {
     use super::*;
     use alloc::vec::Vec;
-    use arch_abi::GuestBytes;
+    use crate::GuestBytes;
 
     #[test]
     fn planar_bios_glyph_uses_the_live_vram_layout_without_stray_writes() {

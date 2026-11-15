@@ -44,9 +44,9 @@ impl State {
     }
 }
 pub(super) fn is_handle(handle: u32) -> bool { handle & 0xff000000 == BASE }
-fn collect<A: crate::Arch>(machine: &mut A) {
+fn collect() {
     for (address, pages) in core::mem::take(&mut *RETIRED.lock()) {
-        unsafe { machine.free_shared_pages(NonNull::new(address as *mut u8).unwrap(), pages); }
+        unsafe { crate::kernel::phys_mm::free_shared_pages(NonNull::new(address as *mut u8).unwrap(), pages); }
     }
 }
 fn open(name: Vec<u16>, flags: u32, kind: u32, create: impl FnOnce() -> Result<Value, u32>)
@@ -109,10 +109,10 @@ pub(super) fn release<A: crate::Arch>(machine: &mut A, state: &mut WindowsState)
     for (base, object) in views {
         memory::call(machine, state, Api::MemoryRelease, base, 0, 1); drop(object);
     }
-    state.threads.named.handles.clear(); collect(machine);
+    state.threads.named.handles.clear(); collect();
 }
 pub(super) fn call<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32; 6]) -> u32 {
-    let result = execute(machine, state, args); collect(machine); result.unwrap_or_else(|s|s)
+    let result = execute(machine, state, args); collect(); result.unwrap_or_else(|s|s)
 }
 fn execute<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32; 6]) -> Result<u32,u32> {
     let [op, handle, a, b, c, out] = args;
@@ -142,10 +142,10 @@ fn execute<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32
             3 => {if b > 1 {return Err(INVALID);} Value::Event {manual:b == 0,signaled:c != 0}},
             20 => {
                 let length = b.checked_add(4095).ok_or(INVALID)? & !4095;
-                if length == 0 || length as usize / 4096 >= machine.free_page_count() {return Err(0xc0000017);}
+                if length == 0 || length as usize / 4096 >= crate::kernel::phys_mm::free_page_count() {return Err(0xc0000017);}
                 if c != 2 && c != 4 { return Err(INVALID); }
                 let pages = length as usize / 4096;
-                let backing = Backing {address:machine.alloc_shared_pages(pages).as_ptr() as usize,pages};
+                let backing = Backing {address:crate::kernel::phys_mm::alloc_shared_pages(pages).as_ptr() as usize,pages};
                 Value::Section {backing,writable:c == 4}
             }, _ => unreachable!()
         }))?;

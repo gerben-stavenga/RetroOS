@@ -69,9 +69,12 @@ fn prepare_startup<A: crate::Arch>(
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
-    if let Some(supply) = machine.page_supply() { crate::kernel::memory::install_supply(supply); }
-    if let Some(access) = machine.physical_frame_io().map(crate::kernel::memory::cache_access)
-        .or_else(|| machine.frame_access()) {
+    if let Some(supply) = machine.page_supply() {
+        unsafe { (*supply).ownership = super::phys_mm::ownership(); }
+        crate::kernel::memory::install_supply(supply);
+    }
+    if let Some(access) = machine.physical_frame_io() {
+        crate::kernel::memory::install_io(access);
         crate::kernel::cache::install(access, vfs::mapping::reclaim_frame);
     }
     crate::compact_println!("{}", crate::build_info::VersionBanner);
@@ -430,7 +433,7 @@ fn select_display<A: crate::Arch>(
         .vga_capability()
         .and_then(|native| native.bios_discover_vbe(machine, bios_workspace));
     crate::kernel::platform::set_vbe_mode(vbe_mode);
-    crate::kernel::dos::reserve_live_vram(machine, bios_workspace.curated_modes());
+    crate::kernel::dos::reserve_live_vram(bios_workspace.curated_modes());
     crate::kernel::platform::set_voodoo_vbe_mode(
         bios_workspace.curated_modes(),
         !display.is_headless(),
@@ -2745,7 +2748,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             exec::BinaryFormat::MzExe => "exe",
             exec::BinaryFormat::Com => "com",
         },
-        machine.free_page_count()
+        crate::kernel::phys_mm::free_page_count()
     );
 
     // Release while the parent's address space is live. The returned token is

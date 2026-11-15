@@ -1,20 +1,11 @@
-//! Real x86 paging under the interpreter (work in progress).
+//! x86 page tables over caller-supplied storage.
 //!
-//! The interpreter has run unicorn with paging OFF — guest linear = physical,
-//! demand-mapped a page at a time via `uc_mem_map_ptr`, one unicorn region per
-//! page. For a large/streaming working set (Doom) that explodes the region/
-//! flatview machinery (`render_memory_region`, `qemu_ram_alloc_from_ptr`) into
-//! an O(n²) cost.
-//!
-//! The fix is to run RetroOS's paging *for real*, exactly as QEMU runs any
-//! paging OS: guest physical RAM is ONE region, the kernel's real x86 page
-//! tables live in that RAM, CR3/CR0.PG are set, and unicorn's softmmu walks
-//! the tables on a TLB miss. Per-page work becomes a bounded TLB fill, not a
-//! region creation.
-//!
-//! This module starts with a standalone proof that unicorn does the page-table
-//! walk with tables we build (a non-identity virtual→physical mapping), then
-//! grows into the real memory backend.
+//! Saved user roots belong to callers. One fixed live directory and long-mode
+//! mirror belong to this CPU. Mapping operations consume PageInput; user faults
+//! consume PageSupply. Neither path allocates or grows host containers.
+
+#[cfg(test)]
+use crate::test_memory;
 
 use crate::phys;
 
@@ -65,17 +56,18 @@ fn write_entry(ppage: u64, i: usize, v: u32) {
     }
 }
 
-/// Allocate and zero a fresh page-table frame; returns its ppage.
-fn alloc_table() -> u64 {
-    let ppage = phys::alloc_frames(1);
+/// Consume and zero one caller-supplied table frame.
+fn take_table() -> u64 {
+    let ppage = phys::take_input().expect("page table needs supplied input");
     unsafe { core::ptr::write_bytes(phys::frame_ptr(ppage), 0, 4096) };
     ppage
 }
 
 /// Create a new (empty) address space: a zeroed page directory frame. Returns
 /// its ppage — this is the value loaded into CR3.
+#[cfg(test)]
 pub fn new_page_dir() -> u64 {
-    alloc_table()
+    take_table()
 }
 
 /// Map virtual page `vaddr` (page-aligned) to physical frame `paddr_ppage` in
@@ -87,7 +79,7 @@ pub fn map_page(pd: u64, vaddr: u32, paddr_ppage: u64, writable: bool) {
     let pt = if pde & PRESENT != 0 {
         (pde >> 12) as u64
     } else {
-        let pt = alloc_table();
+        let pt = take_table();
         write_entry(pd, pde_i, ((pt as u32) << 12) | ENTRY_FLAGS);
         pt
     };
@@ -166,6 +158,7 @@ mod proof {
 
     #[test]
     fn unicorn_walks_our_page_tables() {
+        crate::phys::init_test_ram();
         // One physical RAM region (the "QEMU pc.ram" topology): 16 MiB at
         // physical 0, a single unicorn region.
         let mut uc = Unicorn::new(Arch::X86, Mode::MODE_32).expect("uc");
@@ -230,12 +223,13 @@ mod tables {
 
     #[test]
     fn map_walk_roundtrip() {
+        crate::phys::init_test_ram();
         let pd = new_page_dir();
         // Map a few non-identity pages, including two in the same 4 MiB region
         // (shared page table) and one far away (separate page table).
-        let f1 = phys::alloc_frames(1);
-        let f2 = phys::alloc_frames(1);
-        let f3 = phys::alloc_frames(1);
+        let f1 = test_memory::alloc_backed_pages(1);
+        let f2 = test_memory::alloc_backed_pages(1);
+        let f3 = test_memory::alloc_backed_pages(1);
         map_page(pd, 0x4000_0000, f1, true);
         map_page(pd, 0x4000_1000, f2, true); // same PDE as above
         map_page(pd, 0x8012_3000, f3, false); // different PDE, read-only
@@ -290,6 +284,7 @@ mod integration {
     /// the model the whole migration rests on.
     #[test]
     fn one_region_paging_with_demand_fault() {
+        crate::phys::init_test_ram();
         // Track #PF demand-commits via a thread-local because the intr hook
         // closure can't borrow test locals across emu_start.
         thread_local! { static PD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
@@ -309,8 +304,8 @@ mod integration {
         PD.with(|c| c.set(pd));
 
         // Lay out and map: GDT at virtual 0x1000, code at virtual 0x40_0000.
-        let gdt_frame = phys::alloc_frames(1);
-        let code_frame = phys::alloc_frames(1);
+        let gdt_frame = test_memory::alloc_backed_pages(1);
+        let code_frame = test_memory::alloc_backed_pages(1);
         map_page(pd, 0x1000, gdt_frame, true);
         map_page(pd, 0x40_0000, code_frame, true);
 
@@ -349,7 +344,7 @@ mod integration {
                 // No progress = a paging fault. Demand-commit the page at CR2.
                 let cr2 = uc.reg_read(RegisterX86::CR2).unwrap() as u32;
                 if translate(PD.with(|c| c.get()), cr2).is_none() {
-                    let frame = phys::alloc_frames(1);
+                    let frame = test_memory::alloc_backed_pages(1);
                     PD.with(|c| map_page(c.get(), cr2 & !0xFFF, frame, true));
                     FAULTS.with(|c| c.set(c.get() + 1));
                     // Flush unicorn's softmmu TLB so it re-walks the updated PTE.
@@ -371,159 +366,97 @@ mod integration {
     }
 }
 
-// ── Address-space layer ─────────────────────────────────────────────────────
-//
-// The page-table-based replacement for mmu.rs's `Space` model. An address space
-// IS a page directory (a CR3 value); these are the operations the Arch memory
-// methods drive. Built on the primitives above; the live wiring (cpu.rs
-// build/configure/execute, calls.rs) swaps onto these.
+// Saved roots and fixed live tables.
 
-use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
-
-struct Spaces {
-    /// id → page-directory ppage. id 0 is the boot space.
-    pd: BTreeMap<u32, u64>,
-    active: u32,
-    next: u32,
-}
-
+use std::cell::Cell;
+use crate::space::RootPageTable;
 thread_local! {
-    static SPACES: RefCell<Spaces> =
-        const { RefCell::new(Spaces { pd: BTreeMap::new(), active: 0, next: 0 }) };
+    static STORAGE: Cell<u64> = const { Cell::new(u64::MAX) };
 }
+/// Fixed supervisor storage: directory, SYS table, zero, SYS pages and long twin.
+pub const PAGING_PAGES: usize = 28 + 2054;
 
-/// Create the boot address space (id 0) and make it active.
-pub fn space_init() {
-    let _ = zero_frame();
-    SPACES.with(|s| {
-        let mut s = s.borrow_mut();
-        if s.pd.is_empty() {
-            let pd = new_page_dir();
-            map_kernel_windows(pd);
-            s.pd.insert(0, pd);
-            s.active = 0;
-            s.next = 1;
-        }
-    });
+/// Storage is caller-owned, contiguous, zeroed and resident for this CPU's life.
+pub unsafe fn initialize(storage: u64) {
+    assert!(storage + PAGING_PAGES as u64 <= (phys::PHYS_SIZE / 4096) as u64);
+    STORAGE.with(|s| { assert_eq!(s.replace(storage), u64::MAX); });
+    let pd = storage;
+    write_entry(pd, 1023, (((storage + 1) as u32) << 12) | PRESENT | WRITABLE);
+    for i in 0..crate::sysdesc::SYS_SIZE / 4096 {
+        let address = crate::sysdesc::SYS_BASE as u32 + (i * 4096) as u32;
+        write_entry(storage + 1, pte_index(address),
+            (((storage + 3 + i as u64) as u32) << 12) | PRESENT | WRITABLE);
+    }
+    crate::sysdesc::initialize(storage + 3);
 }
-
-/// Page-directory ppage of the active space (the CR3 value to load).
 pub fn active_pd() -> u64 {
-    SPACES.with(|s| {
-        let s = s.borrow();
-        *s.pd.get(&s.active).expect("active space missing")
-    })
+    STORAGE.with(|s| { assert_ne!(s.get(), u64::MAX, "paging not initialized"); s.get() })
 }
+fn with_active_pd<R>(f: impl FnOnce(u64) -> R) -> R { f(active_pd()) }
 
-fn with_active_pd<R>(f: impl FnOnce(u64) -> R) -> R {
-    f(active_pd())
+pub fn activate(mut incoming: RootPageTable) -> RootPageTable {
+    let pd = active_pd();
+    for (i, entry) in incoming.0.iter_mut().enumerate() {
+        let old = read_entry(pd, i);
+        write_entry(pd, i, *entry);
+        *entry = old;
+    }
+    incoming
 }
+pub fn space_translate(vaddr: u32) -> Option<u32> { translate(active_pd(), vaddr) }
 
-/// Create a fresh empty address space; returns its id.
-pub fn space_new() -> u32 {
-    SPACES.with(|s| {
-        let mut s = s.borrow_mut();
-        let id = s.next;
-        s.next += 1;
-        let pd = new_page_dir();
-        map_kernel_windows(pd);
-        s.pd.insert(id, pd);
-        id
-    })
-}
-
-/// Switch the active space.
-pub fn space_switch(id: u32) {
-    SPACES.with(|s| s.borrow_mut().active = id);
-}
-
-/// Id of the active space.
-pub fn active_id() -> u32 {
-    SPACES.with(|s| s.borrow().active)
-}
-
-
-
-
-
-
-/// Translate a guest virtual address in the active space.
-pub fn space_translate(vaddr: u32) -> Option<u32> {
-    translate(active_pd(), vaddr)
-}
-
-/// Copy-on-write fork: clone the page-table *structure* into a new space, but
-/// share every leaf data frame read-only + COW-marked (bumping its refcount)
-/// instead of copying it. A later write in either space #PFs into
-/// `space_cow_fault`, which privatises just that one frame. The parent's own
-/// PTEs are downgraded to RO+COW too, so its writes fault as well — every slice
-/// reloads CR3, so the parent re-walks the new flags on resume. Kernel windows
-/// (already mapped shared-writable into the fresh space by `space_new`) are left
-/// untouched: the CPL0 trampoline writes its iret frame there.
-pub fn space_fork(src: u32) -> u32 {
-    let src_pd = SPACES.with(|s| *s.borrow().pd.get(&src).expect("fork src"));
-    let dst = space_new();
-    let dst_pd = SPACES.with(|s| *s.borrow().pd.get(&dst).unwrap());
-    for pde_i in 0..1024usize {
-        let pde = read_entry(src_pd, pde_i);
-        if pde & PRESENT == 0 {
-            continue;
-        }
-        let src_pt = (pde >> 12) as u64;
-        for pte_i in 0..1024usize {
-            let pte = read_entry(src_pt, pte_i);
-            if pte == 0 {
-                continue;
-            }
-            let v = ((pde_i << 22) | (pte_i << 12)) as u32;
-            // Kernel windows are pre-mapped (shared, writable) into the fresh
-            // space — never share-COW them (the trampoline writes there).
-            if translate(dst_pd, v).is_some() {
-                continue;
-            }
-            let frame = (pte >> 12) as u64;
-            if pte & PRESENT == 0 || pte & SHARED != 0 {
-                // Preserve trap markers as well as shared RAM: an inactive
-                // planar VGA must not turn into anonymous RAM after fork.
-                map_page(dst_pd, v, frame, pte & WRITABLE != 0);
-                let pt = u64::from(read_entry(dst_pd, pde_index(v)) >> 12);
-                write_entry(pt, pte_i, pte);
-            } else if pte & WRITABLE != 0 || pte & COW != 0 {
-                // Writable, OR already a COW page from an earlier fork (RO but
-                // privately writable): both sides go RO+COW over the one shared
-                // frame. Marking src is idempotent when it's already COW — the
-                // point is to never demote a COW page to plain-RO, or a
-                // grandchild's legitimate write would fault unresolved.
-                let incoming = (pte & !WRITABLE) | COW;
-                write_entry(src_pt, pte_i, incoming);
-                map_page_cow(dst_pd, v, frame);
-                let child_pt = u64::from(read_entry(dst_pd, pde_index(v)) >> 12);
-                write_entry(child_pt, pte_i, incoming);
-            } else {
-                // Genuinely read-only (code/rodata): share as-is, no COW needed.
-                map_page(dst_pd, v, frame, false);
-                let child_pt = u64::from(read_entry(dst_pd, pde_index(v)) >> 12);
-                write_entry(child_pt, pte_i, pte);
-            }
-            if owns_mapping(pte) { phys::inc_ref(frame); }
+/// Share table storage. Leaf references belong to the tables, so retaining a
+/// table does not walk its leaves. Detachment establishes new leaf references.
+pub fn space_fork(child: &mut RootPageTable) {
+    assert!(child.0.iter().all(|&e| e == 0));
+    let pd = active_pd();
+    for (i, entry) in child.0.iter_mut().enumerate() {
+        let raw = read_entry(pd, i);
+        if raw & PRESENT != 0 {
+            phys::retain(u64::from(raw >> 12));
+            *entry = (raw & !WRITABLE) | COW;
+            write_entry(pd, i, *entry);
         }
     }
-    dst
 }
 
-/// Map `vaddr` to `frame` as a copy-on-write page: PRESENT|USER, W=0, COW=1.
-fn map_page_cow(pd: u64, vaddr: u32, frame: u64) {
-    let pde_i = pde_index(vaddr);
-    let pde = read_entry(pd, pde_i);
-    let pt = if pde & PRESENT != 0 {
-        (pde >> 12) as u64
-    } else {
-        let pt = alloc_table();
-        write_entry(pd, pde_i, ((pt as u32) << 12) | ENTRY_FLAGS);
-        pt
-    };
-    write_entry(pt, pte_index(vaddr), ((frame as u32) << 12) | PRESENT | USER | COW);
+fn private_table(pd: u64, index: usize, fault: bool) -> Option<u64> {
+    let pde = read_entry(pd, index);
+    if pde & PRESENT != 0 && pde & COW == 0 { return Some(u64::from(pde >> 12)); }
+    let old = u64::from(pde >> 12);
+    let fresh = if fault { phys::take_fault() } else { phys::take_input() }?;
+    if pde & PRESENT != 0 {
+        for i in 0..1024 {
+            let raw = read_entry(old, i);
+            let borrowed = raw & TYPED != 0 && raw & SHARED != 0;
+            let cow = raw & PRESENT != 0 && raw & WRITABLE != 0 && !borrowed;
+            let entry = if cow { (raw & !WRITABLE) | COW } else { raw };
+            if owns_mapping(entry) { phys::retain(u64::from(entry >> 12)); }
+            write_entry(fresh, i, entry);
+        }
+        release_table(old);
+    }
+    write_entry(pd, index, ((fresh as u32) << 12) | ENTRY_FLAGS);
+    Some(fresh)
+}
+pub fn private_tables() -> i32 {
+    let pd = active_pd();
+    for i in 0..768 {
+        if read_entry(pd, i) & COW != 0 && private_table(pd, i, false).is_none() { return -11; }
+    }
+    0
+}
+fn release_table(table: u64) {
+    if !phys::shared(table) {
+        for i in 0..1024 { release_mapping(read_entry(table, i)); }
+    }
+    phys::release(table);
+}
+pub fn destroy(root: &mut RootPageTable) {
+    for entry in &mut root.0 {
+        if *entry & PRESENT != 0 { release_table(u64::from(*entry >> 12)); }
+        *entry = 0;
+    }
 }
 
 /// Resolve a write #PF on a present COW page in the active space: privatise the
@@ -531,92 +464,37 @@ fn map_page_cow(pd: u64, vaddr: u32, frame: u64) {
 /// and clear the COW mark. Returns false if `vaddr` isn't a COW page — a
 /// genuine read-only/illegal write the kernel must surface as a fault.
 pub fn space_cow_fault(vaddr: u32) -> bool {
-    with_active_pd(|pd| {
-        let pde = read_entry(pd, pde_index(vaddr));
-        if pde & PRESENT == 0 {
-            return false;
-        }
-        let pt = (pde >> 12) as u64;
-        let pte_i = pte_index(vaddr);
-        let pte = read_entry(pt, pte_i);
-        if pte & PRESENT == 0 || pte & COW == 0 {
-            return false;
-        }
-        let frame = (pte >> 12) as u64;
-        let borrowed = pte & TYPED != 0 && pte & SHARED != 0;
-        if borrowed || phys::is_shared(frame) {
-            // Still aliased by another space — copy into a private frame.
-            let new = phys::alloc_frames(1);
-            unsafe {
-                core::ptr::copy_nonoverlapping(phys::frame_ptr(frame), phys::frame_ptr(new), 4096);
-            }
-            write_entry(pt, pte_i, ((new as u32) << 12) | ((pte & 0xfff & !COW & !SHARED) | WRITABLE));
-            if !borrowed { phys::free_frames(frame, 1); }
-        } else {
-            // Sole owner — no copy; just re-enable write and clear COW.
-            write_entry(pt, pte_i, (pte & !COW) | WRITABLE);
-        }
-        true
-    })
+    if !phys::can_fault() { return false; }
+    let pd = active_pd();
+    let pde = read_entry(pd, pde_index(vaddr));
+    if pde & PRESENT == 0 { return false; }
+    let old = pte_raw(pd, vaddr);
+    if old & PRESENT == 0 || pde & COW == 0 && old & COW == 0 { return false; }
+    // A shared table has hardware W=0; detach even when the leaf itself is RO.
+    let pt = private_table(pd, pde_index(vaddr), true).unwrap();
+    let pte = read_entry(pt, pte_index(vaddr));
+    if pte & WRITABLE != 0 { return true; }
+    if pte & COW == 0 { return false; }
+    let frame = u64::from(pte >> 12);
+    let borrowed = pte & TYPED != 0 && pte & SHARED != 0;
+    if borrowed || phys::shared(frame) {
+        let new = phys::take_fault().unwrap();
+        unsafe { core::ptr::copy_nonoverlapping(phys::frame_ptr(frame), phys::frame_ptr(new), 4096); }
+        write_entry(pt, pte_index(vaddr), ((new as u32) << 12) | ((pte & 0xfff & !COW & !SHARED) | WRITABLE));
+        if !borrowed { phys::release(frame); }
+    } else {
+        write_entry(pt, pte_index(vaddr), (pte & !COW) | WRITABLE);
+    }
+    true
 }
 
-// ── Kernel windows: mappings every address space must carry ──────────────────
-//
-// The interpreter's PM/VM86 entry runs a CPL0 `iretd` trampoline through real
-// descriptor tables (GDT/LDT) that live in guest physical RAM. Those tables and
-// the trampoline are reachable only if mapped in the page directory unicorn
-// walks — so every space gets the same high "system" window (and any future
-// kernel-side window) at a fixed linear address backed by globally-shared
-// frames. The client never touches it; it exists for the segment loads + iret.
-
-thread_local! {
-    static KERNEL_WINDOWS: RefCell<Vec<(u32, u64, usize)>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Register a linear→physical window (page-granular) that every address space —
-/// existing and future — must map. `vaddr`/`count` in pages, `ppage` the shared
-/// starting frame. Idempotent enough for one-time setup at backend init.
-pub fn register_kernel_window(vpage: usize, ppage: u64, count: usize) {
-    KERNEL_WINDOWS.with(|w| w.borrow_mut().push((vpage as u32, ppage, count)));
-    // Retro-map into every space that already exists (the boot space).
-    SPACES.with(|s| {
-        for &pd in s.borrow().pd.values() {
-            for i in 0..count {
-                map_page(pd, ((vpage + i) * 4096) as u32, ppage + i as u64, true);
-            }
-        }
-    });
-}
-
-fn map_kernel_windows(pd: u64) {
-    KERNEL_WINDOWS.with(|w| {
-        for &(vpage, ppage, count) in w.borrow().iter() {
-            for i in 0..count {
-                map_page(pd, (vpage as usize + i) as u32 * 4096, ppage + i as u64, true);
-            }
-        }
-    });
-}
-
-/// Kernel-side resolve: translate `vaddr` in the active space to a host pointer,
-/// demand-committing a fresh zero frame if the page is absent. Mirrors the old
-/// `mmu::ensure_committed` (the metal kernel's ring-1 access faults the page in
-/// transparently); the interpreter "kernel" is host code, so it does the commit.
+/// Resolve user bytes through the active directory, consuming only donated
+/// fault pages when necessary. Callers bound transfers and replenish between them.
 pub fn space_resolve(vaddr: u32) -> *mut u8 {
     resolve_in(active_pd(), vaddr)
 }
 
-/// Resolve `vaddr` to a host pointer through a SPECIFIC page directory `pd`
-/// (a ppage, i.e. CR3>>12), not the ambient active space. Demand-commits an
-/// absent page exactly like `space_resolve`.
-///
-/// The sensitive-instruction monitor must read/write the *interpreted thread's*
-/// memory regardless of which space is globally active: a windowed run's
-/// render/focus path can move `active` between the slice and the post-slice
-/// monitor decode, so binding to the running CR3 (not `active_pd()`) is what
-/// keeps the IVT/stack/code reads pointing at the right space. Reproducer:
-/// windowed DN #GP'ing on its first INT 21h read a stale space's IVT → wild
-/// `0xFFFFFFFE` jump; headless (single space) never diverged.
+/// Resolve bytes through the executing CPU's directory.
 pub fn resolve_in(pd: u64, vaddr: u32) -> *mut u8 {
     let raw = pte_raw(pd, vaddr);
     assert!(raw & PRESENT != 0 || raw & TYPED == 0 && raw != ABSENT,
@@ -624,8 +502,10 @@ pub fn resolve_in(pd: u64, vaddr: u32) -> *mut u8 {
     let pa = match translate(pd, vaddr) {
         Some(pa) => pa,
         None => {
-            let frame = phys::alloc_frames(1);
-            map_page(pd, vaddr & !0xFFF, frame, true);
+            assert!(vaddr < 0xc0000000 && phys::can_fault(), "guest byte access needs supplied pages");
+            let table = private_table(pd, pde_index(vaddr), true).unwrap();
+            let frame = phys::take_fault().unwrap();
+            write_entry(table, pte_index(vaddr), ((frame as u32) << 12) | ENTRY_FLAGS);
             (frame as u32) << 12 | (vaddr & 0xFFF)
         }
     };
@@ -634,11 +514,13 @@ pub fn resolve_in(pd: u64, vaddr: u32) -> *mut u8 {
 
 /// Kernel writes to typed mappings obey the same leaf permissions as guests.
 pub(crate) fn space_resolve_write(vaddr: u32) -> *mut u8 {
-    let raw = pte_raw(active_pd(), vaddr);
-    if raw & TYPED != 0 {
-        if raw & COW != 0 && raw & PRESENT != 0 { assert!(space_cow_fault(vaddr)); }
-        assert!(pte_raw(active_pd(), vaddr) & (PRESENT | WRITABLE) == PRESENT | WRITABLE,
-            "guest write to a protected mapping");
+    let pd = active_pd();
+    let raw = pte_raw(pd, vaddr);
+    if raw & PRESENT != 0 {
+        if raw & COW != 0 || read_entry(pd, pde_index(vaddr)) & COW != 0 {
+            assert!(space_cow_fault(vaddr), "guest write to protected mapping");
+        }
+        assert!(pte_raw(pd, vaddr) & WRITABLE != 0, "guest write to protected mapping");
     }
     space_resolve(vaddr)
 }
@@ -661,8 +543,10 @@ pub fn space_demand(vaddr: u32) -> bool {
     if vaddr < NULL_GUARD || (vaddr as usize) >= 0xC000_0000 {
         return false;
     }
-    let frame = phys::alloc_frames(1);
-    map_page(pd, page, frame, true);
+    if !phys::can_fault() { return false; }
+    let table = private_table(pd, pde_index(page), true).unwrap();
+    let frame = phys::take_fault().unwrap();
+    write_entry(table, pte_index(page), ((frame as u32) << 12) | ENTRY_FLAGS);
     true
 }
 
@@ -673,89 +557,17 @@ pub fn space_demand(vaddr: u32) -> bool {
 /// Free every user page in the active space (arch CLEAN): drop the PTEs and
 /// return the frames to the allocator. Kernel windows (high) are left intact.
 pub fn space_clean() {
-    with_active_pd(free_user_frames);
+    let mut old = activate(RootPageTable::empty());
+    destroy(&mut old);
 }
 
-fn free_user_frames(pd: u64) {
-    for pde_i in 0..(0xC000_0000usize >> 22) {
-        let pde = read_entry(pd, pde_i);
-        if pde & PRESENT == 0 {
-            continue;
-        }
-        let pt = (pde >> 12) as u64;
-        for pte_i in 0..1024usize {
-            let pte = read_entry(pt, pte_i);
-            release_mapping(pte);
-            write_entry(pt, pte_i, 0);
-        }
-    }
-}
-
-/// Destroy a space entirely (reaped thread): free its user frames and forget it.
-/// Page-table frames and the PD are leaked back to the bump allocator's reuse
-/// only for user frames; id 0 (boot space) is permanent.
-pub fn space_destroy(id: u32) {
-    if id == 0 {
-        return;
-    }
-    let pd = SPACES.with(|s| s.borrow().pd.get(&id).copied());
-    if let Some(pd) = pd {
-        free_user_frames(pd);
-    }
-    SPACES.with(|s| {
-        let mut s = s.borrow_mut();
-        if s.active == id {
-            s.active = 0;
-        }
-        s.pd.remove(&id);
-    });
-    LONG_TWINS.with(|t| {
-        if let Some(tw) = t.borrow_mut().remove(&id) {
-            for f in tw.frames {
-                phys::free_frames(f, 1);
-            }
-        }
-    });
-}
-
-// ── Long-mode (4-level) twin ─────────────────────────────────────────────────
-//
-// 64-bit user slices run with PAE 4-level tables; the 2-level tree above stays
-// the single source of truth for every mutation (map/unmap/COW/fork/clean).
-// Rather than keeping a second tree in lockstep at each of those sites, the
-// twin is derived lazily: `write_entry` (the one funnel all mutations pass
-// through) bumps a generation, and a 64-bit slice entry calls `active_pml4()`,
-// which rebuilds the active space's 4-level tree iff the generation moved
-// since the last build. A 32-bit leaf PTE zero-extends into a 64-bit PTE
-// unchanged — PRESENT/W/USER/PCD/COW sit at the same bit positions, the frame
-// stays in bits 31:12, and bit 63 (NX) stays 0 — so the twin is a bit-faithful
-// mirror of the source tree, software markers included. Not-present markers
-// (the PCD MMIO trap, COW leftovers) mirror too: the hardware walk #PFs and
-// the kernel resolves against the 2-level tree as always, which bumps the
-// generation and refreshes the twin on the next 64-bit entry.
-
-/// Intermediate-level (PML4E/PDPTE/PDE) flags: present | writable | user.
-// dead_code: nothing enters a 64-bit slice yet — the Mode64 slice wiring is
-// the hosted-64-bit project's next milestone; the twin builder stays
-// compiling until it lands (same allowance on the items below).
-#[allow(dead_code)]
+// Long-mode hardware tables are a bounded mirror of the legacy source tree.
+// A generation change rebuilds the one caller-supplied workspace for this CPU.
 const ENTRY_FLAGS64: u64 = ENTRY_FLAGS as u64;
-
-#[allow(dead_code)]
-struct LongTwin {
-    /// PML4 root frame (ppage) — `frame_phys(pml4)` is the long-mode CR3.
-    pml4: u64,
-    /// Every table frame of the twin (PML4 included), for wholesale free.
-    frames: Vec<u64>,
-    /// `LONG_GEN` at build time; any later 2-level write invalidates. Coarse
-    /// (a write in space A invalidates B's twin too) but safe, and rebuilds
-    /// are a handful of tables for a typical space.
-    built_at: u64,
-}
 
 thread_local! {
     static LONG_GEN: Cell<u64> = const { Cell::new(1) };
-    static LONG_TWINS: RefCell<BTreeMap<u32, LongTwin>> = const { RefCell::new(BTreeMap::new()) };
+    static LONG_BUILT: Cell<u64> = const { Cell::new(0) };
 }
 
 #[allow(dead_code)]
@@ -771,12 +583,14 @@ fn write_entry64(ppage: u64, i: usize, v: u64) {
 /// all below 4 GiB, so the shape is PML4[0] → one PDPT → up to 4 PDs → PTs;
 /// each 32-bit page table (4 MiB reach) feeds two 64-bit ones (2 MiB reach).
 #[allow(dead_code)]
-fn build_long_twin(pd: u64) -> (u64, Vec<u64>) {
-    let mut frames = Vec::new();
-    let fresh = |frames: &mut Vec<u64>| {
-        let f = alloc_table();
-        frames.push(f);
-        f
+fn build_long_twin(pd: u64) -> u64 {
+    let mut frames = 0usize;
+    let fresh = |used: &mut usize| {
+        assert!(*used < 2054);
+        let frame = active_pd() + 28 + *used as u64;
+        *used += 1;
+        unsafe { core::ptr::write_bytes(phys::frame_ptr(frame), 0, 4096); }
+        frame
     };
     let pml4 = fresh(&mut frames);
     let pdpt = fresh(&mut frames);
@@ -812,35 +626,24 @@ fn build_long_twin(pd: u64) -> (u64, Vec<u64>) {
                 write_entry64(pd64, pd_i, (f << 12) | ENTRY_FLAGS64);
                 f
             };
-            write_entry64(pt64, pt_i, pte as u64);
+            write_entry64(pt64, pt_i, (if pde & COW != 0 { pte & !WRITABLE } else { pte }) as u64);
         }
     }
-    (pml4, frames)
+    pml4
 }
 
 /// PML4 root (ppage — `frame_phys` of it is the CR3 value) for a long-mode
 /// slice of the ACTIVE space: the lazily (re)built 4-level twin.
 #[allow(dead_code)]
 pub fn active_pml4() -> u64 {
-    let id = active_id();
-    let pd = active_pd();
-    let gen = LONG_GEN.with(|g| g.get());
-    LONG_TWINS.with(|t| {
-        let mut t = t.borrow_mut();
-        if let Some(tw) = t.get(&id) {
-            if tw.built_at == gen {
-                return tw.pml4;
-            }
+    let generation = LONG_GEN.with(Cell::get);
+    LONG_BUILT.with(|built| {
+        if built.get() != generation {
+            build_long_twin(active_pd());
+            built.set(generation);
         }
-        if let Some(old) = t.remove(&id) {
-            for f in old.frames {
-                phys::free_frames(f, 1);
-            }
-        }
-        let (pml4, frames) = build_long_twin(pd);
-        t.insert(id, LongTwin { pml4, frames, built_at: gen });
-        pml4
-    })
+    });
+    active_pd() + 28
 }
 
 /// 4-level software walk (tests + diagnostics): virtual → physical through a
@@ -867,36 +670,74 @@ mod space_ops {
     use arch_abi::{UserPage, page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFrame}};
 
     #[test]
+    fn exhausted_fault_reservoir_returns_before_the_store_and_resumes() {
+        use arch_abi::{Arch as _, GuestBytes as _, KernelEvent, Regs};
+        crate::phys::init_test_ram();
+        let mut machine = crate::backend::Interp;
+        let code = 0x10000;
+        // mov eax,20000000; mov ecx,96; store; add eax,4096; dec ecx; jnz store; int 80
+        let program = [
+            0xb8,0,0,0,0x20, 0xb9,96,0,0,0,
+            0xc7,0,0x78,0x56,0x34,0x12, 0x05,0,0x10,0,0,
+            0x49,0x75,0xf2, 0xcd,0x80,
+        ];
+        machine.copy_to(code, &program);
+        let mut regs = Regs::empty();
+        regs.init_user_process(code as u32, 0x80000);
+        let mut exhausted = false;
+        let mut finished = false;
+        for _ in 0..1000 {
+            let event = machine.execute(&mut regs, &arch_abi::IoPolicy::default(), std::time::Duration::from_millis(10));
+            match event {
+                KernelEvent::Irq => {
+                    if !phys::can_fault() {
+                        exhausted = true;
+                        assert_eq!(regs.frame.rip, code as u64 + 10);
+                        assert!(space_translate(regs.rax as u32).is_none(), "uncompleted store must remain unmapped");
+                        unsafe { test_memory::replenish_supply(phys::supply()); }
+                    }
+                }
+                KernelEvent::SoftInt(0x80) | KernelEvent::Syscall => { finished = true; break; }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert!(exhausted && finished);
+        assert_eq!(machine.read::<u32>(0x20000000 + 95 * 4096), 0x12345678);
+    }
+
+    #[test]
     fn typed_fault_states_do_not_demand_allocate() {
-        space_init(); space_switch(space_new());
+        crate::phys::init_test_ram();
+
         let page = UserPage::new(0x41000000).unwrap();
         for entry in [PageEntry::Absent, PageEntry::Intercepted] {
             replace_user_mapping(page, entry).unwrap();
             assert!(!space_demand(page.address() as u32));
             assert_eq!(read_mapping(page).unwrap(), entry);
         }
-        let frame = phys::alloc_frames(1);
+        let frame = test_memory::alloc_backed_pages(1);
         let mapping = Mapping { backing: Backing::Owned(PhysicalFrame::new(frame).unwrap()),
             attributes: Attributes::EXECUTABLE | Attributes::CACHE_DISABLE };
         replace_user_mapping(page, PageEntry::NoAccess(mapping)).unwrap();
-        assert!(phys::is_shared(frame));
+        assert!(test_memory::is_shared(frame));
         assert!(!space_demand(page.address() as u32));
         space_clean();
-        assert!(!phys::is_shared(frame));
-        phys::free_frames(frame, 1);
+        assert!(!test_memory::is_shared(frame));
+        test_memory::free_phys_page(frame);
     }
 
     #[test]
     fn cached_frame_private_protection_and_cow_preserve_backing_owner() {
-        space_init(); let parent = space_new(); space_switch(parent);
-        let frame = phys::alloc_frames(1);
+        crate::phys::init_test_ram();
+
+        let frame = test_memory::alloc_backed_pages(1);
         unsafe { *phys::frame_ptr(frame) = 0x42; }
         replace_user_mapping(UserPage::new(0x41000000).unwrap(), PageEntry::ReadOnly(Mapping {
             backing: Backing::Owned(PhysicalFrame::new(frame).unwrap()), attributes: Attributes::EXECUTABLE,
         })).unwrap();
         assert_eq!(space_translate(0x41000000), Some((frame * 4096) as u32));
         assert!(!space_cow_fault(0x41000000), "read-only protection denies writes");
-        let child = space_fork(parent); space_switch(child);
+        let mut child = RootPageTable::empty(); space_fork(&mut child); let parent = activate(child);
         assert!(!space_cow_fault(0x41000000));
         test_protect(0x41000, 1, true);
         assert!(space_cow_fault(0x41000000));
@@ -904,16 +745,14 @@ mod space_ops {
         assert_ne!(u64::from(copy >> 12), frame);
         unsafe { *phys::frame_ptr(u64::from(copy >> 12)) = 0x77; }
         assert_eq!(unsafe { *phys::frame_ptr(frame) }, 0x42);
-        space_clean(); space_switch(parent); space_clean();
-        assert!(!phys::is_shared(frame)); phys::free_frames(frame, 1);
+        space_clean(); activate(parent); space_clean();
+        assert!(!test_memory::is_shared(frame)); test_memory::free_phys_page(frame);
     }
 
     #[test]
     fn shared_kernel_ram_aliases_survive_fork_and_guest_teardown() {
-        space_init();
-        let parent = space_new();
-        space_switch(parent);
-        let backing = phys::alloc_frames(64);
+        crate::phys::init_test_ram();
+        let backing = test_memory::alloc_backed_pages(64);
         for i in 0..64 {
             replace_user_mapping(UserPage::new(0x41000000 + i * 4096).unwrap(), PageEntry::Writable(Mapping {
                 backing: Backing::Borrowed(PhysicalFrame::new(backing + i).unwrap()), attributes: Attributes::EXECUTABLE,
@@ -925,14 +764,13 @@ mod space_ops {
         }
         unsafe { *phys::frame_ptr(backing).add(23) = 0x31; }
         assert_eq!(space_translate(0xA0017), Some((backing as u32 * 4096) + 23));
-        let child = space_fork(parent);
-        space_switch(child);
+        let mut child = RootPageTable::empty(); space_fork(&mut child); let parent = activate(child);
         assert_eq!(pte_raw(active_pd(), 0xB0000), CACHE_DISABLE);
         assert!(!space_demand(0xB0000), "fork must preserve the planar trap");
         for addr in [0xA0017, 0x4100_0017, 0x4103_F000] {
             assert_ne!(pte_raw(active_pd(), addr) & WRITABLE, 0);
             assert_ne!(pte_raw(active_pd(), addr) & SHARED, 0);
-            assert!(!space_cow_fault(addr));
+            let _ = space_cow_fault(addr); // detach the table; borrowed leaf stays writable
         }
         let guest = space_translate(0xA0017).unwrap();
         unsafe { *phys::frame_ptr(u64::from(guest >> 12)).add((guest & 4095) as usize) = 0x72; }
@@ -942,21 +780,19 @@ mod space_ops {
         test_ram(0xA0, 8);
         test_remove(0xA8, 8);
         space_clean();
-        space_switch(parent);
+        activate(parent);
         assert_eq!(space_translate(0xA0017), Some(guest));
         space_clean();
         for page in backing..backing + 64 {
-            assert!(!phys::is_shared(page), "only the kernel reference remains");
+            assert!(!test_memory::is_shared(page), "only the kernel reference remains");
         }
         assert_eq!(unsafe { *phys::frame_ptr(backing).add(23) }, 0x72);
-        phys::free_frames(backing, 64);
+        test_memory::free_phys_contig(backing, 64);
     }
 
     #[test]
     fn long_twin_mirrors_and_tracks_changes() {
-        space_init();
-        let s = space_new();
-        space_switch(s);
+        crate::phys::init_test_ram();
         test_ram(0x10, 2);
         let pml4 = active_pml4();
         assert_eq!(
@@ -984,15 +820,12 @@ mod space_ops {
 
     #[test]
     fn map_fork_translate() {
-        space_init();
-        let s = space_new();
-        space_switch(s);
+        crate::phys::init_test_ram();
         test_ram(0x10, 2); // vpages 0x10,0x11
         let p = space_translate(0x10_000).expect("mapped");
         // Write a marker through the frame and confirm fork copies it.
         unsafe { *phys::frame_ptr((p >> 12) as u64) = 0x7E };
-        let child = space_fork(s);
-        space_switch(child);
+        let mut child = RootPageTable::empty(); space_fork(&mut child); let _parent = activate(child);
         // Fork is COW: the child shares the parent's frame read-only until a
         // write; the first write privatises through the COW fault path.
         let shared = space_translate(0x10_000).expect("child mapped");
@@ -1035,13 +868,14 @@ mod vm86 {
     /// per-thread physical frame — NOT a shared physical address.
     #[test]
     fn vm86_runs_paged() {
+        crate::phys::init_test_ram();
         let mut uc = Unicorn::new(Arch::X86, Mode::MODE_32).expect("uc");
         let base = phys::frame_ptr(0);
         unsafe { uc.mem_map_ptr(0, 16<<20, Prot::ALL, base as *mut core::ffi::c_void).unwrap(); }
 
         let pd = new_page_dir();
         // GDT identity-mapped low so the CPL0 trampoline can load flat selectors.
-        let gdt = phys::alloc_frames(1);
+        let gdt = test_memory::alloc_backed_pages(1);
         map_page(pd, frame_phys(gdt) & !0xFFF, gdt, true); // identity
         wphys(frame_phys(gdt), &[0u8;8]);
         wphys(frame_phys(gdt)+8, &flat_desc(0x9A));   // sel 0x08: ring0 code
@@ -1051,24 +885,24 @@ mod vm86 {
         // VM86 frame below and enters the v86 task. This mirrors configure_pm:
         // VM86 is entered by IRET into a frame whose EFLAGS image has VM=1 — the
         // only architecturally valid entry, and how a real kernel does it.
-        let tramp = phys::alloc_frames(1);
+        let tramp = test_memory::alloc_backed_pages(1);
         let tramp_va = 0x2000u32;
         map_page(pd, tramp_va, tramp, true);
         wphys(frame_phys(tramp), &[0xCFu8]); // iretd
 
         // Trampoline stack page (identity): holds the 32-bit VM86 iret frame.
-        let stk = phys::alloc_frames(1);
+        let stk = test_memory::alloc_backed_pages(1);
         let stk_va = 0x3000u32;
         map_page(pd, stk_va, stk, true);
 
         // VM86 code lives at linear 0x10000 (CS=0x1000, IP=0) but is mapped to a
         // NON-identity physical frame — proving the translation, not a coincidence.
-        let code_frame = phys::alloc_frames(1);
+        let code_frame = test_memory::alloc_backed_pages(1);
         map_page(pd, 0x10000, code_frame, true);
         // mov ax, 0x1234 (real-mode/16-bit) ; jmp $   →  B8 34 12  EB FE
         wphys(frame_phys(code_frame), &[0xB8, 0x34, 0x12, 0xEB, 0xFE]);
         // A VM86 stack so the v86 task has somewhere to point SS:SP (linear 0x1FFF0).
-        let v86stk = phys::alloc_frames(1);
+        let v86stk = test_memory::alloc_backed_pages(1);
         map_page(pd, 0x1F000, v86stk, true);
 
         // VM86 iret frame (32-bit iretd from CPL0 to VM86 pops 9 dwords):
@@ -1143,9 +977,7 @@ mod proof64 {
     /// and TCG Mode64 slice paths both stand on.
     #[test]
     fn unicorn_walks_the_long_mode_twin() {
-        space_init();
-        let s = space_new();
-        space_switch(s);
+        crate::phys::init_test_ram();
 
         // Code page at virtual 0x40_0000, backed by whatever frame the space
         // allocator picked (non-identity by construction).
@@ -1201,18 +1033,20 @@ fn owns_mapping(entry: u32) -> bool {
         && !(entry & TYPED != 0 && entry & SHARED != 0)
 }
 fn release_mapping(entry: u32) {
-    if owns_mapping(entry) { phys::free_frames(u64::from(entry >> 12), 1); }
+    if owns_mapping(entry) { phys::release(u64::from(entry >> 12)); }
 }
-fn zero_frame() -> u64 {
-    static ZERO: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *ZERO.get_or_init(|| phys::alloc_frames(1))
-}
+fn zero_frame() -> u64 { active_pd() + 2 }
 
 pub(crate) fn read_mapping(page: arch_abi::UserPage) -> Result<arch_abi::page_entry::PageEntry, arch_abi::MappingError> {
     use arch_abi::{MappingError, page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFrame, X86PteFormat}};
     if page.address() >= 0xc000_0000 { return Err(MappingError::Unsupported); }
     let address = page.address() as u32;
-    let raw = pte_raw(active_pd(), address);
+    let mut raw = pte_raw(active_pd(), address);
+    if read_entry(active_pd(), pde_index(address)) & COW != 0
+        && raw & PRESENT != 0 && raw & WRITABLE != 0
+        && !(raw & TYPED != 0 && raw & SHARED != 0) {
+        raw = (raw & !WRITABLE) | COW;
+    }
     if raw & TYPED != 0 {
         let encoded = if raw & PRESENT != 0 { raw & !TYPED } else { raw };
         return Ok(PageEntry::decode(u64::from(encoded), X86PteFormat::Legacy32, page.address())?);
@@ -1248,17 +1082,15 @@ pub(crate) fn replace_user_mapping(page: arch_abi::UserPage, entry: arch_abi::pa
     };
     let address = page.address() as u32;
     with_active_pd(|pd| {
-        let pde = read_entry(pd, pde_index(address));
-        let pt = if pde & PRESENT != 0 { u64::from(pde >> 12) } else {
-            let pt = alloc_table(); write_entry(pd, pde_index(address), ((pt as u32) << 12) | ENTRY_FLAGS); pt
-        };
+        let pt = private_table(pd, pde_index(address), false).ok_or(MappingError::NeedPages)?;
         if let Some(m) = mapping {
-            if let Backing::Owned(frame) = m.backing { phys::inc_ref(frame.number()); }
+            if let Backing::Owned(frame) = m.backing { phys::retain(frame.number()); }
         }
         let old = read_entry(pt, pte_index(address));
         write_entry(pt, pte_index(address), raw);
         release_mapping(old);
-    });
+        Ok::<(), MappingError>(())
+    })?;
     crate::engine::invalidate_pages(address as usize / 4096, 1);
     Ok(())
 }
@@ -1267,12 +1099,12 @@ pub(crate) fn replace_user_mapping(page: arch_abi::UserPage, entry: arch_abi::pa
 fn test_ram(base: usize, count: usize) {
     use arch_abi::{UserPage, page_entry::{PageEntry, Mapping, Backing, PhysicalFrame, Attributes}};
     for i in 0..count {
-        let frame = phys::alloc_frames(1);
+        let frame = test_memory::alloc_backed_pages(1);
         unsafe { core::ptr::write_bytes(phys::frame_ptr(frame), 0, 4096); }
         replace_user_mapping(UserPage::new(((base + i) * 4096) as u64).unwrap(), PageEntry::Writable(Mapping {
             backing: Backing::Owned(PhysicalFrame::new(frame).unwrap()), attributes: Attributes::EXECUTABLE,
         })).unwrap();
-        phys::free_frames(frame, 1);
+        test_memory::free_phys_page(frame);
     }
 }
 #[cfg(test)]

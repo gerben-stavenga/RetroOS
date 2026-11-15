@@ -877,7 +877,7 @@ fn handle_debug_trap<A: crate::Arch>(
         // remains in dos.tf_sources and cannot leak into the exception frame.
         action = if regs.mode() == crate::UserMode::VM86 {
             if machine.read::<u16>(4 + 2) != dos::STUB_SEG {
-                arch_abi::monitor::sw_reflect_vm86_int(regs, machine, 1);
+                machine.reflect_vm86_int(regs, 1);
             } else {
                 regs.set_user_tf(false);
                 regs.project_tf();
@@ -1032,7 +1032,7 @@ fn handle_event_inner<A: crate::Arch>(
                         "VM86 SoftInt({:#x}) bubbled to dos — only INT 3/4 should trap from VM86", n);
                     let ivt_seg = machine.read::<u16>((n as usize) * 4 + 2);
                     if ivt_seg != dos::STUB_SEG {
-                        arch_abi::monitor::sw_reflect_vm86_int(regs, machine, n);
+                        machine.reflect_vm86_int(regs, n);
                     }
                     thread::KernelAction::Done
                 } else {
@@ -1093,7 +1093,7 @@ fn handle_event_inner<A: crate::Arch>(
                 dpmi.vif.finish_carrier(regs);
                 refresh_learning_tf(dos);
                 regs.project_tf();
-                return match arch_abi::monitor::monitor(machine, regs) {
+                return match machine.monitor(regs) {
                     arch_abi::monitor::MonitorResult::Resume => thread::KernelAction::Done,
                     arch_abi::monitor::MonitorResult::Event(event) => {
                         handle_event(machine, bios_display, kt, dos, regs, event)
@@ -1129,7 +1129,7 @@ fn handle_event_inner<A: crate::Arch>(
                 // same fault forever. #GP and #PF remain monitor/paging events,
                 // while protected-mode-only selector faults cannot originate
                 // from ordinary VM86 instructions.
-                arch_abi::monitor::sw_reflect_vm86_int(regs, machine, n);
+                machine.reflect_vm86_int(regs, n);
                 thread::KernelAction::Done
             } else {
                 let lin = if is_vm86 {

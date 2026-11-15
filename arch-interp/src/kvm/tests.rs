@@ -7,6 +7,9 @@
 //! phys memfd, so everything runs inside ONE #[test] (Rust runs tests on
 //! separate threads; a second REGS user would race).
 
+#[cfg(test)]
+use crate::test_memory;
+
 use arch_abi::{Memory as _, Arch as _};
 use super::*;
 use crate::space::RootPageTable;
@@ -48,6 +51,7 @@ fn regs() -> Regs {
 
 #[test]
 fn kvm_engine_proofs() {
+        crate::phys::init_test_ram();
     if !kvm_available() {
         assert!(
             std::env::var_os("RETRO_REQUIRE_KVM").is_none(),
@@ -56,7 +60,7 @@ fn kvm_engine_proofs() {
         eprintln!("SKIP: /dev/kvm unavailable — KVM engine proofs not run");
         return;
     }
-    crate::mmu::init();
+    crate::phys::init_test_ram();
     let mut mem = crate::backend::Interp;
     crate::backend::check_virtual_irq_frame(&mut mem);
 
@@ -208,12 +212,12 @@ fn kvm_engine_proofs() {
     let second = mem.read_mapping(second_page).unwrap();
     let arch_abi::page_entry::PageEntry::Writable(first_mapping) = first else { panic!("expected owned RAM") };
     let arch_abi::page_entry::Backing::Owned(frame) = first_mapping.backing else { panic!("expected owned RAM") };
-    crate::phys::inc_ref(frame.number());
+    assert!(unsafe { test_memory::ownership().retain(frame.number()) });
     unsafe {
         mem.replace_mapping(first_page, second).unwrap();
         mem.replace_mapping(second_page, first).unwrap();
     }
-    crate::phys::free_frames(frame.number(), 1);
+    test_memory::free_phys_page(frame.number());
     let mut remapped = r;
     remapped.set_ip32(0x7C00);
     set_regs(remapped);
@@ -262,9 +266,9 @@ fn kvm_engine_proofs() {
     // ── COW: fork the space, write to a shared page in the child, verify the
     // parent's copy is untouched (the #PF → space_cow_fault path under KVM).
     mem.write::<u32>(data as usize, 0x1111_1111);
-    let parent = crate::mmu::active_id();
-    let child = crate::mmu::fork_copy(parent);
-    crate::mmu::switch_to(child);
+    let mut child = RootPageTable::empty();
+    crate::paging::space_fork(&mut child);
+    let parent = crate::backend::Interp.activate(child);
     // In the child: increment the shared dword, then int 0x80.
     // 0xFF 0x05 <addr>   inc dword [data]
     // 0xCD 0x80          int 0x80
@@ -281,7 +285,7 @@ fn kvm_engine_proofs() {
         ev => panic!("COW child: expected SoftInt(0x80), got {ev:?}"),
     }
     assert_eq!(child_mem.read::<u32>(data as usize), 0x1111_1112, "child sees its increment");
-    crate::backend::Interp.activate(RootPageTable(parent));
+    crate::backend::Interp.activate(parent);
     set_regs(Regs::empty());
     assert_eq!(
         mem.read::<u32>(data as usize),

@@ -1,26 +1,8 @@
-//! Software address space — the interpreter's analogue of a page-table root.
-
-/// Handle to one software address space (the interpreter's analogue of the
-/// metal backend's page-table root). The kernel treats it as an opaque blob:
-/// it stores one in each `Vcpu`/`Thread` and hands it back to `Arch::activate`
-/// / `arch_user_fork`. The interpreter maps it to its per-space software MMU
-/// (built out in Milestone 3); for now it is just an identifier.
-#[derive(Clone, Copy)]
-pub struct RootPageTable(pub u32);
-
+//! Caller-owned saved user page-directory entries.
+pub struct RootPageTable(pub(crate) [u32; 768]);
 impl RootPageTable {
-    pub const fn empty() -> Self {
-        RootPageTable(0)
-    }
+    pub const fn empty() -> Self { Self([0; 768]) }
 }
-
 impl Default for RootPageTable {
-    // A vacant saved slot must not alias the live boot address space.
-    // Allocate its page tables only when it is first activated.
-    fn default() -> Self { RootPageTable(u32::MAX) }
+    fn default() -> Self { Self::empty() }
 }
-
-/// Interpreter analogue of the metal kernel's statically-allocated page-table
-/// frames. The hosted kernel has no boot-time paging bring-up, so nothing
-/// constructs this; it exists only for surface parity with the metal backend.
-pub struct KernelPages;

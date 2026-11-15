@@ -24,7 +24,7 @@ static BACKING: spin::Mutex<Arena> = spin::Mutex::new(Arena {
     free: Vec::new(),
     users: Vec::new(),
 });
-pub(super) fn allocate_object<A: crate::Arch>(machine: &mut A, id: u64) -> u64 {
+pub(super) fn allocate_object(id: u64) -> u64 {
     let mut arena = BACKING.lock();
     let offset = if let Some(o) = arena.free.pop() {
         o
@@ -37,7 +37,7 @@ pub(super) fn allocate_object<A: crate::Arch>(machine: &mut A, id: u64) -> u64 {
     while arena.chunks.len() <= index {
         arena
             .chunks
-            .push(machine.alloc_shared_pages(16).as_ptr() as usize);
+            .push(crate::kernel::phys_mm::alloc_shared_pages(16).as_ptr() as usize);
     }
     let ptr = (arena.chunks[index] + (offset as usize % 65536)) as *mut u8;
     // Preserve the seqlock generation across reuse so cached locators notice it.
@@ -113,7 +113,7 @@ pub(super) fn call<A: crate::Arch>(
     let mut backing = BACKING.lock();
     let (pointer, available) = if offset < SIZE {
         if backing.header == 0 {
-            backing.header = machine.alloc_shared_pages(SIZE as usize / 4096).as_ptr() as usize;
+            backing.header = crate::kernel::phys_mm::alloc_shared_pages(SIZE as usize / 4096).as_ptr() as usize;
         }
         (backing.header + offset as usize, SIZE - offset)
     } else {
@@ -209,8 +209,7 @@ mod tests {
 
 // USER handles refer to session slots, independently of process object handles.
 // Publish uniq last, and invalidate it before reusing any locator fields.
-pub(super) fn allocate_user<A: crate::Arch>(
-    machine: &mut A,
+pub(super) fn allocate_user(
     id: u64,
     offset: u64,
     kind: u16,
@@ -227,7 +226,7 @@ pub(super) fn allocate_user<A: crate::Arch>(
         return None;
     }
     if arena.header == 0 {
-        arena.header = machine.alloc_shared_pages(SIZE as usize / 4096).as_ptr() as usize;
+        arena.header = crate::kernel::phys_mm::alloc_shared_pages(SIZE as usize / 4096).as_ptr() as usize;
     }
     if i == arena.users.len() {
         arena.users.push((0, false));

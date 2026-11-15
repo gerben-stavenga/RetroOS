@@ -1,36 +1,5 @@
-//! retroos-arch-interp — the **hosted** arch backend.
-//!
-//! This crate is the software counterpart of `kernel/src/arch/`. The kernel is
-//! built against exactly one `arch` backend: the bare-metal one (real x86, INT
-//! 0x80, Bazel) or *this* one (linked into a hosted `std` process). The kernel
-//! selects between them with
-//! `#[cfg(feature = "hosted")] extern crate retroos_arch_interp as arch;` so
-//! every `crate::arch::*` path resolves here instead.
-//!
-//! The CPU under the hosted guest is itself a compile-time choice between two
-//! **engines** (see `engine.rs`): `tcg` (default — the Unicorn/QEMU-TCG
-//! software core) or `kvm` (real hardware execution via `/dev/kvm`). Both run
-//! the same machine model — the shared phys frames, real x86 page tables,
-//! descriptor tables, and device bus above the engine seam.
-//!
-//! Because of that, this crate must present the **identical public surface**
-//! that `kernel/src/arch/mod.rs` re-exports — same type names, same function
-//! signatures — over `arch-abi` (the shared pure-data contract) plus Unicorn.
-//!
-//! ## Status: Milestone 1 (structural seam)
-//!
-//! The surface is complete and the hosted kernel compiles + links against it.
-//! The pure-data pieces (the `arch-abi` re-exports, `FxState`, the event/IRQ
-//! enums, the call-number constants, the backend types) are real. The runtime
-//! behaviour — running a Vcpu on Unicorn, the software MMU, and the 18 arch
-//! calls — is `unimplemented!()` here and gets filled in by later milestones:
-//!
-//! * **M2** `do_arch_execute` over Unicorn slices + `GuestMem` over guest RAM.
-//! * **M3** the software MMU and the paging-family arch calls.
-//! * **M4** COW fork, LDT/TLS, ELF load → run a 32-bit flat-PM ELF.
-//!
-//! The self-contained Unicorn proof-of-concept that seeded this backend lives
-//! at `examples/poc.rs` (`bazelisk run //arch-interp:poc --platforms=@platforms//host`).
+//! Independent hosted x86 backend implementing arch-abi.
+//! TCG and KVM share the same supplied-storage paging implementation.
 
 // Re-export the backend-agnostic contract so `crate::arch::{Regs, KernelEvent,
 // Irq, RawPage, PAGE_SIZE, LOW_MEM_BASE, USER_CS, ...}` resolve here exactly as
@@ -60,7 +29,7 @@ mod net;
 #[cfg(feature = "kvm")]
 mod kvm;
 mod machine;
-mod mmu;
+
 mod paging;
 mod phys;
 mod screendump;
@@ -75,20 +44,18 @@ pub use calls::*;
 pub mod suite_control;
 
 pub use machine::{
-    clean_fx_template, install_input_sink, free_page_count, halt_forever, inb, inl, insw, inw, now, outb, outl,
+    clean_fx_template, install_input_sink, halt_forever, inb, inl, insw, inw, now, outb, outl,
     outsw, outw, post_irq, shutdown, FxState,
 };
 // Interactive console (hosted `main` drives input): raw terminal mode; key
 // events are delivered by `post_irq` to the entry-installed device sink.
 pub use tty::enter_raw_mode;
-pub use space::{KernelPages, RootPageTable};
+pub use space::RootPageTable;
 pub use vcpu::{mem, GuestMem, Vcpu, REGS};
 
-// Interpreter-specific host bring-up (not part of the metal surface):
-// `init_guest_ram` creates the initial address space; `new_space` allocates a
-// fresh one (until the kernel's thread/fork path drives this in M4);
+// One-time host setup; runtime memory operations use arch-abi.
 pub use vcpu::init_guest_ram;
-pub use mmu::new_space;
+pub use paging::PAGING_PAGES;
 // Platform device composition (the hosted `main` hooks ports): the PortIo trait
 // + `register` for custom devices, and convenience hooks for the built-ins.
 pub use devices::{
@@ -113,3 +80,13 @@ pub use screendump::{enable_live as enable_live_console, request as request_vga_
 // frames from the kernel's present sink; retroos-play takes them and blits;
 // screenshots peek. Presentation (SDL et al.) lives in the consuming binary.
 pub use vga::{peek_frame, publish as publish_frame, recycle_frame, take_frame};
+
+pub use phys::ram as physical_ram;
+
+#[cfg(test)]
+extern crate self as retroos_arch_interp;
+#[cfg(test)]
+#[path = "../tests/mmu.rs"]
+mod mmu_tests;
+#[cfg(test)]
+pub(crate) use mmu_tests::test_memory;

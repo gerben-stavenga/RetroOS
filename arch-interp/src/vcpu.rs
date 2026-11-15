@@ -6,7 +6,6 @@
 //! indexes a flat host-side guest-RAM buffer. The raw access stays confined to
 //! `GuestMem`, so kernel/dos code holds no `unsafe` of its own.
 
-use crate::mmu;
 use crate::paging;
 use crate::space::RootPageTable;
 use arch_abi::{GuestBytes, Regs};
@@ -116,11 +115,12 @@ impl GuestBytes for crate::backend::Interp {
 pub static mut REGS: Vcpu = Vcpu::new(Regs::empty(), RootPageTable::empty());
 
 
-/// Initialize guest memory: create the initial address space. The `len`
-/// argument is vestigial (the MMU reserves the full user VA range per space);
-/// kept for surface compatibility with the bring-up call site.
-pub fn init_guest_ram(_len: usize) {
-    mmu::init();
+/// Install caller-owned fixed paging storage. No allocation occurs here.
+/// # Safety
+/// The contiguous PAGING_PAGES frames must be zeroed, resident and exclusively
+/// owned for the lifetime of this CPU.
+pub unsafe fn init_guest_ram(storage: u64) {
+    unsafe { paging::initialize(storage); }
 }
 
 /// Host pointer for a guest address in the active space, demand-committing the

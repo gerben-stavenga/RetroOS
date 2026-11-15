@@ -416,6 +416,7 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
             let d = uc.get_data();
             if matches!(d.pending_intr, Some(14) | Some(8)) && !d.pending_is_int {
                 let cr2 = d.pending_cr2;
+                if !crate::phys::can_fault() { break; }
                 // Absent VA → demand-commit a fresh frame; present VA → a write to
                 // a read-only page, which is a COW page to privatise (else genuine).
                 let resolved = if crate::paging::space_translate(cr2).is_none() {
@@ -451,6 +452,10 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
         // A page fault that demand-paging did not resolve is a genuine SEGV: the
         // kernel signals the thread. Carry CR2 + the #PF error code.
         if matches!(uc.get_data().pending_intr, Some(14) | Some(8)) && !uc.get_data().pending_is_int {
+            if !crate::phys::can_fault() {
+                uc.get_data_mut().pending_intr = None;
+                return KernelEvent::Irq;
+            }
             let cr2 = uc.get_data().pending_cr2;
             vcpu.err_code = uc.get_data().pending_err as u64;
             uc.get_data_mut().pending_intr = None;
@@ -493,6 +498,7 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
             // (duke3d/raptor at sound init); forwarding the #GP to the client's
             // own handler cascaded into a wild jump.
             if n == 13 && !is_int && uc.get_data().pending_err == 0 {
+                if !crate::phys::can_fault() { return KernelEvent::Irq; }
                 // Where the faulting instruction lives, and whether virtual IF
                 // was on before it ran: a 1 -> 0 transition is the site that
                 // OPENS an interrupts-off window, which is what the gate keys
@@ -890,8 +896,9 @@ mod execution_tests {
 
     #[test]
     fn execution_returns_interruptions_not_queue_contents() {
+        crate::phys::init_test_ram();
         crate::machine::install_input_sink(receive_input);
-        crate::mmu::init();
+        crate::phys::init_test_ram();
         let mut machine = crate::backend::Interp;
         crate::backend::check_virtual_irq_frame(&mut machine);
         machine.copy_to(0x7c00, &[0xcd, 0x31]);

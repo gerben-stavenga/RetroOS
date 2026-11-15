@@ -33,7 +33,7 @@
 //! is invalidated per page when code is written. arch's only job is to reflect
 //! the `#GP`/`#DB` and let us drive `regs` + guest memory.
 
-use arch_abi::{Arch, Regs, UserMode};
+use crate::{Arch, Regs, UserMode};
 
 // EFLAGS bits.
 const IF_FLAG: u32 = 1 << 9;
@@ -297,7 +297,7 @@ impl VifMap {
             // emulation, but inside the VIF learner that bit belongs to this
             // state machine. Preserve the independently tracked guest value.
             let user_tf = regs.user_tf();
-            let monitored = arch_abi::monitor::monitor(arch, regs);
+            let monitored = arch.monitor(regs);
             regs.set_user_tf(user_tf);
             regs.project_tf();
             match monitored {

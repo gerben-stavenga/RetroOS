@@ -25,7 +25,6 @@ static mut POOL: Pool = Pool::new();
 static mut KERNEL_RANGE: (u64, u64) = (0, 0);
 fn pool_ptr() -> *mut Pool { &raw mut POOL }
 static POOL_LOCK: AtomicBool = AtomicBool::new(false);
-static PUBLISHED_FREE: AtomicUsize = AtomicUsize::new(0);
 // Arch reads immutable layout data, never fields covered by a mutable Pool borrow.
 static mut VIEW_REGIONS: [arch_abi::page_supply::FrameRegion; 256] =
     [arch_abi::page_supply::FrameRegion { first: 0, end: 0, offset: 0 }; 256];
@@ -41,7 +40,6 @@ fn with_pool<R>(operation: impl FnOnce(&mut Pool) -> R) -> R {
     // reclaim, free heap storage or enter arch while this borrow is live.
     let pool = unsafe { &mut *pool_ptr() };
     let result = operation(pool);
-    PUBLISHED_FREE.store(pool.free_pages(), Ordering::Release);
     result
 }
 
@@ -126,6 +124,11 @@ pub fn mark_used(low_page: u64, high_page: u64) {
 // No pool borrow survives the callback; it may release cache metadata.
 static RECLAIM: AtomicUsize = AtomicUsize::new(0);
 pub fn set_reclaim(callback: fn() -> Option<u64>) { RECLAIM.store(callback as usize, Ordering::Release); }
+/// Heap growth cannot reclaim objects through the heap it is extending.
+pub fn alloc_resident_page() -> Option<u64> {
+    with_pool(|pool| pool.allocate())
+}
+
 pub fn alloc_phys_page() -> Option<u64> {
     if let Some(page) = with_pool(|pool| pool.allocate()) { return Some(page); }
     let callback = RECLAIM.load(Ordering::Acquire);
@@ -158,7 +161,6 @@ pub fn ownership() -> arch_abi::page_supply::FrameOwnership {
             }
         }
         view.regions = (&raw const VIEW_REGIONS).cast();
-        view.free = &PUBLISHED_FREE;
         view
     })
 }
@@ -210,21 +212,16 @@ mod tests;
 
 /// # Safety
 /// Supply is resident and belongs to the calling CPU. No mutable supply borrow
-/// survives allocation, so nested first-touch faults can use the existing reserve.
+/// survives reclamation, which may return more frames to this supply.
 pub unsafe fn replenish_supply(supply: *mut arch_abi::page_supply::PageSupply) {
-    unsafe { replenish(supply, true); }
+    unsafe { replenish(supply); }
 }
-/// # Safety
-/// Same as replenish_supply, but the caller may hold the heap lock.
-pub unsafe fn replenish_supply_without_reclaim(supply: *mut arch_abi::page_supply::PageSupply) {
-    unsafe { replenish(supply, false); }
-}
-unsafe fn replenish(supply: *mut arch_abi::page_supply::PageSupply, reclaim: bool) {
+unsafe fn replenish(supply: *mut arch_abi::page_supply::PageSupply) {
     if unsafe { (*supply).count } < arch_abi::page_supply::SUPPLY_CAPACITY {
         unsafe { (*supply).refills += 1; }
     }
     while unsafe { (*supply).count } < arch_abi::page_supply::SUPPLY_CAPACITY {
-        let page = if reclaim { alloc_phys_page() } else { with_pool(|pool| pool.allocate()) };
+        let page = alloc_phys_page();
         let Some(page) = page else {
             assert!(unsafe { (*supply).count } >= arch_abi::page_supply::FAULT_PAGES,
                 "physical memory exhausted refilling fault reserve");
@@ -238,8 +235,67 @@ unsafe fn replenish(supply: *mut arch_abi::page_supply::PageSupply, reclaim: boo
         unsafe { (*supply).donate(page); }
     }
 }
-pub fn bootstrap_supply(refill_ip: usize) -> arch_abi::page_supply::PageBootstrap {
+pub fn bootstrap_supply() -> arch_abi::page_supply::PageBootstrap {
     let mut pages = [0; arch_abi::page_supply::FAULT_PAGES];
     for page in &mut pages { *page = alloc_phys_page().expect("out of AP fault reserve pages"); }
-    arch_abi::page_supply::PageBootstrap { ownership: ownership(), pages, refill_ip }
+    arch_abi::page_supply::PageBootstrap { ownership: ownership(), pages }
+}
+
+/// Permanent host mapping of the RAM supplied at platform setup. Zero means
+/// physical RAM has no direct view and shared buffers use the kernel heap.
+static DIRECT_BASE: AtomicUsize = AtomicUsize::new(0);
+static DIRECT_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// # Safety
+/// The page-aligned mapping must remain writable for the lifetime of the kernel.
+/// Call once, before any architecture or kernel memory allocation.
+pub unsafe fn init_direct_ram(base: *mut u8, bytes: usize) {
+    assert!(!base.is_null() && (base as usize).is_multiple_of(PAGE_SIZE));
+    assert!(bytes.is_multiple_of(PAGE_SIZE));
+    DIRECT_BASE.store(base as usize, Ordering::Release);
+    DIRECT_BYTES.store(bytes, Ordering::Release);
+    init_phys_mm(core::iter::once(MemoryRegion { base: 0, length: bytes as u64, usable: true }),
+        (bytes / PAGE_SIZE) as u64, 0, 0, u64::MAX);
+    complete_initialization();
+    prepare_fault_metadata();
+}
+
+/// Allocate zeroed frames from directly mapped RAM. Allocation, reference
+/// counting and reuse use exactly the same pool as native physical memory.
+pub fn alloc_backed_pages(count: usize) -> u64 {
+    assert!(DIRECT_BASE.load(Ordering::Acquire) != 0 && count != 0, "direct RAM not initialized");
+    let page = if count == 1 { alloc_phys_page() } else { alloc_contig(count) }
+        .expect("physical RAM exhausted");
+    unsafe { core::ptr::write_bytes(direct_pointer(page), 0, count.checked_mul(PAGE_SIZE).unwrap()); }
+    page
+}
+
+pub fn direct_pointer(page: u64) -> *mut u8 {
+    let offset = usize::try_from(page).unwrap().checked_mul(PAGE_SIZE).unwrap();
+    assert!(offset < DIRECT_BYTES.load(Ordering::Acquire));
+    (DIRECT_BASE.load(Ordering::Acquire) + offset) as *mut u8
+}
+
+pub fn alloc_shared_pages(count: usize) -> core::ptr::NonNull<u8> {
+    assert!(count != 0);
+    if DIRECT_BASE.load(Ordering::Acquire) != 0 {
+        return core::ptr::NonNull::new(direct_pointer(alloc_backed_pages(count))).unwrap();
+    }
+    let layout = Layout::from_size_align(count.checked_mul(PAGE_SIZE).unwrap(), PAGE_SIZE).unwrap();
+    core::ptr::NonNull::new(unsafe { alloc_zeroed(layout) })
+        .unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout))
+}
+
+/// # Safety
+/// All aliases must be removed, and base/count must match a live allocation.
+pub unsafe fn free_shared_pages(base: core::ptr::NonNull<u8>, count: usize) {
+    let direct = DIRECT_BASE.load(Ordering::Acquire);
+    if direct != 0 {
+        let offset = (base.as_ptr() as usize).checked_sub(direct).unwrap();
+        assert!(offset.is_multiple_of(PAGE_SIZE));
+        assert!(offset.checked_add(count.checked_mul(PAGE_SIZE).unwrap()).unwrap() <= DIRECT_BYTES.load(Ordering::Acquire));
+        for i in 0..count { free_phys_page((offset / PAGE_SIZE + i) as u64); }
+    } else {
+        unsafe { dealloc(base.as_ptr(), Layout::from_size_align(count.checked_mul(PAGE_SIZE).unwrap(), PAGE_SIZE).unwrap()); }
+    }
 }

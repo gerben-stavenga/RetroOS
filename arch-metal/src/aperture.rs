@@ -66,9 +66,10 @@ fn set_cached_base(base: u64) {
 ///
 /// Must run at ring 0 after the physical allocator and heap are initialized,
 /// and before the ring-1 kernel can request a remap.
-pub fn init() {
-    paging2::prepare_kernel_mapping(APERTURE_BASE / paging2::PAGE_SIZE, APERTURE_PAGES);
+pub fn init(table: u64) -> bool {
+    let consumed = paging2::prepare_kernel_mapping(APERTURE_BASE / paging2::PAGE_SIZE, APERTURE_PAGES, table);
     MAPPED_VALID.store(false, Ordering::Release);
+    consumed
 }
 
 /// Request one fixed aperture remap from the ring-1 kernel to ring 0.

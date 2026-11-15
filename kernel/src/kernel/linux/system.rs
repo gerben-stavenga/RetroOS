@@ -29,10 +29,8 @@ pub(super) fn sysinfo<A: crate::Arch>(machine: &mut A, args: &Args, wide: bool) 
         return SyscallResult::val(-EFAULT);
     }
     let pointer = args.a0 as usize;
-    let free = machine.free_page_count() as u64;
-    let Some(total) = machine.total_page_count() else {
-        return SyscallResult::val(-super::ENOSYS);
-    };
+    let free = crate::kernel::phys_mm::free_page_count() as u64;
+    let total = crate::kernel::phys_mm::total_page_count();
     let total = total as u64;
     let uptime = (machine.now() / 1_000_000) / 1000;
     machine.zero(pointer, size as usize);

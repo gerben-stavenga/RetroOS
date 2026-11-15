@@ -1250,7 +1250,7 @@ pub fn exit_thread<A: crate::Arch>(
         crate::kernel::linux::child_exited(&mut threads[parent_tid as usize], tid as i32, exit_code);
     }
     crate::compact_dbg_println!("[mem] exit tid={} code={} free_pages={}",
-        tid, exit_code, machine.free_page_count());
+        tid, exit_code, crate::kernel::phys_mm::free_page_count());
 
     // Hand focus back to the parent that spawned us — it's the natural caller
     // of wait4. Covers "parent was Blocked on wait4 and we just woke it" and

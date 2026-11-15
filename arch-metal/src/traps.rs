@@ -6,7 +6,7 @@
 #![allow(static_mut_refs)]
 
 use crate::irq::handle_irq;
-use crate::paging2::{self, Entry};
+use crate::paging2;
 use crate::x86;
 use arch_abi::Regs;
 use crate::Vcpu;
@@ -107,7 +107,6 @@ pub mod arch_call {
     pub const PRIVATE_TABLES: u64 = 0x12B;
     pub const REFRESH_KERNEL: u64 = 0x12C;
     pub const INTERRUPT_PROCESSOR: u64 = 0x12D;
-    pub const RETURNED_FRAMES: u64 = 0x12A; // EDX=returned-page exchange
     pub const FRAME_OPERATION: u64 = 0x129; // EDX=frame request
     pub const HIGH_MEMORY: u64 = 0x128; // EDX=request pointer
     pub const EXECUTE: u64 = 0x100;      // Swap kernel↔user regs
@@ -284,9 +283,6 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::LOAD_LDT => {
             crate::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
         }
-        arch_call::RETURNED_FRAMES => {
-            crate::memory::handle_returns(unsafe { &mut *(regs.rdx as *mut crate::memory::Returns) });
-        }
         arch_call::FRAME_OPERATION => {
             crate::frames::handle(unsafe { &mut *(regs.rdx as *mut crate::frames::Request) });
         }
@@ -461,13 +457,6 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
             for i in 0..10 {
                 lib::compact_println!("  [esp+{:2}] = {:#010x}", i * 4, unsafe { p.add(i).read_volatile() });
             }
-        }
-        if raw_int_num == 14 && !crate::memory::can_fault() {
-            let mut ip = raw_eip;
-            crate::memory::defer_fault(&mut ip);
-            if from_64 { unsafe { (*stack).regs.frame.rip = ip; } }
-            else { unsafe { (*stack).raw32.0.eip = ip as u32; } }
-            return from_64;
         }
         handle_ring0(raw_int_num, raw_err_code, raw_cs, raw_eip);  // No canonicalization because in 32-bit mode doesn't match Regs layout due to missing esp:ss
         return from_64;
@@ -714,6 +703,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
         // A native long-mode #GP must retain its full faulting RIP rather
         // than decoding unrelated bytes at the truncated low address.
         13 if regs.mode() == UserMode::Mode64 => KE::Exception(13),
+        13 if !crate::memory::can_fault() => KE::Irq,
         13 => {
             // VME raises #GP with VIF=1 && VIP=1 to ask the host to inject the
             // pending virtual interrupt. It normally lands on STI/POPF/IRET
@@ -832,8 +822,7 @@ fn isr_handler_ring1(regs: &mut Regs) {
             panic_with_regs("Unexpected debug exception in kernel", regs);
         }
         14 => {
-            if !crate::memory::can_fault() { crate::memory::defer_fault(&mut regs.frame.rip); return; }
-            if try_handle_page_fault(regs.err_code, false).is_none() {
+            if !crate::memory::can_fault() || try_handle_page_fault(regs.err_code, false).is_none() {
                 panic_with_regs("Unhandled page fault in kernel", regs);
             }
         }
@@ -894,15 +883,10 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
         }
     }
 
-    // Kernel fault in heap region: demand-page a real writable page
-    if !user && (KERNEL_BASE..paging2::HEAP_END).contains(&fault_addr) {
-        let heap_start = paging2::heap_base();
-        if fault_addr >= heap_start && !present {
-            demand_page_kernel(fault_addr);
-            return Some(());
-        }
-        // Present fault or below heap_base in kernel space is a bug
-        return None;
+    // Kernel memory is backed before use. A newly published shared root
+    // may have been missing from this CPU; refresh above makes it visible.
+    if !user && fault_addr >= KERNEL_BASE {
+        return (!present && paging2::kernel_page_resident(fault_addr)).then_some(());
     }
 
     // Legacy mode (VM86/DPMI) shares code+data address space, so don't set NX
@@ -1003,42 +987,13 @@ fn demand_page<E: paging2::Entry>(
 // VM86 segment helpers
 // =============================================================================
 
-/// Demand-page a kernel heap page: allocate a real writable physical page.
-fn demand_page_kernel(fault_addr: usize) {
-    let _mapping = paging2::KernelMappingGuard::lock();
-    paging2::refresh_kernel_mappings();
-    // The fault may predate another CPU installing this shared heap page.
-    if paging2::kernel_page_resident(fault_addr) {
-        x86::invlpg(fault_addr & !(paging2::PAGE_SIZE - 1));
-        return;
-    }
-    let phys = crate::memory::take_page()
-        .unwrap_or_else(|| panic!("Arch: fault reserve exhausted for kernel heap at {fault_addr:#x}; managed pages={}", crate::memory::total_page_count()));
-    let page_index = paging2::page_idx(fault_addr);
-    match paging2::entries() {
-        paging2::Entries::E32(e) => {
-            paging2::replace_mapping(
-                &mut e[page_index],
-                paging2::Entry32::new(phys, true, false),
-            );
-        }
-        paging2::Entries::E64(e) => {
-            paging2::replace_mapping(
-                &mut e[page_index],
-                paging2::Entry64::new(phys, true, false),
-            );
-        }
-    }
-    x86::invlpg(fault_addr & !(paging2::PAGE_SIZE - 1));
-}
-
 /// Ring-0 interrupt handler. No frame conversion, no canonicalization.
 /// Called before from_32/to_32 since 32-bit same-privilege interrupts
 /// don't push ESP/SS.
 fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
     match int_num {
         14 => {
-            if try_handle_page_fault(error, false).is_none() {
+            if !crate::memory::can_fault() || try_handle_page_fault(error, false).is_none() {
                 lib::compact_panic!("Unhandled page fault in arch: addr={:#x} err={:#x}", x86::read_cr2(), error);
             }
         }

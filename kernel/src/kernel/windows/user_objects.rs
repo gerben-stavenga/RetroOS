@@ -51,20 +51,19 @@ struct WindowRecord {
     damage: paint::Damage,
 }
 impl WindowRecord {
-    fn new<A: crate::Arch>(
-        machine: &mut A,
+    fn new(
         class: Arc<classes::Class>,
         owner: [u32; 2],
     ) -> Option<Self> {
         let id = next_id();
-        let offset = session::allocate_object(machine, id);
+        let offset = session::allocate_object(id);
         let mut data = [0u8; 24];
         data[..8].copy_from_slice(&class.id.to_le_bytes());
         data[8..16].copy_from_slice(&class.offset.to_le_bytes());
         // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE (Wine internal value).
         data[16..20].copy_from_slice(&0x12u32.to_le_bytes());
         session::write_object(offset, &data);
-        let Some(handle) = session::allocate_user(machine, id, offset, 1, owner) else {
+        let Some(handle) = session::allocate_user(id, offset, 1, owner) else {
             session::release_object(offset);
             return None;
         };
@@ -207,10 +206,10 @@ pub(super) fn call<A: crate::Arch>(
             let Some([top, message]) = state.classes.desktop_classes() else {
                 return 0xc0010583;
             };
-            let Some(top) = WindowRecord::new(machine, top, [0, 0]) else {
+            let Some(top) = WindowRecord::new(top, [0, 0]) else {
                 return 0xc000009a;
             };
-            let Some(message) = WindowRecord::new(machine, message, [0, 0]) else {
+            let Some(message) = WindowRecord::new(message, [0, 0]) else {
                 return 0xc000009a;
             };
             roots.extend([top, message]);
@@ -282,7 +281,7 @@ pub(super) fn call<A: crate::Arch>(
             }
             let id = next_id();
             let offset = if kind == 2 {
-                let offset = session::allocate_object(machine, id);
+                let offset = session::allocate_object(id);
                 let mut shared = [0u8; 304];
                 shared[24..28].copy_from_slice(&screen_size().0.to_le_bytes());
                 shared[28..32].copy_from_slice(&screen_size().1.to_le_bytes());
@@ -396,7 +395,7 @@ pub(super) fn window_call<A: crate::Arch>(
                 machine.read::<u32>((state.teb_base + 0x24) as usize),
                 machine.read::<u32>((state.teb_base + 0x20) as usize),
             ];
-            let Some(handle) = session::allocate_user(machine, 0, 0, atom as u16, owner) else {
+            let Some(handle) = session::allocate_user(0, 0, atom as u16, owner) else {
                 return 0xc000009a;
             };
             state
@@ -662,7 +661,7 @@ pub(super) fn tree_call<A: crate::Arch>(
             } else {
                 return 0xc0010578;
             };
-            let Some(mut window) = WindowRecord::new(machine, class.clone(), [tid, pid]) else {
+            let Some(mut window) = WindowRecord::new(class.clone(), [tid, pid]) else {
                 return 0xc000009a;
             };
             window.instance = p[5] as u64 | ((p[6] as u64) << 32);

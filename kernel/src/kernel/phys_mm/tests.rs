@@ -73,3 +73,28 @@ fn firmware_holes_high_ram_and_exhaustion() {
     assert_eq!(get_ref_count(259), 1, "reserve keeps ownership of returned frame");
 
 }
+
+#[test]
+fn direct_ram_uses_pool_ownership_and_reuses_contiguous_pages() {
+    use super::*;
+    let bytes = 0x100000 + 16 * PAGE_SIZE;
+    let layout = Layout::from_size_align(bytes, PAGE_SIZE).unwrap();
+    let ram = unsafe { alloc_zeroed(layout) };
+    unsafe { init_direct_ram(ram, bytes); }
+    assert_eq!(total_page_count(), 16);
+    let memory = alloc_shared_pages(16);
+    let first = ((memory.as_ptr() as usize - ram as usize) / PAGE_SIZE) as u64;
+    assert_eq!(free_page_count(), 0);
+    unsafe { core::ptr::write_bytes(memory.as_ptr(), 0xa5, 16 * PAGE_SIZE); }
+    assert!(inc_shared_count(first));
+    unsafe { free_shared_pages(memory, 16); }
+    assert_eq!(free_page_count(), 15);
+    assert_eq!(get_ref_count(first), 1);
+    assert_eq!(unsafe { *direct_pointer(first) }, 0xa5);
+    let reused = alloc_backed_pages(15);
+    assert_eq!(reused, first + 1);
+    assert!(unsafe { core::slice::from_raw_parts(direct_pointer(reused), 15 * PAGE_SIZE) }.iter().all(|&b| b == 0));
+    free_phys_contig(reused, 15);
+    free_phys_page(first);
+    assert_eq!(free_page_count(), 16);
+}

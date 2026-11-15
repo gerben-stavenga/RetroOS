@@ -58,12 +58,28 @@ pub use lib::{
     println, screenln,
 };
 
-// The backend-agnostic arch contract, re-exported at the crate root: the
-// kernel is written against exactly this surface.
+// Backend-neutral data types. Kernel byte-transfer policy is composed below.
 pub use arch_abi::{
-    Arch, BootConfig, ComPort, Frame64, GuestBytes, Irq, KernelEvent, Regs, UserMode, Vcpu,
+    BootConfig, ComPort, Frame64, Irq, KernelEvent, Regs, UserMode, Vcpu,
     parse_debug_watch, LOW_MEM_BASE, PAGE_SIZE, RawPage,
 };
+
+pub use kernel::memory::GuestBytes;
+/// Kernel operations include replenishing user backing between bounded arch calls.
+pub trait Arch: arch_abi::Arch + GuestBytes {
+    fn monitor(&mut self, regs: &mut Regs) -> arch_abi::monitor::MonitorResult;
+    fn reflect_vm86_int(&mut self, regs: &mut Regs, vector: u8);
+}
+impl<A: arch_abi::Arch + arch_abi::GuestBytes> Arch for A {
+    fn monitor(&mut self, regs: &mut Regs) -> arch_abi::monitor::MonitorResult {
+        kernel::memory::service(self);
+        arch_abi::monitor::monitor(self, regs)
+    }
+    fn reflect_vm86_int(&mut self, regs: &mut Regs, vector: u8) {
+        kernel::memory::service(self);
+        arch_abi::monitor::sw_reflect_vm86_int(regs, self, vector);
+    }
+}
 
 pub use kernel::startup::startup;
 pub use kernel::platform::{set_host_env, DebugSink, HostEnv};

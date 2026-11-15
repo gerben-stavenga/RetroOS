@@ -1457,8 +1457,8 @@ fn dispatch<A: crate::Arch>(
         Api::ClearTls => threads::clear_tls(machine, &mut state.threads, arg(machine, regs, 0)),
         Api::SystemInfo => {
             let out = arg(machine, regs, 0) as usize;
-            machine.write::<u32>(out, machine.total_page_count().unwrap_or(machine.free_page_count()) as u32);
-            machine.write::<u32>(out + 4, machine.free_page_count() as u32);
+            machine.write::<u32>(out, crate::kernel::phys_mm::total_page_count() as u32);
+            machine.write::<u32>(out + 4, crate::kernel::phys_mm::free_page_count() as u32);
             let [reserved, committed] = memory::statistics(state);
             machine.write::<u32>(out + 8, reserved);
             machine.write::<u32>(out + 12, committed);

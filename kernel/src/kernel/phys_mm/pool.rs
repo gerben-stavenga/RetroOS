@@ -223,7 +223,7 @@ impl Pool {
     pub(super) fn ownership(&self, zero_page: u64) -> FrameOwnership {
         FrameOwnership { regions: self.regions.as_ptr(), regions_len: self.count,
             bitmap: self.states, blocks: self.blocks, active: self.active,
-            free: &self.free, zero_page }
+            zero_page }
     }
     pub(super) fn refs(&self, page: u64) -> u8 {
         unsafe { self.ownership(u64::MAX).references(page) }

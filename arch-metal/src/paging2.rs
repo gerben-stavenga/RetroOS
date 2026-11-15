@@ -112,8 +112,8 @@ pub const KERNEL_BASE: usize = 0xC0B0_0000;
 pub const KERNEL_PHYS: usize = 0x0010_0000;
 
 /// The kernel heap occupies `[heap_base() .. HEAP_END)` in kernel space. The
-/// demand-paging `#PF` handler grows it on access and the heap allocator carves
-/// within it — but the window itself is a memory-layout fact (the ceiling, and
+/// kernel maps backing explicitly before donating it to its heap allocator.
+/// The window itself is a memory-layout fact (the ceiling, and
 /// the base = first page past the loader-reserved boot pool), owned here, not
 /// allocator policy.
 pub const HEAP_END: usize = arch_abi::DEVICE_WINDOW_BASE;
@@ -1559,31 +1559,35 @@ pub(crate) fn map_boot_mmio(va: usize, phys: u64) -> bool {
 }
 
 /// Ensure the recursive page-table view can represent a kernel virtual range.
-pub(crate) fn prepare_kernel_mapping(vpage_start: usize, count: usize) {
+pub(crate) fn prepare_kernel_mapping(vpage_start: usize, count: usize, table: u64) -> bool {
     let end = vpage_start.checked_add(count).expect("kernel mapping range overflow");
     assert!(end <= NUM_PAGES, "kernel mapping range outside page tables");
     match entries() {
-        Entries::E32(entries) => prepare_kernel_mapping_entries(entries, vpage_start, count),
-        Entries::E64(entries) => prepare_kernel_mapping_entries(entries, vpage_start, count),
+        Entries::E32(entries) => prepare_kernel_mapping_entries(entries, vpage_start, count, table),
+        Entries::E64(entries) => prepare_kernel_mapping_entries(entries, vpage_start, count, table),
     }
 }
 
-fn prepare_kernel_mapping_entries<E: Entry>(entries: &mut [E], vpage_start: usize, count: usize) {
+fn prepare_kernel_mapping_entries<E: Entry>(entries: &mut [E], vpage_start: usize, count: usize, table: u64) -> bool {
     let mut changed = false;
     for vpage in vpage_start..vpage_start + count {
         let parent = parent_index::<E>(vpage);
         assert!(parent < NUM_PAGES, "kernel mapping parent outside page tables");
         if !entries[parent].present() {
-            let page_table = alloc::boxed::Box::leak(alloc::boxed::Box::new(
-                RawPage([0; PAGE_SIZE])));
-            let table_phys = physical_page(page_table as *const RawPage as usize);
-            let _ = replace_entry(&mut entries[parent], E::new(table_phys, true, false));
+            assert!(!changed, "kernel range needs more than one supplied table");
+            let saved = temp_swap(table);
+            unsafe { core::ptr::write_bytes((&raw mut TEMP_PAGE).cast::<u8>(), 0, PAGE_SIZE); }
+            let _ = temp_swap(saved);
+            let mut entry = E::new(table, true, false);
+            entry.set_raw(entry.raw() | flags::FOREIGN);
+            let _ = replace_entry(&mut entries[parent], entry);
             changed = true;
         }
     }
     if changed {
         flush_tlb();
     }
+    changed
 }
 
 /// Map externally owned physical pages writable into the fixed kernel aperture.
@@ -1608,10 +1612,11 @@ pub(crate) fn map_kernel_foreign_range(
     if (!is_pae() && ppage_end > (1 << 20)) || ppage_end > (1 << 40) {
         return false;
     }
-    prepare_kernel_mapping(vpage_start, count);
+
     match entries() {
         Entries::E32(entries) => {
             for i in 0..count {
+                assert!(entries[parent_index::<Entry32>(vpage_start + i)].present());
                 let mut entry = Entry32::new(ppage_start + i as u64, true, false);
                 entry.set_no_execute(true);
                 entry.set_raw(entry.raw() | flags::FOREIGN);
@@ -1620,6 +1625,7 @@ pub(crate) fn map_kernel_foreign_range(
         }
         Entries::E64(entries) => {
             for i in 0..count {
+                assert!(entries[parent_index::<Entry64>(vpage_start + i)].present());
                 let mut entry = Entry64::new(ppage_start + i as u64, true, false);
                 entry.set_no_execute(true);
                 entry.set_raw(entry.raw() | flags::FOREIGN);
@@ -1973,6 +1979,41 @@ pub fn clear_trampoline(saved: u64) {
     }
     sync_hw_pdpt();
     crate::x86::flush_tlb();
+}
+
+/// Map one heap page using only caller-supplied data and table storage.
+pub(crate) fn map_heap_page(address: usize, frame: u64, table: u64) -> bool {
+    assert!(address % PAGE_SIZE == 0 && (heap_base()..HEAP_END).contains(&address));
+    let _guard = KernelMappingGuard::lock();
+    refresh_kernel_mappings();
+    fn install<E: Entry>(e: &mut [E], address: usize, frame: u64, table: u64) -> bool {
+        let index = page_idx(address);
+        let parent = parent_index::<E>(index);
+        let consumed = !e[parent].present();
+        if consumed {
+            let saved = temp_swap(table);
+            unsafe { core::ptr::write_bytes((&raw mut TEMP_PAGE).cast::<u8>(), 0, PAGE_SIZE); }
+            let _ = temp_swap(saved);
+            let mut entry = E::new(table, true, false);
+            entry.set_raw(entry.raw() | flags::FOREIGN);
+            let _ = replace_entry(&mut e[parent], entry);
+            flush_tlb();
+        }
+        assert!(!e[index].present(), "heap page already mapped");
+        let saved = temp_swap(frame);
+        unsafe { core::ptr::write_bytes((&raw mut TEMP_PAGE).cast::<u8>(), 0, PAGE_SIZE); }
+        let _ = temp_swap(saved);
+        let mut entry = E::new(frame, true, false);
+        entry.set_no_execute(true);
+        entry.set_raw(entry.raw() | flags::FOREIGN);
+        let _ = replace_entry(&mut e[index], entry);
+        crate::x86::invlpg(address);
+        consumed
+    }
+    match entries() {
+        Entries::E32(e) => install(e, address, frame, table),
+        Entries::E64(e) => install(e, address, frame, table),
+    }
 }
 
 /// Install borrowed physical storage in the privileged window.
