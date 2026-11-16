@@ -28,7 +28,7 @@ pub use arch_abi::Irq;
 /// Private IDT range reserved for kernel MSI sources. These gates are DPL0,
 /// unlike the guest-callable software-interrupt range below them.
 pub const MSI_VECTOR_BASE: u8 = 0xF8;
-pub const MSI_SOURCE_COUNT: u8 = 8;
+pub const MSI_SOURCE_COUNT: u8 = 7;
 
 /// Device-owned input sink installed during boot. Arch retains no input data.
 #[thread_local]
@@ -198,10 +198,10 @@ const LAPIC_DIV_1: u32 = 0b1011;           // divide-config: bus clock / 1
 // The timer vector reuses the IRQ0 slot (32) so the existing `32..=47 =>
 // handle_irq` dispatch applies unchanged.
 const LAPIC_TIMER_VECTOR: u32 = IRQ_OFFSET as u32;
-// Spurious-interrupt vector: low nibble must be 0xF on P6/early CPUs, and 0x2F
-// lands in the PIC range where handle_irq's spurious-IRQ15 check returns
-// cleanly without us touching the kernel's vector dispatch.
-const LAPIC_SPURIOUS_VECTOR: u32 = 0x2F;
+// Dedicated DPL0 vector, outside both ISA and MSI delivery. The low nibble
+// must be 0xF on P6/early CPUs. Trap entry discards it without sending EOI.
+pub(crate) const LAPIC_SPURIOUS_VECTOR: u32 = 0xFF;
+const _: () = assert!(MSI_VECTOR_BASE as u32 + MSI_SOURCE_COUNT as u32 == LAPIC_SPURIOUS_VECTOR);
 
 const IA32_APIC_BASE: u32 = 0x1B;
 const APIC_BASE_ENABLE: u64 = 1 << 11;     // global enable

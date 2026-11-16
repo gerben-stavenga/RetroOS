@@ -282,14 +282,14 @@ unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
     }
 }
 
-/// Install one complete thread-derived policy immediately before guest entry.
+/// Install the same thread-derived policy for protected and long-mode entry.
 pub fn install_io_policy(policy: &arch_abi::IoPolicy) {
+    // Keep the architectural terminator denied in both hardware layouts.
+    let mut bitmap = [0xFF; IOPB_SIZE];
+    bitmap[..arch_abi::IO_POLICY_BYTES].copy_from_slice(policy.denied_bytes());
     unsafe {
-        TSS32.iopb[..arch_abi::IO_POLICY_BYTES]
-            .copy_from_slice(policy.denied_bytes());
-        // Architectural terminator byte: ports outside the represented window
-        // remain denied even if the CPU probes one byte past the bitmap.
-        TSS32.iopb[arch_abi::IO_POLICY_BYTES..].fill(0xFF);
+        TSS32.iopb = bitmap;
+        TSS64.iopb = bitmap;
     }
 }
 
@@ -509,7 +509,7 @@ pub fn setup_descriptor_tables(arch_stack_top: u32) {
         // 0x20-0x2F: PIC IRQs (DPL=0)
         // 0x30-0xF7: user-callable (DPL=3) — includes 0x80 syscall, 0x31 DPMI,
         //             0xF0 VM86 stubs
-        // 0xF8-0xFF: kernel-only MSI vectors
+        // 0xF8-0xFE: kernel-only MSI vectors; 0xFF: LAPIC spurious vector
         if crate::smp::current_core_id() == 0 {
             let vector_base_32 = int_vector.as_ptr() as u32;
             for i in 0..256 {
@@ -725,10 +725,14 @@ unsafe extern "fastcall" {
 /// - From long mode (compat): switches to protected mode
 ///
 /// The appropriate IDT/TSS is loaded based on EFER.LMA after the switch.
+/// Preserve the caller's interrupt state across the entire transition.
 ///
 /// Safety: Requires trampoline copied to 0xF000 and identity-mapped.
 pub fn toggle_mode(new_cr3: u32) {
-    x86::cli();
+    let flags: u32;
+    unsafe {
+        core::arch::asm!("pushfd", "pop {flags:e}", "cli", flags = out(reg) flags);
+    }
     unsafe { toggle_prot_compat(new_cr3); }
     // Reload IDT/TSS for the new mode. The long-mode reload runs HERE, in compat
     // mode (LMA=1), so a 32-bit lidt zero-extends the base into the now-64-bit
@@ -748,7 +752,11 @@ pub fn toggle_mode(new_cr3: u32) {
     } else {
         load_prot_mode_descriptors();
     }
-    x86::sti();
+    // A trap-handler caller entered with IF clear; only its final IRET may
+    // re-enable interrupts. Other callers recover their original flags.
+    unsafe {
+        core::arch::asm!("push {flags:e}", "popfd", flags = in(reg) flags);
+    }
 }
 
 /// SYSCALL/SYSRET MSR addresses

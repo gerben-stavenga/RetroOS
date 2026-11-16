@@ -436,6 +436,12 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     // vectors >= 0x80. `syscall_entry_64` pushes 256 (out of IDT range) as a
     // sentinel — preserve it so ring3 can route it to `KE::Syscall`.
     let raw_int_num = if raw_int_num == 256 { 256 } else { raw_int_num & 0xFF };
+    // A LAPIC spurious delivery has no in-service interrupt to acknowledge.
+    // Resume the untouched frame at any privilege level: no EOI, line mask,
+    // device event, or return from execute is needed.
+    if raw_int_num == u64::from(crate::irq::LAPIC_SPURIOUS_VECTOR) {
+        return from_64;
+    }
     let from_ring3 = vm86 || (raw_cs & 3) == 3;
     if from_ring3 {
         crate::exec_profile::time(arch_abi::ExecutionProfileStage::Guest);
@@ -764,7 +770,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
             else if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
             else { KE::PageFault { addr: x86::read_cr2_full() } }
         }
-        32..=47 | 0xF8..=0xFF => { handle_irq(regs); KE::Irq }
+        32..=47 | 0xF8..=0xFE => { handle_irq(regs); KE::Irq }
         // Vectors 3/4 (#BP/#OF) are only reachable from user INT3/INTO, so
         // they're soft ints. Other n<32 are genuine CPU exceptions.
         3 | 4 => KE::SoftInt(int_num as u8),
@@ -824,7 +830,7 @@ fn isr_handler_ring1(regs: &mut Regs) {
                 panic_with_regs("Unhandled page fault in kernel", regs);
             }
         }
-        32..=47 | 0xF8..=0xFF => handle_irq(regs),
+        32..=47 | 0xF8..=0xFE => handle_irq(regs),
         0x80 => arch_dispatch(regs),
         _ => panic_with_regs("Unexpected interrupt in kernel", regs),
     }
@@ -996,7 +1002,7 @@ fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
                 lib::compact_panic!("Unhandled page fault in arch: addr={:#x} err={:#x}", x86::read_cr2(), error);
             }
         }
-        32..=47 | 0xF8..=0xFF => {
+        32..=47 | 0xF8..=0xFE => {
             let mut regs = Regs::empty();
             regs.int_num = int_num;
             handle_irq(&mut regs);
