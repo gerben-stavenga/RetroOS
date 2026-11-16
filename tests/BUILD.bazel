@@ -2125,3 +2125,12 @@ integration_test(
     metal = ["//:boot_disk"],
     tags = ["manual", "no-cache", "no-sandbox", "regression"],
 )
+
+
+integration_test(
+    name = "linux_high_paths",
+    command = ["python3", "test/linux_high_stat.py", "--cpus", "4"],
+    sources = ["//:integration_sources"],
+    metal = ["//:boot_disk"],
+    tags = ["manual", "no-cache", "no-sandbox", "regression", "requires-qemu-kvm"],
+)

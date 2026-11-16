@@ -944,9 +944,9 @@ pub fn resolve_path<'a>(path: &[u8], cwd: &[u8], buf: &'a mut [u8]) -> &'a [u8] 
 }
 
 /// Copy a complete mutation path, rejecting overflow before touching the VFS.
-fn mutation_path<A: crate::Arch>(machine: &mut A, pointer: usize, base: &[u8]) -> Result<alloc::vec::Vec<u8>, i32> {
+fn mutation_path<A: crate::Arch>(machine: &mut A, pointer: u64, base: &[u8]) -> Result<alloc::vec::Vec<u8>, i32> {
     let mut raw = [0; vfs::PATH_KEY_MAX];
-    let n = machine.copy_cstr(pointer, &mut raw);
+    let n = high_memory::copy_cstr(machine, pointer, &mut raw)?;
     if n == raw.len() { return Err(-36); }
     if n == 0 { return Err(-ENOENT); }
     if raw[0] != b'/' && base.len() + n + 1 >= vfs::PATH_KEY_MAX { return Err(-36); }
@@ -1436,7 +1436,8 @@ fn sys_read<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
             if n > 0 && !high_memory::copy_to(machine, buf, &tmp[..n as usize]) { return SyscallResult::val(-14); }
             SyscallResult::val(n)
         }
-        thread::FdKind::ConsoleOut | thread::FdKind::PipeWrite(_) | thread::FdKind::Dir { .. } => {
+        thread::FdKind::Dir { .. } => SyscallResult::val(-21), // EISDIR
+        thread::FdKind::ConsoleOut | thread::FdKind::PipeWrite(_) => {
             SyscallResult::val(-EBADF)
         }
         thread::FdKind::None => SyscallResult::val(-EBADF),
@@ -1468,8 +1469,8 @@ fn sys_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
             if !high_memory::copy_from(machine, buf, &mut tmp) { return SyscallResult::val(-14); }
             for &b in &tmp {
                 lib::term::put_utf8(b);
-                // Keep startup errors after a DOS launch restores its screen.
-                if fd == 2 {
+                // Keep startup errors after DOS restores its screen; trace stdout too.
+                if fd == 2 || crate::kernel::startup::trace_enabled() {
                     lib::log::debug_byte(b);
                 }
             }
@@ -1512,10 +1513,11 @@ fn sys_creat<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
 }
 
 fn sys_open_from<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &LinuxState, a: &Args, base: &[u8]) -> SyscallResult {
-    let path_ptr = a.a0 as usize;
+    let path_ptr = a.a0;
     let mut path_buf = [0u8; vfs::PATH_KEY_MAX];
-    let path_len = machine.copy_cstr(path_ptr, &mut path_buf);
+    let path_len = match high_memory::copy_cstr(machine, path_ptr, &mut path_buf) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if path_len == path_buf.len() { return SyscallResult::val(-36); }
+    if path_len == 0 { return SyscallResult::val(-ENOENT); }
     let path = &path_buf[..path_len];
 
     let mut buf = [0u8; vfs::PATH_KEY_MAX];
@@ -1787,10 +1789,10 @@ fn write_sockaddr_out<A: crate::Arch>(machine: &mut A, addr_ptr: usize, addrlen_
 fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args, regs: &mut Regs) -> SyscallResult {
     use crate::kernel::exec;
 
-    let path_ptr = a.a0 as usize;
+    let path_ptr = a.a0;
 
     let mut raw_path_buf = [0u8; vfs::PATH_KEY_MAX];
-    let raw_path_len = machine.copy_cstr(path_ptr, &mut raw_path_buf);
+    let raw_path_len = match high_memory::copy_cstr(machine, path_ptr, &mut raw_path_buf) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if raw_path_len == raw_path_buf.len() { return SyscallResult::val(-36); }
     let raw_path = &raw_path_buf[..raw_path_len];
     linux_trace!("[LINUX] execve path={}", core::str::from_utf8(raw_path).unwrap_or("<non-UTF8>"));
@@ -2054,7 +2056,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
 /// chdir(12)
 fn sys_chdir<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let mut path_buf = [0u8; vfs::PATH_KEY_MAX];
-    let path_len = machine.copy_cstr(a.a0 as usize, &mut path_buf);
+    let path_len = match high_memory::copy_cstr(machine, a.a0, &mut path_buf) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if path_len == path_buf.len() { return SyscallResult::val(-36); }
     let path = &path_buf[..path_len];
     SyscallResult::val(do_chdir(path, &mut linux.cwd, &mut linux.cwd_len))
@@ -2074,8 +2076,8 @@ fn sys_fchdir<A: crate::Arch>(kt: &thread::KernelThread<A>, linux: &mut LinuxSta
 
 /// lseek(19)
 fn sys_rename<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args) -> SyscallResult {
-    let old = match mutation_path(machine, a.a0 as usize, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
-    let new = match mutation_path(machine, a.a1 as usize, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+    let old = match mutation_path(machine, a.a0, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+    let new = match mutation_path(machine, a.a1, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
     SyscallResult::val(vfs::rename_replace(&old, &new))
 }
 /// renameat resolves each relative path against its own directory descriptor.
@@ -2083,7 +2085,7 @@ fn sys_renameat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, l
     let mut paths = [alloc::vec::Vec::new(), alloc::vec::Vec::new()];
     for (index, fd, pointer) in [(0, a.a0 as i32, a.a1), (1, a.a2 as i32, a.a3)] {
         let mut raw = [0; vfs::PATH_KEY_MAX];
-        let n = machine.copy_cstr(pointer as usize, &mut raw);
+        let n = match high_memory::copy_cstr(machine, pointer, &mut raw) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
         if n == raw.len() { return SyscallResult::val(-36); }
         if n == 0 { return SyscallResult::val(-ENOENT); }
         if raw[0] != b'/' && fd != -100 {
@@ -2103,7 +2105,7 @@ fn sys_renameat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, l
 }
 
 fn sys_path_mutation<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args, nr: u32) -> SyscallResult {
-    let path = match mutation_path(machine, a.a0 as usize, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+    let path = match mutation_path(machine, a.a0, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
     SyscallResult::val(match nr {39 => vfs::mkdir_mode(&path, a.a1 as u32 & 0o7777 & !linux.creation_mask),40 => vfs::rmdir(&path),_ => vfs::delete(&path)})
 }
 fn sys_umask(linux: &mut LinuxState, a: &Args) -> SyscallResult {
@@ -2115,7 +2117,7 @@ fn sys_umask(linux: &mut LinuxState, a: &Args) -> SyscallResult {
 fn sys_mkdirat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, linux: &LinuxState, a: &Args) -> SyscallResult {
     let fd = a.a0 as i32;
     let mut raw = [0; vfs::PATH_KEY_MAX];
-    let n = machine.copy_cstr(a.a1 as usize, &mut raw);
+    let n = match high_memory::copy_cstr(machine, a.a1, &mut raw) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if n == raw.len() { return SyscallResult::val(-36); }
     if n == 0 { return SyscallResult::val(-ENOENT); }
     if raw[0] != b'/' && fd != -100 {
@@ -2127,7 +2129,7 @@ fn sys_mkdirat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, li
     }
     let mut directory = [0; vfs::DIR_PATH_MAX];
     let base = at_base(kt, linux, fd, &mut directory);
-    let path = match mutation_path(machine, a.a1 as usize, base) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+    let path = match mutation_path(machine, a.a1, base) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
     SyscallResult::val(vfs::mkdir_mode(&path, a.a2 as u32 & 0o7777 & !linux.creation_mask))
 }
 
@@ -2257,9 +2259,9 @@ fn sys_ioctl<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
 
 fn sys_symlink<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, linux: &LinuxState, args: &Args, at: bool) -> SyscallResult {
     let mut target = [0; vfs::PATH_KEY_MAX];
-    let target_len = machine.copy_cstr(args.a0 as usize, &mut target);
+    let target_len = match high_memory::copy_cstr(machine, args.a0, &mut target) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     let mut raw = [0; vfs::PATH_KEY_MAX];
-    let raw_len = machine.copy_cstr((if at { args.a2 } else { args.a1 }) as usize, &mut raw);
+    let raw_len = match high_memory::copy_cstr(machine, if at { args.a2 } else { args.a1 }, &mut raw) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if target_len == target.len() || raw_len == raw.len() { return SyscallResult::val(-36); }
     if target_len == 0 || raw_len == 0 { return SyscallResult::val(-ENOENT); }
     let dirfd = if at { args.a1 as i32 } else { -100 };
@@ -2282,22 +2284,22 @@ fn readlink_at<A: crate::Arch>(
     machine: &mut A,
     kt: &thread::KernelThread<A>,
     linux: &LinuxState,
-    path_ptr: usize,
+    path_ptr: u64,
     base: &[u8],
-    buf: usize,
+    buf: u64,
     bufsz: usize,
 ) -> SyscallResult {
     let executable = linux.exec_path_str();
     if bufsz == 0 { return SyscallResult::val(-EINVAL); }
     let mut self_exe_buf = [0u8; vfs::PATH_KEY_MAX];
-    let self_exe_len = machine.copy_cstr(path_ptr, &mut self_exe_buf);
+    let self_exe_len = match high_memory::copy_cstr(machine, path_ptr, &mut self_exe_buf) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     let is_self_exe = &self_exe_buf[..self_exe_len] == b"/proc/self/exe";
     if is_self_exe {
         if executable.is_empty() { return SyscallResult::val(-ENOENT); }
         let target = if executable.starts_with(b"/") { executable.to_vec() }
             else { [b"/".as_slice(), executable].concat() };
         let n = target.len().min(bufsz);
-        machine.copy_to(buf, &target[..n]);
+        if !high_memory::copy_to(machine, buf, &target[..n]) { return SyscallResult::val(-14); }
         return SyscallResult::val(n as i32);
     }
 
@@ -2310,14 +2312,14 @@ fn readlink_at<A: crate::Arch>(
     if let Some(target) = proc_fd::readlink(kt, linux, resolved) {
         let Some(target) = target else { return SyscallResult::val(-ENOENT); };
         let count = target.len().min(bufsz);
-        machine.copy_to(buf, &target[..count]);
+        if !high_memory::copy_to(machine, buf, &target[..count]) { return SyscallResult::val(-14); }
         return SyscallResult::val(count as i32);
     }
     if proc_fd::is_dir(resolved) { return SyscallResult::val(-EINVAL); }
     let mut target = [0u8; vfs::DIR_PATH_MAX];
     match vfs::readlink(resolved, &mut target[..bufsz.min(vfs::DIR_PATH_MAX)]) {
         Some(n) => {
-            machine.copy_to(buf, &target[..n]);
+            if !high_memory::copy_to(machine, buf, &target[..n]) { return SyscallResult::val(-14); }
             SyscallResult::val(n as i32)
         }
         // realpath uses ENOENT to reject a missing component, and EINVAL
@@ -2337,9 +2339,9 @@ fn sys_readlink<A: crate::Arch>(
         machine,
         kt,
         linux,
-        a.a0 as usize,
+        a.a0,
         linux.cwd_str(),
-        a.a1 as usize,
+        a.a1,
         a.a2 as usize,
     )
 }
@@ -2357,9 +2359,9 @@ fn sys_readlinkat<A: crate::Arch>(
         machine,
         kt,
         linux,
-        a.a1 as usize,
+        a.a1,
         base,
-        a.a2 as usize,
+        a.a2,
         a.a3 as usize,
     )
 }
@@ -2395,7 +2397,7 @@ fn sys_link<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, linux
 }
 
 fn sys_access<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
-    access_at(machine, linux, a.a0 as usize)
+    access_at(machine, linux, a.a0)
 }
 
 /// faccessat(269) / faccessat2(439) — path at a.a1; only AT_FDCWD dirfds are
@@ -2406,13 +2408,13 @@ fn sys_faccessat<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args) 
     if a.a0 as i32 != AT_FDCWD {
         return SyscallResult::val(-EBADF);
     }
-    access_at(machine, linux, a.a1 as usize)
+    access_at(machine, linux, a.a1)
 }
 
 /// Existence check behind access/faccessat, including directories.
-fn access_at<A: crate::Arch>(machine: &mut A, linux: &LinuxState, path_ptr: usize) -> SyscallResult {
+fn access_at<A: crate::Arch>(machine: &mut A, linux: &LinuxState, path_ptr: u64) -> SyscallResult {
     let mut path_buf = [0u8; vfs::PATH_KEY_MAX];
-    let path_len = machine.copy_cstr(path_ptr, &mut path_buf);
+    let path_len = match high_memory::copy_cstr(machine, path_ptr, &mut path_buf) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if path_len == path_buf.len() { return SyscallResult::val(-36); }
     let path = &path_buf[..path_len];
     let mut buf = [0u8; vfs::PATH_KEY_MAX];
@@ -2498,7 +2500,7 @@ fn sys_fchmod<A: crate::Arch>(kt: &thread::KernelThread<A>, args: &Args) -> Sysc
 }
 fn sys_unlinkat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, linux: &LinuxState, args: &Args) -> SyscallResult {
     if args.a2 & !0x200 != 0 { return SyscallResult::val(-EINVAL); }
-    let mut raw = [0; vfs::PATH_KEY_MAX]; let n = machine.copy_cstr(args.a1 as usize, &mut raw);
+    let mut raw = [0; vfs::PATH_KEY_MAX]; let n = match high_memory::copy_cstr(machine, args.a1, &mut raw) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if n == raw.len() { return SyscallResult::val(-36); }
     if n == 0 { return SyscallResult::val(-ENOENT); }
     let fd = args.a0 as i32;
@@ -2507,11 +2509,11 @@ fn sys_unlinkat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, l
         return SyscallResult::val(-EBADF);
     }
     let mut base = [0; vfs::DIR_PATH_MAX];
-    let path = match mutation_path(machine, args.a1 as usize, at_base(kt, linux, fd, &mut base)) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+    let path = match mutation_path(machine, args.a1, at_base(kt, linux, fd, &mut base)) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
     SyscallResult::val(if args.a2 & 0x200 != 0 { vfs::rmdir(&path) } else { vfs::delete(&path) })
 }
 fn sys_chmod<A: crate::Arch>(machine: &mut A, linux: &LinuxState, args: &Args) -> SyscallResult {
-    let path = match mutation_path(machine, args.a0 as usize, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+    let path = match mutation_path(machine, args.a0, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
     SyscallResult::val(vfs::set_path_mode(&path, args.a1 as u32 & 0o7777))
 }
 
@@ -2519,7 +2521,7 @@ fn sys_fchmodat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, l
     let flags = if with_flags { args.a3 } else { 0 };
     if flags & !0x1100 != 0 { return SyscallResult::val(-EINVAL); }
     let mut raw = [0; vfs::PATH_KEY_MAX];
-    let length = machine.copy_cstr(args.a1 as usize, &mut raw);
+    let length = match high_memory::copy_cstr(machine, args.a1, &mut raw) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if length == raw.len() { return SyscallResult::val(-36); }
     if length == 0 {
         return if flags & 0x1000 != 0 {
@@ -2539,7 +2541,7 @@ fn sys_fchmodat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, l
         }
     }
     let mut directory = [0; vfs::DIR_PATH_MAX];
-    let path = match mutation_path(machine, args.a1 as usize, at_base(kt, linux, fd, &mut directory)) {
+    let path = match mutation_path(machine, args.a1, at_base(kt, linux, fd, &mut directory)) {
         Ok(path) => path, Err(error) => return SyscallResult::val(error),
     };
     if flags & 0x100 != 0 && vfs::stat(&path, false).is_some_and(|stat| stat.is_symlink) {
@@ -2976,15 +2978,17 @@ fn sys_poll<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
 
 /// getcwd(183)
 fn sys_getcwd<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
-    let ptr = a.a0 as usize;
-    let size = a.a1 as usize;
     let cwd = linux.cwd_str();
-    // Linux getcwd returns absolute path with leading /
-    if size < cwd.len() + 2 { return SyscallResult::val(-EINVAL); }
-    machine.write::<u8>(ptr, b'/');
-    machine.copy_to(ptr + 1, cwd);
-    machine.write::<u8>(ptr + 1 + cwd.len(), 0); // NUL
-    SyscallResult::val((cwd.len() + 2) as i32)
+    // Linux includes the terminating NUL in the returned length.
+    let len = cwd.len() + 2;
+    if a.a1 < len as u64 { return SyscallResult::val(-34); } // ERANGE
+    let mut path = alloc::vec![0u8; len];
+    path[0] = b'/';
+    path[1..len - 1].copy_from_slice(cwd);
+    if !high_memory::copy_to(machine, a.a0, &path) {
+        return SyscallResult::val(-14); // EFAULT
+    }
+    SyscallResult::val(len as i32)
 }
 
 /// mmap2(192) — anonymous private only
@@ -3193,7 +3197,7 @@ fn sys_utimensat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, 
     if times == [None, None] { return SyscallResult::val(0); }
     let fd = a.a0 as i32;
     let mut raw = [0; vfs::PATH_KEY_MAX];
-    let length = if a.a1 == 0 { 0 } else { machine.copy_cstr(a.a1 as usize, &mut raw) };
+    let length = if a.a1 == 0 { 0 } else { match high_memory::copy_cstr(machine, a.a1, &mut raw) { Ok(n) => n, Err(error) => return SyscallResult::val(error) } };
     if length == raw.len() { return SyscallResult::val(-36); }
     if a.a1 == 0 || (length == 0 && a.a3 & 0x1000 != 0 && fd >= 0) {
         let path = match kt.fds.get(fd as usize) {
@@ -3532,7 +3536,7 @@ fn write_stat_old<A: crate::Arch>(machine: &mut A, buf: usize, mode: u32, size: 
 /// stat(106) / lstat(107) — old struct stat layout.
 fn sys_stat_old<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, linux: &LinuxState, a: &Args, follow_final: bool) -> SyscallResult {
     let mut path_buf = [0u8; vfs::PATH_KEY_MAX];
-    let path_len = machine.copy_cstr(a.a0 as usize, &mut path_buf);
+    let path_len = match high_memory::copy_cstr(machine, a.a0, &mut path_buf) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if path_len == path_buf.len() { return SyscallResult::val(-36); }
     let path = &path_buf[..path_len];
     let stat_buf = a.a1 as usize;
@@ -3704,7 +3708,7 @@ fn sys_arch_prctl<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThrea
 fn sys_openat<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &LinuxState, a: &Args) -> SyscallResult {
     let dirfd = a.a0 as i32;
     let mut path = [0; vfs::PATH_KEY_MAX];
-    let length = machine.copy_cstr(a.a1 as usize, &mut path);
+    let length = match high_memory::copy_cstr(machine, a.a1, &mut path) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if length == path.len() { return SyscallResult::val(-36); }
     if length == 0 { return SyscallResult::val(-ENOENT); }
     if path[0] != b'/' && dirfd != -100 {

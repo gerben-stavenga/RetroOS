@@ -35,7 +35,7 @@ pub(super) fn proc_target(state: &State, fd: usize) -> Option<Vec<u8>> {
 enum Wait {
     Ready,
     Futex(u64, Option<u32>, u64),
-    Epoll(i32, usize, usize, u64),
+    Epoll(i32, u64, usize, u64),
     Sleep(u64),
     Poll(usize, usize, u64),
     Select,
@@ -273,7 +273,7 @@ fn epoll<A: crate::Arch>(
     kt: &thread::KernelThread<A>,
     s: &mut State,
     fd: i32,
-    out: usize,
+    out: u64,
     max: usize,
 ) -> i32 {
     let Some(Descriptor::Epoll(watches)) = descriptor(s, fd) else {
@@ -304,8 +304,11 @@ fn epoll<A: crate::Arch>(
             w.read_sequence = sequence;
         }
         if w.enabled && deliver != 0 && n < max {
-            machine.write::<u32>(out + n * 12, deliver);
-            machine.write::<u64>(out + n * 12 + 4, w.data);
+            let mut event = [0; 12];
+            event[..4].copy_from_slice(&deliver.to_le_bytes());
+            event[4..].copy_from_slice(&w.data.to_le_bytes());
+            let Some(pointer) = out.checked_add(n as u64 * 12) else { return -EFAULT; };
+            if !high_memory::copy_to(machine, pointer, &event) { return -EFAULT; }
             n += 1;
             if w.events & (1 << 30) != 0 {
                 w.enabled = false;
@@ -482,9 +485,10 @@ pub(super) fn call<A: crate::Arch>(
             {
                 -EBADF
             } else {
-                let ptr = a.a3 as usize;
                 let event = if a.a1 != 2 {
-                    (machine.read::<u32>(ptr), machine.read::<u64>(ptr + 4))
+                    let mut bytes = [0; 12];
+                    if !high_memory::copy_from(machine, a.a3, &mut bytes) { return Some(SyscallResult::val(-EFAULT)); }
+                    (u32::from_le_bytes(bytes[..4].try_into().unwrap()), u64::from_le_bytes(bytes[4..].try_into().unwrap()))
                 } else {
                     (0, 0)
                 };
@@ -580,12 +584,12 @@ pub(super) fn call<A: crate::Arch>(
             if a.a2 == 0 || a.a2 > i32::MAX as u64 {
                 -EINVAL
             } else {
-                let n = epoll(machine, kt, s, fd, a.a1 as usize, a.a2 as usize);
+                let n = epoll(machine, kt, s, fd, a.a1, a.a2 as usize);
                 if n == 0 && a.a3 as i32 != 0 {
                     ensure(machine, kt, s, regs);
                     s.contexts[s.active].wait = Wait::Epoll(
                         fd,
-                        a.a1 as usize,
+                        a.a1,
                         a.a2 as usize,
                         deadline(machine, a.a3 as i32),
                     );
@@ -912,9 +916,8 @@ pub(super) fn call<A: crate::Arch>(
             if a.a1 < 8 {
                 -EINVAL
             } else {
-                machine.zero(a.a2 as usize, a.a1 as usize);
-                machine.write::<u64>(a.a2 as usize, crate::kernel::parallel::cpu_mask::<A>());
-                8
+                let mask = crate::kernel::parallel::cpu_mask::<A>().to_le_bytes();
+                if super::high_memory::copy_to(machine, a.a2, &mask) { 8 } else { -14 }
             }
         }
         _ => return None,
