@@ -288,7 +288,7 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
     };
     assert_eq!(arch_metal::boot_mem::pool_end(), arch_metal::heap_base());
     if use_x2 {
-        assert_ne!(x86::cpuid(1).2 & (1 << 21), 0);
+        assert!(x86::cpu_capabilities().x2apic());
         unsafe {
             x86::wrmsr(0x1b, x86::rdmsr(0x1b) | (1 << 10));
         }

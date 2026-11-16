@@ -53,12 +53,13 @@ pub(super) fn enable_media() {
 // No shared clock or interrupts yet. Prefer the architectural TSC ratio;
 // otherwise use PIT channel 2, with a bounded probe for machines without PIT.
 fn calibrate() -> bool {
-    if x86::cpuid(1).3 & (1 << 4) == 0 {
+    let cpu = x86::cpu_capabilities();
+    if !cpu.tsc() {
         return false;
     }
     let mut hz = 0u64;
-    if x86::cpuid(0).0 >= 0x15 {
-        let (den, num, crystal, _) = x86::cpuid(0x15);
+    if let Some(ratio) = cpu.tsc_ratio {
+        let (den, num, crystal) = (ratio.denominator, ratio.numerator, ratio.crystal_hz);
         if den != 0 && num != 0 {
             hz = u64::from(crystal) * u64::from(num) / u64::from(den);
         }

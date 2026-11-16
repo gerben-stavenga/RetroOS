@@ -106,7 +106,5 @@ pub fn release_page(page: u64) {
 pub fn physical_page_limit() -> u64 {
     use crate::paging2::{self, CpuMode, PAGE_SIZE};
     if paging2::cpu_mode() == CpuMode::Legacy { return (1u64 << 32) / PAGE_SIZE as u64; }
-    let (max, _, _, _) = crate::x86::cpuid(0x8000_0000);
-    let bits = if max >= 0x8000_0008 { crate::x86::cpuid(0x8000_0008).0 & 255 } else { 36 };
-    (1u64 << bits.clamp(32, 52)) / PAGE_SIZE as u64
+    (1u64 << crate::x86::cpu_capabilities().physical_address_bits()) / PAGE_SIZE as u64
 }

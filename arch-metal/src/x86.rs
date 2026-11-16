@@ -1,6 +1,114 @@
 //! x86 CPU control and I/O routines
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// Architectural capabilities shared by all cores. Published once by the BSP.
+#[derive(Clone, Copy)]
+pub struct CpuCapabilities {
+    features: u32,
+    physical_bits: u32,
+    pub family: u32,
+    pub vendor: [u8; 12],
+    pub tsc_ratio: Option<TscRatio>,
+    pub frequency: Option<CpuFrequency>,
+}
+
+#[derive(Clone, Copy)]
+pub struct TscRatio {
+    pub denominator: u32,
+    pub numerator: u32,
+    pub crystal_hz: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct CpuFrequency {
+    pub base_mhz: u32,
+    pub max_mhz: u32,
+    pub bus_mhz: u32,
+}
+
+impl CpuCapabilities {
+    pub fn cr4(&self) -> bool { self.features & 1 != 0 }
+    pub fn pae(&self) -> bool { self.features & (1 << 1) != 0 }
+    pub fn long_mode(&self) -> bool { self.features & (1 << 2) != 0 }
+    pub fn nx(&self) -> bool { self.features & (1 << 3) != 0 }
+    pub fn pat(&self) -> bool { self.features & (1 << 4) != 0 }
+    pub fn vme(&self) -> bool { self.features & (1 << 5) != 0 }
+    pub fn sse(&self) -> bool { self.features & (1 << 6) != 0 }
+    pub fn sse2(&self) -> bool { self.features & (1 << 7) != 0 }
+    pub fn tsc(&self) -> bool { self.features & (1 << 8) != 0 }
+    pub fn apic(&self) -> bool { self.features & (1 << 9) != 0 }
+    pub fn x2apic(&self) -> bool { self.features & (1 << 10) != 0 }
+    pub fn tsc_deadline(&self) -> bool { self.features & (1 << 11) != 0 }
+    pub fn invariant_tsc(&self) -> bool { self.features & (1 << 12) != 0 }
+    pub fn hypervisor(&self) -> bool { self.features & (1 << 13) != 0 }
+    pub fn qemu_tcg(&self) -> bool { self.features & (1 << 14) != 0 }
+    pub fn physical_address_bits(&self) -> u32 { self.physical_bits }
+}
+
+static CAPABILITIES_READY: AtomicBool = AtomicBool::new(false);
+static mut CPU_CAPABILITIES: Option<CpuCapabilities> = None;
+
+// Processor identity is inherently local, unlike architectural capabilities.
+#[thread_local]
+static mut APIC_ID: Option<u32> = None;
+
+pub fn cpu_capabilities() -> &'static CpuCapabilities {
+    assert!(CAPABILITIES_READY.load(Ordering::Acquire), "CPU capabilities not initialized");
+    // The BSP publishes once, before AP startup; no writes follow publication.
+    unsafe { (&*(&raw const CPU_CAPABILITIES)).as_ref().unwrap() }
+}
+
+/// Probe only during core initialization. APs must support the BSP's choices.
+/// # Safety
+/// The BSP must call once, before starting APs. Each AP calls during its startup.
+pub(crate) unsafe fn init_cpu_capabilities(bsp: bool) {
+    let (max, vb, vc, vd) = raw_cpuid(0, 0);
+    let basic = if max >= 1 { raw_cpuid(1, 0) } else { (0, 0, 0, 0) };
+    let (signature, _, ecx, edx) = basic;
+    let max_ext = raw_cpuid(0x8000_0000, 0).0;
+    let extended = if max_ext >= 0x8000_0001 { raw_cpuid(0x8000_0001, 0).3 } else { 0 };
+    let physical_bits = if max_ext >= 0x8000_0008 { raw_cpuid(0x8000_0008, 0).0 & 255 } else { 36 };
+    let invariant_tsc = max_ext >= 0x8000_0007 && raw_cpuid(0x8000_0007, 0).3 & (1 << 8) != 0;
+    let hypervisor = ecx & (1 << 31) != 0;
+    let qemu_tcg = hypervisor && raw_cpuid(0x4000_0000, 0).1 == 0x5447_4354;
+    let family = (signature >> 8) & 15;
+    let family = if family == 15 { family + ((signature >> 20) & 255) } else { family };
+    let supported = [
+        family >= 5, edx & (1 << 6) != 0, extended & (1 << 29) != 0,
+        extended & (1 << 20) != 0, edx & (1 << 16) != 0,
+        edx & (1 << 1) != 0, edx & (1 << 25) != 0, edx & (1 << 26) != 0,
+        edx & (1 << 4) != 0, edx & (1 << 9) != 0, ecx & (1 << 21) != 0,
+        ecx & (1 << 24) != 0, invariant_tsc, hypervisor, qemu_tcg,
+    ];
+    let features = supported.into_iter().enumerate()
+        .fold(0, |bits, (index, present)| bits | (u32::from(present) << index));
+    let mut vendor = [0; 12];
+    vendor[..4].copy_from_slice(&vb.to_le_bytes());
+    vendor[4..8].copy_from_slice(&vd.to_le_bytes());
+    vendor[8..].copy_from_slice(&vc.to_le_bytes());
+    let tsc_ratio = (max >= 0x15).then(|| {
+        let (denominator, numerator, crystal_hz, _) = raw_cpuid(0x15, 0);
+        TscRatio { denominator, numerator, crystal_hz }
+    });
+    let frequency = (max >= 0x16).then(|| {
+        let (base, max, bus, _) = raw_cpuid(0x16, 0);
+        CpuFrequency { base_mhz: base & 0xffff, max_mhz: max & 0xffff, bus_mhz: bus & 0xffff }
+    });
+    let detected = CpuCapabilities { features, physical_bits: physical_bits.clamp(32, 52), family, vendor, tsc_ratio, frequency };
+    unsafe { APIC_ID = probe_apic_id(max, basic); }
+    if bsp {
+        assert!(!CAPABILITIES_READY.load(Ordering::Relaxed), "CPU capabilities already initialized");
+        unsafe { CPU_CAPABILITIES = Some(detected); }
+        CAPABILITIES_READY.store(true, Ordering::Release);
+    } else {
+        let required = cpu_capabilities();
+        assert!(detected.features & required.features == required.features
+            && detected.physical_bits >= required.physical_bits,
+            "AP lacks BSP architectural capabilities");
+    }
+}
 
 /// FPU/SSE state save area.
 /// 512 bytes, 16-byte aligned (required by FXSAVE; FSAVE only uses 108
@@ -191,7 +299,7 @@ pub fn invlpg(addr: usize) {
 pub fn read_cr4() -> u32 {
     // CR4 was introduced with the Pentium. Some late 486s have CPUID, so
     // CPUID availability alone does not establish that CR4 exists.
-    if cpuid(0).0 < 1 || ((cpuid(1).0 >> 8) & 0xf) < 5 { return 0; }
+    if !cpu_capabilities().cr4() { return 0; }
     let value: u32;
     unsafe {
         asm!("mov {}, cr4", out(reg) value, options(nomem, nostack));
@@ -223,16 +331,8 @@ pub fn rdtsc() -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-/// Execute CPUID with subleaf zero.
-#[inline]
-pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
-    cpuid_count(leaf, 0)
-}
-
-/// Execute CPUID with an explicit ECX subleaf. Returns zeros on CPUs without
-/// CPUID, so this is also usable during early boot before installing an IDT.
-#[inline]
-pub fn cpuid_count(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+/// Initialization only. Returns zeros on CPUs without CPUID.
+fn raw_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     // A 386 and early 486 have no CPUID. The EFLAGS ID bit is writable only
     // when CPUID exists; probing it avoids a #UD before the IDT is installed.
     let id_changed: u32;
@@ -274,22 +374,20 @@ pub fn cpuid_count(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     (eax, ebx, ecx, edx)
 }
 
-/// Hardware APIC ID of the executing logical processor (including SMT threads).
+/// Hardware APIC ID captured during this core's initialization.
 /// IDs may be sparse; this is neither a dense core index nor a BSP indicator.
-/// Does not need paging, TLS, or a mapped/enabled local APIC. Returns `None`
-/// when CPUID or a local APIC is unavailable. The legacy fallback is 8 bits.
 pub fn current_apic_id() -> Option<u32> {
-    let max = cpuid(0).0;
-    if max < 1 {
-        return None;
-    }
-    let (_, legacy_id, _, features) = cpuid(1);
+    unsafe { APIC_ID }
+}
+
+fn probe_apic_id(max: u32, basic: (u32, u32, u32, u32)) -> Option<u32> {
+    let (_, legacy_id, _, features) = basic;
     if features & (1 << 9) == 0 {
         return None;
     }
     for leaf in [0x1f, 0x0b] {
         if max >= leaf {
-            let (_, count, _, id) = cpuid_count(leaf, 0);
+            let (_, count, _, id) = raw_cpuid(leaf, 0);
             // A maximum leaf alone does not establish topology-leaf support.
             if count & 0xffff != 0 {
                 return Some(id);

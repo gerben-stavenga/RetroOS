@@ -345,8 +345,7 @@ unsafe fn prepare_boot(
     crate::kernel::klog::init_early();
     lib::log::set_debug_sink(log_byte);
     lib::log::set_fatal_handler(fatal_finish);
-    let (_, _, _, cpu_features) = x86::cpuid(1);
-    if cpu_features & (1 << 1) != 0 {
+    if x86::cpu_capabilities().vme() {
         lib::compact_println!("VME enabled");
     } else {
         lib::compact_println!("VME not supported, using software VM86 monitor");

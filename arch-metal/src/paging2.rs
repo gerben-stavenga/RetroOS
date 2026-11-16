@@ -1236,30 +1236,22 @@ pub fn finish_setup_paging() {
 
 /// Check if CPU supports PAE (CPUID.1:EDX bit 6)
 pub fn cpu_supports_pae() -> bool {
-    let (_, _, _, edx) = crate::x86::cpuid(1);
-    edx & (1 << 6) != 0
+    crate::x86::cpu_capabilities().pae()
 }
 
 /// Check if CPU supports long mode (CPUID.80000001:EDX bit 29)
 pub fn cpu_supports_long_mode() -> bool {
-    let (max_ext, _, _, _) = crate::x86::cpuid(0x80000000);
-    if max_ext < 0x80000001 { return false; }
-    let (_, _, _, edx) = crate::x86::cpuid(0x80000001);
-    edx & (1 << 29) != 0
+    crate::x86::cpu_capabilities().long_mode()
 }
 
 /// Check if CPU supports NX/XD bit (CPUID.80000001:EDX bit 20)
 pub fn cpu_supports_nx() -> bool {
-    let (max_ext, _, _, _) = crate::x86::cpuid(0x80000000);
-    if max_ext < 0x80000001 { return false; }
-    let (_, _, _, edx) = crate::x86::cpuid(0x80000001);
-    edx & (1 << 20) != 0
+    crate::x86::cpu_capabilities().nx()
 }
 
 /// Check if CPU supports the Page Attribute Table (CPUID.1:EDX bit 16).
 pub fn cpu_supports_pat() -> bool {
-    let (_, _, _, edx) = crate::x86::cpuid(1);
-    edx & (1 << 16) != 0
+    crate::x86::cpu_capabilities().pat()
 }
 
 /// Set when `enable_wc_pat` programmed the WC PAT slot. `fbcon` checks this to

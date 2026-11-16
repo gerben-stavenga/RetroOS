@@ -312,7 +312,10 @@ fn arch_dispatch(regs: &mut Regs) {
             regs.rax = crate::descriptors::set_tls_entry(index, base, limit, limit_in_pages) as u64;
             // Also write FS_BASE MSR so 32-bit compat mode picks up the
             // correct hidden base (the 32-bit iret path doesn't touch the MSR).
-            unsafe { crate::x86::wrmsr(0xC000_0100, base as u64); }
+            // CPUs without long mode have no FS_BASE MSR; the GDT suffices.
+            if paging2::cpu_supports_long_mode() {
+                unsafe { crate::x86::wrmsr(0xC000_0100, base as u64); }
+            }
         }
         arch_call::SET_DEBUG_WATCH => {
             unsafe {

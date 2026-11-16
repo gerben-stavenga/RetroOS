@@ -787,10 +787,9 @@ pub(crate) fn framebuffer_map_policy() -> FramebufferMapPolicy {
     #[cfg(target_arch = "x86")]
     {
         use crate::arch::{paging2, x86};
-        let (_, hv_ebx, _, _) = x86::cpuid(0x4000_0000);
-        let (_, _, ecx, edx) = x86::cpuid(1);
-        let hypervisor = ecx & (1 << 31) != 0;
-        let qemu_tcg = hypervisor && hv_ebx == 0x5447_4354;
+        let cpu = x86::cpu_capabilities();
+        let hypervisor = cpu.hypervisor();
+        let qemu_tcg = cpu.qemu_tcg();
         let wc = paging2::wc_pat_enabled();
         let cache = if wc && !qemu_tcg { paging2::flags::WRITE_COMBINE }
             else { paging2::flags::CACHE_DISABLE };
@@ -798,7 +797,7 @@ pub(crate) fn framebuffer_map_policy() -> FramebufferMapPolicy {
             flags: cache | paging2::flags::FOREIGN,
             slow: qemu_tcg,
             // The wide blitter needs SSE2, not merely PAT support.
-            wide: wc && edx & (1 << 26) != 0 && !hypervisor,
+            wide: wc && cpu.sse2() && !hypervisor,
         }
     }
     #[cfg(not(target_arch = "x86"))]

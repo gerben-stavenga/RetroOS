@@ -541,13 +541,13 @@ pub fn setup_descriptor_tables(arch_stack_top: u32) {
     }
 
     // Enable VME if supported (hardware-accelerated VM86: CLI/STI/PUSHF/POPF/IRET use VIF)
-    let (_, _, _, edx) = x86::cpuid(1);
-    if edx & (1 << 1) != 0 {
+    let capabilities = x86::cpu_capabilities();
+    if capabilities.vme() {
         unsafe { x86::write_cr4(x86::read_cr4() | x86::cr4::VME); }
     }
 
     // Enable SSE if supported; always init x87.
-    let has_fxsr = edx & (1 << 25) != 0;
+    let has_fxsr = capabilities.sse();
     if has_fxsr {
         unsafe {
             // CR4: OSFXSR + OSXMMEXCPT

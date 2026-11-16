@@ -333,20 +333,15 @@ fn init_hpet(physical_base: Option<u64>) -> Option<(u64, u64)> {
     Some((hz, mask))
 }
 
-fn invariant_tsc() -> bool {
-    let (max, _, _, _) = crate::x86::cpuid(0x8000_0000);
-    max >= 0x8000_0007 && crate::x86::cpuid(0x8000_0007).3 & (1 << 8) != 0
-}
-
 /// A hypervisor owns the virtual CPU's TSC and this kernel runs only one CPU,
 /// so there is neither package skew nor migration between counters. Calibrate
 /// it against HPET just like an invariant hardware TSC, even when the virtual
 /// CPU model neglects to advertise CPUID.80000007H:EDX.invariant_tsc.
 fn stable_tsc() -> bool {
-    let (_, _, ecx, edx) = crate::x86::cpuid(1);
+    let cpu = crate::x86::cpu_capabilities();
     // Hypervisor presence says nothing about instruction availability. Old
     // CPUs (and deliberately restricted VM models) must use HPET/PIT instead.
-    edx & (1 << 4) != 0 && (invariant_tsc() || ecx & (1 << 31) != 0)
+    cpu.tsc() && (cpu.invariant_tsc() || cpu.hypervisor())
 }
 
 fn calibrate_tsc(hpet: Option<(u64, u64)>) -> Option<u64> {
@@ -497,8 +492,7 @@ fn calibrate_lapic_via_pit2() -> Option<u64> {
 fn setup_lapic_timer() -> bool {
     // APIC-base MSR is architectural only from P6; a P5-class part #GPs on the
     // RDMSR (86Box pentium_p54c). Pre-P6 is a pure-PIC machine anyway.
-    let (sig, _, _, _) = crate::x86::cpuid(1);
-    if (sig >> 8) & 0xF < 6 {
+    if crate::x86::cpu_capabilities().family < 6 {
         return false;
     }
     let base = crate::x86::rdmsr(IA32_APIC_BASE);
@@ -533,7 +527,7 @@ fn setup_lapic_timer() -> bool {
     unsafe {
         LAPIC_HZ = frequency;
         TSC_DEADLINE = matches!(CLOCK.source, ClockSource::Tsc)
-            && crate::x86::cpuid(1).2 & (1 << 24) != 0;
+            && crate::x86::cpu_capabilities().tsc_deadline();
     }
     // One interrupt checks delivery after IF is enabled. There is no boot heartbeat.
     let init_count = (frequency / 1000).max(1).min(u32::MAX as u64) as u32;
@@ -554,9 +548,8 @@ fn legacy_intr_and_pit() {
     const APIC_SOFTWARE_ENABLE: u64 = 1 << 8;
     const APIC_DELIVERY_EXTINT: u64 = 7 << 8;
 
-    let (sig, _, _, edx) = crate::x86::cpuid(1);
-    let family = (sig >> 8) & 0xF;
-    if family >= 6 && edx & (1 << 9) != 0 {
+    let cpu = crate::x86::cpu_capabilities();
+    if cpu.family >= 6 && cpu.apic() {
         let base = crate::x86::rdmsr(IA32_APIC_BASE);
         if base & (APIC_BASE_ENABLE | APIC_BASE_X2) == (APIC_BASE_ENABLE | APIC_BASE_X2) {
             let svr = crate::x86::rdmsr(X2APIC_SVR);
@@ -681,11 +674,11 @@ pub fn init_interrupts(
     // Record the firmware APIC state before our fallback can disable xAPIC.
     // CPUID's APIC bit may itself clear after that transition, so the later
     // self-test alone cannot reveal what the firmware configured.
-    let (sig, _, _, edx) = crate::x86::cpuid(1);
-    if (sig >> 8) & 0xF >= 6 {
+    let cpu = crate::x86::cpu_capabilities();
+    if cpu.family >= 6 {
         lib::compact_println!(
             "IRQ: APIC initial cpuid={} base={:#x}",
-            (edx & (1 << 9) != 0) as u8,
+            cpu.apic() as u8,
             crate::x86::rdmsr(IA32_APIC_BASE),
         );
     }
@@ -881,9 +874,9 @@ pub fn timer_selftest(screen: &mut lib::term::Term) {
     // --- 3. APIC routing recap. CPUID may hide the APIC feature even when
     // IA32_APIC_BASE is readable. setup_lapic_timer() already reads this MSR
     // on family >= 6, so inspect the actual base and LINT0 state here too.
-    let (sig, _, ecx1, edx1) = crate::x86::cpuid(1);
-    let family = (sig >> 8) & 0xF;
-    let cpuid_apic = edx1 & (1 << 9) != 0;
+    let cpu = crate::x86::cpu_capabilities();
+    let family = cpu.family;
+    let cpuid_apic = cpu.apic();
     if family >= 6 {
         let base = crate::x86::rdmsr(IA32_APIC_BASE);
         if base & APIC_BASE_ENABLE != 0 {
@@ -906,30 +899,22 @@ pub fn timer_selftest(screen: &mut lib::term::Term) {
 
     // --- 4. CPU timer capabilities — picks the LAPIC-timer calibration path
     // (no PIT means TSC/CPUID is the only fixed reference we have).
-    let (maxleaf, vb, vc, vd) = crate::x86::cpuid(0);
-    let vendor = [
-        vb as u8, (vb >> 8) as u8, (vb >> 16) as u8, (vb >> 24) as u8,
-        vd as u8, (vd >> 8) as u8, (vd >> 16) as u8, (vd >> 24) as u8,
-        vc as u8, (vc >> 8) as u8, (vc >> 16) as u8, (vc >> 24) as u8,
-    ];
     lib::compact_screenln!(screen,
         "SELFTEST CPU vendor={} family={} tsc_deadline={} x2apic_cap={} invtsc={}",
-        core::str::from_utf8(&vendor).unwrap_or("????????????"),
-        family,
-        (ecx1 >> 24) & 1, (ecx1 >> 21) & 1,
-        if crate::x86::cpuid(0x8000_0007).3 & (1 << 8) != 0 { 1 } else { 0 },
+        core::str::from_utf8(&cpu.vendor).unwrap_or("????????????"),
+        family, cpu.tsc_deadline() as u8, cpu.x2apic() as u8, cpu.invariant_tsc() as u8,
     );
-    if maxleaf >= 0x15 {
-        let (den, num, crystal, _) = crate::x86::cpuid(0x15);
-        lib::compact_screenln!(screen, "SELFTEST CPUID.15H den={} num={} crystal_hz={}", den, num, crystal);
+    if let Some(ratio) = cpu.tsc_ratio {
+        lib::compact_screenln!(screen, "SELFTEST TSC den={} num={} crystal_hz={}",
+            ratio.denominator, ratio.numerator, ratio.crystal_hz);
     } else {
-        lib::compact_screenln!(screen, "SELFTEST CPUID.15H unavailable (maxleaf={:#x})", maxleaf);
+        lib::compact_screenln!(screen, "SELFTEST TSC ratio unavailable");
     }
-    if maxleaf >= 0x16 {
-        let (base_mhz, max_mhz, bus_mhz, _) = crate::x86::cpuid(0x16);
-        lib::compact_screenln!(screen, "SELFTEST CPUID.16H base={}MHz max={}MHz bus={}MHz", base_mhz, max_mhz, bus_mhz);
+    if let Some(frequency) = cpu.frequency {
+        lib::compact_screenln!(screen, "SELFTEST CPU base={}MHz max={}MHz bus={}MHz",
+            frequency.base_mhz, frequency.max_mhz, frequency.bus_mhz);
     } else {
-        lib::compact_screenln!(screen, "SELFTEST CPUID.16H unavailable");
+        lib::compact_screenln!(screen, "SELFTEST CPU frequency unavailable");
     }
 }
 

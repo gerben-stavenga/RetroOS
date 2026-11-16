@@ -61,6 +61,7 @@ pub fn tls_layout() -> Layout {
 /// flat segments, resident caller-owned stack/TLS. Interrupts remain masked.
 pub unsafe fn init_core(core_id: u32) {
     unsafe { CORE_ID = core_id; }
+    unsafe { x86::init_cpu_capabilities(core_id == 0); }
     let stack = if core_id == 0 {
         assert!(crate::boot_mem::pool_start() - paging2::KERNEL_BASE + paging2::KERNEL_PHYS
             <= paging2::BOOT_IDENTITY_END, "boot storage exceeds the physical 4 MiB identity window");
