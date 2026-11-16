@@ -180,8 +180,43 @@ fn read<E: Entry>(entries: &[E], page: UserPage) -> Result<PageEntry, MappingErr
     decode(entries[index], cow)
 }
 
+/// Make every table above `index` present and privately writable, top-down,
+/// exactly as a write fault would: a missing table starts as the shared zero
+/// table, then copy-on-write gives it a page. Outside a fault those pages
+/// come from the caller's batch, never the per-CPU fault reserve; an empty
+/// batch is `NeedPages`, and the kernel refills it and resumes after the
+/// committed prefix. Filling a large fresh range therefore costs batch pages,
+/// not reserve pages (the reserve only covers one fault's worth).
+fn prepare_tables<E: Entry>(entries: &mut [E], index: usize) -> Result<(), MappingError> {
+    let mut chain = [0; 4];
+    let mut count = 0;
+    let mut parent = paging2::parent_index::<E>(index);
+    loop {
+        chain[count] = parent; count += 1;
+        let next = paging2::parent_index::<E>(parent);
+        if next == parent { break; }
+        parent = next;
+    }
+    for &parent in chain[..count].iter().rev() {
+        // The recursive self-map and the kernel's fixed levels are not user tables.
+        if parent >= paging2::recursive_idx() { continue; }
+        if !entries[parent].present() {
+            let zero = paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize);
+            paging2::replace_mapping(&mut entries[parent], E::new(zero, false, true));
+            paging2::flush_tlb();
+        }
+        if !entries[parent].hw_writable() {
+            if !crate::memory::input_available() { return Err(MappingError::NeedPages); }
+            paging2::cow_entry(entries, parent);
+        }
+    }
+    Ok(())
+}
+
 fn replace<E: Entry>(entries: &mut [E], page: UserPage, entry: PageEntry) -> Result<(), MappingError> {
     let incoming = encode::<E>(page, entry)?;
+    // Before taking a frame reference, so NeedPages leaves no leak behind.
+    prepare_tables(entries, page.address() as usize / 4096)?;
     if let PageEntry::NoAccess(m) | PageEntry::ReadOnly(m) | PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) = entry {
         if let Backing::Owned(frame) = m.backing {
             if !crate::memory::inc_shared_count(frame.number()) { return Err(MappingError::InvalidFrame); }
