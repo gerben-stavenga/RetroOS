@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -23,6 +24,7 @@ static void check(int fd, ino_t ino, off_t size, mode_t mode, time_t modified) {
     CHECK(!syscall(SYS_statx,fd,"",AT_EMPTY_PATH,STATX_BASIC_STATS,&x));
     CHECK(x.stx_ino==ino && x.stx_size==size && (x.stx_mode&07777)==mode);
     CHECK(x.stx_uid==s.st_uid && x.stx_gid==s.st_gid && x.stx_mtime.tv_sec==modified);
+    CHECK(makedev(x.stx_dev_major,x.stx_dev_minor)==s.st_dev);
 }
 struct dirent64 { uint64_t ino; int64_t off; unsigned short len; unsigned char type; char name[]; };
 static volatile sig_atomic_t dos_child_signals;

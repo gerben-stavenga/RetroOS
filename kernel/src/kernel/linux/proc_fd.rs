@@ -40,6 +40,41 @@ fn fd_path(path: &[u8]) -> Option<Option<usize>> {
     None
 }
 
+/// A path that continues below a descriptor link, `proc/self/fd/N/rest`:
+/// Linux follows link N mid-walk, so `rest` names an entry of whatever N
+/// refers to. Claude Code creates, reads and renames files this way, through
+/// an `O_PATH` descriptor on the parent directory.
+fn below_descriptor(path: &[u8]) -> Option<(usize, &[u8])> {
+    for prefix in PREFIXES {
+        let Some(tail) = path.strip_prefix(prefix).and_then(|tail| tail.strip_prefix(b"/")) else { continue };
+        let split = tail.iter().position(|&b| b == b'/')?;
+        let (digits, rest) = (&tail[..split], &tail[split + 1..]);
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) { return None; }
+        let fd = core::str::from_utf8(digits).ok()?.parse().ok()?;
+        return Some((fd, rest));
+    }
+    None
+}
+
+/// Rewrite a resolved `proc/self/fd/N/rest` to `<directory of N>/rest`, in
+/// place. Other paths, and descriptors that are not directories, are left
+/// alone; the caller's lookup then fails as it would on Linux (ENOENT or
+/// ENOTDIR from the bare link).
+pub(super) fn follow_directory_link(fds: &[thread::FdKind], buf: &mut [u8], len: usize) -> usize {
+    let Some((fd, rest)) = below_descriptor(&buf[..len]) else { return len };
+    let Some(thread::FdKind::Dir { handle, .. }) = fds.get(fd) else { return len };
+    let mut directory = [0; vfs::DIR_PATH_MAX];
+    let Some(n) = vfs::dir_handle_path(*handle, &mut directory) else { return len };
+    let rest = rest.to_vec();
+    let total = n + usize::from(n != 0 && !rest.is_empty()) + rest.len();
+    if total > buf.len() { return len; }
+    buf[..n].copy_from_slice(&directory[..n]);
+    let mut at = n;
+    if n != 0 && !rest.is_empty() { buf[at] = b'/'; at += 1; }
+    buf[at..at + rest.len()].copy_from_slice(&rest);
+    total
+}
+
 /// Reopen the pipe object behind a descriptor link, retaining an endpoint
 /// independently of the descriptor that named it. Bash process substitution
 /// uses these opens rather than dup().

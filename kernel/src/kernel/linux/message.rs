@@ -29,7 +29,8 @@ fn send<A: crate::Arch>(machine: &mut A, h: i32, header: u64, flags: i32, wide: 
         return -EFAULT;
     }
     let stream = match crate::kernel::net::socket_kind(h) {
-        Ok(kind) => kind == crate::kernel::net::SocketKind::Tcp,
+        Ok(kind) => kind == crate::kernel::net::SocketKind::Tcp
+            && (!crate::kernel::net::local::is_local(h) || crate::kernel::net::local::socket_type(h) == Ok(1)),
         Err(error) => return -net::errno(error),
     };
     let data = match gather_prefix(machine, iov, count, wide, stream) {
@@ -143,10 +144,6 @@ fn receive<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, args: 
     if datagram && flags & 0x20 != 0 { n } else { copied as i32 }
 }
 
-/// Gather a bounded prefix for an in-process stream socket.
-pub(super) fn gather<A: crate::Arch>(machine: &mut A, iov: u64, count: u64, wide: bool) -> Result<Vec<u8>, i32> {
-    gather_prefix(machine, iov, count, wide, true)
-}
 fn gather_prefix<A: crate::Arch>(machine: &mut A, iov: u64, count: u64, wide: bool, partial: bool) -> Result<Vec<u8>, i32> {
     if count > 1024 { return Err(-EINVAL); }
     if count != 0 && iov == 0 { return Err(-EFAULT); }
@@ -171,7 +168,8 @@ pub(super) fn writev<A: crate::Arch>(machine: &mut A, handle: i32, args: &Args, 
     // TCP and Unix streams can return a short write. The scratch-buffer size
     // is not a protocol message limit; only datagrams require all-or-nothing.
     let stream = match crate::kernel::net::socket_kind(handle) {
-        Ok(kind) => kind == crate::kernel::net::SocketKind::Tcp,
+        Ok(kind) => kind == crate::kernel::net::SocketKind::Tcp
+            && (!crate::kernel::net::local::is_local(handle) || crate::kernel::net::local::socket_type(handle) == Ok(1)),
         Err(error) => return SyscallResult::val(-net::errno(error)),
     };
     SyscallResult::val(match gather_prefix(machine, args.a1, args.a2, wide, stream) {

@@ -28,6 +28,7 @@ static void *worker(void *unused) {
     CHECK(write(ready[1], "r", 1) == 1);
     char byte; CHECK(read(input[0], &byte, 1) == 1 && byte == 'x');
     eventfd_t count=5; CHECK(eventfd_write(event, count) == 0);
+    delay.tv_nsec=20000000;CHECK(nanosleep(&delay,NULL)==0);
     byte='s';CHECK(write(pair[1],&byte,1)==1);
     CHECK(read(pair[1],&byte,1)==1 && byte=='t');
     return (void *)37;

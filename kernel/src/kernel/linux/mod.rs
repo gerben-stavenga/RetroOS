@@ -366,11 +366,25 @@ struct Args {
     a5: u64,
 }
 
+#[derive(Clone, Copy)]
 struct PendingSocket {
     nr: u32,
     args: Args,
     mode64: bool,
     deadline: Option<u64>,
+}
+
+impl PendingSocket {
+    fn step<A: crate::Arch>(self, machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, regs: &mut Regs) -> Option<i64> {
+        let result = if self.deadline.is_some_and(|end| crate::kernel::portio::now_ns() >= end) {
+            SyscallResult::val(-110)
+        } else if self.mode64 {
+            dispatch_nr_64(machine, kt, linux, self.nr, &self.args, regs)
+        } else {
+            dispatch_nr(machine, kt, linux, self.nr, &self.args, regs)
+        };
+        (result.retval != -11).then_some(result.retval)
+    }
 }
 
 /// Only native socket operations are retried here. Hosted sockets keep their
@@ -563,18 +577,11 @@ pub fn complete_pending_io<A: crate::Arch>(machine: &mut A,
         return;
     }
     if let Some(pending) = linux.pending_socket.take() {
-        let result = if pending.deadline.is_some_and(|end| crate::kernel::portio::now_ns() >= end) {
-            SyscallResult::val(-110)
-        } else if pending.mode64 {
-            dispatch_nr_64(machine, kt, linux, pending.nr, &pending.args, regs)
-        } else {
-            dispatch_nr(machine, kt, linux, pending.nr, &pending.args, regs)
-        };
-        if result.retval == -11 {
-            linux.pending_socket = Some(pending);
-        } else {
-            regs.rax = result.retval as u64;
+        if let Some(result) = pending.step(machine, kt, linux, regs) {
+            regs.rax = result as u64;
             kt.state = thread::ThreadState::Ready;
+        } else {
+            linux.pending_socket = Some(pending);
         }
         return;
     }
@@ -643,11 +650,16 @@ pub fn dispatch_action<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelT
     if result.retval == -11
         && let Some(connect) = blocking_socket_call(machine, kt, nr, args, regs.mode() == crate::UserMode::Mode64)
     {
-        linux.pending_socket = Some(PendingSocket { nr, args,
+        let pending = PendingSocket { nr, args,
             mode64: regs.mode() == crate::UserMode::Mode64,
             deadline: connect.then(|| crate::kernel::portio::now_ns().saturating_add(30_000_000_000)),
-        });
-        kt.state = thread::ThreadState::Blocked;
+        };
+        if regs.mode() == crate::UserMode::Mode64 {
+            async_io::wait_socket(machine, kt, linux, regs, pending);
+        } else {
+            linux.pending_socket = Some(pending);
+            kt.state = thread::ThreadState::Blocked;
+        }
         return thread::KernelAction::Done;
     }
     if trace_call { linux_trace!("[LINUX] syscall {} => {}", nr, result.retval); }
@@ -676,14 +688,14 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         5   => sys_open(machine, kt, linux, a),
         8   => sys_creat(machine, kt, linux, a),
         6   => sys_close(kt, a),
-        10 | 40 => sys_path_mutation(machine,linux,a,nr),
+        10 | 40 => sys_path_mutation(machine, &kt.fds[..], linux,a,nr),
         9 => sys_link(machine, kt, linux, a, false),
         303 => sys_link(machine, kt, linux, a, true),
-        38 => sys_rename(machine,linux,a),
+        38 => sys_rename(machine, &kt.fds[..], linux,a),
         37 => sys_kill(a),
         93 => if (a.a1 as i32) < 0 { SyscallResult::val(-EINVAL) } else { sys_ftruncate(kt,a) },
         11  => sys_execve(machine, kt, linux, a, regs),
-        12  => sys_chdir(machine, &mut kt.vcpu, linux, a),
+        12  => sys_chdir(machine, &kt.fds[..], &mut kt.vcpu, linux, a),
         133 => sys_fchdir(kt, linux, a),
         13  => time::time(machine,a,false),
         19  => sys_lseek(kt, a, false),
@@ -704,8 +716,8 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         66 => SyscallResult::val(process_group::setsid(kt.tid)),
         132 => SyscallResult::val(process_group::group(if a.a0 == 0 { kt.tid } else { a.a0 as i32 })),
         147 => SyscallResult::val(process_group::session(if a.a0 == 0 { kt.tid } else { a.a0 as i32 })),
-        33  => sys_access(machine, &mut kt.vcpu, linux, a),
-        39 => sys_path_mutation(machine, linux, a, 39),
+        33  => sys_access(machine, &kt.fds[..], &mut kt.vcpu, linux, a),
+        39 => sys_path_mutation(machine, &kt.fds[..], linux, a, 39),
         60 => sys_umask(linux, a),
         99 | 100 => statfs::call(machine, kt, linux, a, false, nr == 100, false),
         268 | 269 => statfs::call(machine, kt, linux, a, false, nr == 269, true),
@@ -722,7 +734,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         118 | 148 => sys_fsync(kt, a),
         370 => message::sendmsg(machine, kt, a, false),
         372 => message::recvmsg(machine, kt, a, false),
-        15 => sys_chmod(machine, linux, a),
+        15 => sys_chmod(machine, &kt.fds[..], linux, a),
         94 => sys_fchmod(kt, a),
         306 => sys_fchmodat(machine, kt, linux, a, false),
         452 => sys_fchmodat(machine, kt, linux, a, true),
@@ -792,6 +804,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         320 => sys_utimensat(machine, kt, linux, a, false),
         412 => sys_utimensat(machine, kt, linux, a, true),
         383 => sys_statx(machine, kt, linux, a),
+        360 => sys_socketpair(machine, kt, a.a0, a.a1, a.a2, a.a3),
         102 => sys_socketcall(machine, kt, linux, a),
         _ => {
             note_unimplemented(nr, false);
@@ -824,7 +837,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         18  => sys_pwrite64(machine, kt, a, true),
         20  => sys_writev(machine, kt, a, true),
         19  => readv::call(machine, kt, linux, a, true),
-        21  => sys_access(machine, &mut kt.vcpu, linux, a),
+        21  => sys_access(machine, &kt.fds[..], &mut kt.vcpu, linux, a),
         22  => sys_pipe(machine, kt, a, false),
         24  => sys_sched_yield(kt, regs),
         25  => sys_mremap(machine, linux, a),
@@ -851,20 +864,20 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         72  => sys_fcntl(kt, a),
         73 => sys_flock(kt, linux, a),
         74 | 75 => sys_fsync(kt, a),
-        90 => sys_chmod(machine, linux, a),
+        90 => sys_chmod(machine, &kt.fds[..], linux, a),
         91 => sys_fchmod(kt, a),
         268 => sys_fchmodat(machine, kt, linux, a, false),
         452 => sys_fchmodat(machine, kt, linux, a, true),
         263 => sys_unlinkat(machine, kt, linux, a),
         264 => sys_renameat(machine, kt, linux, a),
         79  => sys_getcwd(machine, &mut kt.vcpu, linux, a),
-        80  => sys_chdir(machine, &mut kt.vcpu, linux, a),
+        80  => sys_chdir(machine, &kt.fds[..], &mut kt.vcpu, linux, a),
         81  => sys_fchdir(kt, linux, a),
         77 => sys_ftruncate(kt,a),
-        82 => sys_rename(machine,linux,a),
+        82 => sys_rename(machine, &kt.fds[..], linux,a),
         95 => sys_umask(linux, a),
         258 => sys_mkdirat(machine, kt, linux, a),
-        83 | 84 | 87 => sys_path_mutation(machine, linux, a, match nr { 83 => 39, 84 => 40, _ => 10 }),
+        83 | 84 | 87 => sys_path_mutation(machine, &kt.fds[..], linux, a, match nr { 83 => 39, 84 => 40, _ => 10 }),
         88 => sys_symlink(machine, kt, linux, a, false),
         86 => sys_link(machine, kt, linux, a, false),
         265 => sys_link(machine, kt, linux, a, true),
@@ -895,13 +908,13 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         257 => sys_openat(machine, kt, linux, a),
         262 => sys_fstatat64(machine, kt, linux, a, true),
         267 => sys_readlinkat(machine, kt, linux, a),
-        269 => sys_faccessat(machine, linux, a),
+        269 => sys_faccessat(machine, &kt.fds[..], linux, a),
         273 => SyscallResult::val(0),       // set_robust_list — no threads share
         280 => sys_utimensat(machine, kt, linux, a, true),
         293 => sys_pipe(machine, kt, a, true),
         294 => SyscallResult::val(-ENOSYS), // inotify_init1: no filesystem event queue yet
         334 => SyscallResult::val(-ENOSYS), // rseq — glibc falls back cleanly
-        439 => sys_faccessat(machine, linux, a),
+        439 => sys_faccessat(machine, &kt.fds[..], linux, a),
         97 => limits::getrlimit(machine, a, true),
         302 => limits::prlimit(machine, kt, a),
         436 => close_range::call(kt, linux, a),
@@ -923,6 +936,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         50  => sys_listen(kt, a.a0, a.a1),
         51  => sys_getsockname(machine, kt, a.a0, a.a1, a.a2, false),
         52  => sys_getsockname(machine, kt, a.a0, a.a1, a.a2, true),
+        53  => sys_socketpair(machine, kt, a.a0, a.a1, a.a2, a.a3),
         54  => sys_setsockopt(machine, kt, a.a0, a.a1, a.a2, a.a3, a.a4 as usize),
         55  => sys_getsockopt(machine, kt, a.a0, a.a1, a.a2, a.a3, a.a4),
         288 => sys_accept(machine, kt, a.a0, a.a1, a.a2, a.a3), // accept4
@@ -937,30 +951,33 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
 // Helpers: C string / path handling
 // =============================================================================
 
-/// Resolve a path (NUL-terminated user pointer) against cwd.
-/// Leading `/` = absolute (strip it). Otherwise prepend cwd.
-pub fn resolve_path<'a>(path: &[u8], cwd: &[u8], buf: &'a mut [u8]) -> &'a [u8] {
-    crate::kernel::exec::resolve_path(path, cwd, buf)
+/// Resolve a Linux path against `cwd` (leading `/` = absolute, stripped),
+/// then follow a directory descriptor link the path continues below
+/// (`/proc/self/fd/N/name`), as Linux path walk does.
+pub fn resolve_path<'a>(fds: &[thread::FdKind], path: &[u8], cwd: &[u8], buf: &'a mut [u8]) -> &'a [u8] {
+    let len = crate::kernel::exec::resolve_path(path, cwd, buf).len();
+    let len = proc_fd::follow_directory_link(fds, buf, len);
+    &buf[..len]
 }
 
 /// Copy a complete mutation path, rejecting overflow before touching the VFS.
-fn mutation_path<A: crate::Arch>(machine: &mut A, pointer: u64, base: &[u8]) -> Result<alloc::vec::Vec<u8>, i32> {
+fn mutation_path<A: crate::Arch>(machine: &mut A, fds: &[thread::FdKind], pointer: u64, base: &[u8]) -> Result<alloc::vec::Vec<u8>, i32> {
     let mut raw = [0; vfs::PATH_KEY_MAX];
     let n = high_memory::copy_cstr(machine, pointer, &mut raw)?;
     if n == raw.len() { return Err(-36); }
     if n == 0 { return Err(-ENOENT); }
     if raw[0] != b'/' && base.len() + n + 1 >= vfs::PATH_KEY_MAX { return Err(-36); }
     let mut path = [0; vfs::PATH_KEY_MAX];
-    Ok(resolve_path(&raw[..n], base, &mut path).to_vec())
+    Ok(resolve_path(fds, &raw[..n], base, &mut path).to_vec())
 }
 
 /// Change cwd. Validates directory exists. cwd/cwd_len are mutated in place.
-pub fn do_chdir(path: &[u8], cwd: &mut [u8; vfs::PATH_KEY_MAX], cwd_len: &mut usize) -> i32 {
+pub fn do_chdir(fds: &[thread::FdKind], path: &[u8], cwd: &mut [u8; vfs::PATH_KEY_MAX], cwd_len: &mut usize) -> i32 {
     if path.is_empty() { return -ENOENT; }
     let required = if path[0] == b'/' { path.len() } else { cwd_len.saturating_add(path.len()).saturating_add(1) };
     if required >= vfs::PATH_KEY_MAX { return -36; }
     let mut buffer = [0; vfs::PATH_KEY_MAX];
-    let resolved = resolve_path(path, &cwd[..*cwd_len], &mut buffer);
+    let resolved = resolve_path(fds, path, &cwd[..*cwd_len], &mut buffer);
     let Some(canonical) = vfs::canonical_path(resolved) else { return -ENOENT; };
     if !vfs::dir_exists(&canonical) {
         return if vfs::stat(&canonical, true).is_some() { -20 } else { -ENOENT };
@@ -1521,7 +1538,7 @@ fn sys_open_from<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<
     let path = &path_buf[..path_len];
 
     let mut buf = [0u8; vfs::PATH_KEY_MAX];
-    let resolved = resolve_path(path, base, &mut buf);
+    let resolved = resolve_path(&kt.fds[..], path, base, &mut buf);
 
     if let Some(result) = proc_fd::open_pipe(kt, resolved, a.a1 as u32) {
         return SyscallResult::val(result);
@@ -1627,6 +1644,7 @@ fn sys_socketcall<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         5  => sys_accept(machine, kt, g(0), g(1), g(2), 0),
         6  => sys_getsockname(machine, kt, g(0), g(1), g(2), false),
         7  => sys_getsockname(machine, kt, g(0), g(1), g(2), true),
+        8  => sys_socketpair(machine, kt, g(0), g(1), g(2), g(3)),
         9  => sys_sendto(machine, kt, g(0), g(1), g(2) as usize, g(3), 0, 0),
         10 => sys_recvfrom(machine, kt, g(0), g(1), g(2) as usize, g(3), 0, 0),
         11 => sys_sendto(machine, kt, g(0), g(1), g(2) as usize, g(3), g(4), g(5) as usize),
@@ -1675,16 +1693,41 @@ fn sys_socket<A: crate::Arch>(kt: &mut thread::KernelThread<A>, domain: u64, ty:
     }
 }
 
+fn sys_socketpair<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, domain: u64, ty: u64, proto: u64, out: u64) -> SyscallResult {
+    let (one, two) = match net::socketpair(domain as i32, ty as i32, proto as i32, kt.tid) {
+        Ok(pair) => pair, Err(e) => return SyscallResult::val(e),
+    };
+    let Some(first) = kt.alloc_fd(0) else {
+        net::close(one); net::close(two); return SyscallResult::val(-EMFILE);
+    };
+    kt.fds[first] = FdKind::Socket(one);
+    let Some(second) = kt.alloc_fd(0) else {
+        kt.fds[first] = FdKind::None;
+        net::close(one); net::close(two); return SyscallResult::val(-EMFILE);
+    };
+    let mut bytes = [0; 8];
+    bytes[..4].copy_from_slice(&(first as i32).to_le_bytes());
+    bytes[4..].copy_from_slice(&(second as i32).to_le_bytes());
+    if !high_memory::copy_to(machine, out, &bytes) {
+        kt.fds[first] = FdKind::None;
+        net::close(one); net::close(two); return SyscallResult::val(-EFAULT);
+    }
+    kt.fds[second] = FdKind::Socket(two);
+    kt.cloexec.set(first, ty & 0x80000 != 0);
+    kt.cloexec.set(second, ty & 0x80000 != 0);
+    SyscallResult::val(0)
+}
+
 fn sys_connect<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &LinuxState, fd: u64, addr_ptr: u64, addr_len: usize) -> SyscallResult {
     let h = match sock_handle(kt, fd) { Ok(h) => h, Err(e) => return SyscallResult::val(e) };
     let (addr, n) = read_sockaddr(machine, addr_ptr, addr_len);
-    SyscallResult::val(net::connect(h, &addr[..n], kt.tid, linux))
+    SyscallResult::val(net::connect(&kt.fds[..], h, &addr[..n], kt.tid, linux))
 }
 
 fn sys_bind<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &LinuxState, fd: u64, addr_ptr: u64, addr_len: usize) -> SyscallResult {
     let h = match sock_handle(kt, fd) { Ok(h) => h, Err(e) => return SyscallResult::val(e) };
     let (addr, n) = read_sockaddr(machine, addr_ptr, addr_len);
-    SyscallResult::val(net::bind(h, &addr[..n], linux))
+    SyscallResult::val(net::bind(&kt.fds[..], h, &addr[..n], linux))
 }
 
 fn sys_listen<A: crate::Arch>(kt: &mut thread::KernelThread<A>, fd: u64, backlog: u64) -> SyscallResult {
@@ -2054,12 +2097,12 @@ pub(crate) fn handle_exec<A: crate::Arch>(
 
 
 /// chdir(12)
-fn sys_chdir<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+fn sys_chdir<A: crate::Arch>(machine: &mut A, fds: &[thread::FdKind], _vcpu: &mut Regs, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let mut path_buf = [0u8; vfs::PATH_KEY_MAX];
     let path_len = match high_memory::copy_cstr(machine, a.a0, &mut path_buf) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if path_len == path_buf.len() { return SyscallResult::val(-36); }
     let path = &path_buf[..path_len];
-    SyscallResult::val(do_chdir(path, &mut linux.cwd, &mut linux.cwd_len))
+    SyscallResult::val(do_chdir(fds, path, &mut linux.cwd, &mut linux.cwd_len))
 }
 
 fn sys_fchdir<A: crate::Arch>(kt: &thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
@@ -2071,13 +2114,13 @@ fn sys_fchdir<A: crate::Arch>(kt: &thread::KernelThread<A>, linux: &mut LinuxSta
     let mut path = [0; vfs::DIR_PATH_MAX];
     let Some(n) = vfs::dir_handle_path(handle, &mut path) else { return SyscallResult::val(-EBADF); };
     let absolute = [b"/".as_slice(), &path[..n]].concat();
-    SyscallResult::val(do_chdir(&absolute, &mut linux.cwd, &mut linux.cwd_len))
+    SyscallResult::val(do_chdir(&kt.fds[..], &absolute, &mut linux.cwd, &mut linux.cwd_len))
 }
 
 /// lseek(19)
-fn sys_rename<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args) -> SyscallResult {
-    let old = match mutation_path(machine, a.a0, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
-    let new = match mutation_path(machine, a.a1, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+fn sys_rename<A: crate::Arch>(machine: &mut A, fds: &[thread::FdKind], linux: &LinuxState, a: &Args) -> SyscallResult {
+    let old = match mutation_path(machine, fds, a.a0, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+    let new = match mutation_path(machine, fds, a.a1, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
     SyscallResult::val(vfs::rename_replace(&old, &new))
 }
 /// renameat resolves each relative path against its own directory descriptor.
@@ -2099,13 +2142,13 @@ fn sys_renameat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, l
         let base = at_base(kt, linux, fd, &mut directory);
         if raw[0] != b'/' && base.len() + n + 1 >= vfs::PATH_KEY_MAX { return SyscallResult::val(-36); }
         let mut resolved = [0; vfs::PATH_KEY_MAX];
-        paths[index] = resolve_path(&raw[..n], base, &mut resolved).to_vec();
+        paths[index] = resolve_path(&kt.fds[..], &raw[..n], base, &mut resolved).to_vec();
     }
     SyscallResult::val(vfs::rename_replace(&paths[0], &paths[1]))
 }
 
-fn sys_path_mutation<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args, nr: u32) -> SyscallResult {
-    let path = match mutation_path(machine, a.a0, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+fn sys_path_mutation<A: crate::Arch>(machine: &mut A, fds: &[thread::FdKind], linux: &LinuxState, a: &Args, nr: u32) -> SyscallResult {
+    let path = match mutation_path(machine, fds, a.a0, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
     SyscallResult::val(match nr {39 => vfs::mkdir_mode(&path, a.a1 as u32 & 0o7777 & !linux.creation_mask),40 => vfs::rmdir(&path),_ => vfs::delete(&path)})
 }
 fn sys_umask(linux: &mut LinuxState, a: &Args) -> SyscallResult {
@@ -2129,7 +2172,7 @@ fn sys_mkdirat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, li
     }
     let mut directory = [0; vfs::DIR_PATH_MAX];
     let base = at_base(kt, linux, fd, &mut directory);
-    let path = match mutation_path(machine, a.a1, base) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+    let path = match mutation_path(machine, &kt.fds[..], a.a1, base) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
     SyscallResult::val(vfs::mkdir_mode(&path, a.a2 as u32 & 0o7777 & !linux.creation_mask))
 }
 
@@ -2276,7 +2319,7 @@ fn sys_symlink<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, li
     let base = at_base(kt, linux, dirfd, &mut directory);
     if raw[0] != b'/' && base.len() + raw_len + 1 >= vfs::PATH_KEY_MAX { return SyscallResult::val(-36); }
     let mut path = [0; vfs::PATH_KEY_MAX];
-    let resolved = resolve_path(&raw[..raw_len], base, &mut path);
+    let resolved = resolve_path(&kt.fds[..], &raw[..raw_len], base, &mut path);
     SyscallResult::val(vfs::symlink(&target[..target_len], resolved))
 }
 
@@ -2304,7 +2347,7 @@ fn readlink_at<A: crate::Arch>(
     }
 
     let mut resolved_buf = [0u8; vfs::DIR_PATH_MAX];
-    let resolved = resolve_path(&self_exe_buf[..self_exe_len], base, &mut resolved_buf);
+    let resolved = resolve_path(&kt.fds[..], &self_exe_buf[..self_exe_len], base, &mut resolved_buf);
     linux_trace!("[LINUX] readlink path={} base={} resolved={}",
         core::str::from_utf8(&self_exe_buf[..self_exe_len]).unwrap_or("<non-UTF8>"),
         core::str::from_utf8(base).unwrap_or("<non-UTF8>"),
@@ -2389,36 +2432,36 @@ fn sys_link<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, linux
         };
         if path[0] != b'/' && base.len() + n + 1 >= vfs::PATH_KEY_MAX { return Err(-36); }
         let mut buffer = [0; vfs::PATH_KEY_MAX];
-        Ok(resolve_path(&path[..n], base, &mut buffer).to_vec())
+        Ok(resolve_path(&kt.fds[..], &path[..n], base, &mut buffer).to_vec())
     };
     let result = resolve(old_path, old_dir).and_then(|source|
         resolve(new_path, new_dir).map(|destination| vfs::hard_link(&source, &destination, flags & 0x400 != 0)));
     SyscallResult::val(result.unwrap_or_else(|error| error))
 }
 
-fn sys_access<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
-    access_at(machine, linux, a.a0)
+fn sys_access<A: crate::Arch>(machine: &mut A, fds: &[thread::FdKind], _vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
+    access_at(machine, fds, linux, a.a0)
 }
 
 /// faccessat(269) / faccessat2(439) — path at a.a1; only AT_FDCWD dirfds are
 /// honored (path resolves against cwd, which is faccessat's AT_FDCWD meaning).
 /// Mode/flags are ignored like sys_access: existence = permission (single-user).
-fn sys_faccessat<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args) -> SyscallResult {
+fn sys_faccessat<A: crate::Arch>(machine: &mut A, fds: &[thread::FdKind], linux: &LinuxState, a: &Args) -> SyscallResult {
     const AT_FDCWD: i32 = -100;
     if a.a0 as i32 != AT_FDCWD {
         return SyscallResult::val(-EBADF);
     }
-    access_at(machine, linux, a.a1)
+    access_at(machine, fds, linux, a.a1)
 }
 
 /// Existence check behind access/faccessat, including directories.
-fn access_at<A: crate::Arch>(machine: &mut A, linux: &LinuxState, path_ptr: u64) -> SyscallResult {
+fn access_at<A: crate::Arch>(machine: &mut A, fds: &[thread::FdKind], linux: &LinuxState, path_ptr: u64) -> SyscallResult {
     let mut path_buf = [0u8; vfs::PATH_KEY_MAX];
     let path_len = match high_memory::copy_cstr(machine, path_ptr, &mut path_buf) { Ok(n) => n, Err(error) => return SyscallResult::val(error) };
     if path_len == path_buf.len() { return SyscallResult::val(-36); }
     let path = &path_buf[..path_len];
     let mut buf = [0u8; vfs::PATH_KEY_MAX];
-    let resolved = resolve_path(path, linux.cwd_str(), &mut buf);
+    let resolved = resolve_path(fds, path, linux.cwd_str(), &mut buf);
     SyscallResult::val(if proc_fd::is_dir(resolved) || vfs::stat(resolved, true).is_some() { 0 } else { -ENOENT })
 }
 
@@ -2509,11 +2552,11 @@ fn sys_unlinkat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, l
         return SyscallResult::val(-EBADF);
     }
     let mut base = [0; vfs::DIR_PATH_MAX];
-    let path = match mutation_path(machine, args.a1, at_base(kt, linux, fd, &mut base)) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+    let path = match mutation_path(machine, &kt.fds[..], args.a1, at_base(kt, linux, fd, &mut base)) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
     SyscallResult::val(if args.a2 & 0x200 != 0 { vfs::rmdir(&path) } else { vfs::delete(&path) })
 }
-fn sys_chmod<A: crate::Arch>(machine: &mut A, linux: &LinuxState, args: &Args) -> SyscallResult {
-    let path = match mutation_path(machine, args.a0, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
+fn sys_chmod<A: crate::Arch>(machine: &mut A, fds: &[thread::FdKind], linux: &LinuxState, args: &Args) -> SyscallResult {
+    let path = match mutation_path(machine, fds, args.a0, linux.cwd_str()) { Ok(path) => path, Err(error) => return SyscallResult::val(error) };
     SyscallResult::val(vfs::set_path_mode(&path, args.a1 as u32 & 0o7777))
 }
 
@@ -2541,7 +2584,7 @@ fn sys_fchmodat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, l
         }
     }
     let mut directory = [0; vfs::DIR_PATH_MAX];
-    let path = match mutation_path(machine, args.a1, at_base(kt, linux, fd, &mut directory)) {
+    let path = match mutation_path(machine, &kt.fds[..], args.a1, at_base(kt, linux, fd, &mut directory)) {
         Ok(path) => path, Err(error) => return SyscallResult::val(error),
     };
     if flags & 0x100 != 0 && vfs::stat(&path, false).is_some_and(|stat| stat.is_symlink) {
@@ -3219,7 +3262,7 @@ fn sys_utimensat<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, 
     let base = at_base(kt, linux, fd, &mut directory);
     if raw[0] != b'/' && base.len() + length + 1 >= vfs::PATH_KEY_MAX { return SyscallResult::val(-36); }
     let mut buffer = [0; vfs::PATH_KEY_MAX];
-    let resolved = resolve_path(&raw[..length], base, &mut buffer);
+    let resolved = resolve_path(&kt.fds[..], &raw[..length], base, &mut buffer);
     SyscallResult::val(vfs::set_times(resolved, a.a3 & 0x100 == 0, times[0], times[1]))
 }
 
@@ -3259,7 +3302,7 @@ fn sys_xattr<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, linu
     if length == path.len() { return SyscallResult::val(-36); }
     if length == 0 { return SyscallResult::val(-ENOENT); }
     let mut buffer = [0; vfs::PATH_KEY_MAX];
-    let resolved = resolve_path(&path[..length], linux.cwd_str(), &mut buffer);
+    let resolved = resolve_path(&kt.fds[..], &path[..length], linux.cwd_str(), &mut buffer);
     SyscallResult::val(if lookup_stat_owned(kt, linux, resolved, operation.is_multiple_of(3)).is_some() { -95 } else { -ENOENT })
 }
 
@@ -3300,7 +3343,7 @@ fn sys_stat64<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, lin
     let path = &path_buf[..path_len];
 
     let mut pbuf = [0u8; vfs::PATH_KEY_MAX];
-    let resolved = resolve_path(path, linux.cwd_str(), &mut pbuf);
+    let resolved = resolve_path(&kt.fds[..], path, linux.cwd_str(), &mut pbuf);
 
     let stat = lookup_stat_owned(kt, linux, resolved, follow_final);
     match stat {
@@ -3349,7 +3392,7 @@ fn sys_statx<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     let mut dbuf = [0u8; vfs::DIR_PATH_MAX];
     let base = at_base(kt, linux, dirfd, &mut dbuf);
     let mut pbuf = [0u8; vfs::PATH_KEY_MAX];
-    let resolved = resolve_path(path, base, &mut pbuf);
+    let resolved = resolve_path(&kt.fds[..], path, base, &mut pbuf);
     const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     let stat = lookup_stat_owned(kt, linux, resolved, a.a2 & AT_SYMLINK_NOFOLLOW == 0);
     match stat {
@@ -3377,6 +3420,15 @@ fn fd_ownership<A: crate::Arch>(kt: &thread::KernelThread<A>, fd: usize) -> (u32
     }
 }
 
+/// Device number every VFS object reports. `stat` encodes it as a whole
+/// `st_dev`; `statx` splits it into major/minor. Both must name the same
+/// device, or callers that compare the two decide a path was replaced.
+const VFS_DEV_MAJOR: u32 = 0;
+const VFS_DEV_MINOR: u32 = 1;
+/// Linux `new_encode_dev`: minor low byte, major, then the minor's high bits.
+const VFS_DEV: u64 = (VFS_DEV_MINOR as u64 & 0xff) | ((VFS_DEV_MAJOR as u64) << 8)
+    | ((VFS_DEV_MINOR as u64 & !0xff) << 12);
+
 #[allow(clippy::too_many_arguments)]
 fn write_statx<A: crate::Arch>(machine: &mut A, buf: u64, mode: u32, size: u32, ino: u64, mtime: Option<u32>, owner: (u32, u32), nlink: u32) -> i32 {
     let mut bytes = [0u8; 256];
@@ -3391,6 +3443,8 @@ fn write_statx<A: crate::Arch>(machine: &mut A, buf: u64, mode: u32, size: u32, 
     put(40, u64::from(size), 8);
     put(48, u64::from(size).div_ceil(512), 8);
     put(112, u64::from(mtime.unwrap_or(0)), 8);
+    put(136, u64::from(VFS_DEV_MAJOR), 4);
+    put(140, u64::from(VFS_DEV_MINOR), 4);
     if high_memory::copy_to(machine, buf, &bytes) { 0 } else { -EFAULT }
 }
 
@@ -3473,7 +3527,7 @@ fn sys_fstatat64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<
     let mut dbuf = [0u8; vfs::DIR_PATH_MAX];
     let base = at_base(kt, linux, dirfd, &mut dbuf);
     let mut pbuf = [0u8; vfs::PATH_KEY_MAX];
-    let resolved = resolve_path(path, base, &mut pbuf);
+    let resolved = resolve_path(&kt.fds[..], path, base, &mut pbuf);
     const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
     let stat = lookup_stat_owned(kt, linux, resolved, a.a3 & AT_SYMLINK_NOFOLLOW == 0);
     match stat {
@@ -3493,7 +3547,7 @@ fn sys_fstatat64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<
 fn write_stat64<A: crate::Arch>(machine: &mut A, buf: u64, mode: u32, size: u32, ino: u64, mtime: Option<u32>, owner: (u32, u32), nlink: u32, want_64: bool) -> i32 {
     let mut bytes = [0u8; 144];
     let mut put = |offset: usize, value: u64, size: usize| bytes[offset..offset + size].copy_from_slice(&value.to_le_bytes()[..size]);
-    put(0, 1, 8);
+    put(0, VFS_DEV, 8);
     put(64, u64::from(size).div_ceil(512), 8);
     if want_64 {
         put(28, u64::from(owner.0), 4);
@@ -3542,7 +3596,7 @@ fn sys_stat_old<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, l
     let path = &path_buf[..path_len];
     let stat_buf = a.a1;
     let mut pbuf = [0u8; vfs::PATH_KEY_MAX];
-    let resolved = resolve_path(path, linux.cwd_str(), &mut pbuf);
+    let resolved = resolve_path(&kt.fds[..], path, linux.cwd_str(), &mut pbuf);
     let stat = lookup_stat_owned(kt, linux, resolved, follow_final);
     match stat {
         Some(((mode, size, _, mtime), owner)) => {

@@ -13,13 +13,14 @@ struct Stream {
     listening: bool, backlog: usize, pending: VecDeque<i32>, bytes: VecDeque<u8>,
     eof: bool, read_closed: bool, write_closed: bool,
     read_sequence: u64,
+    packet_mode: bool, packets: VecDeque<usize>,
 }
 impl Stream {
     fn new(nonblock: bool, credentials: Credentials) -> Self {
         Self { refs: 1, nonblock, credentials, peer_credentials: None,
             name: Vec::new(), peer_name: Vec::new(), key: None, peer: None,
             connected: false, listening: false, backlog: 1, pending: VecDeque::new(),
-            bytes: VecDeque::new(), eof: false, read_closed: false, write_closed: false, read_sequence: 0 }
+            bytes: VecDeque::new(), eof: false, read_closed: false, write_closed: false, read_sequence: 0, packet_mode: false, packets: VecDeque::new() }
     }
 }
 const BASE: i32 = 0x40000000;
@@ -56,6 +57,26 @@ impl Local {
     }
 }
 pub fn socket(nonblock: bool, credentials: Credentials) -> Result<i32> { LOCAL.lock().add(Stream::new(nonblock, credentials)) }
+/// Create two connected endpoints under the same lock, with no namespace entry.
+pub fn pair(nonblock: bool, packet_mode: bool, credentials: Credentials) -> Result<(i32, i32)> {
+    let mut local = LOCAL.lock();
+    let make = || {
+        let mut stream = Stream::new(nonblock, credentials);
+        stream.connected = true;
+        stream.packet_mode = packet_mode;
+        stream.peer_credentials = Some(credentials);
+        stream
+    };
+    let one = local.add(make())?;
+    let two = match local.add(make()) {
+        Ok(h) => h,
+        Err(e) => { local.close(one); return Err(e); }
+    };
+    local.get_mut(one)?.peer = Some(two);
+    local.get_mut(two)?.peer = Some(one);
+    Ok((one, two))
+}
+pub fn socket_type(h: i32) -> Result<i32> { Ok(if LOCAL.lock().get(h)?.packet_mode { 5 } else { 1 }) }
 pub fn add_ref(h: i32) { if let Ok(stream) = LOCAL.lock().get_mut(h) { stream.refs += 1; } }
 pub fn close(h: i32) { LOCAL.lock().close(h); }
 pub fn nonblocking(h: i32) -> bool { LOCAL.lock().get(h).is_ok_and(|s| s.nonblock) }
@@ -123,6 +144,16 @@ pub fn send(h: i32, bytes: &[u8]) -> Result<i32> {
     if stream.write_closed { return Err(Error::BrokenPipe); }
     let peer = stream.peer.ok_or(Error::BrokenPipe)?; let peer = local.get_mut(peer)?;
     if peer.read_closed { return Err(Error::BrokenPipe); }
+    if peer.packet_mode {
+        if bytes.len() > CAPACITY { return Err(Error::MessageTooLarge); }
+        if bytes.len() > CAPACITY.saturating_sub(peer.bytes.len()) || peer.packets.len() >= CAPACITY {
+            return Err(Error::WouldBlock);
+        }
+        peer.packets.push_back(bytes.len());
+        peer.bytes.extend(bytes.iter().copied());
+        peer.read_sequence = peer.read_sequence.wrapping_add(1);
+        return Ok(bytes.len() as i32);
+    }
     if bytes.is_empty() { return Ok(0); }
     let n = bytes.len().min(CAPACITY.saturating_sub(peer.bytes.len()));
     if n == 0 { return Err(Error::WouldBlock); }
@@ -134,10 +165,14 @@ pub fn receive(h: i32, bytes: &mut [u8], peek: bool) -> Result<i32> {
     let mut local = LOCAL.lock(); let stream = local.get_mut(h)?;
     if !stream.connected { return Err(Error::NotConnected); }
     if bytes.is_empty() || stream.read_closed { return Ok(0); }
-    let n = bytes.len().min(stream.bytes.len());
-    if n == 0 && !stream.eof { return Err(Error::WouldBlock); }
+    let available = stream.packets.front().copied().unwrap_or(stream.bytes.len());
+    let n = bytes.len().min(available);
+    if n == 0 && stream.packets.is_empty() && !stream.eof { return Err(Error::WouldBlock); }
     for (out, input) in bytes.iter_mut().zip(stream.bytes.iter()).take(n) { *out = *input; }
-    if !peek { stream.bytes.drain(..n); } Ok(n as i32)
+    if !peek {
+        let consumed = if stream.packet_mode { stream.packets.pop_front().unwrap_or(0) } else { n };
+        stream.bytes.drain(..consumed);
+    } Ok(n as i32)
 }
 pub fn name(h: i32, peer: bool) -> Result<Vec<u8>> {
     let local = LOCAL.lock(); let stream = local.get(h)?;
@@ -145,12 +180,15 @@ pub fn name(h: i32, peer: bool) -> Result<Vec<u8>> {
     Ok(if peer { stream.peer_name.clone() } else { stream.name.clone() })
 }
 pub fn credentials(h: i32) -> Result<Credentials> { LOCAL.lock().get(h)?.peer_credentials.ok_or(Error::NotConnected) }
-pub fn available(h: i32) -> Result<i32> { Ok(LOCAL.lock().get(h)?.bytes.len() as i32) }
+pub fn available(h: i32) -> Result<i32> {
+    let local = LOCAL.lock(); let stream = local.get(h)?;
+    Ok(stream.packets.front().copied().unwrap_or(stream.bytes.len()) as i32)
+}
 pub fn read_sequence(h: i32) -> u64 { LOCAL.lock().get(h).map_or(0, |stream| stream.read_sequence) }
 pub fn shutdown(h: i32, read: bool, write: bool) -> Result<i32> {
     let mut local = LOCAL.lock(); let stream = local.get_mut(h)?;
     if !stream.connected { return Err(Error::NotConnected); }
-    if read { stream.read_closed = true; stream.bytes.clear(); }
+    if read { stream.read_closed = true; stream.bytes.clear(); stream.packets.clear(); }
     if write { stream.write_closed = true; }
     let peer = stream.peer;
     if write && let Some(peer) = peer && let Ok(peer) = local.get_mut(peer) { peer.eof = true; }
@@ -159,7 +197,7 @@ pub fn shutdown(h: i32, read: bool, write: bool) -> Result<i32> {
 pub fn readiness(h: i32) -> Readiness {
     let local = LOCAL.lock(); let Ok(stream) = local.get(h) else { return Readiness { invalid: true, ..Readiness::default() }; };
     let writable = stream.connected && !stream.write_closed && stream.peer.and_then(|h| local.get(h).ok())
-        .is_some_and(|peer| !peer.read_closed && peer.bytes.len() < CAPACITY);
-    Readiness { readable: if stream.listening { !stream.pending.is_empty() } else { !stream.bytes.is_empty() || stream.eof || stream.read_closed },
+        .is_some_and(|peer| !peer.read_closed && peer.bytes.len() < CAPACITY && peer.packets.len() < CAPACITY);
+    Readiness { readable: if stream.listening { !stream.pending.is_empty() } else { !stream.bytes.is_empty() || !stream.packets.is_empty() || stream.eof || stream.read_closed },
         writable, closed: stream.connected && stream.peer.is_none(), error: false, invalid: false }
 }

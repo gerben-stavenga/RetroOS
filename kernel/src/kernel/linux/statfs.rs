@@ -25,7 +25,7 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>
         if n == raw.len() { return SyscallResult::val(-36); }
         if n == 0 { return SyscallResult::val(-ENOENT); }
         let mut path = [0; vfs::PATH_KEY_MAX];
-        vfs::statfs(resolve_path(&raw[..n], linux.cwd_str(), &mut path))
+        vfs::statfs(resolve_path(&kt.fds[..], &raw[..n], linux.cwd_str(), &mut path))
     };
     let stats = match stats { Ok(stats) => stats, Err(error) => return SyscallResult::val(error) };
     if !wide && !large32 && [stats.blocks, stats.free_blocks, stats.available_blocks, stats.files, stats.free_files]

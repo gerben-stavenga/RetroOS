@@ -16,7 +16,83 @@
 static void check(int ok,int code){if(!ok){dprintf(2,"UNIX FAIL %d errno=%d\n",code,errno);_exit(code);}}
 static void ready(int fd,short events){struct pollfd p={fd,events,0};check(poll(&p,1,3000)>0,90);}
 static socklen_t address(struct sockaddr_un *out,const char *path){memset(out,0,sizeof *out);out->sun_family=AF_UNIX;strcpy(out->sun_path,path);return offsetof(struct sockaddr_un,sun_path)+strlen(path)+1;}
-int main(void){
+static void socketpairs(void) {
+ for (int kind=SOCK_STREAM;kind<=SOCK_SEQPACKET;kind+=SOCK_SEQPACKET-SOCK_STREAM) {
+  int pairs[3][2];
+  for(int i=0;i<3;i++) {
+   check(socketpair(AF_UNIX,kind|SOCK_CLOEXEC,0,pairs[i])==0,100);
+   check(fcntl(pairs[i][0],F_GETFD)==FD_CLOEXEC,101);
+   int type=0;socklen_t len=sizeof type;
+   check(getsockopt(pairs[i][0],SOL_SOCKET,SO_TYPE,&type,&len)==0&&type==kind,102);
+   struct ucred peer;len=sizeof peer;
+   check(getsockopt(pairs[i][0],SOL_SOCKET,SO_PEERCRED,&peer,&len)==0&&peer.pid==getpid(),103);
+  }
+  char *args[]={"probe","socketpair-child",NULL};
+  extern char **environ;
+  pid_t child=vfork();check(child>=0,104);
+  if(!child) {
+   for(int i=0;i<3;i++) if(dup2(pairs[i][1],i)!=i) _exit(105);
+   for(int i=0;i<3;i++) {close(pairs[i][0]);close(pairs[i][1]);}
+   if(close_range(3,~0U,CLOSE_RANGE_CLOEXEC)) _exit(106);
+   execve("/proc/self/exe",args,environ);_exit(107);
+  }
+  for(int i=0;i<3;i++) close(pairs[i][1]);
+#ifdef __x86_64__
+  int ep=epoll_create1(EPOLL_CLOEXEC);check(ep>=0,108);
+  struct epoll_event event={.events=EPOLLIN|EPOLLET,.data.fd=pairs[1][0]};
+  check(epoll_ctl(ep,EPOLL_CTL_ADD,pairs[1][0],&event)==0,109);
+#endif
+  check(write(pairs[0][0],"input",5)==5,110);
+#ifdef __x86_64__
+  check(epoll_wait(ep,&event,1,3000)==1&&event.data.fd==pairs[1][0],111);
+#else
+  ready(pairs[1][0],POLLIN);
+#endif
+  char buf[16];check(read(pairs[1][0],buf,sizeof buf)==5&&!memcmp(buf,"input",5),112);
+  ready(pairs[2][0],POLLIN);
+  check(read(pairs[2][0],buf,sizeof buf)==5&&!memcmp(buf,"error",5),113);
+  int status;check(waitpid(child,&status,0)==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0,114);
+  check(read(pairs[1][0],buf,sizeof buf)==0,115);
+#ifdef __x86_64__
+  close(ep);
+#endif
+  for(int i=0;i<3;i++)close(pairs[i][0]);
+ }
+ int p[2];check(socketpair(AF_UNIX,SOCK_SEQPACKET|SOCK_NONBLOCK,0,p)==0,116);
+ check(fcntl(p[0],F_GETFL)&O_NONBLOCK,117);
+ char buf[8];check(read(p[0],buf,sizeof buf)==-1&&errno==EAGAIN,118);
+ check(write(p[0],"abc",3)==3&&write(p[0],"def",3)==3,119);
+ check(recv(p[1],buf,1,MSG_PEEK)==1&&buf[0]=='a',120);
+ check(read(p[1],buf,1)==1&&buf[0]=='a',121);
+ check(read(p[1],buf,sizeof buf)==3&&!memcmp(buf,"def",3),122);
+ check(send(p[0],"",0,0)==0,123);ready(p[1],POLLIN);
+ check(recv(p[1],buf,sizeof buf,0)==0,124);
+ check(shutdown(p[0],SHUT_WR)==0&&read(p[1],buf,sizeof buf)==0,125);
+ close(p[0]);close(p[1]);
+ /* Neither an invalid result pointer nor a half-allocated pair leaks fds. */
+ int first=dup(0);check(first>=0,127);close(first);
+ for(int i=0;i<16;i++) check(socketpair(AF_UNIX,SOCK_STREAM,0,NULL)==-1&&errno==EFAULT,128);
+ check(socketpair(AF_UNIX,SOCK_STREAM,0,p)==0&&p[0]==first,129);
+ close(p[0]);close(p[1]);
+ int filled[1100],count=0,fd;
+ while(count<1100&&(fd=dup(0))>=0) filled[count++]=fd;
+ check(count>1&&count<1100&&errno==EMFILE,130);
+ int last=filled[--count];close(last);p[0]=p[1]=-123;
+ check(socketpair(AF_UNIX,SOCK_STREAM,0,p)==-1&&errno==EMFILE&&p[0]==-123&&p[1]==-123,131);
+ fd=dup(0);check(fd==last,132);close(fd);
+ while(count)close(filled[--count]);
+}
+int main(int argc,char **argv){
+ if(argc>1&&!strcmp(argv[1],"socketpair-child")) {
+  char bytes[16];int n=read(0,bytes,sizeof bytes);
+  if(n!=5||write(1,bytes,n)!=n||write(2,"error",5)!=5) return 126;
+  return 0;
+ }
+ socketpairs();
+#ifdef __i386__
+ dprintf(2,"UNIX_PASS: 32-bit socketpairs across vfork and exec\n");return 0;
+#endif
+
  umask(0077);pid_t own=getpid();struct sockaddr_un addr,got;socklen_t n=address(&addr,"/home/retroos/test.sock");
  int listener=socket(AF_UNIX,SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC,0);check(listener>=0,1);
  check(bind(listener,(struct sockaddr *)&addr,n)==0,2);

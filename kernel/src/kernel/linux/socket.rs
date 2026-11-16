@@ -77,20 +77,27 @@ pub fn socket(domain: i32, ty: i32, protocol: i32, pid: i32) -> i32 {
     }
     result(net::socket(kind, ty & 0x800 != 0))
 }
-pub fn connect(h: i32, addr: &[u8], pid: i32, linux: &super::LinuxState) -> i32 {
+pub fn socketpair(domain: i32, ty: i32, protocol: i32, pid: i32) -> Result<(i32, i32), i32> {
+    if domain != 1 { return Err(-97); }
+    if ty & !(0xf | 0x800 | 0x80000) != 0 { return Err(-22); }
+    if !matches!(ty & 0xf, 1 | 5) { return Err(-94); }
+    if protocol != 0 { return Err(-93); }
+    local::pair(ty & 0x800 != 0, ty & 0xf == 5, credentials(pid)).map_err(|e| -errno(e))
+}
+pub fn connect(fds: &[super::thread::FdKind], h: i32, addr: &[u8], pid: i32, linux: &super::LinuxState) -> i32 {
     if local::is_local(h) {
         let body = match local_address(addr) { Ok(body) => body, Err(e) => return e };
         if body[0] == 0 { return result(local::connect(h, &(0, body.to_vec()), credentials(pid))); }
         let mut path = [0; crate::kernel::vfs::PATH_KEY_MAX];
         return local_result(crate::kernel::vfs::connect_local_socket(h,
-            super::resolve_path(body, linux.cwd_str(), &mut path), credentials(pid)));
+            super::resolve_path(fds, body, linux.cwd_str(), &mut path), credentials(pid)));
     }
     match decode(addr) {
         Ok(e) => result(net::connect(h, e)),
         Err(e) => e,
     }
 }
-pub fn bind(h: i32, addr: &[u8], linux: &super::LinuxState) -> i32 {
+pub fn bind(fds: &[super::thread::FdKind], h: i32, addr: &[u8], linux: &super::LinuxState) -> i32 {
     if local::is_local(h) {
         let body = match local_address(addr) { Ok(body) => body, Err(e) => return e };
         let mode = (0o777 & !linux.creation_mask) as u16;
@@ -98,7 +105,7 @@ pub fn bind(h: i32, addr: &[u8], linux: &super::LinuxState) -> i32 {
         let mut path = [0; crate::kernel::vfs::PATH_KEY_MAX];
         let mut name = body.to_vec(); name.push(0);
         return local_result(crate::kernel::vfs::bind_local_socket(h,
-            super::resolve_path(body, linux.cwd_str(), &mut path), name, mode));
+            super::resolve_path(fds, body, linux.cwd_str(), &mut path), name, mode));
     }
     match decode(addr) {
         Ok(e) => result(net::bind(h, e)),
@@ -248,7 +255,7 @@ pub fn address_length(h: i32, peer: bool) -> usize {
 pub fn local_option(h: i32, level: i32, option: i32) -> Result<alloc::vec::Vec<u8>, i32> {
     if level != 1 { return Err(-92); }
     let value: i32 = match option {
-        3 | 39 => 1, 4 | 38 => 0, 7 | 8 => 65536,
+        3 => local::socket_type(h).map_err(|e| -errno(e))?, 39 => 1, 4 | 38 => 0, 7 | 8 => 65536,
         17 => {
             let peer = local::credentials(h).map_err(|e| -errno(e))?;
             let mut bytes = alloc::vec::Vec::with_capacity(12);

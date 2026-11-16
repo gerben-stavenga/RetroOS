@@ -980,10 +980,21 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
             return -5;
         };
         let root = media.root_dir();
-        if root.rename(src, &root, dst).is_ok() {
-            0
-        } else {
-            -2
+        // The VFS only reaches a backend with an existing destination for a
+        // POSIX replace, after checking type, emptiness and permission. FAT
+        // has no atomic replace, so the old destination goes first. Editors
+        // save this way (write temp, rename over the original).
+        let mut result = root.rename(src, &root, dst);
+        if matches!(result, Err(fatfs::Error::AlreadyExists)) {
+            if root.remove(dst).is_err() { return -5; }
+            result = root.rename(src, &root, dst);
+        }
+        match result {
+            Ok(()) => 0,
+            Err(fatfs::Error::NotFound) => -2,
+            Err(fatfs::Error::AlreadyExists) => -17,
+            Err(fatfs::Error::DirectoryIsNotEmpty) => -39,
+            Err(_) => -5,
         }
     }
 

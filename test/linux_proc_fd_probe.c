@@ -24,6 +24,16 @@ static long call(word n,word a,word b,word c,word d) {
 #endif
  return r;
 }
+static long call5(word n,word a,word b,word c,word d,word e) {
+ long r;
+#ifdef __x86_64__
+ register word fourth __asm__("r10")=d,fifth __asm__("r8")=e;
+ __asm__ volatile("syscall":"=a"(r):"a"(n),"D"(a),"S"(b),"d"(c),"r"(fourth),"r"(fifth):"rcx","r11","memory");
+#else
+ __asm__ volatile("int $0x80":"=a"(r):"a"(n),"b"(a),"c"(b),"d"(c),"S"(d),"D"(e):"memory");
+#endif
+ return r;
+}
 static void check(int ok,int code){if(!ok){call(__NR_exit,code,0,0,0);for(;;){}}}
 #ifdef __x86_64__
 static long mapping_region(word base,word flags,word file,word protection,word length,word offset){
@@ -41,6 +51,55 @@ static long mapping(word base,word flags,word file,word protection){return mappi
 static unsigned char buffer[96],seen[2048];
 static char link[256];
 static Stat metadata;
+/* "/proc/self/fd/<fd>/<name>" (or another descriptor-link prefix). */
+static char *below(char *out,const char *prefix,long fd,const char *name){
+ char digits[12];int n=0;do{digits[n++]=(char)('0'+fd%10);fd/=10;}while(fd);
+ char *at=out;while(*prefix)*at++=*prefix++;
+ while(n)*at++=digits[--n];*at++='/';while(*name)*at++=*name++;*at=0;return out;
+}
+/* Claude Code anchors file writes on an O_PATH directory descriptor and then
+   creates, renames and reads through /proc/self/fd/N/<name>. */
+static void directory_links(void){
+ char temporary[96],final[96],alias[96];Stat plain,linked;
+ long directory=call(__NR_openat,(word)-100,(word)"/home/retroos",0x200000|0x80000|0x10000,0);check(directory>=0,210);
+ below(temporary,"/proc/self/fd/",directory,"linked.tmp.4.6991781af43d");
+ below(final,"/proc/self/fd/",directory,"linked");
+ below(alias,"/dev/fd/",directory,"linked");
+ long file=call(__NR_openat,(word)-100,(word)temporary,0x1|0x40|0x80|0x20000|0x80000,0644);check(file>=0,211);
+ check(call(__NR_write,file,(word)"LINKED",6,0)==6,212);call(__NR_close,file,0,0,0);
+ check(call(__NR_rename,(word)temporary,(word)final,0,0)==0,213);
+ file=call(__NR_openat,(word)-100,(word)final,0x100|0x800|0x20000|0x80000,0);check(file>=0,214);
+ check(call(__NR_read,file,(word)link,sizeof link,0)==6 && link[0]=='L' && link[5]=='D',215);call(__NR_close,file,0,0,0);
+ check(call(LSTAT,(word)"/home/retroos/linked",(word)&plain,0,0)==0 && (plain.st_mode&0170000)==0100000 && plain.st_size==6,216);
+ check(call(LSTAT,(word)alias,(word)&linked,0,0)==0 && linked.st_ino==plain.st_ino && linked.st_dev==plain.st_dev,217);
+ check(call(LSTAT,(word)"/home/retroos/linked.tmp.4.6991781af43d",(word)&linked,0,0)==-2,218);
+ check(call(__NR_unlink,(word)final,0,0,0)==0 && call(LSTAT,(word)"/home/retroos/linked",(word)&plain,0,0)==-2,219);
+ file=call(__NR_open,(word)"/home/retroos/target",0,0,0);check(file>=0,220);
+ check(call(__NR_open,(word)below(alias,"/proc/self/fd/",file,"inner"),0,0,0)<0,221);
+ call(__NR_close,file,0,0,0);
+ /* Bash tool: reopen a child directory through the link, confirm where it
+    points, then stat and open a file below the new descriptor. */
+ static unsigned char extended[256];static char where[64];
+ long many=call(__NR_openat,(word)-100,(word)below(alias,"/proc/self/fd/",directory,"many"),0x200000|0x20000|0x80000|0x10000,0);check(many>=0,222);
+ below(final,"/proc/self/fd/",many,"");{char *end=final;while(*end)end++;end[-1]=0;} /* drop the trailing slash */
+ check(call(__NR_readlink,(word)final,(word)where,sizeof where,0)==18 && where[14]=='m' && where[17]=='y',223);
+ check(call5(__NR_statx,(word)-100,(word)below(alias,"/proc/self/fd/",many,"entry000"),0x100,0xfff,(word)extended)==0
+  && (*(unsigned short *)(extended+28)&0170000)==0100000 && *(unsigned long long *)(extended+40)==5,224);
+ file=call(__NR_openat,(word)-100,(word)alias,0x800|0x20000|0x80000,0);check(file>=0,225);
+ check(call(__NR_read,file,(word)link,sizeof link,0)==5 && link[0]=='e',226);
+ call(__NR_close,file,0,0,0);call(__NR_close,many,0,0,0);call(__NR_close,directory,0,0,0);
+ /* Editors save by renaming a temporary file over the original. /tmp is the
+    FAT-backed session RAM disk, whose library rename refuses an existing
+    destination. */
+ file=call(__NR_open,(word)"/tmp/saved",0x241,0644,0);check(file>=0,227);
+ check(call(__NR_write,file,(word)"OLD",3,0)==3,228);call(__NR_close,file,0,0,0);
+ file=call(__NR_open,(word)"/tmp/saved.tmp.4.e1f7856cf401",0xc1|0x20000|0x80000,0664,0);check(file>=0,229);
+ check(call(__NR_write,file,(word)"NEWER",5,0)==5,230);call(__NR_close,file,0,0,0);
+ check(call(__NR_rename,(word)"/tmp/saved.tmp.4.e1f7856cf401",(word)"/tmp/saved",0,0)==0,231);
+ check(call(LSTAT,(word)"/tmp/saved",(word)&metadata,0,0)==0 && metadata.st_size==5,232);
+ check(call(LSTAT,(word)"/tmp/saved.tmp.4.e1f7856cf401",(word)&metadata,0,0)==-2,233);
+ check(call(__NR_unlink,(word)"/tmp/saved",0,0,0)==0,234);
+}
 static unsigned char ipc_message[4133];
 static void ipc_child(void){
  unsigned char part[97];word total=0;
@@ -97,7 +156,8 @@ __attribute__((force_align_arg_pointer)) void _start(void){
  check(call(__NR_fchdir,cwd_fd,0,0,0)==-9,206);
  check(call(__NR_fchdir,1,0,0,0)==-20,207);
  check(call(__NR_chdir,(word)"/",0,0,0)==0,208);
- check(call(__NR_setpgid,0,0,0,0)==0,195);
+ long regrouped=call(__NR_setpgid,0,0,0,0); /* EPERM when the probe leads its session, as on Linux. */
+ check(regrouped==0 || regrouped==-1,195);
  check(call(__NR_getpgrp,0,0,0,0)==call(__NR_getpid,0,0,0,0),196);
  check(call(FSTAT,0,(word)&metadata,0,0)==0 && (metadata.st_mode&0170000)==0020000,116);
  long file=call(__NR_open,(word)"/home/retroos/target",0,0,0);check(file==3,1);
@@ -338,6 +398,7 @@ __attribute__((force_align_arg_pointer)) void _start(void){
  check(call(__NR_mkdir,(word)"",0755,0,0)==-2,96);
  check(call(__NR_chdir,(word)"/",0,0,0)==0,97);
  for(int level=3;level>=0;level--){deep[ends[level]]=0;check(call(__NR_rmdir,(word)deep,0,0,0)==0,98);}
+ directory_links();
  ipc_roundtrips();
  call(__NR_exit,0,0,0,0);for(;;){}
 }

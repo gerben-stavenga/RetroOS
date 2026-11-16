@@ -3464,14 +3464,13 @@ mod tests {
         let file = vfs.open_to_handle(b"moved/file"); assert!(file >= 0);
         let mut bytes = [0; 4]; assert_eq!(vfs.cached_read(file, 0, &mut bytes), 3);
         assert_eq!(&bytes[..3], b"old"); assert_eq!(vfs.close_handle(file), 0);
-        // FAT's backend cannot overwrite a destination. A failed operation
-        // must retain existing bytes, followed by a real unlink/name reuse.
+        // A no-replace failure retains cached bytes; POSIX replacement must
+        // retire them even on FAT so the next read sees the new file.
         let moved = (0, path_ino(b"moved/file"), 0);
-        assert_eq!(vfs.rename_inner(b"replacement", b"moved/file", true), -2);
+        assert_eq!(vfs.rename(b"replacement", b"moved/file"), -17);
         assert!(vfs.file_pages.contains_key(&moved));
-        assert_eq!(vfs.delete(b"moved/file"), 0);
+        assert_eq!(vfs.rename_inner(b"replacement", b"moved/file", true), 0);
         assert!(!vfs.file_pages.contains_key(&moved));
-        assert_eq!(vfs.rename(b"replacement", b"moved/file"), 0);
         let file = vfs.open_to_handle(b"moved/file"); assert!(file >= 0);
         assert_eq!(vfs.cached_read(file, 0, &mut bytes), 3); assert_eq!(&bytes[..3], b"new");
         assert!(vfs.file_pages.contains_key(&keep)); assert_eq!(vfs.close_handle(file), 0);

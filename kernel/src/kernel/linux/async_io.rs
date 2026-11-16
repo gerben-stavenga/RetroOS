@@ -5,7 +5,7 @@
 use super::*;
 use alloc::{
     boxed::Box,
-    sync::{Arc, Weak},
+    sync::Arc,
     vec::Vec,
 };
 use spin::Mutex;
@@ -25,11 +25,10 @@ fn timespec_ns<A: crate::Arch>(machine: &mut A, address: u64) -> Result<u64, i32
 pub(super) fn proc_slots(state: &State) -> usize { state.handles.len() }
 pub(super) fn proc_target(state: &State, fd: usize) -> Option<Vec<u8>> {
     let label = match descriptor(state, i32::try_from(fd).ok()?)? {
-        Descriptor::Socket(_) => "socket",
         Descriptor::Event { .. } => "anon_inode:[eventfd]",
         Descriptor::Epoll(_) => "anon_inode:[eventpoll]",
     };
-    Some(if label == "socket" { alloc::format!("socket:[{}]", fd).into_bytes() } else { label.as_bytes().to_vec() })
+    Some(label.as_bytes().to_vec())
 }
 #[derive(Clone, Copy)]
 enum Wait {
@@ -46,7 +45,7 @@ enum Wait {
     ReadV,
     Splice,
     Child(i32, u64),
-    Socket(i32, u64, usize),
+    Socket(PendingSocket),
     Exited,
 }
 struct Context {
@@ -69,19 +68,11 @@ struct Watch {
     read_sequence: u64,
     enabled: bool,
 }
-struct SocketEnd {
-    read_sequence: u64,
-    packets: alloc::collections::VecDeque<Vec<u8>>,
-    peer: Weak<Mutex<SocketEnd>>,
-    packet_mode: bool,
-    nonblock: bool,
-}
 // Fork and dup share open objects; descriptor tables remain process-owned.
 // Epoll may lock an endpoint while holding its watch list. Release endpoint
 // and event-counter guards before calling reset_edge (which locks epoll).
 #[derive(Clone)]
 enum Descriptor {
-    Socket(Arc<Mutex<SocketEnd>>),
     Event {
         count: Arc<Mutex<u64>>,
         semaphore: bool,
@@ -126,7 +117,7 @@ pub(super) fn debug_waits<A: crate::Arch>(kt: &thread::KernelThread<A>, state: &
             Wait::ReadV => ("readv", 0, 0),
             Wait::Splice => ("splice", 0, 0),
             Wait::Child(pid, _) => ("child", pid as u64, 0),
-            Wait::Socket(fd, _, _) => ("socket", fd as u64, 0),
+            Wait::Socket(request) => ("socket", request.args.a0, request.nr as u64),
             Wait::Exited => continue,
         };
         let name = &context.comm[..context.comm.iter().position(|&byte| byte == 0).unwrap_or(context.comm.len())];
@@ -215,15 +206,6 @@ fn ready<A: crate::Arch>(kt: &thread::KernelThread<A>, s: &State, fd: i32) -> u3
         let count = *count.lock();
         return u32::from(count > 0) | if count < u64::MAX - 1 { 4 } else { 0 };
     }
-    if let Some(Descriptor::Socket(end)) = descriptor(s, fd) {
-        let end = end.lock();
-        return u32::from(!end.packets.is_empty())
-            | if end.peer.upgrade().is_some() {
-                4
-            } else {
-                16
-            };
-    }
     if fd < 0 || fd as usize >= thread::MAX_FDS {
         return 0;
     }
@@ -284,13 +266,9 @@ fn epoll<A: crate::Arch>(
     let mut watches = watches.lock();
     let mut n = 0;
     for w in watches.iter_mut() {
-        let sequence = if let Some(Descriptor::Socket(end)) = descriptor(s, w.fd) {
-            end.lock().read_sequence
-        } else {
-            match kt.fds.get(w.fd as usize) {
-                Some(FdKind::Socket(handle)) => crate::kernel::net::read_sequence(*handle),
-                _ => 0,
-            }
+        let sequence = match kt.fds.get(w.fd as usize) {
+            Some(FdKind::Socket(handle)) => crate::kernel::net::read_sequence(*handle),
+            _ => 0,
         };
         let bits = ready(kt, s, w.fd);
         let bits = bits & (w.events | 0x18);
@@ -354,99 +332,6 @@ pub(super) fn call<A: crate::Arch>(
         // wait handling. Return normally so the shared-context scheduler
         // chooses another runnable thread (or polls the idle context).
         24 if !s.contexts.is_empty() => 0,
-        16 if a.a1 as u32 == 0x5421 && matches!(descriptor(s, fd), Some(Descriptor::Socket(_))) => {
-            if a.a2 == 0 || a.a2.checked_add(4).is_none_or(|end| end > 0xc0000000) { return Some(SyscallResult::val(-EFAULT)); }
-            let Some(Descriptor::Socket(end)) = descriptor(s, fd) else { unreachable!() };
-            end.lock().nonblock = machine.read::<i32>(a.a2 as u64) != 0;
-            0
-        }
-        16 if a.a1 as u32 == 0x541b && matches!(descriptor(s, fd), Some(Descriptor::Socket(_))) => {
-            if a.a2 == 0 || a.a2.checked_add(4).is_none_or(|end| end > 0xc0000000) { return Some(SyscallResult::val(-EFAULT)); }
-            let Some(Descriptor::Socket(end)) = descriptor(s, fd) else { unreachable!() };
-            let end = end.lock();
-            let queue = &end.packets;
-            let count = if end.packet_mode { queue.front().map_or(0, Vec::len) }
-                else { queue.iter().map(Vec::len).sum::<usize>() };
-            machine.write::<i32>(a.a2 as u64, count.min(i32::MAX as usize) as i32);
-            0
-        }
-        53 => {
-            let kind = a.a1 & !(0x80000 | 0x800);
-            if a.a0 != 1 || !matches!(kind, 1 | 5) || a.a2 != 0 {
-                -EINVAL
-            } else {
-                let make = || {
-                    Arc::new(Mutex::new(SocketEnd {
-                        read_sequence: 0,
-                        packets: Default::default(),
-                        peer: Default::default(),
-                        packet_mode: kind == 5,
-                        nonblock: a.a1 & 0x800 != 0,
-                    }))
-                };
-                let one = make();
-                let two = make();
-                one.lock().peer = Arc::downgrade(&two);
-                two.lock().peer = Arc::downgrade(&one);
-                let one = alloc_fd(s, Descriptor::Socket(one));
-                let two = alloc_fd(s, Descriptor::Socket(two));
-                for fd in [one, two] {
-                    let index = (fd - FIRST_FD) as usize;
-                    s.cloexec.resize(s.handles.len(), false);
-                    s.cloexec[index] = a.a1 & 0x80000 != 0;
-                }
-                machine.write::<i32>(a.a3 as u64, one);
-                machine.write::<i32>(a.a3 + 4, two);
-                0
-            }
-        }
-        0 | 1 | 20 | 44 | 45 if matches!(descriptor(s, fd), Some(Descriptor::Socket(_))) => {
-            if matches!(nr, 0 | 45) {
-                let end = match descriptor(s, fd).unwrap() {
-                    Descriptor::Socket(end) => end.clone(),
-                    _ => unreachable!(),
-                };
-                match socket_read(machine, &end, a.a1, a.a2 as usize) {
-                    Some(n) => n,
-                    None if end.lock().nonblock || (nr == 45 && a.a3 & 0x40 != 0) => -11,
-                    None => {
-                        ensure(machine, kt, s, regs);
-                        s.contexts[s.active].wait = Wait::Socket(fd, a.a1, a.a2 as usize);
-                        0
-                    }
-                }
-            } else {
-                let peer = match descriptor(s, fd).unwrap() {
-                    Descriptor::Socket(end) => end.lock().peer.upgrade(),
-                    _ => unreachable!(),
-                };
-                if let Some(peer) = peer {
-                    let data = if nr == 20 {
-                        match super::message::gather(machine, a.a1, a.a2, true) {
-                            Ok(bytes) => bytes, Err(e) => return Some(SyscallResult::val(e)),
-                        }
-                    } else {
-                        let sample = crate::kernel::event_profile::file_io_start();
-                        let mut data = alloc::vec![0; a.a2 as usize];
-                        crate::kernel::event_profile::file_io_finish(18, data.len(), sample);
-                        if !high_memory::copy_from(machine, a.a1, &mut data) { return Some(SyscallResult::val(-EFAULT)); }
-                        data
-                    };
-                    let n = data.len() as i32;
-                    if !data.is_empty() {
-                        let mut peer = peer.lock();
-                        peer.packets.push_back(data);
-                        // The reader may drain and refill between epoll waits.
-                        // Keep the notification on the shared endpoint so writes
-                        // through forked/duplicated descriptors remain visible.
-                        peer.read_sequence = peer.read_sequence.wrapping_add(1);
-                    }
-                    n
-                } else {
-                    -EPIPE
-                }
-            }
-        }
         291 => {
             if a.a0 & !0x80000 != 0 {
                 -EINVAL
@@ -680,19 +565,8 @@ pub(super) fn call<A: crate::Arch>(
                 s.cloexec[(fd - FIRST_FD) as usize] = a.a2 & 1 != 0;
                 0
             }
-            4 => {
-                if let Some(Descriptor::Socket(end)) = descriptor(s, fd) {
-                    end.lock().nonblock = a.a2 & 0x800 != 0;
-                }
-                0
-            }
-            3 => {
-                if let Some(Descriptor::Socket(end)) = descriptor(s, fd) {
-                    2 | if end.lock().nonblock { 0x800 } else { 0 }
-                } else {
-                    0x802
-                }
-            }
+            4 => 0,
+            3 => 0x802,
             _ => -EINVAL,
         },
         0 if fd >= 0 && (fd as usize) < thread::MAX_FDS && !s.contexts.is_empty() => {
@@ -943,6 +817,15 @@ pub(super) fn after_io<A: crate::Arch>(kt: &thread::KernelThread<A>, linux: &mut
     }
 }
 
+/// Retry blocking socket syscalls per user context so a sibling can supply data.
+pub(super) fn wait_socket<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
+    linux: &mut LinuxState, regs: &mut Regs, request: PendingSocket) {
+    let s = &mut linux.async_io;
+    ensure(machine, kt, s, regs);
+    s.contexts[s.active].wait = Wait::Socket(request);
+    schedule(machine, kt, linux, regs, false);
+}
+
 pub(super) fn parked(state: &State) -> bool { state.parked }
 
 /// wait4 blocks the calling user thread, not the whole shared-address-space
@@ -1016,6 +899,19 @@ pub(super) fn schedule<A: crate::Arch>(
     if !s.parked {
         s.contexts[s.active].regs = *regs;
     }
+    // Socket retry dispatch needs LinuxState as well as the descriptor table.
+    // End the async-state borrow while retrying each saved syscall.
+    for i in 0..linux.async_io.contexts.len() {
+        let Wait::Socket(request) = linux.async_io.contexts[i].wait else { continue; };
+        let mut frame = linux.async_io.contexts[i].regs;
+        if let Some(result) = request.step(machine, kt, linux, &mut frame) {
+            after_io(kt, linux, request.nr, &request.args, result);
+            let context = &mut linux.async_io.contexts[i];
+            context.regs.rax = result as u64;
+            context.wait = Wait::Ready;
+        }
+    }
+    let s = &mut linux.async_io;
     let now = machine.now();
     for i in 0..s.contexts.len() {
         let result = match s.contexts[i].wait {
@@ -1051,10 +947,6 @@ pub(super) fn schedule<A: crate::Arch>(
                 let n = vfs::flock(handle, operation);
                 if n == -11 { None } else { Some(n) }
             }
-            Wait::Socket(fd, out, count) => match descriptor(s, fd) {
-                Some(Descriptor::Socket(end)) => socket_read(machine, end, out, count),
-                _ => Some(-EBADF),
-            },
             Wait::Read(pipe, out, count) => {
                 let _wait = crate::kernel::event_profile::FileIoScope::start(17, count);
                 let sample = crate::kernel::event_profile::file_io_start();
@@ -1097,35 +989,6 @@ pub(super) fn schedule<A: crate::Arch>(
     }
 }
 
-fn socket_read<A: crate::Arch>(
-    machine: &mut A,
-    end: &Mutex<SocketEnd>,
-    out: u64,
-    count: usize,
-) -> Option<i32> {
-    if count == 0 {
-        return Some(0);
-    }
-    let mut end = end.lock();
-    let packet_mode = end.packet_mode;
-    let packets = &mut end.packets;
-    if let Some(mut packet) = packets.pop_front() {
-        let n = count.min(packet.len());
-        if !high_memory::copy_to(machine, out, &packet[..n]) {
-            packets.push_front(packet);
-            return Some(-EFAULT);
-        }
-        if !packet_mode && n < packet.len() {
-            packet.drain(..n);
-            packets.push_front(packet);
-        }
-        Some(n as i32)
-    } else if end.peer.upgrade().is_none() {
-        Some(0)
-    } else {
-        None
-    }
-}
 fn close_virtual(s: &mut State, fd: i32) {
     if let Some(i) = object(s, fd) {
         s.handles[(fd - FIRST_FD) as usize] = None;
@@ -1168,28 +1031,17 @@ pub(super) fn fork_state(s: &State) -> State {
 mod tests {
     use super::*;
     #[test]
-    fn fork_shares_socket_endpoints_and_exec_closes_only_cloexec_handles() {
-        let make = || {
-            Arc::new(Mutex::new(SocketEnd {
-                read_sequence: 0,
-                packets: Default::default(),
-                peer: Default::default(),
-                packet_mode: true,
-                nonblock: false,
-            }))
-        };
-        let input = make();
-        let output = make();
-        input.lock().peer = Arc::downgrade(&output);
-        output.lock().peer = Arc::downgrade(&input);
+    fn fork_shares_objects_and_exec_closes_only_cloexec_handles() {
+        let input = Arc::new(Mutex::new(0));
+        let output = Arc::new(Mutex::new(0));
         let input_weak = Arc::downgrade(&input);
         let output_weak = Arc::downgrade(&output);
         let mut parent = State {
             parked: true,
             ..State::default()
         };
-        let r = alloc_fd(&mut parent, Descriptor::Socket(input));
-        let w = alloc_fd(&mut parent, Descriptor::Socket(output));
+        let r = alloc_fd(&mut parent, Descriptor::Event { count: input, semaphore: false });
+        let w = alloc_fd(&mut parent, Descriptor::Event { count: output, semaphore: false });
         parent.cloexec[(w - FIRST_FD) as usize] = true;
         let mut child = fork_state(&parent);
         assert!(!child.parked);
@@ -1241,6 +1093,7 @@ pub(super) fn next_deadline(state: &State) -> Option<u64> {
         Wait::Sleep(end) | Wait::Futex(_, _, end) | Wait::Epoll(_, _, _, end) | Wait::Poll(_, _, end) =>
             (end != u64::MAX).then_some(end),
         Wait::Select => context.select.as_ref().unwrap().deadline(),
+        Wait::Socket(request) => request.deadline,
         _ => None,
     }).min()
 }
