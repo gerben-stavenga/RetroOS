@@ -32,11 +32,11 @@ pub(super) fn copy_with<A: crate::Arch>(m: &mut A, out: usize, cap: usize, text:
     let value = encode_with(text, wide, page);
     if cap <= value.len() || out == 0 { return (value.len() + 1) as u32; }
     for (i, &unit) in value.iter().enumerate() {
-        if wide { m.write::<u16>(out + i * 2, unit); }
-        else { m.write::<u8>(out + i, unit as u8); }
+        if wide { m.write::<u16>((out + i * 2) as u64, unit); }
+        else { m.write::<u8>((out + i) as u64, unit as u8); }
     }
-    if wide { m.write::<u16>(out + value.len() * 2, 0); }
-    else { m.write::<u8>(out + value.len(), 0); }
+    if wide { m.write::<u16>((out + value.len() * 2) as u64, 0); }
+    else { m.write::<u8>((out + value.len()) as u64, 0); }
     value.len() as u32
 }
 

@@ -203,7 +203,7 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
 
     if handler_sel == 0 && handler_off == 0 {
         if from_vm86 && matches!(exc_num, 0..=7 | 16 | 17 | 19)
-            && machine.read::<u16>(exc_num as usize * 4 + 2) != dos::STUB_SEG
+            && machine.read::<u16>((exc_num as usize * 4 + 2) as u64) != dos::STUB_SEG
         {
             // A guest-installed RM handler can recover from the fault using
             // the ordinary 16-bit interrupt frame. NDN probes Virtual PC
@@ -347,10 +347,10 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
             - core::mem::size_of::<ExcFrame32>() as u32
             - core::mem::size_of::<ExcFrameV10>() as u32;
         let addr = pm_seg_base.wrapping_add(new_sp) as usize;
-        machine.write::<RetF32>(addr, retf);
-        machine.write::<ExcFrame32>(addr + core::mem::size_of::<RetF32>(), frame);
+        machine.write::<RetF32>(addr as u64, retf);
+        machine.write::<ExcFrame32>((addr + core::mem::size_of::<RetF32>()) as u64, frame);
         machine.write::<ExcFrameV10>(
-            addr + core::mem::size_of::<RetF32>() + core::mem::size_of::<ExcFrame32>(), v10);
+            (addr + core::mem::size_of::<RetF32>() + core::mem::size_of::<ExcFrame32>()) as u64, v10);
     } else {
         // 16-bit: RetF16 (4) + ExcFrame16 (28, padded) + ExcFrameV10 (56) = 88 bytes.
         // 0.9 handler reads +00..+0FH; padding fills +10H..+1FH so the
@@ -367,10 +367,10 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
             - core::mem::size_of::<ExcFrame16>() as u32
             - core::mem::size_of::<ExcFrameV10>() as u32;
         let addr = pm_seg_base.wrapping_add(new_sp) as usize;
-        machine.write::<RetF16>(addr, retf);
-        machine.write::<ExcFrame16>(addr + core::mem::size_of::<RetF16>(), frame);
+        machine.write::<RetF16>(addr as u64, retf);
+        machine.write::<ExcFrame16>((addr + core::mem::size_of::<RetF16>()) as u64, frame);
         machine.write::<ExcFrameV10>(
-            addr + core::mem::size_of::<RetF16>() + core::mem::size_of::<ExcFrame16>(), v10);
+            (addr + core::mem::size_of::<RetF16>() + core::mem::size_of::<ExcFrame16>()) as u64, v10);
     }
 
     // The visible frame uses a fixed slot; its continuation is host-only.
@@ -455,10 +455,10 @@ pub(super) fn exception_return<A: crate::Arch>(machine: &mut A,
     let (new_eip, new_cs, new_eflags, new_esp, new_ss) = match via {
         ExcReturnVia::V09 => {
             if use32 {
-                let f: ExcFrame32 = machine.read(live_base.wrapping_add(live_sp) as usize);
+                let f: ExcFrame32 = machine.read(live_base.wrapping_add(live_sp) as u64);
                 (f.eip, f.cs, f.eflags, f.esp, f.ss)
             } else {
-                let f: ExcFrame16 = machine.read(live_base.wrapping_add(live_sp) as usize);
+                let f: ExcFrame16 = machine.read(live_base.wrapping_add(live_sp) as u64);
                 // 16-bit fields fold into the low halves of the saved
                 // 32-bit registers; upper halves come from the pre-fault
                 // capture in HostContinuation below.
@@ -470,7 +470,7 @@ pub(super) fn exception_return<A: crate::Arch>(machine: &mut A,
             // client bitness (DPMI 1.0 §4.3). The handler returned with
             // `ADD (E)SP, 20h; RETF`, so SS:(E)SP points at the expanded
             // frame's error code — 8 bytes past the struct's return slot.
-            let f: ExcFrameV10 = machine.read(live_base.wrapping_add(live_sp).wrapping_sub(8) as usize);
+            let f: ExcFrameV10 = machine.read(live_base.wrapping_add(live_sp).wrapping_sub(8) as u64);
             // CS lives in low 16 of cs_xinfo; high 16 is ExceptionInfoBits.
             (f.eip, f.cs_xinfo & 0xFFFF, f.eflags, f.esp, f.ss)
         }

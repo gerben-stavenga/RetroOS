@@ -57,7 +57,7 @@ fn ensure<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, t: &mut Sta
     if !t.contexts.is_empty() {
         return;
     }
-    let id = machine.read::<u32>((state.teb_base + 0x24) as usize);
+    let id = machine.read::<u32>(((state.teb_base + 0x24) as usize) as u64);
     t.contexts.push(Context {
         wait_handles: Vec::new(),
         wait_all: false,
@@ -217,7 +217,7 @@ pub(super) fn call<A: crate::Arch>(
             0xc000000d
         } else {
             let handles: Vec<u32> = (0..count)
-                .map(|i| machine.read::<u32>(array + i * 4))
+                .map(|i| machine.read::<u32>((array + i * 4) as u64))
                 .collect();
             let duplicate = handles
                 .iter()
@@ -330,13 +330,13 @@ pub(super) fn schedule<A: crate::Arch>(
         if index != 0 && index < state.ldt.len() {
             state.ldt[index] = descriptor(c.teb, (TEB_SIZE - 1) as u32);
             if state.win16.is_some() {
-                let copy = machine.read::<u32>((PEB_BASE + 0x220) as usize) as usize;
+                let copy = machine.read::<u32>((PEB_BASE + 0x220) as u64) as usize;
                 if copy != 0 {
                     let bits = (TEB_SIZE - 1) as u32
                         | (((state.ldt[index] >> 40) as u32 & 0x1f) << 24)
                         | (1 << 30);
-                    machine.write::<u32>(copy + index * 4, c.teb);
-                    machine.write::<u32>(copy + 32768 + index * 4, bits);
+                    machine.write::<u32>((copy + index * 4) as u64, c.teb);
+                    machine.write::<u32>((copy + 32768 + index * 4) as u64, bits);
                 }
             }
             machine.load_ldt(&state.ldt);
@@ -383,11 +383,11 @@ pub(super) fn clear_tls<A: crate::Arch>(machine: &mut A, threads: &mut State, in
     }
     for base in bases {
         if index < 64 {
-            machine.write::<u32>(base as usize + 0xe10 + index as usize * 4, 0);
+            machine.write::<u32>((base as usize + 0xe10 + index as usize * 4) as u64, 0);
         } else {
-            let slots = machine.read::<u32>(base as usize + 0xf94);
+            let slots = machine.read::<u32>((base as usize + 0xf94) as u64);
             if slots != 0 {
-                machine.write::<u32>((slots + (index - 64) * 4) as usize, 0);
+                machine.write::<u32>((slots + (index - 64) * 4) as u64, 0);
             }
         }
     }
@@ -404,7 +404,7 @@ pub(super) fn event<A: crate::Arch>(
 ) -> u32 {
     if op == 0 {
         let handle = create_event(state, flags & 1 != 0, flags & 2 != 0);
-        machine.write::<u32>(out as usize, handle);
+        machine.write::<u32>(out as u64, handle);
         return 0;
     }
     if op == 3 { processes::close(state,handle); }
@@ -432,7 +432,7 @@ pub(super) fn event<A: crate::Arch>(
     let event = &mut state.threads.events[index];
     if out != 0 {
         machine.write::<u32>(
-            out as usize,
+            out as u64,
             if op == 4 {
                 (event.manual as u32) | ((event.signaled as u32) << 1)
             } else {
@@ -528,7 +528,7 @@ pub(super) fn sync<A: crate::Arch>(
     args: [u32; 6],
 ) -> u32 {
     let [op, handle, value, maximum, out, _] = args;
-    let id = machine.read::<u32>((state.teb_base + 0x24) as usize);
+    let id = machine.read::<u32>((state.teb_base + 0x24) as u64);
     if op <= 1 {
         if op == 0 && (maximum == 0 || maximum > i32::MAX as u32 || value > maximum) {
             return 0xc000000d;
@@ -548,7 +548,7 @@ pub(super) fn sync<A: crate::Arch>(
                 recursion: if value != 0 { 1 } else { 0 },
             });
         }
-        machine.write::<u32>(out as usize, handle);
+        machine.write::<u32>(out as u64, handle);
         return 0;
     }
     if let Some(i) = state
@@ -571,13 +571,13 @@ pub(super) fn sync<A: crate::Arch>(
                     return 0xc0000047;
                 }
                 if out != 0 {
-                    machine.write::<u32>(out as usize, s.count);
+                    machine.write::<u32>(out as u64, s.count);
                 }
                 s.count += value;
             }
             4 => {
-                machine.write::<u32>(out as usize, s.count);
-                machine.write::<u32>(out as usize + 4, s.maximum);
+                machine.write::<u32>(out as u64, s.count);
+                machine.write::<u32>((out as usize + 4) as u64, s.maximum);
             }
             _ => return 0xc0000024,
         }
@@ -600,7 +600,7 @@ pub(super) fn sync<A: crate::Arch>(
                     return 0xc0000046;
                 }
                 if out != 0 {
-                    machine.write::<u32>(out as usize, 1u32.wrapping_sub(m.recursion));
+                    machine.write::<u32>(out as u64, 1u32.wrapping_sub(m.recursion));
                 }
                 m.recursion -= 1;
                 if m.recursion == 0 {
@@ -608,8 +608,8 @@ pub(super) fn sync<A: crate::Arch>(
                 }
             }
             5 => {
-                machine.write::<u32>(out as usize, 1u32.wrapping_sub(m.recursion));
-                machine.write::<u32>(out as usize + 4, (m.owner == id) as u32);
+                machine.write::<u32>(out as u64, 1u32.wrapping_sub(m.recursion));
+                machine.write::<u32>((out as usize + 4) as u64, (m.owner == id) as u32);
             }
             _ => return 0xc0000024,
         }
@@ -644,7 +644,7 @@ fn native<A: crate::Arch>(
     params: u32,
     out: u32,
 ) -> u32 {
-    let p: [u32; 6] = core::array::from_fn(|i| machine.read::<u32>(params as usize + i * 4));
+    let p: [u32; 6] = core::array::from_fn(|i| machine.read::<u32>((params as usize + i * 4) as u64));
     let mut t = core::mem::take(&mut state.threads);
     ensure(machine, state, &mut t, regs);
     state.threads = t;
@@ -678,7 +678,7 @@ fn native<A: crate::Arch>(
         let id = NEXT_THREAD.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let parent = state.threads.contexts[state.threads.active].id;
         state.user_objects.inherit_thread(parent, id);
-        let pid = machine.read::<u32>((state.teb_base + 0x20) as usize);
+        let pid = machine.read::<u32>((state.teb_base + 0x20) as u64);
         for (offset, value) in [
             (0, u32::MAX),
             (4, stack + 4096 + size),
@@ -690,13 +690,13 @@ fn native<A: crate::Arch>(
             (0xe0c, stack),
             (TEB_STATIC_STRING + 4, teb + TEB_STATIC_BUFFER),
         ] {
-            machine.write::<u32>((teb + offset) as usize, value);
+            machine.write::<u32>((teb + offset) as u64, value);
         }
-        machine.write::<u16>((teb + TEB_STATIC_STRING + 2) as usize, 522);
+        machine.write::<u16>((teb + TEB_STATIC_STRING + 2) as u64, 522);
         let sp = stack + 4096 + size - 12;
-        machine.write::<u32>(sp as usize, 0);
-        machine.write::<u32>(sp as usize + 4, p[1]);
-        machine.write::<u32>(sp as usize + 8, p[2]);
+        machine.write::<u32>(sp as u64, 0);
+        machine.write::<u32>((sp as usize + 4) as u64, p[1]);
+        machine.write::<u32>((sp as usize + 8) as u64, p[2]);
         let mut child = Regs::empty();
         child.init_user_process(p[0], sp);
         child.fs = state.teb_selector as u64;
@@ -722,7 +722,7 @@ fn native<A: crate::Arch>(
             stack_size: size,
         });
         for (i, v) in [handle, id, teb, pid].into_iter().enumerate() {
-            machine.write::<u32>(out as usize + i * 4, v);
+            machine.write::<u32>((out as usize + i * 4) as u64, v);
         }
         return 0;
     }
@@ -787,7 +787,7 @@ fn native<A: crate::Arch>(
                     Status::Suspended(previous - 1)
                 };
             }
-            machine.write::<u32>(out as usize, previous);
+            machine.write::<u32>(out as u64, previous);
         }
         2 => {
             c.status = Status::Exited(p[1]);
@@ -808,7 +808,7 @@ fn native<A: crate::Arch>(
             for (i, v) in [
                 code,
                 c.teb,
-                machine.read::<u32>((c.teb + 0x20) as usize),
+                machine.read::<u32>((c.teb + 0x20) as u64),
                 c.id,
                 last as u32,
                 c.stack_base,
@@ -817,7 +817,7 @@ fn native<A: crate::Arch>(
             .into_iter()
             .enumerate()
             {
-                machine.write::<u32>(out as usize + i * 4, v);
+                machine.write::<u32>((out as usize + i * 4) as u64, v);
             }
         }
         _ => return 0xc00000bb,

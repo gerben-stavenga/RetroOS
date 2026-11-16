@@ -22,8 +22,8 @@ fn patch_calls(code: &mut [u8], normal: u32, registers: u32, flat_cs: u16) -> Re
 
 fn map_code<A: crate::Arch>(machine: &mut A, address: u32, bytes: &[u8]) -> Result<(), i32> {
     if bytes.len() > 4096 { return Err(-8); }
-    machine.zero(address as usize, 4096);
-    machine.copy_to(address as usize, bytes);
+    machine.zero(address as u64, 4096);
+    machine.copy_to(address as u64, bytes);
     crate::kernel::memory::protect(machine, address as usize / 4096, 1, false, true);
     Ok(())
 }
@@ -40,37 +40,37 @@ pub(super) fn start<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
     let params = super::super::PROCESS_DATA;
     windows.stack_size = 256 * 1024;
     windows.stack_base = super::super::STACK_TOP - windows.stack_size;
-    machine.zero(windows.stack_base as usize, windows.stack_size as usize);
+    machine.zero(windows.stack_base as u64, windows.stack_size as usize);
     crate::kernel::memory::protect(machine, windows.stack_base as usize / 4096, windows.stack_size as usize / 4096, true, false);
     for (address, size) in [(teb, super::super::TEB_SIZE), (peb, super::super::PEB_SIZE), (params, 4096)] {
-        machine.zero(address as usize, size);
+        machine.zero(address as u64, size);
         crate::kernel::memory::protect(machine, address as usize / 4096, size / 4096, true, false);
     }
     // Wine keeps its default debug-channel options immediately after the PEB.
-    machine.write::<u8>((peb + 4096) as usize, 7);
+    machine.write::<u8>(((peb + 4096) as usize) as u64, 7);
     let teb_selector = selector(&mut windows.ldt, teb, 4096, false)?;
     windows.teb_selector = teb_selector;
     for (offset, value) in [(0, u32::MAX), (4, super::super::STACK_TOP), (8, windows.stack_base),
         (0x18, teb), (0x20, tid as u32 + 1), (0x24, tid as u32 + 1), (0x30, peb),
         (0x10c, super::super::STACK_TOP - 128), (0x1d8, 0)] {
-        machine.write::<u32>((teb + offset) as usize, value);
+        machine.write::<u32>(((teb + offset) as usize) as u64, value);
     }
     super::super::initialize_teb_string(machine);
     // Both PE and NE launch paths supply Wine's normalized process strings.
     super::super::initialize_process_strings(machine,windows)?;
     super::super::initialize_environment(machine,windows)?;
-    machine.write::<u32>((peb + 0x10) as usize, params);
-    machine.write::<u32>((peb + 0x64) as usize, 1); // NumberOfProcessors
-    machine.write::<u32>((peb + 0x220) as usize, LDT_COPY);
-    machine.zero(LDT_COPY as usize, 65536);
+    machine.write::<u32>(((peb + 0x10) as usize) as u64, params);
+    machine.write::<u32>(((peb + 0x64) as usize) as u64, 1); // NumberOfProcessors
+    machine.write::<u32>(((peb + 0x220) as usize) as u64, LDT_COPY);
+    machine.zero(LDT_COPY as u64, 65536);
     crate::kernel::memory::protect(machine, LDT_COPY as usize / 4096, 16, true, false);
     for (i, &desc) in windows.ldt.iter().enumerate() {
         let base = selector_base_from_ldt(&windows.ldt, i as u16 * 8 + 7).unwrap_or(0);
         let limit = ((desc & 0xffff) | ((desc >> 32) & 0xf0000)) as u32;
         let bits = limit | (((desc >> 40) as u32 & 0x1f) << 24)
             | (((desc >> 55) as u32 & 1) << 29) | (((desc >> 54) as u32 & 1) << 30);
-        machine.write::<u32>(LDT_COPY as usize + i * 4, base);
-        machine.write::<u32>(LDT_COPY as usize + 32768 + i * 4, bits);
+        machine.write::<u32>((LDT_COPY as usize + i * 4) as u64, base);
+        machine.write::<u32>((LDT_COPY as usize + 32768 + i * 4) as u64, bits);
     }
     let state = windows.win16.as_ref().ok_or(-8)?;
     for module in &state.modules {
@@ -83,7 +83,7 @@ pub(super) fn start<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
             patch_calls(&mut code, normal, registers, flat_cs)?;
             let address = module_segment_base(module.base, number)? as usize;
             crate::kernel::memory::protect(machine, address / 4096, code.len().div_ceil(4096), true, false);
-            machine.copy_to(address, &code);
+            machine.copy_to(address as u64, &code);
             crate::kernel::memory::protect(machine, address / 4096, code.len().div_ceil(4096), false, true);
         }
         // Wine's generated pointer-conversion helpers read the LDT-copy
@@ -91,7 +91,7 @@ pub(super) fn start<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
         let pe_module = windows.modules.iter().find(|m| m.base == *owner).ok_or(-8)?;
         let pe = super::super::pe::Image::parse(&pe_module.data).map_err(|_| -8)?;
         let (rva, _) = pe.embedded_ne().map_err(|_| -8)?.ok_or(-8)?;
-        machine.write::<u32>((owner + rva + 40) as usize, LDT_COPY);
+        machine.write::<u32>(((owner + rva + 40) as usize) as u64, LDT_COPY);
     }
     // Wine owns the initial NE task and enters through its normal callback
     // relay. A raw far jump skips TDB/TIB and module initialization.
@@ -99,9 +99,9 @@ pub(super) fn start<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
     let start_task = super::super::export_address(&windows.modules, b"KRNL386.EXE16", b"RetroWineStartTask")?;
     let image_path=super::super::guest_windows_path(windows.exec_path_str());
     const TASK_PATH: u32 = ENTER16 + 2048;
-    let tail_size = machine.read::<u8>((super::PSP_BASE + 0x80) as usize).min(126) as usize;
+    let tail_size = machine.read::<u8>((super::PSP_BASE + 0x80) as u64).min(126) as usize;
     let mut tail = vec![0; tail_size];
-    machine.copy_from((super::PSP_BASE + 0x81) as usize, &mut tail);
+    machine.copy_from((super::PSP_BASE + 0x81) as u64, &mut tail);
     let task_tail = TASK_PATH + image_path.len() as u32 + 1;
     let mut enter = Vec::new();
     emit_call(&mut enter, start_task, &[TASK_PATH, task_tail]);

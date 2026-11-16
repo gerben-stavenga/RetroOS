@@ -40,7 +40,7 @@ pub(super) fn deliver<A: crate::Arch>(
     let top = if regs.frame.ss == flat.frame.ss {
         regs.sp32()
     } else {
-        machine.read::<u32>((state.teb_base + 0x10c) as usize)
+        machine.read::<u32>(((state.teb_base + 0x10c) as usize) as u64)
     };
     let Some(sp) = top.checked_sub(128).map(|s| (s & !15) - 4) else {
         return false;
@@ -50,11 +50,11 @@ pub(super) fn deliver<A: crate::Arch>(
     }
     let raw = sp + 16;
     for (i, v) in words(regs).iter().enumerate() {
-        machine.write::<u32>(raw as usize + i * 4, *v);
+        machine.write::<u32>((raw as usize + i * 4) as u64, *v);
     }
-    machine.write::<u32>(sp as usize, 0);
-    machine.write::<u32>(sp as usize + 4, raw);
-    machine.write::<u32>(sp as usize + 8, code);
+    machine.write::<u32>(sp as u64, 0);
+    machine.write::<u32>((sp as usize + 4) as u64, raw);
+    machine.write::<u32>((sp as usize + 8) as u64, code);
     let mut fx = machine.clean_fx_template();
     machine.switch_fx(&mut fx);
     state.exceptions.frames.push((state.teb_base, Box::new(fx)));
@@ -97,7 +97,7 @@ pub(super) fn restore<A: crate::Arch>(
     regs: &mut Regs,
     address: u32,
 ) -> u32 {
-    let w: [u32; WORDS] = core::array::from_fn(|i| machine.read::<u32>(address as usize + i * 4));
+    let w: [u32; WORDS] = core::array::from_fn(|i| machine.read::<u32>((address as usize + i * 4) as u64));
     if !selector(state, w[10], 0)
         || !selector(state, w[11], 1)
         || w[12..].iter().any(|&s| !selector(state, s, 2))

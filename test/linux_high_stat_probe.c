@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
+#include <sys/utsname.h>
+#include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/stat.h>
@@ -46,7 +49,27 @@ int main(void) {
     assert(open((void*)0xffffd000UL,O_RDONLY)==-1 && errno==EFAULT);
     strcpy(region,"/home/retroos/high-path");
     highfd=open(region,O_CREAT|O_EXCL|O_RDWR,0600);assert(highfd>=0);
-    assert(write(highfd,"ok",2)==2);close(highfd);
+    assert(write(highfd,"ok",2)==2);
+    strcpy(region+1024,"config");
+    assert(pwrite(highfd,region+1024,6,1)==6);
+    assert(lseek(highfd,0,SEEK_CUR)==2);
+    memset(region+4094,0,8);
+    assert(pread(highfd,region+4094,8,0)==7);
+    assert(!memcmp(region+4094,"oconfig",7));
+    assert(lseek(highfd,0,SEEK_CUR)==2);
+    assert(pread(highfd,(void*)0xffffd000UL,7,0)==-1 && errno==EFAULT);
+    assert(pwrite(highfd,(void*)0xffffd000UL,7,0)==-1 && errno==EFAULT);
+    assert(pread(highfd,region+4094,8,7)==0);
+    struct iovec *vec=(void*)(region+2048);
+    vec[0]=(struct iovec){region+1024,3};
+    vec[1]=(struct iovec){region+1027,3};
+    assert(writev(highfd,vec,2)==6);
+    assert(pread(highfd,region+4094,8,0)==8);
+    assert(!memcmp(region+4094,"occonfig",8));
+    assert(lseek(highfd,0,SEEK_SET)==0);
+    assert(readv(highfd,vec,2)==6);
+    assert(!memcmp(region+1024,"occonf",6));
+    close(highfd);
     strcpy(region+256,"/home/retroos/high-renamed");
     assert(rename(region,region+256)==0);
     assert(chmod(region+256,0644)==0);
@@ -66,6 +89,16 @@ int main(void) {
     assert(syscall(SYS_sched_getaffinity,0,32,region+1024)==8);
     assert(*(unsigned long long*)(region+1024)!=0);
     assert(syscall(SYS_sched_getaffinity,0,32,(void*)0xffffd000UL)==-1 && errno==EFAULT);
+    struct utsname *uts=(void*)(region+1024);
+    memset(uts,0x5a,sizeof(*uts));
+    child=fork();assert(child>=0);
+    if(!child) {assert(uname(uts)==0 && !strcmp(uts->sysname,"Linux"));_exit(0);}
+    assert(waitpid(child,&status,0)==child && status==0);
+    for(unsigned i=0;i<sizeof(*uts);++i)assert(((unsigned char*)uts)[i]==0x5a);
+    assert(uname(uts)==0 && !strcmp(uts->sysname,"Linux"));
+    struct pollfd *pollfd=(void*)(region+1024);
+    *pollfd=(struct pollfd){fd,POLLIN,0};
+    assert(poll(pollfd,1,0)==1 && (pollfd->revents & POLLIN));
     int ep=epoll_create1(0), ev=eventfd(1,0);assert(ep>=0 && ev>=0);
     struct epoll_event *event=(void*)(region+1024);
     event->events=EPOLLIN;event->data.u64=0x123456789abcdef0ULL;

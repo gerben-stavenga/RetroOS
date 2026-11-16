@@ -67,7 +67,7 @@ pub(super) fn cdrom_read_resume<A: crate::Arch>(
 pub(super) fn read_asciiz<A: crate::Arch>(machine: &mut A, address: u32, output: &mut [u8]) -> usize {
     let mut len = 0;
     while len + 1 < output.len() {
-        let byte = machine.read::<u8>(address as usize + len);
+        let byte = machine.read::<u8>((address as usize + len) as u64);
         if byte == 0 { break; }
         output[len] = byte;
         len += 1;
@@ -354,26 +354,26 @@ pub(super) mod dta {
 
 /// Stamp a search's identity and cursor into the caller's DTA.
 pub(super) fn write_search_state<A: crate::Arch>(machine: &mut A, dta: usize, slot: u8, generation: u8, cursor: u16) {
-    machine.write::<u16>(dta + dta::CURSOR, cursor);
-    machine.write::<u8>(dta + dta::SLOT, slot);
-    machine.write::<u8>(dta + dta::GENERATION, generation);
-    machine.write::<u16>(dta + dta::MAGIC, dta::MAGIC_VALUE);
+    machine.write::<u16>((dta + dta::CURSOR) as u64, cursor);
+    machine.write::<u8>((dta + dta::SLOT) as u64, slot);
+    machine.write::<u8>((dta + dta::GENERATION) as u64, generation);
+    machine.write::<u16>((dta + dta::MAGIC) as u64, dta::MAGIC_VALUE);
 }
 
 /// Recover `(slot, cursor)` from a DTA, or `None` if it holds no live search
 /// of ours — an unpaired FindNext, a DTA the program has since overwritten,
 /// or a stale one whose slot has been recycled.
 fn read_search_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, dta: usize) -> Option<(usize, u16)> {
-    if machine.read::<u16>(dta + dta::MAGIC) != dta::MAGIC_VALUE {
+    if machine.read::<u16>((dta + dta::MAGIC) as u64) != dta::MAGIC_VALUE {
         return None;
     }
-    let slot = machine.read::<u8>(dta + dta::SLOT) as usize;
-    let generation = machine.read::<u8>(dta + dta::GENERATION);
+    let slot = machine.read::<u8>((dta + dta::SLOT) as u64) as usize;
+    let generation = machine.read::<u8>((dta + dta::GENERATION) as u64);
     let s = dos.searches.get(slot)?;
     if !s.in_use || s.generation != generation {
         return None;
     }
-    Some((slot, machine.read::<u16>(dta + dta::CURSOR)))
+    Some((slot, machine.read::<u16>((dta + dta::CURSOR) as u64)))
 }
 
 /// Claim a search slot, round-robin. Slots are never explicitly freed — DOS
@@ -450,16 +450,16 @@ pub(super) fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thre
                     // Clear only the result fields: the reserved area below
                     // holds this search's cursor, and wiping it would strand
                     // the enumeration after its first entry.
-                    machine.zero(dta + dta::RESULT, 43 - dta::RESULT);
+                    machine.zero((dta + dta::RESULT) as u64, 43 - dta::RESULT);
                     write_search_state(machine, dta, slot as u8, generation, idx as u16);
                     let (time, date) = unix_to_dos_datetime(entry.mtime);
-                    machine.write::<u8>(dta + 0x15, found_attributes);
-                    machine.write::<u16>(dta + 0x16, time);
-                    machine.write::<u16>(dta + 0x18, date);
-                    machine.write::<u32>(dta + 0x1A, entry.size);
+                    machine.write::<u8>((dta + 0x15) as u64, found_attributes);
+                    machine.write::<u16>((dta + 0x16) as u64, time);
+                    machine.write::<u16>((dta + 0x18) as u64, date);
+                    machine.write::<u32>((dta + 0x1A) as u64, entry.size);
                     let name_len = alias.len().min(12);
-                    machine.copy_to(dta + 0x1E, &alias[..name_len]);
-                    machine.write::<u8>(dta + 0x1E + name_len, 0);
+                    machine.copy_to((dta + 0x1E) as u64, &alias[..name_len]);
+                    machine.write::<u8>((dta + 0x1E + name_len) as u64, 0);
                     return DosExit::Ok;
                 }
             }

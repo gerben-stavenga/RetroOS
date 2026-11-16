@@ -84,7 +84,7 @@ pub(super) fn call<A: crate::Arch>(
         } else {
             state.session.handles[slot] = true;
         }
-        machine.write::<u32>(out as usize, 0x73000000 | (slot as u32 * 4));
+        machine.write::<u32>(out as u64, 0x73000000 | (slot as u32 * 4));
         return 0;
     }
     if op == 3 {
@@ -134,7 +134,7 @@ pub(super) fn call<A: crate::Arch>(
         };
         n
     };
-    let requested = machine.read::<u32>(out as usize);
+    let requested = machine.read::<u32>(out as u64);
     let base = memory::call(machine, state, Api::MemoryReserve, requested, length, 0);
     if base == 0 {
         return 0xc0000018;
@@ -148,8 +148,8 @@ pub(super) fn call<A: crate::Arch>(
     crate::kernel::memory::protect(machine, base as usize / 4096, length as usize / 4096, false, false);
     memory::adopt_shared(state, base, 0);
     state.session.views.push(base);
-    machine.write::<u32>(out as usize, base);
-    machine.write::<u32>(out as usize + 4, length);
+    machine.write::<u32>(out as u64, base);
+    machine.write::<u32>((out as usize + 4) as u64, length);
     0
 }
 

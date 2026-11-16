@@ -62,9 +62,9 @@ pub(crate) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args:
     let [op,handle,data,size,_,out] = args;
     if op == 0 {
         if data == 0 || out == 0 { return INVALID; }
-        let rate = machine.read::<u32>(data as usize);
-        let channels = machine.read::<u32>(data as usize+4);
-        let bits = machine.read::<u32>(data as usize+8);
+        let rate = machine.read::<u32>(data as u64);
+        let channels = machine.read::<u32>((data as usize+4) as u64);
+        let bits = machine.read::<u32>((data as usize+8) as u64);
         if !(4000..=192000).contains(&rate) || !matches!(channels,1|2) || !matches!(bits,8|16) { return INVALID; }
         if handles.0.iter().flatten().count() >= 16 { return 0xc000009a; }
         let stream = Arc::new(Shared::new(Stream { frames:VecDeque::with_capacity(CAPACITY),rate,channels,bits,
@@ -73,7 +73,7 @@ pub(crate) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args:
         let i = handles.0.iter().position(Option::is_none).unwrap_or(handles.0.len());
         if i == handles.0.len() { handles.0.push(None); }
         handles.0[i] = Some(stream);
-        machine.write::<u32>(out as usize,i as u32+1);
+        machine.write::<u32>(out as u64,i as u32+1);
         return 0;
     }
     if op == 6 && handle == 0 {
@@ -99,16 +99,16 @@ pub(crate) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args:
                 let sample = |address| if stream.bits == 8 {
                     (i16::from(machine.read::<u8>(address))-128)*256
                 } else { machine.read::<i16>(address) };
-                let l = sample(address);
-                let r = if stream.channels == 1 {l} else {sample(address+(stream.bits/8) as usize)};
+                let l = sample(address as u64);
+                let r = if stream.channels == 1 {l} else {sample((address+(stream.bits/8) as usize) as u64)};
                 stream.frames.push_back((l,r));
             }
-            machine.write::<u32>(out as usize,count*stride);
+            machine.write::<u32>(out as u64,count*stride);
         },
         2 => {
             if out == 0 { return INVALID; }
             let bytes = stream.played(super::played_frames()) * u64::from(stream.channels*stream.bits/8);
-            machine.write::<u64>(out as usize,bytes);
+            machine.write::<u64>(out as u64,bytes);
         },
         3 => { stream.frames.clear();stream.phase=0;stream.consumed=0;stream.last_frame=0; },
         4 => stream.paused = data != 0,

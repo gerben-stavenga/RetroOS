@@ -161,13 +161,13 @@ pub(super) fn call<A: crate::Arch>(
     args: [u32; 5],
 ) -> u32 {
     let [op, params, buffer, count, out] = args;
-    let p: [u32; 8] = core::array::from_fn(|i| machine.read::<u32>(params as usize + i * 4));
-    machine.write::<u32>(out as usize, 0);
+    let p: [u32; 8] = core::array::from_fn(|i| machine.read::<u32>((params as usize + i * 4) as u64));
+    machine.write::<u32>(out as u64, 0);
     let c = &mut state.console;
     match op {
         0 => {
-            machine.write::<u32>(buffer as usize, c.input_cp);
-            machine.write::<u32>(buffer as usize + 4, c.output_cp);
+            machine.write::<u32>(buffer as u64, c.input_cp);
+            machine.write::<u32>((buffer as usize + 4) as u64, c.output_cp);
         }
         1 => {
             if p[0] & !3 != 0
@@ -196,7 +196,7 @@ pub(super) fn call<A: crate::Arch>(
             .into_iter()
             .enumerate()
             {
-                machine.write::<u32>(buffer as usize + i * 4, v);
+                machine.write::<u32>((buffer as usize + i * 4) as u64, v);
             }
         }
         3 => {
@@ -219,12 +219,12 @@ pub(super) fn call<A: crate::Arch>(
             }
             let text = if p[0] == 0 {
                 let units: Vec<u16> = (0..count)
-                    .map(|i| machine.read::<u16>((buffer + i * 2) as usize))
+                    .map(|i| machine.read::<u16>((buffer + i * 2) as u64))
                     .collect();
                 alloc::string::String::from_utf16_lossy(&units)
             } else {
                 let mut bytes = vec![0; count as usize];
-                machine.copy_from(buffer as usize, &mut bytes);
+                machine.copy_from(buffer as u64, &mut bytes);
                 super::encoding::page(c.output_cp)
                     .unwrap()
                     .decode(&bytes, false)
@@ -262,7 +262,7 @@ pub(super) fn call<A: crate::Arch>(
                     c.cursor_y -= 1;
                 }
             }
-            machine.write::<u32>(out as usize, count);
+            machine.write::<u32>(out as u64, count);
             paint(state);
         }
         6 => {
@@ -275,11 +275,11 @@ pub(super) fn call<A: crate::Arch>(
             for i in 0..count {
                 let at = (((p[1] + i / p[2]) * u32::from(c.cols) + p[0] + i % p[2]) * 2) as usize;
                 machine.write::<u32>(
-                    (buffer + i * 4) as usize,
+                    (buffer + i * 4) as u64,
                     c.cells[at] | (c.cells[at + 1] << 16),
                 );
             }
-            machine.write::<u32>(out as usize, count);
+            machine.write::<u32>(out as u64, count);
         }
         7 => {
             let item = if p[0] == 0 {
@@ -289,15 +289,15 @@ pub(super) fn call<A: crate::Arch>(
             };
             if let Some(item) = item {
                 for (i, v) in item.into_iter().enumerate() {
-                    machine.write::<u32>(buffer as usize + i * 4, v);
+                    machine.write::<u32>((buffer as usize + i * 4) as u64, v);
                 }
-                machine.write::<u32>(out as usize, 1);
+                machine.write::<u32>(out as u64, 1);
             }
         }
         8 => {
             c.keys.clear();
         }
-        9 => machine.write::<u32>(out as usize, c.keys.len() as u32),
+        9 => machine.write::<u32>(out as u64, c.keys.len() as u32),
         _ => return 0xc00000bb,
     }
     0

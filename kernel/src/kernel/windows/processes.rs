@@ -62,7 +62,7 @@ impl WindowsState {
             return;
         }
         encoding::copy(machine, (PROCESS_DATA + 0x400) as usize, 256, &cwd, true);
-        machine.write::<u16>((PROCESS_DATA + 0x24) as usize, (units.len() * 2) as u16);
+        machine.write::<u16>(((PROCESS_DATA + 0x24) as usize) as u64, (units.len() * 2) as u16);
     }
 }
 pub(super) fn close(state: &mut WindowsState, handle: u32) {
@@ -86,7 +86,7 @@ fn wide<A: crate::Arch>(machine: &A, pointer: u32, length: u32) -> Option<Vec<u8
         return None;
     }
     let units: Vec<u16> = (0..length / 2)
-        .map(|i| machine.read::<u16>((pointer + i * 2) as usize))
+        .map(|i| machine.read::<u16>(((pointer + i * 2) as usize) as u64))
         .collect();
     alloc::string::String::from_utf16(&units)
         .ok()
@@ -99,7 +99,7 @@ pub(super) fn spawn<A: crate::Arch>(
     gate: Gate,
 ) -> thread::KernelAction {
     let params = arg(machine, regs, 0) as usize;
-    let p: [u32; 8] = core::array::from_fn(|i| machine.read::<u32>(params + i * 4));
+    let p: [u32; 8] = core::array::from_fn(|i| machine.read::<u32>((params + i * 4) as u64));
     let result = (|| {
         let path = wide(machine, p[0], p[1]).ok_or(-22)?;
         let command = wide(machine, p[2], p[3]).ok_or(-22)?;
@@ -199,13 +199,13 @@ pub(super) fn call<A: crate::Arch>(
                 threads::create_event(state, true, false),
             ];
             state.processes.children[index].handles = handles;
-            machine.write::<u32>(out, handles[0]);
-            machine.write::<u32>(out + 4, handles[1]);
+            machine.write::<u32>(out as u64, handles[0]);
+            machine.write::<u32>((out + 4) as u64, handles[1]);
             0
         }
         1 => {
             let c = &mut state.processes.children[index];
-            machine.write::<u32>(out, u32::from(c.suspended));
+            machine.write::<u32>(out as u64, u32::from(c.suspended));
             if c.suspended {
                 c.suspended = false;
                 action = thread::KernelAction::WakeChild(c.pid as usize - 1);
@@ -214,8 +214,8 @@ pub(super) fn call<A: crate::Arch>(
         }
         2 => {
             let c = &state.processes.children[index];
-            machine.write::<u32>(out, c.code.map_or(0x103, |v| v as u32));
-            machine.write::<u32>(out + 4, c.pid);
+            machine.write::<u32>(out as u64, c.code.map_or(0x103, |v| v as u32));
+            machine.write::<u32>((out + 4) as u64, c.pid);
             0
         }
         _ => 0xc000000d,

@@ -794,14 +794,14 @@ fn copy_vbe_memory<A: crate::Arch>(
                 *byte = unsafe { ((source + offset + i) as *const u8).read_volatile() };
             }
         } else {
-            machine.copy_from(source + offset, &mut scratch[..count]);
+            machine.copy_from((source + offset) as u64, &mut scratch[..count]);
         }
         if destination >= 0xc000_0000 {
             for (i, &byte) in scratch[..count].iter().enumerate() {
                 unsafe { ((destination + offset + i) as *mut u8).write_volatile(byte); }
             }
         } else {
-            machine.copy_to(destination + offset, &scratch[..count]);
+            machine.copy_to((destination + offset) as u64, &scratch[..count]);
         }
     }
 }
@@ -1229,12 +1229,12 @@ pub fn vram_write<A: crate::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaStat
     let (off, map_mask) = vga.cpu_write_address(off as usize);
     let layout = vga.layout();
     let cur = core::array::from_fn(|p| {
-        machine.read::<u8>(VGA_VRAM_BASE + layout.index(p, off))
+        machine.read::<u8>((VGA_VRAM_BASE + layout.index(p, off)) as u64)
     });
     let out = ::vga::planar_write(cur, vga.latches, &vga.gc.read(), map_mask, byte);
     for p in 0..4 {
         if out[p] != cur[p] {
-            machine.write::<u8>(VGA_VRAM_BASE + layout.index(p, off), out[p]);
+            machine.write::<u8>((VGA_VRAM_BASE + layout.index(p, off)) as u64, out[p]);
         }
     }
 }
@@ -1282,15 +1282,15 @@ pub(in crate::kernel::dos) fn vram_write_live(planes: ::vga::memory::Memory<'_>,
 /// unmapped so raw `machine.copy_to` would fault in the kernel.
 pub fn copy_to_guest<A: crate::GuestBytes>(machine: &mut A, vga: &mut DosVideo, addr: usize, src: &[u8]) {
     let Some(vga) = vga.emulated_mut() else {
-        machine.copy_to(addr, src);
+        machine.copy_to(addr as u64, src);
         return;
     };
     let Some(vga) = vga.state.legacy_mut() else {
-        machine.copy_to(addr, src);
+        machine.copy_to(addr as u64, src);
         return;
     };
     let Some(range) = aperture_range(vga.cpu_aperture()) else {
-        machine.copy_to(addr, src);
+        machine.copy_to(addr as u64, src);
         return;
     };
     let window_base = usize::from(range.start_page) << 12;
@@ -1299,21 +1299,21 @@ pub fn copy_to_guest<A: crate::GuestBytes>(machine: &mut A, vga: &mut DosVideo, 
         || addr >= window_end
         || addr.saturating_add(src.len()) <= window_base
     {
-        machine.copy_to(addr, src);
+        machine.copy_to(addr as u64, src);
         return;
     }
 
     let mut pos = 0;
     if addr < window_base {
         let n = (window_base - addr).min(src.len());
-        machine.copy_to(addr, &src[..n]);
+        machine.copy_to(addr as u64, &src[..n]);
         pos = n;
     }
 
     while pos < src.len() {
         let cur = addr + pos;
         if cur >= window_end {
-            machine.copy_to(cur, &src[pos..]);
+            machine.copy_to(cur as u64, &src[pos..]);
             break;
         }
         let n = (window_end - cur).min(src.len() - pos);
@@ -1340,7 +1340,7 @@ pub fn vram_read<A: crate::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaState
     }
     let (off, read_plane) = vga.cpu_read_address(off as usize);
     let layout = vga.layout();
-    let cur = core::array::from_fn(|p| machine.read::<u8>(VGA_VRAM_BASE + layout.index(p, off)));
+    let cur = core::array::from_fn(|p| machine.read::<u8>((VGA_VRAM_BASE + layout.index(p, off)) as u64));
     finish_read(vga, read_plane, cur)
 }
 
@@ -1372,7 +1372,7 @@ fn read_guest_byte<A: crate::GuestBytes>(machine: &mut A, device: &mut DosVideo,
             return vram_read(machine, vga, (addr - base) as u32);
         }
     }
-    machine.read(addr)
+    machine.read(addr as u64)
 }
 
 /// BIOS text reads must use the VGA CPU view too: a program can leave the
@@ -1524,9 +1524,9 @@ pub fn bios_draw_glyph<A: crate::GuestBytes>(
                     let mask = 0x80u8 >> (px & 7);
                     for p in 0..4usize {
                         let addr = VGA_VRAM_BASE + layout.index(p, byte_off);
-                        let mut byte: u8 = machine.read(addr);
+                        let mut byte: u8 = machine.read(addr as u64);
                         if (color >> p) & 1 != 0 { byte |= mask; } else { byte &= !mask; }
-                        machine.write::<u8>(addr, byte);
+                        machine.write::<u8>(addr as u64, byte);
                     }
                 }
             }
@@ -1666,7 +1666,7 @@ mod bios_memory_tests {
 
     impl GuestBytes for Memory {
         fn high_copy(&mut self, _address: u64, _bytes: &mut [u8], _to_user: bool) -> bool { false }
-        fn read<T: Copy>(&self, addr: usize) -> T {
+        fn read<T: Copy>(&self, addr: u64) -> T {
             let mut value = core::mem::MaybeUninit::<T>::uninit();
             unsafe {
                 let bytes = core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), core::mem::size_of::<T>());
@@ -1674,25 +1674,25 @@ mod bios_memory_tests {
                 value.assume_init()
             }
         }
-        fn write<T: Copy>(&mut self, addr: usize, value: T) {
+        fn write<T: Copy>(&mut self, addr: u64, value: T) {
             let bytes = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(value).cast::<u8>(), core::mem::size_of::<T>()) };
             self.copy_to(addr, bytes);
         }
-        fn copy_from(&self, addr: usize, dst: &mut [u8]) {
+        fn copy_from(&self, addr: u64, dst: &mut [u8]) {
             for (i, byte) in dst.iter_mut().enumerate() {
-                let (plane, off) = self.offset(addr + i);
+                let (plane, off) = self.offset(usize::try_from(addr).unwrap() + i);
                 *byte = if plane { self.planes[off] } else { self.ram[off] };
             }
         }
-        fn copy_to(&mut self, addr: usize, src: &[u8]) {
+        fn copy_to(&mut self, addr: u64, src: &[u8]) {
             for (i, byte) in src.iter().enumerate() {
-                let (plane, off) = self.offset(addr + i);
+                let (plane, off) = self.offset(usize::try_from(addr).unwrap() + i);
                 if plane { self.planes[off] = *byte; } else { self.ram[off] = *byte; }
             }
         }
-        fn copy_cstr(&self, _: usize, _: &mut [u8]) -> usize { unimplemented!() }
-        fn zero(&mut self, _: usize, _: usize) { unimplemented!() }
-        fn copy_within(&mut self, _: usize, _: usize, _: usize) { unimplemented!() }
+        fn copy_cstr(&self, _: u64, _: &mut [u8]) -> usize { unimplemented!() }
+        fn zero(&mut self, _: u64, _: usize) { unimplemented!() }
+        fn copy_within(&mut self, _: u64, _: u64, _: usize) { unimplemented!() }
     }
 
     fn setup(mode: u8) -> (Memory, DosVideo) {

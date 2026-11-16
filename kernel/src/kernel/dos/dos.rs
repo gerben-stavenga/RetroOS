@@ -318,9 +318,9 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
             // its parent's saved frame when it terminates.
             if vector == 0x21 && regs.mode() == crate::UserMode::VM86 {
                 let psp_addr = Psp::base(dos.current_psp);
-                if machine.read::<[u8; 2]>(psp_addr) == [0xCD, 0x20] {
+                if machine.read::<[u8; 2]>(psp_addr as u64) == [0xCD, 0x20] {
                     let saved = (u32::from(vm86_ss(regs)) << 16) | u32::from(vm86_sp(regs));
-                    machine.write::<u32>(psp_addr + core::mem::offset_of!(Psp, _ss_sp), saved);
+                    machine.write::<u32>((psp_addr + core::mem::offset_of!(Psp, _ss_sp)) as u64, saved);
                 }
             }
             // Restore caller FLAGS into regs so handlers may mutate them
@@ -658,7 +658,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
                 let base = seg_offset(dos, regs, seg, off);
                 let mut n = 0;
                 while n < 127 {
-                    let c = machine.read::<u8>((base + n as u32) as usize);
+                    let c = machine.read::<u8>((base + n as u32) as u64);
                     if c == 0 { break; }
                     dst[n] = c;
                     n += 1;
@@ -798,7 +798,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
                     let display_len = lib::codepage::current_codepage().display_line(&buf[..n], &mut display);
                     let dest = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32);
                     for (i, &b) in display[..display_len].iter().enumerate() {
-                        machine.write::<u8>((dest + i as u32) as usize, b);
+                        machine.write::<u8>((dest + i as u32) as u64, b);
                     }
                     regs.rcx = (regs.rcx & !0xFFFF) | (display_len as u64 & 0xFFFF);
                     regs.clear_flag32(1);
@@ -865,7 +865,7 @@ pub(super) fn init_win16_psp<A: crate::Arch>(machine: &mut A, psp: u16) {
     value.cmdline[0] = 0x0d;
     lowmem::Psp::store(machine, psp, value);
     for i in 0..thread::MAX_DOS_FDS {
-        machine.write::<u8>((usize::from(psp) << 4) + 0x100 + i, if i < 3 { i as u8 } else { 0xff });
+        machine.write::<u8>(((usize::from(psp) << 4) + 0x100 + i) as u64, if i < 3 { i as u8 } else { 0xff });
     }
 }
 
@@ -881,5 +881,5 @@ pub(super) fn sync_win16_handles<A: crate::Arch>(
     for (i, fd) in kt.fds.iter().enumerate().take(count) {
         if !fd.is_none() { entries[i] = i as u8; }
     }
-    machine.copy_to(address, &entries[..count]);
+    machine.copy_to(address as u64, &entries[..count]);
 }

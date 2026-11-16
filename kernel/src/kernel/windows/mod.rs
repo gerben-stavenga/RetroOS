@@ -44,9 +44,9 @@ const TEB_SIZE: usize = 8192;
 const TEB_STATIC_STRING: u32 = 0xbf8;
 const TEB_STATIC_BUFFER: u32 = 0xc00;
 fn initialize_teb_string<A: crate::Arch>(machine: &mut A) {
-    machine.write::<u16>((TEB_BASE + TEB_STATIC_STRING) as usize, 0);
-    machine.write::<u16>((TEB_BASE + TEB_STATIC_STRING + 2) as usize, 522);
-    machine.write::<u32>((TEB_BASE + TEB_STATIC_STRING + 4) as usize, TEB_BASE + TEB_STATIC_BUFFER);
+    machine.write::<u16>(((TEB_BASE + TEB_STATIC_STRING) as usize) as u64, 0);
+    machine.write::<u16>(((TEB_BASE + TEB_STATIC_STRING + 2) as usize) as u64, 522);
+    machine.write::<u32>(((TEB_BASE + TEB_STATIC_STRING + 4) as usize) as u64, TEB_BASE + TEB_STATIC_BUFFER);
 }
 // Wine stores debug-channel options on the page following the PEB.
 const PEB_BASE: u32 = 0x7ffd_9000;
@@ -611,16 +611,16 @@ fn map_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i3
     if end >= USER_LIMIT {
         return Err(8);
     }
-    machine.zero(module.base as usize, image.header.size_image as usize);
+    machine.zero(module.base as u64, image.header.size_image as usize);
     let headers = (image.header.size_headers as usize).min(module.data.len());
-    machine.copy_to(module.base as usize, &module.data[..headers]);
+    machine.copy_to(module.base as u64, &module.data[..headers]);
     for section in image.sections().map_err(|_| 8)? {
         let size =
             (section.raw_size as usize).min(section.virtual_size.max(section.raw_size) as usize);
         if size != 0 {
             let raw = section.raw_offset as usize;
             let bytes = module.data.get(raw..raw + size).ok_or(8)?;
-            machine.copy_to((module.base + section.rva) as usize, bytes);
+            machine.copy_to((module.base + section.rva) as u64, bytes);
         }
     }
     let delta = module.base.wrapping_sub(image.header.image_base);
@@ -635,7 +635,7 @@ fn map_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i3
                             .checked_add(page)
                             .and_then(|v| v.checked_add((entry & 0xfff) as u32))
                             .ok_or(8)? as usize;
-                        machine.write::<u32>(at, machine.read::<u32>(at).wrapping_add(delta));
+                        machine.write::<u32>(at as u64, machine.read::<u32>(at as u64).wrapping_add(delta));
                     }
                     _ => return Err(8),
                 }
@@ -795,7 +795,7 @@ fn apply_imports<A: crate::Arch>(machine: &mut A, modules: &[Module], index: usi
                 core::str::from_utf8(&import.module).unwrap_or("dll"),
                 core::str::from_utf8(&name).unwrap_or("symbol"));
         })?;
-        machine.write::<u32>((modules[index].base + import.iat_rva) as usize, address);
+        machine.write::<u32>((modules[index].base + import.iat_rva) as u64, address);
     }
     Ok(())
 }
@@ -908,8 +908,8 @@ fn dll_startup_stub_at<A: crate::Arch>(machine: &mut A, dlls: &[(u32,u32)], exe_
     if code.len() > 4096 {
         return Err(8);
     }
-    machine.zero(stub as usize, 4096);
-    machine.copy_to(stub as usize, &code);
+    machine.zero(stub as u64, 4096);
+    machine.copy_to(stub as u64, &code);
     crate::kernel::memory::protect(machine, stub as usize / 4096, 1, false, true);
     Ok(stub)
 }
@@ -968,7 +968,7 @@ fn register_module_gates<A: crate::Arch>(machine: &A, module: &Module, gates: &m
     let dll_name = module.name.strip_suffix(b".DLL").unwrap_or(&module.name);
     for export in image.exports().map_err(|_| 8)? {
         let address = module.base + export.rva;
-        if machine.read::<u16>(address as usize) != 0x83cd { continue; }
+        if machine.read::<u16>(address as u64) != 0x83cd { continue; }
         let core = API_SPECS.iter().find(|(dll, name, _, _)|
             dll_name.eq_ignore_ascii_case(dll) && export.name == *name);
         let spec = core.map(|(_, name, api, bytes)| (*name, *api, *bytes));
@@ -1111,32 +1111,32 @@ pub fn exec_pe_into<A: crate::Arch>(
         .max(64 * 1024)
         .next_multiple_of(4096);
     let stack_base = STACK_TOP.checked_sub(stack_size).ok_or(8)?;
-    machine.zero(stack_base as usize, stack_size as usize);
+    machine.zero(stack_base as u64, stack_size as usize);
     crate::kernel::memory::protect(machine,
         stack_base as usize / 4096,
         stack_size as usize / 4096,
         true,
         false,
     );
-    machine.zero(PROCESS_DATA as usize, 4096);
-    machine.zero(TEB_BASE as usize, TEB_SIZE);
-    machine.zero(PEB_BASE as usize, PEB_SIZE);
+    machine.zero(PROCESS_DATA as u64, 4096);
+    machine.zero(TEB_BASE as u64, TEB_SIZE);
+    machine.zero(PEB_BASE as u64, PEB_SIZE);
     crate::kernel::memory::protect(machine, PROCESS_DATA as usize / 4096, 1, true, false);
     crate::kernel::memory::protect(machine, TEB_BASE as usize / 4096, TEB_SIZE / 4096, true, false);
     crate::kernel::memory::protect(machine, PEB_BASE as usize / 4096, PEB_SIZE / 4096, true, false);
 
-    machine.write::<u32>(TEB_BASE as usize, 0xffff_ffff); // SEH end marker
-    machine.write::<u32>((TEB_BASE + 4) as usize, STACK_TOP);
-    machine.write::<u32>((TEB_BASE + 8) as usize, stack_base);
-    machine.write::<u32>((TEB_BASE + 0x18) as usize, TEB_BASE);
-    machine.write::<u32>((TEB_BASE + 0x20) as usize, tid as u32 + 1);
-    machine.write::<u32>((TEB_BASE + 0x24) as usize, tid as u32 + 1);
-    machine.write::<u32>((TEB_BASE + 0x30) as usize, PEB_BASE);
+    machine.write::<u32>(TEB_BASE as u64, 0xffff_ffff); // SEH end marker
+    machine.write::<u32>((TEB_BASE + 4) as u64, STACK_TOP);
+    machine.write::<u32>((TEB_BASE + 8) as u64, stack_base);
+    machine.write::<u32>((TEB_BASE + 0x18) as u64, TEB_BASE);
+    machine.write::<u32>((TEB_BASE + 0x20) as u64, tid as u32 + 1);
+    machine.write::<u32>((TEB_BASE + 0x24) as u64, tid as u32 + 1);
+    machine.write::<u32>((TEB_BASE + 0x30) as u64, PEB_BASE);
     initialize_teb_string(machine);
-    machine.write::<u8>((PEB_BASE + 4096) as usize, 7);
-    machine.write::<u32>((PEB_BASE + 0x64) as usize, 1);
-    machine.write::<u32>((PEB_BASE + 8) as usize, modules[0].base);
-    machine.write::<u32>((PEB_BASE + 0x10) as usize, PROCESS_DATA);
+    machine.write::<u8>((PEB_BASE + 4096) as u64, 7);
+    machine.write::<u32>((PEB_BASE + 0x64) as u64, 1);
+    machine.write::<u32>((PEB_BASE + 8) as u64, modules[0].base);
+    machine.write::<u32>((PEB_BASE + 0x10) as u64, PROCESS_DATA);
 
     let win_path = guest_windows_path(&main_path);
     let cmd_a = PROCESS_DATA + 0x200;
@@ -1148,7 +1148,7 @@ pub fn exec_pe_into<A: crate::Arch>(
         protect_module(machine, module)?;
     }
     let stack = STACK_TOP - 4;
-    machine.write::<u32>(stack as usize, 0);
+    machine.write::<u32>(stack as u64, 0);
     let entry = modules[0]
         .base
         .checked_add(main_header.entry_rva)
@@ -1189,8 +1189,8 @@ pub fn exec_pe_into<A: crate::Arch>(
     state.callback_return = export_address(&modules, b"USER32", b"RetroWndProcReturn").unwrap_or(0);
     if state.callback_return == 0 {
         state.callback_return=0x7ff6_0000;
-        machine.zero(state.callback_return as usize,4096);
-        machine.copy_to(state.callback_return as usize,&[0xcd,0x83]);
+        machine.zero(state.callback_return as u64,4096);
+        machine.copy_to(state.callback_return as u64,&[0xcd,0x83]);
         crate::kernel::memory::protect(machine, state.callback_return as usize/4096,1,false,true);
         state.gates.push(Gate{return_ip:state.callback_return+2,api:Api::RetroWndProcReturn,arg_bytes:0,name:b"RetroWndProcReturn"});
     }
@@ -1206,7 +1206,7 @@ pub fn exec_pe_into<A: crate::Arch>(
 }
 
 pub(super) fn arg<A: crate::Arch>(machine: &A, regs: &Regs, n: usize) -> u32 {
-    machine.read::<u32>(regs.sp() as usize + 4 + n * 4)
+    machine.read::<u32>((regs.sp() as usize + 4 + n * 4) as u64)
 }
 
 pub(super) fn c_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
@@ -1219,7 +1219,7 @@ pub(super) fn raw_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Ve
     }
     let mut out = Vec::new();
     for i in 0..32768 {
-        let b = machine.read::<u8>(address as usize + i);
+        let b = machine.read::<u8>((address as usize + i) as u64);
         if b == 0 {
             return Ok(out);
         }
@@ -1230,15 +1230,15 @@ pub(super) fn raw_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Ve
 
 fn finish<A: crate::Arch>(machine: &A, regs: &mut Regs, gate: Gate, result: u32) {
     let sp = regs.sp() as usize;
-    let ret = machine.read::<u32>(sp);
+    let ret = machine.read::<u32>(sp as u64);
     if ret < 0x1000 {
         let mut below = [0u32; 4];
         let mut top = [0u32; 8];
         for (i, word) in below.iter_mut().enumerate() {
-            *word = machine.read::<u32>(sp.wrapping_sub(16) + i * 4);
+            *word = machine.read::<u32>((sp.wrapping_sub(16) + i * 4) as u64);
         }
         for (i, word) in top.iter_mut().enumerate() {
-            *word = machine.read::<u32>(sp + i * 4);
+            *word = machine.read::<u32>((sp + i * 4) as u64);
         }
         crate::compact_println!(
             "Windows: {} returns to {:#x} esp={:#x} eip={:#x} args={}",
@@ -1286,7 +1286,7 @@ fn io_write<A: crate::Arch>(
         return 0;
     }
     let mut data = vec![0; len];
-    machine.copy_from(ptr, &mut data);
+    machine.copy_from(ptr as u64, &mut data);
     let n = match kt.fds[handle] {
         thread::FdKind::ConsoleOut => {
             let text = encoding::page(output_cp).unwrap().decode(&data, false).unwrap();
@@ -1302,7 +1302,7 @@ fn io_write<A: crate::Arch>(
         return 0;
     }
     if actual != 0 {
-        machine.write::<u32>(actual, n as u32);
+        machine.write::<u32>(actual as u64, n as u32);
     }
     1
 }
@@ -1430,7 +1430,7 @@ fn dispatch<A: crate::Arch>(
         Api::Event => threads::event(machine, state, arg(machine, regs, 0), arg(machine, regs, 1), arg(machine, regs, 2), arg(machine, regs, 3)),
         Api::Atom => atoms::call(machine,core::array::from_fn(|i| arg(machine,regs,i))),
         Api::Class => classes::call(machine,state,core::array::from_fn(|i| arg(machine,regs,i))),
-        Api::UniqueId => { let out=arg(machine,regs,0); machine.write::<u64>(out as usize,user_objects::next_id()); 0 },
+        Api::UniqueId => { let out=arg(machine,regs,0); machine.write::<u64>(out as u64,user_objects::next_id()); 0 },
         Api::Graphics => graphics::call(machine,state,core::array::from_fn(|i|arg(machine,regs,i))),
         Api::Cursor => user_objects::cursor_call(machine,state,core::array::from_fn(|i|arg(machine,regs,i))),
         Api::WindowTree => user_objects::tree_call(machine,state,core::array::from_fn(|i|arg(machine,regs,i))),
@@ -1439,7 +1439,7 @@ fn dispatch<A: crate::Arch>(
         Api::MemoryQuery => {
             let Some(info)=memory::query(state,arg(machine,regs,0)) else {return 0xc000000d;};
             let out=arg(machine,regs,1) as usize;
-            for (i,value) in info.into_iter().enumerate() {machine.write::<u32>(out+i*4,value);}
+            for (i,value) in info.into_iter().enumerate() {machine.write::<u32>((out+i*4) as u64,value);}
             0
         },
         Api::Section => sections::call(machine, kt, state, core::array::from_fn(|i| arg(machine, regs, i))),
@@ -1457,11 +1457,11 @@ fn dispatch<A: crate::Arch>(
         Api::ClearTls => threads::clear_tls(machine, &mut state.threads, arg(machine, regs, 0)),
         Api::SystemInfo => {
             let out = arg(machine, regs, 0) as usize;
-            machine.write::<u32>(out, crate::kernel::phys_mm::total_page_count() as u32);
-            machine.write::<u32>(out + 4, crate::kernel::phys_mm::free_page_count() as u32);
+            machine.write::<u32>(out as u64, crate::kernel::phys_mm::total_page_count() as u32);
+            machine.write::<u32>((out + 4) as u64, crate::kernel::phys_mm::free_page_count() as u32);
             let [reserved, committed] = memory::statistics(state);
-            machine.write::<u32>(out + 8, reserved);
-            machine.write::<u32>(out + 12, committed);
+            machine.write::<u32>((out + 8) as u64, reserved);
+            machine.write::<u32>((out + 12) as u64, committed);
             0
         },
         Api::MemoryProtect => change_protection(machine, state, arg(machine, regs, 0),
@@ -1487,9 +1487,9 @@ fn dispatch<A: crate::Arch>(
         Api::Clock => {
             let out = arg(machine, regs, 0) as usize;
             let Some(unix) = crate::kernel::clock::rtc_unix_timestamp() else { return 0xc0000001; };
-            machine.write::<u64>(out, (u64::from(unix) + 11_644_473_600) * 10_000_000);
-            machine.write::<u64>(out + 8, machine.now() / 100);
-            machine.write::<i32>(out + 16, -crate::kernel::clock::utc_offset_minutes());
+            machine.write::<u64>(out as u64, (u64::from(unix) + 11_644_473_600) * 10_000_000);
+            machine.write::<u64>((out + 8) as u64, machine.now() / 100);
+            machine.write::<i32>((out + 16) as u64, -crate::kernel::clock::utc_offset_minutes());
             0
         },
         Api::Registry => registry::call(machine, &mut state.registry, core::array::from_fn(|i| arg(machine, regs, i))),
@@ -1511,10 +1511,10 @@ fn dispatch<A: crate::Arch>(
                 memory::call(machine, state, Api::MemoryRelease, base, 0, 0);
                 return 0xc0000017;
             }
-            machine.copy_to(base as usize, &data);
+            machine.copy_to(base as u64, &data);
             crate::kernel::memory::protect(machine, base as usize / 4096, size as usize / 4096, false, false);
-            machine.write::<u32>(base_out as usize, base);
-            machine.write::<u32>(size_out as usize, data.len() as u32);
+            machine.write::<u32>(base_out as u64, base);
+            machine.write::<u32>(size_out as u64, data.len() as u32);
             0
         },
         Api::MemoryReserve | Api::MemoryCommit | Api::MemoryDecommit | Api::MemoryRelease => {
@@ -1572,15 +1572,15 @@ pub fn handle_event<A: crate::Arch>(
             if gate.api == Api::Unsupported {
                 let name = raw_string(machine, arg(machine, regs, 0)).unwrap_or_default();
                 crate::compact_println!("Wine backend not implemented: {}", core::str::from_utf8(&name).unwrap_or("?"));
-                let lock = machine.read::<u32>((PEB_BASE + 0x1c) as usize);
+                let lock = machine.read::<u32>((PEB_BASE + 0x1c) as u64);
                 crate::compact_println!("Wine PEB lock={:#x} thread={} fs={:#x}", lock,
-                    machine.read::<u32>((state.teb_base + 0x24) as usize), regs.fs);
+                    machine.read::<u32>((state.teb_base + 0x24) as u64), regs.fs);
                 if memory_protection(state, lock).is_some() {
                     crate::compact_println!("Wine PEB lock count={} recursion={} owner={:#x}",
-                        machine.read::<i32>(lock as usize + 4), machine.read::<u32>(lock as usize + 8),
-                        machine.read::<u32>(lock as usize + 12));
+                        machine.read::<i32>((lock as usize + 4) as u64), machine.read::<u32>((lock as usize + 8) as u64),
+                        machine.read::<u32>((lock as usize + 12) as u64));
                 }
-                let caller = machine.read::<u32>(regs.sp32() as usize + 8);
+                let caller = machine.read::<u32>((regs.sp32() as usize + 8) as u64);
                 for module in &state.modules {
                     if module.contains(caller) {
                         crate::compact_println!("Wine backend caller: {}+{:#x}", core::str::from_utf8(&module.name).unwrap_or("?"), caller - module.base);
@@ -1589,13 +1589,13 @@ pub fn handle_event<A: crate::Arch>(
                 let mut frame = regs.rbp as u32;
                 for _ in 0..8 {
                     if frame < state.stack_base || frame.checked_add(8).is_none_or(|end| end > state.stack_base + state.stack_size) { break; }
-                    let caller = machine.read::<u32>(frame as usize + 4);
+                    let caller = machine.read::<u32>((frame as usize + 4) as u64);
                     for module in &state.modules {
                         if module.contains(caller) {
                             crate::compact_println!("Wine backend frame: {}+{:#x}", core::str::from_utf8(&module.name).unwrap_or("?"), caller - module.base);
                         }
                     }
-                    let next = machine.read::<u32>(frame as usize);
+                    let next = machine.read::<u32>(frame as u64);
                     if next <= frame { break; }
                     frame = next;
                 }
@@ -1803,10 +1803,10 @@ fn initialize_environment<A: crate::Arch>(machine:&mut A,state:&mut WindowsState
         memory::call(machine,state,Api::MemoryRelease,base,0,0);
         return Err(-12);
     }
-    for (i,unit) in units.iter().enumerate() {machine.write::<u16>(base as usize+i*2,*unit);}
-    machine.write::<u32>((PROCESS_DATA+0x48) as usize,base);
-    machine.write::<u32>((PROCESS_DATA+0x290) as usize,(units.len()*2) as u32);
-    machine.write::<u32>((PROCESS_DATA+0x294) as usize,1);
+    for (i,unit) in units.iter().enumerate() {machine.write::<u16>((base as usize+i*2) as u64,*unit);}
+    machine.write::<u32>((PROCESS_DATA+0x48) as u64,base);
+    machine.write::<u32>((PROCESS_DATA+0x290) as u64,(units.len()*2) as u32);
+    machine.write::<u32>((PROCESS_DATA+0x294) as u64,1);
     Ok(())
 }
 
@@ -1816,14 +1816,14 @@ fn process_cwd(path:&[u8])->Vec<u8> {
     path
 }
 fn initialize_process_strings<A:crate::Arch>(machine:&mut A,state:&mut WindowsState)->Result<(),i32>{
-    machine.write::<u32>(PROCESS_DATA as usize,4096);
-    machine.write::<u32>((PROCESS_DATA+4) as usize,0x298);
-    machine.write::<u32>((PROCESS_DATA+8) as usize,1);
-    machine.write::<u32>((PROCESS_DATA + 0x10) as usize, 0x7c000001);
+    machine.write::<u32>(PROCESS_DATA as u64,4096);
+    machine.write::<u32>((PROCESS_DATA+4) as u64,0x298);
+    machine.write::<u32>((PROCESS_DATA+8) as u64,1);
+    machine.write::<u32>((PROCESS_DATA + 0x10) as u64, 0x7c000001);
     // Wine's GetStdHandle reads the normalized process parameters. Native
     // file handles carry the same tag as handles returned by NtCreateFile.
     for (field, fd) in [(0x18, 0), (0x1c, 1), (0x20, 2)] {
-        machine.write::<u32>((PROCESS_DATA + field) as usize, 0x40000000 | fd);
+        machine.write::<u32>((PROCESS_DATA + field) as u64, 0x40000000 | fd);
     }
     let image=guest_windows_path(state.exec_path_str());
     let cwd=process_cwd(state.cwd_str());
@@ -1833,9 +1833,9 @@ fn initialize_process_strings<A:crate::Arch>(machine:&mut A,state:&mut WindowsSt
         let units=encoding::encode(value,true);
         if units.len()>=256{return Err(-8);}
         encoding::copy(machine,(PROCESS_DATA+buffer) as usize,256,value,true);
-        machine.write::<u16>((PROCESS_DATA+field) as usize,(units.len()*2) as u16);
-        machine.write::<u16>((PROCESS_DATA+field+2) as usize,512);
-        machine.write::<u32>((PROCESS_DATA+field+4) as usize,PROCESS_DATA+buffer);
+        machine.write::<u16>((PROCESS_DATA+field) as u64,(units.len()*2) as u16);
+        machine.write::<u16>((PROCESS_DATA+field+2) as u64,512);
+        machine.write::<u32>((PROCESS_DATA+field+4) as u64,PROCESS_DATA+buffer);
     }
     state.command_line_w=PROCESS_DATA+0xa00;
     Ok(())

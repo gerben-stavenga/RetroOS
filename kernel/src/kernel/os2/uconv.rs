@@ -41,10 +41,10 @@ pub(super) fn dispatch<A: crate::Arch>(machine: &mut A, state: &mut Os2State, re
         1 => {
             let output = arg32(machine, regs, 1) as usize;
             if a == 0 || output == 0 { return INVALID; }
-            machine.write::<u32>(output, 0);
+            machine.write::<u32>(output as u64, 0);
             let mut units = Vec::new();
             for i in 0..128 {
-                let unit = machine.read::<u16>(a as usize + i * 2);
+                let unit = machine.read::<u16>((a as usize + i * 2) as u64);
                 if unit == 0 {
                     let Ok(name) = String::from_utf16(&units) else { return INVALID; };
                     let converter = match parse(&name) { Ok(c) => c, Err(e) => return e };
@@ -52,7 +52,7 @@ pub(super) fn dispatch<A: crate::Arch>(machine: &mut A, state: &mut Os2State, re
                     let Some(next) = handle.checked_add(1) else { return 0x2040d; };
                     state.next_converter = next;
                     state.converters.push((handle, converter));
-                    machine.write::<u32>(output, handle);
+                    machine.write::<u32>(output as u64, handle);
                     return NO_ERROR;
                 }
                 units.push(unit);
@@ -73,7 +73,7 @@ pub(super) fn dispatch<A: crate::Arch>(machine: &mut A, state: &mut Os2State, re
             let name = format!("IBM-{cp}");
             if capacity < name.len() + 1 { return BUFFER_FULL; }
             for (i, unit) in name.encode_utf16().chain(core::iter::once(0)).enumerate() {
-                machine.write::<u16>(output + i * 2, unit);
+                machine.write::<u16>((output + i * 2) as u64, unit);
             }
             NO_ERROR
         }
@@ -89,10 +89,10 @@ fn convert<A: crate::Arch>(machine: &mut A, regs: &Regs, converter: Converter, t
     let args: [usize; 5] = core::array::from_fn(|i| arg32(machine, regs, i + 1) as usize);
     if args.contains(&0) { return INVALID; }
     let [input_pointer, input_count, output_pointer, output_count, substitutions] = args;
-    let mut input = machine.read::<u32>(input_pointer) as usize;
-    let mut left = machine.read::<u32>(input_count) as usize;
-    let mut output = machine.read::<u32>(output_pointer) as usize;
-    let mut room = machine.read::<u32>(output_count) as usize;
+    let mut input = machine.read::<u32>(input_pointer as u64) as usize;
+    let mut left = machine.read::<u32>(input_count as u64) as usize;
+    let mut output = machine.read::<u32>(output_pointer as u64) as usize;
+    let mut room = machine.read::<u32>(output_count as u64) as usize;
     if (left != 0 && input == 0) || (room != 0 && output == 0) { return INVALID; }
     let mut nonidentical = 0;
     let mut result = NO_ERROR;
@@ -100,24 +100,24 @@ fn convert<A: crate::Arch>(machine: &mut A, regs: &Regs, converter: Converter, t
         if room == 0 { result = BUFFER_FULL; break; }
         let (ch, consumed) = if to_ucs {
             match converter.encoding {
-                Encoding::SingleByte(page) => (page.decode(machine.read::<u8>(input)), 1),
+                Encoding::SingleByte(page) => (page.decode(machine.read::<u8>(input as u64)), 1),
                 Encoding::Utf8 => {
-                    let first = machine.read::<u8>(input);
+                    let first = machine.read::<u8>(input as u64);
                     let length = match first { 0..=0x7f => 1, 0xc2..=0xdf => 2, 0xe0..=0xef => 3, 0xf0..=0xf4 => 4, _ => 0 };
                     if length == 0 || length > left { result = ILLEGAL_SEQUENCE; break; }
-                    let bytes: [u8; 4] = core::array::from_fn(|i| if i < length { machine.read::<u8>(input + i) } else { 0 });
+                    let bytes: [u8; 4] = core::array::from_fn(|i| if i < length { machine.read::<u8>((input + i) as u64) } else { 0 });
                     let Ok(text) = core::str::from_utf8(&bytes[..length]) else { result = ILLEGAL_SEQUENCE; break; };
                     (text.chars().next().unwrap(), length)
                 }
             }
         } else {
             // ULS exposes UCS-2 elements, not Windows UTF-16 surrogate pairs.
-            let Some(ch) = char::from_u32(machine.read::<u16>(input) as u32) else { result = ILLEGAL_SEQUENCE; break; };
+            let Some(ch) = char::from_u32(machine.read::<u16>(input as u64) as u32) else { result = ILLEGAL_SEQUENCE; break; };
             (ch, 1)
         };
         if to_ucs {
             if ch as u32 > 0xffff { result = ILLEGAL_SEQUENCE; break; }
-            machine.write::<u16>(output, ch as u16);
+            machine.write::<u16>(output as u64, ch as u16);
             output += 2;
             room -= 1;
             input += consumed;
@@ -132,7 +132,7 @@ fn convert<A: crate::Arch>(machine: &mut A, regs: &Regs, converter: Converter, t
                 }
             };
             if bytes.len() > room { result = BUFFER_FULL; break; }
-            machine.copy_to(output, bytes);
+            machine.copy_to(output as u64, bytes);
             output += bytes.len();
             room -= bytes.len();
             input += 2;
@@ -140,10 +140,10 @@ fn convert<A: crate::Arch>(machine: &mut A, regs: &Regs, converter: Converter, t
         }
         left -= consumed;
     }
-    machine.write::<u32>(input_pointer, input as u32);
-    machine.write::<u32>(input_count, left as u32);
-    machine.write::<u32>(output_pointer, output as u32);
-    machine.write::<u32>(output_count, room as u32);
-    machine.write::<u32>(substitutions, nonidentical);
+    machine.write::<u32>(input_pointer as u64, input as u32);
+    machine.write::<u32>(input_count as u64, left as u32);
+    machine.write::<u32>(output_pointer as u64, output as u32);
+    machine.write::<u32>(output_count as u64, room as u32);
+    machine.write::<u32>(substitutions as u64, nonidentical);
     result
 }

@@ -165,7 +165,7 @@ pub(super) fn call<A: crate::Arch>(
         if api == Api::MemoryCommit {
             // Recommitting a page must preserve its contents and protection.
             if region.pages[i].is_none() {
-                machine.zero(address, 4096);
+                machine.zero(address as u64, 4096);
                 crate::kernel::memory::protect(machine, address / 4096, 1, flags & 1 != 0, flags & 2 != 0);
                 region.pages[i] = Some(flags);
             }

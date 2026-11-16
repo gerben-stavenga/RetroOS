@@ -436,14 +436,14 @@ impl NativeSb {
             // Snapshot the guest's pre-filled content — whole pages, so the
             // unrelated neighbour bytes on partial end pages survive.
             let mut snap = alloc::vec![0u8; span];
-            machine.copy_from(vbase, &mut snap);
+            machine.copy_from(vbase as u64, &mut snap);
             // Free the guest's original frames, then alias the range onto
             // the channel buffer with CACHE_DISABLE — externally owned, so
             // COW-fork and address-space teardown both leave it intact.
             crate::kernel::memory::reset(machine, vbase >> 12, num_pages);
             crate::kernel::memory::map_physical(machine,
                 vbase >> 12, num_pages, bufpage + win_pgoff, PTE_CACHE_DISABLE);
-            machine.copy_to(vbase, &snap);
+            machine.copy_to(vbase as u64, &snap);
             self.bound_chan  = chan as u8;
             self.bound_host  = host as u8;
             self.bound_gpa   = gpa;
@@ -468,10 +468,10 @@ impl NativeSb {
         let vbase = self.bound_vpage << 12;
         let span  = self.bound_pages * 0x1000;
         let mut snap = alloc::vec![0u8; span];
-        machine.copy_from(vbase, &mut snap);
+        machine.copy_from(vbase as u64, &mut snap);
         crate::kernel::memory::fresh(machine,
             self.bound_vpage, self.bound_pages);
-        machine.copy_to(vbase, &snap);
+        machine.copy_to(vbase as u64, &snap);
         self.bound_chan  = 0xFF;
         self.bound_host  = 0xFF;
         self.bound_gpa   = 0;

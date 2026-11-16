@@ -12,9 +12,9 @@ pub(super) fn install<A: crate::Arch>(machine: &mut A, floor: usize,
     let base = super::file_mapping::allocate_below(
         super::elf::USER_STACK_TOP - 0x0100_0000, floor, PAGE, occupied)?;
     crate::kernel::memory::fresh(machine, base / PAGE, 1);
-    machine.copy_to(base, IMAGE);
-    machine.write::<u64>(base + CLOCK_DATA, epoch);
-    machine.write::<u64>(base + CLOCK_DATA + 8, multiplier);
+    machine.copy_to(base as u64, IMAGE);
+    machine.write::<u64>((base + CLOCK_DATA) as u64, epoch);
+    machine.write::<u64>((base + CLOCK_DATA + 8) as u64, multiplier);
     crate::kernel::memory::protect(machine, base / PAGE, 1, false, true);
     occupied.push((base, base + PAGE));
     Some(base)

@@ -287,7 +287,7 @@ impl AudioDevices {
     }
     pub fn mix_guest<A: crate::Arch>(&mut self, machine: &mut A, now_ns: u64,
         span: crate::kernel::sound::AudioSpan<'_>) -> usize {
-        self.mix_with(now_ns, span, Some(&mut |addr, bytes| machine.copy_from(addr, bytes)))
+        self.mix_with(now_ns, span, Some(&mut |addr, bytes| machine.copy_from(addr as u64, bytes)))
     }
     fn mix_with(&mut self, now_ns: u64, span: crate::kernel::sound::AudioSpan<'_>,
         copy: Option<vsb::DmaCopy<'_>>) -> usize {
@@ -997,7 +997,7 @@ pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kerne
     let di = string_index(regs.rdi, addr32);
     for i in 0..size {
         let b = guest_inb(machine, bios, pc, port + i as u16);
-        machine.write::<u8>((es_base.wrapping_add(di.wrapping_add(i))) as usize, b);
+        machine.write::<u8>((es_base.wrapping_add(di.wrapping_add(i))) as u64, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
     advance_string_index(&mut regs.rdi, size, addr32, df);
@@ -1011,7 +1011,7 @@ pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kern
     let ds_base = seg_base_for::<A>(regs, regs.ds as u16);
     let si = string_index(regs.rsi, addr32);
     for i in 0..size {
-        let b = machine.read::<u8>((ds_base.wrapping_add(si.wrapping_add(i))) as usize);
+        let b = machine.read::<u8>((ds_base.wrapping_add(si.wrapping_add(i))) as u64);
         guest_outb(machine, bios, pc, regs, port + i as u16, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
@@ -1288,12 +1288,12 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
 /// Read a u16 from a real-mode seg:off address, through the active address
 /// space's memory interface (`arch::mem()`) — works under any arch backend.
 pub fn read_u16<A: crate::Arch>(machine: &mut A, seg: u32, off: u32) -> u16 {
-    machine.read::<u16>(((seg << 4) + off) as usize)
+    machine.read::<u16>(((seg << 4) + off) as u64)
 }
 
 /// Write a u16 to a real-mode seg:off address, through `arch::mem()`.
 pub fn write_u16<A: crate::Arch>(machine: &mut A, seg: u32, off: u32, val: u16) {
-    machine.write::<u16>(((seg << 4) + off) as usize, val);
+    machine.write::<u16>(((seg << 4) + off) as u64, val);
 }
 
 /// Push a u16 onto the VM86 stack (SS:SP)
@@ -1316,8 +1316,8 @@ pub fn vm86_pop<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> u16 {
 /// IRET restores this FLAGS word; changing live flags would be overwritten.
 pub fn vm86_set_return_flag<A: crate::Arch>(machine: &mut A, regs: &Regs, mask: u16, enabled: bool) {
     let address = (usize::from(vm86_ss(regs)) << 4) + usize::from(vm86_sp(regs)) + 4;
-    let flags = machine.read::<u16>(address);
-    machine.write::<u16>(address, if enabled { flags | mask } else { flags & !mask });
+    let flags = machine.read::<u16>(address as u64);
+    machine.write::<u16>(address as u64, if enabled { flags | mask } else { flags & !mask });
 }
 
 /// Return from a 16-bit VM86 interrupt, restoring IP, CS and virtual FLAGS.

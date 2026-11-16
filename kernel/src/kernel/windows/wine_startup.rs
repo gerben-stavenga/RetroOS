@@ -55,11 +55,11 @@ pub(super) fn bootstrap<A: crate::Arch>(
     if names.len() > 65536 || code.len() > 4096 {
         return Err(8);
     }
-    machine.zero(NAMES as usize, 65536);
-    machine.copy_to(NAMES as usize, &names);
+    machine.zero(NAMES as u64, 65536);
+    machine.copy_to(NAMES as u64, &names);
     crate::kernel::memory::protect(machine, NAMES as usize / 4096, 16, false, false);
-    machine.zero(BOOTSTRAP as usize, 4096);
-    machine.copy_to(BOOTSTRAP as usize, &code);
+    machine.zero(BOOTSTRAP as u64, 4096);
+    machine.copy_to(BOOTSTRAP as u64, &code);
     crate::kernel::memory::protect(machine, BOOTSTRAP as usize / 4096, 1, false, true);
     Ok(BOOTSTRAP)
 }

@@ -28,26 +28,26 @@ pub(super) fn sysinfo<A: crate::Arch>(machine: &mut A, args: &Args, wide: bool) 
     if args.a0 == 0 || args.a0.checked_add(size).is_none_or(|end| end > 0xc0000000) {
         return SyscallResult::val(-EFAULT);
     }
-    let pointer = args.a0 as usize;
+    let pointer = args.a0;
     let free = crate::kernel::phys_mm::free_page_count() as u64;
     let total = crate::kernel::phys_mm::total_page_count();
     let total = total as u64;
     let uptime = (machine.now() / 1_000_000) / 1000;
-    machine.zero(pointer, size as usize);
+    machine.zero(pointer as u64, size as usize);
     // No swap or high-memory zone is exposed. Load averages and the breakdown
     // into shared/buffer RAM are not tracked; total/free include all allocations.
     if wide {
-        machine.write::<u64>(pointer, uptime);
-        machine.write::<u64>(pointer + 32, total);
-        machine.write::<u64>(pointer + 40, free);
-        machine.write::<u16>(pointer + 80, TASKS.load(Ordering::Relaxed));
-        machine.write::<u32>(pointer + 104, 4096);
+        machine.write::<u64>(pointer as u64, uptime);
+        machine.write::<u64>((pointer + 32) as u64, total);
+        machine.write::<u64>((pointer + 40) as u64, free);
+        machine.write::<u16>((pointer + 80) as u64, TASKS.load(Ordering::Relaxed));
+        machine.write::<u32>((pointer + 104) as u64, 4096);
     } else {
-        machine.write::<u32>(pointer, uptime as u32);
-        machine.write::<u32>(pointer + 16, total as u32);
-        machine.write::<u32>(pointer + 20, free as u32);
-        machine.write::<u16>(pointer + 40, TASKS.load(Ordering::Relaxed));
-        machine.write::<u32>(pointer + 52, 4096);
+        machine.write::<u32>(pointer as u64, uptime as u32);
+        machine.write::<u32>((pointer + 16) as u64, total as u32);
+        machine.write::<u32>((pointer + 20) as u64, free as u32);
+        machine.write::<u16>((pointer + 40) as u64, TASKS.load(Ordering::Relaxed));
+        machine.write::<u32>((pointer + 52) as u64, 4096);
     }
     SyscallResult::val(0)
 }

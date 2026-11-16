@@ -214,7 +214,7 @@ impl Gus {
             sound::dma::Request::Read { bytes, .. } => {
                 let n = bytes.min(len as usize);
                 let mut buf = alloc::vec![0u8; n];
-                machine.copy_from(gpa as usize, &mut buf);
+                machine.copy_from(gpa as u64, &mut buf);
                 let _ = self.card.advance(0, Some(sound::dma::Completion::Read {
                     bytes: &buf, terminal_count: n == len as usize,
                 }));
@@ -222,7 +222,7 @@ impl Gus {
             }
             sound::dma::Request::Write { bytes } => {
                 let n = bytes.len().min(len as usize);
-                machine.copy_to(gpa as usize, &bytes[..n]);
+                machine.copy_to(gpa as u64, &bytes[..n]);
                 sound::dma::Completion::Write { bytes: n, terminal_count: n == len as usize }
             }
         };

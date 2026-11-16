@@ -45,7 +45,7 @@ pub(super) fn shift_state() -> u16 {
         | (((crate::kernel::keyboard::control_state() >> 7) as u16 & 1) << 6)
 }
 fn word<A: crate::Arch>(m: &A, s: &Os2State, r: &Regs, off: usize) -> u16 {
-    m.read::<u16>(stack_linear(s, r) + 4 + off)
+    m.read::<u16>((stack_linear(s, r) + 4 + off) as u64)
 }
 fn pointer<A: crate::Arch>(m: &A, s: &Os2State, r: &Regs, off: usize) -> usize {
     selector_base(s, word(m, s, r, off + 2))
@@ -56,14 +56,14 @@ pub(super) fn kbd<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal
     let out = pointer(m, s, r, if ordinal == 4 { 4 } else { 2 });
     match ordinal {
         10 => {
-            m.write::<u16>(out, 10);
-            m.write::<u16>(out + 2, s.kbd_mask);
-            m.write::<u16>(out + 4, 13);
-            m.write::<u16>(out + 6, 0);
-            m.write::<u16>(out + 8, shift_state());
+            m.write::<u16>(out as u64, 10);
+            m.write::<u16>((out + 2) as u64, s.kbd_mask);
+            m.write::<u16>((out + 4) as u64, 13);
+            m.write::<u16>((out + 6) as u64, 0);
+            m.write::<u16>((out + 8) as u64, shift_state());
         }
         11 => {
-            s.kbd_mask = m.read::<u16>(out + 2);
+            s.kbd_mask = m.read::<u16>((out + 2) as u64);
         }
         4 | 22 => {
             if ordinal == 4 && s.keys.is_empty() && word(m, s, r, 2) == 0 {
@@ -71,20 +71,20 @@ pub(super) fn kbd<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal
                 return u32::MAX;
             }
             s.wait_key = false;
-            m.zero(out, 10);
+            m.zero(out as u64, 10);
             if let Some(&(ascii, scan, shift, milliseconds)) = s.keys.first() {
-                m.write::<u8>(out, ascii);
-                m.write::<u8>(out + 1, scan);
+                m.write::<u8>(out as u64, ascii);
+                m.write::<u8>((out + 1) as u64, scan);
                 // OS/2 requires both the extended-code status bit and a
                 // 00/E0 character for scan-code keys (including Alt chords).
-                m.write::<u8>(out + 2, 0x40 | if ascii == 0 || ascii == 0xe0 { 2 } else { 0 });
-                m.write::<u16>(out + 4, shift);
-                m.write::<u32>(out + 6, milliseconds);
+                m.write::<u8>((out + 2) as u64, 0x40 | if ascii == 0 || ascii == 0xe0 { 2 } else { 0 });
+                m.write::<u16>((out + 4) as u64, shift);
+                m.write::<u32>((out + 6) as u64, milliseconds);
                 if ordinal == 4 {
                     s.keys.remove(0);
                 }
             } else {
-                m.write::<u16>(out + 4, shift_state());
+                m.write::<u16>((out + 4) as u64, shift_state());
             }
         }
         _ => return ERROR_INVALID_FUNCTION,
@@ -146,9 +146,9 @@ fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) ->
     match ordinal {
         1 => {}
         9 => {
-            m.write::<u16>(out, s.video.x);
+            m.write::<u16>(out as u64, s.video.x);
             let row = pointer(m, s, r, 6);
-            m.write::<u16>(row, s.video.y);
+            m.write::<u16>(row as u64, s.video.y);
         }
         15 => {
             s.video.x = word(m, s, r, 2);
@@ -156,7 +156,7 @@ fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) ->
             paint(s);
         }
         21 => {
-            let cb = m.read::<u16>(out) as usize;
+            let cb = m.read::<u16>(out as u64) as usize;
             let mut bytes = [0u8; 34];
             bytes[..2].copy_from_slice(&34u16.to_le_bytes());
             bytes[2] = 1;
@@ -167,11 +167,11 @@ fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) ->
             bytes[10..12].copy_from_slice(&(s.video.rows * 16).to_le_bytes());
             bytes[13] = 1;
             bytes[18..22].copy_from_slice(&(s.video.cells.len() as u32).to_le_bytes());
-            m.copy_to(out, &bytes[..cb.min(bytes.len())]);
+            m.copy_to(out as u64, &bytes[..cb.min(bytes.len())]);
         }
         22 => {
-            let cols = m.read::<u16>(out + 4);
-            let rows = m.read::<u16>(out + 6);
+            let cols = m.read::<u16>((out + 4) as u64);
+            let rows = m.read::<u16>((out + 6) as u64);
             if !(1..=160).contains(&cols) || !(1..=100).contains(&rows) {
                 return ERROR_INVALID_PARAMETER;
             }
@@ -182,27 +182,27 @@ fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) ->
         }
         27 => {
             for (i, &value) in s.video.cursor.iter().enumerate() {
-                m.write::<u16>(out + i * 2, value);
+                m.write::<u16>((out + i * 2) as u64, value);
             }
         }
         32 => {
             for i in 0..4 {
-                s.video.cursor[i] = m.read::<u16>(out + i * 2);
+                s.video.cursor[i] = m.read::<u16>((out + i * 2) as u64);
             }
         }
         31 => {
             if s.video.buffer == 0 {
                 let base = s.heap_next;
                 s.heap_next += 0x10000;
-                m.zero(base as usize, 0x10000);
+                m.zero(base as u64, 0x10000);
                 crate::kernel::memory::protect(m, base as usize / 4096, 16, true, false);
                 s.video.buffer = base;
                 s.video.selector = push_descriptor(&mut s.ldt, base, 65536, false, false);
                 s.on_resume(m);
             }
             let address = pointer(m, s, r, 6);
-            m.write::<u32>(address, (s.video.selector as u32) << 16);
-            m.write::<u16>(out, s.video.cells.len() as u16);
+            m.write::<u32>(address as u64, (s.video.selector as u32) << 16);
+            m.write::<u16>(out as u64, s.video.cells.len() as u16);
         }
         43 => {
             let off = word(m, s, r, 4) as usize;
@@ -211,30 +211,30 @@ fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) ->
                 return ERROR_INVALID_PARAMETER;
             }
             m.copy_from(
-                s.video.buffer as usize + off,
+                (s.video.buffer as usize + off) as u64,
                 &mut s.video.cells[off..off + length],
             );
             paint(s);
         }
         46 => {
             let out = pointer(m, s, r, 2);
-            let cb = m.read::<u16>(out) as usize;
+            let cb = m.read::<u16>(out as u64) as usize;
             let mut data = [0u8; 32];
             data[..2].copy_from_slice(&32u16.to_le_bytes());
             data[2..4].copy_from_slice(&3u16.to_le_bytes());
             data[4..6].copy_from_slice(&3u16.to_le_bytes());
             data[6..10].copy_from_slice(&262144u32.to_le_bytes());
-            m.copy_to(out, &data[..cb.min(32)]);
+            m.copy_to(out as u64, &data[..cb.min(32)]);
         }
         11 => {
             let status = pointer(m, s, r, 2);
-            m.write::<u16>(status, 0);
+            m.write::<u16>(status as u64, 0);
         }
         19 => {
             let n = word(m, s, r, 2) as usize;
             let text = pointer(m, s, r, 4);
             let mut bytes = vec![0; n];
-            m.copy_from(text, &mut bytes);
+            m.copy_from(text as u64, &mut bytes);
             for b in bytes {
                 crate::term::putchar(b);
             }
@@ -245,7 +245,7 @@ fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) ->
             let col = word(m, s, r, 2) as usize;
             let row = word(m, s, r, 4) as usize;
             let count = word(m, s, r, 6) as usize;
-            let attribute = m.read::<u8>(pointer(m, s, r, 8));
+            let attribute = m.read::<u8>((pointer(m, s, r, 8)) as u64);
             let start = row * s.video.cols as usize + col;
             let end = (start + count).min(s.video.cells.len() / 2);
             if start > end {
@@ -255,13 +255,13 @@ fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) ->
                 s.video.cells[cell * 2 + 1] = attribute;
             }
             if s.video.buffer != 0 {
-                m.copy_to(s.video.buffer as usize, &s.video.cells);
+                m.copy_to(s.video.buffer as u64, &s.video.cells);
             }
             paint(s);
         }
         7 => {
             let fill = pointer(m, s, r, 2);
-            let cell = m.read::<u16>(fill).to_le_bytes();
+            let cell = m.read::<u16>(fill as u64).to_le_bytes();
             let count = word(m, s, r, 6) as usize;
             let right = word(m, s, r, 8).min(s.video.cols - 1) as usize;
             let bottom = word(m, s, r, 10).min(s.video.rows - 1) as usize;
@@ -283,7 +283,7 @@ fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) ->
                 }
             }
             if s.video.buffer != 0 {
-                m.copy_to(s.video.buffer as usize, &s.video.cells);
+                m.copy_to(s.video.buffer as u64, &s.video.cells);
             }
             paint(s);
         }
@@ -297,7 +297,7 @@ pub(super) fn alloc_shared<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs
     if result == 0 && name != 0 && let Ok(mut name) = c_string(m, name) {
         name.make_ascii_uppercase();
         s.shared
-            .push((name, m.read::<u32>(arg32(m, r, 0) as usize)));
+            .push((name, m.read::<u32>(arg32(m, r, 0) as u64)));
     }
     result
 }
@@ -309,14 +309,14 @@ pub(super) fn get_shared<A: crate::Arch>(m: &mut A, s: &Os2State, r: &Regs) -> u
     let Some((_, address)) = s.shared.iter().find(|(n, _)| *n == name) else {
         return ERROR_FILE_NOT_FOUND;
     };
-    m.write::<u32>(arg32(m, r, 0) as usize, *address);
+    m.write::<u32>(arg32(m, r, 0) as u64, *address);
     NO_ERROR
 }
 fn copy_string<A: crate::Arch>(m: &mut A, out: usize, cap: usize, bytes: &[u8]) -> u32 {
     let bytes = crate::kernel::text::Encoding::oem().encode(&alloc::string::String::from_utf8_lossy(bytes), b'?').0;
     if cap <= bytes.len() { return 111; }
-    m.copy_to(out, &bytes);
-    m.write::<u8>(out + bytes.len(), 0);
+    m.copy_to(out as u64, &bytes);
+    m.write::<u8>((out + bytes.len()) as u64, 0);
     NO_ERROR
 }
 /// Convert a VFS path to a path relative to C:. C_ROOT has a trailing slash,
@@ -371,20 +371,20 @@ fn file_info<A: crate::Arch>(
     if cap < need {
         return 111;
     }
-    m.zero(out, need);
+    m.zero(out as u64, need);
     let wide = level >= 11;
     let attr_offset = if wide { 28 } else { 20 };
     let allocated = u64::from(size).next_multiple_of(4096);
     if wide {
-        m.write::<u64>(out + 12, u64::from(size));
-        m.write::<u64>(out + 20, allocated);
+        m.write::<u64>((out + 12) as u64, u64::from(size));
+        m.write::<u64>((out + 20) as u64, allocated);
     } else {
-        m.write::<u32>(out + 12, size);
-        m.write::<u32>(out + 16, allocated.min(u64::from(u32::MAX)) as u32);
+        m.write::<u32>((out + 12) as u64, size);
+        m.write::<u32>((out + 16) as u64, allocated.min(u64::from(u32::MAX)) as u32);
     }
-    m.write::<u32>(out + attr_offset, attr);
+    m.write::<u32>((out + attr_offset) as u64, attr);
     if matches!(level, 2 | 12) {
-        m.write::<u32>(out + attr_offset + 4, 4);
+        m.write::<u32>((out + attr_offset + 4) as u64, 4);
     }
     NO_ERROR
 }
@@ -412,35 +412,35 @@ fn find_output<A: crate::Arch>(
             break;
         }
         let dest = out + used;
-        m.zero(dest, len);
+        m.zero(dest as u64, len);
         if let Some(previous) = previous {
-            m.write::<u32>(previous, (dest - previous) as u32);
+            m.write::<u32>(previous as u64, (dest - previous) as u32);
         }
         let allocated = u64::from(entry.size).next_multiple_of(4096);
         if wide {
-            m.write::<u64>(dest + 16, u64::from(entry.size));
-            m.write::<u64>(dest + 24, allocated);
+            m.write::<u64>((dest + 16) as u64, u64::from(entry.size));
+            m.write::<u64>((dest + 24) as u64, allocated);
         } else {
-            m.write::<u32>(dest + 16, entry.size);
-            m.write::<u32>(dest + 20, allocated.min(u64::from(u32::MAX)) as u32);
+            m.write::<u32>((dest + 16) as u64, entry.size);
+            m.write::<u32>((dest + 20) as u64, allocated.min(u64::from(u32::MAX)) as u32);
         }
         m.write::<u32>(
-            dest + attr_offset,
+            (dest + attr_offset) as u64,
             entry
                 .dos_attributes
                 .unwrap_or(if entry.is_dir { 16 } else { 32 }) as u32,
         );
         if ea {
-            m.write::<u32>(dest + attr_offset + 4, 4);
+            m.write::<u32>((dest + attr_offset + 4) as u64, 4);
         }
-        m.write::<u8>(dest + header - 1, name.len() as u8);
-        m.copy_to(dest + header, name);
+        m.write::<u8>((dest + header - 1) as u64, name.len() as u8);
+        m.copy_to((dest + header) as u64, name);
         previous = Some(dest);
         used += len;
         written += 1;
         find.next += 1;
     }
-    m.write::<u32>(actual, written as u32);
+    m.write::<u32>(actual as u64, written as u32);
     if written != 0 {
         NO_ERROR
     } else if find.next >= find.entries.len() {
@@ -487,7 +487,7 @@ pub(super) fn exec_program<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs
     let environment = if env_ptr == 0 { None } else {
         let mut env = Vec::new();
         for i in 0..4096 {
-            let byte = m.read::<u8>(env_ptr as usize + i);
+            let byte = m.read::<u8>((env_ptr as usize + i) as u64);
             env.push(byte);
             if env.len() >= 2 && env[env.len() - 2..] == [0, 0] { break; }
         }
@@ -500,7 +500,7 @@ pub(super) fn exec_program<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs
     s.exec_process = Some(super::ExecProcess { result_out, synchronous: flags == 0, pid: 0, exit_code: None });
     s.exec_environment = environment;
     let out = arg32(m, r, 0) as usize;
-    if out != 0 && arg32(m, r, 1) != 0 { m.write::<u8>(out, 0); }
+    if out != 0 && arg32(m, r, 1) != 0 { m.write::<u8>(out as u64, 0); }
     Ok(thread::KernelAction::ForkExec {
         path: path_buf, path_len: path.len(), cmdtail: tail_buf, cmdtail_len: tail.len(),
         cwd: [0; 164], cwd_len: 0, personality_name: None,
@@ -557,7 +557,7 @@ pub(super) fn dispatch<A: crate::Arch>(
     match api {
         Api::Base(127) => {
             let out = pointer(m, s, r, 0);
-            m.write::<u32>(out, crate::kernel::phys_mm::free_page_count().saturating_mul(4096).min(u32::MAX as usize) as u32);
+            m.write::<u32>(out as u64, crate::kernel::phys_mm::free_page_count().saturating_mul(4096).min(u32::MAX as usize) as u32);
             NO_ERROR
         }
         // Thread exports are present so clients can handle an unsupported
@@ -583,16 +583,16 @@ pub(super) fn dispatch<A: crate::Arch>(
             let Ok(path) = os2_path(s, &raw, false) else { return ERROR_FILE_NOT_FOUND; };
             // VFS currently stores modification time, but cannot persist
             // creation/access times. Zero fields mean leave them unchanged.
-            if m.read::<u32>(info) != 0 || m.read::<u32>(info + 4) != 0 { return 50; }
-            let date = m.read::<u16>(info + 8);
-            let time = m.read::<u16>(info + 10);
+            if m.read::<u32>(info as u64) != 0 || m.read::<u32>((info + 4) as u64) != 0 { return 50; }
+            let date = m.read::<u16>((info + 8) as u64);
+            let time = m.read::<u16>((info + 10) as u64);
             let stamp = if date != 0 || time != 0 {
                 let Some(stamp) = crate::kernel::dos::dos_to_unix_datetime(time, date) else {
                     return ERROR_INVALID_PARAMETER;
                 };
                 Some(stamp)
             } else { None };
-            let attributes = m.read::<u32>(info + attr_offset);
+            let attributes = m.read::<u32>((info + attr_offset) as u64);
             if attributes & !0x37 != 0 { return ERROR_INVALID_PARAMETER; }
             if let Some(stamp) = stamp {
                 let handle = vfs::open_to_handle(&path);
@@ -610,21 +610,21 @@ pub(super) fn dispatch<A: crate::Arch>(
         Api::Vio(n) => video(m, s, r, n),
         Api::Mou(17) => {
             let out = pointer(m, s, r, 0);
-            m.write::<u16>(out, 1);
+            m.write::<u16>(out as u64, 1);
             NO_ERROR
         }
         Api::Mou(9 | 16 | 18 | 21 | 26) => NO_ERROR,
         Api::Mou(8 | 13 | 15 | 19) => {
             let out = pointer(m, s, r, 2);
-            m.write::<u16>(out, if api == Api::Mou(8) { 2 } else { 0 });
+            m.write::<u16>(out as u64, if api == Api::Mou(8) { 2 } else { 0 });
             if matches!(api, Api::Mou(13 | 19)) {
-                m.write::<u16>(out + 2, 0);
+                m.write::<u16>((out + 2) as u64, 0);
             }
             NO_ERROR
         }
         Api::Mou(20) => {
             let out = pointer(m, s, r, 6);
-            m.zero(out, 10);
+            m.zero(out as u64, 10);
             232
         }
         Api::Base(318) => {
@@ -637,7 +637,7 @@ pub(super) fn dispatch<A: crate::Arch>(
             };
             match load_module(m, s, &name) {
                 Ok(h) => {
-                    m.write::<u32>(out, h);
+                    m.write::<u32>(out as u64, h);
                     NO_ERROR
                 }
                 Err(e) => {
@@ -672,21 +672,21 @@ pub(super) fn dispatch<A: crate::Arch>(
         Api::Base(275) => {
             let disk = a(0) as usize;
             let map = a(1) as usize;
-            m.write::<u32>(disk, 3);
-            m.write::<u32>(map, 4);
+            m.write::<u32>(disk as u64, 3);
+            m.write::<u32>(map as u64, 4);
             NO_ERROR
         }
         Api::Base(274) => {
             let out = a(1) as usize;
             let len = a(2) as usize;
-            let cap = m.read::<u32>(len) as usize;
+            let cap = m.read::<u32>(len as u64) as usize;
             let path = current_dos(s);
             if crate::kernel::startup::trace_enabled() {
                 crate::compact_println!("[os2-cwd] {}", core::str::from_utf8(&path).unwrap_or("?"));
             }
             let result = copy_string(m, out, cap, &path);
             let encoded_len = crate::kernel::text::Encoding::oem().encode(&alloc::string::String::from_utf8_lossy(&path), b'?').0.len();
-            m.write::<u32>(len, encoded_len as u32 + 1);
+            m.write::<u32>(len as u64, encoded_len as u32 + 1);
             result
         }
         Api::Base(263) => {
@@ -706,7 +706,7 @@ pub(super) fn dispatch<A: crate::Arch>(
             let out = a(3) as usize;
             let cap = a(4) as usize;
             let actual = a(5) as usize;
-            let count = m.read::<u32>(actual) as usize;
+            let count = m.read::<u32>(actual as u64) as usize;
             let level = a(6);
             if crate::kernel::startup::trace_enabled() {
                 crate::compact_println!("[os2-find] {} attr={:#x} level={} cap={} count={}",
@@ -753,7 +753,7 @@ pub(super) fn dispatch<A: crate::Arch>(
             };
             let result = find_output(m, &mut find, out, cap, count, actual);
             if result == 0 {
-                m.write::<u32>(handle, h);
+                m.write::<u32>(handle as u64, h);
                 s.find.push(find);
             }
             result
@@ -763,7 +763,7 @@ pub(super) fn dispatch<A: crate::Arch>(
             let out = a(1) as usize;
             let cap = a(2) as usize;
             let actual = a(3) as usize;
-            let count = m.read::<u32>(actual) as usize;
+            let count = m.read::<u32>(actual as u64) as usize;
             let Some(find) = s.find.iter_mut().find(|f| f.handle == h) else {
                 return 6;
             };
@@ -778,20 +778,20 @@ pub(super) fn dispatch<A: crate::Arch>(
                     if cap < 18 {
                         return 111;
                     }
-                    m.zero(out, 18);
-                    m.write::<u32>(out + 4, 8);
-                    m.write::<u32>(out + 8, 32768);
-                    m.write::<u32>(out + 12, 24576);
-                    m.write::<u16>(out + 16, 512);
+                    m.zero(out as u64, 18);
+                    m.write::<u32>((out + 4) as u64, 8);
+                    m.write::<u32>((out + 8) as u64, 32768);
+                    m.write::<u32>((out + 12) as u64, 24576);
+                    m.write::<u16>((out + 16) as u64, 512);
                     NO_ERROR
                 }
                 2 => {
                     if cap < 17 {
                         return 111;
                     }
-                    m.zero(out, 17);
-                    m.write::<u8>(out + 4, 7);
-                    m.copy_to(out + 5, b"RETROOS");
+                    m.zero(out as u64, 17);
+                    m.write::<u8>((out + 4) as u64, 7);
+                    m.copy_to((out + 5) as u64, b"RETROOS");
                     NO_ERROR
                 }
                 _ => 124,
@@ -800,13 +800,13 @@ pub(super) fn dispatch<A: crate::Arch>(
         Api::Base(277) => {
             let out = a(3) as usize;
             let length = a(4) as usize;
-            let cap = m.read::<u32>(length) as usize;
+            let cap = m.read::<u32>(length as u64) as usize;
             let bytes = b"\x03\0\x02\0\x03\0\0\0C:\0FAT\0";
-            m.write::<u32>(length, bytes.len() as u32);
+            m.write::<u32>(length as u64, bytes.len() as u32);
             if cap < bytes.len() {
                 111
             } else {
-                m.copy_to(out, bytes);
+                m.copy_to(out as u64, bytes);
                 NO_ERROR
             }
         }
@@ -844,7 +844,7 @@ pub(super) fn dispatch<A: crate::Arch>(
                 crate::kernel::exec::BinaryFormat::Lx => 2,
                 _ => 0x20,
             };
-            m.write::<u32>(out, flags);
+            m.write::<u32>(out as u64, flags);
             NO_ERROR
         }
         Api::Base(255) => {
@@ -887,9 +887,9 @@ pub(super) fn dispatch<A: crate::Arch>(
             else {
                 return 487;
             };
-            let cap = m.read::<u32>(length);
-            m.write::<u32>(length, cap.min(base + size - address));
-            m.write::<u32>(flags, 0x13);
+            let cap = m.read::<u32>(length as u64);
+            m.write::<u32>(length as u64, cap.min(base + size - address));
+            m.write::<u32>(flags as u64, 0x13);
             NO_ERROR
         }
         Api::Pm(0, 813) => 1,
@@ -981,7 +981,7 @@ pub(super) fn dispatch<A: crate::Arch>(
             else {
                 return 8;
             };
-            m.write::<u32>(out, address);
+            m.write::<u32>(out as u64, address);
             NO_ERROR
         }
         Api::Base(353) => NO_ERROR,
@@ -992,16 +992,16 @@ pub(super) fn dispatch<A: crate::Arch>(
             }
             let mut link = PROCESS_DATA;
             for _ in 0..1024 {
-                let current = m.read::<u32>(link as usize);
+                let current = m.read::<u32>(link as u64);
                 if current == record {
                     if api == Api::Base(354) { return ERROR_INVALID_PARAMETER; }
-                    m.write::<u32>(link as usize, m.read::<u32>(record as usize));
+                    m.write::<u32>(link as u64, m.read::<u32>(record as u64));
                     return NO_ERROR;
                 }
                 if current == 0xffff_ffff {
                     if api == Api::Base(355) { return ERROR_INVALID_PARAMETER; }
-                    m.write::<u32>(record as usize, m.read::<u32>(PROCESS_DATA as usize));
-                    m.write::<u32>(PROCESS_DATA as usize, record);
+                    m.write::<u32>(record as u64, m.read::<u32>(PROCESS_DATA as u64));
+                    m.write::<u32>(PROCESS_DATA as u64, record);
                     return NO_ERROR;
                 }
                 if current == 0 || current >= USER_LIMIT.saturating_sub(8) {
@@ -1014,7 +1014,7 @@ pub(super) fn dispatch<A: crate::Arch>(
         Api::Base(378) => {
             let out = a(1) as usize;
             if out != 0 {
-                m.write::<u32>(out, 0);
+                m.write::<u32>(out as u64, 0);
             }
             NO_ERROR
         }
@@ -1087,9 +1087,9 @@ pub(super) fn begin_dll_init<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &mu
     };
     s.dll_saved = Some(*r);
     let stack = (r.sp() as u32).wrapping_sub(12);
-    m.write::<u32>(stack as usize, PROCESS_DATA + 0x300);
-    m.write::<u32>(stack as usize + 4, handle);
-    m.write::<u32>(stack as usize + 8, 0);
+    m.write::<u32>(stack as u64, PROCESS_DATA + 0x300);
+    m.write::<u32>((stack as usize + 4) as u64, handle);
+    m.write::<u32>((stack as usize + 8) as u64, 0);
     r.frame.rsp = stack as u64;
     r.frame.rip = entry as u64;
 }

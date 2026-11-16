@@ -38,8 +38,8 @@ fn store<A: crate::Arch>(machine: &mut A, pointer: u64, timer: Timer, now: u64) 
         (16, timer.deadline.map_or(0, |end| end.saturating_sub(now))),
     ] {
         let micros = nanos.div_ceil(1000);
-        machine.write::<u64>(pointer as usize + offset, micros / 1_000_000);
-        machine.write::<u64>(pointer as usize + offset + 8, micros % 1_000_000);
+        machine.write::<u64>(pointer + offset as u64, micros / 1_000_000);
+        machine.write::<u64>(pointer + offset as u64 + 8, micros % 1_000_000);
     }
 }
 pub(super) fn call<A: crate::Arch>(
@@ -66,8 +66,8 @@ pub(super) fn call<A: crate::Arch>(
         } else {
             let read = |machine: &mut A, offset| {
                 duration(
-                    machine.read(a.a1 as usize + offset),
-                    machine.read(a.a1 as usize + offset + 8),
+                    machine.read(a.a1 + offset),
+                    machine.read(a.a1 + offset + 8),
                 )
             };
             let (Some(interval), Some(value)) = (read(machine, 0), read(machine, 16)) else {

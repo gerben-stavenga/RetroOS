@@ -6,7 +6,7 @@ enum Source { File(i32), Pipe(u8) }
 
 pub(super) struct Request {
     source: Source,
-    regions: alloc::vec::Vec<(usize, usize)>,
+    regions: alloc::vec::Vec<(u64, usize)>,
     length: usize,
 }
 
@@ -22,22 +22,23 @@ impl Request {
         let count = usize::try_from(a.a2).map_err(|_| -EINVAL)?;
         if count > 1024 { return Err(-EINVAL); }
         let stride = if wide { 16 } else { 8 };
-        if count != 0 && (a.a1 == 0 || a.a1.checked_add((count * stride) as u64).is_none_or(|end| end > 0xc0000000)) {
+        if count != 0 && !high_memory::range(a.a1, (count * stride) as u64) {
             return Err(-EFAULT);
         }
         let mut regions = alloc::vec::Vec::new();
         let mut length = 0usize;
         for index in 0..count {
-            let entry = a.a1 as usize + index * stride;
+            let entry = a.a1 + (index * stride) as u64;
             let (pointer, size) = if wide {
-                (machine.read::<u64>(entry), machine.read::<u64>(entry + 8))
+                (machine.read::<u64>(entry as u64), machine.read::<u64>((entry + 8) as u64))
             } else {
-                (u64::from(machine.read::<u32>(entry)), u64::from(machine.read::<u32>(entry + 4)))
+                (u64::from(machine.read::<u32>(entry as u64)), u64::from(machine.read::<u32>((entry + 4) as u64)))
             };
             if size == 0 { continue; }
-            if pointer == 0 || pointer.checked_add(size).is_none_or(|end| end > 0xc0000000) { return Err(-EFAULT); }
-            length = length.checked_add(size as usize).filter(|n| *n <= file_io::MAX_WRITE).ok_or(-EINVAL)?;
-            regions.push((pointer as usize, size as usize));
+            if !high_memory::range(pointer, size) { return Err(-EFAULT); }
+            let size = usize::try_from(size).map_err(|_| -EINVAL)?;
+            length = length.checked_add(size).filter(|n| *n <= file_io::MAX_WRITE).ok_or(-EINVAL)?;
+            regions.push((pointer, size));
         }
         // A concurrent fd close must not destroy the open description while
         // this read is blocked. Fork does not inherit another thread's wait.
@@ -67,7 +68,7 @@ impl Request {
             let mut offset = 0;
             for &(pointer, size) in &self.regions {
                 let count = size.min(result as usize - offset);
-                machine.copy_to(pointer, &bytes[offset..offset + count]);
+                machine.copy_to(pointer as u64, &bytes[offset..offset + count]);
                 offset += count;
                 if offset == result as usize { break; }
             }

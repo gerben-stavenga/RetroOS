@@ -293,17 +293,17 @@ fn sync_selectors<A: crate::Arch>(machine: &mut A, windows: &WindowsState, old_l
     const TABLE: usize = 0x7ff8_0000;
     let pages = (windows.ldt.len()*8).div_ceil(4096);
     let old_pages = (old_len*8).div_ceil(4096);
-    if pages > old_pages { machine.zero(TABLE+old_pages*4096,(pages-old_pages)*4096); }
+    if pages > old_pages { machine.zero((TABLE+old_pages*4096) as u64,(pages-old_pages)*4096); }
     crate::kernel::memory::protect(machine, TABLE/4096,pages,true,false);
     for (i,&desc) in windows.ldt.iter().enumerate() {
         let base = selector_base_from_ldt(&windows.ldt,i as u16*8+7).unwrap_or(0);
         let limit = ((desc&0xffff)|((desc>>32)&0xf0000)) as u32;
-        machine.write::<u32>(TABLE+i*8,base);
-        machine.write::<u32>(TABLE+i*8+4,limit);
+        machine.write::<u32>((TABLE+i*8) as u64,base);
+        machine.write::<u32>((TABLE+i*8+4) as u64,limit);
     }
     crate::kernel::memory::protect(machine, TABLE/4096,pages,false,false);
     if let Ok(config) = super::export_address(&windows.modules,b"USER32",b"Retro16Config") {
-        machine.write::<u32>(config as usize+24,windows.ldt.len() as u32);
+        machine.write::<u32>((config as usize+24) as u64,windows.ldt.len() as u32);
     }
 }
 
@@ -456,7 +456,7 @@ fn embedded_module<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
     // Retain the initializer requirement; builtin NE startup cannot use the
     // retired Retro16 bridge or start the application before PE initialization.
     let address = owner.checked_add(rva).ok_or(-8)?;
-    let relocated = (0..size).map(|offset| machine.read::<u8>(address as usize + offset)).collect();
+    let relocated = (0..size).map(|offset| machine.read::<u8>((address as usize + offset) as u64)).collect();
     Ok((relocated, Some((owner, initializers))))
 }
 
@@ -498,15 +498,15 @@ fn patch_chain<A: crate::Arch>(
         let at = base.checked_add(u32::from(source)).ok_or(-8)? as usize;
         if usize::from(source) >= alloc_size || remaining == 0 { return Err(-8); }
         remaining -= 1;
-        let next = machine.read::<u16>(at);
+        let next = machine.read::<u16>(at as u64);
         match relocation.source_type & 0x0f {
-            2 => machine.write::<u16>(at, selector),
+            2 => machine.write::<u16>(at as u64, selector),
             3 => {
                 if usize::from(source) + 4 > alloc_size { return Err(-8); }
-                machine.write::<u16>(at, offset);
-                machine.write::<u16>(at + 2, selector);
+                machine.write::<u16>(at as u64, offset);
+                machine.write::<u16>((at + 2) as u64, selector);
             }
-            5 => machine.write::<u16>(at, offset),
+            5 => machine.write::<u16>(at as u64, offset),
             kind => {
                 crate::compact_dbg_println!("[win16] unsupported NE source relocation {}", kind);
                 return Err(-8);
@@ -575,8 +575,8 @@ fn imported_target<A: crate::Arch>(
     let selector = *loaded.selectors.get(segment.wrapping_sub(1) as usize).ok_or(-8)?;
     if let (Some(kind), Some(ordinal)) = (kind, ordinal) {
         let base = selector_base_from_ldt(ldt, selector).ok_or(-8)?;
-        if machine.read::<u8>((base + u32::from(offset)) as usize) != 0xcd
-            || machine.read::<u8>((base + u32::from(offset) + 1) as usize) != GATE_VECTOR
+        if machine.read::<u8>((base + u32::from(offset)) as u64) != 0xcd
+            || machine.read::<u8>((base + u32::from(offset) + 1) as u64) != GATE_VECTOR
         {
             // Guest implementations (including mixed-bitness thunks) execute
             // normally. Only actual INT exports belong in the native gate map.
@@ -647,8 +647,8 @@ pub(super) fn exec<A: crate::Arch>(
         let size = segment.alloc_size.checked_add(extra).ok_or(-8)?.min(0x10000);
         if size < segment.alloc_size { return Err(-8); }
         let base = segment_base(number)?;
-        machine.zero(base as usize, size);
-        machine.copy_to(base as usize, image.segment_bytes(segment).map_err(|_| -8)?);
+        machine.zero(base as u64, size);
+        machine.copy_to(base as u64, image.segment_bytes(segment).map_err(|_| -8)?);
         selectors.push(segment_selector(&mut ldt, base, size, segment)?);
     }
 
@@ -690,8 +690,8 @@ pub(super) fn exec<A: crate::Arch>(
             let segment = module_image.segment(number).map_err(|_| -8)?;
             let base = module_segment_base(module_base, number)?;
             let size = module_segment_size(&module_image, number)?;
-            machine.zero(base as usize, size);
-            machine.copy_to(base as usize, module_image.segment_bytes(segment).map_err(|_| -8)?);
+            machine.zero(base as u64, size);
+            machine.copy_to(base as u64, module_image.segment_bytes(segment).map_err(|_| -8)?);
             module_selectors.push(segment_selector(&mut ldt, base, size, segment)?);
         }
         let dependencies = module_image.modules().map_err(|_| -8)?;
@@ -714,16 +714,16 @@ pub(super) fn exec<A: crate::Arch>(
 
     // Preserve the launcher's command tail in the shared PMDOS PSP.
     let tail = &cmdtail[..cmdtail.len().min(126)];
-    machine.write::<u8>((PSP_BASE + 0x80) as usize, tail.len() as u8);
-    machine.copy_to((PSP_BASE + 0x81) as usize, tail);
-    machine.write::<u8>((PSP_BASE + 0x81) as usize + tail.len(), 0);
+    machine.write::<u8>((PSP_BASE + 0x80) as u64, tail.len() as u8);
+    machine.copy_to((PSP_BASE + 0x81) as u64, tail);
+    machine.write::<u8>(((PSP_BASE + 0x81) as usize + tail.len()) as u64, 0);
     // PMDOS initialized the shared PSP/JFT before NE image loading.
-    machine.zero(ENV_BASE as usize, 4096);
+    machine.zero(ENV_BASE as u64, 4096);
     let psp_selector = selector(&mut ldt, PSP_BASE, 256, false)?;
     let env_selector = selector(&mut ldt, ENV_BASE, 4096, false)?;
     let resource_selector = selector(&mut ldt, RESOURCE_BASE, 0x10000, false)?;
-    machine.write::<u16>((PSP_BASE + 0x2c) as usize, env_selector);
-    machine.zero(RESOURCE_BASE as usize, 0x10000);
+    machine.write::<u16>((PSP_BASE + 0x2c) as u64, env_selector);
+    machine.zero(RESOURCE_BASE as u64, 0x10000);
     let mut gates = Vec::new();
     // These private gates are called inside KERNEL.DLL, not through an NE
     // import relocation, so register them explicitly in the matched runtime.
@@ -858,8 +858,8 @@ pub(super) fn exec<A: crate::Arch>(
         let regs = &mut current.kernel.vcpu.regs;
         let stack = selector_base(&windows, regs.frame.ss as u16).ok_or(-8)? as usize;
         let sp = (regs.sp32() as u16).checked_sub(4).ok_or(-8)?;
-        machine.write::<u16>(stack + sp as usize, regs.ip32() as u16);
-        machine.write::<u16>(stack + sp as usize + 2, regs.code_seg());
+        machine.write::<u16>((stack + sp as usize) as u64, regs.ip32() as u16);
+        machine.write::<u16>((stack + sp as usize + 2) as u64, regs.code_seg());
         regs.frame.rsp = u64::from(sp);
         regs.frame.cs = u64::from(kernel.selectors[entry.0 as usize-1]);
         regs.frame.rip = u64::from(entry.1);
@@ -919,29 +919,29 @@ fn init_bridge<A: crate::Arch>(
     let back = super::export_address(&windows.modules, b"USER32", b"Retro16Return")?;
     let config = super::export_address(&windows.modules, b"USER32", b"Retro16Config")?;
     let teb = super::TEB_BASE;
-    machine.zero(teb as usize, 4096);
-    machine.write::<u32>((teb + 0x18) as usize, teb);
-    machine.write::<u32>((teb + 0x24) as usize, tid as u32 + 1);
+    machine.zero(teb as u64, 4096);
+    machine.write::<u32>((teb + 0x18) as u64, teb);
+    machine.write::<u32>((teb + 0x24) as u64, tid as u32 + 1);
     crate::kernel::memory::protect(machine, teb as usize / 4096, 1, true, false);
     let teb_selector = selector(&mut windows.ldt, teb, 4096, false)?;
     const TABLE: u32 = 0x7ff8_0000;
     let table_size = (windows.ldt.len() * 8).next_multiple_of(4096);
-    machine.zero(TABLE as usize, table_size);
+    machine.zero(TABLE as u64, table_size);
     for (i, &desc) in windows.ldt.iter().enumerate().skip(1) {
         let selector = (i as u16) * 8 + 7;
         let base = selector_base(windows, selector).ok_or(-8)?;
         let limit = ((desc & 0xffff) | ((desc >> 32) & 0xf0000)) as u32;
-        machine.write::<u32>(TABLE as usize + i * 8, base);
-        machine.write::<u32>(TABLE as usize + i * 8 + 4, limit);
+        machine.write::<u32>((TABLE as usize + i * 8) as u64, base);
+        machine.write::<u32>((TABLE as usize + i * 8 + 4) as u64, limit);
     }
     crate::kernel::memory::protect(machine, TABLE as usize / 4096, table_size / 4096, false, false);
     windows.stack_size = 256 * 1024;
     windows.stack_base = super::STACK_TOP - windows.stack_size;
     // A read-only guard catches downward stack writes beyond the guest reserve.
     let guard = windows.stack_base as usize - 4096;
-    machine.zero(guard, 4096);
+    machine.zero(guard as u64, 4096);
     crate::kernel::memory::protect(machine, guard / 4096, 1, false, false);
-    machine.zero(windows.stack_base as usize, windows.stack_size as usize);
+    machine.zero(windows.stack_base as u64, windows.stack_size as usize);
     crate::kernel::memory::protect(machine,
         windows.stack_base as usize / 4096,
         windows.stack_size as usize / 4096,
@@ -950,8 +950,8 @@ fn init_bridge<A: crate::Arch>(
     );
     const RESOURCE_IMAGE: u32 = 0x7000_0000;
     let image_pages = image_data.len().div_ceil(4096);
-    machine.zero(RESOURCE_IMAGE as usize, image_pages * 4096);
-    machine.copy_to(RESOURCE_IMAGE as usize, image_data);
+    machine.zero(RESOURCE_IMAGE as u64, image_pages * 4096);
+    machine.copy_to(RESOURCE_IMAGE as u64, image_data);
     crate::kernel::memory::protect(machine, RESOURCE_IMAGE as usize / 4096, image_pages, false, false);
     for (i, value) in [
         flat.ds as u32,
@@ -970,7 +970,7 @@ fn init_bridge<A: crate::Arch>(
     .into_iter()
     .enumerate()
     {
-        machine.write::<u32>(config as usize + i * 4, value);
+        machine.write::<u32>((config as usize + i * 4) as u64, value);
     }
     for loaded in modules {
         let image = ne::Image::parse(&loaded.data).map_err(|_| -8)?;
@@ -985,10 +985,10 @@ fn init_bridge<A: crate::Arch>(
             .alloc_size
             .div_ceil(4096);
         crate::kernel::memory::protect(machine, base as usize / 4096, pages, true, false);
-        machine.write::<u32>((base + u32::from(offset)) as usize, entry);
-        machine.write::<u16>((base + u32::from(offset) + 4) as usize, flat.code_seg());
-        machine.write::<u32>((base + u32::from(offset) + 6) as usize, back);
-        machine.write::<u16>((base + u32::from(offset) + 10) as usize, flat.code_seg());
+        machine.write::<u32>((base + u32::from(offset)) as u64, entry);
+        machine.write::<u16>((base + u32::from(offset) + 4) as u64, flat.code_seg());
+        machine.write::<u32>((base + u32::from(offset) + 6) as u64, back);
+        machine.write::<u16>((base + u32::from(offset) + 10) as u64, flat.code_seg());
         crate::kernel::memory::protect(machine, base as usize / 4096, pages, false, true);
     }
     Ok(())
@@ -1009,13 +1009,13 @@ fn stack_at(state: &WindowsState, regs: &Regs, displacement: u16) -> Option<usiz
 fn stack_u16<A: crate::Arch>(
     machine: &A, state: &WindowsState, regs: &Regs, displacement: u16,
 ) -> Option<u16> {
-    Some(machine.read::<u16>(stack_at(state, regs, displacement)?))
+    Some(machine.read::<u16>((stack_at(state, regs, displacement)?) as u64))
 }
 
 fn stack_u32<A: crate::Arch>(
     machine: &A, state: &WindowsState, regs: &Regs, displacement: u16,
 ) -> Option<u32> {
-    Some(machine.read::<u32>(stack_at(state, regs, displacement)?))
+    Some(machine.read::<u32>((stack_at(state, regs, displacement)?) as u64))
 }
 
 fn far_linear(state: &WindowsState, pointer: u32) -> Option<usize> {
@@ -1031,7 +1031,7 @@ fn far_string<A: crate::Arch>(
     let address = far_linear(state, pointer)?;
     let mut out = Vec::new();
     for n in 0..0x10000usize.saturating_sub(pointer as u16 as usize) {
-        let byte = machine.read::<u8>(address + n);
+        let byte = machine.read::<u8>((address + n) as u64);
         if byte == 0 { return Some(out); }
         out.push(byte);
     }
@@ -1049,17 +1049,17 @@ fn dos_path(path: &[u8]) -> Vec<u8> {
 }
 
 fn dib_header<A: crate::Arch>(machine: &A, header: usize) -> Option<(usize, usize, u16, usize)> {
-    match machine.read::<u32>(header) {
+    match machine.read::<u32>(header as u64) {
         12 => {
-            let width = machine.read::<u16>(header + 4) as usize;
-            let height = machine.read::<u16>(header + 6) as usize;
-            let bpp = machine.read::<u16>(header + 10);
+            let width = machine.read::<u16>((header + 4) as u64) as usize;
+            let height = machine.read::<u16>((header + 6) as u64) as usize;
+            let bpp = machine.read::<u16>((header + 10) as u64);
             (width != 0 && height != 0).then_some((width, height, bpp, header + 12))
         }
         size if (40..=4096).contains(&size) => {
-            let width = machine.read::<i32>(header + 4).unsigned_abs() as usize;
-            let height = machine.read::<i32>(header + 8).unsigned_abs() as usize;
-            let bpp = machine.read::<u16>(header + 14);
+            let width = machine.read::<i32>((header + 4) as u64).unsigned_abs() as usize;
+            let height = machine.read::<i32>((header + 8) as u64).unsigned_abs() as usize;
+            let bpp = machine.read::<u16>((header + 14) as u64);
             (width != 0 && height != 0 && width <= 2048 && height <= 2048)
                 .then_some((width, height, bpp, header + size as usize))
         }
@@ -1077,35 +1077,35 @@ fn decode_dib<A: crate::Arch>(
     output: &mut [u8],
 ) {
     let row_bytes = (width.saturating_mul(bpp as usize).saturating_add(31) / 32) * 4;
-    let core_palette = machine.read::<u32>(palette.saturating_sub(12)) == 12;
+    let core_palette = machine.read::<u32>((palette.saturating_sub(12)) as u64) == 12;
     let palette_stride = if core_palette { 3 } else { 4 };
     for y in 0..height {
         let source_row = bits + (height - 1 - y) * row_bytes;
         for x in 0..width {
             let color = match bpp {
                 1 => {
-                    let byte = machine.read::<u8>(source_row + x / 8);
+                    let byte = machine.read::<u8>((source_row + x / 8) as u64);
                     let index = usize::from((byte >> (7 - x % 8)) & 1);
                     palette_color(machine, palette, palette_stride, index)
                 }
                 4 => {
-                    let byte = machine.read::<u8>(source_row + x / 2);
+                    let byte = machine.read::<u8>((source_row + x / 2) as u64);
                     let index = usize::from(if x & 1 == 0 { byte >> 4 } else { byte & 15 });
                     palette_color(machine, palette, palette_stride, index)
                 }
                 8 => {
-                    let index = machine.read::<u8>(source_row + x) as usize;
+                    let index = machine.read::<u8>((source_row + x) as u64) as usize;
                     palette_color(machine, palette, palette_stride, index)
                 }
                 24 => {
                     let at = source_row + x * 3;
-                    let b = machine.read::<u8>(at) as u32;
-                    let g = machine.read::<u8>(at + 1) as u32;
-                    let r = machine.read::<u8>(at + 2) as u32;
+                    let b = machine.read::<u8>(at as u64) as u32;
+                    let g = machine.read::<u8>((at + 1) as u64) as u32;
+                    let r = machine.read::<u8>((at + 2) as u64) as u32;
                     r | (g << 8) | (b << 16)
                 }
                 32 => {
-                    let v = machine.read::<u32>(source_row + x * 4);
+                    let v = machine.read::<u32>((source_row + x * 4) as u64);
                     ((v & 0xff) << 16) | (v & 0xff00) | ((v >> 16) & 0xff)
                 },
                 _ => 0,
@@ -1122,9 +1122,9 @@ fn palette_color<A: crate::Arch>(
     machine: &A, palette: usize, stride: usize, index: usize,
 ) -> u32 {
     let at = palette + index * stride;
-    let b = machine.read::<u8>(at) as u32;
-    let g = machine.read::<u8>(at + 1) as u32;
-    let r = machine.read::<u8>(at + 2) as u32;
+    let b = machine.read::<u8>(at as u64) as u32;
+    let g = machine.read::<u8>((at + 1) as u64) as u32;
+    let r = machine.read::<u8>((at + 2) as u64) as u32;
     r | (g << 8) | (b << 16)
 }
 
@@ -1136,8 +1136,8 @@ fn finish<A: crate::Arch>(
     result: u32,
 ) -> Result<(), ()> {
     let stack = stack_at(windows, regs, 0).ok_or(())?;
-    let ip = machine.read::<u16>(stack);
-    let cs = machine.read::<u16>(stack + 2);
+    let ip = machine.read::<u16>(stack as u64);
+    let cs = machine.read::<u16>((stack + 2) as u64);
     regs.rax = (regs.rax & !0xffff) | u64::from(result as u16);
     if gate.long_result {
         regs.rdx = (regs.rdx & !0xffff) | u64::from((result >> 16) as u16);
@@ -1165,8 +1165,8 @@ fn local_alloc<A: crate::Arch>(machine: &mut A, windows: &WindowsState, state: &
     let data = (at + overhead) as u16;
     let handle = (at + if movable { 2 } else { 0 }) as u16;
     let Some(pointer) = far_linear(windows, (u32::from(state.auto_data) << 16) | u32::from(data)) else { return 0 };
-    if movable { machine.write::<u16>(pointer - 2, data); }
-    if flags & 0x40 != 0 { machine.zero(pointer, aligned); }
+    if movable { machine.write::<u16>((pointer - 2) as u64, data); }
+    if flags & 0x40 != 0 { machine.zero(pointer as u64, aligned); }
     state.local_blocks.insert(slot, LocalBlock { start: at as u16, data, handle, size: aligned as u16, movable, locks: 0 });
     state.local_next = state.local_next.max((at + overhead + aligned) as u16);
     u32::from(handle)
@@ -1201,10 +1201,10 @@ fn dispatch<A: crate::Arch>(
             // InitTask returns ES:BX pointing into the PSP command tail.
             // Returning heap capacity here makes C runtimes dereference past
             // the 256-byte PSP selector limit.
-            let length = machine.read::<u8>((PSP_BASE + 0x80) as usize).min(126) as u32;
+            let length = machine.read::<u8>((PSP_BASE + 0x80) as u64).min(126) as u32;
             let mut offset = if length == 0 { 0x80 } else { 0x81 };
-            while offset < 0x81 + length && matches!(machine.read::<u8>((PSP_BASE + offset) as usize), b' ' | b'\t') { offset += 1; }
-            machine.write::<u8>((PSP_BASE + 0x81 + length.min(126)) as usize, 0);
+            while offset < 0x81 + length && matches!(machine.read::<u8>((PSP_BASE + offset) as u64), b' ' | b'\t') { offset += 1; }
+            machine.write::<u8>((PSP_BASE + 0x81 + length.min(126)) as u64, 0);
             regs.rbx = u64::from(offset);
             regs.rcx = 0;
             regs.rdx = 1; // SW_SHOWNORMAL, passed by the C runtime to WinMain.
@@ -1233,19 +1233,19 @@ fn dispatch<A: crate::Arch>(
             let limit = state.local_blocks.get(index + 1).map_or(state.local_end, |b| b.start);
             let Some(pointer) = far_linear(windows, (u32::from(state.auto_data) << 16) | u32::from(data)) else { return 0 };
             if usize::from(data) + aligned <= usize::from(limit) {
-                if flags & 0x40 != 0 && aligned > old_size { machine.zero(pointer + old_size, aligned - old_size); }
+                if flags & 0x40 != 0 && aligned > old_size { machine.zero((pointer + old_size) as u64, aligned - old_size); }
                 state.local_blocks[index].size = aligned as u16;
                 state.local_next = state.local_blocks.last().map_or(state.local_start, |b| b.data + b.size);
                 return u32::from(handle);
             }
             if block.locks != 0 || flags & 2 == 0 { return 0; }
             let mut bytes = vec![0; old_size.min(size)];
-            for (i, byte) in bytes.iter_mut().enumerate() { *byte = machine.read::<u8>(pointer + i); }
+            for (i, byte) in bytes.iter_mut().enumerate() { *byte = machine.read::<u8>((pointer + i) as u64); }
             let replacement = local_alloc(machine, windows, state, size, (flags & !2) | if movable { 2 } else { 0 });
             if replacement == 0 { return 0; }
             let new = state.local_blocks.iter().find(|b| u32::from(b.handle) == replacement).unwrap();
             let dest = far_linear(windows, (u32::from(state.auto_data) << 16) | u32::from(new.data)).unwrap();
-            machine.copy_to(dest, &bytes);
+            machine.copy_to(dest as u64, &bytes);
             state.local_blocks.retain(|b| b.handle != handle);
             replacement
         }
@@ -1298,8 +1298,8 @@ fn dispatch<A: crate::Arch>(
             if next == 0 { return 0; }
             let new_address = state.global_blocks.last().unwrap().address;
             for i in 0..length as usize {
-                let byte = machine.read::<u8>(address as usize+i);
-                machine.write::<u8>(new_address as usize+i,byte);
+                let byte = machine.read::<u8>((address as usize+i) as u64);
+                machine.write::<u8>((new_address as usize+i) as u64,byte);
             }
             global_free(windows,state,index);
             next
@@ -1430,7 +1430,7 @@ fn dispatch<A: crate::Arch>(
                     let ds = m.selectors.get(image.header.auto_data.wrapping_sub(1) as usize).copied().unwrap_or(0);
                     let instance = if ds != 0 { ds } else { m.selectors[0] };
                     let words = [image.header.entry_offset, cs, ds, image.header.heap_size, instance, m.selectors[0]];
-                    for (i, word) in words.into_iter().enumerate() { machine.write::<u16>(out + i*2, word); }
+                    for (i, word) in words.into_iter().enumerate() { machine.write::<u16>((out + i*2) as u64, word); }
                     m.initialized = 1;
                     0xffff
                 }
@@ -1452,23 +1452,23 @@ fn dispatch<A: crate::Arch>(
             if capacity == 0 { return 0; }
             let path = dos_path(windows.exec_path_str());
             let len = path.len().min(capacity - 1);
-            machine.copy_to(out, &path[..len]);
-            machine.write::<u8>(out + len, 0);
+            machine.copy_to(out as u64, &path[..len]);
+            machine.write::<u8>((out + len) as u64, 0);
             len as u32
         }
         (Module::Kernel, 51) => {
             // MakeProcInstance is unnecessary in protected mode: preserve the
             // application's far procedure value.
             let Some(p) = stack_at(windows, regs, 6) else { return 0 };
-            machine.read::<u32>(p)
+            machine.read::<u32>(p as u64)
         }
         (Module::Kernel, 88) => {
             let source_pointer = stack_u32(machine, windows, regs, 4).unwrap_or(0);
             let destination_pointer = stack_u32(machine, windows, regs, 8).unwrap_or(0);
             let Some(source) = far_string(machine, windows, source_pointer) else { return 0 };
             let Some(destination) = far_linear(windows, destination_pointer) else { return 0 };
-            machine.copy_to(destination, &source);
-            machine.write::<u8>(destination + source.len(), 0);
+            machine.copy_to(destination as u64, &source);
+            machine.write::<u8>((destination + source.len()) as u64, 0);
             destination_pointer
         }
         (Module::Kernel, 60) => {
@@ -1490,7 +1490,7 @@ fn dispatch<A: crate::Arch>(
             let offset = (usize::from(state.resource_next) + 1) & !1;
             let Some(end) = offset.checked_add(bytes.len()) else { return 0 };
             if end >= 0x10000 { return 0; }
-            machine.copy_to(RESOURCE_BASE as usize + offset, bytes);
+            machine.copy_to((RESOURCE_BASE as usize + offset) as u64, bytes);
             let handle = windows.next_object as u16;
             windows.next_object = windows.next_object.wrapping_add(1);
             state.resources.push(Resource { handle, offset: offset as u16 });
@@ -1522,8 +1522,8 @@ fn dispatch<A: crate::Arch>(
             let Ok(text) = image.string_resource(id) else { return 0 };
             if capacity == 0 { return 0; }
             let len = text.len().min(capacity - 1);
-            machine.copy_to(out, &text[..len]);
-            machine.write::<u8>(out + len, 0);
+            machine.copy_to(out as u64, &text[..len]);
+            machine.write::<u8>((out + len) as u64, 0);
             len as u32
         }
         (Module::User, 180) => {
@@ -1554,19 +1554,19 @@ fn dispatch<A: crate::Arch>(
         (Module::Gdi, 93) => {
             let Some(out) = stack_u32(machine, windows, regs, 4)
                 .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
-            machine.zero(out, 30);
-            machine.write::<i16>(out, 16);      // tmHeight
-            machine.write::<i16>(out + 2, 13);  // tmAscent
-            machine.write::<i16>(out + 4, 3);   // tmDescent
-            machine.write::<i16>(out + 10, 8);  // tmAveCharWidth
-            machine.write::<i16>(out + 12, 8);  // tmMaxCharWidth
-            machine.write::<i16>(out + 14, 400); // tmWeight
-            machine.write::<i16>(out + 18, 96); // tmDigitizedAspectX
-            machine.write::<i16>(out + 20, 96); // tmDigitizedAspectY
-            machine.write::<u8>(out + 22, 0x20); // tmFirstChar
-            machine.write::<u8>(out + 23, 0xff); // tmLastChar
-            machine.write::<u8>(out + 24, b'?'); // tmDefaultChar
-            machine.write::<u8>(out + 25, b' '); // tmBreakChar
+            machine.zero(out as u64, 30);
+            machine.write::<i16>(out as u64, 16);      // tmHeight
+            machine.write::<i16>((out + 2) as u64, 13);  // tmAscent
+            machine.write::<i16>((out + 4) as u64, 3);   // tmDescent
+            machine.write::<i16>((out + 10) as u64, 8);  // tmAveCharWidth
+            machine.write::<i16>((out + 12) as u64, 8);  // tmMaxCharWidth
+            machine.write::<i16>((out + 14) as u64, 400); // tmWeight
+            machine.write::<i16>((out + 18) as u64, 96); // tmDigitizedAspectX
+            machine.write::<i16>((out + 20) as u64, 96); // tmDigitizedAspectY
+            machine.write::<u8>((out + 22) as u64, 0x20); // tmFirstChar
+            machine.write::<u8>((out + 23) as u64, 0xff); // tmLastChar
+            machine.write::<u8>((out + 24) as u64, b'?'); // tmDefaultChar
+            machine.write::<u8>((out + 25) as u64, b' '); // tmBreakChar
             1
         }
         (Module::Gdi, 442) => {
@@ -1727,15 +1727,15 @@ pub(super) fn handle_event<A: crate::Arch>(
                 windows.ldt.get(regs.es as usize >> 3).copied().unwrap_or(0));
             if let Some(address) = far_linear(windows, (u32::from(regs.code_seg()) << 16) | regs.ip32() as u16 as u32) {
                 crate::compact_dbg_println!("[win16] code at {:#x}: {:08x} {:08x}", address,
-                    machine.read::<u32>(address), machine.read::<u32>(address + 4));
+                    machine.read::<u32>(address as u64), machine.read::<u32>((address + 4) as u64));
             }
             let mut frame = regs.rbp as u16 & !1;
             for _ in 0..12 {
                 let Some(bp) = far_linear(windows, ((regs.frame.ss as u32) << 16) | u32::from(frame)) else { break; };
                 crate::compact_dbg_println!("[win16] frame {:04x} caller {:04x}:{:04x} args {:08x} {:08x} {:08x}",
-                    frame, machine.read::<u16>(bp + 4), machine.read::<u16>(bp + 2),
-                    machine.read::<u32>(bp + 6), machine.read::<u32>(bp + 10), machine.read::<u32>(bp + 14));
-                let next = machine.read::<u16>(bp) & !1;
+                    frame, machine.read::<u16>((bp + 4) as u64), machine.read::<u16>((bp + 2) as u64),
+                    machine.read::<u32>((bp + 6) as u64), machine.read::<u32>((bp + 10) as u64), machine.read::<u32>((bp + 14) as u64));
+                let next = machine.read::<u16>(bp as u64) & !1;
                 if next <= frame { break; }
                 frame = next;
             }
@@ -1798,8 +1798,8 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
                 let size = module_segment_size(&image, n)?;
                 mapped.push((base as usize / 4096, size.div_ceil(4096)));
                 crate::kernel::memory::protect(machine, base as usize/4096, size.div_ceil(4096), true, false);
-                machine.zero(base as usize, size);
-                machine.copy_to(base as usize, image.segment_bytes(segment).map_err(|_| -8)?);
+                machine.zero(base as u64, size);
+                machine.copy_to(base as u64, image.segment_bytes(segment).map_err(|_| -8)?);
                 selectors.push(segment_selector(&mut windows.ldt, base, size, segment)?);
             }
             let dependencies = image.modules().map_err(|_| -8)?;
@@ -1818,10 +1818,10 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
             relocate_image(machine, &image, &m.selectors, &state.modules, &windows.ldt, &mut state.gates, m.base)?;
             if let Ok((segment, offset)) = image.entry_by_name(b"RetroBridgeConfig") {
                 let base = selector_base(windows, m.selectors[segment as usize-1]).ok_or(-8)?;
-                machine.write::<u32>((base+u32::from(offset)) as usize, entry);
-                machine.write::<u16>((base+u32::from(offset)+4) as usize, state.bridge_cs);
-                machine.write::<u32>((base+u32::from(offset)+6) as usize, back);
-                machine.write::<u16>((base+u32::from(offset)+10) as usize, state.bridge_cs);
+                machine.write::<u32>((base+u32::from(offset)) as u64, entry);
+                machine.write::<u16>((base+u32::from(offset)+4) as u64, state.bridge_cs);
+                machine.write::<u32>((base+u32::from(offset)+6) as u64, back);
+                machine.write::<u16>((base+u32::from(offset)+10) as u64, state.bridge_cs);
             }
             for n in 1..=image.header.segment_count {
                 let seg = image.segment(n).map_err(|_| -8)?;
@@ -1832,17 +1832,17 @@ fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, sta
         const TABLE: usize = 0x7ff8_0000;
         let pages = (windows.ldt.len()*8).div_ceil(4096);
         let old_pages = (old_ldt*8).div_ceil(4096);
-        if pages > old_pages { machine.zero(TABLE+old_pages*4096, (pages-old_pages)*4096); }
+        if pages > old_pages { machine.zero((TABLE+old_pages*4096) as u64, (pages-old_pages)*4096); }
         crate::kernel::memory::protect(machine, TABLE/4096, pages, true, false);
         for i in old_ldt..windows.ldt.len() {
             let desc = windows.ldt[i];
             let base = selector_base(windows, i as u16*8+7).ok_or(-8)?;
-            machine.write::<u32>(TABLE+i*8, base);
-            machine.write::<u32>(TABLE+i*8+4, ((desc&0xffff)|((desc>>32)&0xf0000)) as u32);
+            machine.write::<u32>((TABLE+i*8) as u64, base);
+            machine.write::<u32>((TABLE+i*8+4) as u64, ((desc&0xffff)|((desc>>32)&0xf0000)) as u32);
         }
         crate::kernel::memory::protect(machine, TABLE/4096, pages, false, false);
         let config = super::export_address(&windows.modules, b"USER32", b"Retro16Config")?;
-        machine.write::<u32>(config as usize+24, windows.ldt.len() as u32);
+        machine.write::<u32>((config as usize+24) as u64, windows.ldt.len() as u32);
         Ok(state.modules[start].selectors[0])
     })();
     if result.is_err() {
@@ -1926,7 +1926,7 @@ pub(super) fn heap_alloc<A: crate::Arch>(machine: &mut A, state: &mut WindowsSta
     if let Some(block) = state.blocks.iter_mut().find(|block| !block.used && block.size >= size) {
         block.used = true;
         if flags & 8 != 0 {
-            machine.zero(block.addr as usize, block.size as usize);
+            machine.zero(block.addr as u64, block.size as usize);
         }
         return block.addr;
     }
@@ -1938,7 +1938,7 @@ pub(super) fn heap_alloc<A: crate::Arch>(machine: &mut A, state: &mut WindowsSta
         return 0;
     }
     state.heap_next = end;
-    machine.zero(addr as usize, size as usize);
+    machine.zero(addr as u64, size as usize);
     // Initialize permissions only on newly committed pages. The partially
     // filled last page may already contain executable Win16 selector aliases.
     let first_page = (addr as usize).div_ceil(4096);

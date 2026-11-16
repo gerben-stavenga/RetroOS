@@ -3,7 +3,7 @@ use super::{Args, EBADF, EINVAL, LinuxState, SyscallResult, thread};
 #[derive(Clone, Copy)]
 pub(super) struct Request {
     sets: [thread::FdSet; 3],
-    pointers: [usize; 3],
+    pointers: [u64; 3],
     nfds: usize,
     wide: bool,
     deadline: u64,
@@ -22,7 +22,7 @@ impl Request {
         let nfds = args.a0 as usize;
         let mut request = Self {
             sets: [thread::FdSet::empty(); 3],
-            pointers: [args.a1 as usize, args.a2 as usize, args.a3 as usize],
+            pointers: [args.a1, args.a2, args.a3],
             nfds,
             wide,
             deadline: u64::MAX,
@@ -32,18 +32,18 @@ impl Request {
         for (index, &pointer) in request.pointers.iter().enumerate() {
             if pointer != 0 && size != 0 {
                 let mut bytes = [0; thread::FD_SET_BYTES];
-                machine.copy_from(pointer, &mut bytes[..size]);
+                machine.copy_from(pointer as u64, &mut bytes[..size]);
                 request.sets[index] = thread::FdSet::from_le_bytes(&bytes[..size]);
             }
         }
         if args.a4 != 0 {
-            let at = args.a4 as usize;
+            let at = args.a4;
             let (sec, nsec) = if wide {
-                (machine.read::<i64>(at), machine.read::<i64>(at + 8))
+                (machine.read::<i64>(at as u64), machine.read::<i64>((at + 8) as u64))
             } else {
                 (
-                    i64::from(machine.read::<i32>(at)),
-                    i64::from(machine.read::<i32>(at + 4)),
+                    i64::from(machine.read::<i32>(at as u64)),
+                    i64::from(machine.read::<i32>((at + 4) as u64)),
                 )
             };
             if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
@@ -105,7 +105,7 @@ impl Request {
         }
         for (index, &pointer) in self.pointers.iter().enumerate() {
             if pointer != 0 {
-                machine.copy_to(pointer, &output[index].to_le_bytes()[..self.size()]);
+                machine.copy_to(pointer as u64, &output[index].to_le_bytes()[..self.size()]);
             }
         }
         Some(count)

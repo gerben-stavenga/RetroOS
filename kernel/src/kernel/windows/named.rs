@@ -70,15 +70,15 @@ fn fold(c: u16) -> u16 { if (65..=90).contains(&c) { c + 32 } else { c } }
 fn path(text: &str) -> Vec<u16> { text.encode_utf16().collect() }
 fn attributes<A: crate::Arch>(machine: &A, state: &State, address: u32) -> Result<(Vec<u16>, u32), u32> {
     if address == 0 { return Ok((Vec::new(), 0)); }
-    if machine.read::<u32>(address as usize) != 24 { return Err(INVALID); }
-    let root = machine.read::<u32>(address as usize + 4);
-    let name = machine.read::<u32>(address as usize + 8);
-    let flags = machine.read::<u32>(address as usize + 12);
+    if machine.read::<u32>(address as u64) != 24 { return Err(INVALID); }
+    let root = machine.read::<u32>((address as usize + 4) as u64);
+    let name = machine.read::<u32>((address as usize + 8) as u64);
+    let flags = machine.read::<u32>((address as usize + 12) as u64);
     if name == 0 { return if root == 0 { Ok((Vec::new(), flags)) } else { Err(INVALID) }; }
-    let length = machine.read::<u16>(name as usize) as usize;
-    let pointer = machine.read::<u32>(name as usize + 4);
+    let length = machine.read::<u16>(name as u64) as usize;
+    let pointer = machine.read::<u32>((name as usize + 4) as u64);
     if !length.is_multiple_of(2) || length > 65534 || pointer == 0 && length != 0 { return Err(INVALID); }
-    let mut name: Vec<_> = (0..length/2).map(|i| machine.read::<u16>(pointer as usize + 2*i)).collect();
+    let mut name: Vec<_> = (0..length/2).map(|i| machine.read::<u16>((pointer as usize + 2*i) as u64)).collect();
     if name.is_empty() { return Ok((name, flags)); }
     if root != 0 {
         let object = state.get(root).ok_or(0xc0000008u32)?;
@@ -117,14 +117,14 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, ar
 fn execute<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32; 6]) -> Result<u32,u32> {
     let [op, handle, a, b, c, out] = args;
     let _serial = WAIT_LOCK.lock();
-    let id = machine.read::<u32>((state.teb_base + 0x24) as usize);
+    let id = machine.read::<u32>((state.teb_base + 0x24) as u64);
     if op == 24 {
         if out == 0 { return Err(INVALID); }
         let (name,flags)=attributes(machine,&state.threads.named,a)?;
         if name.is_empty() {return Err(INVALID);}
         let (object,_) = open(name,flags | 0x80,20,||Err(0xc0000034))?;
         let handle=state.threads.named.insert(object);
-        machine.write::<u32>(out as usize,handle);
+        machine.write::<u32>(out as u64,handle);
         return Ok(0);
     }
     if matches!(op, 0..=3 | 20) {
@@ -150,7 +150,7 @@ fn execute<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32
             }, _ => unreachable!()
         }))?;
         let handle = state.threads.named.insert(object);
-        machine.write::<u32>(out as usize,handle); return Ok(if op == 0 {0}else{status});
+        machine.write::<u32>(out as u64,handle); return Ok(if op == 0 {0}else{status});
     }
     if op == 22 {
         let i = state.threads.named.views.iter().position(|v|v.0 == handle).ok_or(0xc0000019u32)?;
@@ -165,7 +165,7 @@ fn execute<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32
         if out == 0 || a & 65535 != 0 || c != 2 && c != 4 || c == 4 && !*writable {return Err(INVALID);}
         let available = (backing.pages as u32 * 4096).checked_sub(a).filter(|n|*n != 0).ok_or(INVALID)?;
         let length = if b == 0 {available}else{b.checked_add(4095).map(|n|n & !4095).filter(|n|*n <= available).ok_or(INVALID)?};
-        let requested = machine.read::<u32>(out as usize);
+        let requested = machine.read::<u32>(out as u64);
         let base = memory::call(machine,state,Api::MemoryReserve,requested,length,0);
         if base == 0 {return Err(0xc0000018);}
         unsafe {crate::kernel::memory::map_shared_pages(machine, base as usize/4096,NonNull::new((backing.address+a as usize) as *mut u8).unwrap(),length as usize/4096);}
@@ -173,22 +173,22 @@ fn execute<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32
         crate::kernel::memory::protect(machine, base as usize/4096,length as usize/4096,c == 4,false);
         memory::adopt_shared(state,base,permissions);
         state.threads.named.views.push((base,object.clone()));
-        machine.write::<u32>(out as usize,base);machine.write::<u32>(out as usize+4,length);return Ok(0);
+        machine.write::<u32>(out as u64,base);machine.write::<u32>((out as usize+4) as u64,length);return Ok(0);
     }
     match (&mut *value,op) {
         (Value::Semaphore {count,maximum},4) => {
             if a == 0 || a > *maximum-*count {return Err(0xc0000047);}
-            if out != 0 {machine.write::<u32>(out as usize,*count);} *count += a;
+            if out != 0 {machine.write::<u32>(out as u64,*count);} *count += a;
         },
-        (Value::Semaphore {count,maximum},10) => {machine.write::<u32>(out as usize,*count);machine.write::<u32>(out as usize+4,*maximum);},
+        (Value::Semaphore {count,maximum},10) => {machine.write::<u32>(out as u64,*count);machine.write::<u32>((out as usize+4) as u64,*maximum);},
         (Value::Mutant {owner,recursion},5) => {
             if *owner != id || *recursion == 0 {return Err(0xc0000046);}
-            if out != 0 {machine.write::<u32>(out as usize,1u32.wrapping_sub(*recursion));}
+            if out != 0 {machine.write::<u32>(out as u64,1u32.wrapping_sub(*recursion));}
             *recursion -= 1;if *recursion == 0 {*owner = 0;}
         },
-        (Value::Mutant {owner,recursion},11) => {machine.write::<u32>(out as usize,1u32.wrapping_sub(*recursion));machine.write::<u32>(out as usize+4,(*owner == id) as u32);},
-        (Value::Event {signaled,..},6|7) => {if out != 0 {machine.write::<u32>(out as usize,*signaled as u32);}*signaled = op == 6;},
-        (Value::Event {signaled,manual},12) => {machine.write::<u32>(out as usize,(!*manual) as u32);machine.write::<u32>(out as usize+4,*signaled as u32);},
+        (Value::Mutant {owner,recursion},11) => {machine.write::<u32>(out as u64,1u32.wrapping_sub(*recursion));machine.write::<u32>((out as usize+4) as u64,(*owner == id) as u32);},
+        (Value::Event {signaled,..},6|7) => {if out != 0 {machine.write::<u32>(out as u64,*signaled as u32);}*signaled = op == 6;},
+        (Value::Event {signaled,manual},12) => {machine.write::<u32>(out as u64,(!*manual) as u32);machine.write::<u32>((out as usize+4) as u64,*signaled as u32);},
         _ => return Err(TYPE)
     }
     Ok(0)

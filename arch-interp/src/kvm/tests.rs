@@ -236,7 +236,7 @@ fn kvm_engine_proofs() {
     prog.extend_from_slice(&data.to_le_bytes());
     prog.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
     prog.extend_from_slice(&[0xCD, 0x80]);
-    mem.copy_to(code as usize, &prog);
+    mem.copy_to(code as u64, &prog);
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -248,13 +248,13 @@ fn kvm_engine_proofs() {
     assert_eq!(r.code_seg(), USER_CS, "still flat user CS");
     assert_eq!(r.frame.ss as u16, USER_DS, "still flat user SS");
     assert_eq!(
-        mem.read::<u32>(data as usize),
+        mem.read::<u32>(data as u64),
         0xDEAD_BEEF,
         "the demand-faulted store landed in guest memory"
     );
 
     // ── PM #GP path: `hlt` at CPL3 → #GP(0) → monitor → KernelEvent::Hlt.
-    mem.copy_to(code as usize, &[0xF4]);
+    mem.copy_to(code as u64, &[0xF4]);
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -265,7 +265,7 @@ fn kvm_engine_proofs() {
 
     // ── COW: fork the space, write to a shared page in the child, verify the
     // parent's copy is untouched (the #PF → space_cow_fault path under KVM).
-    mem.write::<u32>(data as usize, 0x1111_1111);
+    mem.write::<u32>(data as u64, 0x1111_1111);
     let mut child = RootPageTable::empty();
     crate::paging::space_fork(&mut child);
     let parent = crate::backend::Interp.activate(child);
@@ -276,7 +276,7 @@ fn kvm_engine_proofs() {
     prog.extend_from_slice(&data.to_le_bytes());
     prog.extend_from_slice(&[0xCD, 0x80]);
     let mut child_mem = crate::backend::Interp;
-    child_mem.copy_to(code as usize, &prog);
+    child_mem.copy_to(code as u64, &prog);
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -284,11 +284,11 @@ fn kvm_engine_proofs() {
         KernelEvent::SoftInt(0x80) => {}
         ev => panic!("COW child: expected SoftInt(0x80), got {ev:?}"),
     }
-    assert_eq!(child_mem.read::<u32>(data as usize), 0x1111_1112, "child sees its increment");
+    assert_eq!(child_mem.read::<u32>(data as u64), 0x1111_1112, "child sees its increment");
     crate::backend::Interp.activate(parent);
     set_regs(Regs::empty());
     assert_eq!(
-        mem.read::<u32>(data as usize),
+        mem.read::<u32>(data as u64),
         0x1111_1111,
         "parent's page untouched by the child's COW write"
     );
@@ -309,7 +309,7 @@ fn kvm_engine_proofs() {
         if allowed {
             allow_io_ports(0xE0, 1);
         }
-        mem.copy_to(code as usize, io_prog);
+        mem.copy_to(code as u64, io_prog);
         let mut r = Regs::empty();
         r.init_user_process(code, stack);
         set_regs(r);
@@ -340,7 +340,7 @@ fn kvm_engine_proofs() {
     // marker in XMM0; a switch to a clean thread B clobbers XMM0; switching
     // back must restore A's marker — through the XSAVE round-trip.
     // A: mov eax, 0x11223344; movd xmm0, eax; int 0x80
-    mem.copy_to(code as usize, &[0xB8, 0x44, 0x33, 0x22, 0x11, 0x66, 0x0F, 0x6E, 0xC0, 0xCD, 0x80]);
+    mem.copy_to(code as u64, &[0xB8, 0x44, 0x33, 0x22, 0x11, 0x66, 0x0F, 0x6E, 0xC0, 0xCD, 0x80]);
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -361,7 +361,7 @@ fn kvm_engine_proofs() {
         "outgoing thread's XMM0 captured into its save area"
     );
     // B: mov eax, 0xDEADBEEF; movd xmm0, eax; int 0x80
-    mem.copy_to(code as usize, &[0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0x66, 0x0F, 0x6E, 0xC0, 0xCD, 0x80]);
+    mem.copy_to(code as u64, &[0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0x66, 0x0F, 0x6E, 0xC0, 0xCD, 0x80]);
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -373,7 +373,7 @@ fn kvm_engine_proofs() {
         "thread B's XMM0 captured on the way out"
     );
     // A resumes: movd eax, xmm0; int 0x80 — the marker must have survived B.
-    mem.copy_to(code as usize, &[0x66, 0x0F, 0x7E, 0xC0, 0xCD, 0x80]);
+    mem.copy_to(code as u64, &[0x66, 0x0F, 0x7E, 0xC0, 0xCD, 0x80]);
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -392,7 +392,7 @@ fn kvm_engine_proofs() {
     for &entry in &entries {
         // syscall; then spend time in guest computation before the next one.
         // The timer must interrupt KVM_RUN, not merely expire in host code.
-        mem.copy_to(entry, &[0xb8, 24, 0, 0, 0, 0x0f, 0x05,
+        mem.copy_to((entry) as u64, &[0xb8, 24, 0, 0, 0, 0x0f, 0x05,
             0xb9, 0x40, 0x42, 0x0f, 0, 0xff, 0xc9, 0x75, 0xfc, 0xeb, 0xee]);
     }
     let mut contexts = [Regs::empty(); 2];

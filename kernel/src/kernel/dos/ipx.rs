@@ -30,13 +30,13 @@ impl Far {
         self.offset as usize + len <= 0x10000 && self.linear() + len <= 0xa0000
     }
     fn byte<A: Arch>(self, m: &A, offset: usize) -> u8 {
-        m.read::<u8>(self.linear() + offset)
+        m.read::<u8>((self.linear() + offset) as u64)
     }
     fn word<A: Arch>(self, m: &A, offset: usize) -> u16 {
-        m.read::<u16>(self.linear() + offset)
+        m.read::<u16>((self.linear() + offset) as u64)
     }
     fn put<A: Arch>(self, m: &mut A, offset: usize, value: u8) {
-        m.write::<u8>(self.linear() + offset, value);
+        m.write::<u8>((self.linear() + offset) as u64, value);
     }
     fn esr<A: Arch>(self, m: &A) -> Far {
         Far {
@@ -153,13 +153,13 @@ impl IpxState {
                         let mut offset = 0;
                         for (dest, len) in buffers {
                             let count = len.min(packet.len() - offset);
-                            m.copy_to(dest.linear(), &packet[offset..offset + count]);
+                            m.copy_to((dest.linear()) as u64, &packet[offset..offset + count]);
                             offset += count;
                             if offset == packet.len() {
                                 break;
                             }
                         }
-                        m.copy_to(request.ecb.linear() + 28, &packet[22..28]);
+                        m.copy_to((request.ecb.linear() + 28) as u64, &packet[22..28]);
                         SUCCESS
                     }
                     _ => MALFORMED,
@@ -320,8 +320,8 @@ pub(crate) fn api<A: Arch>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
                 return;
             }
             let mut node = [0; 6];
-            m.copy_from(ecb.linear() + 4, &mut node);
-            m.copy_to(dest.linear(), &node);
+            m.copy_from((ecb.linear() + 4) as u64, &mut node);
+            m.copy_to((dest.linear()) as u64, &node);
             regs.rcx = (regs.rcx & !0xffff) | 1;
             al(regs, SUCCESS);
         }
@@ -382,7 +382,7 @@ pub(crate) fn api<A: Arch>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
             for (source, len) in buffers {
                 let start = packet.len();
                 packet.resize(start + len, 0);
-                m.copy_from(source.linear(), &mut packet[start..]);
+                m.copy_from((source.linear()) as u64, &mut packet[start..]);
             }
             if packet.len() < HEADER {
                 state.finish(m, request, MALFORMED);
@@ -408,7 +408,7 @@ pub(crate) fn api<A: Arch>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
         }
         9 => {
             if ecb.valid(10) {
-                m.copy_to(ecb.linear(), &state.address.unwrap());
+                m.copy_to((ecb.linear()) as u64, &state.address.unwrap());
             } else {
                 al(regs, FAILURE);
             }

@@ -114,7 +114,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             let start = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut addr = start;
             loop {
-                let ch = machine.read::<u8>((addr) as usize);
+                let ch = machine.read::<u8>(addr as u64);
                 if ch == b'$' { break; }
                 dos_putchar(machine, dos, ch);
                 addr = addr.wrapping_add(1);
@@ -133,9 +133,9 @@ pub(super) fn int_21h<A: crate::Arch>(
         // game spins forever asking for input.
         0x0A => {
             let buf_lin = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
-            let max_chars = machine.read::<u8>((buf_lin) as usize);
+            let max_chars = machine.read::<u8>(buf_lin as u64);
             if max_chars == 0 {
-                machine.write::<u8>((buf_lin + 1) as usize, 0);
+                machine.write::<u8>((buf_lin + 1) as u64, 0);
                 return thread::KernelAction::Done;
             }
             *suspension = Some(DosSuspension {
@@ -221,8 +221,8 @@ pub(super) fn int_21h<A: crate::Arch>(
                     return thread::KernelAction::Done;
                 }
                 let addr = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
-                machine.copy_to(addr, cwd);
-                machine.write::<u8>(addr + cwd.len(), 0);
+                machine.copy_to(addr as u64, cwd);
+                machine.write::<u8>((addr + cwd.len()) as u64, 0);
                 DosExit::Ok
             } else {
                 DosExit::Error(0x0F)
@@ -313,10 +313,10 @@ pub(super) fn int_21h<A: crate::Arch>(
             let Some(profile) = profile else { break 'country DosExit::Error(2); };
             let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32) as usize;
             let data = crate::kernel::locale::dos_country(profile, lib::codepage::current_codepage().id);
-            machine.copy_to(addr, &data);
+            machine.copy_to(addr as u64, &data);
             // DOS programs call the far pointer at +12h to uppercase a byte
             // in AL. A zero pointer makes callers jump into the IVT.
-            machine.write::<u32>(addr + 0x12, ctrl_slot_off(SLOT_COUNTRY_UPCASE) as u32);
+            machine.write::<u32>((addr + 0x12) as u64, ctrl_slot_off(SLOT_COUNTRY_UPCASE) as u32);
             regs.rbx = (regs.rbx & !0xFFFF) | u64::from(profile.country);
             regs.rax = (regs.rax & !0xFFFF) | u64::from(profile.country);
             DosExit::Ok
@@ -496,7 +496,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             dos.searches[slot].attributes = regs.rcx as u8;
             let generation = dos.searches[slot].generation;
             let dta = dos.dta as usize;
-            machine.zero(dta, 43);
+            machine.zero(dta as u64, 43);
             write_search_state(machine, dta, slot as u8, generation, 0);
             find_matching_file(machine, dos)
         }
@@ -737,7 +737,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             if console {
                 let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
                 for i in 0..count as u32 {
-                    let ch = machine.read::<u8>((addr + i) as usize);
+                    let ch = machine.read::<u8>((addr + i) as u64);
                     dos_putchar(machine, dos, ch);
                 }
                 DosExit::Ax(count)
@@ -746,7 +746,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             } else {
                 let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
                 let mut data = alloc::vec![0u8; count as usize];
-                machine.copy_from(addr as usize, &mut data);
+                machine.copy_from(addr as u64, &mut data);
                 let n = crate::kernel::vfs::write(machine, handle as i32, &data, &kt.fds);
                 if n >= 0 {
                     if n > 0 {
@@ -849,13 +849,13 @@ pub(super) fn int_21h<A: crate::Arch>(
                 // dos.find_path / dos.find_idx, then drop into the
                 // shared scan loop below.
                 let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
-                let (is_ext, fcb_off) = if machine.read::<u8>(addr as usize) == 0xFF { (true, 7) } else { (false, 0) };
+                let (is_ext, fcb_off) = if machine.read::<u8>(addr as u64) == 0xFF { (true, 7) } else { (false, 0) };
                 let fcb_base = addr.wrapping_add(fcb_off);
-                let drive_byte = machine.read::<u8>((fcb_base) as usize);
+                let drive_byte = machine.read::<u8>(fcb_base as u64);
                 let mut name = [0u8; 8];
-                machine.copy_from((fcb_base + 1) as usize, &mut name);
+                machine.copy_from((fcb_base + 1) as u64, &mut name);
                 let mut ext = [0u8; 3];
-                machine.copy_from((fcb_base + 9) as usize, &mut ext);
+                machine.copy_from((fcb_base + 9) as u64, &mut ext);
                 // Build "[X:][cwd\]NAME[.EXT]" — wildcards stay as-is
                 // ('?' for single, real chars for literal). resolve()
                 // uppercases and applies cwd.
@@ -922,15 +922,15 @@ pub(super) fn int_21h<A: crate::Arch>(
                         let dta = dos.dta as usize;
                         // Zero the (extended-prefix + 32-byte) area first.
                         let total = if is_ext { 7 + 32 } else { 32 };
-                        machine.zero(dta, total);
+                        machine.zero(dta as u64, total);
                         let fcb_base = if is_ext {
-                            machine.write::<u8>(dta, 0xFF);
-                            machine.write::<u8>(dta + 6, if is_dir { 0x10 } else { 0x20 });
+                            machine.write::<u8>(dta as u64, 0xFF);
+                            machine.write::<u8>((dta + 6) as u64, if is_dir { 0x10 } else { 0x20 });
                             dta + 7
                         } else {
                             dta
                         };
-                        machine.write::<u8>(fcb_base, drive);
+                        machine.write::<u8>(fcb_base as u64, drive);
                         // Split alias (e.g. "CIV.EXE" or "AUTOEXEC.BAT")
                         // into 8-char name + 3-char ext, space-padded.
                         let mut name_buf = [b' '; 8];
@@ -946,16 +946,16 @@ pub(super) fn int_21h<A: crate::Arch>(
                         for (i, &c) in e.iter().take(3).enumerate() {
                             ext_buf[i] = c.to_ascii_uppercase();
                         }
-                        machine.copy_to(fcb_base + 1, &name_buf);
-                        machine.copy_to(fcb_base + 9, &ext_buf);
+                        machine.copy_to((fcb_base + 1) as u64, &name_buf);
+                        machine.copy_to((fcb_base + 9) as u64, &ext_buf);
                         // current block = 0 (offsets 0x0C-0x0D), record
                         // size = 128 (0x0E-0x0F), file size at 0x10-0x13.
-                        machine.write::<u16>(fcb_base + 0x0E, 128);
-                        machine.write::<u32>(fcb_base + 0x10, size);
+                        machine.write::<u16>((fcb_base + 0x0E) as u64, 128);
+                        machine.write::<u32>((fcb_base + 0x10) as u64, size);
                         // Real mtime; (0, 0) when the backing fs has none.
                         let (time, date) = unix_to_dos_datetime(ent.mtime);
-                        machine.write::<u16>(fcb_base + 0x14, date);
-                        machine.write::<u16>(fcb_base + 0x16, time);
+                        machine.write::<u16>((fcb_base + 0x14) as u64, date);
+                        machine.write::<u16>((fcb_base + 0x16) as u64, time);
                         regs.rax &= !0xFF;
                         return thread::KernelAction::Done;
                     }
@@ -986,7 +986,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             let flags = regs.rax as u8;
             if flags & 1 != 0 {
                 loop {
-                    let ch = machine.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
+                    let ch = machine.read::<u8>((ds_base.wrapping_add(si as u32)) as u64);
                     if ch == b' ' || ch == b'\t' || ch == b';' || ch == b',' {
                         si += 1;
                     } else {
@@ -996,50 +996,50 @@ pub(super) fn int_21h<A: crate::Arch>(
             }
 
             // Zero-fill the 11-byte name field in FCB (drive byte at +0, name at +1..+12)
-            machine.copy_to((fcb + 1) as usize, &[b' '; 11]);
+            machine.copy_to((fcb + 1) as u64, &[b' '; 11]);
 
             // Check for drive letter (e.g., "C:")
-            let ch0 = machine.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
-            let ch1 = machine.read::<u8>((ds_base.wrapping_add(si as u32 + 1)) as usize);
+            let ch0 = machine.read::<u8>((ds_base.wrapping_add(si as u32)) as u64);
+            let ch1 = machine.read::<u8>((ds_base.wrapping_add(si as u32 + 1)) as u64);
             if ch1 == b':' && ch0.is_ascii_alphabetic() {
-                machine.write::<u8>((fcb) as usize, ch0.to_ascii_uppercase() - b'A' + 1);
+                machine.write::<u8>(fcb as u64, ch0.to_ascii_uppercase() - b'A' + 1);
                 si += 2;
             } else {
-                machine.write::<u8>((fcb) as usize, 0); // default drive
+                machine.write::<u8>(fcb as u64, 0); // default drive
             }
 
             // Parse filename (up to 8 chars) into FCB+1
             let mut pos = 0u32;
             loop {
-                let ch = machine.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
+                let ch = machine.read::<u8>((ds_base.wrapping_add(si as u32)) as u64);
                 if ch == b'.' || ch == 0 || ch == b' ' || ch == b'/' || ch == b'\\' || ch == b'\r' { break; }
                 if ch == b'*' {
-                    while pos < 8 { machine.write::<u8>((fcb + 1 + pos) as usize, b'?'); pos += 1; }
+                    while pos < 8 { machine.write::<u8>((fcb + 1 + pos) as u64, b'?'); pos += 1; }
                     si += 1;
                     break;
                 }
                 if pos < 8 {
-                    machine.write::<u8>((fcb + 1 + pos) as usize, ch.to_ascii_uppercase());
+                    machine.write::<u8>((fcb + 1 + pos) as u64, ch.to_ascii_uppercase());
                     pos += 1;
                 }
                 si += 1;
             }
 
             // Parse extension (up to 3 chars) into FCB+9
-            let ch = machine.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
+            let ch = machine.read::<u8>((ds_base.wrapping_add(si as u32)) as u64);
             if ch == b'.' {
                 si += 1;
                 pos = 0;
                 loop {
-                    let ch = machine.read::<u8>((ds_base.wrapping_add(si as u32)) as usize);
+                    let ch = machine.read::<u8>((ds_base.wrapping_add(si as u32)) as u64);
                     if ch == 0 || ch == b' ' || ch == b'/' || ch == b'\\' || ch == b'\r' { break; }
                     if ch == b'*' {
-                        while pos < 3 { machine.write::<u8>((fcb + 9 + pos) as usize, b'?'); pos += 1; }
+                        while pos < 3 { machine.write::<u8>((fcb + 9 + pos) as u64, b'?'); pos += 1; }
                         si += 1;
                         break;
                     }
                     if pos < 3 {
-                        machine.write::<u8>((fcb + 9 + pos) as usize, ch.to_ascii_uppercase());
+                        machine.write::<u8>((fcb + 9 + pos) as u64, ch.to_ascii_uppercase());
                         pos += 1;
                     }
                     si += 1;
@@ -1050,7 +1050,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             regs.rsi = (regs.rsi & !0xFFFF) | si as u64;
             // AL=0: no wildcards, AL=1: wildcards present, AL=0xFF: drive invalid
             let mut fcb_name = [0u8; 11];
-            machine.copy_from((fcb + 1) as usize, &mut fcb_name);
+            machine.copy_from((fcb + 1) as u64, &mut fcb_name);
             let has_wildcards = fcb_name.contains(&b'?');
             regs.rax = (regs.rax & !0xFF) | if has_wildcards { 1 } else { 0 };
             thread::KernelAction::Done
@@ -1170,7 +1170,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             }
             out[pos] = 0;
             // Write to ES:DI
-            machine.copy_to(dst as usize, &out[..pos + 1]);
+            machine.copy_to(dst as u64, &out[..pos + 1]);
             DosExit::Ok
         }
         // AH=0x52: Get List of Lists (returns ES:BX → DOS internal structure)
@@ -1218,7 +1218,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             // and inspect the descriptor before checking AL for failure.
             if (1..=26).contains(&drive) {
                 let address=LOW_MEM_BASE+core::mem::offset_of!(LowMem,allocation_media) as u32+u32::from(drive-1);
-                machine.write::<u8>(address as usize,if drive<=2 {0xf0}else{0xf8});
+                machine.write::<u8>(address as u64,if drive<=2 {0xf0}else{0xf8});
                 if regs.mode()!=crate::UserMode::VM86 {
                     regs.ds=u64::from(dpmi::LOW_MEM_SEL);
                     regs.rbx=u64::from(address);
@@ -1352,11 +1352,11 @@ pub(super) fn int_21h<A: crate::Arch>(
                     Ok(new_seg) => {
                         let new_addr = (new_seg as usize) << 4;
                         for i in 0..requested {
-                            machine.write::<u8>(new_addr + i, 0xFF);
+                            machine.write::<u8>((new_addr + i) as u64, 0xFF);
                         }
                         for i in 0..old_count.min(requested) {
-                            let entry = machine.read::<u8>(old_addr + i);
-                            machine.write::<u8>(new_addr + i, entry);
+                            let entry = machine.read::<u8>((old_addr + i) as u64);
+                            machine.write::<u8>((new_addr + i) as u64, entry);
                         }
                         Psp::set_jft_location(machine, psp_seg, requested as u16, 0, new_seg);
                         if let Some(old_seg) = old_external_seg {
@@ -1432,8 +1432,8 @@ pub(super) fn int_21h<A: crate::Arch>(
                 break;
             }
             if created >= 0 {
-                machine.copy_to(addr as usize, &prefix[..final_len]);
-                machine.write::<u8>((addr + final_len as u32) as usize, 0);
+                machine.copy_to(addr as u64, &prefix[..final_len]);
+                machine.write::<u8>((addr + final_len as u32) as u64, 0);
                 DosExit::Ax(created as u16)
             } else {
                 DosExit::Errno(created)
@@ -1532,7 +1532,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             let child = regs.rdx as u16;
             let top = regs.rsi as u16;
             let parent_seg = dos.current_psp;
-            let parent = machine.read::<Psp>(Psp::base(parent_seg));
+            let parent = machine.read::<Psp>((Psp::base(parent_seg)) as u64);
             let allocated = dos.dos_blocks.iter().any(|block| {
                 block.owner == parent_seg && block.seg <= child
                     && u32::from(child) + 0x10 <= u32::from(block.seg) + u32::from(block.paras)
@@ -1556,7 +1556,7 @@ pub(super) fn int_21h<A: crate::Arch>(
                 let parent_jft = Psp::jft_addr(machine, parent_seg);
                 let inherited = usize::from(parent.max_files.min(20));
                 if inherited != 0 && parent_jft <= 0x100000 - inherited {
-                    machine.copy_from(parent_jft, &mut psp.jft[..inherited]);
+                    machine.copy_from(parent_jft as u64, &mut psp.jft[..inherited]);
                 }
                 // PSP:38h is the previous-PSP pointer; each child starts
                 // with two empty default FCBs rather than its parent's FCBs.

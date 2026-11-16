@@ -21,7 +21,7 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>
         }
     } else {
         let mut raw = [0; vfs::PATH_KEY_MAX];
-        let n = machine.copy_cstr(a.a0 as usize, &mut raw);
+        let n = machine.copy_cstr(a.a0 as u64, &mut raw);
         if n == raw.len() { return SyscallResult::val(-36); }
         if n == 0 { return SyscallResult::val(-ENOENT); }
         let mut path = [0; vfs::PATH_KEY_MAX];
@@ -30,26 +30,25 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>
     let stats = match stats { Ok(stats) => stats, Err(error) => return SyscallResult::val(error) };
     if !wide && !large32 && [stats.blocks, stats.free_blocks, stats.available_blocks, stats.files, stats.free_files]
         .iter().any(|value| *value > u64::from(u32::MAX)) { return SyscallResult::val(-75); }
-    let pointer = pointer as usize;
-    machine.zero(pointer, size as usize);
+    machine.zero(pointer as u64, size as usize);
     if wide {
         for (i, value) in [stats.kind, stats.block_size, stats.blocks, stats.free_blocks,
             stats.available_blocks, stats.files, stats.free_files, stats.id, stats.name_max,
             stats.block_size, stats.flags].into_iter().enumerate() {
-            machine.write::<u64>(pointer + i * 8, value);
+            machine.write::<u64>((pointer + (i * 8) as u64) as u64, value);
         }
     } else {
-        machine.write::<u32>(pointer, stats.kind as u32);
-        machine.write::<u32>(pointer + 4, stats.block_size as u32);
+        machine.write::<u32>(pointer as u64, stats.kind as u32);
+        machine.write::<u32>((pointer + 4) as u64, stats.block_size as u32);
         for (i, value) in [stats.blocks, stats.free_blocks, stats.available_blocks, stats.files, stats.free_files].into_iter().enumerate() {
-            if large32 { machine.write::<u64>(pointer + 8 + i * 8, value); }
-            else { machine.write::<u32>(pointer + 8 + i * 4, value as u32); }
+            if large32 { machine.write::<u64>((pointer + 8 + (i * 8) as u64) as u64, value); }
+            else { machine.write::<u32>((pointer + 8 + (i * 4) as u64) as u64, value as u32); }
         }
         let id_at = if large32 { 48 } else { 28 };
-        machine.write::<u64>(pointer + id_at, stats.id);
-        machine.write::<u32>(pointer + id_at + 8, stats.name_max as u32);
-        machine.write::<u32>(pointer + id_at + 12, stats.block_size as u32);
-        machine.write::<u32>(pointer + id_at + 16, stats.flags as u32);
+        machine.write::<u64>((pointer + id_at) as u64, stats.id);
+        machine.write::<u32>((pointer + id_at + 8) as u64, stats.name_max as u32);
+        machine.write::<u32>((pointer + id_at + 12) as u64, stats.block_size as u32);
+        machine.write::<u32>((pointer + id_at + 16) as u64, stats.flags as u32);
     }
     SyscallResult::val(0)
 }

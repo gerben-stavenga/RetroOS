@@ -49,7 +49,7 @@ pub fn range(address: u64, length: u64) -> bool {
 }
 pub fn copy_to<A: crate::Arch>(machine: &mut A, address: u64, bytes: &[u8]) -> bool {
     if !range(address, bytes.len() as u64) { return false; }
-    if address < START { machine.copy_to(address as usize, bytes); true }
+    if address < START { machine.copy_to(address, bytes); true }
     else {
         // Keep the Arch interface mutable-buffer-only without exposing a guest reference.
         let mut buffer = bytes.to_vec();
@@ -58,7 +58,7 @@ pub fn copy_to<A: crate::Arch>(machine: &mut A, address: u64, bytes: &[u8]) -> b
 }
 pub fn copy_from<A: crate::Arch>(machine: &mut A, address: u64, bytes: &mut [u8]) -> bool {
     if !range(address, bytes.len() as u64) { return false; }
-    if address < START { machine.copy_from(address as usize, bytes); true }
+    if address < START { machine.copy_from(address, bytes); true }
     else { machine.high_copy(address, bytes, false) }
 }
 
@@ -68,7 +68,7 @@ pub(super) fn copy_cstr<A: crate::Arch>(machine: &mut A, address: u64, bytes: &m
     if address < START {
         if !range(address, 1) { return Err(-EFAULT); }
         let count = bytes.len().min((0xc0000000 - address) as usize);
-        let length = machine.copy_cstr(address as usize, &mut bytes[..count]);
+        let length = machine.copy_cstr(address, &mut bytes[..count]);
         return if length == count && count < bytes.len() { Err(-EFAULT) } else { Ok(length) };
     }
     let mut offset = 0;

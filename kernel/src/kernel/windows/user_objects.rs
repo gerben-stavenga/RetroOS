@@ -167,7 +167,7 @@ pub(super) fn call<A: crate::Arch>(
             return 0xc0000022;
         };
         let mut data = vec![0u8; length as usize];
-        machine.copy_from(name as usize, &mut data);
+        machine.copy_from(name as u64, &mut data);
         let names = NAMES.lock();
         let mut monitors = station.monitors.lock();
         if flags != 0 || monitors.1 != data {
@@ -181,13 +181,13 @@ pub(super) fn call<A: crate::Arch>(
         {
             session::write_object_part(desktop.offset, 288, &monitors.0.to_le_bytes());
         }
-        machine.write::<u64>(out as usize, monitors.0);
+        machine.write::<u64>(out as u64, monitors.0);
         return 0;
     }
     if length > 510 || length & 1 != 0 {
         return 0xc000000d;
     }
-    let tid = machine.read::<u32>((state.teb_base + 0x24) as usize);
+    let tid = machine.read::<u32>((state.teb_base + 0x24) as u64);
     let mut object = None;
     let mut result = handle;
     let mut previous = 0;
@@ -214,9 +214,9 @@ pub(super) fn call<A: crate::Arch>(
             };
             roots.extend([top, message]);
         }
-        machine.zero(out as usize, 544);
-        machine.write::<u32>(out as usize, roots[0].handle);
-        machine.write::<u32>(out as usize + 4, roots[1].handle);
+        machine.zero(out as u64, 544);
+        machine.write::<u32>(out as u64, roots[0].handle);
+        machine.write::<u32>((out as usize + 4) as u64, roots[1].handle);
         return 0;
     }
     if op == 0 {
@@ -257,7 +257,7 @@ pub(super) fn call<A: crate::Arch>(
             return 0xc0000008;
         }
         let name: Vec<u16> = (0..length / 2)
-            .map(|i| machine.read::<u16>((name + i * 2) as usize))
+            .map(|i| machine.read::<u16>((name + i * 2) as u64))
             .collect();
         if name.is_empty() {
             return 0xc0000033;
@@ -352,16 +352,16 @@ pub(super) fn call<A: crate::Arch>(
         object = Some(o);
     }
     if out != 0 {
-        machine.zero(out as usize, 32 + 512);
-        machine.write::<u32>(out as usize, result);
+        machine.zero(out as u64, 32 + 512);
+        machine.write::<u32>(out as u64, result);
         if let Some(o) = object {
-            machine.write::<u32>(out as usize + 4, o.kind);
-            machine.write::<u32>(out as usize + 8, previous);
-            machine.write::<u32>(out as usize + 12, o.name.len() as u32 * 2);
-            machine.write::<u64>(out as usize + 16, o.id);
-            machine.write::<u64>(out as usize + 24, o.offset);
+            machine.write::<u32>((out as usize + 4) as u64, o.kind);
+            machine.write::<u32>((out as usize + 8) as u64, previous);
+            machine.write::<u32>((out as usize + 12) as u64, o.name.len() as u32 * 2);
+            machine.write::<u64>((out as usize + 16) as u64, o.id);
+            machine.write::<u64>((out as usize + 24) as u64, o.offset);
             for (i, c) in o.name.iter().enumerate() {
-                machine.write::<u16>(out as usize + 32 + i * 2, *c);
+                machine.write::<u16>((out as usize + 32 + i * 2) as u64, *c);
             }
         }
     }
@@ -392,8 +392,8 @@ pub(super) fn window_call<A: crate::Arch>(
         }
         if op == 3 {
             let owner = [
-                machine.read::<u32>((state.teb_base + 0x24) as usize),
-                machine.read::<u32>((state.teb_base + 0x20) as usize),
+                machine.read::<u32>((state.teb_base + 0x24) as u64),
+                machine.read::<u32>((state.teb_base + 0x20) as u64),
             ];
             let Some(handle) = session::allocate_user(0, 0, atom as u16, owner) else {
                 return 0xc000009a;
@@ -402,7 +402,7 @@ pub(super) fn window_call<A: crate::Arch>(
                 .user_objects
                 .client_handles
                 .push((handle, atom as u16));
-            machine.write::<u32>(data as usize, handle);
+            machine.write::<u32>(data as u64, handle);
         } else {
             let Some(i) = state
                 .user_objects
@@ -425,7 +425,7 @@ pub(super) fn window_call<A: crate::Arch>(
     if (op > 2 && op != 5) || length > 510 || length & 1 != 0 || atom > 0xffff {
         return 0xc000000d;
     }
-    let tid = machine.read::<u32>((state.teb_base + 0x24) as usize);
+    let tid = machine.read::<u32>((state.teb_base + 0x24) as u64);
     let desktop = state
         .user_objects
         .desktops
@@ -482,7 +482,7 @@ pub(super) fn window_call<A: crate::Arch>(
             .chain(tree)
             .enumerate()
         {
-            machine.write::<u32>(data as usize + i * 4, n);
+            machine.write::<u32>((data as usize + i * 4) as u64, n);
         }
         let mut origin = [0i32; 2];
         let mut parent = w.parent;
@@ -492,7 +492,7 @@ pub(super) fn window_call<A: crate::Arch>(
             parent = p.parent;
         }
         for (i, n) in w.rect.into_iter().chain(w.client_rect).enumerate() {
-            machine.write::<i32>(data as usize + 96 + i * 4, n.saturating_add(origin[i % 2]));
+            machine.write::<i32>((data as usize + 96 + i * 4) as u64, n.saturating_add(origin[i % 2]));
         }
         return 0;
     }
@@ -500,7 +500,7 @@ pub(super) fn window_call<A: crate::Arch>(
     let mut table = atoms::GLOBAL.lock();
     let key = if length != 0 {
         let units: Vec<u16> = (0..length / 2)
-            .map(|i| machine.read::<u16>((name + i * 2) as usize))
+            .map(|i| machine.read::<u16>((name + i * 2) as u64))
             .collect();
         let Ok(name) = alloc::string::String::from_utf16(&units) else {
             return 0xc000000d;
@@ -516,14 +516,14 @@ pub(super) fn window_call<A: crate::Arch>(
     let key = match key {
         Ok(key) => key,
         Err(_) if op != 1 => {
-            machine.write::<u64>(data as usize, 0);
+            machine.write::<u64>(data as u64, 0);
             return 0;
         }
         Err(_) => return 0xc000000d,
     };
     let index = window.properties.iter().position(|p| p.atom == key);
     if op == 1 {
-        let value = machine.read::<u64>(data as usize);
+        let value = machine.read::<u64>(data as u64);
         if let Some(i) = index {
             window.properties[i].data = value;
             let _ = table.delete(key); // release temporary lookup reference
@@ -540,7 +540,7 @@ pub(super) fn window_call<A: crate::Arch>(
             && let Some(i) = index {
                 window.properties.swap_remove(i);
             }
-        machine.write::<u64>(data as usize, value);
+        machine.write::<u64>(data as u64, value);
     }
     0
 }
@@ -555,9 +555,9 @@ pub(super) fn tree_call<A: crate::Arch>(
     args: [u32; 3],
 ) -> u32 {
     let [op, params, out] = args;
-    let p: [u32; 16] = core::array::from_fn(|i| machine.read::<u32>(params as usize + i * 4));
-    let tid = machine.read::<u32>((state.teb_base + 0x24) as usize);
-    let pid = machine.read::<u32>((state.teb_base + 0x20) as usize);
+    let p: [u32; 16] = core::array::from_fn(|i| machine.read::<u32>((params as usize + i * 4) as u64));
+    let tid = machine.read::<u32>((state.teb_base + 0x24) as u64);
+    let pid = machine.read::<u32>((state.teb_base + 0x20) as u64);
     let desktop = if op == 2 && p[0] != 0 {
         state.user_objects.get(p[0]).filter(|o| o.kind == 2)
     } else {
@@ -572,7 +572,7 @@ pub(super) fn tree_call<A: crate::Arch>(
         return 0xc0000008;
     };
     let mut windows = desktop.windows.lock();
-    machine.zero(out as usize, 32);
+    machine.zero(out as u64, 32);
     match op {
         // FindWindowEx enumerates siblings by class; the portable Wine code
         // applies its title filter to this ordered candidate list.
@@ -581,7 +581,7 @@ pub(super) fn tree_call<A: crate::Arch>(
             if atom == 0 && p[4] != 0 {
                 if p[4] > 510 || p[4] & 1 != 0 { return 0xc000000d; }
                 let name: Vec<u16> = (0..p[4] / 2)
-                    .map(|i| machine.read::<u16>((p[3] + i * 2) as usize)).collect();
+                    .map(|i| machine.read::<u16>((p[3] + i * 2) as u64)).collect();
                 let Ok(name) = alloc::string::String::from_utf16(&name) else { return 0xc000000d; };
                 let Ok(found) = atoms::USER.lock().lookup(&name, false) else { return 0; };
                 atom = u32::from(found);
@@ -601,10 +601,10 @@ pub(super) fn tree_call<A: crate::Arch>(
                 && parent.map_or(w.parent == root || w.parent == message, |p| w.parent == p)
                 && (atom == 0 || w._class.matches_atom(atom)))
                 .map(|w| w.handle).collect();
-            machine.write::<u32>(out as usize, list.len() as u32);
+            machine.write::<u32>(out as u64, list.len() as u32);
             if list.len() > p[5] as usize { return 0xc0000023; }
             for (i, h) in list.into_iter().enumerate() {
-                machine.write::<u32>(p[6] as usize + i * 4, h);
+                machine.write::<u32>((p[6] as usize + i * 4) as u64, h);
             }
         }
         16 => return paint::visible_region(machine, &windows, p, out),
@@ -621,7 +621,7 @@ pub(super) fn tree_call<A: crate::Arch>(
                 return 0xc000000d;
             }
             let name: Vec<u16> = (0..p[12] / 2)
-                .map(|i| machine.read::<u16>((p[11] + i * 2) as usize))
+                .map(|i| machine.read::<u16>((p[11] + i * 2) as u64))
                 .collect();
             let Some(class) = state
                 .classes
@@ -681,9 +681,9 @@ pub(super) fn tree_call<A: crate::Arch>(
                 .into_iter()
                 .enumerate()
             {
-                machine.write::<u32>(out as usize + i * 4, n);
+                machine.write::<u32>((out as usize + i * 4) as u64, n);
             }
-            machine.write::<u64>(out as usize + 16, class.client);
+            machine.write::<u64>((out as usize + 16) as u64, class.client);
             windows.push(window);
         }
         1 => {
@@ -768,12 +768,12 @@ pub(super) fn tree_call<A: crate::Arch>(
                     list.retain(|h| windows.iter().any(|w| w.handle == *h && w.tid == p[2]));
                 }
             }
-            machine.write::<u32>(out as usize, list.len() as u32);
+            machine.write::<u32>(out as u64, list.len() as u32);
             if list.len() > p[4] as usize {
                 return 0xc0000023;
             }
             for (i, h) in list.into_iter().enumerate() {
-                machine.write::<u32>(p[5] as usize + i * 4, h);
+                machine.write::<u32>((p[5] as usize + i * 4) as u64, h);
             }
         }
         3 => {
@@ -803,8 +803,8 @@ pub(super) fn tree_call<A: crate::Arch>(
             w.rect = core::array::from_fn(|i| p[4 + i] as i32);
             w.client_rect = core::array::from_fn(|i| p[8 + i] as i32);
             w.paint_flags = p[3] & 7;
-            w.visible_rect = if p[13] >= 16 { core::array::from_fn(|i| machine.read::<i32>(p[12] as usize + i * 4)) } else { w.rect };
-            w.surface_rect = if p[13] >= 32 { core::array::from_fn(|i| machine.read::<i32>(p[12] as usize + 16 + i * 4)) } else { w.visible_rect };
+            w.visible_rect = if p[13] >= 16 { core::array::from_fn(|i| machine.read::<i32>((p[12] as usize + i * 4) as u64)) } else { w.rect };
+            w.surface_rect = if p[13] >= 32 { core::array::from_fn(|i| machine.read::<i32>((p[12] as usize + 16 + i * 4) as u64)) } else { w.visible_rect };
             if p[2] & 0x40 != 0 {
                 w.style |= 0x10000000;
             }
@@ -813,8 +813,8 @@ pub(super) fn tree_call<A: crate::Arch>(
             }
             w.linked = true;
             paint::positioned(w, old_rect, p[2]);
-            machine.write::<u32>(out as usize, w.style);
-            machine.write::<u32>(out as usize + 4, w.ex_style);
+            machine.write::<u32>(out as u64, w.style);
+            machine.write::<u32>((out as usize + 4) as u64, w.ex_style);
             if p[2] & (0x40 | 8) == 0x40 {
                 // Exposing a parent exposes its visible descendants as well.
                 // Controls created under a hidden dialog have no update region.
@@ -825,7 +825,7 @@ pub(super) fn tree_call<A: crate::Arch>(
             }
             let top = paint::surface_window(&windows, i);
             if paint::visible(&windows, top) && windows[top].paint_flags & 1 != 0 {
-                machine.write::<u32>(out as usize + 8, windows[top].handle);
+                machine.write::<u32>((out as usize + 8) as u64, windows[top].handle);
             }
             let w = &windows[i];
             if p[2] & 4 == 0 && !matches_handle(w.handle, p[1]) {
@@ -883,9 +883,9 @@ pub(super) fn tree_call<A: crate::Arch>(
                 }
                 _ => return 0xc0010585,
             };
-            machine.write::<u64>(out as usize, old);
-            machine.write::<u32>(out as usize + 8, w.unicode);
-            machine.write::<u32>(out as usize + 12, w.last_active);
+            machine.write::<u64>(out as u64, old);
+            machine.write::<u32>((out as usize + 8) as u64, w.unicode);
+            machine.write::<u32>((out as usize + 12) as u64, w.last_active);
             if op == 6 {
                 match offset {
                     -16 => w.style = value as u32,
@@ -921,7 +921,7 @@ pub(super) fn tree_call<A: crate::Arch>(
                 let mut region = Vec::new();
                 for i in 0..p[3] / 16 {
                     let r: [i32; 4] = core::array::from_fn(|j| {
-                        machine.read::<i32>(p[2] as usize + i as usize * 16 + j * 4)
+                        machine.read::<i32>((p[2] as usize + i as usize * 16 + j * 4) as u64)
                     });
                     if r[0] > r[2] || r[1] > r[3] {
                         return 0xc000000d;
@@ -934,7 +934,7 @@ pub(super) fn tree_call<A: crate::Arch>(
                 return 0;
             }
             for (i, n) in w.rect.into_iter().enumerate() {
-                machine.write::<i32>(out as usize + i * 4, n);
+                machine.write::<i32>((out as usize + i * 4) as u64, n);
             }
             if p[1] != 0 && w.style & 0x10000000 == 0 {
                 return 0;
@@ -964,13 +964,13 @@ pub(super) fn tree_call<A: crate::Arch>(
                 region.push([0; 4]);
             }
             let bytes = region.len() * 16;
-            machine.write::<u32>(out as usize + 16, bytes as u32);
+            machine.write::<u32>((out as usize + 16) as u64, bytes as u32);
             if bytes > p[3] as usize {
                 return 0x80000005;
             }
             for (i, r) in region.iter().enumerate() {
                 for (j, n) in r.iter().enumerate() {
-                    machine.write::<i32>(p[2] as usize + i * 16 + j * 4, *n);
+                    machine.write::<i32>((p[2] as usize + i * 16 + j * 4) as u64, *n);
                 }
             }
         }
@@ -999,8 +999,8 @@ pub(super) fn tree_call<A: crate::Arch>(
                 }
                 Some(windows[j].handle)
             };
-            machine.write::<u32>(out as usize, windows[i].parent);
-            machine.write::<u32>(out as usize + 4, parent.unwrap_or(0));
+            machine.write::<u32>(out as u64, windows[i].parent);
+            machine.write::<u32>((out as usize + 4) as u64, parent.unwrap_or(0));
             if let Some(parent) = parent {
                 let mut w = windows.remove(i);
                 w.parent = parent;
@@ -1020,14 +1020,14 @@ pub(super) fn tree_call<A: crate::Arch>(
                     return 0xc000000d;
                 }
                 w.text = (0..p[2] / 2)
-                    .map(|i| machine.read::<u16>(p[1] as usize + i as usize * 2))
+                    .map(|i| machine.read::<u16>((p[1] as usize + i as usize * 2) as u64))
                     .collect();
             } else {
                 let bytes = (w.text.len() * 2).min(p[2] as usize);
-                machine.write::<u32>(out as usize, w.text.len() as u32);
-                machine.write::<u32>(out as usize + 4, bytes as u32);
+                machine.write::<u32>(out as u64, w.text.len() as u32);
+                machine.write::<u32>((out as usize + 4) as u64, bytes as u32);
                 for i in 0..bytes {
-                    machine.write::<u8>(p[1] as usize + i, w.text[i / 2].to_le_bytes()[i % 2]);
+                    machine.write::<u8>((p[1] as usize + i) as u64, w.text[i / 2].to_le_bytes()[i % 2]);
                 }
             }
         }
@@ -1089,9 +1089,9 @@ pub(super) fn tree_call<A: crate::Arch>(
                     }
                 }
             }
-            machine.write::<u32>(out as usize, hits.len() as u32);
+            machine.write::<u32>(out as u64, hits.len() as u32);
             for (i, h) in hits.iter().take(p[5] as usize).enumerate() {
-                machine.write::<u32>(p[4] as usize + i * 4, *h);
+                machine.write::<u32>((p[4] as usize + i * 4) as u64, *h);
             }
         }
         _ => return 0xc000000d,
@@ -1166,11 +1166,11 @@ pub(super) fn cursor_call<A: crate::Arch>(
     args: [u32; 2],
 ) -> u32 {
     let [params, out] = args;
-    let p: [u32; 9] = core::array::from_fn(|i| machine.read::<u32>(params as usize + i * 4));
+    let p: [u32; 9] = core::array::from_fn(|i| machine.read::<u32>((params as usize + i * 4) as u64));
     if p[0] & !0x3f != 0 {
         return 0xc000000d;
     }
-    let tid = machine.read::<u32>((state.teb_base + 0x24) as usize);
+    let tid = machine.read::<u32>((state.teb_base + 0x24) as u64);
     let Some(desktop) = state
         .user_objects
         .desktops
@@ -1240,7 +1240,7 @@ pub(super) fn cursor_call<A: crate::Arch>(
         .chain([cursor.changed])
         .enumerate()
     {
-        machine.write::<u32>(out as usize + i * 4, n);
+        machine.write::<u32>((out as usize + i * 4) as u64, n);
     }
     state.mouse_x = cursor.x;
     state.mouse_y = cursor.y;

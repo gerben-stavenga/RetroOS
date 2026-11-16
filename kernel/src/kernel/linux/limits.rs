@@ -34,8 +34,8 @@ pub(super) fn prlimit<A: crate::Arch>(
         return SyscallResult::val(-EFAULT);
     }
     if args.a2 != 0 {
-        let proposed_soft = machine.read::<u64>(args.a2 as usize);
-        let proposed_hard = machine.read::<u64>(args.a2 as usize + 8);
+        let proposed_soft = machine.read::<u64>(args.a2 as u64);
+        let proposed_hard = machine.read::<u64>(args.a2 + 8);
         if proposed_soft > proposed_hard {
             return SyscallResult::val(-EINVAL);
         }
@@ -44,8 +44,8 @@ pub(super) fn prlimit<A: crate::Arch>(
         }
     }
     if args.a3 != 0 {
-        machine.write::<u64>(args.a3 as usize, soft);
-        machine.write::<u64>(args.a3 as usize + 8, hard);
+        machine.write::<u64>(args.a3 as u64, soft);
+        machine.write::<u64>(args.a3 + 8, hard);
     }
     SyscallResult::val(0)
 }
@@ -58,11 +58,11 @@ pub(super) fn getrlimit<A: crate::Arch>(machine: &mut A, args: &Args, wide: bool
         return SyscallResult::val(-EFAULT);
     }
     if wide {
-        machine.write::<u64>(args.a1 as usize, soft);
-        machine.write::<u64>(args.a1 as usize + 8, hard);
+        machine.write::<u64>(args.a1 as u64, soft);
+        machine.write::<u64>(args.a1 + 8, hard);
     } else {
-        machine.write::<u32>(args.a1 as usize, soft.min(u32::MAX as u64) as u32);
-        machine.write::<u32>(args.a1 as usize + 4, hard.min(u32::MAX as u64) as u32);
+        machine.write::<u32>(args.a1 as u64, soft.min(u32::MAX as u64) as u32);
+        machine.write::<u32>(args.a1 + 4, hard.min(u32::MAX as u64) as u32);
     }
     SyscallResult::val(0)
 }

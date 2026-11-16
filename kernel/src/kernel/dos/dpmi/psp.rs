@@ -11,7 +11,7 @@ use super::state::PspCacheEntry;
 pub(in crate::kernel::dos) fn install_dpmi_psp_view<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>) {
     let rm_psp = dos.current_psp;
     let psp_base = (rm_psp as u32) * 16;
-    let env_seg = machine.read::<u16>((psp_base + 0x2C) as usize);
+    let env_seg = machine.read::<u16>(((psp_base + 0x2C) as usize) as u64);
 
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
@@ -40,7 +40,7 @@ pub(in crate::kernel::dos) fn install_dpmi_psp_view<A: crate::Arch>(machine: &mu
             let env_base = (env_seg as u32) * 16;
             dos.ldt[idx] = make_data_desc_ex(env_base, 0xFFFF, false);
             let env_sel = idx_to_sel(idx);
-            machine.write::<u16>((psp_base + 0x2C) as usize, env_sel);
+            machine.write::<u16>(((psp_base + 0x2C) as usize) as u64, env_sel);
             dpmi.env_ldt_idx = idx;
         }
 }

@@ -61,7 +61,7 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args:
         return 0xc000000d;
     }
     let name: Vec<u16> = (0..length / 2)
-        .map(|i| machine.read::<u16>((name + i * 2) as usize))
+        .map(|i| machine.read::<u16>(((name + i * 2) as usize) as u64))
         .collect();
     let spelling = name.clone();
     let name = canonical(&name);
@@ -159,8 +159,8 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args:
         } else {
             handles.keys[slot] = Some(index);
         }
-        machine.write::<u32>(info as usize, BASE + slot as u32 * 4);
-        machine.write::<u32>(info as usize + 4, disposition);
+        machine.write::<u32>(info as u64, BASE + slot as u32 * 4);
+        machine.write::<u32>((info as usize + 4) as u64, disposition);
         return 0;
     }
     let Some(index) = index else {
@@ -251,11 +251,11 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args:
             key.values.iter().map(|v| v.2.len()).max().unwrap_or(0),
         ];
         for (i, n) in metadata.into_iter().enumerate() {
-            machine.write::<u32>(info as usize + i * 4, n as u32);
+            machine.write::<u32>((info as usize + i * 4) as u64, n as u32);
         }
-        machine.write::<u64>(info as usize + 24, key.modified);
+        machine.write::<u64>((info as usize + 24) as u64, key.modified);
         for (i, c) in label.iter().take(size as usize / 2).enumerate() {
-            machine.write::<u16>(data as usize + i * 2, *c);
+            machine.write::<u16>((data as usize + i * 2) as u64, *c);
         }
         return if size as usize >= label.len() * 2 {
             0
@@ -271,10 +271,10 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args:
             .into_iter()
             .enumerate()
         {
-            machine.write::<u32>(info as usize + i * 4, n);
+            machine.write::<u32>((info as usize + i * 4) as u64, n);
         }
         let mut bytes = Vec::with_capacity(value.0.len() * 2 + value.2.len());
-        let mode = machine.read::<u32>(info as usize + 12);
+        let mode = machine.read::<u32>((info as usize + 12) as u64);
         if mode != 1 {
             for c in &value.3 {
                 bytes.extend_from_slice(&c.to_le_bytes());
@@ -284,7 +284,7 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args:
             bytes.extend_from_slice(&value.2);
         }
         let n = (size as usize).min(bytes.len());
-        machine.copy_to(data as usize, &bytes[..n]);
+        machine.copy_to(data as u64, &bytes[..n]);
         return if n < bytes.len() { 0x80000005 } else { 0 };
     }
     let key = &mut keys[index];
@@ -298,8 +298,8 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args:
     }
     if op == 3 {
         let mut bytes = vec![0; size as usize];
-        machine.copy_from(data as usize, &mut bytes);
-        let kind = machine.read::<u32>(info as usize);
+        machine.copy_from(data as u64, &mut bytes);
+        let kind = machine.read::<u32>(info as u64);
         if key.link && (name != canonical(&"SymbolicLinkValue".encode_utf16().collect::<Vec<_>>()) || kind != 6 || size & 1 != 0) {
             return 0xc000000d;
         }
@@ -316,11 +316,11 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args:
         let Some(value) = key.values.iter().find(|v| v.0 == name) else {
             return 0xc0000034;
         };
-        machine.write::<u32>(info as usize, value.1);
-        machine.write::<u32>(info as usize + 4, value.2.len() as u32);
+        machine.write::<u32>(info as u64, value.1);
+        machine.write::<u32>((info as usize + 4) as u64, value.2.len() as u32);
         let count = (size as usize).min(value.2.len());
         if count != 0 {
-            machine.copy_to(data as usize, &value.2[..count]);
+            machine.copy_to(data as u64, &value.2[..count]);
         }
         return if count < value.2.len() { 0x80000005 } else { 0 };
     }

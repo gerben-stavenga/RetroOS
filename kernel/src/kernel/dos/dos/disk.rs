@@ -107,14 +107,14 @@ fn floppy_int13<A: crate::Arch>(machine: &mut A, regs: &mut Regs, ah: u8, dl: u8
                     let ok = match ah {
                         0x02 => match floppy::read_sector(drive, lba + i as u32, &mut sector) {
                             Ok(()) => {
-                                machine.copy_to(addr, &sector);
+                                machine.copy_to(addr as u64, &sector);
                                 true
                             }
                             Err(_) => false,
                         },
                         0x03 => {
                             for (j, byte) in sector.iter_mut().enumerate() {
-                                *byte = machine.read::<u8>(addr + j);
+                                *byte = machine.read::<u8>((addr + j) as u64);
                             }
                             floppy::write_sector(drive, lba + i as u32, &sector).is_ok()
                         }

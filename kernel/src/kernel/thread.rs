@@ -172,7 +172,7 @@ pub struct PendingRead {
 /// A pending blocked poll — re-evaluated on each event-loop tick until any
 /// monitored fd becomes ready or the timeout expires.
 pub struct PendingPoll {
-    pub fds_ptr: usize,    // user-space pointer to pollfd[]
+    pub fds_ptr: u64,    // user-space pointer to pollfd[]
     pub nfds: usize,
     pub timeout_ms: i32,   // -1 = infinite
     pub deadline_ns: Option<u64>,
@@ -260,7 +260,7 @@ pub enum KernelAction {
     },
     /// wait4: reap a zombie child (or block until one exists). Run in the
     /// executor so the child-table scan/reap happens off the parent's borrow.
-    Wait { pid: i32, status_ptr: usize, options: i32 },
+    Wait { pid: i32, status_ptr: u64, options: i32 },
     /// Deliver a Linux process signal after releasing the caller's borrow.
     Signal { pid: i32, signal: u8 },
     ThreadSignal { group: Option<i32>, target: i32, signal: u8 },

@@ -139,10 +139,10 @@ pub(super) fn call<A: crate::Arch>(
                 return SyscallResult::val(-14);
             }
             let new = (a.a1 != 0).then(|| Action {
-                handler: machine.read(a.a1 as usize),
-                flags: machine.read(a.a1 as usize + 8),
-                restorer: machine.read(a.a1 as usize + 16),
-                mask: machine.read(a.a1 as usize + 24),
+                handler: machine.read(a.a1 as u64),
+                flags: machine.read(a.a1 + 8),
+                restorer: machine.read(a.a1 + 16),
+                mask: machine.read(a.a1 + 24),
             });
             let old = state.actions[sig];
             if a.a2 != 0 {
@@ -150,7 +150,7 @@ pub(super) fn call<A: crate::Arch>(
                     .iter()
                     .enumerate()
                 {
-                    machine.write(a.a2 as usize + i * 8, *value);
+                    machine.write(a.a2 + (i * 8) as u64, *value);
                 }
             }
             if let Some(mut action) = new {
@@ -317,18 +317,18 @@ pub(super) fn deliver<A: crate::Arch>(
     let Some(image) = image else {
         return false;
     };
-    machine.zero(base, FRAME_SIZE);
-    machine.write(base, action.restorer);
-    machine.write(base + UC + 16, local.stack);
+    machine.zero(base as u64, FRAME_SIZE);
+    machine.write(base as u64, action.restorer);
+    machine.write((base + UC + 16) as u64, local.stack);
     machine.write::<u32>(
-        base + UC + 24,
+        (base + UC + 24) as u64,
         if local.size == 0 {
             2
         } else {
             u32::from(on_stack(local, regs.frame.rsp))
         },
     );
-    machine.write(base + UC + 32, local.size);
+    machine.write((base + UC + 32) as u64, local.size);
     let general = [
         regs.r8,
         regs.r9,
@@ -355,17 +355,17 @@ pub(super) fn deliver<A: crate::Arch>(
         if fault { addr } else { 0 },
     ];
     for (index, value) in general.iter().enumerate() {
-        machine.write(base + MC + index * 8, *value);
+        machine.write((base + MC + index * 8) as u64, *value);
     }
-    machine.write::<u64>(base + MC + 184, (base + FP) as u64);
-    machine.write(base + MASK, local.saved_wait_mask.unwrap_or(local.mask));
-    machine.write::<i32>(base + INFO, signal as i32);
-    machine.write::<i32>(base + INFO + 8, code);
-    machine.write::<u64>(base + INFO + 16, addr);
+    machine.write::<u64>((base + MC + 184) as u64, (base + FP) as u64);
+    machine.write((base + MASK) as u64, local.saved_wait_mask.unwrap_or(local.mask));
+    machine.write::<i32>((base + INFO) as u64, signal as i32);
+    machine.write::<i32>((base + INFO + 8) as u64, code);
+    machine.write::<u64>((base + INFO + 16) as u64, addr);
     if matches!(code, 0 | -6) && !fault {
-        machine.write::<u32>(base + INFO + 20, super::environment::identity().0);
+        machine.write::<u32>((base + INFO + 20) as u64, super::environment::identity().0);
     }
-    machine.copy_to(base + FP, &image);
+    machine.copy_to((base + FP) as u64, &image);
     state.frames.push(Frame {
         tid,
         base,
@@ -401,7 +401,7 @@ pub(super) fn deliver_child_exit<A: crate::Arch>(
     if !deliver(machine, linux, process, regs, 17, if signaled { 2 } else { 1 }, child as u64) {
         return false;
     }
-    machine.write::<i32>(regs.frame.rsp as usize + INFO + 24,
+    machine.write::<i32>(regs.frame.rsp + INFO as u64 + 24,
         if signaled { -exit_code } else { exit_code & 0xff });
     true
 }
@@ -419,12 +419,12 @@ fn restore<A: crate::Arch>(
     }
     let mut general = [0u64; 23];
     for (i, value) in general.iter_mut().enumerate() {
-        *value = machine.read(base + MC + i * 8);
+        *value = machine.read((base + MC + i * 8) as u64);
     }
     if !valid(general[16], 1) || !valid(general[15], 1) {
         return None;
     }
-    let ptr = machine.read::<u64>(base + MC + 184);
+    let ptr = machine.read::<u64>((base + MC + 184) as u64);
     let mut fx = machine.clean_fx_template();
     if ptr != 0 {
         if !valid(ptr, 512) {
@@ -433,7 +433,7 @@ fn restore<A: crate::Arch>(
         let bytes = A::fx_state_bytes_mut(&mut fx)?;
         let allowed = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
         let allowed = if allowed == 0 { 0xffbf } else { allowed };
-        machine.copy_from(ptr as usize, bytes);
+        machine.copy_from(ptr as u64, bytes);
         let mxcsr = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
         // Reserved MXCSR bits cause #GP in FXRSTOR; never pass them to arch.
         if mxcsr & !allowed != 0 {
@@ -461,7 +461,7 @@ fn restore<A: crate::Arch>(
     regs.frame.rip = general[16];
     const USER_FLAGS: u64 = 0x254dd5;
     regs.frame.rflags = (original.frame.rflags & !USER_FLAGS) | (general[17] & USER_FLAGS);
-    state.locals.entry(tid).or_default().mask = machine.read::<u64>(base + MASK) & !UNBLOCKABLE;
+    state.locals.entry(tid).or_default().mask = machine.read::<u64>((base + MASK) as u64) & !UNBLOCKABLE;
     machine.switch_fx(&mut fx);
     Some(regs.rax as i64)
 }

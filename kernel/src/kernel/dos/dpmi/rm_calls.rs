@@ -28,10 +28,10 @@ impl Transfer {
 fn transfer<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, transfer: Transfer) -> thread::KernelAction {
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
-    let rm = machine.read::<RmCallStruct>((struct_addr) as usize);
+    let rm = machine.read::<RmCallStruct>(((struct_addr) as usize) as u64);
     let rm_stack = if rm.ss == 0 { mode_transitions::rm_stack(dos, regs) }
                    else { (rm.ss, rm.sp as u32) };
-    machine.write::<RmCallStruct>(struct_addr as usize, RmCallStruct::capture(regs));
+    machine.write::<RmCallStruct>(struct_addr as u64, RmCallStruct::capture(regs));
     mode_transitions::enter_rm(dos, regs, rm_stack, Some(struct_addr));
     mode_transitions::suspend_call_vif(dos);
     rm.restore(regs);
@@ -94,7 +94,7 @@ pub(in crate::kernel::dos) fn direct_int21_iret<A: crate::Arch>(
     }
     let use32 = dos.dpmi.as_ref()?.client_use32;
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, use32);
-    let rm = machine.read::<RmCallStruct>(struct_addr as usize);
+    let rm = machine.read::<RmCallStruct>(struct_addr as u64);
     if rm.cs != dos::STUB_SEG || rm.ip != dos::slot_offset(0x21) {
         return None;
     }
@@ -130,7 +130,7 @@ pub(in crate::kernel::dos) fn direct_int21_iret<A: crate::Arch>(
         result.cs = rm.cs;
         result.sp = rm.sp;
         result.ss = rm.ss;
-        machine.write::<RmCallStruct>(struct_addr as usize, result);
+        machine.write::<RmCallStruct>(struct_addr as u64, result);
         *regs = saved;
         return Some(action);
     }
@@ -233,7 +233,7 @@ pub(in crate::kernel::dos) fn callback_entry<A: crate::Arch>(machine: &mut A, do
     let struct_addr = seg_base(&dos.ldt[..], rm_struct_sel).wrapping_add(rm_struct_off);
 
     let rm_call = RmCallStruct::capture(regs);
-    machine.write::<RmCallStruct>((struct_addr) as usize, rm_call);
+    machine.write::<RmCallStruct>(struct_addr as u64, rm_call);
 
     // RM→PM toggle: pushes HostContinuation on the pm side and records
     // the RM call-structure address in it. `resume_continuation` later

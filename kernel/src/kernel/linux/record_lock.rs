@@ -48,25 +48,25 @@ impl Request {
             return Err(-14);
         }
         let p = args.a2 as usize;
-        let kind = match machine.read::<u16>(p) {
+        let kind = match machine.read::<u16>(p as u64) {
             0 => Some(Kind::Read),
             1 => Some(Kind::Write),
             2 => None,
             _ => return Err(-EINVAL),
         };
         let (offset, size) = vfs::record_lock_origin(handle)?;
-        let origin = match machine.read::<u16>(p + 2) {
+        let origin = match machine.read::<u16>((p + 2) as u64) {
             0 => 0,
             1 => i64::from(offset),
             2 => i64::from(size),
             _ => return Err(-EINVAL),
         };
         let (start, length) = match layout {
-            Layout::Native64 => (machine.read::<i64>(p + 8), machine.read::<i64>(p + 16)),
-            Layout::Packed64 => (machine.read::<i64>(p + 4), machine.read::<i64>(p + 12)),
+            Layout::Native64 => (machine.read::<i64>((p + 8) as u64), machine.read::<i64>((p + 16) as u64)),
+            Layout::Packed64 => (machine.read::<i64>((p + 4) as u64), machine.read::<i64>((p + 12) as u64)),
             Layout::Native32 => (
-                i64::from(machine.read::<i32>(p + 4)),
-                i64::from(machine.read::<i32>(p + 8)),
+                i64::from(machine.read::<i32>((p + 4) as u64)),
+                i64::from(machine.read::<i32>((p + 8) as u64)),
             ),
         };
         let start = origin.checked_add(start).ok_or(-75)?;
@@ -138,27 +138,27 @@ impl Request {
                         {
                             return Some(-75);
                         }
-                        machine.write::<u16>(p, if lock.kind == Kind::Read { 0 } else { 1 });
-                        machine.write::<u16>(p + 2, 0);
+                        machine.write::<u16>(p as u64, if lock.kind == Kind::Read { 0 } else { 1 });
+                        machine.write::<u16>((p + 2) as u64, 0);
                         match self.layout {
                             Layout::Native64 => {
-                                machine.write::<i64>(p + 8, lock.start as i64);
-                                machine.write::<i64>(p + 16, length);
-                                machine.write::<i32>(p + 24, lock.owner);
+                                machine.write::<i64>((p + 8) as u64, lock.start as i64);
+                                machine.write::<i64>((p + 16) as u64, length);
+                                machine.write::<i32>((p + 24) as u64, lock.owner);
                             }
                             Layout::Packed64 => {
-                                machine.write::<i64>(p + 4, lock.start as i64);
-                                machine.write::<i64>(p + 12, length);
-                                machine.write::<i32>(p + 20, lock.owner);
+                                machine.write::<i64>((p + 4) as u64, lock.start as i64);
+                                machine.write::<i64>((p + 12) as u64, length);
+                                machine.write::<i32>((p + 20) as u64, lock.owner);
                             }
                             Layout::Native32 => {
-                                machine.write::<i32>(p + 4, lock.start as i32);
-                                machine.write::<i32>(p + 8, length as i32);
-                                machine.write::<i32>(p + 12, lock.owner);
+                                machine.write::<i32>((p + 4) as u64, lock.start as i32);
+                                machine.write::<i32>((p + 8) as u64, length as i32);
+                                machine.write::<i32>((p + 12) as u64, lock.owner);
                             }
                         }
                     } else {
-                        machine.write::<u16>(self.pointer, 2);
+                        machine.write::<u16>(self.pointer as u64, 2);
                     }
                 }
                 Some(0)

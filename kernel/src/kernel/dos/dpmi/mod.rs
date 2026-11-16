@@ -316,7 +316,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 if let Some(dpmi) = dos.dpmi.as_ref()
                     && !dpmi.client_use32 && dpmi.env_ldt_idx != 0 && (base & 0xF) == 0 {
                         let psp_base = desc_base(dos.ldt[PSP_LDT_IDX]);
-                        let env_sel = machine.read::<u16>((psp_base + 0x2C) as usize);
+                        let env_sel = machine.read::<u16>((psp_base + 0x2C) as u64);
                         if env_sel != 0 && ((env_sel as u32) << 4) == base {
                             let env_idx = sel_to_idx(env_sel);
                             if env_idx < LDT_ENTRIES && ldt_is_allocated(&dos.ldt_alloc, env_idx) {
@@ -396,7 +396,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
                 let desc = dos.ldt[idx];
-                machine.write::<u64>((dest) as usize, desc);
+                machine.write::<u64>(dest as u64, desc);
                 dos_trace!("[DPMI] 000B sel={:04X} -> base={:08X} raw={:016X}", sel,
                     desc_base(desc), desc);
                 regs.clear_flag32(1);
@@ -410,7 +410,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             let sel = regs.rbx as u16;
             if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let src = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
-                let mut new_desc = machine.read::<u64>((src) as usize);
+                let mut new_desc = machine.read::<u64>(src as u64);
                 // Match CWSDPMI: force the descriptor to stay non-system.
                 new_desc |= 1u64 << 44;
                 // ...and force the DPL to the client's — see `client_dpl`.
@@ -739,9 +739,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             // Buffer layout (DPMI 1.0 §3.4): [0]=major (decimal), [1]=minor,
             // [2..]=ASCIIZ vendor identifier (≤126 bytes).
             const VENDOR: &[u8] = b"RetroOS DPMI Host\0";
-            machine.write::<u8>(dest as usize, 1);        // host major = 1
-            machine.write::<u8>(dest as usize + 1, 0);    // host minor = 0
-            machine.copy_to(dest as usize + 2, VENDOR);
+            machine.write::<u8>(dest as u64, 1);        // host major = 1
+            machine.write::<u8>((dest as usize + 1) as u64, 0);    // host minor = 0
+            machine.copy_to((dest as usize + 2) as u64, VENDOR);
             regs.clear_flag32(1);
         }
         // AX=0500h — Get Free Memory Information
@@ -749,7 +749,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         0x0500 => {
             let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
             for (i, value) in memory::info(machine, &dos.memory, dpmi).into_iter().enumerate() {
-                machine.write::<u32>(dest as usize + i * 4, value);
+                machine.write::<u32>((dest as usize + i * 4) as u64, value);
             }
             regs.clear_flag32(1);
         }

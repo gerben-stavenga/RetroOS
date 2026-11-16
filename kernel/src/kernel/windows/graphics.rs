@@ -6,20 +6,20 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, ar
     let [op, params, out] = args;
     if op == 0 {
         for (i, n) in [screen_size().0 as u32, screen_size().1 as u32, 32].into_iter().enumerate() {
-            machine.write::<u32>(out as usize + i * 4, n);
+            machine.write::<u32>((out as usize + i * 4) as u64, n);
         }
         return 0;
     }
     if !(1..=3).contains(&op) { return 0xc000000d; }
-    let p: [u32; 13] = core::array::from_fn(|i| machine.read::<u32>(params as usize + i * 4));
-    let tid = machine.read::<u32>((state.teb_base + 0x24) as usize);
+    let p: [u32; 13] = core::array::from_fn(|i| machine.read::<u32>((params as usize + i * 4) as u64));
+    let tid = machine.read::<u32>(((state.teb_base + 0x24) as usize) as u64);
     let Some((hwnd, _, pid)) = user_objects::window_owner(state, tid, p[0]) else {
         return 0xc0010578;
     };
-    if pid != machine.read::<u32>((state.teb_base + 0x20) as usize) { return 0xc0000022; }
+    if pid != machine.read::<u32>(((state.teb_base + 0x20) as usize) as u64) { return 0xc0000022; }
     let mut p = p;
     p[0] = hwnd;
-    let status = transport(state, op, p, |address, bytes| machine.copy_from(address, bytes));
+    let status = transport(state, op, p, |address, bytes| machine.copy_from(address as u64, bytes));
     if status == 0 { user_objects::order_surfaces(state, tid); }
     status
 }

@@ -103,12 +103,12 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(
             let ss_32 = seg_is_32(&dos.ldt[..], regs.stack_seg());
             let sp = if ss_32 { regs.sp32() } else { regs.sp32() & 0xFFFF };
             let (ret_eip, ret_cs, frame_size) = if use32 {
-                let eip = machine.read::<u32>((ss_base.wrapping_add(sp)) as usize);
-                let cs = machine.read::<u32>((ss_base.wrapping_add(sp + 4)) as usize);
+                let eip = machine.read::<u32>((ss_base.wrapping_add(sp)) as u64);
+                let cs = machine.read::<u32>((ss_base.wrapping_add(sp + 4)) as u64);
                 (eip, cs, 8u32)
             } else {
-                let ip = machine.read::<u16>((ss_base.wrapping_add(sp)) as usize) as u32;
-                let cs = machine.read::<u16>((ss_base.wrapping_add(sp + 2)) as usize) as u32;
+                let ip = machine.read::<u16>((ss_base.wrapping_add(sp)) as u64) as u32;
+                let cs = machine.read::<u16>((ss_base.wrapping_add(sp + 2)) as u64) as u32;
                 (ip, cs, 4u32)
             };
             let new_sp = sp.wrapping_add(frame_size);

@@ -106,7 +106,7 @@ pub(super) fn call<A: crate::Arch>(
             }
         }
         state.sections.handles[slot] = Some(Arc::new(Section { data, image, identity:vfs::file_ino_by_handle(file) }));
-        machine.write::<u32>(out as usize, 0x76000000 | (slot as u32 * 4));
+        machine.write::<u32>(out as u64, 0x76000000 | (slot as u32 * 4));
         return 0;
     }
     if op == 3 {
@@ -153,7 +153,7 @@ pub(super) fn call<A: crate::Arch>(
             long(opt + 64),
         ];
         for (i, value) in info.into_iter().enumerate() {
-            machine.write::<u32>(out as usize + i * 4, value);
+            machine.write::<u32>((out as usize + i * 4) as u64, value);
         }
         return 0;
     }
@@ -168,7 +168,7 @@ pub(super) fn call<A: crate::Arch>(
         if size != 0 && size < length {
             return 0xc000001f;
         }
-        let requested = machine.read::<u32>(out as usize);
+        let requested = machine.read::<u32>(out as u64);
         let mut base = memory::call(
             machine,
             state,
@@ -192,12 +192,12 @@ pub(super) fn call<A: crate::Arch>(
             return 0xc0000017;
         }
         machine.copy_to(
-            base as usize,
+            base as u64,
             &section.data[..image.header.size_headers as usize],
         );
         for part in image.sections().unwrap() {
             machine.copy_to(
-                (base + part.rva) as usize,
+                (base + part.rva) as u64,
                 &section.data[part.raw_offset as usize..(part.raw_offset + part.raw_size) as usize],
             );
         }
@@ -220,8 +220,8 @@ pub(super) fn call<A: crate::Arch>(
         }
         memory::mark_image(state, base);
         state.sections.views.push((base,length,section.clone()));
-        machine.write::<u32>(out as usize, base);
-        machine.write::<u32>(out as usize + 4, length);
+        machine.write::<u32>(out as u64, base);
+        machine.write::<u32>((out as usize + 4) as u64, length);
         return if base == image.header.image_base {
             0
         } else {
@@ -248,7 +248,7 @@ pub(super) fn call<A: crate::Arch>(
         };
         n
     };
-    let requested = machine.read::<u32>(out as usize);
+    let requested = machine.read::<u32>(out as u64);
     let base = memory::call(machine, state, Api::MemoryReserve, requested, length, 0);
     if base == 0 {
         return 0xc0000018;
@@ -259,13 +259,13 @@ pub(super) fn call<A: crate::Arch>(
     }
     let count = (length as usize).min(data.len() - offset as usize);
     machine.copy_to(
-        base as usize,
+        base as u64,
         &data[offset as usize..offset as usize + count],
     );
     let _ = super::change_protection(machine, state, base, length, if flags == 8 { 4 } else { 2 });
     memory::mark_mapped(state, base);
     state.sections.views.push((base,length,section.clone()));
-    machine.write::<u32>(out as usize, base);
-    machine.write::<u32>(out as usize + 4, length);
+    machine.write::<u32>(out as u64, base);
+    machine.write::<u32>((out as usize + 4) as u64, length);
     0
 }

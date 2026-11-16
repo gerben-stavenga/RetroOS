@@ -90,16 +90,9 @@ unsafe fn rep_stosb(dst: *mut u8, val: u8, len: usize) {
 }
 
 
-/// The metal guest-memory primitive. On the ring-1 kernel a guest-linear address
-/// *is* a host pointer (shared page tables), so these dereference it directly.
-/// Every access is **volatile** (guest/BIOS/devices may observe and mutate the
-/// bytes) and **bytewise** (so any address/alignment is fine — a DOS guest puts
-/// live structures at address 0 and at unaligned paragraph addresses). No method
-/// hands out a reference into guest memory: bytes are copied to/from a
-/// caller-owned buffer, so kernel/dos code never asserts Rust's non-null /
-/// alignment / aliasing invariants against guest RAM, and holds no `unsafe`.
-/// `self` (the page-table root) is not consulted — the access reaches the active
-/// mapping (single-core; one space is live at a time).
+/// Guest byte access over this core's active address space. Low addresses use
+/// direct volatile transfers; high addresses use the physical mapping window.
+/// No reference into guest memory escapes either path.
 impl GuestBytes for crate::backend::Metal {
     fn high_copy(&mut self, address: u64, buffer: &mut [u8], to_user: bool, pages: arch_abi::page_supply::PageInput) -> (bool, arch_abi::page_supply::PageInput) {
         crate::memory::with_input(pages, || {
@@ -108,50 +101,84 @@ impl GuestBytes for crate::backend::Metal {
             }) == 0
         })
     }
-    fn read<T: Copy>(&self, addr: usize) -> T {
-        let mut v = core::mem::MaybeUninit::<T>::uninit();
-        let dst = v.as_mut_ptr() as *mut u8;
-        let src = addr as *const u8;
-        for i in 0..core::mem::size_of::<T>() {
-            unsafe { dst.add(i).write(src.add(i).read_volatile()); }
+    fn read<T: Copy>(&self, addr: u64) -> T {
+        let mut value = core::mem::MaybeUninit::<T>::uninit();
+        transfer(addr, value.as_mut_ptr().cast(), core::mem::size_of::<T>(), false);
+        unsafe { value.assume_init() }
+    }
+    fn write<T: Copy>(&mut self, addr: u64, val: T) {
+        transfer(addr, (&val as *const T).cast_mut().cast(), core::mem::size_of::<T>(), true);
+    }
+    fn copy_from(&self, addr: u64, dst: &mut [u8]) {
+        transfer(addr, dst.as_mut_ptr(), dst.len(), false);
+    }
+    fn copy_to(&mut self, addr: u64, src: &[u8]) {
+        transfer(addr, src.as_ptr().cast_mut(), src.len(), true);
+    }
+    fn copy_cstr(&self, addr: u64, dst: &mut [u8]) -> usize {
+        for (index, byte) in dst.iter_mut().enumerate() {
+            let value = self.read::<u8>(addr.checked_add(index as u64).expect("guest address overflow"));
+            if value == 0 { return index; }
+            *byte = value;
         }
-        unsafe { v.assume_init() }
+        dst.len()
     }
-    fn write<T: Copy>(&mut self, addr: usize, val: T) {
-        let src = &val as *const T as *const u8;
-        let dst = addr as *mut u8;
-        for i in 0..core::mem::size_of::<T>() {
-            unsafe { dst.add(i).write_volatile(src.add(i).read()); }
+    fn zero(&mut self, mut addr: u64, mut len: usize) {
+        if addr.checked_add(len as u64).is_some_and(|end| end <= 0xc0000000) {
+            unsafe { rep_stosb(addr as usize as *mut u8, 0, len); }
+            return;
+        }
+        let zeros = [0; 4096];
+        while len != 0 {
+            let n = len.min(zeros.len());
+            self.copy_to(addr, &zeros[..n]);
+            addr = addr.checked_add(n as u64).expect("guest address overflow");
+            len -= n;
         }
     }
-    fn copy_from(&self, addr: usize, dst: &mut [u8]) {
-        unsafe { rep_movsb(dst.as_mut_ptr(), addr as *const u8, dst.len()) };
-    }
-    fn copy_to(&mut self, addr: usize, src: &[u8]) {
-        unsafe { rep_movsb(addr as *mut u8, src.as_ptr(), src.len()) };
-    }
-    fn copy_cstr(&self, addr: usize, dst: &mut [u8]) -> usize {
-        let src = addr as *const u8;
-        let mut n = 0;
-        while n < dst.len() {
-            let b = unsafe { src.add(n).read_volatile() };
-            if b == 0 { break; }
-            dst[n] = b;
-            n += 1;
+    fn copy_within(&mut self, src: u64, dst: u64, len: usize) {
+        if src.checked_add(len as u64).is_some_and(|end| end <= 0xc0000000)
+            && dst.checked_add(len as u64).is_some_and(|end| end <= 0xc0000000) {
+            if len == 0 { return; }
+            unsafe {
+                if dst > src && dst < src + len as u64 {
+                    rep_movsb_back((dst + len as u64 - 1) as usize as *mut u8, (src + len as u64 - 1) as usize as *const u8, len);
+                } else { rep_movsb(dst as usize as *mut u8, src as usize as *const u8, len); }
+            }
+            return;
         }
-        n
-    }
-    fn zero(&mut self, addr: usize, len: usize) {
-        unsafe { rep_stosb(addr as *mut u8, 0, len) };
-    }
-    fn copy_within(&mut self, src: usize, dst: usize, len: usize) {
-        // Overlap-safe: copy back-to-front when the destination is above the
-        // source, front-to-back otherwise.
-        if dst > src && dst < src + len {
-            unsafe { rep_movsb_back((dst + len - 1) as *mut u8, (src + len - 1) as *const u8, len) };
-        } else {
-            unsafe { rep_movsb(dst as *mut u8, src as *const u8, len) };
+        let mut buffer = [0; 4096];
+        let mut left = len;
+        while left != 0 {
+            let n = left.min(buffer.len());
+            let offset = (if dst > src { left - n } else { len - left }) as u64;
+            self.copy_from(src.checked_add(offset).expect("guest address overflow"), &mut buffer[..n]);
+            self.copy_to(dst.checked_add(offset).expect("guest address overflow"), &buffer[..n]);
+            left -= n;
         }
     }
 }
 
+/// Direct low access and windowed high access share one full-width address API.
+fn transfer(mut address: u64, mut buffer: *mut u8, mut len: usize, to_user: bool) {
+    let end = address.checked_add(len as u64).expect("guest address overflow");
+    if end <= 0xc0000000 {
+        unsafe {
+            if to_user { rep_movsb(address as usize as *mut u8, buffer, len); }
+            else { rep_movsb(buffer, address as usize as *const u8, len); }
+        }
+        return;
+    }
+    assert!(address >= crate::high_paging::START && end <= crate::high_paging::END, "invalid guest address");
+    while len != 0 {
+        let n = len.min(4096 - (address as usize & 4095));
+        // Like direct low accesses, demand/COW faults consume the donated reserve.
+        let _fault = crate::memory::FaultGuard::enter();
+        assert_eq!(crate::high_paging::invoke(crate::high_paging::Request {
+            address, length: n as u64, to_user, buffer: buffer as usize, result: 0,
+        }), 0, "invalid guest access");
+        address += n as u64;
+        buffer = unsafe { buffer.add(n) };
+        len -= n;
+    }
+}

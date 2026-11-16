@@ -29,10 +29,10 @@ pub(super) fn int_2eh<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelTh
     // DS:SI = pointer to command-line length byte + text (same as PSP:80h format)
     // Treat as COMMAND.COM /C — fork-exec the program in a fresh address space.
     let addr = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32);
-    let len = machine.read::<u8>((addr) as usize) as usize;
+    let len = machine.read::<u8>(((addr) as usize) as u64) as usize;
     let mut cmd = [0u8; 128];
     let copy = len.min(127);
-    machine.copy_from((addr + 1) as usize, &mut cmd[..copy]);
+    machine.copy_from(((addr + 1) as usize) as u64, &mut cmd[..copy]);
     let mut start = 0;
     while start < copy && cmd[start] == b' ' { start += 1; }
     let mut end = start;
@@ -188,16 +188,16 @@ pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::Ker
 
     // Read parameter block at ES:BX
     let pb = seg_offset(dos, regs, regs.es as u16, regs.rbx as u32);
-    let cmdtail_off = machine.read::<u16>((pb + 2) as usize) as u32;
-    let cmdtail_seg = machine.read::<u16>((pb + 4) as usize);
+    let cmdtail_off = machine.read::<u16>((pb + 2) as u64) as u32;
+    let cmdtail_seg = machine.read::<u16>((pb + 4) as u64);
     // The embedded (segment, offset) far pointer is a PM selector:offset
     // when the caller is in PM, an RM paragraph:offset in VM86 — same
     // discriminator seg_offset() uses for buffer addresses elsewhere.
     let cmdtail_addr = seg_offset(dos, regs, cmdtail_seg, cmdtail_off);
-    let tail_len = machine.read::<u8>((cmdtail_addr) as usize) as usize;
+    let tail_len = machine.read::<u8>(cmdtail_addr as u64) as usize;
     let mut tail = [0u8; 128];
     let copy_len = tail_len.min(127);
-    machine.copy_from((cmdtail_addr + 1) as usize, &mut tail[..copy_len]);
+    machine.copy_from((cmdtail_addr + 1) as u64, &mut tail[..copy_len]);
 
     let prog_name: &[u8] = &filename[..flen];
 
@@ -397,8 +397,8 @@ fn exec_load_overlay<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThr
 
     // Parameter block at ES:BX — two WORDs.
     let pb = seg_offset(dos, regs, regs.es as u16, regs.rbx as u32);
-    let load_seg = machine.read::<u16>((pb) as usize);
-    let reloc_factor = machine.read::<u16>((pb + 2) as usize);
+    let load_seg = machine.read::<u16>(pb as u64);
+    let reloc_factor = machine.read::<u16>((pb + 2) as u64);
 
     let fd = dos_open_program(kt, dos, prog_name);
     if fd < 0 {
@@ -447,19 +447,19 @@ fn exec_load_overlay<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThr
         }
 
         let img = &data[header_size as usize..header_size as usize + load_size];
-        machine.copy_to(load_base as usize, img);
+        machine.copy_to(load_base as u64, img);
         // Apply relocations using caller's reloc_factor (not load_seg).
         for i in 0..reloc_count {
             let entry = reloc_offset + i * 4;
             let off = w(entry) as u32;
             let seg = w(entry + 2) as u32;
             let a = (load_base + (seg << 4) + off) as usize;
-            let v: u16 = machine.read(a);
-            machine.write::<u16>(a, v.wrapping_add(reloc_factor));
+            let v: u16 = machine.read(a as u64);
+            machine.write::<u16>(a as u64, v.wrapping_add(reloc_factor));
         }
     } else {
         // Raw / .COM: copy file verbatim at load_seg:0.
-        machine.copy_to(load_base as usize, &buf);
+        machine.copy_to(load_base as u64, &buf);
     }
 
     regs.clear_flag32(1);
@@ -674,7 +674,7 @@ fn populate_program<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &mut 
     if dos.cpu_pacer.limited() {
         crate::compact_println!("DOS CPU limit: {}%", dos.cpu_pacer.percent());
     }
-    machine.copy_to(((env_seg as u32) << 4) as usize, &env);
+    machine.copy_to(((env_seg as u32) << 4) as u64, &env);
     // Latch this program's BLASTER A/I/D/H into the SB-DMA layer so the
     // virtual 8237 traps the right channel and the IRQ relay uses the
     // right vector. Missing BLASTER leaves the SB16 defaults.
@@ -702,7 +702,7 @@ pub(in crate::kernel::dos) fn load_com<A: crate::Arch>(machine: &mut A, regs: &m
 
     // Load .COM code at psp_seg:0x100 (= (psp_seg+0x10):0).
     let load_addr = ((psp_seg as u32) << 4) + COM_OFFSET as u32;
-    machine.copy_to(load_addr as usize, data);
+    machine.copy_to(load_addr as u64, data);
 
     Loaded {
         env_seg, psp_seg,
@@ -779,13 +779,13 @@ pub(in crate::kernel::dos) fn load_exe<A: crate::Arch>(machine: &mut A, regs: &m
 
     let load_base = (load_segment as u32) << 4;
     let load_data = &data[header_size as usize..header_size as usize + load_size];
-    machine.copy_to(load_base as usize, load_data);
+    machine.copy_to(load_base as u64, load_data);
 
     // Zero the allocation tail so re-exec cannot expose stale data past the image.
     let bss_start = load_base + load_size as u32;
     let bss_end = (end_seg as u32) << 4;
     if bss_end > bss_start {
-        machine.zero(bss_start as usize, (bss_end - bss_start) as usize);
+        machine.zero(bss_start as u64, (bss_end - bss_start) as usize);
     }
 
     // Apply relocations: each entry is (offset, segment) within the load
@@ -797,8 +797,8 @@ pub(in crate::kernel::dos) fn load_exe<A: crate::Arch>(machine: &mut A, regs: &m
         let off = w(entry) as u32;
         let seg = w(entry + 2) as u32;
         let addr = (load_base + (seg << 4) + off) as usize;
-        let val: u16 = machine.read(addr);
-        machine.write::<u16>(addr, val.wrapping_add(load_segment));
+        let val: u16 = machine.read(addr as u64);
+        machine.write::<u16>(addr as u64, val.wrapping_add(load_segment));
     }
 
     Some(Loaded {
@@ -821,13 +821,13 @@ pub(super) fn return_to_psp_parent<A: crate::Arch>(
 ) -> bool {
     if regs.mode() != crate::UserMode::VM86 { return false; }
     let child_seg = dos.current_psp;
-    let child = machine.read::<Psp>(Psp::base(child_seg));
+    let child = machine.read::<Psp>((Psp::base(child_seg)) as u64);
     if child.int_20 != [0xCD, 0x20] || child.parent_psp == child_seg
         || child._terminate_addr == 0
     {
         return false;
     }
-    let parent = machine.read::<Psp>(Psp::base(child.parent_psp));
+    let parent = machine.read::<Psp>((Psp::base(child.parent_psp)) as u64);
     let saved = parent._ss_sp;
     if parent.int_20 != [0xCD, 0x20] || saved == 0 { return false; }
     if resident_paras.is_none() { dos.ipx.release(machine, child_seg); }
@@ -837,7 +837,7 @@ pub(super) fn return_to_psp_parent<A: crate::Arch>(
     for (vector, target) in [(0x22usize, child._terminate_addr),
                              (0x23, child._ctrl_break_addr),
                              (0x24, child._critical_err)] {
-        machine.write::<u32>(vector * 4, target);
+        machine.write::<u32>((vector * 4) as u64, target);
     }
     let ss = (saved >> 16) as u16;
     let sp = saved as u16;

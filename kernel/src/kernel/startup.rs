@@ -2270,7 +2270,7 @@ fn dump_fault_stack<A: crate::Arch>(machine: &A, regs: &Regs) {
         if at < rsp || at >= 0xbff0_0000 {
             break;
         }
-        *word = machine.read::<u32>(at as usize);
+        *word = machine.read::<u32>(at as u64);
     }
     crate::compact_println!(
         "  stack {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
@@ -2278,9 +2278,9 @@ fn dump_fault_stack<A: crate::Arch>(machine: &A, regs: &Regs) {
     );
     let ebx = regs.rbx as u32;
     if (0x1000..0xc000_0000).contains(&ebx) {
-        let p34 = machine.read::<u32>(ebx as usize + 0x34);
-        let p40 = machine.read::<u32>(ebx as usize + 0x40);
-        let p1c = machine.read::<u32>(ebx as usize + 0x1c);
+        let p34 = machine.read::<u32>((ebx as usize + 0x34) as u64);
+        let p40 = machine.read::<u32>((ebx as usize + 0x40) as u64);
+        let p1c = machine.read::<u32>((ebx as usize + 0x1c) as u64);
         crate::compact_println!(
             "  obj {:#x} +1c={:#x} +34={:#x} +40={:#x}",
             ebx, p1c, p34, p40
@@ -2291,8 +2291,8 @@ fn dump_fault_stack<A: crate::Arch>(machine: &A, regs: &Regs) {
         if !(0xbf00_0000..0xbff0_0000).contains(&ebp) || !ebp.is_multiple_of(4) {
             break;
         }
-        let prev = machine.read::<u32>(ebp as usize);
-        let ret = machine.read::<u32>((ebp as usize).wrapping_add(4));
+        let prev = machine.read::<u32>(ebp as u64);
+        let ret = machine.read::<u32>(((ebp as usize).wrapping_add(4)) as u64);
         crate::compact_println!("  frame ebp={:#x} ret={:#x}", ebp, ret);
         if prev <= ebp || prev.wrapping_sub(ebp) > 0x1_0000 || prev >= 0xbff0_0000 {
             break;
@@ -3152,7 +3152,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
         // Guest reads via arch::mem() (identity on metal, mmap offset on the
         // interpreter) — raw `lin as *const u8` would fault on the interp.
         let mut b = [0u8; 8];
-        machine.copy_from(lin as usize, &mut b);
+        machine.copy_from(lin as u64, &mut b);
         let ticks = crate::kernel::dos::Bda::tick_count(machine);
         crate::compact_dbg_println!(
             "[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} VIF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
@@ -3340,8 +3340,8 @@ fn dump_virtual_hw<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>) {
         };
         let (pm_sel, pm_off) = dos.pm_vectors[vector as usize];
         let ivt = usize::from(vector) * 4;
-        let rm_off = machine.read::<u16>(ivt);
-        let rm_seg = machine.read::<u16>(ivt + 2);
+        let rm_off = machine.read::<u16>(ivt as u64);
+        let rm_seg = machine.read::<u16>((ivt + 2) as u64);
         crate::compact_dbg_println!(
             "[GUSIRQ] irq={} vector={:02X} pm={:04X}:{:08X} rm={:04X}:{:04X}",
             audio.gus.irq, vector, pm_sel, pm_off, rm_seg, rm_off
@@ -3351,8 +3351,8 @@ fn dump_virtual_hw<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>) {
         for vec in (0x08usize..0x10).chain(0x70..0x78) {
             let (sel, off) = dos.pm_vectors[vec];
             let ivt = vec * 4;
-            let rm_off = machine.read::<u16>(ivt);
-            let rm_seg = machine.read::<u16>(ivt + 2);
+            let rm_off = machine.read::<u16>(ivt as u64);
+            let rm_seg = machine.read::<u16>((ivt + 2) as u64);
             crate::compact_dbg_println!(
                 "[IRQVEC] {:02X} pm={:04X}:{:08X} rm={:04X}:{:04X}",
                 vec, sel, off, rm_seg, rm_off

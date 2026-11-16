@@ -51,12 +51,12 @@ pub(super) fn install_rom_font<A: crate::Arch>(machine: &mut A) {
     // The substitute BIOS publishes its own font image at the IBM ROM address.
     // Patch owned RAM, then expose the completed image read-only.
     crate::kernel::memory::private_copy(machine, ROM_FONT_8X8 / 4096, 1);
-    machine.copy_to(ROM_FONT_8X8, &lib::vga_fonts::FONT_8X8[..1024]);
+    machine.copy_to(ROM_FONT_8X8 as u64, &lib::vga_fonts::FONT_8X8[..1024]);
     crate::kernel::memory::protect(machine, ROM_FONT_8X8 / 4096, 1, false, true);
     let fonts = lib::codepage::current_codepage().fonts();
-    machine.copy_to(font8 as usize, fonts.h8);
-    machine.copy_to(font14 as usize, fonts.h14);
-    machine.copy_to(font16 as usize, &fonts.h16);
+    machine.copy_to(font8 as u64, fonts.h8);
+    machine.copy_to(font14 as u64, fonts.h14);
+    machine.copy_to(font16 as u64, &fonts.h16);
     set_data_vector(machine, 0x1F, font8 + 128 * 8);
     publish_active_font(machine, 16); // POST starts in 80x25, 8x16 mode 3.
 }
@@ -78,7 +78,7 @@ pub(super) fn seed_video_static_info<A: crate::Arch>(machine: &mut A) {
     t[10] = 0xFF;
     // Misc support #2: save/restore state, blink/intensity control, DCC.
     t[11] = 0x0E;
-    machine.copy_to(dos::video_static_info_addr() as usize, &t);
+    machine.copy_to((dos::video_static_info_addr() as usize) as u64, &t);
 }
 
 // ============================================================================
@@ -203,7 +203,7 @@ fn font_service<A: crate::Arch>(
             if glyph_h == 0 || glyph_h > 32 || first + count > 256 { return; }
             owned.resize(count * glyph_h, 0);
             let src = seg_offset(dos, regs, regs.es as u16, regs.rbp as u16 as u32) as usize;
-            machine.copy_from(src, &mut owned);
+            machine.copy_from(src as u64, &mut owned);
             (first, glyph_h, &owned)
         }
         0x01 | 0x11 => (0, 14, fonts.h14),
@@ -285,9 +285,9 @@ pub(in crate::kernel::dos) fn install_codepage_font<A: crate::Arch>(
         true
     };
     if installed {
-        machine.copy_to(dos::font_8x8_addr() as usize, fonts.h8);
-        machine.copy_to(dos::font_8x14_addr() as usize, fonts.h14);
-        machine.copy_to(dos::font_8x16_addr() as usize, &fonts.h16);
+        machine.copy_to(dos::font_8x8_addr() as u64, fonts.h8);
+        machine.copy_to(dos::font_8x14_addr() as u64, fonts.h14);
+        machine.copy_to(dos::font_8x16_addr() as u64, &fonts.h16);
     }
     installed
 }
@@ -316,7 +316,7 @@ pub(in crate::kernel::dos) fn install_codepage_font<A: crate::Arch>(
 pub(in crate::kernel::dos) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, ch: u8, fg: u8) {
     let page: u8 = bda_field!(machine, active_page);
     let pos_off = core::mem::offset_of!(Bda, cursor_pos) + (page & 7) as usize * 2;
-    let pos: u16 = machine.read(Bda::BASE + pos_off);
+    let pos: u16 = machine.read((Bda::BASE + pos_off) as u64);
     let (mut row, mut col) = ((pos >> 8) as u32, (pos & 0xFF) as u32);
     let cols: u16 = bda_field!(machine, columns);
     let mode = Bda::video_mode(machine);
@@ -343,7 +343,7 @@ pub(in crate::kernel::dos) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mu
         scroll_text_page(machine, dos, page, cols, max_row);
         row = max_row as u32;
     }
-    machine.write::<u16>(Bda::BASE + pos_off, ((row << 8) | col) as u16);
+    machine.write::<u16>((Bda::BASE + pos_off) as u64, ((row << 8) | col) as u16);
     sync_cursor_position(machine, dos);
 }
 
@@ -418,7 +418,7 @@ fn sync_cursor_shape<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>) {
 /// A page's cursor position from the BDA, as (row, column).
 fn cursor_of<A: crate::Arch>(machine: &mut A, page: u8) -> (u32, u32) {
     let pos_off = core::mem::offset_of!(Bda, cursor_pos) + (page as usize & 7) * 2;
-    let pos: u16 = machine.read(Bda::BASE + pos_off);
+    let pos: u16 = machine.read((Bda::BASE + pos_off) as u64);
     ((pos >> 8) as u32, (pos & 0xFF) as u32)
 }
 
@@ -587,14 +587,14 @@ pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
             // Set cursor position: BH=page, DH=row, DL=col.
             let page = ((regs.rbx >> 8) & 0x7) as usize;
             let pos_off = core::mem::offset_of!(Bda, cursor_pos) + page * 2;
-            machine.write::<u16>(Bda::BASE + pos_off, regs.rdx as u16);
+            machine.write::<u16>((Bda::BASE + pos_off) as u64, regs.rdx as u16);
             let active: u8 = bda_field!(machine, active_page);
             if page == usize::from(active) { sync_cursor_position(machine, dos); }
         }
         0x03 => {
             let page = ((regs.rbx >> 8) & 0x7) as usize;
             let pos_off = core::mem::offset_of!(Bda, cursor_pos) + page * 2;
-            let pos: u16 = machine.read(Bda::BASE + pos_off);
+            let pos: u16 = machine.read((Bda::BASE + pos_off) as u64);
             let shape: u16 = bda_field!(machine, cursor_shape);
             regs.rdx = (regs.rdx & !0xFFFF) | pos as u64;
             regs.rcx = (regs.rcx & !0xFFFF) | shape as u64;
@@ -699,13 +699,13 @@ pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
                     0x02 => {
                         let tbl = seg_offset(dos, regs, regs.es as u16, regs.rdx as u16 as u32) as usize;
                         let mut data = alloc::vec![0; 17];
-                        machine.copy_from(tbl, &mut data);
+                        machine.copy_from(tbl as u64, &mut data);
                         (data, true, None)
                     }
                     0x12 => {
                         let tbl = seg_offset(dos, regs, regs.es as u16, regs.rdx as u16 as u32) as usize;
                         let mut data = alloc::vec![0; regs.rcx as u16 as usize * 3];
-                        machine.copy_from(tbl, &mut data);
+                        machine.copy_from(tbl as u64, &mut data);
                         (data, true, None)
                     }
                     0x17 => {
@@ -731,7 +731,7 @@ pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
                 if called
                     && let Some(dst) = guest_dst
                 {
-                    machine.copy_to(dst, &buffer);
+                    machine.copy_to(dst as u64, &buffer);
                 }
                 return;
             }
@@ -763,11 +763,11 @@ pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
                     let tbl = seg_offset(dos, regs, regs.es as u16, regs.rdx as u16 as u32) as usize;
                     let _ = emulate_inb(machine, &mut dos.pc, 0x3DA);
                     for i in 0..16u8 {
-                        let b: u8 = machine.read(tbl + i as usize);
+                        let b: u8 = machine.read((tbl + i as usize) as u64);
                         emulate_outb(machine, &mut dos.pc, regs, 0x3C0, i);
                         emulate_outb(machine, &mut dos.pc, regs, 0x3C0, b);
                     }
-                    let ov: u8 = machine.read(tbl + 16);
+                    let ov: u8 = machine.read((tbl + 16) as u64);
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C0, 0x11);
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C0, ov);
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C0, 0x20);
@@ -802,7 +802,7 @@ pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
                     let bx = regs.rbx as u8;
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C8, bx);
                     for i in 0..n {
-                        let b: u8 = machine.read(tbl + i);
+                        let b: u8 = machine.read((tbl + i) as u64);
                         emulate_outb(machine, &mut dos.pc, regs, 0x3C9, b);
                     }
                 }
@@ -826,7 +826,7 @@ pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C7, bx);
                     for i in 0..n {
                         let v = emulate_inb(machine, &mut dos.pc, 0x3C9);
-                        machine.write::<u8>(tbl + i, v);
+                        machine.write::<u8>((tbl + i) as u64, v);
                     }
                 }
                 _ => {}
@@ -865,7 +865,7 @@ fn state_info<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, regs: &mut Reg
         return; // BX=0 is the only defined implementation type
     }
     let lin = seg_offset(dos, regs, regs.es as u16, regs.rdi as u16 as u32) as usize;
-    machine.copy_to(lin, &[0u8; 64]);
+    machine.copy_to(lin as u64, &[0u8; 64]);
     let mode = Bda::video_mode(machine);
     let columns: u16 = bda_field!(machine, columns);
     let rows_minus1: u8 = bda_field!(machine, rows_minus1);
@@ -887,41 +887,41 @@ fn state_info<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, regs: &mut Reg
         // (what a real VGA BIOS reports here; 40-column pages are half that).
         _ => (if columns > 40 { 0x1000 } else { 0x0800 }, if mode == 7 { 1 } else { 16 }, 8),
     };
-    machine.write::<u32>(lin, dos::video_static_info_addr());
-    machine.write::<u8>(lin + 0x04, mode);
-    machine.write::<u16>(lin + 0x05, columns);
-    machine.write::<u16>(lin + 0x07, regen_len);
-    machine.write::<u16>(lin + 0x09, 0); // page 0 starts at the buffer base
+    machine.write::<u32>(lin as u64, dos::video_static_info_addr());
+    machine.write::<u8>((lin + 0x04) as u64, mode);
+    machine.write::<u16>((lin + 0x05) as u64, columns);
+    machine.write::<u16>((lin + 0x07) as u64, regen_len);
+    machine.write::<u16>((lin + 0x09) as u64, 0); // page 0 starts at the buffer base
     for page in 0..8 {
         let pos_off = core::mem::offset_of!(Bda, cursor_pos) + page * 2;
-        let pos: u16 = machine.read(Bda::BASE + pos_off);
-        machine.write::<u16>(lin + 0x0B + page * 2, pos);
+        let pos: u16 = machine.read((Bda::BASE + pos_off) as u64);
+        machine.write::<u16>((lin + 0x0B + page * 2) as u64, pos);
     }
     let shape: u16 = bda_field!(machine, cursor_shape);
-    machine.write::<u8>(lin + 0x1B, shape as u8); // cursor end line
-    machine.write::<u8>(lin + 0x1C, (shape >> 8) as u8); // cursor start line
-    machine.write::<u8>(lin + 0x1D, bda_field!(machine, active_page));
-    machine.write::<u16>(lin + 0x1E, bda_field!(machine, crtc_base));
-    machine.write::<u8>(lin + 0x20, bda_field!(machine, crt_mode_ctl));
-    machine.write::<u8>(lin + 0x21, bda_field!(machine, crt_palette));
-    machine.write::<u8>(lin + 0x22, rows);
-    machine.write::<u16>(lin + 0x23, bda_field!(machine, cell_height));
-    machine.write::<u8>(lin + 0x25, 0x08); // active display combination: VGA colour
-    machine.write::<u8>(lin + 0x26, 0x00); // no alternate display
-    machine.write::<u16>(lin + 0x27, colours);
-    machine.write::<u8>(lin + 0x29, pages);
+    machine.write::<u8>((lin + 0x1B) as u64, shape as u8); // cursor end line
+    machine.write::<u8>((lin + 0x1C) as u64, (shape >> 8) as u8); // cursor start line
+    machine.write::<u8>((lin + 0x1D) as u64, bda_field!(machine, active_page));
+    machine.write::<u16>((lin + 0x1E) as u64, bda_field!(machine, crtc_base));
+    machine.write::<u8>((lin + 0x20) as u64, bda_field!(machine, crt_mode_ctl));
+    machine.write::<u8>((lin + 0x21) as u64, bda_field!(machine, crt_palette));
+    machine.write::<u8>((lin + 0x22) as u64, rows);
+    machine.write::<u16>((lin + 0x23) as u64, bda_field!(machine, cell_height));
+    machine.write::<u8>((lin + 0x25) as u64, 0x08); // active display combination: VGA colour
+    machine.write::<u8>((lin + 0x26) as u64, 0x00); // no alternate display
+    machine.write::<u16>((lin + 0x27) as u64, colours);
+    machine.write::<u8>((lin + 0x29) as u64, pages);
     // Active scan lines: 0 = 200, 1 = 350, 2 = 400, 3 = 480.
-    machine.write::<u8>(lin + 0x2A, match mode {
+    machine.write::<u8>((lin + 0x2A) as u64, match mode {
         0x11 | 0x12 => 3,
         0x0F | 0x10 => 1,
         4..=6 | 0x0D | 0x0E | 0x13 => 0,
         _ => 2, // BIOS text modes come up 400-line (8x16 cells)
     });
-    machine.write::<u8>(lin + 0x2B, 0); // primary character block
-    machine.write::<u8>(lin + 0x2C, 0); // secondary character block
+    machine.write::<u8>((lin + 0x2B) as u64, 0); // primary character block
+    machine.write::<u8>((lin + 0x2C) as u64, 0); // secondary character block
     // Misc flags: all modes on all displays, plus blink/intensity control in
     // text modes (bit 5).
-    machine.write::<u8>(lin + 0x2D, if is_text_mode(mode) { 0x21 } else { 0x01 });
-    machine.write::<u8>(lin + 0x31, 3); // 256 KB of video memory
+    machine.write::<u8>((lin + 0x2D) as u64, if is_text_mode(mode) { 0x21 } else { 0x01 });
+    machine.write::<u8>((lin + 0x31) as u64, 3); // 256 KB of video memory
     regs.rax = (regs.rax & !0xFF) | 0x1B; // function supported
 }

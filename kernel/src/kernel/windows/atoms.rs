@@ -148,7 +148,7 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, args: [u32; 5]) -> u32 {
     };
     let atom = if op <= 1 {
         let units: Vec<u16> = (0..length / 2)
-            .map(|i| machine.read::<u16>((name + i * 2) as usize))
+            .map(|i| machine.read::<u16>((name + i * 2) as u64))
             .collect();
         let Ok(name) = String::from_utf16(&units) else {
             return 0xc0000033;
@@ -182,11 +182,11 @@ pub(super) fn call<A: crate::Arch>(machine: &mut A, args: [u32; 5]) -> u32 {
             .references
     };
     let units: Vec<u16> = name.encode_utf16().collect();
-    machine.write::<u32>(out as usize, u32::from(atom));
-    machine.write::<u32>(out as usize + 4, refs);
-    machine.write::<u32>(out as usize + 8, units.len() as u32 * 2);
+    machine.write::<u32>(out as u64, u32::from(atom));
+    machine.write::<u32>((out as usize + 4) as u64, refs);
+    machine.write::<u32>((out as usize + 8) as u64, units.len() as u32 * 2);
     for (i, c) in units.iter().enumerate() {
-        machine.write::<u16>(out as usize + 12 + i * 2, *c);
+        machine.write::<u16>((out as usize + 12 + i * 2) as u64, *c);
     }
     0
 }

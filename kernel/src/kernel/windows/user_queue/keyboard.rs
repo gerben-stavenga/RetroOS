@@ -167,12 +167,12 @@ pub(super) fn read<A: crate::Arch>(
             .position(|m| m.message == 0x12 || hwnd_matches(m.hwnd) && msg_matches(m.message))
         {
             let m = &queue.posted[i];
-            machine.zero(out as usize, 48);
-            machine.write::<u32>(out as usize, m.hwnd);
-            machine.write::<u32>(out as usize + 4, m.message);
-            machine.write::<u64>(out as usize + 8, m.wparam);
-            machine.write::<u64>(out as usize + 16, m.lparam);
-            machine.write::<u32>(out as usize + 24, MSG_POSTED);
+            machine.zero(out as u64, 48);
+            machine.write::<u32>(out as u64, m.hwnd);
+            machine.write::<u32>((out as usize + 4) as u64, m.message);
+            machine.write::<u64>((out as usize + 8) as u64, m.wparam);
+            machine.write::<u64>((out as usize + 16) as u64, m.lparam);
+            machine.write::<u32>((out as usize + 24) as u64, MSG_POSTED);
             if p[0] & 1 != 0 {
                 queue.posted.remove(i);
             }
@@ -192,7 +192,7 @@ pub(super) fn read<A: crate::Arch>(
     else {
         return false;
     };
-    machine.zero(out as usize, 48);
+    machine.zero(out as u64, 48);
     for (i, v) in [
         (0, m.hwnd),
         (1, m.message),
@@ -204,7 +204,7 @@ pub(super) fn read<A: crate::Arch>(
         (9, m.time),
         (10, m.id),
     ] {
-        machine.write::<u32>(out as usize + i * 4, v);
+        machine.write::<u32>((out as usize + i * 4) as u64, v);
     }
     true
 }

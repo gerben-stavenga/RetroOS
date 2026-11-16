@@ -41,8 +41,8 @@ pub(super) fn int_2fh<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
             let dest = seg_offset(dos, regs, regs.es as u16, regs.rbx as u32) as usize;
             let header = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cdrom_header) as u32;
             let far_ptr = ((header >> 4) << 16) | (header & 0xF);
-            machine.write::<u8>(dest, 0); // driver subunit zero
-            machine.write::<u32>(dest + 1, far_ptr);
+            machine.write::<u8>(dest as u64, 0); // driver subunit zero
+            machine.write::<u32>((dest + 1) as u64, far_ptr);
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -65,7 +65,7 @@ pub(super) fn int_2fh<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
         // AX=150Dh — return one byte per installed CD-ROM drive at ES:BX.
         0x150D => {
             let dest = seg_offset(dos, regs, regs.es as u16, regs.rbx as u32);
-            machine.write::<u8>(dest as usize, 3); // D: (A:=0)
+            machine.write::<u8>(dest as u64, 3); // D: (A:=0)
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }

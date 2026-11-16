@@ -431,7 +431,7 @@ fn io_insn_len(vcpu: &crate::vcpu::Vcpu, port: u16) -> u32 {
     };
     let mut len: u32 = 0;
     loop {
-        let b = crate::backend::Interp.read::<u8>(base.wrapping_add(vcpu.ip32()).wrapping_add(len) as usize);
+        let b = crate::backend::Interp.read::<u8>(base.wrapping_add(vcpu.ip32()).wrapping_add(len) as u64);
         match b {
             // Legacy prefixes (operand/address size, rep, lock, seg overrides).
             0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => len += 1,
@@ -668,7 +668,7 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
             } else {
                 crate::desc::seg_base(pre_cs)
             };
-            let op = crate::backend::Interp.read::<u8>(base.wrapping_add(pre_ip) as usize);
+            let op = crate::backend::Interp.read::<u8>(base.wrapping_add(pre_ip) as u64);
             eprintln!(
                 "[VIF-DROP] mode={mode:?} pre={pre_cs:#06x}:{pre_ip:#010x} op={op:02X} \
                  post={:#06x}:{:#010x} shim={shim_vec:?} ev={ev:?}",
@@ -727,8 +727,8 @@ fn dispatch_shim64(
     // rcx/r11 get the architected SYSCALL clobber values for ABI fidelity.
     if n == 6 {
         let rip = vcpu.frame.rip;
-        let b0: u8 = crate::backend::Interp.read(rip as usize);
-        let b1: u8 = crate::backend::Interp.read(rip as usize + 1);
+        let b0: u8 = crate::backend::Interp.read(rip as u64);
+        let b1: u8 = crate::backend::Interp.read(rip as u64 + 1);
         if (b0, b1) == (0x0F, 0x05) {
             vcpu.frame.rip = rip.wrapping_add(2);
             vcpu.rcx = vcpu.frame.rip;

@@ -46,7 +46,8 @@ pub type Vcpu = arch_abi::Vcpu<crate::backend::Interp>;
 /// inherent `GuestMem` API below stays for arch-internal callers — BIOS/screen
 /// setup — that legitimately want slice views below the boundary.)
 impl GuestBytes for crate::backend::Interp {
-    fn read<T: Copy>(&self, addr: usize) -> T {
+    fn read<T: Copy>(&self, addr: u64) -> T {
+        let addr = low_address(addr, core::mem::size_of::<T>());
         let size = core::mem::size_of::<T>();
         let mut v = core::mem::MaybeUninit::<T>::uninit();
         let dst = v.as_mut_ptr() as *mut u8;
@@ -55,7 +56,8 @@ impl GuestBytes for crate::backend::Interp {
         });
         unsafe { v.assume_init() }
     }
-    fn write<T: Copy>(&mut self, addr: usize, val: T) {
+    fn write<T: Copy>(&mut self, addr: u64, val: T) {
+        let addr = low_address(addr, core::mem::size_of::<T>());
         let size = core::mem::size_of::<T>();
         let src = &val as *const T as *const u8;
         for_chunks(addr, size, true, |host, off, n| unsafe {
@@ -63,18 +65,21 @@ impl GuestBytes for crate::backend::Interp {
         });
         crate::engine::invalidate_code_range(addr as u32, size as u32);
     }
-    fn copy_from(&self, addr: usize, dst: &mut [u8]) {
+    fn copy_from(&self, addr: u64, dst: &mut [u8]) {
+        let addr = low_address(addr, dst.len());
         for_chunks(addr, dst.len(), false, |host, off, n| unsafe {
             for i in 0..n { dst[off + i] = (host as *const u8).add(i).read_volatile(); }
         });
     }
-    fn copy_to(&mut self, addr: usize, src: &[u8]) {
+    fn copy_to(&mut self, addr: u64, src: &[u8]) {
+        let addr = low_address(addr, src.len());
         for_chunks(addr, src.len(), true, |host, off, n| unsafe {
             for i in 0..n { host.add(i).write_volatile(src[off + i]); }
         });
         crate::engine::invalidate_code_range(addr as u32, src.len() as u32);
     }
-    fn copy_cstr(&self, addr: usize, dst: &mut [u8]) -> usize {
+    fn copy_cstr(&self, addr: u64, dst: &mut [u8]) -> usize {
+        let addr = low_address(addr, dst.len());
         let mut n = 0;
         while n < dst.len() {
             let b = unsafe { (paging::space_resolve((addr + n) as u32) as *const u8).read_volatile() };
@@ -84,13 +89,16 @@ impl GuestBytes for crate::backend::Interp {
         }
         n
     }
-    fn zero(&mut self, addr: usize, len: usize) {
+    fn zero(&mut self, addr: u64, len: usize) {
+        let addr = low_address(addr, len);
         for_chunks(addr, len, true, |host, _off, n| unsafe {
             core::ptr::write_bytes(host, 0, n);
         });
         crate::engine::invalidate_code_range(addr as u32, len as u32);
     }
-    fn copy_within(&mut self, src: usize, dst: usize, len: usize) {
+    fn copy_within(&mut self, src: u64, dst: u64, len: usize) {
+        let src = low_address(src, len);
+        let dst = low_address(dst, len);
         // Frames are scattered under real paging, so there is no single aliased
         // region: resolve each byte through the page tables in the overlap-safe
         // direction. Not on the guest hot path (DOS loaders, relocation).
@@ -164,22 +172,36 @@ impl GuestMem {
         }
     }
     pub fn read<T: Copy>(self, addr: usize) -> T {
-        crate::backend::Interp.read::<T>(addr)
+        crate::backend::Interp.read::<T>(addr as u64)
     }
     pub fn write<T: Copy>(self, addr: usize, val: T) {
-        crate::backend::Interp.write::<T>(addr, val);
+        crate::backend::Interp.write::<T>(addr as u64, val);
     }
     pub fn at<T>(self, addr: usize) -> &'static mut T {
         debug_assert!((addr & 0xFFF) + core::mem::size_of::<T>() <= 4096, "GuestMem::at crosses a page");
         unsafe { &mut *(host_ptr(addr, core::mem::size_of::<T>()) as *mut T) }
     }
     pub fn zero(self, addr: usize, len: usize) {
-        crate::backend::Interp.zero(addr, len);
+        crate::backend::Interp.zero(addr as u64, len);
     }
     pub fn write_bytes(self, addr: usize, src: &[u8]) {
-        crate::backend::Interp.copy_to(addr, src);
+        crate::backend::Interp.copy_to(addr as u64, src);
     }
     pub fn copy_within(self, src: usize, dst: usize, len: usize) {
-        crate::backend::Interp.copy_within(src, dst, len);
+        crate::backend::Interp.copy_within(src as u64, dst as u64, len);
+    }
+}
+
+fn low_address(address: u64, length: usize) -> usize {
+    assert!(address.checked_add(length as u64).is_some_and(|end| end <= 0xc0000000), "unsupported guest address");
+    address as usize
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[should_panic(expected = "unsupported guest address")]
+    fn high_guest_address_cannot_alias_low_memory() {
+        super::low_address(0x1_0000_1000, 1);
     }
 }

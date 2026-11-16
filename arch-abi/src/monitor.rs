@@ -143,13 +143,13 @@ fn set_sp(regs: &mut Regs, ss_32: bool, val: u32) {
 fn push16<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bool, val: u16) {
     let new_sp = get_sp(regs, ss_32).wrapping_sub(2);
     set_sp(regs, ss_32, new_sp);
-    space.write::<u16>((ss_base.wrapping_add(new_sp)) as usize, val);
+    space.write::<u16>((ss_base.wrapping_add(new_sp)) as u64, val);
 }
 
 #[inline]
 fn pop16<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bool) -> u16 {
     let cur = get_sp(regs, ss_32);
-    let val = space.read::<u16>(ss_base.wrapping_add(cur) as usize);
+    let val = space.read::<u16>(ss_base.wrapping_add(cur) as u64);
     set_sp(regs, ss_32, cur.wrapping_add(2));
     val
 }
@@ -158,13 +158,13 @@ fn pop16<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: boo
 fn push32<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bool, val: u32) {
     let new_sp = get_sp(regs, ss_32).wrapping_sub(4);
     set_sp(regs, ss_32, new_sp);
-    space.write::<u32>((ss_base.wrapping_add(new_sp)) as usize, val);
+    space.write::<u32>((ss_base.wrapping_add(new_sp)) as u64, val);
 }
 
 #[inline]
 fn pop32<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: bool) -> u32 {
     let cur = get_sp(regs, ss_32);
-    let val = space.read::<u32>(ss_base.wrapping_add(cur) as usize);
+    let val = space.read::<u32>(ss_base.wrapping_add(cur) as u64);
     set_sp(regs, ss_32, cur.wrapping_add(4));
     val
 }
@@ -178,8 +178,8 @@ fn pop32<P: GuestBytes>(regs: &mut Regs, space: &mut P, ss_base: u32, ss_32: boo
 pub fn sw_reflect_vm86_int<P: GuestBytes>(regs: &mut Regs, space: &mut P, vector: u8) {
     // IVT lives at linear 0; entries are 4 bytes each.
     let ivt_addr = (vector as u32) * 4;
-    let new_ip = space.read::<u16>((ivt_addr) as usize);
-    let new_cs = space.read::<u16>((ivt_addr + 2) as usize);
+    let new_ip = space.read::<u16>(ivt_addr as u64);
+    let new_cs = space.read::<u16>((ivt_addr + 2) as u64);
 
     let ss_base = (regs.stack_seg() as u32) << 4;
     // The guest observes its virtual-IF (VIF) in the bit-9 slot of the saved
@@ -284,7 +284,7 @@ fn monitor_rs<A: X86 + GuestBytes>(arch: &mut A, regs: &mut Regs) -> MonitorResu
     let start_ip = regs.ip32();
     // Read the i'th instruction byte. Not a closure — each call reborrows
     // `space` so the stack helpers below can also take `&mut` it.
-    macro_rules! peek { ($off:expr) => { arch.read::<u8>(cs_base.wrapping_add(start_ip.wrapping_add($off)) as usize) }; }
+    macro_rules! peek { ($off:expr) => { arch.read::<u8>(cs_base.wrapping_add(start_ip.wrapping_add($off)) as u64) }; }
 
     // Parse the legacy prefixes we care about: 0x66 (operand-size), 0x67
     // (address-size), and 0xF2/0xF3 (REP — only meaningful on the string I/O

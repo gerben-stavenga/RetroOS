@@ -244,9 +244,8 @@ pub trait Diagnostics {
 /// guest/devices can observe and change the bytes) and **unaligned-safe** (done
 /// byte-at-a-time, so any `addr`/alignment is fine).
 ///
-/// `addr` is a guest-linear address as `usize` (the 32-bit kernel addresses all
-/// low guest memory within 4 GiB). High long-mode mappings use
-/// `Memory::read_mappings` and `GuestBytes::high_copy` without narrowing their addresses.
+/// Guest-linear addresses are always `u64`, independently of the kernel target.
+/// Backends must translate or reject addresses without truncating them.
 ///
 /// Soundness note: `read::<T>` reconstructs a `T` from copied bytes, so `T` must
 /// be valid for *all* bit patterns (an integer or a `#[repr(C, packed)]` POD
@@ -261,21 +260,21 @@ pub trait GuestBytes {
     fn high_copy(&mut self, _address: u64, _buffer: &mut [u8], _to_user: bool, pages: PageInput) -> (bool, PageInput) { (false, pages) }
 
     /// Read a `T` at `addr` (volatile, unaligned, bytewise into a local).
-    fn read<T: Copy>(&self, addr: usize) -> T;
+    fn read<T: Copy>(&self, addr: u64) -> T;
     /// Write a `T` at `addr` (volatile, unaligned, bytewise from a local).
-    fn write<T: Copy>(&mut self, addr: usize, val: T);
+    fn write<T: Copy>(&mut self, addr: u64, val: T);
     /// Copy `dst.len()` bytes from guest memory at `addr` into `dst`.
-    fn copy_from(&self, addr: usize, dst: &mut [u8]);
+    fn copy_from(&self, addr: u64, dst: &mut [u8]);
     /// Copy `src` into guest memory at `addr`.
-    fn copy_to(&mut self, addr: usize, src: &[u8]);
+    fn copy_to(&mut self, addr: u64, src: &[u8]);
     /// Copy bytes from guest memory at `addr` into `dst`, stopping before the
     /// first NUL or at `dst.len()`. Returns the number of bytes copied (the
     /// C-string length, capped at `dst.len()`); the NUL is not copied.
-    fn copy_cstr(&self, addr: usize, dst: &mut [u8]) -> usize;
+    fn copy_cstr(&self, addr: u64, dst: &mut [u8]) -> usize;
     /// Zero `len` bytes at `addr`.
-    fn zero(&mut self, addr: usize, len: usize);
+    fn zero(&mut self, addr: u64, len: usize);
     /// Copy `len` bytes within guest memory (`src` → `dst`), overlap-safe.
-    fn copy_within(&mut self, src: usize, dst: usize, len: usize);
+    fn copy_within(&mut self, src: u64, dst: u64, len: usize);
 }
 
 // =============================================================================

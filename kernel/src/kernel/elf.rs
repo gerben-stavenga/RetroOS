@@ -104,7 +104,7 @@ pub(crate) fn load_elf_source<A: crate::Arch>(machine: &mut A, elf_data: &[u8], 
                 let first = prefix.min(seg.filesz);
                 if first > 0 {
                     source.read_exact(seg.file_offset, &mut scratch[..first]).map_err(|_| ElfError::InvalidType)?;
-                    machine.copy_to(vaddr, &scratch[..first]);
+                    machine.copy_to(vaddr as u64, &scratch[..first]);
                 }
                 copied = first;
                 let full = (seg.filesz - copied) / PAGE_SIZE * PAGE_SIZE;
@@ -122,16 +122,16 @@ pub(crate) fn load_elf_source<A: crate::Arch>(machine: &mut A, elf_data: &[u8], 
                 crate::kernel::event_profile::file_io_finish(7, count, sample);
                 result.map_err(|_| ElfError::InvalidType)?;
                 let sample = crate::kernel::event_profile::file_io_start();
-                machine.copy_to(vaddr + copied, &scratch[..count]);
+                machine.copy_to((vaddr + copied) as u64, &scratch[..count]);
                 crate::kernel::event_profile::file_io_finish(8, count, sample);
                 copied += count;
             }
         } else if seg.filesz > 0 {
             let data = seg.data.ok_or(ElfError::InvalidType)?;
-            machine.copy_to(vaddr, data);
+            machine.copy_to(vaddr as u64, data);
         }
         if seg.memsz > seg.filesz {
-            machine.zero(vaddr + seg.filesz, seg.memsz - seg.filesz);
+            machine.zero((vaddr + seg.filesz) as u64, seg.memsz - seg.filesz);
         }
     }
 

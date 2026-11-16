@@ -70,7 +70,7 @@ pub(super) fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u
                 machine::set_vm86_ip(regs, stub_ip.wrapping_sub(2));
                 return Parked::Yes;
             }
-            let key: u16 = machine.read(Bda::BASE + head as usize);
+            let key: u16 = machine.read((Bda::BASE + head as usize) as u64);
             let mut next = head + 2;
             if next >= KB_RING_END {
                 next = KB_RING_FIRST;
@@ -83,7 +83,7 @@ pub(super) fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u
             // Peek: ZF in the caller's stacked FLAGS (popped on return).
             vm86_set_return_flag(machine, regs, 0x40, head == tail);
             if head != tail {
-                let key: u16 = machine.read(Bda::BASE + head as usize);
+                let key: u16 = machine.read((Bda::BASE + head as usize) as u64);
                 let key = if ah == 0x01 { conventional(key) } else { key };
                 regs.rax = (regs.rax & !0xFFFF) | key as u64;
             }
@@ -195,7 +195,7 @@ fn finish_int09<A: crate::Arch>(
         let next = if tail + 2 >= KB_RING_END { KB_RING_FIRST } else { tail + 2 };
         let head: u16 = bda_field!(machine,kb_head);
         if next != head {
-            machine.write::<u16>(Bda::BASE + tail as usize,word);
+            machine.write::<u16>((Bda::BASE + tail as usize) as u64,word);
             bda_field!(machine,kb_tail = next);
         }
     }

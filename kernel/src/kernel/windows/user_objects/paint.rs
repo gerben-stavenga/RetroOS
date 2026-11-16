@@ -153,7 +153,7 @@ pub(super) fn call<A: crate::Arch>(
         let mut input = Vec::new();
         for n in 0..p[3] / 16 {
             let r = core::array::from_fn(|j| {
-                machine.read::<i32>(p[2] as usize + n as usize * 16 + j * 4)
+                machine.read::<i32>((p[2] as usize + n as usize * 16 + j * 4) as u64)
             });
             if r[0] > r[2] || r[1] > r[3] {
                 return 0xc000000d;
@@ -288,8 +288,8 @@ pub(super) fn call<A: crate::Arch>(
         .find(|&i| update_flags(&windows[i], p[2]) != 0);
     let i = chosen.unwrap_or(root);
     let flags = chosen.map_or(0, |i| update_flags(&windows[i], p[2]));
-    machine.write::<u32>(out as usize, windows[i].handle);
-    machine.write::<u32>(out as usize + 4, flags);
+    machine.write::<u32>(out as u64, windows[i].handle);
+    machine.write::<u32>((out as usize + 4) as u64, flags);
     if p[2] & 0x40 != 0 {
         return 0;
     }
@@ -304,14 +304,14 @@ pub(super) fn call<A: crate::Arch>(
         }
     }
     let bytes = region.len() * 16;
-    machine.write::<u32>(out as usize + 8, bytes as u32);
+    machine.write::<u32>((out as usize + 8) as u64, bytes as u32);
     if bytes > p[4] as usize {
         return 0x80000005;
     }
     let (x, y) = origin(windows, i);
     for (n, r) in region.iter().enumerate() {
         for (j, v) in shift(*r, x, y).iter().enumerate() {
-            machine.write::<i32>(p[3] as usize + n * 16 + j * 4, *v);
+            machine.write::<i32>((p[3] as usize + n * 16 + j * 4) as u64, *v);
         }
     }
     if flags & 12 != 0 {
@@ -472,14 +472,14 @@ pub(super) fn visible_region<A: crate::Arch>(
         .chain([size as u32])
         .enumerate()
     {
-        machine.write::<u32>(out as usize + j * 4, v);
+        machine.write::<u32>((out as usize + j * 4) as u64, v);
     }
     if size > p[3] as usize {
         return 0x80000005;
     }
     for (j, rect) in region.iter().enumerate() {
         for (k, v) in rect.iter().enumerate() {
-            machine.write::<i32>(p[2] as usize + j * 16 + k * 4, *v);
+            machine.write::<i32>((p[2] as usize + j * 16 + k * 4) as u64, *v);
         }
     }
     0

@@ -317,9 +317,9 @@ pub fn private_copy<A: Arch>(machine: &mut A, first: usize, count: usize) {
 pub trait GuestBytes {
     /// Copy a high user buffer without narrowing its address. False means EFAULT.
     fn high_copy(&mut self, address: u64, bytes: &mut [u8], to_user: bool) -> bool;
-    fn copy_from(&self, address: usize, bytes: &mut [u8]);
-    fn copy_to(&mut self, address: usize, bytes: &[u8]);
-    fn read<T: Copy>(&self, address: usize) -> T {
+    fn copy_from(&self, address: u64, bytes: &mut [u8]);
+    fn copy_to(&mut self, address: u64, bytes: &[u8]);
+    fn read<T: Copy>(&self, address: u64) -> T {
         let mut value = core::mem::MaybeUninit::<T>::uninit();
         unsafe {
             self.copy_from(address, core::slice::from_raw_parts_mut(
@@ -327,35 +327,35 @@ pub trait GuestBytes {
             value.assume_init()
         }
     }
-    fn write<T: Copy>(&mut self, address: usize, value: T) {
+    fn write<T: Copy>(&mut self, address: u64, value: T) {
         unsafe { self.copy_to(address, core::slice::from_raw_parts(
             (&value as *const T).cast(), core::mem::size_of::<T>())); }
     }
-    fn copy_cstr(&self, address: usize, bytes: &mut [u8]) -> usize {
+    fn copy_cstr(&self, address: u64, bytes: &mut [u8]) -> usize {
         for (i, byte) in bytes.iter_mut().enumerate() {
-            let value = self.read::<u8>(address + i);
+            let value = self.read::<u8>(address + i as u64);
             if value == 0 { return i; }
             *byte = value;
         }
         bytes.len()
     }
-    fn zero(&mut self, mut address: usize, mut length: usize) {
+    fn zero(&mut self, mut address: u64, mut length: usize) {
         let zeros = [0; 4096];
         while length != 0 {
             let n = length.min(4096);
             self.copy_to(address, &zeros[..n]);
-            address += n;
+            address += n as u64;
             length -= n;
         }
     }
-    fn copy_within(&mut self, src: usize, dst: usize, len: usize) {
+    fn copy_within(&mut self, src: u64, dst: u64, len: usize) {
         let mut buffer = [0; 4096];
         let mut remaining = len;
         while remaining != 0 {
             let n = remaining.min(buffer.len());
             let offset = if dst > src { remaining - n } else { len - remaining };
-            self.copy_from(src + offset, &mut buffer[..n]);
-            self.copy_to(dst + offset, &buffer[..n]);
+            self.copy_from(src + offset as u64, &mut buffer[..n]);
+            self.copy_to(dst + offset as u64, &buffer[..n]);
             remaining -= n;
         }
     }
@@ -373,22 +373,22 @@ impl<A: arch_abi::Arch + arch_abi::GuestBytes> GuestBytes for A {
         }
         true
     }
-    fn copy_from(&self, mut address: usize, mut bytes: &mut [u8]) {
+    fn copy_from(&self, mut address: u64, mut bytes: &mut [u8]) {
         while !bytes.is_empty() {
             service(self);
-            let n = bytes.len().min(4096 - (address & 4095));
+            let n = bytes.len().min(4096 - (address as usize & 4095));
             let (part, rest) = bytes.split_at_mut(n);
             arch_abi::GuestBytes::copy_from(self, address, part);
-            address += n;
+            address += n as u64;
             bytes = rest;
         }
     }
-    fn copy_to(&mut self, mut address: usize, mut bytes: &[u8]) {
+    fn copy_to(&mut self, mut address: u64, mut bytes: &[u8]) {
         while !bytes.is_empty() {
             service(self);
-            let n = bytes.len().min(4096 - (address & 4095));
+            let n = bytes.len().min(4096 - (address as usize & 4095));
             arch_abi::GuestBytes::copy_to(self, address, &bytes[..n]);
-            address += n;
+            address += n as u64;
             bytes = &bytes[n..];
         }
     }

@@ -81,38 +81,38 @@ impl Psp {
     #[inline]
     pub(super) fn base(psp_seg: u16) -> usize { ((psp_seg as u32) << 4) as usize }
     /// Write the whole PSP at `psp_seg`.
-    pub fn store<A: crate::Arch>(machine: &mut A, psp_seg: u16, psp: Self) { machine.write::<Self>(Self::base(psp_seg), psp); }
+    pub fn store<A: crate::Arch>(machine: &mut A, psp_seg: u16, psp: Self) { machine.write::<Self>((Self::base(psp_seg)) as u64, psp); }
     /// Read PSP[0x2C] (environment segment or selector).
     pub fn env_seg<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> u16 {
-        machine.read::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, env_seg))
+        machine.read::<u16>((Self::base(psp_seg) + core::mem::offset_of!(Self, env_seg)) as u64)
     }
     /// Linear address of the process's active Job File Table.
     pub fn jft_addr<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> usize {
         let base = Self::base(psp_seg);
-        let off = machine.read::<u16>(base + core::mem::offset_of!(Self, jft_far_off)) as usize;
-        let seg = machine.read::<u16>(base + core::mem::offset_of!(Self, jft_far_seg)) as usize;
+        let off = machine.read::<u16>((base + core::mem::offset_of!(Self, jft_far_off)) as u64) as usize;
+        let seg = machine.read::<u16>((base + core::mem::offset_of!(Self, jft_far_seg)) as u64) as usize;
         (seg << 4) + off
     }
 
     /// Current capacity of the active JFT.
     pub fn max_files<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> u16 {
-        machine.read::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, max_files))
+        machine.read::<u16>((Self::base(psp_seg) + core::mem::offset_of!(Self, max_files)) as u64)
     }
 
     /// Segment of an AH=67h-allocated JFT, if the inline table is not active.
     pub fn external_jft_seg<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> Option<u16> {
         let base = Self::base(psp_seg);
-        let off = machine.read::<u16>(base + core::mem::offset_of!(Self, jft_far_off));
-        let seg = machine.read::<u16>(base + core::mem::offset_of!(Self, jft_far_seg));
+        let off = machine.read::<u16>((base + core::mem::offset_of!(Self, jft_far_off)) as u64);
+        let seg = machine.read::<u16>((base + core::mem::offset_of!(Self, jft_far_seg)) as u64);
         if off == 0x0018 && seg == psp_seg { None } else { Some(seg) }
     }
 
     /// Select a new active JFT and publish its capacity in the PSP.
     pub fn set_jft_location<A: crate::Arch>(machine: &mut A, psp_seg: u16, count: u16, off: u16, seg: u16) {
         let base = Self::base(psp_seg);
-        machine.write::<u16>(base + core::mem::offset_of!(Self, max_files), count);
-        machine.write::<u16>(base + core::mem::offset_of!(Self, jft_far_off), off);
-        machine.write::<u16>(base + core::mem::offset_of!(Self, jft_far_seg), seg);
+        machine.write::<u16>((base + core::mem::offset_of!(Self, max_files)) as u64, count);
+        machine.write::<u16>((base + core::mem::offset_of!(Self, jft_far_off)) as u64, off);
+        machine.write::<u16>((base + core::mem::offset_of!(Self, jft_far_seg)) as u64, seg);
     }
 
     /// Record one entry in the process's active Job File Table.
@@ -125,7 +125,7 @@ impl Psp {
     {
         if idx >= Self::max_files(machine, psp_seg) as usize { return Err(JftFull); }
         let addr = Self::jft_addr(machine, psp_seg) + idx;
-        machine.write::<u8>(addr, val);
+        machine.write::<u8>(addr as u64, val);
         Ok(())
     }
 
@@ -143,10 +143,10 @@ impl Psp {
     pub fn set_cmdline<A: crate::Arch>(machine: &mut A, psp_seg: u16, tail: &[u8]) {
         let n = tail.len().min(126);
         let base = Self::base(psp_seg);
-        machine.write::<u8>(base + core::mem::offset_of!(Self, cmdline_len), n as u8);
+        machine.write::<u8>((base + core::mem::offset_of!(Self, cmdline_len)) as u64, n as u8);
         let cmd = base + core::mem::offset_of!(Self, cmdline);
-        machine.copy_to(cmd, &tail[..n]);
-        machine.write::<u8>(cmd + n, 0x0D);
+        machine.copy_to(cmd as u64, &tail[..n]);
+        machine.write::<u8>((cmd + n) as u64, 0x0D);
     }
 }
 impl Default for Psp {
@@ -360,7 +360,7 @@ fn lm_field(field_off: usize) -> usize { LOW_MEM_BASE as usize + field_off }
 /// `sync_mcb_chain` so AH=52h-style chain walkers see the current
 /// `heap_base_seg`.
 pub(in crate::kernel::dos) fn set_first_mcb_seg<A: crate::Arch>(machine: &mut A, seg: u16) {
-    machine.write::<u16>(lm_field(core::mem::offset_of!(LowMem, first_mcb_seg)), seg);
+    machine.write::<u16>((lm_field(core::mem::offset_of!(LowMem, first_mcb_seg))) as u64, seg);
 }
 
 /// Linear addresses of the substitute BIOS's guest-readable ROM-font copies.
@@ -584,7 +584,7 @@ pub(in crate::kernel::dos) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &
     // (or PM CALL FAR) traps to STUB_INT and the slot dispatcher.
     let stubs = lm_field(core::mem::offset_of!(LowMem, stubs));
     for i in 0..256 {
-        machine.write::<[u8; 2]>(stubs + i * 2, [0xCD, STUB_INT]);
+        machine.write::<[u8; 2]>((stubs + i * 2) as u64, [0xCD, STUB_INT]);
     }
     // A blocked DOS operation must stop executing guest instructions until
     // the event loop polls it again. HLT traps uniformly in VM86 and PM and
@@ -592,7 +592,7 @@ pub(in crate::kernel::dos) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &
     // entries. The second byte is another HLT for defensive fall-through;
     // `poll_suspended_call` rewinds to byte zero while still waiting.
     machine.write::<[u8; 2]>(
-        stubs + SLOT_RESUME as usize * 2,
+        (stubs + SLOT_RESUME as usize * 2) as u64,
         [0xF4, 0xF4],
     );
 
@@ -654,7 +654,7 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
         last_drive,
         ..Default::default()
     };
-    machine.write::<Lol>(lm_field(core::mem::offset_of!(LowMem, lol)), lol);
+    machine.write::<Lol>((lm_field(core::mem::offset_of!(LowMem, lol))) as u64, lol);
 
     // SFT header: end-of-chain link, entry count + zeroed entries; then
     // pre-populate stdin/stdout/stderr as character devices.
@@ -666,7 +666,7 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
             ..Default::default()
         };
     }
-    machine.write::<Sft>(lm_field(core::mem::offset_of!(LowMem, sft)), sft);
+    machine.write::<Sft>((lm_field(core::mem::offset_of!(LowMem, sft))) as u64, sft);
 
     // CDS: C: is the data disk, D: the hot-swappable CD-ROM; other drives follow configured mounts.
     // Programs such as Dos Navigator read this table directly rather than
@@ -692,14 +692,14 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
             cds[usize::from(letter - b'A')] = mk(letter);
         }
     }
-    machine.write::<[CdsEntry; NUM_DRIVES as usize]>(lm_field(core::mem::offset_of!(LowMem, cds)), cds);
+    machine.write::<[CdsEntry; NUM_DRIVES as usize]>((lm_field(core::mem::offset_of!(LowMem, cds))) as u64, cds);
 
     // Diskette parameter table (1.44M defaults: 512-byte sectors, 18 spt,
     // conventional step/settle timings), pointed at by IVT 1Eh per BIOS
     // convention and returned by INT 13h AH=08h in ES:DI.
     let ddpt_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, ddpt) as u32;
     machine.write::<[u8; 11]>(
-        ddpt_addr as usize,
+        ddpt_addr as u64,
         [0xAF, 0x02, 0x25, 0x02, 18, 0x1B, 0xFF, 0x6C, 0xF6, 0x0F, 0x08],
     );
     write_u16(machine, 0, 0x1E * 4, (ddpt_addr & 0xF) as u16);
@@ -710,7 +710,7 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     let header_segment_base = cdrom_header_addr & !0xF;
     let retf_off = (cdrom_retf_addr - header_segment_base) as u16;
     machine.write::<CdromDeviceHeader>(
-        cdrom_header_addr as usize,
+        cdrom_header_addr as u64,
         CdromDeviceHeader {
             next: u32::MAX,
             attributes: 0xC800, // character, IOCTL, open/close, CD-ROM
@@ -722,7 +722,7 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
             subunits: 1,
         },
     );
-    machine.write::<u8>(cdrom_retf_addr as usize, 0xCB);
+    machine.write::<u8>(cdrom_retf_addr as u64, 0xCB);
 }
 
 /// Linear address of `LowMem.sft.entries[handle]`.
@@ -735,7 +735,7 @@ fn sft_entry_addr(handle: usize) -> usize {
 /// Populate SFT entry for a newly opened file handle.
 pub(super) fn sft_set_file<A: crate::Arch>(machine: &mut A, handle: u16, size: u32) {
     if handle as usize >= SFT_ENTRIES { return; }
-    machine.write::<SftEntry>(sft_entry_addr(handle as usize), SftEntry {
+    machine.write::<SftEntry>((sft_entry_addr(handle as usize)) as u64, SftEntry {
         refcount: 1,
         attribute: 0x20,    // archive
         time: 0x6000,       // 12:00:00
@@ -748,5 +748,5 @@ pub(super) fn sft_set_file<A: crate::Arch>(machine: &mut A, handle: u16, size: u
 /// Clear SFT entry when a file handle is closed.
 pub(super) fn sft_clear<A: crate::Arch>(machine: &mut A, handle: u16) {
     if handle as usize >= SFT_ENTRIES { return; }
-    machine.write::<u16>(sft_entry_addr(handle as usize) + core::mem::offset_of!(SftEntry, refcount), 0);
+    machine.write::<u16>((sft_entry_addr(handle as usize) + core::mem::offset_of!(SftEntry, refcount)) as u64, 0);
 }

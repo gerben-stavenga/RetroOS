@@ -1030,7 +1030,7 @@ fn handle_event_inner<A: crate::Arch>(
                 if is_vm86 {
                     debug_assert!(matches!(n, 3 | 4),
                         "VM86 SoftInt({:#x}) bubbled to dos — only INT 3/4 should trap from VM86", n);
-                    let ivt_seg = machine.read::<u16>((n as usize) * 4 + 2);
+                    let ivt_seg = machine.read::<u16>(((n as usize) * 4 + 2) as u64);
                     if ivt_seg != dos::STUB_SEG {
                         machine.reflect_vm86_int(regs, n);
                     }
@@ -1117,7 +1117,7 @@ fn handle_event_inner<A: crate::Arch>(
                 }
                 dpmi::dispatch_dpmi_exception(machine, dos, regs, n as u32)
             } else if is_vm86 && matches!(n, 0..=7 | 16 | 17 | 19)
-                && machine.read::<u16>((n as usize) * 4 + 2) != dos::STUB_SEG
+                && machine.read::<u16>(((n as usize) * 4 + 2) as u64) != dos::STUB_SEG
             {
                 // Bare VM86 (no DPMI): reflect the CPU exceptions that a
                 // real-mode program can handle through the same-numbered IVT
@@ -1138,18 +1138,18 @@ fn handle_event_inner<A: crate::Arch>(
                     A::seg_base(regs.code_seg()).wrapping_add(regs.ip32())
                 };
                 let mut bytes = [0u8; 8];
-                machine.copy_from(lin as usize, &mut bytes);
+                machine.copy_from(lin as u64, &mut bytes);
                 let ss_lin = if is_vm86 {
                     ((regs.stack_seg() as u32) << 4).wrapping_add(regs.sp32() & 0xFFFF)
                 } else {
                     A::seg_base(regs.stack_seg()).wrapping_add(regs.sp32())
                 };
-                let s0 = machine.read::<u16>((ss_lin) as usize);
-                let s1 = machine.read::<u16>((ss_lin.wrapping_add(2)) as usize);
-                let s2 = machine.read::<u16>((ss_lin.wrapping_add(4)) as usize);
-                let s3 = machine.read::<u16>((ss_lin.wrapping_add(6)) as usize);
-                let s4 = machine.read::<u16>((ss_lin.wrapping_add(8)) as usize);
-                let s5 = machine.read::<u16>((ss_lin.wrapping_add(10)) as usize);
+                let s0 = machine.read::<u16>(ss_lin as u64);
+                let s1 = machine.read::<u16>((ss_lin.wrapping_add(2)) as u64);
+                let s2 = machine.read::<u16>((ss_lin.wrapping_add(4)) as u64);
+                let s3 = machine.read::<u16>((ss_lin.wrapping_add(6)) as u64);
+                let s4 = machine.read::<u16>((ss_lin.wrapping_add(8)) as u64);
+                let s5 = machine.read::<u16>((ss_lin.wrapping_add(10)) as u64);
                 let liq = unsafe { mode_transitions::LAST_IRQ };
                 crate::compact_println!("DOS: CPU exception {} at CS:EIP={:04x}:{:#x} ss:sp={:04x}:{:08x} psp={:04x} (vm86={}) bytes={:02x?} stack={:04x} {:04x} {:04x} {:04x} {:04x} {:04x} last_irq=vec{:02x} target={:04x}:{:08x} from cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
                     n, regs.code_seg(), regs.ip32(),
@@ -1168,7 +1168,7 @@ fn handle_event_inner<A: crate::Arch>(
             if is_vm86 {
                 let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
                 let mut bytes = [0u8; 8];
-                machine.copy_from(lin as usize, &mut bytes);
+                machine.copy_from(lin as u64, &mut bytes);
                 // A plain `push ds` etc. cannot #GP in genuine VM86, so
                 // SS:SP/flags and the last reflected IRQ help explain the
                 // fault. Terminate this DOS process, not the whole kernel.
@@ -1535,7 +1535,7 @@ fn snapshot_env<A: crate::Arch>(machine: &mut A, env_seg: u16) -> alloc::vec::Ve
     let mut prev_was_nul = false;
     let mut i = 0usize;
     while i < 32768 {
-        let b = machine.read::<u8>(base + i);
+        let b = machine.read::<u8>((base + i) as u64);
         out.push(b);
         i += 1;
         if b == 0 && prev_was_nul { break; }
@@ -1837,9 +1837,9 @@ fn sync_mcb_chain<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, _regs: &mu
     for (i, &(mcb_seg, ow, paras)) in entries.iter().enumerate() {
         let sig = if i + 1 == last_idx { b'Z' } else { b'M' };
         let addr = (mcb_seg as u32) << 4;
-        machine.write::<u8>(addr as usize, sig);
-        machine.write::<u16>(addr as usize + 1, ow);
-        machine.write::<u16>(addr as usize + 3, paras);
+        machine.write::<u8>(addr as u64, sig);
+        machine.write::<u16>((addr as usize + 1) as u64, ow);
+        machine.write::<u16>((addr as usize + 3) as u64, paras);
         // Bytes 5..15 are not structural chain fields. In particular, do not
         // clear them while splitting a block: a caller may have its INT 21h
         // return frame in the paragraph that becomes the new free MCB. DOS
@@ -2017,9 +2017,9 @@ fn dos_resize_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs
     {
         let child_mcb = seg.saturating_sub(1);
         let child_addr = (child_mcb as usize) << 4;
-        let child_sig = machine.read::<u8>(child_addr);
-        let child_owner = machine.read::<u16>(child_addr + 1);
-        let child_paras = machine.read::<u16>(child_addr + 3);
+        let child_sig = machine.read::<u8>(child_addr as u64);
+        let child_owner = machine.read::<u16>((child_addr + 1) as u64);
+        let child_paras = machine.read::<u16>((child_addr + 3) as u64);
         let parent = dos.dos_blocks.iter().enumerate().find_map(|(idx, block)| {
             let end = block.seg as u32 + block.paras as u32;
             (block.owner == dos.current_psp
@@ -2030,9 +2030,9 @@ fn dos_resize_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs
         if let Some((idx, parent)) = parent {
             let parent_mcb = parent.seg.saturating_sub(1);
             let parent_addr = (parent_mcb as usize) << 4;
-            let parent_sig = machine.read::<u8>(parent_addr);
-            let parent_owner = machine.read::<u16>(parent_addr + 1);
-            let parent_paras = machine.read::<u16>(parent_addr + 3);
+            let parent_sig = machine.read::<u8>(parent_addr as u64);
+            let parent_owner = machine.read::<u16>((parent_addr + 1) as u64);
+            let parent_paras = machine.read::<u16>((parent_addr + 3) as u64);
             let left_paras = seg.saturating_sub(parent.seg).saturating_sub(1);
             let child_end = seg as u32 + child_paras as u32;
             let expected_child_sig = if child_end >= 0xA000 { b'Z' } else { b'M' };
@@ -2104,14 +2104,14 @@ fn log_pm_gp<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
         regs.ip32() & 0xffff
     };
     let mut bytes = [0u8; 12];
-    machine.copy_from(cs_b.wrapping_add(ip) as usize, &mut bytes);
+    machine.copy_from(cs_b.wrapping_add(ip) as u64, &mut bytes);
     let sp = if mode_transitions::seg_is_32(&dos.ldt[..], regs.stack_seg()) {
         regs.sp32()
     } else {
         regs.sp32() & 0xffff
     };
     let mut stack = [0u8; 24];
-    machine.copy_from(ss_b.wrapping_add(sp) as usize, &mut stack);
+    machine.copy_from(ss_b.wrapping_add(sp) as u64, &mut stack);
     let last_irq = unsafe { mode_transitions::LAST_IRQ };
     crate::compact_println!(
         "[#GP] cs={:04x}:{:#x} err={:#x} bytes={:02x?} eax={:#x} ebx={:#x} esi={:#x}",
@@ -2138,8 +2138,8 @@ fn log_pm_gp<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
     if bytes[0] == 0xFF && bytes[1] == 0x1D {
         let disp = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
         let addr = ds_b.wrapping_add(disp) as usize;
-        let target_off = machine.read::<u32>(addr);
-        let target_sel = machine.read::<u16>(addr + 4);
+        let target_off = machine.read::<u32>(addr as u64);
+        let target_sel = machine.read::<u16>((addr + 4) as u64);
         let index = (target_sel >> 3) as usize;
         let raw = if target_sel & 0x04 != 0 {
             dos.ldt.get(index).copied()
@@ -2184,9 +2184,9 @@ fn log_pm_ud<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
     let ip = regs.ip32();
     let linear = base.wrapping_add(ip);
     let mut bytes = [0u8; 16];
-    machine.copy_from(linear as usize, &mut bytes);
+    machine.copy_from(linear as u64, &mut bytes);
     let mut preceding = [0u8; 8];
-    machine.copy_from(linear.wrapping_sub(preceding.len() as u32) as usize, &mut preceding);
+    machine.copy_from(linear.wrapping_sub(preceding.len() as u32) as u64, &mut preceding);
     crate::compact_println!(
         "[#UD] vm86={} cs={:04x}:{:#x} linear={:#x} limit={:#x} bytes={:02x?} before={:02x?}",
         regs.mode() == crate::UserMode::VM86, selector, ip, linear, limit, &bytes[..], &preceding[..]

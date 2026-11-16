@@ -129,21 +129,21 @@ pub(super) fn call<A: crate::Arch>(
     args: [u32; 3],
 ) -> u32 {
     let [op, params, out] = args;
-    let p: [u32; 10] = core::array::from_fn(|i| machine.read::<u32>(params as usize + i * 4));
-    let current_tid = machine.read::<u32>((state.teb_base + 0x24) as usize);
+    let p: [u32; 10] = core::array::from_fn(|i| machine.read::<u32>((params as usize + i * 4) as u64));
+    let current_tid = machine.read::<u32>((state.teb_base + 0x24) as u64);
     if op == 7 {
-        machine.zero(out as usize, 48);
+        machine.zero(out as u64, 48);
         if p[0] == 0 {
             if let Some(foreground) = user_objects::foreground(state, current_tid) {
                 let fg = foreground.lock();
-                machine.write::<u64>(out as usize, fg.id);
-                machine.write::<u64>(out as usize + 8, fg.offset);
+                machine.write::<u64>(out as u64, fg.id);
+                machine.write::<u64>((out as usize + 8) as u64, fg.offset);
             }
             return 0;
         }
         if let Some(queue) = state.user_queues.queues.iter().find(|q| q.tid == p[0]) {
-            machine.write::<u64>(out as usize, queue.input_id);
-            machine.write::<u64>(out as usize + 8, queue.input_offset);
+            machine.write::<u64>(out as u64, queue.input_id);
+            machine.write::<u64>((out as usize + 8) as u64, queue.input_offset);
             return 0;
         }
         return if p[0] == current_tid { 0 } else { 0xc000000b };
@@ -166,7 +166,7 @@ pub(super) fn call<A: crate::Arch>(
         let Some((handle, tid, pid)) = user_objects::window_owner(state, current_tid, p[0]) else {
             return 0xc0000008;
         };
-        if tid == 0 || pid != machine.read::<u32>((state.teb_base + 0x20) as usize) {
+        if tid == 0 || pid != machine.read::<u32>((state.teb_base + 0x20) as u64) {
             return 0xc0000022;
         }
         (handle, tid)
@@ -237,22 +237,22 @@ pub(super) fn call<A: crate::Arch>(
         state.user_queues.queues.len() - 1
     };
     if op == 10 {
-        machine.zero(out as usize, 48);
+        machine.zero(out as u64, 48);
         let Some((_, owner, pid, is_desktop)) =
             user_objects::foreground_window(state, current_tid, p[0])
         else {
             return 0xc0010578;
         };
-        if !is_desktop && pid != machine.read::<u32>((state.teb_base + 0x20) as usize) {
+        if !is_desktop && pid != machine.read::<u32>((state.teb_base + 0x20) as u64) {
             return 0xc00000bb; // Cross-process input queues are not implemented yet.
         }
         let Some(target) = state.user_queues.queues.iter().find(|q| q.tid == owner) else {
             return 0xc0010578;
         };
         let mut fg = target.foreground.lock();
-        machine.write::<u32>(out as usize, fg.active);
+        machine.write::<u32>(out as u64, fg.active);
         machine.write::<u32>(
-            out as usize + 4,
+            (out as usize + 4) as u64,
             (fg.active != 0 && fg.tid != current_tid) as u32,
         );
         let clear = is_desktop && p[1] == 0;
@@ -272,7 +272,7 @@ pub(super) fn call<A: crate::Arch>(
                 session::write_object_part(fg.offset, 0, &1u32.to_le_bytes());
             }
         }
-        machine.write::<u32>(out as usize + 8, (fg.tid != current_tid) as u32);
+        machine.write::<u32>((out as usize + 8) as u64, (fg.tid != current_tid) as u32);
         return 0;
     }
     if op == 6
@@ -296,10 +296,10 @@ pub(super) fn call<A: crate::Arch>(
             .iter()
             .find(|&&(t, h)| t == tid && (p[1] == 0 || window_filter.contains(&h)))
         {
-            machine.zero(out as usize, 48);
-            machine.write::<u32>(out as usize, hwnd);
-            machine.write::<u32>(out as usize + 4, 0xf);
-            machine.write::<u32>(out as usize + 24, MSG_POSTED);
+            machine.zero(out as u64, 48);
+            machine.write::<u32>(out as u64, hwnd);
+            machine.write::<u32>((out as usize + 4) as u64, 0xf);
+            machine.write::<u32>((out as usize + 24) as u64, MSG_POSTED);
             if p[0] & 1 != 0 {
                 user_objects::consume_internal_paint(state, tid, hwnd);
             }
@@ -313,7 +313,7 @@ pub(super) fn call<A: crate::Arch>(
     queue.paint = paints.iter().any(|p| p.0 == tid);
     let now = machine.now();
     refresh(queue, &mut state.threads, now);
-    machine.zero(out as usize, 48);
+    machine.zero(out as u64, 48);
     let mut status = 0;
     match op {
         14 => {
@@ -333,14 +333,14 @@ pub(super) fn call<A: crate::Arch>(
             } else {
                 queue.keys[key]
             };
-            machine.write::<u32>(out as usize, value as u32);
+            machine.write::<u32>(out as u64, value as u32);
         }
         17 => {
             if p[0] != 0 {
                 return 0xc00000bb;
             }
             for (i, key) in queue.keys.iter_mut().enumerate() {
-                *key = machine.read::<u8>(p[1] as usize + i);
+                *key = machine.read::<u8>((p[1] as usize + i) as u64);
             }
             session::write_object_part(queue.input_offset, 52, &queue.keys);
             session::write_object_part(queue.input_offset, 308, &1u32.to_le_bytes());
@@ -364,7 +364,7 @@ pub(super) fn call<A: crate::Arch>(
             if op == 13 && queue.menu_owner != 0 && p[1] & 1 == 0 {
                 return 0xc0000022;
             }
-            machine.write::<u32>(out as usize, previous);
+            machine.write::<u32>(out as u64, previous);
             match op {
                 11 => {
                     queue.active = caret_handle;
@@ -378,18 +378,18 @@ pub(super) fn call<A: crate::Arch>(
                     queue.capture = caret_handle;
                     queue.menu_owner = if p[1] & 1 != 0 { caret_handle } else { 0 };
                     queue.move_size = if p[1] & 2 != 0 { caret_handle } else { 0 };
-                    machine.write::<u32>(out as usize + 4, caret_handle);
+                    machine.write::<u32>((out as usize + 4) as u64, caret_handle);
                 }
             }
             sync_activation(queue);
         }
         8 | 9 => {
-            machine.write::<u32>(out as usize, queue.caret);
+            machine.write::<u32>(out as u64, queue.caret);
             for (j, value) in queue.caret_rect.iter().enumerate() {
-                machine.write::<i32>(out as usize + 4 + j * 4, *value);
+                machine.write::<i32>((out as usize + 4 + j * 4) as u64, *value);
             }
-            machine.write::<i32>(out as usize + 20, queue.caret_hide);
-            machine.write::<i32>(out as usize + 24, queue.caret_state);
+            machine.write::<i32>((out as usize + 20) as u64, queue.caret_hide);
+            machine.write::<i32>((out as usize + 24) as u64, queue.caret_state);
             if op == 8 {
                 if caret_handle == 0 || caret_handle != queue.caret {
                     queue.caret_rect = [0; 4];
@@ -429,13 +429,13 @@ pub(super) fn call<A: crate::Arch>(
             sync_caret(queue);
         }
         0 => {
-            machine.write::<u64>(out as usize, queue.id);
-            machine.write::<u64>(out as usize + 8, queue.offset);
+            machine.write::<u64>(out as u64, queue.id);
+            machine.write::<u64>((out as usize + 8) as u64, queue.offset);
         }
-        1 => machine.write::<u32>(out as usize, queue.event),
+        1 => machine.write::<u32>(out as u64, queue.event),
         2 | 3 => {
-            machine.write::<u32>(out as usize, queue.wake_bits);
-            machine.write::<u32>(out as usize + 4, queue.changed_bits);
+            machine.write::<u32>(out as u64, queue.wake_bits);
+            machine.write::<u32>((out as usize + 4) as u64, queue.changed_bits);
             if op == 2 {
                 queue.wake_mask = p[0];
                 queue.changed_mask = p[1];
@@ -488,7 +488,7 @@ pub(super) fn call<A: crate::Arch>(
             } else {
                 queue.timers.push(timer);
             }
-            machine.write::<u64>(out as usize, id);
+            machine.write::<u64>(out as u64, id);
         }
         5 => {
             let id = p[3] as u64 | ((p[4] as u64) << 32);
@@ -516,12 +516,12 @@ pub(super) fn call<A: crate::Arch>(
             });
             if let Some(i) = index {
                 let timer = &mut queue.timers[i];
-                machine.write::<u32>(out as usize, timer.window);
-                machine.write::<u32>(out as usize + 4, timer.message);
-                machine.write::<u64>(out as usize + 8, timer.id);
-                machine.write::<u64>(out as usize + 16, timer.callback);
-                machine.write::<u32>(out as usize + 24, MSG_POSTED); // MSG_POSTED
-                machine.write::<u32>(out as usize + 36, (now / 1_000_000) as u32);
+                machine.write::<u32>(out as u64, timer.window);
+                machine.write::<u32>((out as usize + 4) as u64, timer.message);
+                machine.write::<u64>((out as usize + 8) as u64, timer.id);
+                machine.write::<u64>((out as usize + 16) as u64, timer.callback);
+                machine.write::<u32>((out as usize + 24) as u64, MSG_POSTED); // MSG_POSTED
+                machine.write::<u32>((out as usize + 36) as u64, (now / 1_000_000) as u32);
                 if p[0] & 1 != 0 {
                     timer.deadline = now.saturating_add(timer.period);
                 }

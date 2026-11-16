@@ -136,62 +136,62 @@ impl Bda {
     pub(super) const BASE: usize = 0x400;
 
     pub(crate) fn video_mode<A: crate::Arch>(machine: &A) -> u8 {
-        machine.read(Self::BASE + core::mem::offset_of!(Self, video_mode))
+        machine.read((Self::BASE + core::mem::offset_of!(Self, video_mode)) as u64)
     }
 
     pub(crate) fn tick_count<A: crate::Arch>(machine: &A) -> u32 {
-        machine.read(Self::BASE + core::mem::offset_of!(Self, tick_count))
+        machine.read((Self::BASE + core::mem::offset_of!(Self, tick_count)) as u64)
     }
 
     pub(crate) fn set_page0_cursor<A: crate::Arch>(machine: &mut A, col: u8, row: u8) {
         let addr = Self::BASE + core::mem::offset_of!(Self, cursor_pos);
-        machine.write::<u16>(addr, u16::from_le_bytes([col, row]));
+        machine.write::<u16>(addr as u64, u16::from_le_bytes([col, row]));
     }
 
     pub(crate) fn keyboard_buffer_nonempty<A: crate::Arch>(machine: &A) -> bool {
-        let head: u16 = machine.read(Self::BASE + core::mem::offset_of!(Self, kb_head));
-        let tail: u16 = machine.read(Self::BASE + core::mem::offset_of!(Self, kb_tail));
+        let head: u16 = machine.read((Self::BASE + core::mem::offset_of!(Self, kb_head)) as u64);
+        let tail: u16 = machine.read((Self::BASE + core::mem::offset_of!(Self, kb_tail)) as u64);
         head != tail
     }
 
     pub(crate) fn clear_keyboard_buffer<A: crate::Arch>(machine: &mut A) {
         let first = core::mem::offset_of!(Self, kb_ring) as u16;
-        machine.write::<u16>(Self::BASE + core::mem::offset_of!(Self, kb_head), first);
-        machine.write::<u16>(Self::BASE + core::mem::offset_of!(Self, kb_tail), first);
-        machine.copy_to(Self::BASE + core::mem::offset_of!(Self, kb_ring), &[0; 32]);
+        machine.write::<u16>((Self::BASE + core::mem::offset_of!(Self, kb_head)) as u64, first);
+        machine.write::<u16>((Self::BASE + core::mem::offset_of!(Self, kb_tail)) as u64, first);
+        machine.copy_to((Self::BASE + core::mem::offset_of!(Self, kb_ring)) as u64, &[0; 32]);
     }
 
     pub(crate) fn pop_keyboard_word<A: crate::Arch>(machine: &mut A) -> Option<u16> {
         let head_addr = Self::BASE + core::mem::offset_of!(Self, kb_head);
         let tail_addr = Self::BASE + core::mem::offset_of!(Self, kb_tail);
-        let head: u16 = machine.read(head_addr);
-        let tail: u16 = machine.read(tail_addr);
+        let head: u16 = machine.read(head_addr as u64);
+        let tail: u16 = machine.read(tail_addr as u64);
         if head == tail {
             return None;
         }
         let first = core::mem::offset_of!(Self, kb_ring) as u16;
         let end = first + core::mem::size_of::<[u16; 16]>() as u16;
-        let word = machine.read::<u16>(Self::BASE + head as usize);
+        let word = machine.read::<u16>((Self::BASE + head as usize) as u64);
         let next = if head + 2 >= end { first } else { head + 2 };
-        machine.write::<u16>(head_addr, next);
+        machine.write::<u16>(head_addr as u64, next);
         Some(word)
     }
 
     pub(crate) fn keyboard_flags<A: crate::Arch>(machine: &A) -> u8 {
-        machine.read(Self::BASE + core::mem::offset_of!(Self, kb_flags))
+        machine.read((Self::BASE + core::mem::offset_of!(Self, kb_flags)) as u64)
     }
 
     pub(crate) fn set_keyboard_flags<A: crate::Arch>(machine: &mut A, flags: u8) {
-        machine.write(Self::BASE + core::mem::offset_of!(Self, kb_flags), flags);
+        machine.write((Self::BASE + core::mem::offset_of!(Self, kb_flags)) as u64, flags);
     }
 }
 
 macro_rules! bda_field {
     ($machine:expr, $field:ident) => {
-        $machine.read(Bda::BASE + core::mem::offset_of!(Bda, $field))
+        $machine.read((Bda::BASE + core::mem::offset_of!(Bda, $field)) as u64)
     };
     ($machine:expr, $field:ident = $val:expr) => {
-        $machine.write(Bda::BASE + core::mem::offset_of!(Bda, $field), $val)
+        $machine.write((Bda::BASE + core::mem::offset_of!(Bda, $field)) as u64, $val)
     };
 }
 pub(super) use bda_field;
@@ -256,7 +256,7 @@ fn seed_bda<A: crate::Arch>(machine: &mut A) {
     // whatever the firmware left behind (a real POST cleared it), and guests
     // read unseeded fields directly — DOS/4GW #DE'd converting a leftover
     // 0xFFF1xxxx at 40:6C to a time of day.
-    machine.copy_to(Bda::BASE, &[0u8; 0x100]);
+    machine.copy_to((Bda::BASE) as u64, &[0u8; 0x100]);
     // Tick-of-day counter: a real POST seeds 40:6C from the RTC.
     let ticks = super::dos::rtc_ticks_today(machine);
     bda_field!(machine, tick_count = ticks);

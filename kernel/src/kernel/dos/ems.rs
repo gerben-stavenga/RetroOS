@@ -305,8 +305,8 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
             let mut count = 0u16;
             for i in 1..MAX_EMS_HANDLES {
                 if let Some(ref h) = ems.handles[i] {
-                    machine.write::<u16>(addr as usize, i as u16);
-                    machine.write::<u16>(addr as usize + 2, h.pages);
+                    machine.write::<u16>(addr as u64, i as u16);
+                    machine.write::<u16>((addr as usize + 2) as u64, h.pages);
                     addr += 4;
                     count += 1;
                 }
@@ -325,8 +325,8 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
             let result = (|| -> Result<(), u8> {
                 if sub > 1 { return Err(0x8F); }
                 for i in 0..usize::from(count) {
-                    let logical = machine.read::<u16>(address + i * 4);
-                    let physical = machine.read::<u16>(address + i * 4 + 2);
+                    let logical = machine.read::<u16>((address + i * 4) as u64);
+                    let physical = machine.read::<u16>((address + i * 4 + 2) as u64);
                     let window = if sub == 0 { usize::from(physical) } else {
                         let offset = physical.checked_sub(ems_frame_seg()).ok_or(0x8B)?;
                         if !offset.is_multiple_of(0x400) { return Err(0x8B); }
@@ -426,8 +426,8 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
                 let base = (es << 4) + di;
                 for i in 0..4u32 {
                     let seg = ems_frame_seg() + (i as u16) * 0x0400;
-                    machine.write::<u16>((base + i * 4) as usize, seg);
-                    machine.write::<u16>((base + i * 4 + 2) as usize, i as u16);
+                    machine.write::<u16>((base + i * 4) as u64, seg);
+                    machine.write::<u16>((base + i * 4 + 2) as u64, i as u16);
                 }
                 regs.rcx = (regs.rcx & !0xFFFF) | 4; // 4 mappable pages
                 regs.rax &= !0xFF00;
@@ -448,10 +448,10 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
 /// pages, but the initial offset must lie within its first 16 KiB page.
 fn region_address<A: crate::Arch>(machine: &A, ems: &EmsState, descriptor: usize,
                                   length: usize) -> Result<usize, u8> {
-    let kind = machine.read::<u8>(descriptor);
-    let handle = machine.read::<u16>(descriptor + 1);
-    let offset = usize::from(machine.read::<u16>(descriptor + 3));
-    let page = usize::from(machine.read::<u16>(descriptor + 5));
+    let kind = machine.read::<u8>(descriptor as u64);
+    let handle = machine.read::<u16>((descriptor + 1) as u64);
+    let offset = usize::from(machine.read::<u16>((descriptor + 3) as u64));
+    let page = usize::from(machine.read::<u16>((descriptor + 5) as u64));
     match kind {
         0 => {
             let address = (page << 4) + offset;
@@ -502,7 +502,7 @@ fn move_region<A: crate::Arch>(machine: &mut A, ems: &EmsState, regs: &Regs) -> 
     let sub = regs.rax as u8;
     if sub > 1 { return Err(0x8F); }
     let descriptor = ((regs.ds as u16 as usize) << 4) + regs.rsi as u16 as usize;
-    let length = machine.read::<u32>(descriptor) as usize;
+    let length = machine.read::<u32>(descriptor as u64) as usize;
     if length > 0x10_0000 { return Err(0x96); }
     let src = region_address(machine, ems, descriptor + 4, length)?;
     let dst = region_address(machine, ems, descriptor + 11, length)?;
@@ -510,21 +510,21 @@ fn move_region<A: crate::Arch>(machine: &mut A, ems: &EmsState, regs: &Regs) -> 
     let destinations = region_spans(ems, dst, length);
     let overlap = sources.iter().any(|&(s, sn)| destinations.iter()
         .any(|&(d, dn)| s < d + dn && d < s + sn));
-    let overlap_status = if machine.read::<u8>(descriptor + 4)
-        != machine.read::<u8>(descriptor + 11) { 0x94 } else if sub == 1 { 0x97 } else { 0x92 };
+    let overlap_status = if machine.read::<u8>((descriptor + 4) as u64)
+        != machine.read::<u8>((descriptor + 11) as u64) { 0x94 } else if sub == 1 { 0x97 } else { 0x92 };
     if overlap && sub == 1 { return Err(overlap_status); }
     if sub == 0 && !overlap {
-        machine.copy_within(src, dst, length);
+        machine.copy_within(src as u64,dst as u64, length);
         return Ok(());
     }
     // Snapshot before writing: linear addresses alone cannot reveal physical
     // overlap through two different page-frame windows. The spec limits this
     // temporary buffer to 1 MiB, and no guest page mappings need to change.
     let mut source = alloc::vec![0u8; length];
-    machine.copy_from(src, &mut source);
+    machine.copy_from(src as u64, &mut source);
     if sub == 1 {
-        machine.copy_within(dst, src, length);
+        machine.copy_within(dst as u64,src as u64, length);
     }
-    machine.copy_to(dst, &source);
+    machine.copy_to(dst as u64, &source);
     if overlap { Err(overlap_status) } else { Ok(()) }
 }

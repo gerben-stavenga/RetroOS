@@ -19,7 +19,7 @@ pub(super) fn call<A: crate::Arch>(
             return 0xc000000d;
         }
         let units: Vec<u16> = (0..length / 2)
-            .map(|i| machine.read::<u16>((data + i * 2) as usize))
+            .map(|i| machine.read::<u16>(((data + i * 2) as usize) as u64))
             .collect();
         let Ok(path) = alloc::string::String::from_utf16(&units) else {
             return 0xc0000033;
@@ -43,7 +43,7 @@ pub(super) fn call<A: crate::Arch>(
             .into_iter()
             .enumerate()
             {
-                machine.write::<u32>(out as usize + i * 4, value);
+                machine.write::<u32>((out as usize + i * 4) as u64, value);
             }
             return 0;
         }
@@ -119,9 +119,9 @@ pub(super) fn call<A: crate::Arch>(
                 kt.close_fd(slot);
                 return 0xc0000022;
             }
-        machine.write::<u32>(out as usize, slot as u32);
+        machine.write::<u32>(out as u64, slot as u32);
         machine.write::<u32>(
-            out as usize + 4,
+            (out as usize + 4) as u64,
             if !existed {
                 2
             } else if truncate {
@@ -167,7 +167,7 @@ pub(super) fn call<A: crate::Arch>(
         if name.len() > 255 || short.len() > 12 {
             return 0xc0000106;
         }
-        machine.zero(out as usize, 556);
+        machine.zero(out as u64, 556);
         let attributes =
             u32::from(
                 entry
@@ -184,13 +184,13 @@ pub(super) fn call<A: crate::Arch>(
         .into_iter()
         .enumerate()
         {
-            machine.write::<u32>(out as usize + i * 4, value);
+            machine.write::<u32>((out as usize + i * 4) as u64, value);
         }
         for (i, value) in name.into_iter().enumerate() {
-            machine.write::<u16>(out as usize + 20 + i * 2, value);
+            machine.write::<u16>((out as usize + 20 + i * 2) as u64, value);
         }
         for (i, value) in short.into_iter().enumerate() {
-            machine.write::<u16>(out as usize + 532 + i * 2, value);
+            machine.write::<u16>((out as usize + 532 + i * 2) as u64, value);
         }
         return 0;
     }
@@ -232,10 +232,10 @@ pub(super) fn call<A: crate::Arch>(
                     return 0xc000000d;
                 }
                 let mut buffer = vec![0; length as usize];
-                machine.copy_from(data as usize, &mut buffer);
+                machine.copy_from(data as u64, &mut buffer);
                 let n = vfs::write_by_handle(machine, handle, &buffer);
                 if n >= 0 {
-                    machine.write::<u32>(out as usize, n as u32);
+                    machine.write::<u32>(out as u64, n as u32);
                 }
                 n
             }
@@ -277,8 +277,8 @@ pub(super) fn call<A: crate::Arch>(
         if n < 0 {
             return 0xc0000001;
         }
-        machine.copy_to(data as usize, &buffer[..n as usize]);
-        machine.write::<u32>(out as usize, n as u32);
+        machine.copy_to(data as u64, &buffer[..n as usize]);
+        machine.write::<u32>(out as u64, n as u32);
         return if n == 0 && length != 0 { 0xc0000011 } else { 0 };
     }
     if op == 3 {
@@ -292,7 +292,7 @@ pub(super) fn call<A: crate::Arch>(
             _ => return 0xc0000008,
         };
         for (i, word) in [size, position, directory].into_iter().enumerate() {
-            machine.write::<u32>(out as usize + i * 4, word);
+            machine.write::<u32>((out as usize + i * 4) as u64, word);
         }
         return 0;
     }

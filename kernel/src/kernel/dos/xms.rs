@@ -423,11 +423,11 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
 fn xms_move<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     let addr = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32);
 
-    let length = machine.read::<u32>((addr) as usize) as usize;
-    let src_handle = machine.read::<u16>((addr + 4) as usize);
-    let src_offset = machine.read::<u32>((addr + 6) as usize);
-    let dst_handle = machine.read::<u16>((addr + 10) as usize);
-    let dst_offset = machine.read::<u32>((addr + 12) as usize);
+    let length = machine.read::<u32>(addr as u64) as usize;
+    let src_handle = machine.read::<u16>((addr + 4) as u64);
+    let src_offset = machine.read::<u32>((addr + 6) as u64);
+    let dst_handle = machine.read::<u16>((addr + 10) as u64);
+    let dst_offset = machine.read::<u32>((addr + 12) as u64);
 
     if length & 1 != 0 {
         regs.rax &= !0xFFFF;
@@ -491,7 +491,7 @@ fn xms_move<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs
         return;
     }
 
-    machine.copy_within(src as usize, dst as usize, length);
+    machine.copy_within(src as u64,dst as u64, length);
     regs.rax = (regs.rax & !0xFFFF) | 1;
 }
 

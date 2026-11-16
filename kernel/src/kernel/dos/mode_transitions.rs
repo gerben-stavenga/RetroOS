@@ -212,14 +212,14 @@ pub(super) fn resume_continuation<A: crate::Arch>(machine: &mut A, dos: &mut thr
     let callback_return = save.frame.rflags & machine::VM_FLAG as u64 != 0
         && save.rm_call_struct_addr.is_some();
     let saved_regs = save.rm_call_struct_addr.map(|addr| {
-        let saved = machine.read::<RmCallStruct>((addr) as usize);
+        let saved = machine.read::<RmCallStruct>(addr as u64);
         if !callback_return {
             // 0300/01/02 return results through the caller's register block.
             // An allocated callback is the opposite direction: its PM handler
             // has already edited this block to define the RM continuation, and
             // extender cleanup code may read it again after the mode switch.
             let current = RmCallStruct::capture(regs);
-            machine.write::<RmCallStruct>((addr) as usize, current);
+            machine.write::<RmCallStruct>(addr as u64, current);
         }
         saved
     });
@@ -658,13 +658,13 @@ pub(super) fn push_iret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], regs
     let addr = base.wrapping_add(eff_sp);
     let a = addr as usize;
     if frame_use32 {
-        machine.write::<u32>(a, eip);
-        machine.write::<u32>(a + 4, cs as u32);
-        machine.write::<u32>(a + 8, flags);
+        machine.write::<u32>(a as u64, eip);
+        machine.write::<u32>((a + 4) as u64, cs as u32);
+        machine.write::<u32>((a + 8) as u64, flags);
     } else {
-        machine.write::<u16>(a, eip as u16);
-        machine.write::<u16>(a + 2, cs);
-        machine.write::<u16>(a + 4, flags as u16);
+        machine.write::<u16>(a as u64, eip as u16);
+        machine.write::<u16>((a + 2) as u64, cs);
+        machine.write::<u16>((a + 4) as u64, flags as u16);
     }
     regs.set_sp32(sp);
 }
@@ -692,11 +692,11 @@ pub(super) fn push_farret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], re
     let addr = base.wrapping_add(eff_sp);
     let a = addr as usize;
     if handler_is_32 {
-        machine.write::<u32>(a, eip);
-        machine.write::<u32>(a + 4, cs as u32);
+        machine.write::<u32>(a as u64, eip);
+        machine.write::<u32>((a + 4) as u64, cs as u32);
     } else {
-        machine.write::<u16>(a, eip as u16);
-        machine.write::<u16>(a + 2, cs);
+        machine.write::<u16>(a as u64, eip as u16);
+        machine.write::<u16>((a + 2) as u64, cs);
     }
     regs.set_sp32(sp);
 }
@@ -714,9 +714,9 @@ pub(super) fn pop_iret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], regs:
     let addr = base.wrapping_add(eff_sp);
     let a = addr as usize;
     let frame = if frame_use32 {
-        (machine.read::<u32>(a), machine.read::<u32>(a + 4) as u16, machine.read::<u32>(a + 8))
+        (machine.read::<u32>(a as u64), machine.read::<u32>((a + 4) as u64) as u16, machine.read::<u32>((a + 8) as u64))
     } else {
-        (machine.read::<u16>(a) as u32, machine.read::<u16>(a + 2), machine.read::<u16>(a + 4) as u32)
+        (machine.read::<u16>(a as u64) as u32, machine.read::<u16>((a + 2) as u64), machine.read::<u16>((a + 4) as u64) as u32)
     };
     let new_sp = if stack_is_32 {
         sp_in.wrapping_add(frame_size)

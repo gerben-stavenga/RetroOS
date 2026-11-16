@@ -36,8 +36,8 @@ pub(super) fn buffered_input_resume<A: crate::Arch>(_machine: &mut A, buf_lin: u
             };
             match ch {
                 0x0D => {
-                    machine.write::<u8>((buf_lin + 1) as usize, count);
-                    machine.write::<u8>((buf_lin + 2 + count as u32) as usize, 0x0D);
+                    machine.write::<u8>(((buf_lin + 1) as usize) as u64, count);
+                    machine.write::<u8>(((buf_lin + 2 + count as u32) as usize) as u64, 0x0D);
                     dos_putchar(machine, dos, 0x0D);
                     dos_putchar(machine, dos, 0x0A);
                     None
@@ -54,7 +54,7 @@ pub(super) fn buffered_input_resume<A: crate::Arch>(_machine: &mut A, buf_lin: u
                 }
                 _ => {
                     if (count as u32) + 1 < max_chars as u32 {
-                        machine.write::<u8>((buf_lin + 2 + count as u32) as usize, ch);
+                        machine.write::<u8>(((buf_lin + 2 + count as u32) as usize) as u64, ch);
                         dos_putchar(machine, dos, ch);
                         Some(buffered_input_resume(machine, buf_lin, max_chars, count + 1))
                     } else {

@@ -216,8 +216,8 @@ impl Os2State {
                     let code = process.exit_code.unwrap();
                     (if code < 0 { 4 } else { 0 }, code as u32)
                 } else { (process.pid, 0) };
-                machine.write::<u32>(process.result_out, termination);
-                machine.write::<u32>(process.result_out + 4, result);
+                machine.write::<u32>(process.result_out as u64, termination);
+                machine.write::<u32>((process.result_out + 4) as u64, result);
             }
         }
     }
@@ -532,7 +532,7 @@ fn map_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i3
         let end32 = base32.checked_add(object.size).ok_or(8)?;
         if end32 > USER_LIMIT { return Err(8); }
         let base = base32 as usize;
-        machine.zero(base, object.size as usize);
+        machine.zero(base as u64, object.size as usize);
         for n in 0..object.map_count {
             let page = image.page(object.map_index + n).map_err(|_| 8)?;
             let within = n.checked_mul(image.header.page_size).ok_or(8)?;
@@ -543,7 +543,7 @@ fn map_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i3
                     // page of an object may contain linker padding beyond the
                     // object's declared virtual size; map only its live prefix.
                     let remaining = object.size.saturating_sub(within) as usize;
-                    machine.copy_to(base + within as usize, &bytes[..bytes.len().min(remaining)]);
+                    machine.copy_to((base + within as usize) as u64, &bytes[..bytes.len().min(remaining)]);
                 }
                 lx::PAGE_ZEROED | lx::PAGE_INVALID => {}
                 _ => return Err(8),
@@ -596,16 +596,16 @@ fn apply_fixups<A: crate::Arch>(machine: &mut A, modules: &[Module], module_inde
         let linear = target.linear.wrapping_add(fixup.additive);
         let offset = target.offset.wrapping_add(fixup.additive);
         match fixup.source_type & 0x0f {
-            0 => machine.write::<u8>(source as usize, linear as u8),
+            0 => machine.write::<u8>(source as u64, linear as u8),
             3 => {
-                machine.write::<u16>(source as usize, offset as u16);
-                machine.write::<u16>(source as usize + 2, target.selector);
+                machine.write::<u16>(source as u64, offset as u16);
+                machine.write::<u16>((source as usize + 2) as u64, target.selector);
             }
-            5 => machine.write::<u16>(source as usize, offset as u16),
-            2 => machine.write::<u16>(source as usize, target.selector),
-            6 => { machine.write::<u32>(source as usize, offset); machine.write::<u16>(source as usize + 4, target.selector); },
-            7 => machine.write::<u32>(source as usize, linear),
-            8 => machine.write::<u32>(source as usize, linear.wrapping_sub(source.wrapping_add(4))),
+            5 => machine.write::<u16>(source as u64, offset as u16),
+            2 => machine.write::<u16>(source as u64, target.selector),
+            6 => { machine.write::<u32>(source as u64, offset); machine.write::<u16>((source as usize + 4) as u64, target.selector); },
+            7 => machine.write::<u32>(source as u64, linear),
+            8 => machine.write::<u32>(source as u64, linear.wrapping_sub(source.wrapping_add(4))),
             _ => return Err(8),
         }
     }
@@ -730,14 +730,14 @@ pub fn exec_lx_into<A: crate::Arch>(
         let size = main.header.stack_size.max(64 * 1024) as usize;
         if size >= STACK_TOP as usize { return Err(8); }
         let base = STACK_TOP as usize - size;
-        machine.zero(base, size);
+        machine.zero(base as u64, size);
         crate::kernel::memory::protect(machine, base / 4096, size.div_ceil(4096), true, false);
         STACK_TOP
     };
 
     // OS/2 loader process data: a TIB selected by FS, followed by TIB2, PIB,
     // environment and the two-string command block expected by Open Watcom.
-    machine.zero(PROCESS_DATA as usize, 8192);
+    machine.zero(PROCESS_DATA as u64, 8192);
     crate::kernel::memory::protect(machine, PROCESS_DATA as usize / 4096, 2, true, false);
     let tib = PROCESS_DATA;
     let tib2 = tib + 0x40;
@@ -745,16 +745,16 @@ pub fn exec_lx_into<A: crate::Arch>(
     let env = tib + 4096;
     let image_name = tib + 0x400;
     let tib_sel = push_descriptor(&mut ldt, tib, 4096, false, true);
-    machine.write::<u32>((tib + 4) as usize, stack.saturating_sub(main.header.stack_size.max(64 * 1024)));
-    machine.write::<u32>((tib + 8) as usize, stack);
-    machine.write::<u32>(tib as usize, 0xffff_ffff);
-    machine.write::<u32>((tib + 16) as usize, 20);
-    machine.write::<u32>((tib + 12) as usize, tib2);
-    machine.write::<u32>(tib2 as usize, tid as u32 + 1);
-    machine.write::<u32>(pib as usize, tid as u32 + 1);
-    machine.write::<u32>((pib + 8) as usize, 1);
-    machine.write::<u32>((pib + 16) as usize, env);
-    machine.write::<u32>((pib + 24) as usize, 2); // windowable VIO session
+    machine.write::<u32>((tib + 4) as u64, stack.saturating_sub(main.header.stack_size.max(64 * 1024)));
+    machine.write::<u32>((tib + 8) as u64, stack);
+    machine.write::<u32>(tib as u64, 0xffff_ffff);
+    machine.write::<u32>((tib + 16) as u64, 20);
+    machine.write::<u32>((tib + 12) as u64, tib2);
+    machine.write::<u32>(tib2 as u64, tid as u32 + 1);
+    machine.write::<u32>(pib as u64, tid as u32 + 1);
+    machine.write::<u32>((pib + 8) as u64, 1);
+    machine.write::<u32>((pib + 16) as u64, env);
+    machine.write::<u32>((pib + 24) as u64, 2); // windowable VIO session
     let environment = if parent_env.is_empty() {
         b"PATH=C:\\OS2\\APPS;C:\\RETROOS\\OS2\\DLL\0COMSPEC=C:\\RETROOS\\COMMAND.COM\0\0".to_vec()
     } else { parent_env.to_vec() };
@@ -762,7 +762,7 @@ pub fn exec_lx_into<A: crate::Arch>(
     let guest_environment = crate::kernel::text::Encoding::oem().encode(
         &alloc::string::String::from_utf8_lossy(&environment), b'?').0;
     if guest_environment.len() > 4096 { return Err(8); }
-    machine.copy_to(env as usize, &guest_environment);
+    machine.copy_to(env as u64, &guest_environment);
     let mut os2_name = Vec::with_capacity(main_path.len() + 4);
     os2_name.extend_from_slice(b"C:\\");
     let croot = crate::kernel::dos::c_root();
@@ -776,25 +776,25 @@ pub fn exec_lx_into<A: crate::Arch>(
     // block (argv[0]\0tail\0), not at that preceding image name. Virtual
     // Pascal obtains ParamStr(0) by walking backwards from pchcmd - 2.
     let os2_name = crate::kernel::text::Encoding::oem().encode(&alloc::string::String::from_utf8_lossy(&os2_name), b'?').0;
-    machine.copy_to(image_name as usize, &os2_name);
-    machine.write::<u8>(image_name as usize + os2_name.len(), 0);
+    machine.copy_to(image_name as u64, &os2_name);
+    machine.write::<u8>((image_name as usize + os2_name.len()) as u64, 0);
     let cmd = image_name + os2_name.len() as u32 + 1;
-    machine.write::<u32>((pib + 12) as usize, cmd);
-    machine.copy_to(cmd as usize, &os2_name);
-    machine.write::<u8>(cmd as usize + os2_name.len(), 0);
+    machine.write::<u32>((pib + 12) as u64, cmd);
+    machine.copy_to(cmd as u64, &os2_name);
+    machine.write::<u8>((cmd as usize + os2_name.len()) as u64, 0);
     let cmdtail = crate::kernel::text::Encoding::oem().encode(
         &alloc::string::String::from_utf8_lossy(cmdtail), b'?').0;
-    machine.copy_to(cmd as usize + os2_name.len() + 1, &cmdtail);
-    machine.write::<u8>(cmd as usize + os2_name.len() + 1 + cmdtail.len(), 0);
-    machine.write::<u8>(cmd as usize + os2_name.len() + 2 + cmdtail.len(), 0);
+    machine.copy_to((cmd as usize + os2_name.len() + 1) as u64, &cmdtail);
+    machine.write::<u8>((cmd as usize + os2_name.len() + 1 + cmdtail.len()) as u64, 0);
+    machine.write::<u8>((cmd as usize + os2_name.len() + 2 + cmdtail.len()) as u64, 0);
 
     // The CRT entry sees an OS/2 loader frame, not a C CALL frame.
     stack = stack.checked_sub(20).ok_or(8)?;
-    machine.write::<u32>(stack as usize, 0);
-    machine.write::<u32>(stack as usize + 4, 1); // main module handle
-    machine.write::<u32>(stack as usize + 8, pib);
-    machine.write::<u32>(stack as usize + 12, env);
-    machine.write::<u32>(stack as usize + 16, cmd);
+    machine.write::<u32>(stack as u64, 0);
+    machine.write::<u32>((stack as usize + 4) as u64, 1); // main module handle
+    machine.write::<u32>((stack as usize + 8) as u64, pib);
+    machine.write::<u32>((stack as usize + 12) as u64, env);
+    machine.write::<u32>((stack as usize + 16) as u64, cmd);
 
     for module in &modules { protect_module(machine, module)?; }
 
@@ -804,10 +804,10 @@ pub fn exec_lx_into<A: crate::Arch>(
     let mut state = Os2State::new();
     state.ldt = ldt;
     register_gates(&mut state, &modules);
-    machine.copy_to((PROCESS_DATA + 0x300) as usize, &[0xcd, GATE_VECTOR]);
+    machine.copy_to((PROCESS_DATA + 0x300) as u64, &[0xcd, GATE_VECTOR]);
     crate::kernel::memory::protect(machine, PROCESS_DATA as usize / 4096, 1, true, true);
     state.gates.push(Gate { cs: arch_abi::USER_CS, return_ip: PROCESS_DATA+0x302, api: Api::DllReturn, far16_args: 0 });
-    machine.copy_to((PROCESS_DATA+0x310) as usize,&[0xf4,0xcd,GATE_VECTOR]);
+    machine.copy_to((PROCESS_DATA+0x310) as u64,&[0xf4,0xcd,GATE_VECTOR]);
     state.gates.push(Gate {cs:arch_abi::USER_CS,return_ip:PROCESS_DATA+0x313,api:Api::WaitReturn,far16_args:0});
     state.environment = environment;
     state.set_exec_path(&main_path);
@@ -1036,7 +1036,7 @@ fn gate_from_event(state: &Os2State, cs: u16, ip: u32) -> Option<Gate> {
 
 fn finish_call<A: crate::Arch>(machine: &A, regs: &mut Regs, result: u32) {
     let sp = regs.sp() as usize;
-    let return_eip = machine.read::<u32>(sp);
+    let return_eip = machine.read::<u32>(sp as u64);
     regs.rax = result as u64;
     regs.frame.rip = return_eip as u64;
     // _System is caller-clean: consume only CALL's return address. The caller
@@ -1050,14 +1050,14 @@ fn finish_gate<A: crate::Arch>(machine: &A, state: &Os2State, regs: &mut Regs, g
     } else {
         let sp = stack_linear(state, regs);
         regs.rax = (regs.rax & !0xffff) | result as u16 as u64;
-        regs.frame.rip = machine.read::<u16>(sp) as u64;
-        regs.frame.cs = machine.read::<u16>(sp + 2) as u64;
+        regs.frame.rip = machine.read::<u16>(sp as u64) as u64;
+        regs.frame.cs = machine.read::<u16>((sp + 2) as u64) as u64;
         regs.frame.rsp = regs.frame.rsp.wrapping_add(4 + gate.far16_args as u64);
     }
 }
 
 fn arg32<A: crate::Arch>(machine: &A, regs: &Regs, n: usize) -> u32 {
-    machine.read::<u32>(regs.sp() as usize + 4 + n * 4)
+    machine.read::<u32>((regs.sp() as usize + 4 + n * 4) as u64)
 }
 
 fn c_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
@@ -1068,7 +1068,7 @@ fn raw_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32>
     if address == 0 { return Err(ERROR_INVALID_PARAMETER); }
     let mut out = Vec::new();
     for i in 0..1024 {
-        let b = machine.read::<u8>(address as usize + i);
+        let b = machine.read::<u8>((address as usize + i) as u64);
         if b == 0 { return Ok(out); }
         out.push(b);
     }
@@ -1139,8 +1139,8 @@ fn dos_open<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, s
         return 4;
     };
     kt.fds[fd] = thread::FdKind::Vfs(handle);
-    machine.write::<u32>(phandle, fd as u32);
-    if paction != 0 { machine.write::<u32>(paction, if existed { if actions & 3 == 2 { 3 } else { 1 } } else { 2 }); }
+    machine.write::<u32>(phandle as u64, fd as u32);
+    if paction != 0 { machine.write::<u32>(paction as u64, if existed { if actions & 3 == 2 { 3 } else { 1 } } else { 2 }); }
     NO_ERROR
 }
 
@@ -1168,8 +1168,8 @@ fn dos_open_l<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
     if handle < 0 { return os2_error(handle); }
     let Some(fd) = kt.alloc_fd(3) else { crate::kernel::vfs::close_vfs_handle(handle); return 4; };
     kt.fds[fd] = thread::FdKind::Vfs(handle);
-    machine.write::<u32>(phandle, fd as u32);
-    if paction != 0 { machine.write::<u32>(paction, if existed { if actions & 3 == 2 { 3 } else { 1 } } else { 2 }); }
+    machine.write::<u32>(phandle as u64, fd as u32);
+    if paction != 0 { machine.write::<u32>(paction as u64, if existed { if actions & 3 == 2 { 3 } else { 1 } } else { 2 }); }
     NO_ERROR
 }
 
@@ -1186,8 +1186,8 @@ fn dos_read<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, r
         _ => return ERROR_INVALID_HANDLE,
     };
     if n < 0 { return os2_error(n); }
-    machine.copy_to(address, &bytes[..n as usize]);
-    if actual != 0 { machine.write::<u32>(actual, n as u32); }
+    machine.copy_to(address as u64, &bytes[..n as usize]);
+    if actual != 0 { machine.write::<u32>(actual as u64, n as u32); }
     NO_ERROR
 }
 
@@ -1198,7 +1198,7 @@ fn dos_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     let actual = arg32(machine, regs, 3) as usize;
     if handle >= thread::MAX_FDS { return ERROR_INVALID_HANDLE; }
     let mut bytes = vec![0u8; length];
-    machine.copy_from(buffer, &mut bytes);
+    machine.copy_from(buffer as u64, &mut bytes);
     let written = match kt.fds[handle] {
         thread::FdKind::ConsoleOut => {
             let text = crate::kernel::text::Encoding::oem().decode(&bytes, false).unwrap();
@@ -1211,7 +1211,7 @@ fn dos_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
         _ => return ERROR_INVALID_HANDLE,
     };
     if written < 0 { return ERROR_INVALID_HANDLE; }
-    if actual != 0 { machine.write::<u32>(actual, written as u32); }
+    if actual != 0 { machine.write::<u32>(actual as u64, written as u32); }
     NO_ERROR
 }
 
@@ -1226,13 +1226,13 @@ fn selector_base(state: &Os2State, selector: u16) -> Option<u32> {
 }
 
 fn write_pm_message<A: crate::Arch>(machine: &mut A, address: usize, message: PmMessage) {
-    machine.write::<u32>(address, message.hwnd);
-    machine.write::<u32>(address + 4, message.message);
-    machine.write::<u32>(address + 8, message.mp1);
-    machine.write::<u32>(address + 12, message.mp2);
-    machine.write::<u32>(address + 16, (machine.now() / 1_000_000) as u32);
-    machine.write::<u32>(address + 20, 0);
-    machine.write::<u32>(address + 24, 0);
+    machine.write::<u32>(address as u64, message.hwnd);
+    machine.write::<u32>((address + 4) as u64, message.message);
+    machine.write::<u32>((address + 8) as u64, message.mp1);
+    machine.write::<u32>((address + 12) as u64, message.mp2);
+    machine.write::<u32>((address + 16) as u64, (machine.now() / 1_000_000) as u32);
+    machine.write::<u32>((address + 20) as u64, 0);
+    machine.write::<u32>((address + 24) as u64, 0);
 }
 
 fn fill_pm_rect<A: crate::Arch>(machine: &A, state: &mut Os2State, regs: &Regs) -> u32 {
@@ -1242,10 +1242,10 @@ fn fill_pm_rect<A: crate::Arch>(machine: &A, state: &mut Os2State, regs: &Regs) 
     let Some(window) = state.pm_windows.iter_mut().find(|window| window.hwnd == hps) else {
         return 0;
     };
-    let left = machine.read::<i32>(rect).clamp(0, window.width as i32);
-    let bottom = machine.read::<i32>(rect + 4).clamp(0, window.height as i32);
-    let right = machine.read::<i32>(rect + 8).clamp(left, window.width as i32);
-    let top = machine.read::<i32>(rect + 12).clamp(bottom, window.height as i32);
+    let left = machine.read::<i32>(rect as u64).clamp(0, window.width as i32);
+    let bottom = machine.read::<i32>((rect + 4) as u64).clamp(0, window.height as i32);
+    let right = machine.read::<i32>((rect + 8) as u64).clamp(left, window.width as i32);
+    let top = machine.read::<i32>((rect + 12) as u64).clamp(bottom, window.height as i32);
     for pm_y in bottom..top {
         let y = window.height as i32 - 1 - pm_y;
         for x in left..right {
@@ -1300,11 +1300,11 @@ fn begin_wndproc<A: crate::Arch>(
     };
     if window.wndproc == 0 || state.callback.is_some() { return false; }
     let sp = regs.sp().wrapping_sub(20);
-    machine.write::<u32>(sp as usize, state.callback_return);
-    machine.write::<u32>(sp as usize + 4, message.hwnd);
-    machine.write::<u32>(sp as usize + 8, message.message);
-    machine.write::<u32>(sp as usize + 12, message.mp1);
-    machine.write::<u32>(sp as usize + 16, message.mp2);
+    machine.write::<u32>(sp as u64, state.callback_return);
+    machine.write::<u32>((sp as usize + 4) as u64, message.hwnd);
+    machine.write::<u32>((sp as usize + 8) as u64, message.message);
+    machine.write::<u32>((sp as usize + 12) as u64, message.mp1);
+    machine.write::<u32>((sp as usize + 16) as u64, message.mp2);
     state.callback = Some(Callback { dispatch_sp: regs.sp() as u32 });
     regs.frame.rsp = sp;
     regs.frame.rip = window.wndproc as u64;
@@ -1317,10 +1317,10 @@ fn alloc_os2_memory<A: crate::Arch>(machine: &mut A, state: &mut Os2State, out: 
     if end >= USER_LIMIT { return ERROR_NOT_ENOUGH_MEMORY; }
     let base = state.heap_next;
     state.heap_next = end;
-    machine.zero(base as usize, size as usize);
+    machine.zero(base as u64, size as usize);
     crate::kernel::memory::protect(machine, base as usize / 4096, size as usize / 4096, true, false);
     state.allocations.push((base, size));
-    machine.write::<u32>(out, base);
+    machine.write::<u32>(out as u64, base);
     NO_ERROR
 }
 
@@ -1410,8 +1410,8 @@ fn draw_pm_bitmap<A: crate::Arch>(machine: &A, state: &mut Os2State, regs: &Regs
     let destination = arg32(machine, regs, 3) as usize;
     let Some(bitmap) = state.pm_bitmaps.iter().find(|bitmap| bitmap.handle == handle) else { return 0; };
     let Some(window) = state.pm_windows.iter_mut().find(|window| window.hwnd == hps) else { return 0; };
-    let left = machine.read::<i32>(destination);
-    let bottom = machine.read::<i32>(destination + 4);
+    let left = machine.read::<i32>(destination as u64);
+    let bottom = machine.read::<i32>((destination + 4) as u64);
     for source_y in 0..bitmap.height as i32 {
         let target_y = window.height as i32 - 1 - (bottom + bitmap.height as i32 - 1 - source_y);
         if !(0..window.height as i32).contains(&target_y) { continue; }
@@ -1449,8 +1449,8 @@ fn dispatch_api<A: crate::Arch>(
             let pos = crate::kernel::vfs::seek_by_handle(handle, offset, whence);
             if pos < 0 { os2_error(pos) } else {
                 if actual != 0 {
-                    machine.write::<u32>(actual, pos as u32);
-                    machine.write::<u32>(actual + 4, 0);
+                    machine.write::<u32>(actual as u64, pos as u32);
+                    machine.write::<u32>((actual + 4) as u64, 0);
                 }
                 NO_ERROR
             }
@@ -1471,7 +1471,7 @@ fn dispatch_api<A: crate::Arch>(
             let thread::FdKind::Vfs(handle) = kt.fds[fd] else { return ERROR_INVALID_HANDLE; };
             let pos = crate::kernel::vfs::seek_by_handle(handle, offset, whence);
             if pos < 0 { os2_error(pos) } else {
-                if actual != 0 { machine.write::<u32>(actual, pos as u32); }
+                if actual != 0 { machine.write::<u32>(actual as u64, pos as u32); }
                 NO_ERROR
             }
         }
@@ -1484,8 +1484,8 @@ fn dispatch_api<A: crate::Arch>(
                 thread::FdKind::PipeRead(_) | thread::FdKind::PipeWrite(_) => 2,
                 _ => 1,
             };
-            machine.write::<u32>(arg32(machine, regs, 1) as usize, kind);
-            machine.write::<u32>(arg32(machine, regs, 2) as usize, 0);
+            machine.write::<u32>(arg32(machine, regs, 1) as u64, kind);
+            machine.write::<u32>(arg32(machine, regs, 2) as u64, 0);
             NO_ERROR
         }
         Api::DosQueryCp => {
@@ -1493,8 +1493,8 @@ fn dispatch_api<A: crate::Arch>(
             let list = arg32(machine, regs, 1) as usize;
             let actual = arg32(machine, regs, 2) as usize;
             if cb < 4 { ERROR_INVALID_PARAMETER } else {
-                machine.write::<u32>(list, u32::from(lib::codepage::current_codepage().id));
-                machine.write::<u32>(actual, 4);
+                machine.write::<u32>(list as u64, u32::from(lib::codepage::current_codepage().id));
+                machine.write::<u32>(actual as u64, 4);
                 NO_ERROR
             }
         }
@@ -1511,7 +1511,7 @@ fn dispatch_api<A: crate::Arch>(
         Api::DosQueryModuleHandle => {
             let name = match c_string(machine, arg32(machine, regs, 0)) { Ok(n) => n, Err(e) => return e };
             if let Some(index) = find_module(&state.modules, &name) {
-                machine.write::<u32>(arg32(machine, regs, 1) as usize, index as u32 + 1);
+                machine.write::<u32>(arg32(machine, regs, 1) as u64, index as u32 + 1);
                 NO_ERROR
             } else { 126 }
         }
@@ -1529,7 +1529,7 @@ fn dispatch_api<A: crate::Arch>(
                 resolve_export(&state.modules, handle - 1, None, Some(&name))
             };
             match target {
-                Ok(t) => { machine.write::<u32>(arg32(machine, regs, 3) as usize, t.linear); NO_ERROR }
+                Ok(t) => { machine.write::<u32>(arg32(machine, regs, 3) as u64, t.linear); NO_ERROR }
                 Err(e) => e as u32,
             }
         }
@@ -1547,13 +1547,13 @@ fn dispatch_api<A: crate::Arch>(
                     13 => 0, 14 => (machine.now() / 1_000_000) as u32, 17 | 19 | 20 => 256 * 1024 * 1024,
                     26 => 1, _ => 0,
                 };
-                machine.write::<u32>(out + i * 4, value);
+                machine.write::<u32>((out + i * 4) as u64, value);
             }
             NO_ERROR
         }
         Api::DosSetRelMaxFH => {
             let max = arg32(machine, regs, 1) as usize;
-            if max != 0 { machine.write::<u32>(max, thread::MAX_FDS as u32); }
+            if max != 0 { machine.write::<u32>(max as u64, thread::MAX_FDS as u32); }
             NO_ERROR
         }
         Api::DosGetDateTime => {
@@ -1563,29 +1563,29 @@ fn dispatch_api<A: crate::Arch>(
             let unix = crate::kernel::clock::unix_to_local(unix);
             let [year, month, weekday, day, hour, minute, second, milliseconds] =
                 crate::kernel::clock::calendar_from_unix(i64::from(unix));
-            machine.zero(out, 12);
-            machine.write::<u8>(out, hour as u8);
-            machine.write::<u8>(out + 1, minute as u8);
-            machine.write::<u8>(out + 2, second as u8);
-            machine.write::<u8>(out + 3, (milliseconds / 10) as u8);
-            machine.write::<u8>(out + 4, day as u8);
-            machine.write::<u8>(out + 5, month as u8);
-            machine.write::<u16>(out + 6, year);
+            machine.zero(out as u64, 12);
+            machine.write::<u8>(out as u64, hour as u8);
+            machine.write::<u8>((out + 1) as u64, minute as u8);
+            machine.write::<u8>((out + 2) as u64, second as u8);
+            machine.write::<u8>((out + 3) as u64, (milliseconds / 10) as u8);
+            machine.write::<u8>((out + 4) as u64, day as u8);
+            machine.write::<u8>((out + 5) as u64, month as u8);
+            machine.write::<u16>((out + 6) as u64, year);
             // OS/2 reports minutes west of UTC (the opposite of our offset).
-            machine.write::<i16>(out + 8, -crate::kernel::clock::utc_offset_minutes() as i16);
-            machine.write::<u8>(out + 10, weekday as u8);
+            machine.write::<i16>((out + 8) as u64, -crate::kernel::clock::utc_offset_minutes() as i16);
+            machine.write::<u8>((out + 10) as u64, weekday as u8);
             NO_ERROR
         }
         Api::DosGetNamedSharedMem => extra::get_shared(machine, state, regs),
         Api::DosGetInfoBlocks => {
-            machine.write::<u32>(arg32(machine, regs, 0) as usize, PROCESS_DATA);
-            machine.write::<u32>(arg32(machine, regs, 1) as usize, PROCESS_DATA + 0x80);
+            machine.write::<u32>(arg32(machine, regs, 0) as u64, PROCESS_DATA);
+            machine.write::<u32>(arg32(machine, regs, 1) as u64, PROCESS_DATA + 0x80);
             NO_ERROR
         }
         Api::DosQueryDBCSEnv => {
             let cb = arg32(machine, regs, 0) as usize;
             let out = arg32(machine, regs, 2) as usize;
-            if cb != 0 { machine.zero(out, cb); }
+            if cb != 0 { machine.zero(out as u64, cb); }
             NO_ERROR
         }
         Api::DosMapCase | Api::DosQueryCtryInfo | Api::DosQueryCollate => nls::dispatch(machine, regs, api),
@@ -1679,7 +1679,7 @@ fn dispatch_api<A: crate::Arch>(
             let class = c_string(machine, arg32(machine, regs, 3)).unwrap_or_default();
             let client = create_pm_window(state, &class, 0x8008, 640, 480, true);
             let out = arg32(machine, regs, 8) as usize;
-            if out != 0 { machine.write::<u32>(out, client); }
+            if out != 0 { machine.write::<u32>(out as u64, client); }
             client
         }
         Api::WinBeginPaint => {
@@ -1687,10 +1687,10 @@ fn dispatch_api<A: crate::Arch>(
             let rect = arg32(machine, regs, 2) as usize;
             if let Some(window) = state.pm_windows.iter().find(|window| window.hwnd == hwnd) {
                 if rect != 0 {
-                    machine.write::<i32>(rect, 0);
-                    machine.write::<i32>(rect + 4, 0);
-                    machine.write::<i32>(rect + 8, window.width as i32);
-                    machine.write::<i32>(rect + 12, window.height as i32);
+                    machine.write::<i32>(rect as u64, 0);
+                    machine.write::<i32>((rect + 4) as u64, 0);
+                    machine.write::<i32>((rect + 8) as u64, window.width as i32);
+                    machine.write::<i32>((rect + 12) as u64, window.height as i32);
                 }
                 hwnd
             } else { 0 }
@@ -1714,22 +1714,22 @@ fn dispatch_api<A: crate::Arch>(
             let hwnd = arg32(machine, regs, 0);
             let out = arg32(machine, regs, 1) as usize;
             let Some(window) = state.pm_windows.iter().find(|window| window.hwnd == hwnd) else { return 0; };
-            machine.write::<i32>(out, 0);
-            machine.write::<i32>(out + 4, 0);
-            machine.write::<i32>(out + 8, window.width as i32);
-            machine.write::<i32>(out + 12, window.height as i32);
+            machine.write::<i32>(out as u64, 0);
+            machine.write::<i32>((out + 4) as u64, 0);
+            machine.write::<i32>((out + 8) as u64, window.width as i32);
+            machine.write::<i32>((out + 12) as u64, window.height as i32);
             1
         }
         Api::WinQueryWindowPos => {
             let hwnd = arg32(machine, regs, 0);
             let out = arg32(machine, regs, 1) as usize;
             let Some(window) = state.pm_windows.iter().find(|window| window.hwnd == hwnd) else { return 0; };
-            machine.zero(out, 36);
-            machine.write::<i32>(out + 4, window.height as i32);
-            machine.write::<i32>(out + 8, window.width as i32);
-            machine.write::<i32>(out + 12, window.y);
-            machine.write::<i32>(out + 16, window.x);
-            machine.write::<u32>(out + 24, hwnd);
+            machine.zero(out as u64, 36);
+            machine.write::<i32>((out + 4) as u64, window.height as i32);
+            machine.write::<i32>((out + 8) as u64, window.width as i32);
+            machine.write::<i32>((out + 12) as u64, window.y);
+            machine.write::<i32>((out + 16) as u64, window.x);
+            machine.write::<u32>((out + 24) as u64, hwnd);
             1
         }
         Api::WinSetWindowPos => {
@@ -1780,16 +1780,16 @@ fn dispatch_api<A: crate::Arch>(
         Api::WinPtInRect => {
             let rect = arg32(machine, regs, 1) as usize;
             let point = arg32(machine, regs, 2) as usize;
-            let x = machine.read::<i32>(point);
-            let y = machine.read::<i32>(point + 4);
-            (x >= machine.read::<i32>(rect) && x < machine.read::<i32>(rect + 8)
-                && y >= machine.read::<i32>(rect + 4) && y < machine.read::<i32>(rect + 12)) as u32
+            let x = machine.read::<i32>(point as u64);
+            let y = machine.read::<i32>((point + 4) as u64);
+            (x >= machine.read::<i32>(rect as u64) && x < machine.read::<i32>((rect + 8) as u64)
+                && y >= machine.read::<i32>((rect + 4) as u64) && y < machine.read::<i32>((rect + 12) as u64)) as u32
         }
         Api::WinLoadString | Api::WinQueryDlgItemText => {
             let (length_arg, out_arg) = if api == Api::WinLoadString { (3, 4) } else { (2, 3) };
             let length = arg32(machine, regs, length_arg) as usize;
             let out = arg32(machine, regs, out_arg) as usize;
-            if length != 0 { machine.write::<u8>(out, 0); }
+            if length != 0 { machine.write::<u8>(out as u64, 0); }
             0
         }
         Api::WinAlarm => {
@@ -1822,16 +1822,16 @@ fn dispatch_api<A: crate::Arch>(
             // NULL application/key enumerates an empty profile, rather than
             // returning the default as if it were an application or key name.
             if app == 0 || key == 0 {
-                machine.write::<u8>(out, 0);
-                if capacity > 1 { machine.write::<u8>(out + 1, 0); }
+                machine.write::<u8>(out as u64, 0);
+                if capacity > 1 { machine.write::<u8>((out + 1) as u64, 0); }
                 return 0;
             }
             let value = if default == 0 { Vec::new() } else {
                 match raw_string(machine, default) { Ok(value) => value, Err(_) => return 0 }
             };
             let copied = value.len().min(capacity - 1);
-            machine.copy_to(out, &value[..copied]);
-            machine.write::<u8>(out + copied, 0);
+            machine.copy_to(out as u64, &value[..copied]);
+            machine.write::<u8>((out + copied) as u64, 0);
             (copied + 1) as u32 // OS/2 counts the terminating NUL.
         },
         Api::WinCreateHelpInstance => 1,
@@ -1872,7 +1872,7 @@ pub fn handle_event<A: crate::Arch>(
                     }
                 }
                 Api::DosExit => {
-                    let result = machine.read::<u32>(regs.sp() as usize + 8);
+                    let result = machine.read::<u32>((regs.sp() as usize + 8) as u64);
                     thread::KernelAction::Exit(result as i32)
                 }
                 Api::WaitReturn => {
@@ -1897,17 +1897,17 @@ pub fn handle_event<A: crate::Arch>(
                     };
                     let result = regs.rax as u32;
                     regs.rax = result as u64;
-                    regs.frame.rip = machine.read::<u32>(callback.dispatch_sp as usize) as u64;
+                    regs.frame.rip = machine.read::<u32>(callback.dispatch_sp as u64) as u64;
                     regs.frame.rsp = callback.dispatch_sp.wrapping_add(4) as u64;
                     thread::KernelAction::Done
                 }
                 Api::WinDispatchMsg => {
                     let msg = arg32(machine, regs, 1) as usize;
                     let message = PmMessage {
-                        hwnd: machine.read::<u32>(msg),
-                        message: machine.read::<u32>(msg + 4),
-                        mp1: machine.read::<u32>(msg + 8),
-                        mp2: machine.read::<u32>(msg + 12),
+                        hwnd: machine.read::<u32>(msg as u64),
+                        message: machine.read::<u32>((msg + 4) as u64),
+                        mp1: machine.read::<u32>((msg + 8) as u64),
+                        mp2: machine.read::<u32>((msg + 12) as u64),
                     };
                     if begin_wndproc(machine, regs, state, gate, message) {
                         thread::KernelAction::Done
@@ -1934,10 +1934,10 @@ pub fn handle_event<A: crate::Arch>(
         _ => {
             crate::compact_println!("OS/2: unhandled event {:?} at {:#x}", event, regs.ip32());
             let mut code = [0u8; 16];
-            machine.copy_from(regs.ip32() as usize, &mut code);
+            machine.copy_from(regs.ip32() as u64, &mut code);
             let mut stack = [0u32; 8];
             for (i, word) in stack.iter_mut().enumerate() {
-                *word = machine.read::<u32>(regs.sp() as usize + i * 4);
+                *word = machine.read::<u32>((regs.sp() as usize + i * 4) as u64);
             }
             crate::compact_println!("OS/2: code={:02x?} sp={:#x} stack={:08x?}", &code[..], regs.sp(), &stack[..]);
             let _ = ERROR_INVALID_FUNCTION;

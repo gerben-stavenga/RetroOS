@@ -52,7 +52,7 @@ impl Binding {
         let pages = ((guest & 4095) + bytes).div_ceil(4096);
         let base = core::ptr::NonNull::new((buffer.address + (offset & !4095)) as *mut u8)?;
         let mut saved = alloc::vec![0; pages * 4096];
-        machine.copy_from(vpage * 4096, &mut saved);
+        machine.copy_from((vpage * 4096) as u64, &mut saved);
         // Preserve complete end pages, including non-DMA neighbour bytes.
         // Shared aliases leave the permanent channel frames out of COW and
         // teardown. This is software DMA: normal coherent RAM avoids turning
@@ -61,7 +61,7 @@ impl Binding {
         unsafe {
             crate::kernel::memory::map_shared_pages(machine, vpage, base, pages);
         }
-        machine.copy_to(vpage * 4096, &saved);
+        machine.copy_to((vpage * 4096) as u64, &saved);
         Some(Self { buffer, channel, guest, bytes, offset, vpage, pages })
     }
     pub(crate) fn read(&self, offset: usize, destination: &mut [u8]) {
@@ -70,9 +70,9 @@ impl Binding {
     }
     pub(crate) fn unbind<A: Arch>(self, machine: &mut A) {
         let mut saved = alloc::vec![0; self.pages * 4096];
-        machine.copy_from(self.vpage * 4096, &mut saved);
+        machine.copy_from((self.vpage * 4096) as u64, &mut saved);
         crate::kernel::memory::fresh(machine, self.vpage, self.pages);
-        machine.copy_to(self.vpage * 4096, &saved);
+        machine.copy_to((self.vpage * 4096) as u64, &saved);
     }
 }
 

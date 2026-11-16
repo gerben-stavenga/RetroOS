@@ -443,8 +443,8 @@ impl<A: crate::Arch> FaultBus for BackendBus<'_, '_, A> {
     fn read8(&mut self, off: u32) -> u8 { self.target.read8(self.machine, off) }
     fn write8(&mut self, off: u32, value: u8) { self.target.write8(self.machine, off, value); }
     fn offset(&self, address: u32) -> Option<u32> { self.target.offset(address) }
-    fn guest_read(&self, address: u32) -> u8 { self.machine.read::<u8>(address as usize) }
-    fn guest_write(&mut self, address: u32, value: u8) { self.machine.write(address as usize, value); }
+    fn guest_read(&self, address: u32) -> u8 { self.machine.read::<u8>(address as u64) }
+    fn guest_write(&mut self, address: u32, value: u8) { self.machine.write(address as u64, value); }
     fn fpu_st0(&self) -> [u8; 10] { self.machine.fpu_st0() }
     fn fpu_pop(&mut self) { self.machine.fpu_pop(); }
     fn end_instruction(&mut self) { self.target.end_instruction(); }

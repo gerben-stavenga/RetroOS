@@ -267,7 +267,7 @@ pub(super) fn vbe<A: crate::Arch>(
             // Personality-owned code, never a pointer into the isolated
             // native firmware workspace. Clients may copy the complete block.
             let address = dos::vbe_pm_interface_addr();
-            machine.copy_to(address as usize, &VBE_PM_INTERFACE);
+            machine.copy_to(address as u64, &VBE_PM_INTERFACE);
             regs.es = u64::from(address >> 4);
             regs.rdi = (regs.rdi & !0xFFFF) | u64::from(address & 15);
             regs.rcx = (regs.rcx & !0xFFFF) | VBE_PM_INTERFACE.len() as u64;
@@ -420,11 +420,11 @@ fn vbe_palette<A: crate::Arch>(
     if let Some(display) = dos.pc.vga.native_mut() {
         let mut data = alloc::vec![0; count * 4];
         let subfn = regs.rbx as u8;
-        if matches!(subfn, 0 | 0x80) { machine.copy_from(tbl, &mut data); }
+        if matches!(subfn, 0 | 0x80) { machine.copy_from(tbl as u64, &mut data); }
         let ok = display.cap_mut().bios_indexed_palette_call(
             machine, bios_display, subfn, start, &mut data,
         ).is_ok();
-        if ok && subfn == 1 { machine.copy_to(tbl, &data); }
+        if ok && subfn == 1 { machine.copy_to(tbl as u64, &data); }
         return ok;
     }
     let Some(dev) = dos.pc.vga.emulated_mut() else { return false };
@@ -436,7 +436,7 @@ fn vbe_palette<A: crate::Arch>(
             // modes exposed by RetroOS.
             for i in 0..count {
                 let e = tbl + i * 4;
-                let (b, g, r): (u8, u8, u8) = (machine.read(e), machine.read(e + 1), machine.read(e + 2));
+                let (b, g, r): (u8, u8, u8) = (machine.read(e as u64), machine.read((e + 1) as u64), machine.read((e + 2) as u64));
                 let entry = [b, g, r, 0];
                 let Some(svga) = dev.state.svga_mut() else { return false };
                 if !svga.palette.write((usize::from(start) + i) as u16, &entry) {
@@ -454,10 +454,10 @@ fn vbe_palette<A: crate::Arch>(
                     return false;
                 }
                 let e = tbl + i * 4;
-                machine.write::<u8>(e, entry[0]);
-                machine.write::<u8>(e + 1, entry[1]);
-                machine.write::<u8>(e + 2, entry[2]);
-                machine.write::<u8>(e + 3, 0);
+                machine.write::<u8>(e as u64, entry[0]);
+                machine.write::<u8>((e + 1) as u64, entry[1]);
+                machine.write::<u8>((e + 2) as u64, entry[2]);
+                machine.write::<u8>((e + 3) as u64, 0);
             }
             true
         }
@@ -476,34 +476,34 @@ fn vbe_controller_info<A: crate::Arch>(
 ) {
     let lin = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32) as usize;
     for i in (0..256).step_by(4) {
-        machine.write::<u32>(lin + i, 0);
+        machine.write::<u32>((lin + i) as u64, 0);
     }
-    machine.write::<u8>(lin, b'V');
-    machine.write::<u8>(lin + 1, b'E');
-    machine.write::<u8>(lin + 2, b'S');
-    machine.write::<u8>(lin + 3, b'A');
-    machine.write::<u16>(lin + 0x04, 0x0200); // VBE 2.0
+    machine.write::<u8>(lin as u64, b'V');
+    machine.write::<u8>((lin + 1) as u64, b'E');
+    machine.write::<u8>((lin + 2) as u64, b'S');
+    machine.write::<u8>((lin + 3) as u64, b'A');
+    machine.write::<u16>((lin + 0x04) as u64, 0x0200); // VBE 2.0
     // Bit 0: the RetroOS VBE boundary supports switching between six- and
     // eight-bit DAC components; storage remains canonical eight-bit.
-    machine.write::<u32>(lin + 0x0A, 1);
+    machine.write::<u32>((lin + 0x0A) as u64, 1);
     let list = dos::vbe_mode_list_addr() as usize;
     // Far pointer 0000:list. The fixed LowMem target is below 64 KiB.
-    machine.write::<u32>(lin + 0x0E, list as u32);
-    machine.write::<u16>(lin + 0x12, 0x100); // generic adapter memory: 16 MB
+    machine.write::<u32>((lin + 0x0E) as u64, list as u32);
+    machine.write::<u16>((lin + 0x12) as u64, 0x100); // generic adapter memory: 16 MB
     let mut p = list;
     let remaining = dos::VBE_MODE_LIST_CAPACITY - 1;
     if let Some(modes) = native_modes {
         for mode in modes.iter().take(remaining) {
-            machine.write::<u16>(p, mode.number);
+            machine.write::<u16>(p as u64, mode.number);
             p += 2;
         }
     } else {
         for mode in VBE_MODES.iter().filter_map(|&(num, ..)| substitute_vbe_mode(num)).take(remaining) {
-            machine.write::<u16>(p, mode.number);
+            machine.write::<u16>(p as u64, mode.number);
             p += 2;
         }
     }
-    machine.write::<u16>(p, 0xFFFF); // list terminator
+    machine.write::<u16>(p as u64, 0xFFFF); // list terminator
 }
 
 /// Generic RetroOS VBE 4F01h — mode info for CX into ES:DI. Curated native
@@ -528,35 +528,35 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
     };
     let lin = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32) as usize;
     for i in (0..256).step_by(4) {
-        machine.write::<u32>(lin + i, 0);
+        machine.write::<u32>((lin + i) as u64, 0);
     }
     let direct = matches!(format, crate::kernel::display::FormatSpec::Packed(_));
     // ModeAttributes: supported|reserved|colour|graphics, plus LFB only when
     // the curated hardware mode actually has one. The substitute modes have
     // both apertures; a native banked-only mode must not entice a client into
     // sending an unsupported 4F02h request with bit 14 set.
-    machine.write::<u16>(lin, 0x003B | if linear { 0x0080 } else { 0 });
-    machine.write::<u8>(lin + 0x02, if banked { 0x07 } else { 0 });
-    machine.write::<u8>(lin + 0x03, 0x00); // win B: not present
-    machine.write::<u16>(lin + 0x04, if banked { 64 } else { 0 });
-    machine.write::<u16>(lin + 0x06, if banked { 64 } else { 0 });
-    machine.write::<u16>(lin + 0x08, if banked { 0xA000 } else { 0 });
+    machine.write::<u16>(lin as u64, 0x003B | if linear { 0x0080 } else { 0 });
+    machine.write::<u8>((lin + 0x02) as u64, if banked { 0x07 } else { 0 });
+    machine.write::<u8>((lin + 0x03) as u64, 0x00); // win B: not present
+    machine.write::<u16>((lin + 0x04) as u64, if banked { 64 } else { 0 });
+    machine.write::<u16>((lin + 0x06) as u64, if banked { 64 } else { 0 });
+    machine.write::<u16>((lin + 0x08) as u64, if banked { 0xA000 } else { 0 });
     machine.write::<u32>(
-        lin + 0x0C,
+        (lin + 0x0C) as u64,
         if banked { dos::vbe_window_ptr() } else { 0 },
     );
-    machine.write::<u16>(lin + 0x10, banked_pitch); // banked bytes per scanline
-    machine.write::<u16>(lin + 0x12, w);
-    machine.write::<u16>(lin + 0x14, h);
-    machine.write::<u8>(lin + 0x16, 8); // char width
-    machine.write::<u8>(lin + 0x17, 16); // char height
-    machine.write::<u8>(lin + 0x18, 1); // planes
-    machine.write::<u8>(lin + 0x19, bpp);
-    machine.write::<u8>(lin + 0x1A, 1); // banks
-    machine.write::<u8>(lin + 0x1B, if direct { 6 } else { 4 }); // direct vs packed
-    machine.write::<u8>(lin + 0x1C, if banked { 64 } else { 0 });
-    machine.write::<u8>(lin + 0x1D, banked_pages);
-    machine.write::<u8>(lin + 0x1E, 1); // reserved (must be 1)
+    machine.write::<u16>((lin + 0x10) as u64, banked_pitch); // banked bytes per scanline
+    machine.write::<u16>((lin + 0x12) as u64, w);
+    machine.write::<u16>((lin + 0x14) as u64, h);
+    machine.write::<u8>((lin + 0x16) as u64, 8); // char width
+    machine.write::<u8>((lin + 0x17) as u64, 16); // char height
+    machine.write::<u8>((lin + 0x18) as u64, 1); // planes
+    machine.write::<u8>((lin + 0x19) as u64, bpp);
+    machine.write::<u8>((lin + 0x1A) as u64, 1); // banks
+    machine.write::<u8>((lin + 0x1B) as u64, if direct { 6 } else { 4 }); // direct vs packed
+    machine.write::<u8>((lin + 0x1C) as u64, if banked { 64 } else { 0 });
+    machine.write::<u8>((lin + 0x1D) as u64, banked_pages);
+    machine.write::<u8>((lin + 0x1E) as u64, 1); // reserved (must be 1)
     if direct {
         // (red, grn, blu, rsv) as (mask_size, field_position) at 0x1F..0x26.
         let crate::kernel::display::FormatSpec::Packed(pixel) = format else {
@@ -570,25 +570,25 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
             (bpp.saturating_sub(used), used),
         ];
         for (i, &(sz, pos)) in masks.iter().enumerate() {
-            machine.write::<u8>(lin + 0x1F + i * 2, sz);
-            machine.write::<u8>(lin + 0x20 + i * 2, pos);
+            machine.write::<u8>((lin + 0x1F + i * 2) as u64, sz);
+            machine.write::<u8>((lin + 0x20 + i * 2) as u64, pos);
             // VBE 3.0's linear-framebuffer mask fields. The curated model
             // exposes one canonical pixel encoding for both access paths.
-            machine.write::<u8>(lin + 0x36 + i * 2, sz);
-            machine.write::<u8>(lin + 0x37 + i * 2, pos);
+            machine.write::<u8>((lin + 0x36 + i * 2) as u64, sz);
+            machine.write::<u8>((lin + 0x37 + i * 2) as u64, pos);
         }
-        machine.write::<u8>(lin + 0x27, 1); // direct-colour mode information
+        machine.write::<u8>((lin + 0x27) as u64, 1); // direct-colour mode information
     }
     // PhysBasePtr is RetroOS's stable guest-linear aperture, but only a mode
     // backed by a genuine physical or emulated LFB has one. A native banked
     // card remains banked all the way through; paging cannot make its moving
     // 64 KiB window into a simultaneous linear framebuffer.
     machine.write::<u32>(
-        lin + 0x28,
+        (lin + 0x28) as u64,
         if linear { machine::vga::svga_lfb_base() } else { 0 },
     );
-    machine.write::<u16>(lin + 0x32, linear_pitch);
-    machine.write::<u8>(lin + 0x35, linear_pages);
+    machine.write::<u16>((lin + 0x32) as u64, linear_pitch);
+    machine.write::<u8>((lin + 0x35) as u64, linear_pages);
     true
 }
 

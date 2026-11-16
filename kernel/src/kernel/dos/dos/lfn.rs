@@ -23,7 +23,7 @@ fn string<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Reg
     let address = seg_offset(dos, regs, seg, off) as usize;
     let mut name = Vec::new();
     for i in 0..=PATH_MAX {
-        let byte = machine.read::<u8>(address + i);
+        let byte = machine.read::<u8>((address + i) as u64);
         if byte == 0 { return Ok(name); }
         name.push(byte);
     }
@@ -31,8 +31,8 @@ fn string<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Reg
 }
 
 fn put_string<A: crate::Arch>(machine: &mut A, address: usize, value: &[u8]) {
-    machine.copy_to(address, value);
-    machine.write::<u8>(address + value.len(), 0);
+    machine.copy_to(address as u64, value);
+    machine.write::<u8>((address + value.len()) as u64, 0);
 }
 
 fn writable(path: &[u8]) -> Result<(), u16> {
@@ -167,7 +167,7 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
             };
             let output = find_data(&found, format)?;
             let address = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32) as usize;
-            machine.copy_to(address, &output);
+            machine.copy_to(address as u64, &output);
             word(&mut regs.rcx, found.conversion);
             return Ok(Some(if first { handle } else { 0x4f00 | (handle & 0xff) }));
         }
@@ -218,14 +218,14 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
             out[44..48].copy_from_slice(&((stat.ino >> 32) as u32).to_le_bytes());
             out[48..52].copy_from_slice(&(stat.ino as u32).to_le_bytes());
             let address = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32) as usize;
-            machine.copy_to(address, &out);
+            machine.copy_to(address as u64, &out);
         }
         // The clock currently has no configurable timezone: DOS timestamps
         // and UTC use the same clock, as in the existing AH=57h implementation.
         0xa7 => match regs.rbx as u8 {
             0 => {
                 let address = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
-                let ft = machine.read::<u64>(address);
+                let ft = machine.read::<u64>(address as u64);
                 let (time, date, hundredths) = filetime_to_dos(ft).ok_or(13u16)?;
                 word(&mut regs.rcx, time); word(&mut regs.rdx, date);
                 regs.rbx = (regs.rbx & !0xff00) | (u64::from(hundredths) << 8);
@@ -233,7 +233,7 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
             1 => {
                 let ft = dos_to_filetime(regs.rcx as u16, regs.rdx as u16, (regs.rbx >> 8) as u8).ok_or(13u16)?;
                 let address = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32) as usize;
-                machine.write::<u64>(address, ft);
+                machine.write::<u64>(address as u64, ft);
             }
             _ => return Err(1),
         },
@@ -243,7 +243,7 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
             let name = string(machine, dos, regs, regs.ds as u16, regs.rsi as u32)?;
             let output = short_without_tail(&name, (regs.rdx >> 8) as u8)?;
             let address = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32) as usize;
-            if regs.rdx & 0xff00 == 0 { machine.copy_to(address, &output); }
+            if regs.rdx & 0xff00 == 0 { machine.copy_to(address as u64, &output); }
             else { put_string(machine, address, &output); }
         }
         _ => return Err(0x7100),

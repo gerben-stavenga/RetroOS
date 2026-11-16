@@ -37,7 +37,7 @@ enum Wait {
     Futex(u64, Option<u32>, u64),
     Epoll(i32, u64, usize, u64),
     Sleep(u64),
-    Poll(usize, usize, u64),
+    Poll(u64, usize, u64),
     Select,
     Random(super::entropy::Request),
     Flock(i32, u32),
@@ -45,7 +45,7 @@ enum Wait {
     Read(u8, u64, usize),
     ReadV,
     Splice,
-    Child(i32, usize),
+    Child(i32, u64),
     Socket(i32, u64, usize),
     Exited,
 }
@@ -247,13 +247,13 @@ fn poll<A: crate::Arch>(
     machine: &mut A,
     kt: &thread::KernelThread<A>,
     s: &State,
-    ptr: usize,
+    ptr: u64,
     count: usize,
 ) -> i32 {
     let mut n = 0;
     for i in 0..count {
-        let fd = machine.read::<i32>(ptr + i * 8);
-        let requested = machine.read::<u16>(ptr + i * 8 + 4) as u32;
+        let fd = machine.read::<i32>((ptr + (i * 8) as u64) as u64);
+        let requested = machine.read::<u16>((ptr + (i * 8) as u64 + 4) as u64) as u32;
         let bits = if fd < 0 {
             0
         } else if descriptor(s, fd).is_none()
@@ -263,7 +263,7 @@ fn poll<A: crate::Arch>(
         } else {
             ready(kt, s, fd) & (requested | 0x18)
         };
-        machine.write::<u16>(ptr + i * 8 + 6, bits as u16);
+        machine.write::<u16>((ptr + (i * 8) as u64 + 6) as u64, bits as u16);
         n += i32::from(bits != 0);
     }
     n
@@ -357,7 +357,7 @@ pub(super) fn call<A: crate::Arch>(
         16 if a.a1 as u32 == 0x5421 && matches!(descriptor(s, fd), Some(Descriptor::Socket(_))) => {
             if a.a2 == 0 || a.a2.checked_add(4).is_none_or(|end| end > 0xc0000000) { return Some(SyscallResult::val(-EFAULT)); }
             let Some(Descriptor::Socket(end)) = descriptor(s, fd) else { unreachable!() };
-            end.lock().nonblock = machine.read::<i32>(a.a2 as usize) != 0;
+            end.lock().nonblock = machine.read::<i32>(a.a2 as u64) != 0;
             0
         }
         16 if a.a1 as u32 == 0x541b && matches!(descriptor(s, fd), Some(Descriptor::Socket(_))) => {
@@ -367,7 +367,7 @@ pub(super) fn call<A: crate::Arch>(
             let queue = &end.packets;
             let count = if end.packet_mode { queue.front().map_or(0, Vec::len) }
                 else { queue.iter().map(Vec::len).sum::<usize>() };
-            machine.write::<i32>(a.a2 as usize, count.min(i32::MAX as usize) as i32);
+            machine.write::<i32>(a.a2 as u64, count.min(i32::MAX as usize) as i32);
             0
         }
         53 => {
@@ -395,8 +395,8 @@ pub(super) fn call<A: crate::Arch>(
                     s.cloexec.resize(s.handles.len(), false);
                     s.cloexec[index] = a.a1 & 0x80000 != 0;
                 }
-                machine.write::<i32>(a.a3 as usize, one);
-                machine.write::<i32>(a.a3 as usize + 4, two);
+                machine.write::<i32>(a.a3 as u64, one);
+                machine.write::<i32>(a.a3 + 4, two);
                 0
             }
         }
@@ -422,7 +422,7 @@ pub(super) fn call<A: crate::Arch>(
                 };
                 if let Some(peer) = peer {
                     let data = if nr == 20 {
-                        match super::message::gather(machine, a.a1 as usize, a.a2 as usize, true) {
+                        match super::message::gather(machine, a.a1, a.a2, true) {
                             Ok(bytes) => bytes, Err(e) => return Some(SyscallResult::val(e)),
                         }
                     } else {
@@ -544,11 +544,11 @@ pub(super) fn call<A: crate::Arch>(
             if a.a1 > 4096 {
                 -EINVAL
             } else {
-                let n = poll(machine, kt, s, a.a0 as usize, a.a1 as usize);
+                let n = poll(machine, kt, s, a.a0, a.a1 as usize);
                 if n == 0 && a.a2 as i32 != 0 {
                     ensure(machine, kt, s, regs);
                     s.contexts[s.active].wait =
-                        Wait::Poll(a.a0 as usize, a.a1 as usize, deadline(machine, a.a2 as i32));
+                        Wait::Poll(a.a0, a.a1 as usize, deadline(machine, a.a2 as i32));
                 }
                 n
             }
@@ -805,7 +805,7 @@ pub(super) fn call<A: crate::Arch>(
                 ensure(machine, kt, s, regs);
                 let mut name = [0; 16];
                 for (i, slot) in name.iter_mut().take(15).enumerate() {
-                    *slot = machine.read::<u8>(a.a1 as usize + i);
+                    *slot = machine.read::<u8>(a.a1 + i as u64);
                     if *slot == 0 {
                         break;
                     }
@@ -823,7 +823,7 @@ pub(super) fn call<A: crate::Arch>(
                     s.contexts[s.active].comm
                 };
                 name[15] = 0;
-                machine.copy_to(a.a1 as usize, &name);
+                machine.copy_to(a.a1 as u64, &name);
                 0
             }
             _ => -EINVAL,
@@ -949,7 +949,7 @@ pub(super) fn parked(state: &State) -> bool { state.parked }
 /// process. Child-table access and status writes happen with the process root
 /// active in the executor, outside the syscall handler's task-table borrow.
 pub(super) fn wait_child<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
-    linux: &mut LinuxState, regs: &mut Regs, pid: i32, status: usize)
+    linux: &mut LinuxState, regs: &mut Regs, pid: i32, status: u64)
 {
     ensure(machine, kt, &mut linux.async_io, regs);
     let s = &mut linux.async_io;
@@ -961,7 +961,7 @@ pub(super) fn wait_child<A: crate::Arch>(machine: &mut A, kt: &mut thread::Kerne
 pub(super) fn children_changed(state: &mut State) { state.children_changed = true; }
 pub(super) fn take_child_changes(state: &mut State) -> bool { core::mem::take(&mut state.children_changed) }
 
-pub(super) fn next_child_wait(state: &State, start: usize) -> Option<(usize, i32, usize)> {
+pub(super) fn next_child_wait(state: &State, start: usize) -> Option<(usize, i32, u64)> {
     state.contexts.iter().enumerate().skip(start).find_map(|(index, context)| {
         if let Wait::Child(pid, status) = context.wait { Some((index, pid, status)) } else { None }
     })

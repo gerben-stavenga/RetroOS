@@ -161,9 +161,9 @@ impl VifMap {
             // now and nothing rewrites it before the exit reads it — tag it.
             Some(Class::Flags(d)) if d >= 0 => {
                 let addr = stack_base::<A>(regs).wrapping_add(cli_sp.wrapping_add(d as u32));
-                let w: u32 = arch.read(addr as usize);
+                let w: u32 = arch.read(addr as u64);
                 if looks_like_flags(w) {
-                    arch.write(addr as usize, w | CARRIER_FLAGS);
+                    arch.write(addr as u64, w | CARRIER_FLAGS);
                     self.stats[1] = self.stats[1].wrapping_add(1);
                 } else {
                     self.begin_learn(regs, None); // stale delta (wrong page / SMC) → relearn
@@ -274,7 +274,7 @@ impl VifMap {
             let mut p = regs.ip32();
             let mut has66 = false;
             loop {
-                let b = arch.read::<u8>(cs_base.wrapping_add(p) as usize);
+                let b = arch.read::<u8>(cs_base.wrapping_add(p) as u64);
                 if b == 0x66 {
                     has66 = true;
                     p = p.wrapping_add(1);
@@ -284,7 +284,7 @@ impl VifMap {
                     break;
                 }
             }
-            let op = arch.read::<u8>(cs_base.wrapping_add(p) as usize);
+            let op = arch.read::<u8>(cs_base.wrapping_add(p) as u64);
             if !matches!(op, 0x9C | 0x9D | 0xCF | 0xFA | 0xFB) {
                 self.stats[3] = self.stats[3].wrapping_add(1);
                 return DbResult::Resume;
@@ -361,7 +361,7 @@ fn classify_exit<A: Arch>(
         // POPF never changes CS, so the code base is still the faulting CS's —
         // resolve it here instead of threading it through the call.
         let cs_base = code_view::<A>(regs).0;
-        let popped: u32 = arch.read(stack_base::<A>(regs).wrapping_add(sp_before) as usize);
+        let popped: u32 = arch.read(stack_base::<A>(regs).wrapping_add(sp_before) as u64);
         let m = if op32 { u32::MAX } else { 0xFFFF };
         if let Some(r) = a.probe {
             if popped & CARRIER_FLAGS == CARRIER_FLAGS
@@ -393,7 +393,7 @@ fn classify_exit<A: Arch>(
 /// checks the values line up and a probe pass proves the dataflow before the
 /// site runs free. Returns `(r1, r2)` (never esp).
 fn reg_idiom<A: Arch>(arch: &mut A, cs_base: u32, cli_ip: u32, popf_ip: u32) -> Option<(u8, u8)> {
-    let at = |ip: u32| -> u8 { arch.read::<u8>(cs_base.wrapping_add(ip) as usize) };
+    let at = |ip: u32| -> u8 { arch.read::<u8>(cs_base.wrapping_add(ip) as u64) };
     let pushf = at(cli_ip.wrapping_sub(2)); // 9C
     let pop = at(cli_ip.wrapping_sub(1)); //  58..5F  pop r1
     let push = at(popf_ip.wrapping_sub(1)); // 50..57  push r2

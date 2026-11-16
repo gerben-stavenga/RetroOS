@@ -62,14 +62,14 @@ fn int15_block_move<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     let gdt = ((regs.es as u32) << 4) + (regs.rsi as u32 & 0xFFFF);
     let base = |desc: u32| -> u32 {
         let d = (gdt + desc) as usize;
-        (machine.read::<u16>(d + 2) as u32)                      // base bits 0–15
-            | (((machine.read::<u16>(d + 4) as u32) & 0xFF) << 16) // byte 4: bits 16–23
-            | (((machine.read::<u16>(d + 6) as u32) >> 8) << 24)   // byte 7: bits 24–31
+        (machine.read::<u16>((d + 2) as u64) as u32)                      // base bits 0–15
+            | (((machine.read::<u16>((d + 4) as u64) as u32) & 0xFF) << 16) // byte 4: bits 16–23
+            | (((machine.read::<u16>((d + 6) as u64) as u32) >> 8) << 24)   // byte 7: bits 24–31
     };
     let src = base(0x10);
     let dst = base(0x18);
     let len = (regs.rcx as usize & 0xFFFF) * 2;
-    machine.copy_within(src as usize, dst as usize, len);
+    machine.copy_within(src as u64,dst as u64, len);
     regs.rax &= !0xFF00;       // AH = 0 (success)
     vm86_set_return_flag(machine, regs, 1, false);  // CF = 0
 }

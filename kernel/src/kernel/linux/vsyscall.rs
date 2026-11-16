@@ -20,10 +20,10 @@ pub(super) fn getcpu<A: crate::Arch>(machine: &mut A, args: &Args, cpu: usize) -
         return SyscallResult::val(-EFAULT);
     }
     if args.a0 != 0 {
-        machine.write::<u32>(args.a0 as usize, if cpu == usize::MAX { 0 } else { cpu as u32 });
+        machine.write::<u32>(args.a0 as u64, if cpu == usize::MAX { 0 } else { cpu as u32 });
     }
     if args.a1 != 0 {
-        machine.write::<u32>(args.a1 as usize, 0);
+        machine.write::<u32>(args.a1 as u64, 0);
     }
     SyscallResult::val(0)
 }
@@ -60,7 +60,7 @@ pub(super) fn emulate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, address:
     if !output_ok(regs.rdi, first_size) || (second_size != 0 && !output_ok(regs.rsi, second_size)) {
         return false;
     }
-    let caller = machine.read::<u64>(stack as usize);
+    let caller = machine.read::<u64>(stack as u64);
     if caller >= USER_END {
         return false;
     }

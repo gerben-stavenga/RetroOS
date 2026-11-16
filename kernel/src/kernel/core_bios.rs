@@ -62,7 +62,7 @@ fn scratch_base() -> usize {
 
 fn prepare_bios_int10<A: Arch>(machine: &mut A, regs: &mut Regs) {
     let base = scratch_base();
-    machine.write::<[u8; 4]>(base, [0xCD, 0x10, 0xCD, 0x31]);
+    machine.write::<[u8; 4]>(base as u64, [0xCD, 0x10, 0xCD, 0x31]);
     *regs = Regs::empty();
     regs.frame = crate::Frame64 {
         rip: 0,
@@ -1455,8 +1455,8 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         *regs = request;
         regs.frame = frame;
         match &transfer {
-            BiosTransfer::Input(address, buffer) => machine.copy_to(*address, buffer),
-            BiosTransfer::InOut(address, buffer) => machine.copy_to(*address, buffer),
+            BiosTransfer::Input(address, buffer) => machine.copy_to((*address) as u64, buffer),
+            BiosTransfer::InOut(address, buffer) => machine.copy_to((*address) as u64, buffer),
             BiosTransfer::None | BiosTransfer::Output(..) => {}
         }
         let io = crate::kernel::io_policy::bios_display(bios_display);
@@ -1464,7 +1464,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         if completed.is_ok() {
             match &mut transfer {
                 BiosTransfer::Output(address, buffer) | BiosTransfer::InOut(address, buffer) => {
-                    machine.copy_from(*address, buffer);
+                    machine.copy_from((*address) as u64, buffer);
                 }
                 BiosTransfer::None | BiosTransfer::Input(..) => {}
             }
@@ -1477,7 +1477,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
     fn read_workspace(&mut self, machine: &mut A, address: usize, output: &mut [u8]) {
         machine.switch_fx(&mut self.fx);
         let caller_space = machine.activate(core::mem::take(&mut self.bios_vcpu.space));
-        machine.copy_from(address, output);
+        machine.copy_from(address as u64, output);
         machine.switch_fx(&mut self.fx);
         self.bios_vcpu.space = machine.activate(caller_space);
     }

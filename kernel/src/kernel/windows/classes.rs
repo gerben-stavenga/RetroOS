@@ -44,9 +44,9 @@ pub(super) fn call<A: crate::Arch>(
     if length > 510 || length & 1 != 0 {
         return 0xc000000d;
     }
-    let p: [u32; 10] = core::array::from_fn(|i| machine.read::<u32>(params as usize + i * 4));
+    let p: [u32; 10] = core::array::from_fn(|i| machine.read::<u32>((params as usize + i * 4) as u64));
     let mut name: Vec<u16> = (0..length / 2)
-        .map(|i| machine.read::<u16>((name + i * 2) as usize))
+        .map(|i| machine.read::<u16>(((name + i * 2) as usize) as u64))
         .collect();
     if name.is_empty() && p[1] != 0 {
         name = alloc::format!("#{}", p[1]).encode_utf16().collect();
@@ -69,7 +69,7 @@ pub(super) fn call<A: crate::Arch>(
         if Arc::strong_count(&state.classes.entries[i]) != 1 {
             return 0xc0010584; // STATUS_CLASS_HAS_WINDOWS
         }
-        machine.write::<u64>(out as usize + 24, state.classes.entries[i].client);
+        machine.write::<u64>((out as usize + 24) as u64, state.classes.entries[i].client);
         state.classes.entries.remove(i);
         return 0;
     }
@@ -138,9 +138,9 @@ pub(super) fn call<A: crate::Arch>(
         offset,
         _atoms: atoms,
     }));
-    machine.write::<u64>(out as usize, id);
-    machine.write::<u64>(out as usize + 8, offset);
-    machine.write::<u32>(out as usize + 16, base_atom);
+    machine.write::<u64>(out as u64, id);
+    machine.write::<u64>((out as usize + 8) as u64, offset);
+    machine.write::<u32>((out as usize + 16) as u64, base_atom);
     0
 }
 
