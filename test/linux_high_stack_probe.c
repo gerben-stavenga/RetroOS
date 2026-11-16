@@ -13,6 +13,13 @@
 
 #define CHECK(ok) do { if (!(ok)) { dprintf(2, "HIGH_STACK_FAIL line=%d errno=%d\n", __LINE__, errno); _exit(1); } } while (0)
 static int input[2], ready[2], pair[2], event;
+static char *alt_lo, *alt_hi;
+static volatile int handled;
+static void on_usr1(int signal, siginfo_t *info, void *context) {
+    char here;
+    (void)context;
+    handled = signal == SIGUSR1 && info->si_signo == SIGUSR1 && &here > alt_lo && &here < alt_hi ? 1 : -1;
+}
 static void *worker(void *unused) {
     (void)unused;
     volatile int word = 7;
@@ -25,6 +32,19 @@ static void *worker(void *unused) {
     struct timespec delay = {0, 1000000};
     errno=0; CHECK(syscall(SYS_futex, &word, 128, 7, &delay, NULL, 0) == -1 && errno == ETIMEDOUT);
     CHECK(nanosleep(&delay, NULL) == 0);
+    /* Go's shape: sigaction structs and the alternate stack in the high half,
+       so delivery writes and rt_sigreturn reads a high frame. */
+    char alt[16384]; alt_lo = alt; alt_hi = alt + sizeof alt;
+    stack_t ss = { .ss_sp = alt, .ss_size = sizeof alt, .ss_flags = 0 };
+    CHECK(sigaltstack(&ss, NULL) == 0);
+    struct sigaction act = { .sa_sigaction = on_usr1, .sa_flags = SA_SIGINFO | SA_ONSTACK }, prev;
+    CHECK((unsigned long)&act >= (1UL<<39));
+    CHECK(sigaction(SIGUSR1, &act, NULL) == 0);
+    CHECK(sigaction(SIGUSR1, NULL, &prev) == 0 && prev.sa_sigaction == on_usr1 && (prev.sa_flags & SA_ONSTACK));
+    CHECK(syscall(SYS_tgkill, getpid(), gettid(), SIGUSR1) == 0);
+    CHECK(handled == 1);
+    CHECK(word == 7);
+    ss.ss_flags = SS_DISABLE; CHECK(sigaltstack(&ss, NULL) == 0);
     CHECK(write(ready[1], "r", 1) == 1);
     char byte; CHECK(read(input[0], &byte, 1) == 1 && byte == 'x');
     eventfd_t count=5; CHECK(eventfd_write(event, count) == 0);
@@ -50,6 +70,6 @@ int main(void) {
     void *result=NULL;CHECK(pthread_join(thread,&result)==0 && result==(void *)37);
     eventfd_t count;CHECK(eventfd_read(event,&count)==0 && count==5);
     CHECK(munmap(stack,size)==0);
-    fprintf(stderr,"HIGH_STACK_PASS: pthread TLS/TID, time, random, signal mask, futex, sleep, pipe, eventfd and socketpair\n");
+    fprintf(stderr,"HIGH_STACK_PASS: pthread TLS/TID, time, random, signal mask, high sigaction/altstack delivery, futex, sleep, pipe, eventfd and socketpair\n");
     return 0;
 }

@@ -1,9 +1,8 @@
 //! Linux x86-64 signal frames, masks and rt_sigreturn ABI.
-use super::{Args, LinuxState, SyscallResult, async_io, thread};
+use super::{Args, LinuxState, SyscallResult, async_io, high_memory, thread};
 use crate::Regs;
 use alloc::{collections::BTreeMap, vec::Vec};
 
-const USER_END: u64 = 0xc0000000;
 const UNBLOCKABLE: u64 = (1 << 8) | (1 << 18);
 const SA_RESTORER: u64 = 0x04000000;
 const SA_ONSTACK: u64 = 0x08000000;
@@ -47,7 +46,7 @@ pub(super) fn finish_wait(state: &mut State, tid: i32) {
 #[derive(Clone)]
 struct Frame {
     tid: i32,
-    base: usize,
+    base: u64,
     regs: Regs,
 }
 #[derive(Clone)]
@@ -65,8 +64,16 @@ impl Default for State {
         }
     }
 }
+/// A nonzero guest range in either user window: below the compat kernel or
+/// in the long-mode high half (Go's heap and goroutine stacks live there).
 fn valid(ptr: u64, len: u64) -> bool {
-    ptr != 0 && ptr.checked_add(len).is_some_and(|end| end <= USER_END)
+    ptr != 0 && high_memory::range(ptr, len)
+}
+fn word(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+fn put(bytes: &mut [u8], at: usize, value: &[u8]) {
+    bytes[at..at + value.len()].copy_from_slice(value);
 }
 fn on_stack(local: Local, rsp: u64) -> bool {
     local.size != 0 && rsp.wrapping_sub(local.stack) < local.size
@@ -135,23 +142,18 @@ pub(super) fn call<A: crate::Arch>(
             if a.a0 > 64 || sig == 0 || a.a3 != 8 || (a.a1 != 0 && matches!(sig, 9 | 19)) {
                 return SyscallResult::val(-22);
             }
-            if (a.a1 != 0 && !valid(a.a1, 32)) || (a.a2 != 0 && !valid(a.a2, 32)) {
-                return SyscallResult::val(-14);
-            }
-            let new = (a.a1 != 0).then(|| Action {
-                handler: machine.read(a.a1 as u64),
-                flags: machine.read(a.a1 + 8),
-                restorer: machine.read(a.a1 + 16),
-                mask: machine.read(a.a1 + 24),
-            });
+            let new = if a.a1 != 0 {
+                let mut bytes = [0; 32];
+                if !high_memory::copy_from(machine, a.a1, &mut bytes) { return SyscallResult::val(-14); }
+                Some(Action { handler: word(&bytes, 0), flags: word(&bytes, 8), restorer: word(&bytes, 16), mask: word(&bytes, 24) })
+            } else { None };
             let old = state.actions[sig];
             if a.a2 != 0 {
-                for (i, value) in [old.handler, old.flags, old.restorer, old.mask]
-                    .iter()
-                    .enumerate()
-                {
-                    machine.write(a.a2 + (i * 8) as u64, *value);
+                let mut bytes = [0; 32];
+                for (i, value) in [old.handler, old.flags, old.restorer, old.mask].iter().enumerate() {
+                    put(&mut bytes, i * 8, &value.to_le_bytes());
                 }
+                if !high_memory::copy_to(machine, a.a2, &bytes) { return SyscallResult::val(-14); }
             }
             if let Some(mut action) = new {
                 action.mask &= !UNBLOCKABLE;
@@ -187,7 +189,7 @@ pub(super) fn call<A: crate::Arch>(
                     return SyscallResult::val(-1);
                 }
                 let mut bytes = [0; 24];
-                if !super::high_memory::copy_from(machine, a.a0, &mut bytes) { return SyscallResult::val(-14); }
+                if !high_memory::copy_from(machine, a.a0, &mut bytes) { return SyscallResult::val(-14); }
                 let flags = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
                 let stack = u64::from_le_bytes(bytes[..8].try_into().unwrap());
                 let size = u64::from_le_bytes(bytes[16..].try_into().unwrap());
@@ -197,7 +199,7 @@ pub(super) fn call<A: crate::Arch>(
                 if flags == 0 && size < 2048 {
                     return SyscallResult::val(-12);
                 }
-                if flags == 0 && !super::high_memory::range(stack, size) {
+                if flags == 0 && !high_memory::range(stack, size) {
                     return SyscallResult::val(-14);
                 }
                 Some(if flags == 2 {
@@ -216,7 +218,7 @@ pub(super) fn call<A: crate::Arch>(
                 bytes[..8].copy_from_slice(&old.stack.to_le_bytes());
                 bytes[8..12].copy_from_slice(&(if old.size == 0 { 2 } else { u32::from(active) }).to_le_bytes());
                 bytes[16..].copy_from_slice(&old.size.to_le_bytes());
-                if !super::high_memory::copy_to(machine, a.a1, &bytes) { return SyscallResult::val(-14); }
+                if !high_memory::copy_to(machine, a.a1, &bytes) { return SyscallResult::val(-14); }
             }
             if let Some(local) = new {
                 state.locals.insert(tid, local);
@@ -274,6 +276,20 @@ pub(super) fn deliver<A: crate::Arch>(
     code: i32,
     addr: u64,
 ) -> bool {
+    deliver_frame(machine, linux, process, regs, signal, code, addr, 0)
+}
+
+/// `status` is siginfo's si_status slot (offset 24); only SIGCHLD sets it.
+fn deliver_frame<A: crate::Arch>(
+    machine: &mut A,
+    linux: &mut LinuxState,
+    process: i32,
+    regs: &mut Regs,
+    signal: usize,
+    code: i32,
+    addr: u64,
+    status: i32,
+) -> bool {
     if regs.mode() != crate::UserMode::Mode64 {
         return false;
     }
@@ -308,7 +324,6 @@ pub(super) fn deliver<A: crate::Arch>(
     {
         return false;
     }
-    let base = base as usize;
     // Snapshot without disturbing the live floating point state.
     let mut fx = machine.clean_fx_template();
     machine.switch_fx(&mut fx);
@@ -317,18 +332,14 @@ pub(super) fn deliver<A: crate::Arch>(
     let Some(image) = image else {
         return false;
     };
-    machine.zero(base as u64, FRAME_SIZE);
-    machine.write(base as u64, action.restorer);
-    machine.write((base + UC + 16) as u64, local.stack);
-    machine.write::<u32>(
-        (base + UC + 24) as u64,
-        if local.size == 0 {
-            2
-        } else {
-            u32::from(on_stack(local, regs.frame.rsp))
-        },
-    );
-    machine.write((base + UC + 32) as u64, local.size);
+    // Build the whole frame here and copy it out once: the frame may sit on a
+    // high-half alternate stack that plain machine.write cannot reach.
+    let mut frame = [0u8; FRAME_SIZE];
+    put(&mut frame, 0, &action.restorer.to_le_bytes());
+    put(&mut frame, UC + 16, &local.stack.to_le_bytes());
+    let ss_flags = if local.size == 0 { 2 } else { u32::from(on_stack(local, regs.frame.rsp)) };
+    put(&mut frame, UC + 24, &ss_flags.to_le_bytes());
+    put(&mut frame, UC + 32, &local.size.to_le_bytes());
     let general = [
         regs.r8,
         regs.r9,
@@ -355,17 +366,21 @@ pub(super) fn deliver<A: crate::Arch>(
         if fault { addr } else { 0 },
     ];
     for (index, value) in general.iter().enumerate() {
-        machine.write((base + MC + index * 8) as u64, *value);
+        put(&mut frame, MC + index * 8, &value.to_le_bytes());
     }
-    machine.write::<u64>((base + MC + 184) as u64, (base + FP) as u64);
-    machine.write((base + MASK) as u64, local.saved_wait_mask.unwrap_or(local.mask));
-    machine.write::<i32>((base + INFO) as u64, signal as i32);
-    machine.write::<i32>((base + INFO + 8) as u64, code);
-    machine.write::<u64>((base + INFO + 16) as u64, addr);
+    put(&mut frame, MC + 184, &(base + FP as u64).to_le_bytes());
+    put(&mut frame, MASK, &local.saved_wait_mask.unwrap_or(local.mask).to_le_bytes());
+    put(&mut frame, INFO, &(signal as i32).to_le_bytes());
+    put(&mut frame, INFO + 8, &code.to_le_bytes());
+    put(&mut frame, INFO + 16, &addr.to_le_bytes());
     if matches!(code, 0 | -6) && !fault {
-        machine.write::<u32>((base + INFO + 20) as u64, super::environment::identity().0);
+        put(&mut frame, INFO + 20, &super::environment::identity().0.to_le_bytes());
     }
-    machine.copy_to((base + FP) as u64, &image);
+    put(&mut frame, INFO + 24, &status.to_le_bytes());
+    put(&mut frame, FP, &image);
+    if !high_memory::copy_to(machine, base, &frame) {
+        return false;
+    }
     state.frames.push(Frame {
         tid,
         base,
@@ -383,12 +398,12 @@ pub(super) fn deliver<A: crate::Arch>(
     if action.flags & SA_RESETHAND != 0 {
         state.actions[signal] = Action::default();
     }
-    regs.frame.rsp = base as u64;
+    regs.frame.rsp = base;
     regs.frame.rip = action.handler;
     regs.frame.rflags &= !(0x100 | 0x400); // clear TF and DF on handler entry
     regs.rdi = signal as u64;
-    regs.rsi = (base + INFO) as u64;
-    regs.rdx = (base + UC) as u64;
+    regs.rsi = base + INFO as u64;
+    regs.rdx = base + UC as u64;
     regs.rax = 0;
     true
 }
@@ -398,12 +413,8 @@ pub(super) fn deliver_child_exit<A: crate::Arch>(
     child: i32, exit_code: i32,
 ) -> bool {
     let signaled = (-64..0).contains(&exit_code);
-    if !deliver(machine, linux, process, regs, 17, if signaled { 2 } else { 1 }, child as u64) {
-        return false;
-    }
-    machine.write::<i32>(regs.frame.rsp + INFO as u64 + 24,
-        if signaled { -exit_code } else { exit_code & 0xff });
-    true
+    let status = if signaled { -exit_code } else { exit_code & 0xff };
+    deliver_frame(machine, linux, process, regs, 17, if signaled { 2 } else { 1 }, child as u64, status)
 }
 
 fn restore<A: crate::Arch>(
@@ -412,28 +423,28 @@ fn restore<A: crate::Arch>(
     tid: i32,
     regs: &mut Regs,
 ) -> Option<i64> {
-    let base = regs.frame.rsp.checked_sub(8)? as usize;
+    let base = regs.frame.rsp.checked_sub(8)?;
     let index = state.frames.iter().rposition(|frame| frame.tid == tid)?;
-    if state.frames[index].base != base || !valid(base as u64, FRAME_SIZE as u64) {
+    let mut frame = [0u8; FRAME_SIZE];
+    if state.frames[index].base != base || !high_memory::copy_from(machine, base, &mut frame) {
         return None;
     }
     let mut general = [0u64; 23];
     for (i, value) in general.iter_mut().enumerate() {
-        *value = machine.read((base + MC + i * 8) as u64);
+        *value = word(&frame, MC + i * 8);
     }
     if !valid(general[16], 1) || !valid(general[15], 1) {
         return None;
     }
-    let ptr = machine.read::<u64>((base + MC + 184) as u64);
+    let ptr = word(&frame, MC + 184);
     let mut fx = machine.clean_fx_template();
     if ptr != 0 {
-        if !valid(ptr, 512) {
-            return None;
-        }
         let bytes = A::fx_state_bytes_mut(&mut fx)?;
         let allowed = u32::from_le_bytes(bytes[28..32].try_into().unwrap());
         let allowed = if allowed == 0 { 0xffbf } else { allowed };
-        machine.copy_from(ptr as u64, bytes);
+        if !valid(ptr, 512) || !high_memory::copy_from(machine, ptr, bytes) {
+            return None;
+        }
         let mxcsr = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
         // Reserved MXCSR bits cause #GP in FXRSTOR; never pass them to arch.
         if mxcsr & !allowed != 0 {
@@ -461,7 +472,7 @@ fn restore<A: crate::Arch>(
     regs.frame.rip = general[16];
     const USER_FLAGS: u64 = 0x254dd5;
     regs.frame.rflags = (original.frame.rflags & !USER_FLAGS) | (general[17] & USER_FLAGS);
-    state.locals.entry(tid).or_default().mask = machine.read::<u64>((base + MASK) as u64) & !UNBLOCKABLE;
+    state.locals.entry(tid).or_default().mask = word(&frame, MASK) & !UNBLOCKABLE;
     machine.switch_fx(&mut fx);
     Some(regs.rax as i64)
 }
