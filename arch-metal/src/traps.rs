@@ -9,7 +9,6 @@ use crate::irq::handle_irq;
 use crate::paging2;
 use crate::x86;
 use arch_abi::Regs;
-use crate::Vcpu;
 
 // =============================================================================
 // Arch call interface (ring-1 kernel → ring-0 arch via INT 0x80)
@@ -76,20 +75,14 @@ const _: () = {
     assert!(core::mem::offset_of!(Raw32, eax) == core::mem::offset_of!(Regs, rax));
 };
 
-/// The live execution context while the kernel runs: `REGS.regs` is the user
-/// register swap buffer (holds user regs when the kernel runs); the Vcpu
-/// wrapper also exposes the user-memory API (`REGS.read/write/slice/...`)
-/// against the active mapping, so any code holding `&mut REGS` can touch guest
-/// memory. `REGS.space` tracks the current thread's address space (set at
-/// thread switch); it is not consulted by the memory API, which always hits
-/// the active page tables.
+/// Register swap buffer used when no execute register object is installed.
 #[thread_local]
-pub(crate) static mut REGS: Vcpu = Vcpu::new(Regs::empty(), paging2::RootPageTable::empty());
+static mut REGS: Regs = Regs::empty();
 
 // While Arch::execute is in flight, point directly at the event loop's
 // register object.  The ring-1 entry and ring-3 exit can then exchange their
 // physical trap frames with that object instead of bouncing the same 216-byte
-// register file through REGS.regs before and after every run.
+// register file through REGS before and after every run.
 #[thread_local]
 static mut EXECUTE_REGS: *mut Regs = core::ptr::null_mut();
 
@@ -372,7 +365,7 @@ fn swap_regs(regs: &mut Regs) {
     let execute = unsafe { EXECUTE_REGS };
     if execute.is_null() {
         let p = &raw mut REGS;
-        unsafe { core::mem::swap(regs, &mut (*p).regs); }
+        unsafe { core::ptr::swap(regs, p); }
     } else {
         unsafe { core::ptr::swap(regs, execute); }
     }

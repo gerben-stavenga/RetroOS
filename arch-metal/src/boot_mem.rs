@@ -1,8 +1,8 @@
 //! A loader-reserved, physically contiguous pool placed last in kernel BSS.
 //! Minimal BSP setup reserves the shared kernel tables. Callers can reserve
-//! other early storage before opening the tail to permanent low-memory DMA.
-//! The kernel starts APs with resident heap stacks/TLS after allocator setup;
-//! those allocations do not consume this pool.
+//! other early storage before opening the tail to permanent low-memory storage.
+//! AP TLS (including CR3 targets) and DMA consume this pool. AP stacks use
+//! resident kernel heap mappings instead.
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 

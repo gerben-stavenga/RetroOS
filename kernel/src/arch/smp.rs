@@ -185,16 +185,22 @@ pub(super) unsafe fn start(
             if Some(id) == own || (!x2 && id >= 255) {
                 continue;
             }
-            // Allocate virtual ranges from the ordinary kernel heap. Touch
-            // every page on the BSP: AP bootstrap must never demand-fault
-            // while borrowing the BSP root or before installing its own IDT.
+            // TLS contains CR3 targets, which must be physically below 4 GiB.
+            // start_core initializes it before handing it to the AP.
+            let tls = match arch::boot_mem::allocate_permanent(tls) {
+                Ok(storage) => storage,
+                Err(_) => {
+                    lib::compact_screenln!(screen, "SMP: low TLS pool exhausted; limiting cores");
+                    break;
+                }
+            };
+            // Stacks only need resident mappings; their frames can be high.
             let resident = |layout: Layout| {
                 let storage = unsafe { alloc::alloc::alloc_zeroed(layout) };
                 assert!(!storage.is_null(), "cannot allocate resident AP storage");
                 storage
             };
             let trap = resident(trap);
-            let tls = resident(tls);
             let stack = resident(stack);
             let logical = selected + 1;
             slots[logical].processor.store(id, Ordering::Relaxed);
@@ -215,7 +221,7 @@ pub(super) unsafe fn start(
         }
     }
     if selected != 0 {
-        lib::compact_screenln!(screen, "SMP: AP stacks/TLS use resident kernel heap mappings");
+        lib::compact_screenln!(screen, "SMP: AP TLS uses low BSS pool; stacks use resident heap");
     }
     let mut online = 1;
     for &(id, start) in starts.iter().flatten() {

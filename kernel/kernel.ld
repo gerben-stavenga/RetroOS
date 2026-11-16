@@ -58,17 +58,16 @@ SECTIONS
 
     /* ELF local-exec TLS template. Runtime copies are separate from the
      * template; GS:0 holds the linked address immediately after each copy.
-     * Page alignment also accommodates CPU-local page-table storage. */
+     * Group page-aligned objects before small fields. Include zero-initialized
+     * TLS in the template so initialized and zero fields share the same tail
+     * page instead of requiring separate alignment padding. */
     .tdata ALIGN(4K) : {
         TLS_TEMPLATE = .;
-        *(.tdata .tdata.*)
+        *(SORT_BY_ALIGNMENT(.t[bd]*))
     }
-    .tbss : {
-        *(.tbss .tbss.*)
-    }
-    TLS_ALIGN = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));
+    TLS_ALIGN = ALIGNOF(.tdata);
     TLS_FILE_SIZE = SIZEOF(.tdata);
-    TLS_SIZE = ALIGN(ADDR(.tbss) + SIZEOF(.tbss) - TLS_TEMPLATE, TLS_ALIGN);
+    TLS_SIZE = ALIGN(SIZEOF(.tdata), TLS_ALIGN);
 
     .bss ALIGN(4K) (NOLOAD) : {
         *(.bss .bss.*)

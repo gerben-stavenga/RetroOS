@@ -4,8 +4,8 @@
 //! with paging off, offset segments, a private stack, and initialized Rust TLS.
 //! The consumer calls `init_core` on both paths; only core 0 initializes devices.
 //! APs borrow the BSP page table only for the trampoline, then adopt private
-//! roots. Caller-owned stacks/TLS need resident virtual mappings, not contiguous
-//! physical memory or storage from the loader's BSS pool.
+//! roots. Caller-owned stacks/TLS need resident virtual mappings. TLS contains
+//! CR3 targets and must be physically below 4 GiB; stacks have no such limit.
 
 use crate::{descriptors, paging2, x86};
 use core::alloc::Layout;
@@ -112,7 +112,8 @@ pub enum StartError {
 /// `start` must provide exclusive, mapped, resident storage: a 64 KiB kernel
 /// stack, a 16 KiB trap stack in one 64 KiB window, and `tls_layout()` bytes.
 /// Stack/TLS mappings must be resident in the BSP root, writable, and remain
-/// alive for the CPU's lifetime. Physical contiguity is unnecessary. Keep the
+/// alive for the CPU's lifetime. TLS must be backed below 4 GiB because it holds
+/// CR3 targets. Physical contiguity is unnecessary. Keep the
 /// BSP root and its boot identity mapping stable until this AP acknowledges.
 /// `ready` must be distinct for each AP, initially zero, and valid on both CPUs.
 /// After ANY delivery/startup timeout, retain the page and all AP storage and
