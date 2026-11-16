@@ -36,10 +36,17 @@ run "DIGGER (real-mode) + keyboard" \
     --cmd "GAMES/DIGGER/DIGGER.EXE" --keys "wait:3,SPACE,wait:1,RIGHT,RIGHT,ENTER" \
     --settle 2 --timeout 25
 
-# DOOM shareware: 32-bit DOS/4GW protected-mode game — reaching its setup
-# without a kernel panic exercises the DPMI + mode-13h path.
+# DOOM shareware: require progress beyond timer initialization. A lost IRQ0
+# EOI used to leave it spinning there indefinitely without a kernel panic.
 run "DOOM (shareware, DPMI) boots" \
-    --cmd "GAMES/DOOMS/DOOM.EXE" --settle 2 --timeout 35
+    --cmd "GAMES/DOOMS/DOOM.EXE" --settle 12 --timeout 35 \
+    --expect-log "ST_Init: Init status bar."
+
+# Exercise DN's child-execution path as well as the direct boot path.
+run "DN launches DOOM" \
+    --settle 6 --timeout 35 \
+    --keys 'cd c:\games\dooms,ENTER,wait:2,doom.exe,ENTER,wait:15' \
+    --expect-log "ST_Init: Init status bar."
 
 # Substitute-BIOS VBE: controller/mode records, packed + direct-colour mode
 # metadata, bank switching with retained VRAM, palette data, and LFB address.

@@ -463,8 +463,8 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
         }
         if trace_on() {
             let intr = uc.get_data().pending_intr;
-            let ev = uc.get_data().pending.is_some();
-            eprintln!("   -> cs={:#06x}:{:#010x} ss={:#06x}:{:#010x} intr={:?} ev={} run={:?}",
+            let ev = &uc.get_data().pending;
+            eprintln!("   -> cs={:#06x}:{:#010x} ss={:#06x}:{:#010x} intr={:?} ev={:?} run={:?}",
                 vcpu.code_seg(), vcpu.frame.rip, vcpu.frame.ss as u16, vcpu.frame.rsp,
                 intr, ev, run.is_ok());
         }
@@ -591,9 +591,8 @@ fn flush_tlb(uc: &mut Unicorn<'static, Ctx>) {
 // so the monitor sees them all and no TF stepping is needed.
 
 /// Invalidate cached translations for a range after an arch call mutated the
-/// active space's page tables. `configure` reloads CR3 at the start of every
-/// slice (a full TLB flush), so the only window this must cover is a mutation
-/// applied while the CPU is already configured — handled by a CR3 rewrite.
+/// active space's page tables. Guest re-entry can retain the current CPU
+/// context, so page-table mutations must explicitly invalidate its TLB.
 pub fn invalidate_uc(vpage: usize, count: usize) {
     MACHINE.with(|cell| {
         if let Some(uc) = cell.borrow_mut().as_mut() {
@@ -749,6 +748,27 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
     w(uc, RegisterX86::EDI, r.rdi);
     w(uc, RegisterX86::EBP, r.rbp);
 
+    // Most device exits change only general registers and IP. Keep the loaded
+    // segment caches and paging context when they still describe this frame;
+    // rebuilding them through real mode + IRET flushes the TLB on every VGA
+    // store. Descriptor edits and address-space changes require a full entry.
+    if mode == UserMode::Mode32 && !crate::desc::tables_dirty()
+        && uc.reg_read(RegisterX86::CR0).unwrap_or(0) & 0x8000_0001 == 0x8000_0001
+        && uc.reg_read(RegisterX86::EFLAGS).unwrap_or(VM_FLAG) & VM_FLAG == 0
+        && uc.reg_read(RegisterX86::CR3).unwrap_or(u64::MAX)
+            == crate::paging::frame_phys(crate::paging::active_pd()) as u64
+        && [
+            (RegisterX86::CS, r.code_seg()), (RegisterX86::SS, r.stack_seg()),
+            (RegisterX86::DS, r.ds as u16), (RegisterX86::ES, r.es as u16),
+            (RegisterX86::FS, r.fs as u16), (RegisterX86::GS, r.gs as u16),
+        ].into_iter().all(|(reg, selector)| uc.reg_read(reg).ok() == Some(selector as u64))
+    {
+        let flags = vif_to_if((r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32) & !NT_FLAG) | (1 << 12) | 2);
+        w(uc, RegisterX86::EFLAGS, flags as u64);
+        w(uc, RegisterX86::ESP, r.sp32() as u64);
+        return r.ip32() as u64;
+    }
+
     match mode {
         UserMode::VM86 => {
             // VM86 runs PAGED now (PE=1, VM=1, PG=1) — its real-mode seg<<4 linear
@@ -886,6 +906,66 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
 #[cfg(test)]
 mod execution_tests {
     use arch_abi::{Arch as _, GuestBytes, Irq, KernelEvent, Regs};
+
+    #[test]
+    fn port_io_stops_before_the_next_instruction() {
+        use super::{Arch, Mode, Prot, RegisterX86, Unicorn};
+        // Immediate and DX-addressed IN/OUT must retire exactly once, without
+        // running the following instruction with stale input/output registers.
+        for instruction in [&[0xe6, 0x20][..], &[0xee], &[0xe4, 0x21], &[0xec]] {
+            let mut uc = Unicorn::new(Arch::X86, Mode::MODE_32).unwrap();
+            uc.mem_map(0x1000, 4096, Prot::ALL).unwrap();
+            let mut code = instruction.to_vec();
+            code.extend_from_slice(&[0x40, 0xcd, 0x31]); // inc eax; int 31h
+            uc.mem_write(0x1000, &code).unwrap();
+            uc.reg_write(RegisterX86::EAX, 0x20).unwrap();
+            uc.reg_write(RegisterX86::EDX, 0x20).unwrap();
+            uc.add_insn_out_hook(|uc, _, _, value| {
+                assert_eq!(value, 0x20);
+                uc.emu_stop().unwrap();
+            }).unwrap();
+            uc.add_insn_in_hook(|uc, _, _| {
+                uc.emu_stop().unwrap();
+                0x42
+            }).unwrap();
+            uc.add_intr_hook(|_, _| panic!("executed beyond port I/O")).unwrap();
+            uc.emu_start(0x1000, 0x2000, 0, 0).unwrap();
+            assert_eq!(uc.reg_read(RegisterX86::EIP).unwrap(), 0x1000 + instruction.len() as u64);
+            let expected = if instruction[0] == 0xe4 || instruction[0] == 0xec { 0x42 } else { 0x20 };
+            assert_eq!(uc.reg_read(RegisterX86::EAX).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn protected_reentry_observes_flags_and_descriptor_changes() {
+        crate::phys::init_test_ram();
+        let mut machine = crate::backend::Interp;
+        let mut ldt = [0,
+            crate::sysdesc::gdt_desc(0, 0xfffff, 0xfa, 0xc),
+            crate::sysdesc::gdt_desc(0, 0xfffff, 0xf2, 0xc)];
+        crate::desc::load_ldt(&ldt);
+        // mov al,[9000h]; adc al,0; int 31h
+        machine.copy_to(0x8000, &[0xa0, 0x00, 0x90, 0, 0, 0x14, 0, 0xcd, 0x31]);
+        machine.copy_to(0x9000, &[0x10]);
+        machine.copy_to(0xa000, &[0x30]);
+        let mut regs = Regs::empty();
+        regs.set_cs32(0x0f);
+        regs.set_ss32(0x17);
+        regs.ds = 0x17; regs.es = 0x17; regs.fs = 0x17; regs.gs = 0x17;
+        regs.set_sp32(0x7000);
+        let io = arch_abi::IoPolicy::deny_all();
+        for (carry, expected) in [(1, 0x11), (0, 0x10), (0, 0x30)] {
+            if expected == 0x30 {
+                // Same selector, different hidden segment base: must reload.
+                ldt[2] = crate::sysdesc::gdt_desc(0x1000, 0xfffff, 0xf2, 0xc);
+                crate::desc::mark_ldt_dirty();
+            }
+            regs.set_ip32(0x8000);
+            regs.set_flags32((1 << 19) | 2 | carry);
+            assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
+            assert_eq!(regs.rax as u8, expected);
+        }
+    }
 
     static INPUT: std::sync::Mutex<std::vec::Vec<(arch_abi::Irq, u64)>> = std::sync::Mutex::new(std::vec::Vec::new());
     fn receive_input(event: arch_abi::Irq, timestamp: u64) { INPUT.lock().unwrap().push((event, timestamp)); }

@@ -92,7 +92,30 @@ pub fn execute<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>,
             }
         }
     }
-    let _ = dos;
+    // Hosted MMIO returns through arch, but a completed VGA access does not
+    // require a scheduler/device-polling round trip. Resume within the same
+    // CPU loan, just as the native aperture handler does. Keep its original
+    // deadline so a stream of VGA stores cannot postpone timer or input work.
+    #[cfg(not(target_arch = "x86"))]
+    {
+        let deadline = machine.now().saturating_add(max_time.as_nanos().min(u64::MAX as u128) as u64);
+        loop {
+            let remaining = deadline.saturating_sub(machine.now());
+            let event = machine.execute(regs, io, core::time::Duration::from_nanos(remaining));
+            if let crate::KernelEvent::PageFault { addr } = event {
+                let stepped = arch_abi::monitor::stepping(regs);
+                let user_was = regs.user_tf();
+                if addr <= u32::MAX as u64 && super::try_vga_fault(machine, dos, regs, addr as u32) {
+                    if stepped {
+                        return (crate::KernelEvent::EmulatedStep { user_was }, 0);
+                    }
+                    continue;
+                }
+            }
+            return (event, 0);
+        }
+    }
+    #[cfg(target_arch = "x86")]
     (machine.execute(regs, io, max_time), 0)
 }
 

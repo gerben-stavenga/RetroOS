@@ -96,6 +96,11 @@ pub fn mark_ldt_dirty() {
     DESC.with(|d| d.borrow_mut().dirty = true);
 }
 
+#[cfg(feature = "tcg")]
+pub(crate) fn tables_dirty() -> bool {
+    DESC.with(|d| d.borrow().dirty)
+}
+
 /// Consume the dirty flag: true (and clear) if the tables need materializing.
 pub(crate) fn take_dirty() -> bool {
     DESC.with(|d| {
