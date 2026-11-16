@@ -67,13 +67,26 @@ impl X86 for Interp {
 }
 
 impl Memory for Interp {
-    fn read_mapping(&mut self, page: arch_abi::UserPage) -> Result<arch_abi::page_entry::PageEntry, arch_abi::MappingError> {
-        crate::paging::read_mapping(page)
+    fn read_mappings(&mut self, start: arch_abi::UserPage, entries: &mut [arch_abi::page_entry::PageEntry]) -> Result<(), arch_abi::MappingFailure> {
+        crate::paging::mapping_batch(start, entries.len(), |page, index| {
+            entries[index] = crate::paging::read_mapping(page)?;
+            Ok(())
+        })
     }
 
-    unsafe fn replace_mapping(&mut self, page: arch_abi::UserPage, entry: arch_abi::page_entry::PageEntry, pages: arch_abi::page_supply::PageInput) -> (Result<(), arch_abi::MappingError>, arch_abi::page_supply::PageInput) {
+    fn read_mapping_run(&mut self, start: arch_abi::UserPage, maximum: usize) -> Result<(arch_abi::page_entry::PageEntry, usize), arch_abi::MappingError> {
+        crate::paging::read_mapping_run(start, maximum)
+    }
+
+    unsafe fn replace_mappings(&mut self, start: arch_abi::UserPage, entries: &[arch_abi::page_entry::PageEntry], pages: arch_abi::page_supply::PageInput) -> (Result<(), arch_abi::MappingFailure>, arch_abi::page_supply::PageInput) {
         crate::phys::with_input(pages, || {
-            crate::paging::replace_user_mapping(page, entry)
+            crate::paging::mapping_batch(start, entries.len(), |page, index| crate::paging::replace_user_mapping(page, entries[index]))
+        })
+    }
+
+    unsafe fn fill_mappings(&mut self, start: arch_abi::UserPage, count: usize, entry: arch_abi::page_entry::PageEntry, pages: arch_abi::page_supply::PageInput) -> (Result<(), arch_abi::MappingFailure>, arch_abi::page_supply::PageInput) {
+        crate::phys::with_input(pages, || {
+            crate::paging::mapping_batch(start, count, |page, _| crate::paging::replace_user_mapping(page, entry))
         })
     }
 

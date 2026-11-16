@@ -1063,6 +1063,36 @@ fn release_mapping(entry: u32) {
 }
 fn zero_frame() -> u64 { active_pd() + 2 }
 
+/// Keep validation and the whole completed prefix within one paging transition.
+pub(crate) fn mapping_batch(start: arch_abi::UserPage, count: usize,
+    mut apply: impl FnMut(arch_abi::UserPage, usize) -> Result<(), arch_abi::MappingError>,
+) -> Result<(), arch_abi::MappingFailure> {
+    let _paging = PagingGuard::lock();
+    if count != 0 {
+        start.offset(count - 1).map_err(|error| arch_abi::MappingFailure { completed: 0, error })?;
+    }
+    for completed in 0..count {
+        apply(start.offset(completed).unwrap(), completed)
+            .map_err(|error| arch_abi::MappingFailure { completed, error })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn read_mapping_run(start: arch_abi::UserPage, maximum: usize) -> Result<(arch_abi::page_entry::PageEntry, usize), arch_abi::MappingError> {
+    let _paging = PagingGuard::lock();
+    if maximum == 0 { return Err(arch_abi::MappingError::InvalidAddress); }
+    start.offset(maximum - 1)?;
+    let entry = read_mapping(start)?;
+    // Bound a scan to one table; a missing table is already uniformly zero.
+    let limit = maximum.min(1024 - pte_index(start.address() as u32));
+    if read_entry(active_pd(), pde_index(start.address() as u32)) & PRESENT == 0 {
+        return Ok((entry, limit));
+    }
+    let mut count = 1;
+    while count < limit && read_mapping(start.offset(count)?)? == entry { count += 1; }
+    Ok((entry, count))
+}
+
 pub(crate) fn read_mapping(page: arch_abi::UserPage) -> Result<arch_abi::page_entry::PageEntry, arch_abi::MappingError> {
     let _paging = PagingGuard::lock();
     use arch_abi::{MappingError, page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFrame, X86PteFormat}};

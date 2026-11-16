@@ -35,8 +35,8 @@ fn demand_isolation_and_unmap() {
 
     // Unmap drops the page; the next access demand-zeroes it.
     let mut machine = arch::Interp;
-    let zero = machine.read_mapping(UserPage::new(0x7000_0000).unwrap()).unwrap();
-    unsafe { machine.replace_mapping(UserPage::new(HI as u64).unwrap(), zero, test_memory::input(5)).0.unwrap(); }
+    let zero = arch_abi::mapping::read_mapping(&mut machine, UserPage::new(0x7000_0000).unwrap()).unwrap();
+    unsafe { arch_abi::mapping::replace_mapping(&mut machine, UserPage::new(HI as u64).unwrap(), zero, test_memory::input(5)).0.unwrap(); }
     assert_eq!(arch::mem().read::<u32>(HI), 0, "unmapped page reads back zero");
 }
 
@@ -52,7 +52,7 @@ fn kernel_owned_shared_pages_are_coherent_across_guest_fork() {
         for i in 0..3 {
             let pointer = core::ptr::NonNull::new_unchecked(memory.as_ptr().add(i * 4096));
             let frame = PhysicalFrame::new(test_memory::direct_frame(pointer)).unwrap();
-            machine.replace_mapping(start.offset(i).unwrap(), PageEntry::Writable(Mapping {
+            arch_abi::mapping::replace_mapping(&mut machine, start.offset(i).unwrap(), PageEntry::Writable(Mapping {
                 backing: Backing::Borrowed(frame), attributes: Attributes::EXECUTABLE,
             }), test_memory::input(5)).0.unwrap();
         }
@@ -97,19 +97,19 @@ fn typed_mapping_ownership_and_protection() {
     let mapping = Mapping { backing: Backing::Owned(frame), attributes: Attributes::EXECUTABLE };
     unsafe { arch::physical_ram().0.add(frame.number() as usize * 4096).write(0x42); }
     unsafe {
-        machine.replace_mapping(page, PageEntry::Writable(mapping), test_memory::input(5)).0.unwrap();
+        arch_abi::mapping::replace_mapping(&mut machine, page, PageEntry::Writable(mapping), test_memory::input(5)).0.unwrap();
         // Transfer lifetime to the mapping by dropping the allocation reference.
         test_memory::free_phys_page(frame.number());
-        machine.replace_mapping(page, PageEntry::NoAccess(mapping), test_memory::input(5)).0.unwrap();
+        arch_abi::mapping::replace_mapping(&mut machine, page, PageEntry::NoAccess(mapping), test_memory::input(5)).0.unwrap();
     }
-    assert_eq!(machine.read_mapping(page).unwrap(), PageEntry::NoAccess(mapping));
-    unsafe { machine.replace_mapping(page, PageEntry::ReadOnly(mapping), test_memory::input(5)).0.unwrap(); }
+    assert_eq!(arch_abi::mapping::read_mapping(&mut machine, page).unwrap(), PageEntry::NoAccess(mapping));
+    unsafe { arch_abi::mapping::replace_mapping(&mut machine, page, PageEntry::ReadOnly(mapping), test_memory::input(5)).0.unwrap(); }
     assert_eq!(arch::mem().read::<u8>(HI), 0x42);
     // Self replacement must retain before releasing the last mapping reference.
-    unsafe { machine.replace_mapping(page, PageEntry::ReadOnly(mapping), test_memory::input(5)).0.unwrap(); }
+    unsafe { arch_abi::mapping::replace_mapping(&mut machine, page, PageEntry::ReadOnly(mapping), test_memory::input(5)).0.unwrap(); }
     assert_eq!(arch::mem().read::<u8>(HI), 0x42);
-    unsafe { machine.replace_mapping(page, PageEntry::Absent, test_memory::input(5)).0.unwrap(); }
-    assert_eq!(machine.read_mapping(page).unwrap(), PageEntry::Absent);
+    unsafe { arch_abi::mapping::replace_mapping(&mut machine, page, PageEntry::Absent, test_memory::input(5)).0.unwrap(); }
+    assert_eq!(arch_abi::mapping::read_mapping(&mut machine, page).unwrap(), PageEntry::Absent);
 }
 
 #[test]
@@ -122,24 +122,24 @@ fn borrowed_cow_copies_and_batch_failure_reports_progress() {
     let mapping = Mapping { backing: Backing::Borrowed(frame), attributes: Attributes::EXECUTABLE };
     unsafe {
         *memory.as_ptr() = 0x42;
-        machine.replace_mapping(start, PageEntry::CopyOnWrite(mapping), test_memory::input(5)).0.unwrap();
+        arch_abi::mapping::replace_mapping(&mut machine, start, PageEntry::CopyOnWrite(mapping), test_memory::input(5)).0.unwrap();
     }
     arch::mem().write::<u8>(HI, 0x79);
     assert_eq!(unsafe { *memory.as_ptr() }, 0x42);
     assert_eq!(arch::mem().read::<u8>(HI), 0x79);
-    assert!(matches!(machine.read_mapping(start).unwrap(),
+    assert!(matches!(arch_abi::mapping::read_mapping(&mut machine, start).unwrap(),
         PageEntry::Writable(Mapping { backing: Backing::Owned(_), .. })));
     let invalid = Mapping { backing: Backing::Borrowed(PhysicalFrame::new(1 << 20).unwrap()), ..mapping };
     let result = unsafe { machine.replace_mappings(start, &[
         PageEntry::Intercepted, PageEntry::ReadOnly(invalid), PageEntry::Absent,
     ], test_memory::input(5)).0 }.unwrap_err();
     assert_eq!(result.completed, 1);
-    assert_eq!(machine.read_mapping(start).unwrap(), PageEntry::Intercepted);
+    assert_eq!(arch_abi::mapping::read_mapping(&mut machine, start).unwrap(), PageEntry::Intercepted);
     let end = UserPage::new(0xbfff_f000).unwrap();
-    let before = machine.read_mapping(end).unwrap();
+    let before = arch_abi::mapping::read_mapping(&mut machine, end).unwrap();
     let result = unsafe { machine.replace_mappings(end, &[PageEntry::Absent; 2], test_memory::input(5)).0 }.unwrap_err();
     assert_eq!(result.completed, 0);
-    assert_eq!(machine.read_mapping(end).unwrap(), before);
+    assert_eq!(arch_abi::mapping::read_mapping(&mut machine, end).unwrap(), before);
     unsafe { test_memory::free_shared_pages(memory, 1); }
 }
 
@@ -152,15 +152,27 @@ fn fill_and_range_validation_through_arch() {
     let mut entries = [PageEntry::Absent; 3];
     machine.read_mappings(start, &mut entries).unwrap();
     assert_eq!(entries, [PageEntry::Intercepted; 3]);
-    assert_eq!(machine.read_mapping_run(start, 3), Ok((PageEntry::Intercepted, 1)));
+    assert_eq!(machine.read_mapping_run(start, 3), Ok((PageEntry::Intercepted, 3)));
     assert_eq!(machine.read_mapping_run(start, 0), Err(arch_abi::MappingError::InvalidAddress));
+    assert_eq!(machine.read_mapping_run(start, 2), Ok((PageEntry::Intercepted, 2)));
+    assert_eq!(machine.read_mapping_run(start, 4), Ok((PageEntry::Intercepted, 3)));
+    // Missing tables describe repeated zero backing without consuming input.
+    let sparse = UserPage::new(0x6800_0000).unwrap();
+    let zero = arch_abi::mapping::read_mapping(&mut machine, sparse).unwrap();
+    assert_eq!(machine.read_mapping_run(sparse, 1024), Ok((zero, 1024)));
+    // Adjacent RAM frames are different entries, even with equal permissions.
+    arch::mem().write::<u8>(HI + 0x10000, 1);
+    arch::mem().write::<u8>(HI + 0x11000, 2);
+    let ram = UserPage::new((HI + 0x10000) as u64).unwrap();
+    assert_eq!(machine.read_mapping_run(ram, 2).unwrap().1, 1);
+
     let end = UserPage::new(0xbfff_f000).unwrap();
-    let before = machine.read_mapping(end).unwrap();
+    let before = arch_abi::mapping::read_mapping(&mut machine, end).unwrap();
     let failure = unsafe { machine.fill_mappings(end, 2, PageEntry::Absent, test_memory::input(5)).0 }.unwrap_err();
     assert_eq!(failure, arch_abi::MappingFailure { completed: 0, error: arch_abi::MappingError::InvalidAddress });
-    assert_eq!(machine.read_mapping(end).unwrap(), before);
+    assert_eq!(arch_abi::mapping::read_mapping(&mut machine, end).unwrap(), before);
     unsafe { machine.fill_mappings(start, 0, PageEntry::Absent, test_memory::input(5)).0.unwrap(); }
-    assert_eq!(machine.read_mapping(start).unwrap(), PageEntry::Intercepted);
+    assert_eq!(arch_abi::mapping::read_mapping(&mut machine, start).unwrap(), PageEntry::Intercepted);
 }
 
 #[test]
@@ -172,14 +184,14 @@ fn supplied_input_exhaustion_preserves_the_uncompleted_suffix() {
     input.count = 1;
     // The two entries require different page tables.
     let start = UserPage::new(0x403f_f000).unwrap();
-    let untouched = machine.read_mapping(start.offset(1).unwrap()).unwrap();
+    let untouched = arch_abi::mapping::read_mapping(&mut machine, start.offset(1).unwrap()).unwrap();
     let (result, input) = unsafe { machine.replace_mappings(start, &[PageEntry::Intercepted; 2], input) };
     let failure = result.unwrap_err();
     assert_eq!(failure, arch_abi::MappingFailure { completed: 1, error: arch_abi::MappingError::NeedPages });
     assert_eq!(input.count, 0);
-    assert_eq!(machine.read_mapping(start).unwrap(), PageEntry::Intercepted);
-    assert_eq!(machine.read_mapping(start.offset(1).unwrap()).unwrap(), untouched);
-    unsafe { machine.replace_mapping(start.offset(1).unwrap(), PageEntry::Intercepted, test_memory::input(5)).0.unwrap(); }
+    assert_eq!(arch_abi::mapping::read_mapping(&mut machine, start).unwrap(), PageEntry::Intercepted);
+    assert_eq!(arch_abi::mapping::read_mapping(&mut machine, start.offset(1).unwrap()).unwrap(), untouched);
+    unsafe { arch_abi::mapping::replace_mapping(&mut machine, start.offset(1).unwrap(), PageEntry::Intercepted, test_memory::input(5)).0.unwrap(); }
 }
 
 #[test]
@@ -187,18 +199,18 @@ fn fork_needs_no_allocation_and_detachment_waits_for_input() {
     init();
     let mut machine = arch::Interp;
     let at = UserPage::new(HI as u64).unwrap();
-    unsafe { machine.replace_mapping(at, PageEntry::Intercepted, test_memory::input(5)).0.unwrap(); }
+    unsafe { arch_abi::mapping::replace_mapping(&mut machine, at, PageEntry::Intercepted, test_memory::input(5)).0.unwrap(); }
     let input = arch_abi::page_supply::PageInput::new();
     let mut child = arch::RootPageTable::default();
     let ((), input) = machine.user_fork(&mut child, input);
     let parent = machine.activate(child);
-    let (result, input) = unsafe { machine.replace_mapping(at, PageEntry::Absent, input) };
+    let (result, input) = unsafe { arch_abi::mapping::replace_mapping(&mut machine, at, PageEntry::Absent, input) };
     assert_eq!(result, Err(arch_abi::MappingError::NeedPages));
-    assert_eq!(machine.read_mapping(at).unwrap(), PageEntry::Intercepted);
+    assert_eq!(arch_abi::mapping::read_mapping(&mut machine, at).unwrap(), PageEntry::Intercepted);
     assert_eq!(input.count, 0);
-    unsafe { machine.replace_mapping(at, PageEntry::Absent, test_memory::input(5)).0.unwrap(); }
+    unsafe { arch_abi::mapping::replace_mapping(&mut machine, at, PageEntry::Absent, test_memory::input(5)).0.unwrap(); }
     let mut child = machine.activate(parent);
-    assert_eq!(machine.read_mapping(at).unwrap(), PageEntry::Intercepted);
+    assert_eq!(arch_abi::mapping::read_mapping(&mut machine, at).unwrap(), PageEntry::Intercepted);
     machine.destroy_space(&mut child);
 }
 
@@ -212,10 +224,10 @@ fn page_batches_return_rejected_and_unused_ownership() {
     assert_eq!(needed, 0);
     assert_eq!(&pages.pages[..pages.count], &numbers);
     let at = UserPage::new(HI as u64).unwrap();
-    let (result, pages) = unsafe { machine.replace_mapping(at, PageEntry::Intercepted, pages) };
+    let (result, pages) = unsafe { arch_abi::mapping::replace_mapping(&mut machine, at, PageEntry::Intercepted, pages) };
     result.unwrap();
     assert_eq!(pages.count, 1, "only the new table consumes backing");
-    let (result, mut pages) = unsafe { machine.replace_mapping(at, PageEntry::Absent, pages) };
+    let (result, mut pages) = unsafe { arch_abi::mapping::replace_mapping(&mut machine, at, PageEntry::Absent, pages) };
     result.unwrap();
     assert_eq!(pages.count, 1, "reusing a table returns all unused backing");
     while let Some(page) = pages.take() { test_memory::free_phys_page(page); }
@@ -235,7 +247,7 @@ fn retired_pages_are_drained_in_bounded_batches() {
         let pages = test_memory::input(1);
         expected.insert(pages.pages[0]);
         let page = UserPage::new(index * 0x40_0000).unwrap();
-        let (result, unused) = unsafe { machine.replace_mapping(page, PageEntry::Intercepted, pages) };
+        let (result, unused) = unsafe { arch_abi::mapping::replace_mapping(&mut machine, page, PageEntry::Intercepted, pages) };
         result.unwrap();
         assert_eq!(unused.count, 0);
     }
@@ -286,9 +298,9 @@ fn concurrent_forks_detach_replace_and_destroy_shared_tables() {
                         assert_eq!(arch::mem().read::<u8>(address), 17);
                         arch::mem().write::<u8>(address, (worker * 16 + round + 32) as u8);
                         let page = UserPage::new((address + 4096) as u64).unwrap();
-                        let (result, _) = unsafe { machine.replace_mapping(page, PageEntry::Absent, test_memory::input(5)) };
+                        let (result, _) = unsafe { arch_abi::mapping::replace_mapping(&mut machine, page, PageEntry::Absent, test_memory::input(5)) };
                         result.unwrap();
-                        assert_eq!(machine.read_mapping(page).unwrap(), PageEntry::Absent);
+                        assert_eq!(arch_abi::mapping::read_mapping(&mut machine, page).unwrap(), PageEntry::Absent);
                     }
                     // One CPU may release the last old table while another
                     // CPU is retaining its leaves for a private replacement.
@@ -308,7 +320,7 @@ fn concurrent_forks_detach_replace_and_destroy_shared_tables() {
     for index in 0..4 {
         let address = HI + index * STRIDE;
         assert_eq!(arch::mem().read::<u8>(address), 17);
-        let entry = machine.read_mapping(UserPage::new(address as u64).unwrap()).unwrap();
+        let entry = arch_abi::mapping::read_mapping(&mut machine, UserPage::new(address as u64).unwrap()).unwrap();
         let mapping = match entry {
             PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => m,
             _ => panic!("expected RAM"),

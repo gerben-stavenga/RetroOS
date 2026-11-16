@@ -6,7 +6,7 @@
 use crate::page_supply::PageInput;
 use crate::{Regs, KernelEvent, ExecutionProfile, ExecutionProfileStage};
 use crate::page_entry::PageEntry;
-use crate::mapping::{MappingError, MappingFailure, UserPage, validate_batch};
+use crate::mapping::{MappingError, MappingFailure, UserPage};
 
 /// Execution and lifecycle of one backend/core, with supporting capabilities
 /// grouped into independently usable traits.
@@ -151,60 +151,34 @@ pub trait Memory {
     /// empty placeholder a switch leaves behind in a now-running thread's slot.
     type PageTable: Default;
 
-    /// Read does not allocate data frames. The result is a snapshot, not an
-    /// owning reference; its backing must stay valid until replacement finishes.
-    fn read_mapping(&mut self, page: UserPage) -> Result<PageEntry, MappingError>;
+    /// Read consecutive entries without materializing absent page tables or data.
+    /// Results are snapshots, not owning references. On failure, `completed`
+    /// identifies the valid prefix of the output slice.
+    fn read_mappings(&mut self, start: UserPage, entries: &mut [PageEntry]) -> Result<(), MappingFailure>;
 
-    /// Return a uniform run starting at `page`, bounded by `maximum` pages.
-    /// This exposes sparse mapping state without expanding its page tables.
-    fn read_mapping_run(&mut self, page: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError> {
-        if maximum == 0 { return Err(MappingError::InvalidAddress); }
-        page.offset(maximum - 1)?;
-        Ok((self.read_mapping(page)?, 1))
-    }
+    /// Read a uniform prefix of a range. Returns an entry and a count in
+    /// `1..=maximum`; every page in that prefix has exactly that entry,
+    /// including its backing frame. The prefix need not be maximal.
+    /// Does not materialize absent tables or data. Zero maximum is invalid.
+    fn read_mapping_run(&mut self, start: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError>;
 
-    /// Repeat an entry across a range. Each Owned occurrence retains a reference.
-    /// # Safety
-    /// Same backing lifetime requirements as replace_mapping.
-    unsafe fn fill_mappings(&mut self, start: UserPage, count: usize, entry: PageEntry, mut pages: PageInput) -> (Result<(), MappingFailure>, PageInput) {
-        if let Err(error) = validate_batch(start, count) { return (Err(error), pages); }
-        for completed in 0..count {
-            let (result, unused) = unsafe { self.replace_mapping(start.offset(completed).unwrap(), entry, pages) };
-            pages = unused;
-            if let Err(error) = result { return (Err(MappingFailure { completed, error }), pages); }
-        }
-        (Ok(()), pages)
-    }
-
-    /// Retain Owned backing before releasing the displaced mapping's reference.
-    /// Borrowed mappings never retain or release backing.
-    ///
+    /// Replace consecutive entries, retaining Owned backing before releasing
+    /// displaced references. Borrowed backing is neither retained nor released.
+    /// Returns unused table backing and reports any completed prefix on failure.
+    /// Invalid address ranges fail before changing any mapping. Empty ranges
+    /// succeed without consuming supplied pages.
     /// # Safety
     /// Supplied frames must be valid; Borrowed backing must outlive every alias.
     /// Writable aliases must obey the caller's synchronization/ownership rules.
-    /// Serialize mapping changes with other CPUs using the same address space.
-    unsafe fn replace_mapping(&mut self, page: UserPage, entry: PageEntry, pages: PageInput) -> (Result<(), MappingError>, PageInput);
+    /// The caller must exclusively own the active address space.
+    unsafe fn replace_mappings(&mut self, start: UserPage, entries: &[PageEntry], pages: PageInput) -> (Result<(), MappingFailure>, PageInput);
 
-    fn read_mappings(&mut self, start: UserPage, entries: &mut [PageEntry]) -> Result<(), MappingFailure> {
-        validate_batch(start, entries.len())?;
-        for (completed, entry) in entries.iter_mut().enumerate() {
-            *entry = self.read_mapping(start.offset(completed).unwrap())
-                .map_err(|error| MappingFailure { completed, error })?;
-        }
-        Ok(())
-    }
-
+    /// Repeat exactly one entry across a range, including its backing frame.
+    /// Each Owned occurrence retains a reference. Failure and empty-range
+    /// behavior match replace_mappings.
     /// # Safety
-    /// Same requirements as replace_mapping, for every supplied entry.
-    unsafe fn replace_mappings(&mut self, start: UserPage, entries: &[PageEntry], mut pages: PageInput) -> (Result<(), MappingFailure>, PageInput) {
-        if let Err(error) = validate_batch(start, entries.len()) { return (Err(error), pages); }
-        for (completed, &entry) in entries.iter().enumerate() {
-            let (result, unused) = unsafe { self.replace_mapping(start.offset(completed).unwrap(), entry, pages) };
-            pages = unused;
-            if let Err(error) = result { return (Err(MappingFailure { completed, error }), pages); }
-        }
-        (Ok(()), pages)
-    }
+    /// Same backing lifetime and ownership requirements as replace_mappings.
+    unsafe fn fill_mappings(&mut self, start: UserPage, count: usize, entry: PageEntry, pages: PageInput) -> (Result<(), MappingFailure>, PageInput);
 
     /// Install `incoming` as the active address space and return the displaced
     /// one. Registers and FPU state are unchanged.
@@ -272,7 +246,7 @@ pub trait Diagnostics {
 ///
 /// `addr` is a guest-linear address as `usize` (the 32-bit kernel addresses all
 /// low guest memory within 4 GiB). High long-mode mappings use
-/// `Memory::read_mapping` and `GuestBytes::high_copy` without narrowing their addresses.
+/// `Memory::read_mappings` and `GuestBytes::high_copy` without narrowing their addresses.
 ///
 /// Soundness note: `read::<T>` reconstructs a `T` from copied bytes, so `T` must
 /// be valid for *all* bit patterns (an integer or a `#[repr(C, packed)]` POD

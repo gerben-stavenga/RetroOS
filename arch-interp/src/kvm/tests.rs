@@ -208,14 +208,14 @@ fn kvm_engine_proofs() {
     mem.copy_to(0x8C00, &[0xB8, 0x78, 0x56, 0xCD, 0x31]);
     let first_page = arch_abi::UserPage::new(0x7000).unwrap();
     let second_page = arch_abi::UserPage::new(0x8000).unwrap();
-    let first = mem.read_mapping(first_page).unwrap();
-    let second = mem.read_mapping(second_page).unwrap();
+    let first = arch_abi::mapping::read_mapping(&mut mem, first_page).unwrap();
+    let second = arch_abi::mapping::read_mapping(&mut mem, second_page).unwrap();
     let arch_abi::page_entry::PageEntry::Writable(first_mapping) = first else { panic!("expected owned RAM") };
     let arch_abi::page_entry::Backing::Owned(frame) = first_mapping.backing else { panic!("expected owned RAM") };
     assert!(unsafe { test_memory::ownership().retain(frame.number()) });
     unsafe {
-        mem.replace_mapping(first_page, second, test_memory::input(5)).0.unwrap();
-        mem.replace_mapping(second_page, first, test_memory::input(5)).0.unwrap();
+        arch_abi::mapping::replace_mapping(&mut mem, first_page, second, test_memory::input(5)).0.unwrap();
+        arch_abi::mapping::replace_mapping(&mut mem, second_page, first, test_memory::input(5)).0.unwrap();
     }
     test_memory::free_phys_page(frame.number());
     let mut remapped = r;

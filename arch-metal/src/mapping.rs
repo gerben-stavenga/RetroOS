@@ -35,10 +35,18 @@ pub(crate) unsafe fn invoke<T>(call: u64, arguments: &mut T) {
 
 fn read_run(page: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError> {
     if page.address() >= crate::high_paging::START { return crate::high_paging::read_run(page, maximum); }
+    fn scan<E: Entry>(entries: &[E], page: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError> {
+        let entry = read(entries, page)?;
+        let per_table = 4096 / core::mem::size_of::<E>();
+        let limit = maximum.min(per_table - (page.address() as usize / 4096) % per_table);
+        let mut count = 1;
+        while count < limit && read(entries, page.offset(count)?)? == entry { count += 1; }
+        Ok((entry, count))
+    }
     match paging2::entries() {
-        Entries::E32(e) => read(e, page),
-        Entries::E64(e) => read(e, page),
-    }.map(|entry| (entry, 1))
+        Entries::E32(e) => scan(e, page, maximum),
+        Entries::E64(e) => scan(e, page, maximum),
+    }
 }
 fn replace_page(page: UserPage, incoming: PageEntry) -> Result<(), MappingError> {
     if page.address() >= crate::high_paging::START {

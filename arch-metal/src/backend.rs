@@ -76,17 +76,6 @@ impl X86 for Metal {
 }
 
 impl Memory for Metal {
-    fn read_mapping(&mut self, page: UserPage) -> Result<PageEntry, MappingError> {
-        let mut entry = PageEntry::Absent;
-        self.read_mappings(page, core::slice::from_mut(&mut entry)).map_err(|failure| failure.error)?;
-        Ok(entry)
-    }
-
-    unsafe fn replace_mapping(&mut self, page: UserPage, entry: PageEntry, pages: arch_abi::page_supply::PageInput) -> (Result<(), MappingError>, arch_abi::page_supply::PageInput) {
-        let (result, pages) = unsafe { self.replace_mappings(page, core::slice::from_ref(&entry), pages) };
-        (result.map_err(|failure| failure.error), pages)
-    }
-
     fn read_mappings(&mut self, page: UserPage, entries: &mut [PageEntry]) -> Result<(), MappingFailure> {
         let mut arguments = Read { page, entries, result: Ok(()) };
         unsafe { invoke(crate::arch_call::READ_MAPPINGS, &mut arguments); }

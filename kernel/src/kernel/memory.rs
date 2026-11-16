@@ -58,19 +58,19 @@ pub(crate) fn allocate_frame<A: arch_abi::Memory>(machine: &A) -> Option<u64> {
 
 /// Install one mapping with explicit table backing and retry only uncompleted work.
 /// # Safety
-/// The entry's backing must satisfy Arch::replace_mapping's requirements.
+/// The entry's backing must satisfy Arch::replace_mappings's requirements.
 pub unsafe fn replace<A: Arch>(machine: &mut A, page: arch_abi::UserPage,
     entry: arch_abi::page_entry::PageEntry) -> Result<(), arch_abi::MappingError>
 {
     loop {
-        let result = with_pages(machine, 5, |machine, pages| unsafe { machine.replace_mapping(page, entry, pages) });
+        let result = with_pages(machine, 5, |machine, pages| unsafe { arch_abi::mapping::replace_mapping(machine, page, entry, pages) });
         if result != Err(arch_abi::MappingError::NeedPages) { return result; }
     }
 }
 
 /// Install a batch, resuming after the committed prefix if table backing runs out.
 /// # Safety
-/// Every entry must satisfy Arch::replace_mapping's requirements.
+/// Every entry must satisfy Arch::replace_mappings's requirements.
 pub unsafe fn replace_batch<A: Arch>(machine: &mut A, mut page: arch_abi::UserPage,
     mut entries: &[arch_abi::page_entry::PageEntry]) -> Result<(), arch_abi::MappingError>
 {
@@ -200,7 +200,7 @@ pub fn fresh<A: Arch>(machine: &mut A, vpage: usize, count: usize) {
 pub fn protect<A: Arch>(machine: &mut A, vpage: usize, count: usize, writable: bool, executable: bool) {
     for index in 0..count {
         let page = page(vpage + index);
-        let old = machine.read_mapping(page).expect("read protection");
+        let old = arch_abi::mapping::read_mapping(machine, page).expect("read protection");
         let Some(mut mapping) = backing(old) else { continue; };
         let mut temporary = None;
         if !writable && matches!(old, PageEntry::CopyOnWrite(Mapping { backing: Backing::Borrowed(_), .. }))
@@ -232,7 +232,7 @@ pub fn alias<A: Arch>(machine: &mut A, source: usize, destination: usize, count:
     let mut entries = alloc::vec::Vec::with_capacity(count);
     for index in 0..count {
         let at = page(source + index);
-        let mut entry = machine.read_mapping(at).expect("read alias source");
+        let mut entry = arch_abi::mapping::read_mapping(machine, at).expect("read alias source");
         if let PageEntry::CopyOnWrite(mut mapping) = entry {
             service(machine);
             let frame = allocate_frame(machine).expect("alias backing allocation");
@@ -256,7 +256,7 @@ pub fn alias<A: Arch>(machine: &mut A, source: usize, destination: usize, count:
 pub fn swap<A: Arch>(machine: &mut A, a: usize, b: usize, count: usize) {
     for index in 0..count {
         let a = page(a + index); let b = page(b + index);
-        let left = machine.read_mapping(a).unwrap(); let right = machine.read_mapping(b).unwrap();
+        let left = arch_abi::mapping::read_mapping(machine, a).unwrap(); let right = arch_abi::mapping::read_mapping(machine, b).unwrap();
         pin(left); pin(right);
         unsafe { replace(machine, a, right).unwrap(); replace(machine, b, left).unwrap(); }
         unpin(left); unpin(right);
@@ -300,7 +300,7 @@ pub fn map_text_screen<A: Arch>(machine: &mut A) {
 pub fn private_copy<A: Arch>(machine: &mut A, first: usize, count: usize) {
     for index in 0..count {
         let at = page(first + index);
-        let mut mapping = backing(machine.read_mapping(at).expect("read image mapping")).expect("image backing");
+        let mut mapping = backing(arch_abi::mapping::read_mapping(machine, at).expect("read image mapping")).expect("image backing");
         service(machine);
         let frame = allocate_frame(machine).expect("private image allocation");
         let mut bytes = [0; 4096];

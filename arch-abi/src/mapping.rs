@@ -43,7 +43,19 @@ pub struct MappingFailure {
 }
 
 
-pub(crate) fn validate_batch(start: UserPage, count: usize) -> Result<(), MappingFailure> {
-    if count != 0 { start.offset(count - 1).map_err(|error| MappingFailure { completed: 0, error })?; }
-    Ok(())
+/// Read one entry using the range primitive. The result does not own backing.
+pub fn read_mapping<M: crate::Memory + ?Sized>(machine: &mut M, page: UserPage) -> Result<crate::page_entry::PageEntry, MappingError> {
+    let mut entry = crate::page_entry::PageEntry::Absent;
+    machine.read_mappings(page, core::slice::from_mut(&mut entry)).map_err(|failure| failure.error)?;
+    Ok(entry)
+}
+
+/// Replace one entry using the range primitive.
+/// # Safety
+/// Same requirements as [`crate::Memory::replace_mappings`].
+pub unsafe fn replace_mapping<M: crate::Memory + ?Sized>(machine: &mut M, page: UserPage,
+    entry: crate::page_entry::PageEntry, pages: crate::page_supply::PageInput,
+) -> (Result<(), MappingError>, crate::page_supply::PageInput) {
+    let (result, pages) = unsafe { machine.replace_mappings(page, core::slice::from_ref(&entry), pages) };
+    (result.map_err(|failure| failure.error), pages)
 }
