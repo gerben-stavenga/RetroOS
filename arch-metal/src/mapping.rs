@@ -225,3 +225,58 @@ fn replace<E: Entry>(entries: &mut [E], page: UserPage, entry: PageEntry) -> Res
     paging2::replace_mapping(&mut entries[page.address() as usize / 4096], incoming);
     Ok(())
 }
+
+struct Rearrangement;
+impl arch_abi::mapping::Rearrange for Rearrangement {
+    fn read(&mut self, page: UserPage) -> Result<PageEntry, MappingError> { read_run(page, 1).map(|(entry, _)| entry) }
+    fn prepare(&mut self, page: UserPage) -> Result<(), MappingError> {
+        let entry = self.read(page)?;
+        self.replace(page, entry)
+    }
+    #[inline(never)]
+    fn private_alias(&mut self, page: UserPage) -> Result<(), MappingError> {
+        let PageEntry::CopyOnWrite(mut mapping) = self.read(page)? else { return Ok(()); };
+        let frame = PhysicalFrame::new(crate::memory::take_page().ok_or(MappingError::NeedPages)?).unwrap();
+        let mut bytes = [0; 4096];
+        // The paging lock protects the temporary window; this runs at ring 0.
+        let saved = paging2::temp_swap(mapping.backing.frame().number());
+        unsafe { core::ptr::copy_nonoverlapping((&raw const paging2::TEMP_PAGE).cast::<u8>(), bytes.as_mut_ptr(), 4096); }
+        let _ = paging2::temp_swap(frame.number());
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (&raw mut paging2::TEMP_PAGE).cast::<u8>(), 4096); }
+        let _ = paging2::temp_swap(saved);
+        mapping.backing = Backing::Owned(frame);
+        let entry = PageEntry::Writable(mapping);
+        let result = self.replace(page, entry);
+        // replace retained the mapping; release our temporary owned reference.
+        self.release(entry);
+        result
+    }
+    fn replace(&mut self, page: UserPage, entry: PageEntry) -> Result<(), MappingError> { replace_page(page, entry) }
+    fn retain(&mut self, entry: PageEntry) {
+        if let Some(frame) = owned_backing(entry) { assert!(crate::memory::inc_shared_count(frame.number())); }
+    }
+    fn release(&mut self, entry: PageEntry) {
+        if let Some(frame) = owned_backing(entry) { crate::memory::release_page(frame.number()); }
+    }
+}
+fn owned_backing(entry: PageEntry) -> Option<PhysicalFrame> {
+    match entry {
+        PageEntry::NoAccess(m) | PageEntry::ReadOnly(m) | PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => {
+            match m.backing { Backing::Owned(frame) => Some(frame), Backing::Borrowed(_) => None }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) struct Rearrange {
+    pub a: UserPage,
+    pub b: UserPage,
+    pub count: usize,
+    pub swap: bool,
+    pub result: Result<(), MappingError>,
+}
+pub(crate) fn rearrange_mappings(args: &mut Rearrange) {
+    let _paging = paging2::PagingGuard::lock();
+    args.result = arch_abi::mapping::rearrange(&mut Rearrangement, args.a, args.b, args.count, args.swap);
+    paging2::flush_tlb();
+}

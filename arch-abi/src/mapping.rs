@@ -59,3 +59,51 @@ pub unsafe fn replace_mapping<M: crate::Memory + ?Sized>(machine: &mut M, page: 
     let (result, pages) = unsafe { machine.replace_mappings(page, core::slice::from_ref(&entry), pages) };
     (result.map_err(|failure| failure.error), pages)
 }
+
+/// Internal paging mechanisms used while the backend holds its paging lock.
+/// Preparation may consume supplied frames; replacement after preparation must
+/// not need more table storage. No operation allocates host/kernel storage.
+pub trait Rearrange {
+    fn read(&mut self, page: UserPage) -> Result<crate::page_entry::PageEntry, MappingError>;
+    fn prepare(&mut self, page: UserPage) -> Result<(), MappingError>;
+    fn private_alias(&mut self, page: UserPage) -> Result<(), MappingError>;
+    fn replace(&mut self, page: UserPage, entry: crate::page_entry::PageEntry) -> Result<(), MappingError>;
+    fn retain(&mut self, entry: crate::page_entry::PageEntry);
+    fn release(&mut self, entry: crate::page_entry::PageEntry);
+}
+
+/// No destination changes occur until preparation succeeds. NeedPages can be
+/// retried with more supplied storage: prepared tables and private COW sources
+/// persist, but no aliases or swaps have yet been applied.
+pub fn rearrange(ops: &mut impl Rearrange, a: UserPage, b: UserPage, count: usize, swap: bool) -> Result<(), MappingError> {
+    if count == 0 { return Ok(()); }
+    a.offset(count - 1)?;
+    b.offset(count - 1)?;
+    if a == b { return Ok(()); }
+    for i in 0..count {
+        let left = a.offset(i)?;
+        ops.prepare(left)?;
+        if !swap { ops.private_alias(left)?; }
+        ops.prepare(b.offset(i)?)?;
+    }
+    // Aliases have memmove semantics. Preparing all sources first and copying
+    // in this direction preserves the original source snapshot on overlap.
+    for step in 0..count {
+        let i = if !swap && b.address() > a.address() { count - 1 - step } else { step };
+        let left = a.offset(i)?;
+        let right = b.offset(i)?;
+        let l = ops.read(left)?;
+        if swap {
+            let r = ops.read(right)?;
+            ops.retain(l);
+            ops.retain(r);
+            let result = ops.replace(left, r).and_then(|()| ops.replace(right, l));
+            ops.release(l);
+            ops.release(r);
+            result?;
+        } else {
+            ops.replace(right, l)?;
+        }
+    }
+    Ok(())
+}

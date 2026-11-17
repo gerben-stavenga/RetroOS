@@ -153,15 +153,6 @@ fn backing(entry: PageEntry) -> Option<Mapping> {
         _ => None,
     }
 }
-fn pin(entry: PageEntry) {
-    if let Some(Mapping { backing: Backing::Owned(frame), .. }) = backing(entry) {
-        assert!(phys_mm::inc_shared_count(frame.number()), "invalid mapping reference");
-    }
-}
-fn unpin(entry: PageEntry) {
-    if let Some(Mapping { backing: Backing::Owned(frame), .. }) = backing(entry) { phys_mm::free_phys_page(frame.number()); }
-}
-
 static ZERO_FRAME: spin::Once<PhysicalFrame> = spin::Once::new();
 pub fn zero_mapping<A: Arch>(machine: &A, executable: bool) -> Mapping {
     let frame = *ZERO_FRAME.call_once(|| {
@@ -225,41 +216,25 @@ pub fn protect<A: Arch>(machine: &mut A, vpage: usize, count: usize, writable: b
     }
 }
 
-/// Snapshot and pin all source references before replacing overlapping ranges.
-/// COW sources become private RAM before another writable alias is installed.
+/// Request aliases; arch owns overlap handling, COW, and frame references.
 pub fn alias<A: Arch>(machine: &mut A, source: usize, destination: usize, count: usize) {
     if count == 0 || source == destination { return; }
-    let mut entries = alloc::vec::Vec::with_capacity(count);
-    for index in 0..count {
-        let at = page(source + index);
-        let mut entry = arch_abi::mapping::read_mapping(machine, at).expect("read alias source");
-        if let PageEntry::CopyOnWrite(mut mapping) = entry {
-            service(machine);
-            let frame = allocate_frame(machine).expect("alias backing allocation");
-            let mut bytes = [0; 4096];
-            super::platform::read_physical_frame(mapping.backing.frame().number(), 0, &mut bytes);
-            super::platform::write_physical_frame(frame, 0, &bytes);
-            mapping.backing = Backing::Owned(PhysicalFrame::new(frame).unwrap());
-            entry = PageEntry::Writable(mapping);
-            let result = unsafe { replace(machine, at, entry) };
-            phys_mm::free_phys_page(frame);
-            result.expect("materialize alias source");
+    loop {
+        match with_pages(machine, 5, |machine, pages| machine.alias_mappings(page(source), page(destination), count, pages)) {
+            Err(arch_abi::MappingError::NeedPages) => continue,
+            result => { result.expect("install aliases"); return; }
         }
-        pin(entry); entries.push(entry);
     }
-    let result = unsafe { replace_batch(machine, page(destination), &entries) };
-    for entry in entries { unpin(entry); }
-    result.expect("install aliases");
 }
 
-/// Swap each pair while holding both references across replacement.
+/// Request pairwise swaps; arch preserves both references across replacement.
 pub fn swap<A: Arch>(machine: &mut A, a: usize, b: usize, count: usize) {
-    for index in 0..count {
-        let a = page(a + index); let b = page(b + index);
-        let left = arch_abi::mapping::read_mapping(machine, a).unwrap(); let right = arch_abi::mapping::read_mapping(machine, b).unwrap();
-        pin(left); pin(right);
-        unsafe { replace(machine, a, right).unwrap(); replace(machine, b, left).unwrap(); }
-        unpin(left); unpin(right);
+    if count == 0 || a == b { return; }
+    loop {
+        match with_pages(machine, 5, |machine, pages| machine.swap_mappings(page(a), page(b), count, pages)) {
+            Err(arch_abi::MappingError::NeedPages) => continue,
+            result => { result.expect("swap mappings"); return; }
+        }
     }
 }
 

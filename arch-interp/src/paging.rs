@@ -1190,3 +1190,48 @@ fn test_alias(source: usize, destination: usize, count: usize) {
         replace_user_mapping(arch_abi::UserPage::new(((destination + i) * 4096) as u64).unwrap(), entry).unwrap();
     }
 }
+
+use arch_abi::{UserPage, MappingError, page_entry::{PageEntry, Backing, PhysicalFrame}};
+
+struct Rearrangement;
+impl arch_abi::mapping::Rearrange for Rearrangement {
+    fn read(&mut self, page: UserPage) -> Result<PageEntry, MappingError> { read_mapping(page) }
+    fn prepare(&mut self, page: UserPage) -> Result<(), MappingError> {
+        let entry = self.read(page)?;
+        self.replace(page, entry)
+    }
+    #[inline(never)]
+    fn private_alias(&mut self, page: UserPage) -> Result<(), MappingError> {
+        let PageEntry::CopyOnWrite(mut mapping) = self.read(page)? else { return Ok(()); };
+        let frame = PhysicalFrame::new(phys::take_input().ok_or(MappingError::NeedPages)?).unwrap();
+        unsafe { core::ptr::copy_nonoverlapping(phys::frame_ptr(mapping.backing.frame().number()), phys::frame_ptr(frame.number()), 4096); }
+        mapping.backing = Backing::Owned(frame);
+        let entry = PageEntry::Writable(mapping);
+        let result = self.replace(page, entry);
+        // replace retained the mapping; release our temporary owned reference.
+        self.release(entry);
+        result
+    }
+    fn replace(&mut self, page: UserPage, entry: PageEntry) -> Result<(), MappingError> { replace_user_mapping(page, entry) }
+    fn retain(&mut self, entry: PageEntry) {
+        if let Some(frame) = owned_backing(entry) { phys::retain(frame.number()); }
+    }
+    fn release(&mut self, entry: PageEntry) {
+        if let Some(frame) = owned_backing(entry) { phys::release(frame.number()); }
+    }
+}
+fn owned_backing(entry: PageEntry) -> Option<PhysicalFrame> {
+    match entry {
+        PageEntry::NoAccess(m) | PageEntry::ReadOnly(m) | PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => {
+            match m.backing { Backing::Owned(frame) => Some(frame), Backing::Borrowed(_) => None }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn rearrange_mappings(a: UserPage, b: UserPage, count: usize, swap: bool) -> Result<(), MappingError> {
+    let _paging = PagingGuard::lock();
+    // Reject unsupported high ranges before any preparation on the low range.
+    if count != 0 && (a.address() >= 0xc0000000 || b.address() >= 0xc0000000) { return Err(MappingError::Unsupported); }
+    arch_abi::mapping::rearrange(&mut Rearrangement, a, b, count, swap)
+}

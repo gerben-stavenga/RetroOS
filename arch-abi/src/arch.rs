@@ -162,6 +162,19 @@ pub trait Memory {
     /// Does not materialize absent tables or data. Zero maximum is invalid.
     fn read_mapping_run(&mut self, start: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError>;
 
+    /// Alias a source range with memmove overlap semantics. COW sources first
+    /// become private writable RAM. Uses only supplied pages. NeedPages leaves
+    /// destinations unchanged (source COW preparation may have completed) and
+    /// the entire operation can be retried with a fresh batch.
+    fn alias_mappings(&mut self, source: UserPage, destination: UserPage, count: usize,
+        pages: crate::page_supply::PageInput) -> (Result<(), MappingError>, crate::page_supply::PageInput);
+
+    /// Swap consecutive pairs in ascending order, including overlapping ranges.
+    /// NeedPages leaves mappings unchanged apart from private table preparation;
+    /// retry the entire operation. Lifetime bookkeeping is internal to arch.
+    fn swap_mappings(&mut self, a: UserPage, b: UserPage, count: usize,
+        pages: crate::page_supply::PageInput) -> (Result<(), MappingError>, crate::page_supply::PageInput);
+
     /// Replace consecutive entries, retaining Owned backing before releasing
     /// displaced references. Borrowed backing is neither retained nor released.
     /// Returns unused table backing and reports any completed prefix on failure.

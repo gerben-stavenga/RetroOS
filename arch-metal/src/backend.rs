@@ -76,6 +76,24 @@ impl X86 for Metal {
 }
 
 impl Memory for Metal {
+    fn alias_mappings(&mut self, a: arch_abi::UserPage, b: arch_abi::UserPage, count: usize,
+        pages: arch_abi::page_supply::PageInput) -> (Result<(), arch_abi::MappingError>, arch_abi::page_supply::PageInput) {
+        crate::memory::with_input(pages, || {
+            let mut args = crate::mapping::Rearrange { a, b, count, swap: false, result: Ok(()) };
+            unsafe { invoke(crate::arch_call::REARRANGE_MAPPINGS, &mut args); }
+            args.result
+        })
+    }
+
+    fn swap_mappings(&mut self, a: arch_abi::UserPage, b: arch_abi::UserPage, count: usize,
+        pages: arch_abi::page_supply::PageInput) -> (Result<(), arch_abi::MappingError>, arch_abi::page_supply::PageInput) {
+        crate::memory::with_input(pages, || {
+            let mut args = crate::mapping::Rearrange { a, b, count, swap: true, result: Ok(()) };
+            unsafe { invoke(crate::arch_call::REARRANGE_MAPPINGS, &mut args); }
+            args.result
+        })
+    }
+
     fn read_mappings(&mut self, page: UserPage, entries: &mut [PageEntry]) -> Result<(), MappingFailure> {
         let mut arguments = Read { page, entries, result: Ok(()) };
         unsafe { invoke(crate::arch_call::READ_MAPPINGS, &mut arguments); }

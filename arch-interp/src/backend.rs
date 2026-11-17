@@ -67,6 +67,16 @@ impl X86 for Interp {
 }
 
 impl Memory for Interp {
+    fn alias_mappings(&mut self, a: arch_abi::UserPage, b: arch_abi::UserPage, count: usize,
+        pages: arch_abi::page_supply::PageInput) -> (Result<(), arch_abi::MappingError>, arch_abi::page_supply::PageInput) {
+        crate::phys::with_input(pages, || crate::paging::rearrange_mappings(a, b, count, false))
+    }
+
+    fn swap_mappings(&mut self, a: arch_abi::UserPage, b: arch_abi::UserPage, count: usize,
+        pages: arch_abi::page_supply::PageInput) -> (Result<(), arch_abi::MappingError>, arch_abi::page_supply::PageInput) {
+        crate::phys::with_input(pages, || crate::paging::rearrange_mappings(a, b, count, true))
+    }
+
     fn read_mappings(&mut self, start: arch_abi::UserPage, entries: &mut [arch_abi::page_entry::PageEntry]) -> Result<(), arch_abi::MappingFailure> {
         crate::paging::mapping_batch(start, entries.len(), |page, index| {
             entries[index] = crate::paging::read_mapping(page)?;

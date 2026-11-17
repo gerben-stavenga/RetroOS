@@ -296,7 +296,13 @@ fn concurrent_forks_detach_replace_and_destroy_shared_tables() {
                     for index in 0..4 {
                         let address = HI + index * STRIDE;
                         assert_eq!(arch::mem().read::<u8>(address), 17);
+                        let source = UserPage::new(address as u64).unwrap();
+                        let alias = source.offset(2).unwrap();
+                        machine.alias_mappings(source, alias, 1, test_memory::input(5)).0.unwrap();
+                        machine.swap_mappings(source.offset(1).unwrap(), alias, 1, test_memory::input(5)).0.unwrap();
+                        assert_eq!(arch::mem().read::<u8>(address + 8192), 29);
                         arch::mem().write::<u8>(address, (worker * 16 + round + 32) as u8);
+                        assert_eq!(arch::mem().read::<u8>(address + 4096), (worker * 16 + round + 32) as u8);
                         let page = UserPage::new((address + 4096) as u64).unwrap();
                         let (result, _) = unsafe { arch_abi::mapping::replace_mapping(&mut machine, page, PageEntry::Absent, test_memory::input(5)) };
                         result.unwrap();
@@ -397,4 +403,53 @@ pub mod test_memory {
     pub unsafe fn free_shared_pages(base: std::ptr::NonNull<u8>, count: usize) {
         free_phys_contig(((base.as_ptr() as usize - pool().base) / 4096) as u64, count);
     }
+}
+
+#[test]
+fn arch_alias_swap_overlap_cow_and_retry() {
+    init();
+    let mut machine = arch::Interp;
+    let a = UserPage::new(0x2000000).unwrap();
+    let b = UserPage::new(0x3000000).unwrap();
+    for i in 0..4 { arch::mem().write::<u32>(a.address() as usize + i * 4096, 10 + i as u32); }
+    // A fork shares both tables and leaves. Aliasing must detach the source
+    // before making it writable, and must not alter the child's snapshot.
+    let mut child = arch::RootPageTable::default();
+    machine.user_fork(&mut child, test_memory::input(5));
+    assert_eq!(machine.alias_mappings(a, b, 4, Default::default()).0, Err(arch_abi::MappingError::NeedPages));
+    for i in 0..4 { assert_eq!(arch::mem().read::<u32>(a.address() as usize + i * 4096), 10 + i as u32); }
+    // Small batches force preparation to span several calls. No destination
+    // aliases may be installed until preparation is complete.
+    for attempt in 0..20 {
+        match machine.alias_mappings(a, b, 4, test_memory::input(1)).0 {
+            Ok(()) => break,
+            Err(arch_abi::MappingError::NeedPages) => {
+                assert!(attempt < 19, "preparation failed to make progress");
+                assert!(matches!(arch_abi::mapping::read_mapping(&mut machine, b).unwrap(), PageEntry::CopyOnWrite(_)));
+            }
+            result => panic!("alias failed: {result:?}"),
+        }
+    }
+    arch::mem().write::<u32>(b.address() as usize, 99);
+    assert_eq!(arch::mem().read::<u32>(a.address() as usize), 99);
+    let parent = machine.activate(child);
+    assert_eq!(arch::mem().read::<u32>(a.address() as usize), 10);
+    let mut child = machine.activate(parent);
+    machine.destroy_space(&mut child);
+
+    // Right-overlapping aliases must use the original snapshot, not repeatedly
+    // copy the first frame. Then test the opposite overlap direction.
+    machine.alias_mappings(a, a.offset(1).unwrap(), 3, test_memory::input(5)).0.unwrap();
+    let values = |base: UserPage| core::array::from_fn::<_, 4, _>(|i| arch::mem().read::<u32>(base.address() as usize + i * 4096));
+    assert_eq!(values(a), [99, 99, 11, 12]);
+    machine.alias_mappings(a.offset(1).unwrap(), a, 3, test_memory::input(5)).0.unwrap();
+    assert_eq!(values(a), [99, 11, 12, 12]);
+    machine.swap_mappings(a, a.offset(1).unwrap(), 3, test_memory::input(5)).0.unwrap();
+    assert_eq!(values(a), [11, 12, 12, 99]);
+
+    // Invalid ranges are rejected before any preparation or replacement.
+    let before = values(a);
+    let end = UserPage::new(0xbffff000).unwrap();
+    assert_eq!(machine.alias_mappings(a, end, 2, test_memory::input(5)).0, Err(arch_abi::MappingError::InvalidAddress));
+    assert_eq!(values(a), before);
 }
