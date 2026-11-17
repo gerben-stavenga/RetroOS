@@ -10,6 +10,16 @@ section .note.GNU-stack noalloc noexec nowrite progbits
 section .note.GNU-stack noalloc noexec nowrite progbits
 %endif
 
+%ifdef KVM_ENTRY
+; The hosted engine loads this image into its supervisor SYS window.
+org 0xFFFF5000
+KERNEL_TLS_SEL equ 0x18
+ESPFIX_SS_SEL equ 0x38
+bits 32
+section .text
+dd int_vector, isr_handler, exit_interrupt_32, exit_interrupt_64
+%else
+ESPFIX_SS_SEL equ 0x48
 ; Constants from linker script
 KERNEL_BASE equ 0xC0B00000
 KERNEL_PHYS equ 0x00100000
@@ -208,6 +218,9 @@ global toggle_prot_compat_end
 toggle_prot_compat_end:
 
 ; =============================================================================
+%endif ; native startup
+[bits 32]
+
 ; Mode-agnostic entry: int_vector + common_dispatch. Every instruction below
 ; has the same encoding under 32-bit and 64-bit CS, so the same table serves
 ; both IDT32 and IDT64. CS low byte distinguishes 0x08 vs 0x10.
@@ -330,13 +343,17 @@ common_call:
     ; simply loading flat SS would reinterpret that same ESP in low memory.
     ; Translate it back to its flat address in the MOV-SS interrupt shadow.
     mov eax, ss
-    cmp ax, 0x48
+    cmp ax, ESPFIX_SS_SEL
     jne .flat_ss
     mov eax, 0x18
     mov ds, eax
     mov edx, KERNEL_TLS_SEL
     mov gs, edx
+%ifdef KVM_ENTRY
+    mov edx, 0xFFFF0000          ; hosted ring-0 stack window
+%else
     mov edx, [gs:4]             ; CPU-local espfix stack window
+%endif
     mov ss, eax
     add esp, edx
     jmp .data_segs
@@ -382,7 +399,7 @@ exit_interrupt_32:
     ; blocks interrupts for the following instruction (IF is 0 here anyway).
     test byte [esp + 200], 3    ; saved CS at Raw32 offset 200; RPL==0 → ring 0
     jz .no_espfix
-    mov ax, 0x48                ; ESPFIX_SS_SEL (ring-0 trap-stack alias)
+    mov ax, ESPFIX_SS_SEL       ; ESPFIX_SS_SEL (ring-0 trap-stack alias)
     mov ss, ax
     movzx esp, sp
 .no_espfix:
@@ -585,6 +602,13 @@ far_ptr_32:
     dw 0x08                 ; 32-bit code segment
 
 ; -----------------------------------------------------------------------------
+%ifdef KVM_ENTRY
+bits 32
+isr_handler:
+    out 0xF4, al                ; host reads/updates the saved frame
+    mov eax, [esp + 8]          ; return from_64 to the shared epilogue
+    ret
+%else
 ; zero_rsp_high — clear the high 32 bits of RSP after entering compat mode.
 ; In compat mode the kernel runs on ESP and RSP[63:32] is never cleared (compat
 ; 32-bit ops don't zero-extend), so it retains whatever was there — on the UEFI
@@ -727,3 +751,5 @@ ap_entry:
     push ebx
     call boot_kernel           ; same Rust entry, paging on for APs
     ud2
+
+%endif ; native CPU helpers and AP startup

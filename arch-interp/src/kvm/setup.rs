@@ -77,7 +77,7 @@ fn init() -> KvmCpu {
     // Guest-side tables: the shared SYS window plus the KVM trap shim (a
     // Once — the kernel's io_policy may already have initialized it through
     // the first per-entry I/O policy installation).
-    super::shim::ensure_shim();
+    super::entry::ensure_shim();
 
     install_alarm(&mut vcpu);
 

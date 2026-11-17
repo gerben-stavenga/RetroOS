@@ -208,22 +208,21 @@ impl Parallel {
             threads[tid].kernel.pending_event.is_some()
             && matches!(threads[tid].kernel.state, ThreadState::Ready | ThreadState::Running))
     }
-    /// Start work on free CPUs and return only the current process's loan.
-    /// Other workers keep running across event-loop and lifecycle operations.
-    pub fn execute<A: Arch>(
+    /// Assign runnable processes to CPUs and install the BSP's selected context.
+    /// This only transfers ownership; the event loop executes the local context.
+    pub fn schedule<A: Arch>(
         &mut self, machine: &mut A, threads: &mut [Thread<A>], ctx: &mut ExecutionContext<A>,
-        bios: &super::bios_display::BiosDisplayWorkspace<A>, deadline: u64,
-    ) -> KernelEvent {
+        deadline: u64,
+    ) {
         self.kernel_cycles = 0;
-        ctx.device_cycles = 0;
         collect_finished::<A>(threads);
         let current = ctx.tid;
-        if let Some(event) = threads[current].kernel.pending_event.take() { return event; }
+        if threads[current].kernel.pending_event.is_some() { return; }
         // Only Linux can be loaned to workers. DOS stays on the BSP, where
         // native Sound Blaster IRQs must interrupt its execution directly.
         if !self.enabled::<A>() || !matches!(threads[current].personality, thread::Personality::Linux(_)) {
             stop_all(machine, threads);
-            return ctx.run(machine, bios, &mut threads[current].personality, deadline);
+            return;
         }
         let started = crate::kernel::event_profile::cycles();
         super::memory::service(machine);
@@ -241,17 +240,10 @@ impl Parallel {
             if self.available::<A>(cpu) && chosen[cpu] == usize::MAX { chosen[cpu] = tid; }
         }
         if chosen[0] == current && chosen.iter().skip(1).all(|&tid| tid == usize::MAX) {
-            return ctx.run(machine, bios, &mut threads[current].personality, deadline);
+            return;
         }
         self.batches += 1;
-        let mut fx = machine.clean_fx_template();
-        machine.switch_fx(&mut fx);
-        threads[current].kernel.vcpu.space = machine.activate(Default::default());
-        threads[current].kernel.vcpu.regs = ctx.regs;
-        // The current process can remain parked when its assigned CPU is
-        // occupied by a peer. Record this save even when no loan is issued.
-        threads[current].kernel.cpu_hash = thread::hash_regs(&ctx.regs);
-        threads[current].kernel.fx_state = fx;
+        threads[current].materialize(machine, ctx.regs);
         for &tid in &chosen {
             if tid == usize::MAX { continue; }
             let task = &mut threads[tid];
@@ -295,25 +287,7 @@ impl Parallel {
             slot.state.store(RUN, Ordering::Release);
             machine.interrupt_processor(slot.processor.load(Ordering::Relaxed));
         }
-        let prepared = crate::kernel::event_profile::cycles();
-        if chosen[0] != usize::MAX {
-            let task = &mut threads[chosen[0]];
-            let mut fx = task.kernel.fx_state;
-            machine.switch_fx(&mut fx);
-            let empty = machine.activate(core::mem::take(&mut task.kernel.vcpu.space));
-            task.personality.on_resume(machine);
-            machine.execution_profile_begin();
-            task.kernel.pending_event = Some(machine.execute(&mut task.kernel.vcpu.regs, &arch_abi::IoPolicy::deny_all(), core::time::Duration::from_nanos(deadline.saturating_sub(machine.now()))));
-            machine.switch_fx(&mut fx);
-            task.kernel.vcpu.space = machine.activate(empty);
-            task.kernel.fx_state = fx;
-            task.kernel.cpu_hash = thread::hash_regs(&task.kernel.vcpu.regs);
-        }
-        let work_finished = if chosen[0] == usize::MAX { prepared } else { crate::kernel::event_profile::cycles() };
-        // A BSP task already returned an event. Dispatch it now instead of
-        // waiting for the process which happened to initiate this CPU loan.
-        // Linux peers share a presentation endpoint; execution can change
-        // without transferring console focus or stopping the outstanding AP.
+        // Prefer the selected local process while unrelated workers continue.
         let resume = if chosen[0] != usize::MAX { chosen[0] } else { current };
         if resume != current && threads[current].kernel.state == ThreadState::OnCpu {
             BSP_EVENTS_WITH_WORKERS.fetch_add(1, Ordering::Relaxed);
@@ -334,14 +308,8 @@ impl Parallel {
             super::linux::foreground_console(resume);
         }
         ctx.tid = resume;
-        let task = &mut threads[resume];
-        let mut fx = task.kernel.fx_state;
-        machine.switch_fx(&mut fx);
-        let _empty = machine.activate(core::mem::take(&mut task.kernel.vcpu.space));
-        task.personality.on_resume(machine);
-        ctx.regs = task.kernel.vcpu.regs;
-        self.kernel_cycles = prepared.wrapping_sub(started).wrapping_add(crate::kernel::event_profile::cycles().wrapping_sub(work_finished));
-        task.kernel.pending_event.take().unwrap_or(KernelEvent::Irq)
+        ctx.regs = threads[resume].resume(machine);
+        self.kernel_cycles = crate::kernel::event_profile::cycles().wrapping_sub(started);
     }
 }
 

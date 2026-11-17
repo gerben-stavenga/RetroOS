@@ -27,6 +27,8 @@ fn store<A: crate::Arch>(machine: &mut A, pointer: u64, seconds: u64, fraction: 
 fn realtime() -> u64 {
     u64::from(crate::kernel::clock::rtc_unix_timestamp().unwrap_or(0))
 }
+/// CLOCK_REALTIME in nanoseconds (second resolution: the RTC is the source).
+pub(super) fn realtime_ns() -> u64 { realtime().saturating_mul(1_000_000_000) }
 pub(super) fn clock_gettime<A: crate::Arch>(
     machine: &mut A,
     args: &Args,

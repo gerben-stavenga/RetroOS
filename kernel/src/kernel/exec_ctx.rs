@@ -1,15 +1,8 @@
-//! The CPU loan — the live execution context and which thread holds it.
+//! The event loop's current thread and live register frame.
 //!
-//! The event loop owns exactly one of these: `vcpu` is the live register
-//! frame + address-space handle (no global `REGS` on the kernel side), and
-//! `tid` names the thread it belongs to. `run` lends the CPU to user code;
-//! `switch_to` is a pure EXECUTION swap — registers, FPU, address space,
-//! per-thread CPU bindings (`on_resume`). At the one guest-entry boundary,
-//! `run` derives the live I/O bitmap from the personality's capabilities.
-//! Console-focus transfer is deliberately
-//! NOT here: focus is a separate concept (`kernel::focus`) that today
-//! accompanies every switch (see startup's `switch_focus_and_run`) and
-//! tomorrow won't.
+//! Switching materializes the old thread and resumes the new one. The event
+//! loop calls `Arch::execute` itself; this context only holds registers and
+//! caches the personality's I/O policy. Display focus is managed separately.
 
 use crate::kernel::thread;
 
@@ -26,7 +19,7 @@ pub struct ExecutionContext<A: crate::Arch> {
     pub regs: crate::Regs,
     pub device_cycles: u64,
     io_key: Option<crate::kernel::io_policy::PolicyKey>,
-    io_policy: arch_abi::IoPolicy,
+    pub(crate) io_policy: arch_abi::IoPolicy,
     _a: core::marker::PhantomData<A>,
 }
 
@@ -59,39 +52,17 @@ impl<A: crate::Arch> ExecutionContext<A> {
         thread::get_thread(threads, self.tid).expect("ExecutionContext: current thread vanished")
     }
 
-    /// Lend the CPU to this personality. This is the only guest-entry point,
-    /// and therefore the single place where the live IOPB is reconciled with
-    /// the thread's current capabilities.
-    #[inline(never)]
-    pub fn run(
+    /// Reconcile the I/O bitmap with the current personality's capabilities.
+    pub fn prepare_io(
         &mut self,
-        machine: &mut A,
         bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        personality: &mut thread::Personality<A>,
-        deadline: u64,
-    ) -> crate::KernelEvent {
-        crate::kernel::memory::service(machine);
-        machine.execution_profile_begin();
+        personality: &thread::Personality<A>,
+    ) {
         let key = crate::kernel::io_policy::key(personality, bios);
         if self.io_key != Some(key) {
             self.io_policy = crate::kernel::io_policy::for_key(key);
             self.io_key = Some(key);
         }
-        machine.execution_profile_time(arch_abi::ExecutionProfileStage::PolicyLookup);
-        self.device_cycles = 0;
-        let max_time = core::time::Duration::from_nanos(deadline.saturating_sub(machine.now()));
-        if let thread::Personality::Dos(dos) = personality {
-            // Native SB interrupts target the BSP. Its DOS owner must execute
-            // there so a physical IRQ ends the owner's CPU loan directly.
-            assert!(!crate::kernel::parallel::on_worker()
-                || dos.pc.audio.lock().sb.physical().is_none(),
-                "DOS with native Sound Blaster must execute on the BSP");
-            let (event, cycles) = crate::kernel::dos::planar::execute(machine, dos,
-                &mut self.regs, &self.io_policy, max_time);
-            self.device_cycles = cycles;
-            return event;
-        }
-        machine.execute(&mut self.regs, &self.io_policy, max_time)
     }
 
     /// Execution swap: make `new_tid` the running thread. No-op when it already
@@ -104,23 +75,10 @@ impl<A: crate::Arch> ExecutionContext<A> {
         }
         crate::kernel::parallel::take_process(machine, threads, new_tid);
         let (old, new) = thread::get_two_threads(threads, self.tid, new_tid);
-        old.personality.on_suspend(machine);
-        verify_kernel_cpu_hash(&new.kernel, "switch-in");
-        // Registers are plain data: park the outgoing set, load the incoming.
-        old.kernel.vcpu.regs = self.regs;
-        self.regs = new.kernel.vcpu.regs;
-        // The address space is the moved resource: `activate` swaps the incoming
-        // space into the live slot and hands back the displaced (outgoing) one.
-        let mut swap_fx = new.kernel.fx_state;
-        let incoming = core::mem::take(&mut new.kernel.vcpu.space);
         if ASSERT_ADDR_HASH { old.kernel.addr_hash = machine.check_address_space(0); }
-        machine.switch_fx(&mut swap_fx);
-        let old_space = machine.activate(incoming);
+        old.materialize(machine, self.regs);
+        self.regs = new.resume(machine);
         if ASSERT_ADDR_HASH { machine.check_address_space(new.kernel.addr_hash); }
-        old.kernel.vcpu.space = old_space;
-        old.kernel.fx_state = swap_fx;
-        old.kernel.cpu_hash = thread::hash_regs(&old.kernel.vcpu.regs);
-        new.personality.on_resume(machine);
         self.tid = new_tid;
     }
 
@@ -138,7 +96,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
 
 /// Verify that saved CPU state still matches the hash recorded on the last
 /// switch-out. Print a diff-style dump on mismatch.
-fn verify_kernel_cpu_hash<A: crate::Arch>(k: &thread::KernelThread<A>, tag: &str) {
+pub(crate) fn verify_kernel_cpu_hash<A: crate::Arch>(k: &thread::KernelThread<A>, tag: &str) {
     if k.cpu_hash == 0 { return; }
     let actual = thread::hash_regs(&k.vcpu.regs);
     if actual == k.cpu_hash { return; }

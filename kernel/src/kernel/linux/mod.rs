@@ -47,6 +47,7 @@ mod limits;
 mod close_range;
 mod message;
 mod select;
+mod timerfd;
 
 use crate::kernel::elf;
 use crate::kernel::thread;
@@ -236,10 +237,10 @@ impl LinuxState {
         alloc::sync::Arc::ptr_eq(&self.tty, &other.tty)
     }
 
-    pub(crate) fn timer_due(&self, now: u64) -> bool { parent_death::due(self) || self.alarm_deadline().is_some_and(|end| end <= now) }
+    pub(crate) fn timer_due(&self, now: u64) -> bool { parent_death::due(self) || self.alarm_deadline(now).is_some_and(|end| end <= now) }
     pub(crate) fn expire_alarm(&mut self, now: u64) { self.alarm.expire(now); }
-    pub(crate) fn alarm_deadline(&self) -> Option<u64> {
-        [self.alarm.deadline(), async_io::next_deadline(&self.async_io),
+    pub(crate) fn alarm_deadline(&self, now: u64) -> Option<u64> {
+        [self.alarm.deadline(), async_io::next_deadline(&self.async_io, now),
             self.pending_poll.as_ref().and_then(|poll| poll.deadline_ns),
             self.pending_select.as_ref().and_then(|request| request.deadline()),
             self.pending_socket.as_ref().and_then(|socket| socket.deadline)]

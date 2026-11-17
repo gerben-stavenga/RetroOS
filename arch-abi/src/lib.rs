@@ -1063,3 +1063,7 @@ pub enum Irq {
 }
 
 pub mod page_supply;
+
+pub mod entry;
+
+pub mod trap;

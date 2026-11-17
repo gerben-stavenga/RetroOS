@@ -13,6 +13,14 @@ nasm_library(
     copts = ["-f", "elf32"],
 )
 
+# Identical trap entry/return assembly with a VM-exit handler, loaded by KVM.
+genrule(
+    name = "kvm_entry",
+    srcs = ["src/entry.asm"],
+    outs = ["kvm-entry.bin"],
+    cmd = "nasm -DKVM_ENTRY -f bin -o $@ $<",
+)
+
 rust_library(
     name = "arch-metal",
     srcs = glob(["src/**/*.rs"]),

@@ -1,16 +1,15 @@
 //! The KVM engine — run guest ring-3/VM86 slices on the real CPU via
 //! `/dev/kvm`, with the kernel staying a normal host process.
 //!
-//! Layering (everything above the engine seam is shared with the TCG engine):
-//! * `setup.rs` — VM/vcpu/memory-slot/CPUID bring-up + one-shot wakeup alarms.
-//! * `shim.rs`  — the in-guest ring-0 trap shim (IDT + stubs + TSS) that turns
-//!   guest faults into `KVM_EXIT_IO` on a magic port.
-//! * `run.rs`   — the execute loop: `Regs` ↔ KVM register mapping, the
-//!   `KVM_EXIT_*` → `KernelEvent` demux, virtual-IF single-stepping.
+//! * `setup.rs` — VM creation and host alarms.
+//! * `entry.rs` — descriptors, raw frame conversion and guest return.
+//! * `trap.rs` — KVM adaptations for the shared canonical guest dispatcher.
+//! * `run.rs` — VM exits and the execute loop.
 
 mod run;
+mod trap;
 mod setup;
-mod shim;
+mod entry;
 #[cfg(test)]
 mod tests;
 
@@ -37,17 +36,17 @@ pub(super) fn take_tlb_dirty() -> bool {
 /// ports trapped through the shim + monitor).
 #[cfg(test)]
 pub fn allow_io_ports(port: u16, count: usize) {
-    shim::iopb_allow(port, count)
+    entry::iopb_allow(port, count)
 }
 
 /// Reset the guest TSS I/O bitmap to all-deny (per swap-in, like metal).
 #[cfg(test)]
 pub fn reset_io_bitmap() {
-    shim::iopb_reset()
+    entry::iopb_reset()
 }
 
 pub fn install_io_policy(policy: &arch_abi::IoPolicy) {
-    shim::iopb_install(policy)
+    entry::iopb_install(policy)
 }
 
 /// The guest's x87 ST(0) as its raw 80-bit extended encoding, read out of the

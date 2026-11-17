@@ -40,83 +40,71 @@ static DECODE16: [u32; 128] = decode_table(false);
 #[cfg(any(target_arch = "x86", test))]
 static DECODE32: [u32; 128] = decode_table(true);
 
-pub fn execute<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>,
-    regs: &mut crate::Regs, io: &arch_abi::IoPolicy, max_time: core::time::Duration) -> (crate::KernelEvent, u64) {
-    #[cfg(target_arch = "x86")]
-    {
-        use super::machine::vga;
-        let base = vga::live_vram_ptr_if_initialized();
-        let state = dos.pc.vga.emulated_mut().and_then(|dev| dev.state.legacy_mut());
-        if let (Some(base), Some(state)) = (base, state) {
-            let pages = vga::trapped_aperture(state).unwrap_or(0..0);
-            let fast = Fast {
-                enabled: u32::from(assembly_writes(state)),
-                decode: 0,
-                cs_mode: 0, default32: 0, code_base: 0, code_limit: 0,
-                planes: base.as_ptr() as u32, base: u32::from(pages.start) << 12,
-                end: u32::from(pages.end) << 12, plane_mask: u32::from(state.seq.get(2) & 15),
-                profile: u32::from(crate::kernel::startup::profile_enabled()),
-                cycles_lo: 0, cycles_hi: 0, start_lo: 0, start_hi: 0,
-                profile_kind: 0, profile_details: [[0; 4]; 7],
-            };
-            // The callback only touches resident device state and atomic VRAM.
-            let mut context = Context {
-                fast, state, ldt: &dos.ldt[..], planes: base.as_ptr(),
-                dma: &mut dos.pc.dma, audio: &dos.pc.audio,
-                base: u32::from(pages.start) << 12,
-                end: u32::from(pages.end) << 12, stepped: false, user_tf: regs.user_tf(),
-            };
-            context.set_code(regs.code_seg(), regs.mode() == crate::UserMode::VM86);
-            unsafe {
-                PLANAR_FAST_CONTEXT = &mut context.fast;
-                ACTIVE = (&mut context as *mut Context<'_>).cast();
-                let previous = machine.replace_interrupt_handlers(14, arch_abi::InterruptHandlers {
-                    entry32: planar_page_fault_32 as *const () as u32,
-                    entry64: planar_page_fault_64 as *const () as u64,
-                });
-                let previous_input = machine.replace_interrupt_handlers(13, arch_abi::InterruptHandlers {
-                    entry32: device_io_32 as *const () as u32,
-                    entry64: device_io_64 as *const () as u64,
-                });
-                let mut event = machine.execute(regs, io, max_time);
-                machine.replace_interrupt_handlers(13, previous_input);
-                machine.replace_interrupt_handlers(14, previous);
-                ACTIVE = core::ptr::null_mut();
-                PLANAR_FAST_CONTEXT = core::ptr::null_mut();
-                if context.stepped { event = crate::KernelEvent::EmulatedStep { user_was: context.user_tf }; }
-                let fast_cycles = (u64::from(context.fast.cycles_hi) << 32) | u64::from(context.fast.cycles_lo);
-                if context.fast.profile != 0 {
-                    crate::kernel::event_profile::record_device_entries(context.fast.profile_details);
-                }
-                return (event, fast_cycles);
-            }
+/// Bind this CPU's native DOS handlers. Storage is per-core, not a pointer
+/// into an execution wrapper's stack. Only guest execution may use the binding;
+/// materialize it before the kernel mutates or replaces the DOS context.
+#[cfg(target_arch = "x86")]
+pub fn resume<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &crate::Regs) {
+    materialize(machine, crate::KernelEvent::Irq);
+    use super::machine::vga;
+    let base = vga::live_vram_ptr_if_initialized();
+    let state = dos.pc.vga.emulated_mut().and_then(|dev| dev.state.legacy_mut());
+    if let (Some(base), Some(state)) = (base, state) {
+        let pages = vga::trapped_aperture(state).unwrap_or(0..0);
+        let fast = Fast {
+            enabled: u32::from(assembly_writes(state)),
+            decode: 0,
+            cs_mode: 0, default32: 0, code_base: 0, code_limit: 0,
+            planes: base.as_ptr() as u32, base: u32::from(pages.start) << 12,
+            end: u32::from(pages.end) << 12, plane_mask: u32::from(state.seq.get(2) & 15),
+            profile: u32::from(crate::kernel::startup::profile_enabled()),
+            cycles_lo: 0, cycles_hi: 0, start_lo: 0, start_hi: 0,
+            profile_kind: 0, profile_details: [[0; 4]; 7],
+        };
+        // The callback only touches resident device state and atomic VRAM.
+        let mut context = Context {
+            fast, state, ldt: &dos.ldt[..], planes: base.as_ptr(),
+            dma: &mut dos.pc.dma, audio: &*dos.pc.audio,
+            base: u32::from(pages.start) << 12,
+            end: u32::from(pages.end) << 12, stepped: false, user_tf: regs.user_tf(),
+        };
+        context.set_code(regs.code_seg(), regs.mode() == crate::UserMode::VM86);
+        unsafe {
+            let pointer = (&raw mut RESIDENT).cast::<Context>();
+            pointer.write(context);
+            PLANAR_FAST_CONTEXT = &raw mut (*pointer).fast;
+            ACTIVE = pointer.cast();
+            let fault = machine.replace_interrupt_handlers(14, arch_abi::InterruptHandlers {
+                entry32: planar_page_fault_32 as *const () as u32,
+                entry64: planar_page_fault_64 as *const () as u64,
+            });
+            let input = machine.replace_interrupt_handlers(13, arch_abi::InterruptHandlers {
+                entry32: device_io_32 as *const () as u32,
+                entry64: device_io_64 as *const () as u64,
+            });
+            PREVIOUS = Some((fault, input));
         }
     }
-    // Hosted MMIO returns through arch, but a completed VGA access does not
-    // require a scheduler/device-polling round trip. Resume within the same
-    // CPU loan, just as the native aperture handler does. Keep its original
-    // deadline so a stream of VGA stores cannot postpone timer or input work.
-    #[cfg(not(target_arch = "x86"))]
-    {
-        let deadline = machine.now().saturating_add(max_time.as_nanos().min(u64::MAX as u128) as u64);
-        loop {
-            let remaining = deadline.saturating_sub(machine.now());
-            let event = machine.execute(regs, io, core::time::Duration::from_nanos(remaining));
-            if let crate::KernelEvent::PageFault { addr } = event {
-                let stepped = arch_abi::monitor::stepping(regs);
-                let user_was = regs.user_tf();
-                if addr <= u32::MAX as u64 && super::try_vga_fault(machine, dos, regs, addr as u32) {
-                    if stepped {
-                        return (crate::KernelEvent::EmulatedStep { user_was }, 0);
-                    }
-                    continue;
-                }
-            }
-            return (event, 0);
+}
+
+/// Detach native handlers and collect state produced during guest execution.
+#[cfg(target_arch = "x86")]
+pub fn materialize<A: crate::Arch>(machine: &mut A, mut event: crate::KernelEvent) -> (crate::KernelEvent, u64) {
+    unsafe {
+        let previous = core::ptr::replace(&raw mut PREVIOUS, None);
+        let Some((fault, input)) = previous else { return (event, 0) };
+        machine.replace_interrupt_handlers(13, input);
+        machine.replace_interrupt_handlers(14, fault);
+        let context = &mut *ACTIVE.cast::<Context>();
+        ACTIVE = core::ptr::null_mut();
+        PLANAR_FAST_CONTEXT = core::ptr::null_mut();
+        if context.stepped { event = crate::KernelEvent::EmulatedStep { user_was: context.user_tf }; }
+        let cycles = (u64::from(context.fast.cycles_hi) << 32) | u64::from(context.fast.cycles_lo);
+        if context.fast.profile != 0 {
+            crate::kernel::event_profile::record_device_entries(context.fast.profile_details);
         }
+        (event, cycles)
     }
-    #[cfg(target_arch = "x86")]
-    (machine.execute(regs, io, max_time), 0)
 }
 
 // This descriptor lives for one CPU loan. Emulated VGA port programming
@@ -164,12 +152,12 @@ fn assembly_writes(state: &super::machine::vga::LegacyVgaState) -> bool {
 static mut PLANAR_FAST_CONTEXT: *mut Fast = core::ptr::null_mut();
 
 #[cfg(target_arch = "x86")]
-struct Context<'a> {
+struct Context {
     fast: Fast,
-    state: &'a mut super::machine::vga::LegacyVgaState,
-    ldt: &'a [u64],
-    dma: &'a mut super::machine::Dma8237,
-    audio: &'a crate::kernel::media::Shared<super::AudioDevices>,
+    state: *mut super::machine::vga::LegacyVgaState,
+    ldt: *const [u64],
+    dma: *mut super::machine::Dma8237,
+    audio: *const crate::kernel::media::Shared<super::AudioDevices>,
     planes: *mut u8,
     base: u32,
     end: u32,
@@ -188,6 +176,12 @@ unsafe extern "C" {
 #[cfg(target_arch = "x86")]
 #[thread_local]
 static mut ACTIVE: *mut () = core::ptr::null_mut();
+#[cfg(target_arch = "x86")]
+#[thread_local]
+static mut RESIDENT: core::mem::MaybeUninit<Context> = core::mem::MaybeUninit::uninit();
+#[cfg(target_arch = "x86")]
+#[thread_local]
+static mut PREVIOUS: Option<(arch_abi::InterruptHandlers, arch_abi::InterruptHandlers)> = None;
 
 /// GPR slots are identical in both entries: low halves at index * 8.
 /// Only the CPU's return-frame width differs. It remains separate from GPRs.
@@ -246,7 +240,7 @@ impl Frame {
 #[unsafe(no_mangle)]
 #[cold]
 unsafe extern "C" fn planar_fault(pointer: *mut u8, wide: u32, address: u32) -> u32 {
-    let context = unsafe { &mut *ACTIVE.cast::<Context<'_>>() };
+    let context = unsafe { &mut *ACTIVE.cast::<Context>() };
     let mut frame = Frame { pointer, wide: wide != 0 };
     let handled = if !(context.base..context.end).contains(&address) { 0 }
         else { u32::from(context.emulate(&mut frame, address)) };
@@ -261,7 +255,7 @@ unsafe extern "C" fn planar_fault(pointer: *mut u8, wide: u32, address: u32) -> 
 #[cfg(target_arch = "x86")]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn device_io(pointer: *mut u8, wide: u32, _: u32) -> u32 {
-    let context = unsafe { &mut *ACTIVE.cast::<Context<'_>>() };
+    let context = unsafe { &mut *ACTIVE.cast::<Context>() };
     let mut frame = Frame { pointer, wide: wide != 0 };
     let flags = frame.read(frame.flags_offset());
     if flags & 0x100 != 0 || flags & (3 << 19) == 3 << 19 { return 0; }
@@ -288,12 +282,12 @@ unsafe extern "C" fn device_io(pointer: *mut u8, wide: u32, _: u32) -> u32 {
     } else { frame.read(16) as u16 };
     match (opcode, port) {
         (0xec, 0x388..=0x38b) => {
-            let Some(mut audio) = context.audio.try_lock() else { return 0 };
+            let Some(mut audio) = (unsafe { &*context.audio }).try_lock() else { return 0 };
             let Some(status) = audio.sb.fm_status(port) else { return 0 };
             unsafe { pointer.write(status); }
         }
         (0xec, 0x3c6..=0x3c9) => {
-            let value = context.state.port_read(port);
+            let value = (unsafe { &mut *context.state }).port_read(port);
             unsafe { pointer.write(value); }
         }
         (0xee, 0x3c6..=0x3c9) => {
@@ -301,31 +295,31 @@ unsafe extern "C" fn device_io(pointer: *mut u8, wide: u32, _: u32) -> u32 {
             // device's canonical register operation directly, including its
             // palette cursor and six-bit component semantics.
             let value = frame.read(0) as u8;
-            context.state.port_write(port, value);
-            super::machine::vga::profile_port_write(context.state, port, value);
+            (unsafe { &mut *context.state }).port_write(port, value);
+            super::machine::vga::profile_port_write(unsafe { &mut *context.state }, port, value);
         }
         (0xec, 0..=7 | 0xc0..=0xcf) | (0xee, 0x0c | 0xd8) => {
             // Never wait for core 1 while trapping a guest instruction.
             // Both paths use the same DMA latch and source-consumption cursor.
-            let Some(mut audio) = context.audio.try_lock() else { return 0 };
+            let Some(mut audio) = (unsafe { &*context.audio }).try_lock() else { return 0 };
             let write = (opcode == 0xee).then_some(frame.read(0) as u8);
             let now = crate::kernel::portio::now_ns();
-            let Some(value) = audio.sb.dma_poll(context.dma, port, write, now) else { return 0 };
+            let Some(value) = audio.sb.dma_poll(unsafe { &mut *context.dma }, port, write, now) else { return 0 };
             if write.is_none() { unsafe { pointer.write(value); } }
         }
         (0xec, 0x3da) => {
             let now = crate::kernel::portio::now_ns();
-            let status = context.state.beam(now).status;
+            let status = (unsafe { &mut *context.state }).beam(now).status;
             if context.fast.profile != 0 {
                 crate::kernel::event_profile::record_status_poll(frame.cs(), ip, status, now);
             }
-            context.state.ac_state.pending_data = false;
+            (unsafe { &mut *context.state }).ac_state.pending_data = false;
             unsafe { pointer.write(status); }
         }
         (0xee, 0x3c4 | 0x3c5) | (0xef, 0x3c4) => {
             if opcode == 0xef && operand32 { return 0; }
-            if !mask_out(context.state, port, frame.read(0) as u16, opcode == 0xef) { return 0; }
-            context.fast.plane_mask = u32::from(context.state.seq.get(2) & 15);
+            if !mask_out(unsafe { &mut *context.state }, port, frame.read(0) as u16, opcode == 0xef) { return 0; }
+            context.fast.plane_mask = u32::from((unsafe { &mut *context.state }).seq.get(2) & 15);
         }
         _ => return 0,
     }
@@ -352,22 +346,22 @@ fn mask_out(state: &mut ::vga::LegacyVgaState, port: u16, value: u16, word: bool
 }
 
 #[cfg(target_arch = "x86")]
-impl Context<'_> {
+impl Context {
     fn set_code(&mut self, cs: u16, vm86: bool) {
         use super::mode_transitions as segments;
         self.fast.cs_mode = u32::from(cs) | if vm86 { 0 } else { 1 << 20 };
-        self.fast.default32 = u32::from(!vm86 && segments::seg_is_32(self.ldt, cs));
+        self.fast.default32 = u32::from(!vm86 && segments::seg_is_32(unsafe { &*self.ldt }, cs));
         self.fast.decode = if self.fast.default32 != 0 { DECODE32.as_ptr() } else { DECODE16.as_ptr() } as u32;
-        self.fast.code_base = if vm86 { u32::from(cs) << 4 } else { segments::seg_base(self.ldt, cs) };
-        self.fast.code_limit = if vm86 { 0xffff } else { segments::seg_limit(self.ldt, cs) };
+        self.fast.code_base = if vm86 { u32::from(cs) << 4 } else { segments::seg_base(unsafe { &*self.ldt }, cs) };
+        self.fast.code_limit = if vm86 { 0xffff } else { segments::seg_limit(unsafe { &*self.ldt }, cs) };
     }
     fn emulate(&mut self, frame: &mut Frame, address: u32) -> bool {
         use super::{machine::mmio, mode_transitions as segments};
         let vm86 = frame.vm86();
         self.set_code(frame.cs(), vm86);
         let (ds, es) = frame.selectors();
-        let ds = if vm86 { u32::from(ds) << 4 } else { segments::seg_base(self.ldt, ds) };
-        let es = if vm86 { u32::from(es) << 4 } else { segments::seg_base(self.ldt, es) };
+        let ds = if vm86 { u32::from(ds) << 4 } else { segments::seg_base(unsafe { &*self.ldt }, ds) };
+        let es = if vm86 { u32::from(es) << 4 } else { segments::seg_base(unsafe { &*self.ldt }, es) };
         let (base, cs, default32) = (self.base, self.fast.code_base, self.fast.default32 != 0);
         if self.fast.profile != 0 {
             let address = cs.wrapping_add(frame.ip()) as usize;
@@ -380,7 +374,7 @@ impl Context<'_> {
             crate::kernel::event_profile::record_vga_instruction(frame.cs(), frame.ip(), u32::from_le_bytes(bytes), count);
         }
         let (ss, fs, gs) = frame.other_selectors();
-        let segment = |sel| if vm86 { u32::from(sel) << 4 } else { segments::seg_base(self.ldt, sel) };
+        let segment = |sel| if vm86 { u32::from(sel) << 4 } else { segments::seg_base(unsafe { &*self.ldt }, sel) };
         let bases = [es, cs, segment(ss), ds, segment(fs), segment(gs)];
         mmio::emulate(self, &mut frame.operands(), cs, default32, &bases, address - base)
     }
@@ -388,14 +382,14 @@ impl Context<'_> {
 }
 
 #[cfg(target_arch = "x86")]
-impl super::machine::mmio::FaultBus for Context<'_> {
+impl super::machine::mmio::FaultBus for Context {
     fn read8(&mut self, off: u32) -> u8 {
         let planes = unsafe { ::vga::memory::Memory::mapped(self.planes, super::machine::vga::PLANES_LEN) };
-        super::machine::vga::vram_read_live(planes, self.state, off)
+        super::machine::vga::vram_read_live(planes, unsafe { &mut *self.state }, off)
     }
     fn write8(&mut self, off: u32, value: u8) {
         let planes = unsafe { ::vga::memory::Memory::mapped(self.planes, super::machine::vga::PLANES_LEN) };
-        super::machine::vga::vram_write_live(planes, self.state, off, value);
+        super::machine::vga::vram_write_live(planes, unsafe { &mut *self.state }, off, value);
     }
     fn offset(&self, address: u32) -> Option<u32> {
         (self.base..self.end).contains(&address).then(|| address - self.base)
@@ -408,7 +402,7 @@ impl super::machine::mmio::FaultBus for Context<'_> {
         if destination < self.base || destination_end > self.end
             || source < self.end && source_end > self.base { return false; }
         let planes = unsafe { ::vga::memory::Memory::mapped(self.planes, super::machine::vga::PLANES_LEN) };
-        self.state.write_sequential_span(planes, (destination - self.base) as usize, len as usize,
+        (unsafe { &mut *self.state }).write_sequential_span(planes, (destination - self.base) as usize, len as usize,
             |i| unsafe { core::ptr::with_exposed_provenance::<u8>(source as usize + i).read_volatile() })
     }
     fn fpu_st0(&self) -> [u8; 10] {

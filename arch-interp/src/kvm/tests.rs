@@ -225,8 +225,7 @@ fn kvm_engine_proofs() {
     assert_eq!(regs().rax as u16, 0x5678, "execute the remapped frame, not a stale TLB entry");
 
     // ── Flat PM: a store to an unmapped page (demand-#PF resolved inside the
-    // engine), then `int 0x80` → SoftInt(0x80). Exercises: CPL3 PM entry with
-    // no trampoline, in-engine demand paging on a data write, DPL-3 gate INT.
+    // engine), then `int 0x80` → SoftInt(0x80). Exercises: CPL3 PM return through IRET, in-engine demand paging on a data write, DPL-3 gate INT.
     // 0xC7 0x05 <addr> <imm32>   mov dword [0x0030_0000], 0xDEADBEEF
     // 0xCD 0x80                  int 0x80
     let code: u32 = 0x0020_0000;
@@ -384,6 +383,50 @@ fn kvm_engine_proofs() {
         "thread A's XMM0 restored across the switch"
     );
 
+    // TF must start after IRET, not while restoring registers in entry.asm.
+    // Re-enter twice to verify one guest instruction per step, then clear TF.
+    mem.copy_to(code as u64, &[0x40, 0x40, 0xcd, 0x80]); // inc eax; inc eax; int 80
+    let mut stepped = r;
+    stepped.set_ip32(code);
+    stepped.rax = 10;
+    stepped.set_forced_tf(true);
+    stepped.project_tf();
+    set_regs(stepped);
+    for n in 1..=2 {
+        assert!(matches!(run_to_event(), KernelEvent::DebugTrap));
+        assert_eq!(regs().ip32(), code + n);
+        assert_eq!(regs().rax, 10 + n as u64);
+        assert_eq!(regs().code_seg(), USER_CS);
+    }
+    let mut unstepped = regs();
+    unstepped.set_forced_tf(false);
+    unstepped.project_tf();
+    set_regs(unstepped);
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+
+    // Long-mode return must restore FS/GS bases and the full-width GPRs.
+    let tls_code = 0x0050_0000;
+    let fs_base = 0x0051_0000;
+    let gs_base = 0x0052_0000;
+    mem.copy_to(tls_code, &[
+        0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov rax, fs:[0]
+        0x65, 0x48, 0x8b, 0x1c, 0x25, 0, 0, 0, 0, // mov rbx, gs:[0]
+        0x0f, 0x05,
+    ]);
+    mem.copy_to(fs_base, &0x1234567887654321u64.to_le_bytes());
+    mem.copy_to(gs_base, &0xfedcba9876543210u64.to_le_bytes());
+    let mut tls = Regs::empty();
+    tls.init_user_process_64(tls_code, stack as u64);
+    tls.fs = fs_base;
+    tls.gs = gs_base;
+    tls.r15 = 0xabcdef0123456789;
+    set_regs(tls);
+    assert!(matches!(run_to_event(), KernelEvent::Syscall));
+    assert_eq!(regs().rax, 0x1234567887654321);
+    assert_eq!(regs().rbx, 0xfedcba9876543210);
+    assert_eq!(regs().r15, tls.r15);
+    assert_eq!((regs().fs, regs().gs), (fs_base, gs_base));
+
     // A timer interrupt may switch 64-bit contexts only after KVM has
     // delivered any pending syscall #UD to the trap shim. Repeatedly switch
     // between distinct code addresses at both timer and syscall boundaries;
@@ -399,21 +442,16 @@ fn kvm_engine_proofs() {
     for (i, context) in contexts.iter_mut().enumerate() {
         context.init_user_process_64(entries[i] as u64, stack as u64);
     }
-    // A #UD already queued for SYSCALL still belongs to this context even
-    // when the alarm is due before the next KVM_RUN.
+    // Expire the alarm during the shared return path. Supervisor register
+    // state must never escape as a user context, even before the first IRET.
     let mut syscall = contexts[0];
     syscall.frame.rip = entries[0] as u64 + 5;
     syscall.rax = 24;
     set_regs(syscall);
-    super::setup::with(|k| {
-        let mut events = k.vcpu.get_vcpu_events().unwrap();
-        events.exception.injected = 1;
-        events.exception.nr = 6;
-        events.exception.has_error_code = 0;
-        k.vcpu.set_vcpu_events(&events).unwrap();
-    });
-
-    assert!(matches!(execute(core::time::Duration::from_nanos(1)), KernelEvent::Syscall), "drain the queued syscall before returning an alarm");
+    let early = execute(core::time::Duration::from_nanos(1));
+    assert!(matches!(early, KernelEvent::Syscall | KernelEvent::Irq));
+    assert_eq!(regs().code_seg(), arch_abi::USER_CS64);
+    assert!(matches!(regs().frame.rip, ip if ip == entries[0] as u64 + 5 || ip == entries[0] as u64 + 7));
     let mut active = 0;
     let mut syscalls = 0;
     let mut alarms = 0;

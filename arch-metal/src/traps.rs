@@ -8,7 +8,8 @@
 use crate::irq::handle_irq;
 use crate::paging2;
 use crate::x86;
-use arch_abi::Regs;
+use arch_abi::{Regs, UserMode};
+use arch_abi::entry::{KernelCall, CallOutcome};
 
 // =============================================================================
 // Arch call interface (ring-1 kernel → ring-0 arch via INT 0x80)
@@ -18,64 +19,8 @@ use arch_abi::Regs;
 // Arch state (Ring 0 maintains state for Ring 1 and Ring 3)
 // =============================================================================
 
-/// Hybrid 32-bit entry layout. Assembly saves the segments and general
-/// registers directly in their canonical `Regs` qword slots, then leaves a
-/// 28-byte expansion gap before the native dword interrupt/IRET tail. Rust
-/// widens only that tail for cross-privilege entries. Same-ring ring-0 entries
-/// return before widening and therefore never inspect the absent ESP/SS.
-///
-/// VM86 segs (es, ds, fs, gs) the CPU pushes above the IRET frame for VM86
-/// entries are *not* part of `Raw32` — they form the second component of the
-/// 32-bit `StackFrame` arm `(Raw32, Vm86Segs)`, valid only when EFLAGS.VM is
-/// set on entry/exit.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Raw32 {
-    pub gs: u64, pub fs: u64, pub es: u64, pub ds: u64,
-    pub r15: u64, pub r14: u64, pub r13: u64, pub r12: u64,
-    pub r11: u64, pub r10: u64, pub r9: u64, pub r8: u64,
-    pub edi: u64, pub esi: u64, pub ebp: u64, pub esp_dummy: u64,
-    pub ebx: u64, pub edx: u64, pub ecx: u64, pub eax: u64,
-    pub _expand: [u8; 28],
-    pub int_num: u32, pub err_code: u32,
-    pub eip: u32, pub cs: u32, pub eflags: u32, pub esp: u32, pub ss: u32,
-}
-
-/// 4 VM86 segment selectors the CPU pushes above the IRET frame on a VM86
-/// trap. Bytes are valid only when EFLAGS.VM is set on entry/exit; otherwise
-/// kernel-stack residue.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Vm86Segs {
-    pub es: u32, pub ds: u32, pub fs: u32, pub gs: u32,
-}
-
-/// Stack-side view of a saved interrupt frame. Two arms: `regs` is the
-/// canonical 64-bit form (216B); the 32-bit arm is `(Raw32, Vm86Segs)` — its
-/// 216-byte hybrid slot plus the optional VM86 seg tail. `isr_handler` picks
-/// the live arm via `from_64`.
-///
-/// The 16-byte `Vm86Segs` tail is always safe to read/write: TSS.sp0 is
-/// pinned 16 bytes below the kernel stack top (see `arch/boot.rs`), and ring
-/// transitions are the only path that lands here, so the spare 16 bytes
-/// above the IRET frame always exist. For VM86 entries the CPU pushed real
-/// vm86 segs there; for non-VM86 it's spare bytes we can scribble on.
-#[repr(C)]
-pub union StackFrame {
-    pub regs: Regs,
-    pub raw32: (Raw32, Vm86Segs),
-}
-
-const _: () = {
-    assert!(core::mem::size_of::<Raw32>() == core::mem::size_of::<Regs>());
-    assert!(core::mem::offset_of!(Raw32, int_num) == 188);
-    assert!(core::mem::offset_of!(Raw32, cs) == 200);
-    assert!(core::mem::offset_of!(Raw32, gs) == core::mem::offset_of!(Regs, gs));
-    assert!(core::mem::offset_of!(Raw32, edi) == core::mem::offset_of!(Regs, rdi));
-    assert!(core::mem::offset_of!(Raw32, eax) == core::mem::offset_of!(Regs, rax));
-};
-
-/// Register swap buffer used when no execute register object is installed.
+/// Parked app frame between kernel calls. During a syscall it holds the
+/// kernel continuation while the app frame is on the physical trap stack.
 #[thread_local]
 static mut REGS: Regs = Regs::empty();
 
@@ -87,7 +32,14 @@ static mut REGS: Regs = Regs::empty();
 static mut EXECUTE_REGS: *mut Regs = core::ptr::null_mut();
 
 pub(crate) fn set_execute_regs(regs: *mut Regs) {
-    unsafe { EXECUTE_REGS = regs; }
+    unsafe {
+        // Once execute returns, retain the current app frame for ordinary
+        // kernel calls too. The caller-owned register borrow ends here.
+        if regs.is_null() && !EXECUTE_REGS.is_null() {
+            REGS = *EXECUTE_REGS;
+        }
+        EXECUTE_REGS = regs;
+    }
 }
 
 
@@ -178,7 +130,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
             let cs_base = if regs.mode() == arch_abi::UserMode::VM86 {
                 (regs.code_seg() as u32) << 4
             } else {
-                crate::monitor::seg_base(regs.code_seg())
+                crate::descriptors::seg_base(regs.code_seg())
             };
             let ip = regs.ip32();
             let lin = cs_base.wrapping_add(ip);
@@ -186,7 +138,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
             let ss_base = if regs.mode() == arch_abi::UserMode::VM86 {
                 (regs.stack_seg() as u32) << 4
             } else {
-                crate::monitor::seg_base(regs.stack_seg())
+                crate::descriptors::seg_base(regs.stack_seg())
             };
             let bp_addr = ss_base.wrapping_add(regs.rbp as u32);
             let st0 = unsafe { core::ptr::read_unaligned(bp_addr as *const u16) };
@@ -214,7 +166,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
 // They are a distinct phase of trap handling: do not let fat LTO reserve that
 // scratch in the common ISR frame used by every hardware interrupt.
 #[inline(never)]
-fn arch_dispatch(regs: &mut Regs) {
+fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
     match regs.rax {
         arch_call::REARRANGE_MAPPINGS => crate::mapping::rearrange_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Rearrange) }),
         arch_call::READ_MAPPINGS => crate::mapping::read_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Read) }),
@@ -236,7 +188,7 @@ fn arch_dispatch(regs: &mut Regs) {
                 regs.rcx = extra >> 32;
             } else {
                 super::irq::arm_alarm(Some(super::irq::now(false).saturating_add(max_ns)));
-                swap_regs(regs);
+                return CallOutcome::Execute;
             }
         },
         arch_call::ACTIVATE => unsafe {
@@ -348,25 +300,19 @@ fn arch_dispatch(regs: &mut Regs) {
         },
         _ => lib::compact_panic!("Unknown arch call: {:#x}", regs.rax),
     }
+    CallOutcome::Complete
 }
 
-fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
-    use arch_abi::UserMode;
-    let want_64 = regs.mode() == UserMode::Mode64;
-    let is_vm86 = regs.mode() == UserMode::VM86;
-    let need_toggle = (!is_long && want_64) || (is_long && is_vm86);
-    if !need_toggle {
-        return is_long;
-    }
-    paging2::sync_hw_pdpt();
-    x86::flush_tlb();
-    let saved = paging2::ensure_trampoline_mapped();
-    crate::descriptors::toggle_mode(paging2::toggle_cr3(want_64));
-    paging2::clear_trampoline(saved);
-    !is_long
+pub(crate) fn dispatch_parked_call() -> CallOutcome {
+    let execute = unsafe { EXECUTE_REGS };
+    let parked = if execute.is_null() { &raw mut REGS } else { execute };
+    let mut call = KernelCall::from_regs(unsafe { &*parked });
+    let outcome = arch_dispatch(&mut call);
+    call.write_result(unsafe { &mut *parked });
+    outcome
 }
 
-fn swap_regs(regs: &mut Regs) {
+pub(crate) fn swap_regs(regs: &mut Regs) {
     let execute = unsafe { EXECUTE_REGS };
     if execute.is_null() {
         let p = &raw mut REGS;
@@ -380,441 +326,54 @@ fn swap_regs(regs: &mut Regs) {
 // Interrupt dispatch
 // =============================================================================
 
-/// Main interrupt service routine.
-///
-/// Ring 1 (kernel): IRQ → ACK+queue+return. INT 0x80 → arch call. Trap → panic.
-/// Ring 3 (user): save state, return event to ring-1 kernel.
-/// Ring 0 (boot): page fault → demand paging. IRQ → ACK+queue. Rest → panic.
-///
-/// `stack` is the raw saved state on the kernel stack. `from_64` tells us which
-/// union arm holds live data:
-/// the 64-bit form pushed by `entry_wrapper_64`, or the 32-bit form pushed by
-/// `entry_wrapper_32`. We canonicalize to `Regs` (always the 64-bit form), let
-/// the kernel run on it, then denormalize back if exiting to 32-bit user.
-///
-/// Returns true if the kernel wants to iret to long mode (the 64-bit exit path).
-#[unsafe(no_mangle)]
-#[allow(private_interfaces)]
-pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
-    paging2::refresh_kernel_mappings();
-    #[thread_local]
-    static mut VIF: bool = false;
-    #[thread_local]
-    static mut VIP: bool = false;
-    #[thread_local]
-    static mut USER_TF: bool = false;
-    #[thread_local]
-    static mut FORCED_TF: bool = false;
-    #[thread_local]
-    static mut PVI_POLICY: bool = false;
-    // This handler is the sole owner of CR4.PVI. Keep its state here so the
-    // overwhelmingly common trap path does not execute serializing CR4 reads.
-    #[thread_local]
-    static mut PVI_ACTIVE: bool = false;
-    // Per-thread virtual IOPL (EFLAGS bits 12-13), carried across the iret like
-    // VIF/VIP. The run pins the *real* IOPL=1 (so CLI/STI/IN/OUT trap); this
-    // stash holds the level the client is *treated* as having, so the dispatch
-    // can read the launch policy back. 1 = spec-strict, 2 = learn/tag repair,
-    // and 3 = always-step reference mode. The kernel is its single writer.
-    #[thread_local]
-    static mut VIOPL: u8 = 1;
-    // Read just enough raw fields to classify the trap before canonicalizing.
-    // Same-priv (ring 0 → ring 0) traps don't push SS/ESP and never reach VM86
-    // segs, so canonicalizing would read residue. Cross-priv traps (ring 1
-    // kernel or ring 3 user → arch ring 0) get full canonicalization.
-    let (vm86, raw_cs, raw_int_num, raw_err_code, raw_eip) = if from_64 {
-        // EFLAGS.VM is reserved in long mode -- 64-bit entry is never VM86.
-        let r = unsafe { &(*stack).regs };
-        (false, r.frame.cs, r.int_num, r.err_code, r.frame.rip)
-    } else {
-        let r = unsafe { &(*stack).raw32.0 };
-        (r.eflags as u64 & VM_FLAG != 0, r.cs as u64, r.int_num as u64, r.err_code as u64, r.eip as u64)
-    };
-    // Mask int_num to 8 bits to undo sign-extension from `push imm8` for
-    // vectors >= 0x80. `syscall_entry_64` pushes 256 (out of IDT range) as a
-    // sentinel — preserve it so ring3 can route it to `KE::Syscall`.
-    let raw_int_num = if raw_int_num == 256 { 256 } else { raw_int_num & 0xFF };
-    // A LAPIC spurious delivery has no in-service interrupt to acknowledge.
-    // Resume the untouched frame at any privilege level: no EOI, line mask,
-    // device event, or return from execute is needed.
-    if raw_int_num == u64::from(crate::irq::LAPIC_SPURIOUS_VECTOR) {
-        return from_64;
+/// Native interrupt-controller and diagnostic adaptation. Guest dispatch
+/// itself returns an outcome and cannot switch to the kernel.
+pub(crate) fn guest_trap(regs: &mut Regs) -> arch_abi::trap::Outcome {
+    use arch_abi::trap::Outcome;
+    if regs.int_num == 1 && debug_watch_trap(regs, unsafe { x86::read_dr6() }, false) {
+        return Outcome::Resume;
     }
-    let from_ring3 = vm86 || (raw_cs & 3) == 3;
-    if from_ring3 {
-        crate::exec_profile::time(arch_abi::ExecutionProfileStage::Guest);
+    if matches!(regs.int_num, 32..=47 | 0xF8..=0xFE) {
+        handle_irq(regs);
+        return Outcome::ReturnToKernel(arch_abi::KernelEvent::Irq);
     }
-
-    if !vm86 && (raw_cs & 3) == 0 {  // from ring 0?
-        // An unhandled ring-0 exception is headed for the panic in
-        // handle_ring0. The most common cause is the exit path's `iret` /
-        // segment pops rejecting a garbage guest frame (#GP at
-        // exit_interrupt_32), and that doomed frame still sits just above
-        // this trap's CPU-pushed portion — a same-ring trap pushes no
-        // SS/ESP, so Raw32's esp/ss slots and the bytes beyond line up
-        // with it. Dump the words so the panic names the bad frame.
-        if !from_64 && !(raw_int_num == 14 || (32..=47).contains(&raw_int_num)) {
-            let p = unsafe { core::ptr::addr_of!((*stack).raw32.0.esp) };
-            lib::compact_println!("ring0 fault: words above the trap frame (iret-target frame):");
-            for i in 0..10 {
-                lib::compact_println!("  [esp+{:2}] = {:#010x}", i * 4, unsafe { p.add(i).read_volatile() });
-            }
-        }
-        handle_ring0(raw_int_num, raw_err_code, raw_cs, raw_eip);  // No canonicalization because in 32-bit mode doesn't match Regs layout due to missing esp:ss
-        return from_64;
-    }
-
-    // Canonicalize the native dword tail in place. The wrapper-owned prefix is
-    // already in canonical qword slots. Capture every native value first,
-    // because the widened Regs tail overlaps the compact tail.
-    let regs = unsafe { &mut (*stack).regs };
-    if from_64 {
-        // 64-bit user: entry_wrapper_64 already pushed the right FS/GS
-        // shape (FS_BASE/GS_BASE for cs=0x33, selectors otherwise) into
-        // the regs slot, and exit_interrupt_64 will restore it via wrmsr
-        // or `mov fs/gs, sel`. Nothing to do here.
-        regs.int_num = raw_int_num;
-    } else {
-        let (r, v) = unsafe { &(*stack).raw32 };
-        let eflags = r.eflags as u64;
-        let esp = r.esp as u64;
-        let ss = r.ss as u64;
-        let vm_segs = (v.gs as u64, v.fs as u64, v.es as u64, v.ds as u64);
-        regs.int_num = raw_int_num;
-        regs.err_code = raw_err_code;
-        regs.frame.rip = raw_eip;
-        regs.frame.cs = raw_cs;
-        regs.frame.rflags = eflags;
-        regs.frame.rsp = esp;
-        regs.frame.ss = ss;
-        if vm86 {
-            (regs.gs, regs.fs, regs.es, regs.ds) = vm_segs;
+    if regs.int_num == 10 {
+        let carrier_iret = regs.err_code == 0 && regs.flags32() & (1 << 14) != 0;
+        if !carrier_iret {
+            let cs_base = if regs.mode() == UserMode::VM86 {
+                (regs.code_seg() as u32) << 4
+            } else {
+                crate::descriptors::seg_base(regs.code_seg())
+            };
+            let lin = cs_base.wrapping_add(regs.ip32());
+            let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+            let ss_base = if regs.mode() == UserMode::VM86 {
+                (regs.stack_seg() as u32) << 4
+            } else {
+                crate::descriptors::seg_base(regs.stack_seg())
+            };
+            let sp = regs.sp32();
+            let stack = unsafe { core::slice::from_raw_parts(ss_base.wrapping_add(sp) as *const u32, 6) };
+            lib::compact_dbg_println!("#TS at {:04x}:{:#x} err={:#x} bytes={:02x?} SS:ESP={:04x}:{:#x} stack={:08x?}",
+                regs.code_seg(), regs.ip32(), regs.err_code, bytes,
+                regs.stack_seg(), sp, stack);
         }
     }
-    let execute_entry = !from_ring3
-        && raw_int_num == 0x80
-        && regs.rax == arch_call::EXECUTE;
-
-    // 16-bit SS sanity-fix: CPU only loads low 16 bits of SP for B=0 stacks;
-    // upper bits are kernel residue.
-    if !vm86 && regs.frame.ss & 4 != 0 {
-        let ss = regs.frame.ss as u16;
-        let ar: u32;
-        let ok: u8;
-        unsafe {
-            core::arch::asm!(
-                "lar {ar:e}, {sel:e}",
-                "setz {ok}",
-                sel = in(reg) ss as u32,
-                ar = out(reg) ar,
-                ok = out(reg_byte) ok,
-            );
-        }
-        if ok != 0 && ar & (1 << 22) == 0 {
-            regs.frame.rsp &= 0xFFFF;
-        }
-    }
-
-    // Only ring 3 / VM86 needs the full user-emulation cleanup (VIF/VIP swap,
-    // VM86 seg promotion). Ring 1 kernel just needs the layout normalized.
-
-    // The guest's virtual-IF lives in EFLAGS bit 19 (VIF) of the saved frame —
-    // the kernel's single virtual-IF home. Bit 9 (IF) is the *real* interrupt
-    // flag only, never guest state. VME+VM86 and PVI+PM keep VIF/VIP in the
-    // hardware frame. Other guests use the software stash below.
-    if from_ring3 {
-        let hardware_vif = (vm86 && x86::read_cr4() & x86::cr4::VME != 0)
-            || (!vm86 && unsafe { PVI_ACTIVE });
-        if !hardware_vif {
-            unsafe {
-                if VIF { regs.frame.rflags |= 1 << 19; } else { regs.frame.rflags &= !(1 << 19); }
-                if VIP { regs.frame.rflags |= 1 << 20; } else { regs.frame.rflags &= !(1 << 20); }
-            }
-        }
-        // Restore the per-thread virtual IOPL: the run pinned real IOPL=1 on
-        // exit, so the just-pushed frame reads 1; put the virtual level back in
-        // bits 12-13 before the dispatch so `virtual_if_stepping` sees it.
-        unsafe { regs.frame.rflags = (regs.frame.rflags & !(3 << 12)) | ((VIOPL as u64) << 12); }
-        unsafe {
-            regs.set_user_tf(USER_TF);
-            regs.set_forced_tf(FORCED_TF);
-            regs.set_pvi_policy(PVI_POLICY);
-        }
-        crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitFrameIn);
-        isr_handler_ring3(regs);
-        crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitDispatch);
-    } else {
-        if execute_entry {
-            crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0EnterFrameIn);
-        }
-        isr_handler_ring1(regs);
-        if execute_entry {
-            crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0EnterDispatch);
-        }
-    }
-
-    // Mode-toggle the CPU if the kernel's output mode differs from entry.
-    let to_64 = toggle_mode_if_needed(regs, from_64);
-
-    // Exit to a ring-3/VM86 guest: force real IF=1 (bit 9) so HW IRQs always
-    // preempt. VIF/VIP stay in bits 19/20 (the kernel's virtual-IF home).
-    let to_vm86 = is_vm86(regs);
-    let to_ring3 = to_vm86 || (regs.frame.cs & 3) == 3;
-    if to_ring3 {
-        // Application policy, not the live vIOPL, owns PVI. A PM IRQ handler
-        // temporarily runs with vIOPL=1 and must not toggle PVI inside a repair
-        // client. PVI is harmless in VM86 and can remain set across RM calls.
-        let pvi_enabled = unsafe { PVI_ACTIVE };
-        // VME and PVI arrived together. Probe CR4 only when first enabling
-        // PVI; after that PVI_ACTIVE is authoritative because this is the
-        // sole code which changes CR4.PVI.
-        let use_pvi = regs.pvi_policy()
-            && (pvi_enabled || x86::read_cr4() & x86::cr4::VME != 0);
-        if use_pvi != pvi_enabled {
-            let mut cr4 = x86::read_cr4();
-            if use_pvi { cr4 |= x86::cr4::PVI; } else { cr4 &= !x86::cr4::PVI; }
-            unsafe { x86::write_cr4(cr4); }
-            unsafe { PVI_ACTIVE = use_pvi; }
-        }
-        let hardware_vif = (to_vm86 && x86::read_cr4() & x86::cr4::VME != 0)
-            || (!to_vm86 && use_pvi);
-        if !hardware_vif {
-            // no-VME / PM: the hardware can't carry VIF/VIP across the iret —
-            // bits 19/20 must be 0 or the CPU applies VME virtual-interrupt
-            // semantics to the client (the Bochs Doom/Jazz/Duke3D timer-ISR
-            // wedge: a stale VIF flips on CLI/STI, the dispatcher's EOI never
-            // lands, IRQ0 wedges in-service). So stash them in the statics and
-            // clear the bits; the next entry restores them into the frame.
-            // VME+VM86 leaves bits 19/20 in the frame for the hardware.
-            unsafe {
-                VIF = regs.frame.rflags & (1 << 19) != 0;
-                VIP = regs.frame.rflags & (1 << 20) != 0;
-            }
-            regs.frame.rflags &= !((1 << 19) | (1 << 20));
-        }
-        regs.frame.rflags |= 0x200;
-        // Pin IOPL=1 for every ring-3 guest. The whole system runs at IOPL=1:
-        // the ring-1 kernel does port I/O directly, while ring-3 guests (VM86
-        // and PM/DPMI) sit at CPL(3) > IOPL(1) so every IN/OUT is filtered
-        // through the TSS I/O bitmap — open ports (VGA regs, AdLib) pass
-        // straight through at full speed, closed ports (0x3DA, PIC, keyboard)
-        // trap into the raster emu / vPIC / vkbd. There is no reason for a
-        // client to run at IOPL=3: it gains nothing (the bitmap already grants
-        // the VGA ports) and loses everything (IOPL=3 bypasses the bitmap, so
-        // 0x3DA/0x20/0x60 go direct to the host — the Bochs keyboard/IRQ
-        // breakage). IOPL is a preserved flag the guest can't change, so the
-        // various cross-mode transitions that copy flags around can leak an
-        // IOPL=3 into a client's eflags; normalize it here — the one ring-3
-        // exit — rather than in each setter. (Where the 3 originates is still
-        // open; see TODO "DPMI client IOPL=3 leak".)
-        //
-        // vIOPL: stash the virtual IOPL (bits 12-13) for the next entry, THEN
-        // pin the real run IOPL=1. This replaces the old unconditional squash —
-        // the kernel now owns the virtual IOPL and we carry it across the iret
-        // like VIF/VIP, while the client always actually runs at IOPL=1.
-        unsafe { VIOPL = ((regs.frame.rflags >> 12) & 3) as u8; }
-        unsafe {
-            USER_TF = regs.user_tf();
-            FORCED_TF = regs.forced_tf();
-            PVI_POLICY = regs.pvi_policy();
-        }
-        regs.frame.rflags &= !(arch_abi::USER_TF_SHADOW
-            | arch_abi::FORCED_TF_SHADOW
-            | arch_abi::PVI_POLICY_SHADOW);
-        regs.frame.rflags = (regs.frame.rflags & !(3 << 12)) | (1 << 12);
-    }
-
-    // Denormalize back to the 32-bit push form if exiting to 32-bit/VM86.
-    if to_64 {
-        // 64-bit-mode exit. exit_interrupt_64 owns FS/GS restore (rdmsr/
-        // wrmsr for 64-bit user, mov fs/gs for 32-bit compat user). regs.fs
-        // / regs.gs hold whatever shape entry pushed; no fixup needed here.
-    } else {
-        // Decouple from `regs` before we overwrite the same memory via the
-        // union's other arm: shadow it with a value-copy (Regs is Copy).
-        let r = *regs;
-        // For VM86 exit, the user's segs go into the `Vm86Segs` tail (popped
-        // by iret); the kernel-side seg slots in `Raw32` must be NULL because
-        // asm's `pop gs/fs/es/ds` in PM ring 0 validates them as descriptors
-        // before iret takes over.
-        let (gs, fs, es, ds) = if to_vm86 {
-            (0, 0, 0, 0)
-        } else {
-            (r.gs, r.fs, r.es, r.ds)
-        };
-        // The register prefix is already in the form consumed by assembly;
-        // compact only the interrupt/IRET tail back into its native dwords.
-        let raw = unsafe { &mut (*stack).raw32.0 };
-        raw.gs = gs;
-        raw.fs = fs;
-        raw.es = es;
-        raw.ds = ds;
-        raw.int_num = r.int_num as u32;
-        raw.err_code = r.err_code as u32;
-        raw.eip = r.frame.rip as u32;
-        raw.cs = r.frame.cs as u32;
-        raw.eflags = r.frame.rflags as u32;
-        raw.esp = r.frame.rsp as u32;
-        raw.ss = r.frame.ss as u32;
-
-        if to_vm86 {
-            let v = unsafe { &mut (*stack).raw32.1 };
-            v.es = r.es as u32;
-            v.ds = r.ds as u32;
-            v.fs = r.fs as u32;
-            v.gs = r.gs as u32;
-        }
-    }
-    if from_ring3 {
-        crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitFrameOut);
-    } else if execute_entry {
-        crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0EnterFrameOut);
-    }
-    to_64
+    let address = if regs.int_num == 14 { x86::read_cr2_full() } else { 0 };
+    arch_abi::trap::handle(&mut crate::backend::Metal, regs, address)
 }
 
-/// Ring-3 / VM86 trap dispatch. Classifies the x86 vector into a
-/// `KernelEvent` and bubbles it up to the ring-1 kernel via swap_regs;
-/// `#GP` runs the sensitive-instruction monitor first, `#PF` and IRQs
-/// are handled inline by arch before bubbling.
-fn isr_handler_ring3(regs: &mut Regs) {
-    use crate::monitor::{monitor, KernelEvent as KE, MonitorResult};
-    use arch_abi::UserMode;
-    let int_num = regs.int_num;
-    let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
-    let kevent: KE = match int_num {
-        // #DB has two owners. PM clients use TF for virtual-IF learning, while
-        // VM86 programs may deliberately single-step through a hooked INT 1
-        // vector (ST3's packer does this). Preserve the latter as a guest CPU
-        // exception so DOS can reflect it through the real-mode IVT.
-        1 => {
-            let dr6 = unsafe { x86::read_dr6() };
-            if debug_watch_trap(regs, dr6, false) {
-                return;
-            }
-            match regs.mode() {
-                UserMode::VM86 => KE::Exception(1),
-                UserMode::Mode32 => KE::DebugTrap,
-                _ => {
-                    regs.clear_flag32(1 << 8); // stale internal TF
-                    return;
-                }
-            }
-        }
-        // The legacy sensitive-instruction decoder uses 32-bit addresses.
-        // A native long-mode #GP must retain its full faulting RIP rather
-        // than decoding unrelated bytes at the truncated low address.
-        13 if regs.mode() == UserMode::Mode64 => KE::Exception(13),
-        13 if !crate::memory::can_fault() => KE::Irq,
-        13 => {
-            // VME raises #GP with VIF=1 && VIP=1 to ask the host to inject the
-            // pending virtual interrupt. It normally lands on STI/POPF/IRET
-            // (monitor Resume), but the STI interrupt-shadow can defer it onto
-            // the *following* instruction (monitor Fault on a plain opcode —
-            // e.g. the `push ds` right after `sti` in the Bochs BIOS INT 9
-            // handler). Either way it's a delivery request, not an instruction
-            // fault: bubble it as an IRQ and let `pick_pending_vec` choose the
-            // highest-priority deliverable line. The Fault path leaves IP on
-            // the (innocent) instruction, so it re-runs after the handler IRETs.
-            const VIF_VIP: u32 = (1 << 19) | (1 << 20);
-            let pending_virtual_irq = regs.flags32() & VIF_VIP == VIF_VIP;
-            // Where this instruction lives, and whether virtual IF was on before
-            // it ran: a PM CLI/STI that toggles virtual IF is a window boundary,
-            // reflected to `dpmi::vif`.
-            let entry_ip = regs.ip32();
-            let vif_was_on = regs.flags32() & (1 << 19) != 0;
-            let stepped = arch_abi::monitor::stepping(regs);
-            let user_was = regs.user_tf();
-            match monitor(regs) {
-                MonitorResult::Resume => {
-                    // A PM CLI/STI toggled virtual IF: reflect the window to
-                    // dpmi::vif (which owns the per-space tag/learn policy). VM86
-                    // handles POPF/IRET on its own #GP (VME) and needs no tag.
-                    if regs.mode() != UserMode::VM86
-                        && (regs.flags32() & (1 << 19) != 0) != vif_was_on
-                    {
-                        let flags = regs.flags32();
-                        let vif_now = flags & (1 << 19) != 0;
-                        let viopl = (flags >> 12) & 3;
-                        if viopl >= 2 {
-                            // Repair/reference modes need the CLI boundary in
-                            // ring 1 to learn or step a later POPF/IRET exit.
-                            KE::VifWindow { entry_ip, vif_was_on }
-                        } else if vif_now && flags & (1 << 20) != 0 {
-                            // Strict mode has no learning work. Bubble out only
-                            // when STI made a pending virtual IRQ deliverable.
-                            KE::Irq
-                        } else {
-                            // CLI/STI was fully emulated in ring 0; returning a
-                            // VifWindow to ring 1 would be a pure round trip.
-                            return;
-                        }
-                    } else if regs.flags32() & VIF_VIP == VIF_VIP {
-                        KE::Irq
-                    } else if stepped && (regs.user_tf() || regs.forced_tf()) {
-                        KE::EmulatedStep { user_was }
-                    } else {
-                        return;
-                    }
-                }
-                // A real fault is reclassified as IRQ delivery only when the
-                // VME pending-interrupt condition held at fault time.
-                MonitorResult::Event(KE::Fault) if pending_virtual_irq => KE::Irq,
-                MonitorResult::Event(e) => e,
-            }
-        }
-        14 => {
-            if !crate::memory::can_fault() { KE::Irq }
-            else if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
-            else { KE::PageFault { addr: x86::read_cr2_full() } }
-        }
-        32..=47 | 0xF8..=0xFE => { handle_irq(regs); KE::Irq }
-        // Vectors 3/4 (#BP/#OF) are only reachable from user INT3/INTO, so
-        // they're soft ints. Other n<32 are genuine CPU exceptions.
-        3 | 4 => KE::SoftInt(int_num as u8),
-        10 => {
-            let carrier_iret = regs.err_code == 0 && regs.flags32() & (1 << 14) != 0;
-            if !carrier_iret {
-                let cs_base = if regs.mode() == UserMode::VM86 {
-                    (regs.code_seg() as u32) << 4
-                } else {
-                    crate::monitor::seg_base(regs.code_seg())
-                };
-                let lin = cs_base.wrapping_add(regs.ip32());
-                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
-                let ss_base = if regs.mode() == UserMode::VM86 {
-                    (regs.stack_seg() as u32) << 4
-                } else {
-                    crate::monitor::seg_base(regs.stack_seg())
-                };
-                let sp = regs.sp32();
-                let stack = unsafe { core::slice::from_raw_parts(ss_base.wrapping_add(sp) as *const u32, 6) };
-                lib::compact_dbg_println!("#TS at {:04x}:{:#x} err={:#x} bytes={:02x?} SS:ESP={:04x}:{:#x} stack={:08x?}",
-                    regs.code_seg(), regs.ip32(), regs.err_code, bytes,
-                    regs.stack_seg(), sp, stack);
-            }
-            KE::Exception(int_num as u8)
-        }
-        0..=31 => KE::Exception(int_num as u8),
-        // SYSCALL instruction: `syscall_entry_64` tags it with the synthetic
-        // 256, distinct from any IDT vector — keep it before the catch-all so
-        // `INT 0x80` (which lands as SoftInt(0x80)) stays a different event.
-        256 => KE::Syscall,
-        // Direct-IDT soft interrupts: 0x30..=0xFF (plus VM86 INT3/0xCC bypass
-        // of VME landing here too).
-        _ => KE::SoftInt(int_num as u8),
-    };
-    super::irq::arm_alarm(None);
-    swap_regs(regs);
-    let (event, extra) = kevent.encode();
-    regs.rax = event as u64;
-    regs.rdx = extra as u32 as u64;
-    regs.rcx = extra >> 32;
+impl arch_abi::trap::Machine for crate::backend::Metal {
+    fn can_fault(&self) -> bool { crate::memory::can_fault() }
+    fn resolve_page_fault(&mut self, regs: &Regs, _address: u64) -> bool {
+        let legacy = is_vm86(regs) || regs.frame.cs & 4 != 0;
+        try_handle_page_fault(regs.err_code, legacy).is_some()
+    }
 }
 
 /// Ring-1 (kernel) trap dispatch: arch calls, page faults, IRQs. Anything
 /// else from kernel context is a bug.
-fn isr_handler_ring1(regs: &mut Regs) {
+pub(crate) fn isr_handler_ring1(regs: &mut Regs) {
     match regs.int_num {
         1 => {
             let dr6 = unsafe { x86::read_dr6() };
@@ -829,7 +388,7 @@ fn isr_handler_ring1(regs: &mut Regs) {
             }
         }
         32..=47 | 0xF8..=0xFE => handle_irq(regs),
-        0x80 => arch_dispatch(regs),
+        0x80 => unreachable!("kernel calls enter through entry::kernel_call"),
         _ => panic_with_regs("Unexpected interrupt in kernel", regs),
     }
 }
@@ -993,7 +552,7 @@ fn demand_page<E: paging2::Entry>(
 /// Ring-0 interrupt handler. No frame conversion, no canonicalization.
 /// Called before from_32/to_32 since 32-bit same-privilege interrupts
 /// don't push ESP/SS.
-fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
+pub(crate) fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
     match int_num {
         14 => {
             if !crate::memory::can_fault() || try_handle_page_fault(error, false).is_none() {
@@ -1008,8 +567,6 @@ fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
         _ => lib::compact_panic!("Unhandled exception in arch: int={:#x} err={:#x} at {:#06x}:{:#010x}", int_num, error, cs, eip),
     }
 }
-
-const VM_FLAG: u64 = 1 << 17;
 
 fn is_vm86(regs: &Regs) -> bool {
     regs.mode() == arch_abi::UserMode::VM86

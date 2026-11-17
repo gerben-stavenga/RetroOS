@@ -35,6 +35,8 @@ rust_library(
     name = "arch-interp-kvm",
     srcs = glob(["src/**/*.rs", "tests/mmu.rs"]),
     crate_name = "retroos_arch_interp",
+    compile_data = ["//arch-metal:kvm_entry"],
+    rustc_env = {"KVM_ENTRY_IMAGE": "$(execpath //arch-metal:kvm_entry)"},
     crate_features = ["kvm"],
     edition = "2021",
     rustc_flags = [

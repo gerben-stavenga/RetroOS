@@ -500,7 +500,7 @@ fn monitor_rs<A: X86 + GuestBytes>(arch: &mut A, regs: &mut Regs) -> MonitorResu
 
 /// Whether the projected architectural TF requests a hardware single step.
 /// DOS composes guest tracing, VIF learning and device-delay sources before
-/// entry; the KVM engine uses the result to arm KVM_GUESTDBG_SINGLESTEP.
+/// entry; each backend starts tracing at the first user instruction.
 #[inline]
 pub fn stepping(regs: &Regs) -> bool {
     regs.flags32() & TF_FLAG != 0

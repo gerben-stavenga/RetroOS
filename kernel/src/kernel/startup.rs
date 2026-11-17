@@ -1932,16 +1932,37 @@ fn event_loop<A: crate::Arch>(
         // IRQs, other syscalls and lifecycle actions return to the full loop.
         deadlines.include(Some(quantum.deadline()));
         let loan_deadline = deadlines.next();
+        let mut scheduled = false;
         let (action, hide_window, old_endpoint) = loop {
             stats.pre_run(machine, &ctx.regs);
             let event_sample = super::event_profile::Sample::start(machine);
             ctx.device_cycles = 0;
-            let kevent = if threads[ctx.tid].kernel.pending_event.is_some() {
-                parallel.execute(machine, threads, &mut ctx, bios_workspace, loan_deadline.unwrap())
+            if !scheduled {
+                parallel.schedule(machine, threads, &mut ctx, loan_deadline.unwrap());
+                scheduled = true;
+            }
+            let kevent = if let Some(event) = threads[ctx.tid].kernel.pending_event.take() {
+                event
             } else if threads[ctx.tid].personality.timer_due(machine.now()) {
                 crate::KernelEvent::Irq
             } else {
-                parallel.execute(machine, threads, &mut ctx, bios_workspace, loan_deadline.unwrap())
+                super::memory::service(machine);
+                machine.execution_profile_begin();
+                ctx.prepare_io(bios_workspace, &threads[ctx.tid].personality);
+                machine.execution_profile_time(arch_abi::ExecutionProfileStage::PolicyLookup);
+                #[cfg(target_arch = "x86")]
+                if let thread::Personality::Dos(dos) = &mut threads[ctx.tid].personality {
+                    super::dos::planar::resume(machine, dos, &ctx.regs);
+                }
+                let event = machine.execute(&mut ctx.regs, &ctx.io_policy,
+                    core::time::Duration::from_nanos(loan_deadline.unwrap().saturating_sub(machine.now())));
+                #[cfg(target_arch = "x86")]
+                let event = {
+                    let (event, cycles) = super::dos::planar::materialize(machine, event);
+                    ctx.device_cycles = cycles;
+                    event
+                };
+                event
             };
             let peers_pending = threads.iter().any(|task| task.kernel.pending_event.is_some());
             let thread = ctx.thread(threads);
@@ -1964,7 +1985,9 @@ fn event_loop<A: crate::Arch>(
             let old_endpoint = thread.window_endpoint();
             event_dispatch.finish(machine);
             stats.after_dispatch(machine);
-            if clock_read && !peers_pending && matches!(action, thread::KernelAction::Done)
+            let device_access = matches!(&thread.personality, thread::Personality::Dos(_))
+                && matches!(kevent, crate::KernelEvent::PageFault { .. });
+            if (clock_read || device_access) && !peers_pending && matches!(action, thread::KernelAction::Done)
                 && matches!(thread.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running)
                 && loan_deadline.is_some_and(|end| machine.now() < end)
             {
@@ -2342,8 +2365,13 @@ fn dispatch<A: crate::Arch>(
             && crate::kernel::linux::try_signal_fault(machine, linux, thread.kernel.tid, regs, addr) {
             return thread::KernelAction::Done;
         }
+        let stepped = arch_abi::monitor::stepping(regs);
+        let user_was = regs.user_tf();
         if addr <= u32::MAX as u64 && thread.personality.try_vga_fault(machine, regs, addr as u32) {
-            return thread::KernelAction::Done;
+            return if stepped {
+                thread.personality.handle_event(machine, bios_display, &mut thread.kernel, regs,
+                    crate::KernelEvent::EmulatedStep { user_was })
+            } else { thread::KernelAction::Done };
         }
         crate::compact_println!(
             "  fault rip={:#x} addr={:#x} err={:#x}",

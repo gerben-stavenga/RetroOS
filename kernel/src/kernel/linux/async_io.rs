@@ -27,6 +27,7 @@ pub(super) fn proc_target(state: &State, fd: usize) -> Option<Vec<u8>> {
     let label = match descriptor(state, i32::try_from(fd).ok()?)? {
         Descriptor::Event { .. } => "anon_inode:[eventfd]",
         Descriptor::Epoll(_) => "anon_inode:[eventpoll]",
+        Descriptor::Timer(_) => "anon_inode:[timerfd]",
     };
     Some(label.as_bytes().to_vec())
 }
@@ -42,6 +43,8 @@ enum Wait {
     Flock(i32, u32),
     RecordLock(super::record_lock::Request),
     Read(u8, u64, usize),
+    /// Blocking timerfd read: (fd, user buffer).
+    TimerRead(i32, u64),
     ReadV,
     Splice,
     Child(i32, u64),
@@ -78,6 +81,7 @@ enum Descriptor {
         semaphore: bool,
     },
     Epoll(Arc<Mutex<Vec<Watch>>>),
+    Timer(Arc<Mutex<super::timerfd::Timer>>),
 }
 #[derive(Default)]
 pub(super) struct State {
@@ -114,6 +118,7 @@ pub(super) fn debug_waits<A: crate::Arch>(kt: &thread::KernelThread<A>, state: &
             Wait::Flock(fd, _) => ("flock", fd as u64, 0),
             Wait::RecordLock(_) => ("record-lock", 0, 0),
             Wait::Read(fd, _, _) => ("read", fd as u64, 0),
+            Wait::TimerRead(fd, _) => ("timerfd-read", fd as u64, 0),
             Wait::ReadV => ("readv", 0, 0),
             Wait::Splice => ("splice", 0, 0),
             Wait::Child(pid, _) => ("child", pid as u64, 0),
@@ -129,7 +134,7 @@ pub(super) fn debug_waits<A: crate::Arch>(kt: &thread::KernelThread<A>, state: &
         if let Some(Descriptor::Epoll(watches)) = descriptor {
             for watch in watches.lock().iter() {
                 crate::compact_dbg_println!("[LINUX EPOLL] pid={} object={} fd={} events={:#x} last={:#x} ready={:#x} enabled={}",
-                    kt.tid, index, watch.fd, watch.events, watch.last, ready(kt, state, watch.fd), watch.enabled);
+                    kt.tid, index, watch.fd, watch.events, watch.last, ready(kt, state, watch.fd, now), watch.enabled);
             }
         }
     }
@@ -194,6 +199,26 @@ fn object(s: &State, fd: i32) -> Option<usize> {
 fn descriptor(s: &State, fd: i32) -> Option<&Descriptor> {
     s.descriptors.get(object(s, fd)?)?.as_ref()
 }
+/// The timerfd behind `fd`: EBADF for no descriptor, EINVAL for another kind.
+fn timer<A: crate::Arch>(kt: &thread::KernelThread<A>, s: &State, fd: i32)
+    -> Result<Arc<Mutex<super::timerfd::Timer>>, i32> {
+    match descriptor(s, fd) {
+        Some(Descriptor::Timer(timer)) => Ok(timer.clone()),
+        Some(_) => Err(-EINVAL),
+        None if fd >= 0 && (fd as usize) < thread::MAX_FDS && !kt.fds[fd as usize].is_none() => Err(-EINVAL),
+        None => Err(-EBADF),
+    }
+}
+/// Copy out and consume pending expirations; None while none are pending.
+fn read_timer<A: crate::Arch>(machine: &mut A, timer: &Mutex<super::timerfd::Timer>, out: u64) -> Option<i32> {
+    let now = machine.now();
+    let mut timer = timer.lock();
+    let n = timer.expirations(now);
+    if n == 0 { return None; }
+    if !high_memory::copy_to(machine, out, &n.to_le_bytes()) { return Some(-EFAULT); }
+    timer.take(now);
+    Some(8)
+}
 fn deadline<A: crate::Arch>(machine: &A, ms: i32) -> u64 {
     if ms < 0 {
         u64::MAX
@@ -201,10 +226,14 @@ fn deadline<A: crate::Arch>(machine: &A, ms: i32) -> u64 {
         machine.now().saturating_add(ms as u64 * 1_000_000)
     }
 }
-fn ready<A: crate::Arch>(kt: &thread::KernelThread<A>, s: &State, fd: i32) -> u32 {
-    if let Some(Descriptor::Event { count, .. }) = descriptor(s, fd) {
-        let count = *count.lock();
-        return u32::from(count > 0) | if count < u64::MAX - 1 { 4 } else { 0 };
+fn ready<A: crate::Arch>(kt: &thread::KernelThread<A>, s: &State, fd: i32, now: u64) -> u32 {
+    match descriptor(s, fd) {
+        Some(Descriptor::Event { count, .. }) => {
+            let count = *count.lock();
+            return u32::from(count > 0) | if count < u64::MAX - 1 { 4 } else { 0 };
+        }
+        Some(Descriptor::Timer(timer)) => return u32::from(timer.lock().expirations(now) != 0),
+        _ => {}
     }
     if fd < 0 || fd as usize >= thread::MAX_FDS {
         return 0;
@@ -232,6 +261,7 @@ fn poll<A: crate::Arch>(
     ptr: u64,
     count: usize,
 ) -> i32 {
+    let now = machine.now();
     let mut n = 0;
     for i in 0..count {
         let fd = machine.read::<i32>((ptr + (i * 8) as u64) as u64);
@@ -243,7 +273,7 @@ fn poll<A: crate::Arch>(
         {
             32
         } else {
-            ready(kt, s, fd) & (requested | 0x18)
+            ready(kt, s, fd, now) & (requested | 0x18)
         };
         machine.write::<u16>((ptr + (i * 8) as u64 + 6) as u64, bits as u16);
         n += i32::from(bits != 0);
@@ -264,13 +294,16 @@ fn epoll<A: crate::Arch>(
     // Hold the watch-list lock through readiness sampling and delivery. A
     // forked process may change this same epoll object on another CPU.
     let mut watches = watches.lock();
+    let now = machine.now();
     let mut n = 0;
     for w in watches.iter_mut() {
+        // A timerfd needs no sequence: as on Linux, an unread periodic timer
+        // raises one edge; read and settime start a new one via reset_edge.
         let sequence = match kt.fds.get(w.fd as usize) {
             Some(FdKind::Socket(handle)) => crate::kernel::net::read_sequence(*handle),
             _ => 0,
         };
-        let bits = ready(kt, s, w.fd);
+        let bits = ready(kt, s, w.fd, now);
         let bits = bits & (w.events | 0x18);
         let deliver = if w.events & (1 << 31) != 0 {
             (bits & !w.last) | if sequence != w.read_sequence { bits & 1 } else { 0 }
@@ -355,6 +388,54 @@ pub(super) fn call<A: crate::Arch>(
                     },
                     a.a1 & 0x80000 != 0,
                 )
+            }
+        }
+        283 => match super::timerfd::Timer::new(a.a0, a.a1) {
+            Ok(timer) => alloc_fd_cloexec(s, Descriptor::Timer(Arc::new(Mutex::new(timer))),
+                super::timerfd::Timer::cloexec(a.a1)),
+            Err(error) => error,
+        },
+        286 | 287 => match timer(kt, s, fd) {
+            Err(error) => error,
+            Ok(timer) => {
+                let now = machine.now();
+                let old = if nr == 286 {
+                    let spec = match super::timerfd::read_spec(machine, a.a2) {
+                        Ok(spec) => spec,
+                        Err(error) => return Some(SyscallResult::val(error)),
+                    };
+                    let realtime_now = super::time::realtime_ns();
+                    let old = timer.lock().set(now, realtime_now, a.a1, spec);
+                    // Netty re-arms its edge-triggered timerfd without reading
+                    // it; the next expiry must be a fresh edge.
+                    reset_edge(s, fd);
+                    old
+                } else {
+                    Ok(timer.lock().current(now))
+                };
+                let out = if nr == 286 { a.a3 } else { a.a1 };
+                match old {
+                    Err(error) => error,
+                    Ok(old) if out != 0 && !super::timerfd::write_spec(machine, out, old) => -EFAULT,
+                    Ok(_) => 0,
+                }
+            }
+        },
+        0 if matches!(descriptor(s, fd), Some(Descriptor::Timer(_))) => {
+            let Some(Descriptor::Timer(timer)) = descriptor(s, fd) else { unreachable!() };
+            let timer = timer.clone();
+            if a.a2 < 8 {
+                -EINVAL
+            } else {
+                match read_timer(machine, &timer, a.a1) {
+                    Some(result) => { reset_edge(s, fd); result }
+                    None if timer.lock().nonblocking => -11,
+                    None => {
+                        ensure(machine, kt, s, regs);
+                        s.contexts[s.active].wait = Wait::TimerRead(fd, a.a1);
+                        0
+                    }
+                }
             }
         }
         233 => {
@@ -807,7 +888,8 @@ pub(super) fn after_io<A: crate::Arch>(kt: &thread::KernelThread<A>, linux: &mut
     if !matches!(kt.fds.get(fd as usize), Some(FdKind::Socket(_))) { return; }
     let direction = match nr { 0 | 45 | 47 => 1, 1 | 20 | 44 | 46 => 4, _ => return };
     let s = &mut linux.async_io;
-    let lost = if result == -11 { direction } else { direction & !ready(kt, s, fd) };
+    // Sockets only: no timerfd here, so the clock value never matters.
+    let lost = if result == -11 { direction } else { direction & !ready(kt, s, fd, 0) };
     for descriptor in &mut s.descriptors {
         if let Some(Descriptor::Epoll(watches)) = descriptor {
             for watch in watches.lock().iter_mut().filter(|w| w.fd == fd) {
@@ -955,6 +1037,15 @@ pub(super) fn schedule<A: crate::Arch>(
                 crate::kernel::kpipe::read_event(pipe, &mut data)
                     .map(|n| if high_memory::copy_to(machine, out, &data[..n]) { n as i32 } else { -EFAULT })
             }
+            Wait::TimerRead(fd, out) => match descriptor(s, fd) {
+                Some(Descriptor::Timer(timer)) => {
+                    let timer = timer.clone();
+                    let result = read_timer(machine, &timer, out);
+                    if result.is_some() { reset_edge(s, fd); }
+                    result
+                }
+                _ => Some(-EBADF),
+            },
             Wait::ReadV => s.contexts[i].readv.as_ref().unwrap().step(machine),
             Wait::Splice => s.contexts[i].splice.as_ref().unwrap().step(),
             _ => None,
@@ -1087,10 +1178,24 @@ pub(super) fn exec_state(s: &State) -> State {
     fork_state(s)
 }
 
-/// Timed waits retain their absolute expiry while other contexts run.
-pub(super) fn next_deadline(state: &State) -> Option<u64> {
+/// Timed waits retain their absolute expiry while other contexts run. A
+/// timerfd a waiter depends on contributes its next future expiry.
+pub(super) fn next_deadline(state: &State, now: u64) -> Option<u64> {
+    let fire = |fd: i32| match descriptor(state, fd) {
+        Some(Descriptor::Timer(timer)) => timer.lock().next_fire(now),
+        _ => None,
+    };
     state.contexts.iter().filter_map(|context| match context.wait {
-        Wait::Sleep(end) | Wait::Futex(_, _, end) | Wait::Epoll(_, _, _, end) | Wait::Poll(_, _, end) =>
+        Wait::Epoll(epfd, _, _, end) => {
+            let watched = match descriptor(state, epfd) {
+                Some(Descriptor::Epoll(watches)) => watches.lock().iter()
+                    .filter(|w| w.enabled).filter_map(|w| fire(w.fd)).min(),
+                _ => None,
+            };
+            [(end != u64::MAX).then_some(end), watched].into_iter().flatten().min()
+        }
+        Wait::TimerRead(fd, _) => fire(fd),
+        Wait::Sleep(end) | Wait::Futex(_, _, end) | Wait::Poll(_, _, end) =>
             (end != u64::MAX).then_some(end),
         Wait::Select => context.select.as_ref().unwrap().deadline(),
         Wait::Socket(request) => request.deadline,
@@ -1100,7 +1205,7 @@ pub(super) fn next_deadline(state: &State) -> Option<u64> {
 pub(super) fn needs_poll(state: &State) -> bool {
     state.contexts.iter().any(|context| matches!(context.wait,
         Wait::Epoll(..) | Wait::Poll(..) | Wait::Select | Wait::Random(..)
-        | Wait::Flock(..) | Wait::RecordLock(..) | Wait::Read(..) | Wait::ReadV | Wait::Socket(..)))
+        | Wait::Flock(..) | Wait::RecordLock(..) | Wait::Read(..) | Wait::TimerRead(..) | Wait::ReadV | Wait::Socket(..)))
 }
 
 pub(super) fn has_exited(state: &State) -> bool { !state.exited_tasks.is_empty() }

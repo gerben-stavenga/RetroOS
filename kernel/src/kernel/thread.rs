@@ -536,7 +536,7 @@ impl<A: crate::Arch> Personality<A> {
                     dos.cpu_pacer.deadline(now).filter(|_| active),
                     dos.pc.audio.try_lock().map_or(Some(now.saturating_add(1_000_000)), |audio| audio.next_deadline(now)).filter(|_| active)].into_iter().flatten().min()
             }
-            Self::Linux(linux) => linux.alarm_deadline().filter(|&end| end > now),
+            Self::Linux(linux) => linux.alarm_deadline(now).filter(|&end| end > now),
             Self::Os2(os2) => os2.next_deadline(),
             Self::Windows(windows) => windows.next_deadline(now),
         }
@@ -708,6 +708,33 @@ pub struct Thread<A: crate::Arch> {
 }
 
 impl<A: crate::Arch> Thread<A> {
+    /// Move the live CPU state into this thread, leaving an empty user space.
+    pub fn materialize(&mut self, machine: &mut A, regs: Regs) {
+        #[cfg(target_arch = "x86")]
+        crate::kernel::dos::planar::materialize(machine, crate::KernelEvent::Irq);
+        self.personality.on_suspend(machine);
+        self.kernel.vcpu.regs = regs;
+        let mut fx = machine.clean_fx_template();
+        machine.switch_fx(&mut fx);
+        self.kernel.fx_state = fx;
+        self.kernel.vcpu.space = machine.activate(Default::default());
+        self.kernel.cpu_hash = hash_regs(&regs);
+    }
+
+    /// Make this materialized thread the CPU's current context. Does not run it.
+    pub fn resume(&mut self, machine: &mut A) -> Regs {
+        crate::kernel::exec_ctx::verify_kernel_cpu_hash(&self.kernel, "resume");
+        let mut fx = self.kernel.fx_state;
+        machine.switch_fx(&mut fx);
+        let _empty = machine.activate(core::mem::take(&mut self.kernel.vcpu.space));
+        self.personality.on_resume(machine);
+        #[cfg(target_arch = "x86")]
+        if let Personality::Dos(dos) = &mut self.personality {
+            crate::kernel::dos::planar::resume(machine, dos, &self.kernel.vcpu.regs);
+        }
+        self.kernel.vcpu.regs
+    }
+
     /// Linux processes currently share one console and stdin endpoint. Its
     /// presentation identity stays stable across shell fork/exec and exit.
     pub fn window_endpoint(&self) -> crate::kernel::gui::EndpointId {

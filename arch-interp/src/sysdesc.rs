@@ -166,6 +166,8 @@ fn materialize() {
     gdt[(TSS_SEL >> 3) as usize] = gdt_desc(TSS_ADDR as u32, 0x1FF, 0x8B, 0x0);
     #[cfg(feature = "kvm")]
     {
+        // Shared entry.asm's 16-bit-stack return alias (slot 7 is free).
+        gdt[7] = gdt_desc(0xFFFF0000, 0xFFFF, 0x92, 0x4);
         // Long-mode descriptors (64-bit user slices). KERNEL_CS64 is fetched
         // from this table by the CPU on every 64-bit gate delivery; USER_CS64
         // matches arch-abi's Mode64 selector; the TSS64 descriptor is 16 bytes
