@@ -1,5 +1,5 @@
 //! KVM-engine proofs: enter the guest for real (VM86 and flat PM), drive the
-//! trap shim, demand paging, COW, and the shared monitor end-to-end on
+//! arch supervisor, demand paging, COW, and the shared monitor end-to-end on
 //! hardware. Each test skips with a message when `/dev/kvm` is unavailable
 //! (CI without nested virt), so the suite stays green everywhere.
 //!
@@ -13,7 +13,8 @@ use crate::test_memory;
 use arch_abi::{Memory as _, Arch as _};
 use super::*;
 use crate::space::RootPageTable;
-use crate::sysdesc::{VIF_FLAG, VM_FLAG};
+const VIF_FLAG: u32 = 1 << 19;
+const VM_FLAG: u64 = 1 << 17;
 use arch_abi::{GuestBytes, KernelEvent, Regs, USER_CS, USER_DS};
 
 static INPUT: std::sync::Mutex<std::vec::Vec<(arch_abi::Irq, u64)>> = std::sync::Mutex::new(std::vec::Vec::new());
@@ -39,6 +40,8 @@ fn run_to_event() -> KernelEvent {
 }
 
 fn set_regs(regs: Regs) {
+    let base = if regs.mode() == arch_abi::UserMode::VM86 { u64::from(regs.code_seg()) << 4 } else { <crate::Interp as arch_abi::X86>::seg_base(regs.code_seg()) as u64 };
+    crate::mmu_tests::executable(base + regs.frame.rip);
     // Seed the backend's live frame directly (arch-level proof, below the
     // kernel loop where `execute` would swap them in). Space is unchanged —
     // the active one, set via `Arch::activate` where a test needs to switch.
@@ -65,7 +68,7 @@ fn kvm_engine_proofs() {
     crate::backend::check_virtual_irq_frame(&mut mem);
 
     // ── VM86: `int 0x31` (the trapped DPMI stub vector) from real-mode code.
-    // The INT is IOPL-sensitive at IOPL=1 → #GP → shim → shared monitor →
+    // The INT is IOPL-sensitive at IOPL=1 → #GP → arch → shared monitor →
     // redirection bitmap traps 0x31 → SoftInt(0x31). Exercises: v86 entry
     // shape, demand-#PF on the first code fetch, the #GP monitor path.
     // 0xB8 0x34 0x12   mov ax, 0x1234
@@ -266,7 +269,7 @@ fn kvm_engine_proofs() {
     // parent's copy is untouched (the #PF → space_cow_fault path under KVM).
     mem.write::<u32>(data as u64, 0x1111_1111);
     let mut child = RootPageTable::empty();
-    crate::paging::space_fork(&mut child);
+    mem.user_fork(&mut child, test_memory::input(5));
     let parent = crate::backend::Interp.activate(child);
     // In the child: increment the shared dword, then int 0x80.
     // 0xFF 0x05 <addr>   inc dword [data]
@@ -292,22 +295,19 @@ fn kvm_engine_proofs() {
         "parent's page untouched by the child's COW write"
     );
 
-    // ── IOPB fast path: an allowed port exits as a direct KVM_EXIT_IO (no
-    // #GP, no shim) and must surface with the monitor's exact contract — IP
-    // advanced, OUT value in EAX, IN result taken from EAX on re-entry (the
-    // canceled KVM completion must NOT clobber it). Then the same code with
-    // the port denied again goes through the shim + monitor and must behave
-    // identically — the two paths are meant to be observationally equal.
-    // 0xB0 0x5A   mov al, 0x5A
-    // 0xE6 0xE0   out 0xE0, al
-    // 0xE4 0xE0   in  al, 0xE0
-    // 0xCD 0x80   int 0x80
+    mem.copy_to(code as u64, &[0xe7, arch_abi::vm::EXIT_PORT as u8, 0xcd, 0x80]);
+    let mut handoff = Regs::empty();
+    handoff.init_user_process(code, stack);
+    handoff.rax = 0xdeadbeef;
+    set_regs(handoff);
+    assert!(matches!(run_to_event(), KernelEvent::Out { port: arch_abi::vm::EXIT_PORT, size: arch_abi::IoSize::Dword }));
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+
+    // Port access is denied by the supervisor's TSS and decoded by the
+    // shared monitor. The returned frame has already advanced past the OUT.
     let io_prog: &[u8] = &[0xB0, 0x5A, 0xE6, 0xE0, 0xE4, 0xE0, 0xCD, 0x80];
-    for (label, allowed) in [("fast path", true), ("shim path", false)] {
-        reset_io_bitmap();
-        if allowed {
-            allow_io_ports(0xE0, 1);
-        }
+    {
+        let label = "monitored port";
         mem.copy_to(code as u64, io_prog);
         let mut r = Regs::empty();
         r.init_user_process(code, stack);
@@ -332,7 +332,6 @@ fn kvm_engine_proofs() {
         }
         assert_eq!(regs().rax as u8, 0xA5, "{label}: IN result in AL survived re-entry");
     }
-    reset_io_bitmap();
 
     // ── FPU switch: fx_switch swaps the vcpu's live x87/SSE state with a
     // thread save area (metal's switch_fx semantics). Thread A parks a
@@ -427,8 +426,29 @@ fn kvm_engine_proofs() {
     assert_eq!(regs().r15, tls.r15);
     assert_eq!((regs().fs, regs().gs), (fs_base, gs_base));
 
+    // Full-width paging is performed inside arch, including kernel copies,
+    // execution above 512 GiB, and COW after a fork.
+    let high = (1u64 << 39) + 0x1234_0000;
+    let zero = arch_abi::mapping::read_mapping(&mut mem, UserPage::new(0x7000_0000).unwrap()).unwrap();
+    unsafe { mem.fill_mappings(UserPage::new(high).unwrap(), 2, zero, test_memory::input(8)).0.unwrap(); }
+    mem.copy_to(high, &[0x48, 0xff, 0x07, 0x48, 0x8b, 0x07, 0x0f, 0x05]); // inc [rdi]; mov rax,[rdi]; syscall
+    mem.write::<u64>(high + 4096, 41);
+    let mut child = RootPageTable::empty();
+    mem.user_fork(&mut child, test_memory::input(8));
+    let parent = mem.activate(child);
+    let mut high_regs = Regs::empty();
+    high_regs.init_user_process_64(high, stack as u64);
+    high_regs.rdi = high + 4096;
+    set_regs(high_regs);
+    assert!(matches!(run_to_event(), KernelEvent::Syscall));
+    assert_eq!(regs().rax, 42);
+    assert_eq!(mem.read::<u64>(high + 4096), 42);
+    let mut child = mem.activate(parent);
+    assert_eq!(mem.read::<u64>(high + 4096), 41);
+    mem.destroy_space(&mut child);
+
     // A timer interrupt may switch 64-bit contexts only after KVM has
-    // delivered any pending syscall #UD to the trap shim. Repeatedly switch
+    // delivered any pending syscall #UD to the arch supervisor. Repeatedly switch
     // between distinct code addresses at both timer and syscall boundaries;
     // a stale queued exception at the new MOV/JMP must never escape as #UD.
     let entries = [0x0060_0000usize, 0x0060_1000];

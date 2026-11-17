@@ -12,13 +12,17 @@ use core::alloc::Layout;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 unsafe extern "C" {
+    #[cfg(not(feature = "kvm"))]
     static TLS_TEMPLATE: u8;
+    #[cfg(not(feature = "kvm"))]
     static TLS_FILE_SIZE: u8;
     static TLS_SIZE: u8;
     static TLS_ALIGN: u8;
     static ARCH_STACK_TOP: u8;
     static _kernel_start: u8;
+    #[cfg(not(feature = "kvm"))]
     static ap_trampoline: u8;
+    #[cfg(not(feature = "kvm"))]
     static ap_trampoline_end: u8;
 }
 
@@ -120,6 +124,7 @@ pub enum StartError {
 /// After ANY delivery/startup timeout, retain the page and all AP storage and
 /// do not retry/reuse them: an AP may still arrive late. Callback code must
 /// synchronize shared state and must not use the unsynchronized global heap.
+#[cfg(not(feature = "kvm"))]
 pub unsafe fn start_core(
     apic_id: u32,
     page_phys: u32,

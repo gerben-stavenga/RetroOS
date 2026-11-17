@@ -109,7 +109,10 @@ pub use arch_abi::LOW_MEM_BASE;
 pub const KERNEL_BASE: usize = 0xC0B0_0000;
 
 /// Kernel physical load address (must match KERNEL_PHYS in `kernel.ld`).
+#[cfg(not(feature = "kvm"))]
 pub const KERNEL_PHYS: usize = 0x0010_0000;
+#[cfg(feature = "kvm")]
+pub const KERNEL_PHYS: usize = arch_abi::vm::IMAGE_PHYSICAL;
 
 /// The kernel heap occupies `[heap_base() .. HEAP_END)` in kernel space. The
 /// kernel maps backing explicitly before donating it to its heap allocator.
@@ -1519,6 +1522,7 @@ pub(crate) fn read_boot_physical(mut physical: u64, mut out: &mut [u8]) -> bool 
 
 /// Map the startup sender's APIC without using the heap or frame allocator.
 /// AP stacks/TLS have priority: this consumes only the finished pool's tail.
+#[cfg(not(feature = "kvm"))]
 pub(crate) fn map_boot_mmio(va: usize, phys: u64) -> bool {
     fn map<E: Entry>(entries: &mut [E], va: usize, phys: u64) -> bool {
         let page = va / PAGE_SIZE;

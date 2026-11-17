@@ -34,6 +34,7 @@ mod calls;
 mod exec_profile;
 pub mod mem;
 pub mod descriptors;
+#[cfg(not(feature = "kvm"))]
 pub mod irq;
 pub mod aperture;
 pub mod acpi;
@@ -127,7 +128,7 @@ pub const MULTIBOOT_INFO_FRAMEBUFFER: u32 = 1 << 12;
 pub use backend::Metal;
 pub use paging2::{RawPage, RootPageTable, PAGE_SIZE, LOW_MEM_BASE, HEAP_END, heap_base};
 pub use vcpu::Vcpu;
-pub use irq::Irq;
+pub use arch_abi::Irq;
 pub use descriptors::{USER_CS, USER_CS64, USER_DS};
 
 // Arch call constants + the ring-1 wrappers that issue them (the kernel-facing
@@ -165,8 +166,12 @@ pub fn halt_forever() -> ! {
 pub use x86::{inb, outb, inw, outw, inl, outl, insw, outsw};
 pub use x86::{rdtsc, current_apic_id};
 pub use x86::{FxState, clean_fx_template};
+#[cfg(not(feature = "kvm"))]
 pub use irq::now;
 
 mod frames;
 pub use frames::{map_heap_page, physical as kernel_frame, read as read_physical_frame, write as write_physical_frame};
 mod mapping;
+
+#[cfg(feature = "kvm")]
+pub mod vm;

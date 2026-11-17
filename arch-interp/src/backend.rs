@@ -1,14 +1,18 @@
 //! Hosted implementation of the shared arch-abi traits.
 
+#[cfg(feature = "tcg")]
 use crate::space::RootPageTable;
 use crate::vcpu::{self};
-use arch_abi::{X86, Memory, Arch, Diagnostics, KernelEvent, Regs};
+#[cfg(feature = "tcg")]
+use arch_abi::{X86, Memory};
+use arch_abi::{Arch, Diagnostics, KernelEvent, Regs};
 
 /// The interpreter backend handle. Zero-sized today (state lives in module
 /// statics); it gains fields as the globals migrate into it.
 pub struct Interp;
 
 
+#[cfg(feature = "tcg")]
 impl X86 for Interp {
     fn isa_unmask_irq(&mut self, line: u8) { crate::calls::arch_isa_unmask_irq(line) }
 
@@ -66,6 +70,7 @@ impl X86 for Interp {
     fn int_intercepted(vector: u8) -> bool { crate::desc::int_intercepted(vector) }
 }
 
+#[cfg(feature = "tcg")]
 impl Memory for Interp {
     fn alias_mappings(&mut self, a: arch_abi::UserPage, b: arch_abi::UserPage, count: usize,
         pages: arch_abi::page_supply::PageInput) -> (Result<(), arch_abi::MappingError>, arch_abi::page_supply::PageInput) {
@@ -131,9 +136,8 @@ impl Memory for Interp {
 
 impl Arch for Interp {
     #[allow(clippy::deref_addrof)]
-    fn execute(&mut self, regs: &mut Regs, io: &arch_abi::IoPolicy, max_time: core::time::Duration) -> KernelEvent {
+    fn execute(&mut self, regs: &mut Regs, _io: &arch_abi::IoPolicy, max_time: core::time::Duration) -> KernelEvent {
         crate::suite_control::gate();
-        crate::engine::install_io_policy(io);
         // Bridge the loop-owned registers to the backend's live frame for the
         // run, then read them
         // back. Swap, not copy — `Regs` is Copy but swap keeps a single source.
@@ -168,6 +172,8 @@ pub(crate) fn check_virtual_irq_frame(machine: &mut Interp) {
     let limit = core::time::Duration::from_millis(100);
     for opcode in [0xfb, 0x9d, 0xcf] { // STI, POPF, IRET
         machine.copy_to((CODE) as u64, &[opcode, 0xcd, 0x31]);
+        #[cfg(feature = "kvm")]
+        crate::mmu_tests::executable(CODE as u64);
         let mut pending = Regs::empty();
         pending.set_cs32(0);
         pending.set_ss32(0);
@@ -181,8 +187,9 @@ pub(crate) fn check_virtual_irq_frame(machine: &mut Interp) {
         } else {
             machine.write::<u16>(0x7000, 0x202);
         }
-        assert!(matches!(machine.execute(&mut pending, &io, limit), KernelEvent::Irq),
-            "opcode {opcode:x} must return when VIP becomes deliverable");
+        let event = machine.execute(&mut pending, &io, limit);
+        assert!(matches!(event, KernelEvent::Irq),
+            "opcode {opcode:x} must return when VIP becomes deliverable: {event:?}, regs={pending:?}");
         assert_eq!(pending.ip32(), (CODE + 1) as u32);
         assert_eq!(pending.flags32() & (VIF | VIP), VIF | VIP);
 

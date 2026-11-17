@@ -1,4 +1,4 @@
-//! Physical RAM allocator: a one-bit RAM bitmap and sparse shared refcounts.
+//! Physical RAM allocator: an allocation bitmap separate from resident frame references.
 #![no_std]
 extern crate alloc;
 use arch_abi::PAGE_SIZE;
@@ -15,7 +15,7 @@ use alloc::alloc::{alloc_zeroed, dealloc};
 use core::alloc::Layout;
 #[path = "phys_mm/pool.rs"]
 mod pool;
-use pool::{Pool, REF_BLOCK_PAGES};
+use pool::Pool;
 
 // One bootstrap page covers 128 MiB of usable RAM; address holes and boot
 // modules are excluded before allocation. Full metadata is sized to real RAM.
@@ -92,14 +92,10 @@ pub fn complete_initialization() {
     let pages = unsafe { (*pool_ptr()).pages };
     assert!(pages != 0, "firmware supplied no usable RAM");
     let state_layout = Layout::array::<u8>(pages.div_ceil(8)).expect("page state size overflow");
-    let block_layout = Layout::array::<*mut u8>(pages.div_ceil(REF_BLOCK_PAGES))
-        .expect("refcount directory size overflow");
     unsafe {
         let states = alloc_zeroed(state_layout);
         assert!(!states.is_null(), "cannot allocate physical page states");
-        let blocks = alloc_zeroed(block_layout).cast::<*mut u8>();
-        assert!(!blocks.is_null(), "cannot allocate physical refcount directory");
-        (*pool_ptr()).expand(states, blocks);
+        (*pool_ptr()).expand(states, core::ptr::null_mut());
     }
 }
 
@@ -139,10 +135,7 @@ pub fn alloc_phys_page() -> Option<u64> {
 
 pub fn free_phys_page(page: u64) {
     if is_zero_page(page) { return; }
-    let unused = with_pool(|pool| pool.release(page));
-    if let Some(data) = unused {
-        unsafe { dealloc(data, Layout::array::<u8>(REF_BLOCK_PAGES).unwrap()); }
-    }
+    with_pool(|pool| pool.release(page));
 }
 
 pub fn inc_shared_count(page: u64) -> bool {
@@ -165,17 +158,14 @@ pub fn ownership() -> arch_abi::page_supply::FrameOwnership {
     })
 }
 
-/// Populate all refcount blocks before guest execution. Allocation and first
+/// Provision the page-aligned reference arena before guest execution. Allocation and first
 /// touches happen in kernel context; fault handlers only access resident bytes.
 pub fn prepare_fault_metadata() {
     let pages = unsafe { (*pool_ptr()).pages };
-    let blocks = pages.div_ceil(REF_BLOCK_PAGES);
-    let bytes = blocks.checked_mul(REF_BLOCK_PAGES).expect("reference metadata overflow");
-    let arena = unsafe { alloc_zeroed(Layout::array::<u8>(bytes).unwrap()) };
+    let bytes = pages.next_multiple_of(PAGE_SIZE);
+    let arena = unsafe { alloc_zeroed(Layout::from_size_align(bytes, PAGE_SIZE).unwrap()) };
     assert!(!arena.is_null(), "cannot allocate resident frame references");
-    for block in 0..blocks {
-        assert!(unsafe { (*pool_ptr()).install_ref_block(block, arena.add(block * REF_BLOCK_PAGES)) });
-    }
+    unsafe { (*pool_ptr()).install_counts(arena); }
 }
 
 pub fn get_ref_count(page: u64) -> u8 {

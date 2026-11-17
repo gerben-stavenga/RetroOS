@@ -8,7 +8,10 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 // Reservation capacity is independent of the pre-paging allocation ceiling.
 // The tail can serve ISA DMA after flat segments/paging are established.
+#[cfg(not(feature = "kvm"))]
 pub const CAPACITY: usize = 2 * 1024 * 1024;
+#[cfg(feature = "kvm")]
+pub const CAPACITY: usize = 64 * 1024;
 pub const BOOT_MARGIN: usize = 128 * 1024;
 pub fn boot_limit() -> usize {
     (crate::paging2::KERNEL_BASE + crate::paging2::BOOT_IDENTITY_END

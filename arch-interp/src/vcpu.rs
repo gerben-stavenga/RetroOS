@@ -15,6 +15,7 @@ use arch_abi::{GuestBytes, Regs};
 /// pages). `on_chunk(host_ptr, offset_into_request, chunk_len)`. Replaces the
 /// old "VA is a contiguous host pointer" model: under real paging the frames a
 /// VA range lands on are scattered, so every guest access is page-split here.
+#[cfg(feature = "tcg")]
 #[inline]
 fn for_chunks(addr: usize, len: usize, write: bool, mut on_chunk: impl FnMut(*mut u8, usize, usize)) {
     let mut off = 0;
@@ -45,6 +46,7 @@ pub type Vcpu = arch_abi::Vcpu<crate::backend::Interp>;
 /// `host_ptr` resolves the *active* space, matching the prior behaviour. (The
 /// inherent `GuestMem` API below stays for arch-internal callers — BIOS/screen
 /// setup — that legitimately want slice views below the boundary.)
+#[cfg(feature = "tcg")]
 impl GuestBytes for crate::backend::Interp {
     fn read<T: Copy>(&self, addr: u64) -> T {
         let addr = low_address(addr, core::mem::size_of::<T>());
@@ -192,6 +194,7 @@ impl GuestMem {
     }
 }
 
+#[cfg(any(feature = "tcg", test))]
 fn low_address(address: u64, length: usize) -> usize {
     assert!(address.checked_add(length as u64).is_some_and(|end| end <= 0xc0000000), "unsupported guest address");
     address as usize

@@ -38,3 +38,23 @@ host_platform_test = rule(
     test = True,
     doc = "Forwards a test executable built for @platforms//host.",
 )
+
+# Embed the freestanding arch supervisor in a host binary without rebuilding
+# the host kernel for the supervisor's 32-bit target.
+def _metal_transition_impl(_settings, _attr):
+    return {"//command_line_option:platforms": str(Label("//toolchain:i686_retro_none"))}
+
+_metal_transition = transition(
+    implementation = _metal_transition_impl,
+    inputs = [],
+    outputs = ["//command_line_option:platforms"],
+)
+def _metal_artifact_impl(ctx):
+    return [DefaultInfo(files = ctx.attr.target[0][DefaultInfo].files)]
+metal_artifact = rule(
+    implementation = _metal_artifact_impl,
+    attrs = {
+        "target": attr.label(cfg = _metal_transition, mandatory = True),
+        "_allowlist_function_transition": attr.label(default = "@bazel_tools//tools/allowlists/function_transition_allowlist"),
+    },
+)

@@ -12,7 +12,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-ROOT_DIR=$(mktemp -d /tmp/retroos-games-root.XXXXXX)
+ROOT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/retroos-games-root.XXXXXX")
 trap 'rm -rf "$ROOT_DIR"' EXIT
 tar -xf bazel-bin/root_module_base_tar.tar -C "$ROOT_DIR"
 tar -xf bazel-bin/root_module_showcase_tar.tar -C "$ROOT_DIR"

@@ -80,6 +80,7 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     // A LAPIC spurious delivery has no in-service interrupt to acknowledge.
     // Resume the untouched frame at any privilege level: no EOI, line mask,
     // device event, or return from execute is needed.
+    #[cfg(not(feature = "kvm"))]
     if raw_int_num == u64::from(crate::irq::LAPIC_SPURIOUS_VECTOR) {
         return from_64;
     }
@@ -258,6 +259,7 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
 
 
 /// Native kernel handoff: save the user frame and restore the suspended caller.
+#[cfg(not(feature = "kvm"))]
 fn return_to_kernel(regs: &mut Regs, event: arch_abi::KernelEvent) {
     crate::irq::arm_alarm(None);
     crate::traps::swap_regs(regs);
@@ -270,6 +272,7 @@ fn return_to_kernel(regs: &mut Regs, event: arch_abi::KernelEvent) {
 /// Normalize a metal syscall before dispatch: the physical entry frame is
 /// always the app frame while an operation runs. The syscall frame, including
 /// its kernel continuation and result registers, stays in separate storage.
+#[cfg(not(feature = "kvm"))]
 fn kernel_call(frame: &mut Regs) {
     // swap_regs parks the kernel continuation and installs the app frame.
     // The operation reads/writes the parked call, never the app's registers.
@@ -279,3 +282,10 @@ fn kernel_call(frame: &mut Regs) {
     }
     // execute leaves the app frame in place for the assembly IRET epilogue.
 }
+
+#[cfg(feature = "kvm")]
+fn return_to_kernel(regs: &mut Regs, event: arch_abi::KernelEvent) {
+    crate::vm::return_to_kernel(regs, event);
+}
+#[cfg(feature = "kvm")]
+fn kernel_call(frame: &mut Regs) { crate::vm::requests(frame); }

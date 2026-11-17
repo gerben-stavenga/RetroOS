@@ -10,19 +10,14 @@ section .note.GNU-stack noalloc noexec nowrite progbits
 section .note.GNU-stack noalloc noexec nowrite progbits
 %endif
 
-%ifdef KVM_ENTRY
-; The hosted engine loads this image into its supervisor SYS window.
-org 0xFFFF5000
-KERNEL_TLS_SEL equ 0x18
-ESPFIX_SS_SEL equ 0x38
-bits 32
-section .text
-dd int_vector, isr_handler, exit_interrupt_32, exit_interrupt_64
-%else
 ESPFIX_SS_SEL equ 0x48
 ; Constants from linker script
 KERNEL_BASE equ 0xC0B00000
+%ifdef KVM_SUPERVISOR
+KERNEL_PHYS equ 0x00001000
+%else
 KERNEL_PHYS equ 0x00100000
+%endif
 KERNEL_TLS_SEL equ 0x91       ; GDT slot 18, DPL/RPL 1 (descriptors.rs)
 
 ; External symbols defined in Rust
@@ -218,7 +213,6 @@ global toggle_prot_compat_end
 toggle_prot_compat_end:
 
 ; =============================================================================
-%endif ; native startup
 [bits 32]
 
 ; Mode-agnostic entry: int_vector + common_dispatch. Every instruction below
@@ -349,11 +343,7 @@ common_call:
     mov ds, eax
     mov edx, KERNEL_TLS_SEL
     mov gs, edx
-%ifdef KVM_ENTRY
-    mov edx, 0xFFFF0000          ; hosted ring-0 stack window
-%else
     mov edx, [gs:4]             ; CPU-local espfix stack window
-%endif
     mov ss, eax
     add esp, edx
     jmp .data_segs
@@ -602,13 +592,6 @@ far_ptr_32:
     dw 0x08                 ; 32-bit code segment
 
 ; -----------------------------------------------------------------------------
-%ifdef KVM_ENTRY
-bits 32
-isr_handler:
-    out 0xF4, al                ; host reads/updates the saved frame
-    mov eax, [esp + 8]          ; return from_64 to the shared epilogue
-    ret
-%else
 ; zero_rsp_high — clear the high 32 bits of RSP after entering compat mode.
 ; In compat mode the kernel runs on ESP and RSP[63:32] is never cleared (compat
 ; 32-bit ops don't zero-extend), so it retains whatever was there — on the UEFI
@@ -752,4 +735,20 @@ ap_entry:
     call boot_kernel           ; same Rust entry, paging on for APs
     ud2
 
-%endif ; native CPU helpers and AP startup
+
+%ifdef KVM_SUPERVISOR
+bits 32
+section .text
+global vm_supervisor_start
+extern ARCH_STACK_TOP
+vm_supervisor_start:
+    mov esp, ARCH_STACK_TOP - 256
+    mov edi, esp
+    mov ecx, 64
+    xor eax, eax
+    rep stosd
+    mov dword [esp + 188], 0x80
+    mov dword [esp + 200], 1
+    xor ebx, ebx
+    jmp common_call
+%endif

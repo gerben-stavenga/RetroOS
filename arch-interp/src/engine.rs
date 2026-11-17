@@ -23,23 +23,12 @@ mod imp {
     pub fn invalidate_pages(vpage: usize, count: usize) {
         crate::cpu::invalidate_uc(vpage, count)
     }
-    /// All I/O is interpreted; there is no IOPB fast path on this engine.
-    pub fn install_io_policy(_policy: &arch_abi::IoPolicy) {}
+
 }
 
 #[cfg(feature = "kvm")]
 mod imp {
-    pub use crate::kvm::{execute, fpu_pop, fpu_st0, fx_switch, install_io_policy};
-    /// The guest TLB is real: mark it dirty so the next entry flushes it.
-    pub fn flush() {
-        crate::kvm::mark_tlb_dirty()
-    }
-    pub fn invalidate_pages(_vpage: usize, _count: usize) {
-        crate::kvm::mark_tlb_dirty()
-    }
-    /// The real CPU is store-vs-fetch coherent; there are no cached
-    /// translations to drop on a guest-code write.
-    pub fn invalidate_code_range(_addr: u32, _len: u32) {}
+    pub use crate::kvm::execute;
 }
 
 pub(crate) use imp::*;

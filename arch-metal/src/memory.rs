@@ -36,7 +36,14 @@ pub fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
     while pages.count < pages.pages.len() && state.returned_head != 0 {
         let page = state.returned_head;
         let mut next = [0; 8];
+        #[cfg(not(feature = "kvm"))]
         crate::frames::read(page, 0, &mut next);
+        #[cfg(feature = "kvm")]
+        {
+            let saved = paging2::temp_swap(page);
+            unsafe { core::ptr::copy_nonoverlapping((&raw const paging2::TEMP_PAGE).cast::<u8>(), next.as_mut_ptr(), 8); }
+            let _ = paging2::temp_swap(saved);
+        }
         state.returned_head = u64::from_ne_bytes(next);
         state.returned_count -= 1;
         pages.push(page);

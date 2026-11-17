@@ -1,5 +1,5 @@
 //! Hosted physical RAM backing: one shared mapping addressed by frame number.
-//! The kernel owns allocation, accounting, reference counts and reclamation.
+//! The kernel allocates RAM; arch maintains references to donated frames.
 
 const PAGE: usize = 4096;
 
@@ -134,24 +134,32 @@ pub fn init_test_ram() {
         if ready.replace(true) { return; }
         unsafe { crate::vcpu::init_guest_ram(test_memory::alloc_backed_pages(crate::paging::PAGING_PAGES), test_memory::ownership()); }
         refill_test_reserve();
-        let mut input = PageInput::new();
-        for _ in 0..64 {
-            input.pages[input.count] = test_memory::alloc_backed_pages(1);
-            input.count += 1;
+        #[cfg(feature = "tcg")]
+        {
+            let mut input = PageInput::new();
+            for _ in 0..64 { input.push(test_memory::alloc_backed_pages(1)); }
+            INPUT.with(|p| p.replace(input));
         }
-        INPUT.with(|p| p.replace(input));
     });
 }
 
 #[cfg(test)]
 use crate::test_memory;
 
-use arch_abi::page_supply::{PageSupply, PageInput, FAULT_PAGES};
+#[cfg(any(feature = "tcg", test))]
+use arch_abi::page_supply::PageInput;
+#[cfg(feature = "tcg")]
+use arch_abi::page_supply::PageSupply;
+#[cfg(feature = "tcg")]
+use arch_abi::page_supply::FAULT_PAGES;
+#[cfg(feature = "tcg")]
 thread_local! {
     static SUPPLY: core::cell::UnsafeCell<PageSupply> = const { core::cell::UnsafeCell::new(PageSupply::new()) };
     static INPUT: core::cell::RefCell<PageInput> = const { core::cell::RefCell::new(PageInput::new()) };
 }
+#[cfg(feature = "tcg")]
 fn supply() -> *mut PageSupply { SUPPLY.with(|s| s.get()) }
+#[cfg(feature = "tcg")]
 pub(crate) fn with_input<R>(pages: PageInput, operation: impl FnOnce() -> R) -> (R, PageInput) {
     struct Restore(PageInput);
     impl Drop for Restore {
@@ -161,9 +169,19 @@ pub(crate) fn with_input<R>(pages: PageInput, operation: impl FnOnce() -> R) -> 
     let result = operation();
     (result, INPUT.with(|p| p.take()))
 }
+#[cfg(feature = "tcg")]
 pub(crate) fn configure(ownership: arch_abi::page_supply::FrameOwnership) {
     unsafe { (*supply()).ownership = ownership; }
 }
+#[cfg(feature = "kvm")]
+thread_local! {
+    static OWNERSHIP: core::cell::Cell<arch_abi::page_supply::FrameOwnership> = const {
+        core::cell::Cell::new(arch_abi::page_supply::FrameOwnership::EMPTY)
+    };
+}
+#[cfg(feature = "kvm")]
+pub(crate) fn configure(ownership: arch_abi::page_supply::FrameOwnership) { OWNERSHIP.with(|slot| slot.set(ownership)); }
+#[cfg(feature = "tcg")]
 pub(crate) fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
     let state = unsafe { &mut *supply() };
     while state.count < state.pages.len() {
@@ -178,10 +196,13 @@ pub(crate) fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
     }
     (state.pages.len() - state.count, pages)
 }
+#[cfg(feature = "tcg")]
 pub(crate) fn can_fault() -> bool { unsafe { (*supply()).count >= FAULT_PAGES } }
+#[cfg(feature = "tcg")]
 pub(crate) fn take_input() -> Option<u64> {
     INPUT.with(|p| p.borrow_mut().take()).map(zero)
 }
+#[cfg(feature = "tcg")]
 pub(crate) fn take_fault() -> Option<u64> {
     unsafe {
         let state = &mut *supply();
@@ -190,16 +211,20 @@ pub(crate) fn take_fault() -> Option<u64> {
         Some(zero(page))
     }
 }
+#[cfg(feature = "tcg")]
 fn zero(page: u64) -> u64 {
     unsafe { core::ptr::write_bytes(frame_ptr(page), 0, PAGE); }
     page
 }
+#[cfg(feature = "tcg")]
 pub(crate) fn retain(page: u64) {
     assert!(unsafe { (*supply()).ownership.retain(page) });
 }
+#[cfg(feature = "tcg")]
 pub(crate) fn shared(page: u64) -> bool {
     unsafe { (*supply()).ownership.references(page) > 1 }
 }
+#[cfg(feature = "tcg")]
 pub(crate) fn release(page: u64) {
     unsafe {
         let state = &mut *supply();
@@ -222,3 +247,8 @@ pub(crate) fn refill_test_reserve() {
     for _ in 0..needed { pages.push(test_memory::alloc_backed_pages(1)); }
     assert_eq!(supply_pages(pages).1.count, 0);
 }
+
+#[cfg(feature = "kvm")]
+pub(crate) fn ownership() -> arch_abi::page_supply::FrameOwnership { OWNERSHIP.with(|slot| slot.get()) }
+#[cfg(all(feature = "kvm", test))]
+pub(crate) fn supply_pages(pages: PageInput) -> (usize, PageInput) { arch_abi::Memory::supply_pages(&crate::Interp, pages) }

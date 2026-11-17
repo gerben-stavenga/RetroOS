@@ -1,9 +1,8 @@
 //! Compact metadata for usable RAM only. No allocation inside page operations;
-//! the caller supplies the bitmap, directory, and individual shared-ref blocks.
+//! the caller supplies the allocation bitmap and resident reference arena.
 
 use arch_abi::page_supply::{FrameOwnership, FrameRegion as Region};
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-pub(super) const REF_BLOCK_PAGES: usize = arch_abi::page_supply::REF_BLOCK_PAGES;
 const MAX_REGIONS: usize = 256;
 const FREE: u8 = 0;
 const OWNED: u8 = 1;
@@ -16,7 +15,7 @@ pub(super) struct Pool {
     pub(super) pages: usize,
     states: *mut u8,
     active: usize,
-    blocks: *mut *mut u8,
+    counts: *mut u8,
     free: AtomicUsize,
     next: usize,
     pub(super) started: bool,
@@ -25,7 +24,7 @@ pub(super) struct Pool {
 impl Pool {
     pub(super) const fn new() -> Self {
         Self { regions: [EMPTY; MAX_REGIONS], count: 0, pages: 0,
-            states: core::ptr::null_mut(), active: 0, blocks: core::ptr::null_mut(),
+            states: core::ptr::null_mut(), active: 0, counts: core::ptr::null_mut(),
             free: AtomicUsize::new(0), next: 0, started: false }
     }
 
@@ -114,8 +113,8 @@ impl Pool {
 
     /// Buffers are zeroed and remain live for the life of the pool. Copy after
     /// both allocations: backing their pages has changed bootstrap ownership.
-    pub(super) unsafe fn expand(&mut self, states: *mut u8, blocks: *mut *mut u8) {
-        assert!(self.blocks.is_null(), "physical metadata already expanded");
+    pub(super) unsafe fn expand(&mut self, states: *mut u8, counts: *mut u8) {
+        assert!(self.counts.is_null(), "physical metadata already expanded");
         unsafe { core::ptr::copy_nonoverlapping(self.states, states, self.active.div_ceil(8)); }
         // Padding bits from the last bootstrap byte must describe free RAM.
         if !self.active.is_multiple_of(8) {
@@ -124,7 +123,7 @@ impl Pool {
         self.free.fetch_add(self.pages - self.active, Ordering::Relaxed);
         self.active = self.pages;
         self.states = states;
-        self.blocks = blocks;
+        self.counts = counts;
     }
 
     fn state(&self, index: usize) -> u8 {
@@ -222,38 +221,28 @@ impl Pool {
 
     pub(super) fn ownership(&self, zero_page: u64) -> FrameOwnership {
         FrameOwnership { regions: self.regions.as_ptr(), regions_len: self.count,
-            bitmap: self.states, blocks: self.blocks, active: self.active,
+            counts: self.counts, active: self.active,
             zero_page }
     }
     pub(super) fn refs(&self, page: u64) -> u8 {
+        if self.index(page).is_some_and(|index| self.state(index) == FREE) { return 0; }
         unsafe { self.ownership(u64::MAX).references(page) }
     }
 
-    /// Request one zeroed block outside the mutable pool borrow: its heap
-    /// backing can recursively call allocate() during a kernel page fault.
-    #[cfg(test)]
-    pub(super) fn missing_ref_block(&self, page: u64) -> Option<usize> {
-        let index = self.index(page)?;
-        if self.state(index) != OWNED || self.blocks.is_null() { return None; }
-        let block = index / REF_BLOCK_PAGES;
-        unsafe { (*self.blocks.add(block)).is_null().then_some(block) }
-    }
-
-    pub(super) unsafe fn install_ref_block(&mut self, block: usize, data: *mut u8) -> bool {
-        unsafe {
-            let slot = self.blocks.add(block);
-            if !(*slot).is_null() { return false; }
-            *slot = data;
-            true
-        }
+    pub(super) unsafe fn install_counts(&mut self, counts: *mut u8) {
+        assert!(self.counts.is_null());
+        self.counts = counts;
     }
 
     pub(super) fn retain(&mut self, page: u64) -> bool {
+        if !self.index(page).is_some_and(|index| self.state(index) == OWNED) { return false; }
         unsafe { self.ownership(u64::MAX).retain(page) }
     }
 
     /// Reference metadata stays resident: fault handlers must never allocate it.
     pub(super) fn release(&mut self, page: u64) -> Option<*mut u8> {
+        let index = self.index(page).expect("release outside managed RAM");
+        assert_eq!(self.state(index), OWNED, "double release of physical page");
         if unsafe { self.ownership(u64::MAX).release_shared(page) } {
             let index = self.index(page).expect("release outside managed RAM");
             self.set(index, FREE);
@@ -268,14 +257,13 @@ impl Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::{boxed::Box, vec, vec::Vec};
+    use alloc::{vec, vec::Vec};
 
     struct Fixture {
         pool: Pool,
         _bootstrap: Vec<u8>,
         _bitmap: Vec<u8>,
-        _directory: Vec<*mut u8>,
-        blocks: Vec<Box<[u8; REF_BLOCK_PAGES]>>,
+        _counts: Vec<u8>,
     }
     impl Fixture {
         fn new(ranges: &[(u64, u64)], holes: &[(u64, u64)]) -> Self {
@@ -285,16 +273,11 @@ mod tests {
             let mut bootstrap = vec![0; pool.pages.div_ceil(8).min(4096)];
             unsafe { pool.bootstrap(bootstrap.as_mut_ptr(), bootstrap.len()); }
             let mut bitmap = vec![0; pool.pages.div_ceil(8)];
-            let mut directory = vec![core::ptr::null_mut(); pool.pages.div_ceil(REF_BLOCK_PAGES)];
-            unsafe { pool.expand(bitmap.as_mut_ptr(), directory.as_mut_ptr()); }
-            Self { pool, _bootstrap: bootstrap, _bitmap: bitmap, _directory: directory, blocks: vec![] }
+            let mut counts = vec![0; pool.pages];
+            unsafe { pool.expand(bitmap.as_mut_ptr(), counts.as_mut_ptr()); }
+            Self { pool, _bootstrap: bootstrap, _bitmap: bitmap, _counts: counts }
         }
         fn retain(&mut self, page: u64) -> bool {
-            if let Some(index) = self.pool.missing_ref_block(page) {
-                let mut block = Box::new([0; REF_BLOCK_PAGES]);
-                assert!(unsafe { self.pool.install_ref_block(index, block.as_mut_ptr()) });
-                self.blocks.push(block);
-            }
             self.pool.retain(page)
         }
     }
@@ -334,13 +317,11 @@ mod tests {
         assert!(a > u32::MAX as u64);
         assert_eq!(f.pool.refs(a), 1);
         assert!(f.retain(a) && f.retain(b) && f.retain(a));
-        assert_eq!(f.blocks.len(), 1);
         assert_eq!(f.pool.refs(a), 3);
         assert_eq!(f.pool.release(a), None);
         assert_eq!(f.pool.release(a), None);
         assert_eq!(f.pool.refs(a), 1);
         assert_eq!(f.pool.release(b), None);
-        assert_eq!(f.pool.missing_ref_block(a), None);
         assert_eq!(f.pool.refs(a), 1);
         assert_eq!(f.pool.release(a), None);
         assert_eq!(f.pool.refs(a), 0);

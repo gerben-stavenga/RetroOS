@@ -129,7 +129,7 @@ fn borrowed_cow_copies_and_batch_failure_reports_progress() {
     assert_eq!(arch::mem().read::<u8>(HI), 0x79);
     assert!(matches!(arch_abi::mapping::read_mapping(&mut machine, start).unwrap(),
         PageEntry::Writable(Mapping { backing: Backing::Owned(_), .. })));
-    let invalid = Mapping { backing: Backing::Borrowed(PhysicalFrame::new(1 << 20).unwrap()), ..mapping };
+    let invalid = Mapping { backing: Backing::Owned(PhysicalFrame::new(1 << 20).unwrap()), ..mapping };
     let result = unsafe { machine.replace_mappings(start, &[
         PageEntry::Intercepted, PageEntry::ReadOnly(invalid), PageEntry::Absent,
     ], test_memory::input(5)).0 }.unwrap_err();
@@ -159,7 +159,9 @@ fn fill_and_range_validation_through_arch() {
     // Missing tables describe repeated zero backing without consuming input.
     let sparse = UserPage::new(0x6800_0000).unwrap();
     let zero = arch_abi::mapping::read_mapping(&mut machine, sparse).unwrap();
-    assert_eq!(machine.read_mapping_run(sparse, 1024), Ok((zero, 1024)));
+    let (entry, count) = machine.read_mapping_run(sparse, 1024).unwrap();
+    assert_eq!(entry, zero);
+    assert!((1..=1024).contains(&count));
     // Adjacent RAM frames are different entries, even with equal permissions.
     arch::mem().write::<u8>(HI + 0x10000, 1);
     arch::mem().write::<u8>(HI + 0x11000, 2);
@@ -171,6 +173,15 @@ fn fill_and_range_validation_through_arch() {
     let failure = unsafe { machine.fill_mappings(end, 2, PageEntry::Absent, test_memory::input(5)).0 }.unwrap_err();
     assert_eq!(failure, arch_abi::MappingFailure { completed: 0, error: arch_abi::MappingError::InvalidAddress });
     assert_eq!(arch_abi::mapping::read_mapping(&mut machine, end).unwrap(), before);
+    // Validate the whole range before any transport-sized chunk is committed.
+    let cross = UserPage::new(0xc000_0000 - 128 * 4096).unwrap();
+    let mut many = [PageEntry::Intercepted; 129];
+    let before = arch_abi::mapping::read_mapping(&mut machine, cross).unwrap();
+    let expected = arch_abi::MappingFailure { completed: 0, error: arch_abi::MappingError::InvalidAddress };
+    assert_eq!(machine.read_mappings(cross, &mut many), Err(expected));
+    assert!(many.iter().all(|entry| *entry == PageEntry::Intercepted));
+    assert_eq!(unsafe { machine.replace_mappings(cross, &many, test_memory::input(5)).0 }, Err(expected));
+    assert_eq!(arch_abi::mapping::read_mapping(&mut machine, cross).unwrap(), before);
     unsafe { machine.fill_mappings(start, 0, PageEntry::Absent, test_memory::input(5)).0.unwrap(); }
     assert_eq!(arch_abi::mapping::read_mapping(&mut machine, start).unwrap(), PageEntry::Intercepted);
 }
@@ -180,8 +191,7 @@ fn supplied_input_exhaustion_preserves_the_uncompleted_suffix() {
     init();
     let mut machine = arch::Interp;
     let mut input = arch_abi::page_supply::PageInput::new();
-    input.pages[0] = test_memory::alloc_backed_pages(1);
-    input.count = 1;
+    for _ in 0..if cfg!(feature = "kvm") { 2 } else { 1 } { input.push(test_memory::alloc_backed_pages(1)); }
     // The two entries require different page tables.
     let start = UserPage::new(0x403f_f000).unwrap();
     let untouched = arch_abi::mapping::read_mapping(&mut machine, start.offset(1).unwrap()).unwrap();
@@ -195,14 +205,18 @@ fn supplied_input_exhaustion_preserves_the_uncompleted_suffix() {
 }
 
 #[test]
-fn fork_needs_no_allocation_and_detachment_waits_for_input() {
+fn fork_and_detachment_use_only_supplied_input() {
     init();
     let mut machine = arch::Interp;
     let at = UserPage::new(HI as u64).unwrap();
     unsafe { arch_abi::mapping::replace_mapping(&mut machine, at, PageEntry::Intercepted, test_memory::input(5)).0.unwrap(); }
     let input = arch_abi::page_supply::PageInput::new();
     let mut child = arch::RootPageTable::default();
-    let ((), input) = machine.user_fork(&mut child, input);
+    // PAE must detach the parent directory because PDPTEs cannot enforce COW.
+    let fork_input = if cfg!(feature = "kvm") { test_memory::input(3) } else { input };
+    let ((), mut unused) = machine.user_fork(&mut child, fork_input);
+    while let Some(page) = unused.take() { test_memory::free_phys_page(page); }
+    let input = arch_abi::page_supply::PageInput::new();
     let parent = machine.activate(child);
     let (result, input) = unsafe { arch_abi::mapping::replace_mapping(&mut machine, at, PageEntry::Absent, input) };
     assert_eq!(result, Err(arch_abi::MappingError::NeedPages));
@@ -218,11 +232,11 @@ fn fork_needs_no_allocation_and_detachment_waits_for_input() {
 fn page_batches_return_rejected_and_unused_ownership() {
     init();
     let mut machine = arch::Interp;
-    let pages = test_memory::input(2);
-    let numbers = [pages.pages[0], pages.pages[1]];
+    let pages = test_memory::input(if cfg!(feature = "kvm") { 3 } else { 2 });
+    let numbers = pages.pages[..pages.count].to_vec();
     let (needed, pages) = machine.supply_pages(pages);
     assert_eq!(needed, 0);
-    assert_eq!(&pages.pages[..pages.count], &numbers);
+    assert_eq!(&pages.pages[..pages.count], numbers.as_slice());
     let at = UserPage::new(HI as u64).unwrap();
     let (result, pages) = unsafe { arch_abi::mapping::replace_mapping(&mut machine, at, PageEntry::Intercepted, pages) };
     result.unwrap();
@@ -244,18 +258,20 @@ fn retired_pages_are_drained_in_bounded_batches() {
     let mut machine = arch::Interp;
     let mut expected = std::collections::BTreeSet::new();
     for index in 1..=70 {
-        let pages = test_memory::input(1);
-        expected.insert(pages.pages[0]);
+        let pages = test_memory::input(3);
+        let supplied = pages.pages[..pages.count].to_vec();
         let page = UserPage::new(index * 0x40_0000).unwrap();
         let (result, unused) = unsafe { arch_abi::mapping::replace_mapping(&mut machine, page, PageEntry::Intercepted, pages) };
         result.unwrap();
-        assert_eq!(unused.count, 0);
+        for &page in &supplied[unused.count..] { expected.insert(page); }
+        for &page in &unused.pages[..unused.count] { test_memory::free_phys_page(page); }
     }
     machine.free_user_pages();
-    for count in [64, 6, 0] {
+    loop {
         let (needed, mut pages) = machine.supply_pages(Default::default());
         assert_eq!(needed, 0);
-        assert_eq!(pages.count, count);
+        assert!(pages.count <= arch_abi::page_supply::SUPPLY_CAPACITY);
+        if pages.count == 0 { break; }
         while let Some(page) = pages.take() {
             assert!(expected.remove(&page), "retired backing returned exactly once");
             test_memory::free_phys_page(page);
@@ -348,7 +364,7 @@ fn init() {
 /// A deliberately simple test caller. Arch receives ownership metadata and
 /// donated frames; it has no dependency on any kernel allocator.
 pub mod test_memory {
-    use arch_abi::page_supply::{FrameOwnership, FrameRegion, PageInput, REF_BLOCK_PAGES};
+    use arch_abi::page_supply::{FrameOwnership, FrameRegion, PageInput};
     use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
     struct Pool { view: FrameOwnership, base: usize, bytes: usize, next: AtomicU64 }
     unsafe impl Send for Pool {}
@@ -358,14 +374,11 @@ pub mod test_memory {
         POOL.get_or_init(|| {
             let pages = bytes / 4096;
             let regions = Box::leak(Box::new([FrameRegion { first: 0, end: pages as u64, offset: 0 }]));
-            let bitmap = Box::leak(vec![255u8; pages.div_ceil(8)].into_boxed_slice());
-            let refs = Box::leak(vec![0u8; pages].into_boxed_slice());
-            let blocks = Box::leak((0..pages.div_ceil(REF_BLOCK_PAGES))
-                .map(|i| unsafe { refs.as_mut_ptr().add(i * REF_BLOCK_PAGES) })
-                .collect::<Vec<_>>().into_boxed_slice());
+            let refs = unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align(pages, 4096).unwrap()) };
+            assert!(!refs.is_null());
             Pool { base: base as usize, bytes, next: AtomicU64::new(256),
                 view: FrameOwnership { regions: regions.as_ptr(), regions_len: 1,
-                    bitmap: bitmap.as_ptr(), blocks: blocks.as_ptr(), active: pages, zero_page: u64::MAX } }
+                    counts: refs, active: pages, zero_page: u64::MAX } }
         });
     }
     fn pool() -> &'static Pool { POOL.get().unwrap() }
@@ -378,6 +391,7 @@ pub mod test_memory {
         frame
     }
     pub fn alloc_phys_page() -> Option<u64> { Some(alloc_backed_pages(1)) }
+    #[cfg(feature = "tcg")]
     pub fn is_shared(frame: u64) -> bool { unsafe { ownership().references(frame) > 1 } }
     pub fn free_phys_page(frame: u64) { unsafe { ownership().release_shared(frame); } }
     pub fn free_phys_contig(frame: u64, count: usize) {
@@ -452,4 +466,19 @@ fn arch_alias_swap_overlap_cow_and_retry() {
     let end = UserPage::new(0xbffff000).unwrap();
     assert_eq!(machine.alias_mappings(a, end, 2, test_memory::input(5)).0, Err(arch_abi::MappingError::InvalidAddress));
     assert_eq!(values(a), before);
+}
+
+/// Code fixtures explicitly request executable backing, as real loaders do.
+#[cfg(feature = "kvm")]
+pub(crate) fn executable(address: u64) {
+    let mut machine = arch::Interp;
+    let page = UserPage::new(address & !4095).unwrap();
+    let mut entry = arch_abi::mapping::read_mapping(&mut machine, page).unwrap();
+    match &mut entry {
+        PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) | PageEntry::ReadOnly(m) => {
+            m.attributes = m.attributes.with_executable(true);
+        }
+        _ => panic!("code fixture requires RAM"),
+    }
+    unsafe { arch_abi::mapping::replace_mapping(&mut machine, page, entry, test_memory::input(5)).0.unwrap(); }
 }

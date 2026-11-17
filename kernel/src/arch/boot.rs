@@ -450,8 +450,8 @@ unsafe fn prepare_boot(
     ALLOCATOR.end.store(arch::heap_base(), core::sync::atomic::Ordering::Relaxed);
     ALLOCATOR.heap.enable_small_cache();
     phys_mm::complete_initialization();
-    arch::memory::configure(phys_mm::ownership());
     phys_mm::prepare_fault_metadata();
+    arch::memory::configure(phys_mm::ownership());
     crate::kernel::klog::init();
     let table = phys_mm::alloc_phys_page().expect("physical aperture table");
     if !arch::aperture::init(table) { phys_mm::free_phys_page(table); }

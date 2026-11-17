@@ -595,6 +595,7 @@ pub unsafe fn lldt(selector: u16) {
 
 /// Enable interrupts
 #[inline]
+#[cfg(not(feature = "kvm"))]
 pub(super) fn sti() {
     unsafe {
         asm!("sti", options(nomem, nostack));

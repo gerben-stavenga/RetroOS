@@ -1,28 +1,27 @@
-//! Resident frame ownership metadata and explicitly donated per-CPU pages.
+//! Resident frame reference counts and explicitly donated per-CPU pages.
 //! No allocator or reclaim operation crosses this boundary.
 use core::sync::atomic::{AtomicU8, Ordering};
 
 pub const FAULT_PAGES: usize = 5; // data + up to four x86 page-table levels
 pub const SUPPLY_CAPACITY: usize = 64;
-pub const REF_BLOCK_PAGES: usize = 64;
 
 #[derive(Clone, Copy)]
 pub struct FrameRegion { pub first: u64, pub end: u64, pub offset: usize }
 
-/// Non-owning access to resident, kernel-owned ownership metadata.
-/// Regions and metadata storage remain resident and alive while installed.
+/// Resident reference-count arena. Allocator bitmaps are separate.
+/// Setup supplies the arena and region index; both remain resident while installed.
+/// Callers must own the frame: zero here denotes one exclusive reference, not free RAM.
 #[derive(Clone, Copy)]
 pub struct FrameOwnership {
     pub regions: *const FrameRegion,
     pub regions_len: usize,
-    pub bitmap: *const u8,
-    pub blocks: *const *mut u8,
+    pub counts: *mut u8,
     pub active: usize,
     pub zero_page: u64,
 }
 impl FrameOwnership {
     pub const EMPTY: Self = Self { regions: core::ptr::null(), regions_len: 0,
-        bitmap: core::ptr::null(), blocks: core::ptr::null(), active: 0,
+        counts: core::ptr::null_mut(), active: 0,
         zero_page: u64::MAX };
     unsafe fn index(&self, page: u64) -> Option<usize> {
         if self.regions_len == 0 { return None; }
@@ -34,17 +33,14 @@ impl FrameOwnership {
         (index < self.active).then_some(index)
     }
     unsafe fn count(&self, index: usize) -> Option<&AtomicU8> {
-        if self.blocks.is_null() { return None; }
-        let block = unsafe { *self.blocks.add(index / REF_BLOCK_PAGES) };
-        if block.is_null() { return None; }
-        Some(unsafe { &*block.add(index % REF_BLOCK_PAGES).cast::<AtomicU8>() })
+        if self.counts.is_null() { return None; }
+        Some(unsafe { &*self.counts.add(index).cast::<AtomicU8>() })
     }
     /// # Safety
     /// This descriptor and all referenced storage must be resident and valid.
     pub unsafe fn references(&self, page: u64) -> u8 {
         if page == self.zero_page { return 255; }
         let Some(index) = (unsafe { self.index(page) }) else { return 255; };
-        if unsafe { ((&*self.bitmap.add(index / 8).cast::<AtomicU8>()).load(Ordering::Acquire) >> (index % 8)) & 1 } == 0 { return 0; }
         let n = unsafe { self.count(index) }.map_or(0, |c| c.load(Ordering::Acquire));
         if n == 0 { 1 } else { n }
     }
@@ -53,7 +49,6 @@ impl FrameOwnership {
     pub unsafe fn retain(&self, page: u64) -> bool {
         if page == self.zero_page { return true; }
         let Some(index) = (unsafe { self.index(page) }) else { return false; };
-        if unsafe { ((&*self.bitmap.add(index / 8).cast::<AtomicU8>()).load(Ordering::Acquire) >> (index % 8)) & 1 } == 0 { return false; }
         let Some(count) = (unsafe { self.count(index) }) else { return false; };
         count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
             assert!(old < 254, "physical page refcount overflow");
@@ -68,8 +63,6 @@ impl FrameOwnership {
     pub unsafe fn release_shared(&self, page: u64) -> bool {
         if page == self.zero_page { return false; }
         let Some(index) = (unsafe { self.index(page) }) else { return false; };
-        assert_ne!(unsafe { ((&*self.bitmap.add(index / 8).cast::<AtomicU8>()).load(Ordering::Acquire) >> (index % 8)) & 1 }, 0,
-            "double release of physical page");
         let Some(count) = (unsafe { self.count(index) }) else { return true; };
         let result = count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
             if old < 2 { None } else { Some(if old == 2 { 0 } else { old - 1 }) }
@@ -138,15 +131,13 @@ mod tests {
     use super::*;
     #[test]
     fn concurrent_sharing_preserves_the_exclusive_owner() {
-        let counts: [AtomicU8; REF_BLOCK_PAGES] = core::array::from_fn(|_| AtomicU8::new(0));
+        let counts: [AtomicU8; 64] = core::array::from_fn(|_| AtomicU8::new(0));
         let region = [FrameRegion { first: 256, end: 320, offset: 0 }];
-        let bitmap = [255u8; 8];
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 scope.spawn(|| {
-                    let blocks = [counts.as_ptr().cast_mut().cast::<u8>()];
                     let refs = FrameOwnership { regions: region.as_ptr(), regions_len: 1,
-                        bitmap: bitmap.as_ptr(), blocks: blocks.as_ptr(), active: 64,
+                        counts: counts.as_ptr().cast_mut().cast::<u8>(), active: 64,
                         zero_page: 0 };
                     for _ in 0..1000 {
                         assert!(unsafe { refs.retain(256) });

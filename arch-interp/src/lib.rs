@@ -1,5 +1,5 @@
 //! Independent hosted x86 backend implementing arch-abi.
-//! TCG and KVM share the same supplied-storage paging implementation.
+//! TCG implements the contract in the host; KVM runs arch-metal in the VM.
 
 // Re-export the backend-agnostic contract so `crate::arch::{Regs, KernelEvent,
 // Irq, RawPage, PAGE_SIZE, LOW_MEM_BASE, USER_CS, ...}` resolve here exactly as
@@ -19,9 +19,11 @@ compile_error!("select an execution engine: feature `tcg` (default) or `kvm`");
 compile_error!("the `kvm` engine requires Linux (/dev/kvm)");
 
 mod backend;
+#[cfg(feature = "tcg")]
 mod calls;
 #[cfg(feature = "tcg")]
 mod cpu;
+#[cfg(feature = "tcg")]
 mod desc;
 mod devices;
 mod engine;
@@ -30,16 +32,21 @@ mod net;
 mod kvm;
 mod machine;
 
+#[cfg(feature = "tcg")]
 mod paging;
+#[cfg(feature = "kvm")]
+use kvm::paging;
 mod phys;
 mod screendump;
 mod space;
+#[cfg(feature = "tcg")]
 mod sysdesc;
 mod tty;
 mod vcpu;
 mod vga;
 
 pub use backend::Interp;
+#[cfg(feature = "tcg")]
 pub use calls::*;
 pub mod suite_control;
 

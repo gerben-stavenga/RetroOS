@@ -19,12 +19,18 @@ pub(crate) struct Request {
     pub result: i32,
 }
 
-pub(crate) fn invoke(mut request: Request) -> i32 {
-    unsafe { core::arch::asm!("int 0x80",
-        in("eax") crate::arch_call::HIGH_MEMORY as u32,
-        in("edx") &mut request as *mut Request as usize,
-    ); }
-    request.result
+pub(crate) fn invoke(request: Request) -> i32 {
+    #[cfg(feature = "kvm")]
+    { self::request(&request) }
+    #[cfg(not(feature = "kvm"))]
+    {
+        let mut request = request;
+        unsafe { core::arch::asm!("int 0x80",
+            in("eax") crate::arch_call::HIGH_MEMORY as u32,
+            in("edx") &mut request as *mut Request as usize,
+        ); }
+        request.result
+    }
 }
 
 fn supported() -> bool { paging2::cpu_mode() == paging2::CpuMode::Compat }

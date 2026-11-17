@@ -11,16 +11,29 @@ use arch_abi::{MappingError, MappingFailure, UserPage};
 use arch_abi::page_entry::PageEntry;
 use super::paging2::RootPageTable;
 use super::x86::FxState;
-use arch_abi::{X86, Memory, Arch, Diagnostics, ExecutionProfile, ExecutionProfileStage, KernelEvent, Regs};
+use arch_abi::{X86, Memory, Diagnostics, ExecutionProfile, ExecutionProfileStage};
+
+#[cfg(not(feature = "kvm"))]
+use arch_abi::{Arch, KernelEvent, Regs};
 
 /// Zero-sized handle to the current CPU. Trap state lives in CPU-local TLS;
 /// machine-wide resources remain shared.
 pub struct Metal;
 
 impl X86 for Metal {
-    fn isa_unmask_irq(&mut self, line: u8) { super::calls::arch_isa_unmask_irq(line) }
+    fn isa_unmask_irq(&mut self, line: u8) {
+        #[cfg(not(feature = "kvm"))]
+        super::calls::arch_isa_unmask_irq(line);
+        #[cfg(feature = "kvm")]
+        panic!("no physical ISA controller in KVM (line {line})");
+    }
 
-    fn isa_enable_irq(&mut self, line: u8) { super::irq::isa_enable_irq(line) }
+    fn isa_enable_irq(&mut self, line: u8) {
+        #[cfg(not(feature = "kvm"))]
+        super::irq::isa_enable_irq(line);
+        #[cfg(feature = "kvm")]
+        panic!("no physical ISA controller in KVM (line {line})");
+    }
 
     type Fx = FxState;
 
@@ -145,6 +158,7 @@ impl Memory for Metal {
     }
 }
 
+#[cfg(not(feature = "kvm"))]
 impl Arch for Metal {
     fn interrupt_processor(&mut self, processor: u32) {
         unsafe { core::arch::asm!("int 0x80", in("eax") crate::arch_call::INTERRUPT_PROCESSOR as u32, in("edx") processor); }

@@ -5,6 +5,7 @@
 
 #![allow(static_mut_refs)]
 
+#[cfg(not(feature = "kvm"))]
 use crate::irq::handle_irq;
 use crate::paging2;
 use crate::x86;
@@ -21,6 +22,7 @@ use arch_abi::entry::{KernelCall, CallOutcome};
 
 /// Parked app frame between kernel calls. During a syscall it holds the
 /// kernel continuation while the app frame is on the physical trap stack.
+#[cfg(not(feature = "kvm"))]
 #[thread_local]
 static mut REGS: Regs = Regs::empty();
 
@@ -28,9 +30,11 @@ static mut REGS: Regs = Regs::empty();
 // register object.  The ring-1 entry and ring-3 exit can then exchange their
 // physical trap frames with that object instead of bouncing the same 216-byte
 // register file through REGS before and after every run.
+#[cfg(not(feature = "kvm"))]
 #[thread_local]
 static mut EXECUTE_REGS: *mut Regs = core::ptr::null_mut();
 
+#[cfg(not(feature = "kvm"))]
 pub(crate) fn set_execute_regs(regs: *mut Regs) {
     unsafe {
         // Once execute returns, retain the current app frame for ordinary
@@ -166,7 +170,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
 // They are a distinct phase of trap handling: do not let fat LTO reserve that
 // scratch in the common ISR frame used by every hardware interrupt.
 #[inline(never)]
-fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
+pub(crate) fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
     match regs.rax {
         arch_call::REARRANGE_MAPPINGS => crate::mapping::rearrange_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Rearrange) }),
         arch_call::READ_MAPPINGS => crate::mapping::read_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Read) }),
@@ -174,11 +178,13 @@ fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
         arch_call::FILL_MAPPINGS => crate::mapping::fill_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Fill) }),
         arch_call::READ_MAPPING_RUN => crate::mapping::read_mapping_run(unsafe { &mut *(regs.rdx as *mut crate::mapping::ReadRun) }),
         arch_call::REFRESH_KERNEL => { paging2::refresh_kernel_mappings(); x86::flush_tlb(); }
+        #[cfg(not(feature = "kvm"))]
         arch_call::INTERRUPT_PROCESSOR => { crate::irq::interrupt_processor(regs.rdx as u32); }
         arch_call::HIGH_MEMORY => {
             let request = unsafe { &mut *(regs.rdx as u32 as *mut crate::high_paging::Request) };
             request.result = crate::high_paging::request(request);
         }
+        #[cfg(not(feature = "kvm"))]
         arch_call::EXECUTE => {
             let max_ns = (regs.rdx as u32 as u64) | ((regs.rcx as u32 as u64) << 32);
             if max_ns == 0 {
@@ -247,6 +253,7 @@ fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
         }
         // HALT: the ring-1 kernel cannot `hlt` (CPL-0-only, #GPs); panic and
         // shutdown funnel here to die quietly at ring 0.
+        #[cfg(not(feature = "kvm"))]
         arch_call::IDLE => {
             let max_ns = (regs.rdx as u32 as u64) | ((regs.rcx as u32 as u64) << 32);
             super::irq::idle(max_ns);
@@ -255,6 +262,7 @@ fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
             x86::cli();
             loop { x86::hlt(); }
         }
+        #[cfg(not(feature = "kvm"))]
         arch_call::ISA_UNMASK_IRQ => {
             crate::irq::isa_unmask_irq(regs.rdx as u8);
         }
@@ -303,6 +311,7 @@ fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
     CallOutcome::Complete
 }
 
+#[cfg(not(feature = "kvm"))]
 pub(crate) fn dispatch_parked_call() -> CallOutcome {
     let execute = unsafe { EXECUTE_REGS };
     let parked = if execute.is_null() { &raw mut REGS } else { execute };
@@ -312,6 +321,7 @@ pub(crate) fn dispatch_parked_call() -> CallOutcome {
     outcome
 }
 
+#[cfg(not(feature = "kvm"))]
 pub(crate) fn swap_regs(regs: &mut Regs) {
     let execute = unsafe { EXECUTE_REGS };
     if execute.is_null() {
@@ -333,7 +343,12 @@ pub(crate) fn guest_trap(regs: &mut Regs) -> arch_abi::trap::Outcome {
     if regs.int_num == 1 && debug_watch_trap(regs, unsafe { x86::read_dr6() }, false) {
         return Outcome::Resume;
     }
-    if matches!(regs.int_num, 32..=47 | 0xF8..=0xFE) {
+    #[cfg(not(feature = "kvm"))]
+    let interruption = matches!(regs.int_num, 32..=47 | 0xF8..=0xFE);
+    #[cfg(feature = "kvm")]
+    let interruption = regs.int_num == arch_abi::vm::INTERRUPT_VECTOR as u64;
+    if interruption {
+        #[cfg(not(feature = "kvm"))]
         handle_irq(regs);
         return Outcome::ReturnToKernel(arch_abi::KernelEvent::Irq);
     }
@@ -387,6 +402,7 @@ pub(crate) fn isr_handler_ring1(regs: &mut Regs) {
                 panic_with_regs("Unhandled page fault in kernel", regs);
             }
         }
+        #[cfg(not(feature = "kvm"))]
         32..=47 | 0xF8..=0xFE => handle_irq(regs),
         0x80 => unreachable!("kernel calls enter through entry::kernel_call"),
         _ => panic_with_regs("Unexpected interrupt in kernel", regs),
@@ -559,6 +575,7 @@ pub(crate) fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
                 lib::compact_panic!("Unhandled page fault in arch: addr={:#x} err={:#x}", x86::read_cr2(), error);
             }
         }
+        #[cfg(not(feature = "kvm"))]
         32..=47 | 0xF8..=0xFE => {
             let mut regs = Regs::empty();
             regs.int_num = int_num;

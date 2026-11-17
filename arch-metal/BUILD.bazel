@@ -13,14 +13,6 @@ nasm_library(
     copts = ["-f", "elf32"],
 )
 
-# Identical trap entry/return assembly with a VM-exit handler, loaded by KVM.
-genrule(
-    name = "kvm_entry",
-    srcs = ["src/entry.asm"],
-    outs = ["kvm-entry.bin"],
-    cmd = "nasm -DKVM_ENTRY -f bin -o $@ $<",
-)
-
 rust_library(
     name = "arch-metal",
     srcs = glob(["src/**/*.rs"]),
@@ -82,4 +74,40 @@ rust_test(
 host_platform_test(
     name = "acpi_test",
     test = ":acpi_test_host",
+)
+
+# The same supervisor compiled freestanding for KVM, with a VM kernel handoff.
+nasm_library(
+    name = "vm_entry",
+    srcs = ["src/entry.asm"],
+    copts = ["-f", "elf32", "-DKVM_SUPERVISOR"],
+)
+rust_library(
+    name = "arch-vm",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "arch_metal",
+    crate_features = ["kvm"],
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Crelocation-model=static", "-Cforce-frame-pointers=yes", "-Ztls-model=local-exec"],
+    deps = ["//arch-abi", "//lib", "//lib:compact_fmt"],
+)
+rust_binary(
+    name = "vm_supervisor",
+    srcs = ["vm_main.rs"],
+    edition = "2024",
+    compile_data = [":vm_ld", ":vm_entry"],
+    rustc_flags = [
+        "-Cpanic=abort", "-Crelocation-model=static",
+        "-Clink-self-contained=+linker", "-Clinker-flavor=ld.lld", "-Clinker=rust-lld",
+        "-Clink-arg=-T$(location :vm_ld)", "-Clink-arg=$(location :vm_entry)",
+        "-Clink-arg=-nostdlib", "-Clink-arg=-no-pie",
+    ],
+    deps = [":arch-vm", "//arch-abi", "//lib"],
+)
+
+genrule(
+    name = "vm_ld",
+    srcs = ["//kernel:kernel_ld"],
+    outs = ["vm-link.ld"],
+    cmd = "sed 's/KERNEL_PHYS = 0x00100000;/KERNEL_PHYS = 0x00001000;/' $< > $@ && echo 'ASSERT(_end - KERNEL_BASE + KERNEL_PHYS <= 1M, \"arch supervisor exceeds reserved low memory\")' >> $@",
 )

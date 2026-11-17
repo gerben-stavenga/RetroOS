@@ -1067,3 +1067,5 @@ pub mod page_supply;
 pub mod entry;
 
 pub mod trap;
+
+pub mod vm;

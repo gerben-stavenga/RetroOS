@@ -276,8 +276,8 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
     install_physical_memory();
     back_heap(arch::heap_base(), arch::heap_base() + 2 * 1024 * 1024);
     phys_mm::complete_initialization();
-    arch::memory::configure(phys_mm::ownership());
     phys_mm::prepare_fault_metadata();
+    arch::memory::configure(phys_mm::ownership());
     let missing = if missing_test {
         Some(allocate_core(4, &MISSING_READY))
     } else {

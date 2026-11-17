@@ -1,101 +1,83 @@
-//! KVM VM/vcpu bring-up and the real-time preemption kick.
-//!
-//! One VM, one vcpu, one memory slot: guest-physical `[0, PHYS_SIZE)` is the
-//! same memfd mapping the TCG engine hands Unicorn (`phys::region_base()`), so
-//! frame aliasing, COW sharing and hole-punched frees are transparently
-//! visible to the guest. No in-kernel irqchip and no in-kernel PIT — the
-//! RetroOS kernel emulates the PIC/PIT itself; hardware interrupts surface to
-//! it as `KernelEvent::Irq` returns and are never injected into the guest.
-
-use kvm_bindings::{kvm_sregs, kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
+//! Host setup for the real arch supervisor. Runtime requests never install
+//! guest page tables, descriptor tables, or application registers with ioctls.
+use kvm_bindings::{kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES};
 use kvm_ioctls::{Kvm, VcpuFd, VmFd};
 use std::cell::RefCell;
+use arch_abi::vm::{self, Exchange};
 
 pub(super) struct KvmCpu {
-    /// Keeps the VM fd alive (memory slots die with it).
     pub _vm: VmFd,
     pub vcpu: VcpuFd,
-    /// The last KVM_SET_GUEST_DEBUG `control` word written, so an unchanged
-    /// state costs no ioctl (see `run::apply_guest_debug`). 0 = never written.
-    pub dbg_control: u32,
-    /// The vcpu's reset sregs — the template each entry builds on, so fields
-    /// this engine doesn't manage (apic_base, interrupt_bitmap) keep the
-    /// values KVM expects.
-    pub sregs0: kvm_sregs,
+    pub image: *mut u8,
+    pub message: *mut Exchange,
 }
-
-thread_local! {
-    /// The engine's vcpu — thread-local like all interp state; created lazily
-    /// on first `execute()`, i.e. on the CPU thread.
-    static KVM: RefCell<Option<KvmCpu>> = const { RefCell::new(None) };
-}
-
+thread_local! { static KVM: RefCell<Option<KvmCpu>> = const { RefCell::new(None) }; }
+// All VM CPUs share donated RAM and reference counts. Serialize supervisor
+// transitions, including fault handling, just as the metal paging lock does.
+static SUPERVISOR: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub(super) fn with<R>(f: impl FnOnce(&mut KvmCpu) -> R) -> R {
+    let _lock = SUPERVISOR.lock().unwrap();
     KVM.with(|cell| {
         let mut slot = cell.borrow_mut();
         f(slot.get_or_insert_with(init))
     })
 }
-
 fn init() -> KvmCpu {
-    let kvm = Kvm::new().expect("open /dev/kvm (is the kvm module loaded and the device accessible?)");
-    let vm = kvm.create_vm().expect("KVM_CREATE_VM");
-
-    // Legacy VMX real/vm86 emulation scratch (pre-unrestricted-guest CPUs);
-    // required to exist, must not overlap guest RAM. Park it high.
-    vm.set_tss_address(0xE000_0000).expect("KVM_SET_TSS_ADDR");
-
-    // The single memory slot over the phys memfd view.
-    let region = kvm_userspace_memory_region {
-        slot: 0,
-        flags: 0,
-        guest_phys_addr: 0,
-        memory_size: crate::phys::PHYS_SIZE as u64,
-        userspace_addr: crate::phys::region_base() as u64,
-    };
-    unsafe { vm.set_user_memory_region(region) }.expect("KVM_SET_USER_MEMORY_REGION");
-
-    let mut vcpu = vm.create_vcpu(0).expect("KVM_CREATE_VCPU");
-
-    // Host-supported CPUID, minus the paravirt tells: the guest is meant to see
-    // a plain (fast) PC, exactly like metal. Zero the hypervisor leaves and the
-    // hypervisor-present bit.
+    let kvm = Kvm::new().expect("open /dev/kvm");
+    let vmfd = kvm.create_vm().expect("KVM_CREATE_VM");
+    vmfd.set_tss_address(0xe0000000).expect("KVM_SET_TSS_ADDR");
+    let image = unsafe { libc::mmap(core::ptr::null_mut(), vm::IMAGE_LIMIT,
+        libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+    assert_ne!(image, libc::MAP_FAILED);
+    let entry = super::entry::load(image.cast());
+    let ownership = crate::phys::ownership();
+    assert!(!ownership.counts.is_null() && ownership.counts as usize % 4096 == 0);
+    for (slot, physical, bytes, host) in [
+        (0, 0, vm::IMAGE_LIMIT, image as u64),
+        (1, vm::IMAGE_LIMIT as u64, crate::phys::PHYS_SIZE - vm::IMAGE_LIMIT,
+            unsafe { crate::phys::region_base().add(vm::IMAGE_LIMIT) } as u64),
+        (2, vm::COUNTS_PHYSICAL, ownership.active.next_multiple_of(4096), ownership.counts as u64),
+    ] {
+        unsafe { vmfd.set_user_memory_region(kvm_userspace_memory_region {
+            slot, flags: 0, guest_phys_addr: physical, memory_size: bytes as u64, userspace_addr: host,
+        }) }.expect("KVM_SET_USER_MEMORY_REGION");
+    }
+    let mut vcpu = vmfd.create_vcpu(0).expect("KVM_CREATE_VCPU");
     let mut cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES).expect("KVM_GET_SUPPORTED_CPUID");
-    for e in cpuid.as_mut_slice().iter_mut() {
-        if e.function == 1 {
-            e.ecx &= !(1 << 31); // CPUID.1:ECX.HYPERVISOR
-        }
-        if (0x4000_0000..=0x4000_00FF).contains(&e.function) {
-            e.eax = 0;
-            e.ebx = 0;
-            e.ecx = 0;
-            e.edx = 0;
-        }
+    for e in cpuid.as_mut_slice() {
+        if e.function == 1 { e.ecx &= !(1 << 31); }
+        if (0x40000000..=0x400000ff).contains(&e.function) { e.eax = 0; e.ebx = 0; e.ecx = 0; e.edx = 0; }
     }
     vcpu.set_cpuid2(&cpuid).expect("KVM_SET_CPUID2");
-
-    // Guest-side tables: the shared SYS window plus the KVM trap shim (a
-    // Once — the kernel's io_policy may already have initialized it through
-    // the first per-entry I/O policy installation).
-    super::entry::ensure_shim();
-
+    super::entry::boot(&vcpu, entry);
     install_alarm(&mut vcpu);
-
-    let sregs0 = vcpu.get_sregs().expect("KVM_GET_SREGS");
-    KvmCpu { _vm: vm, vcpu, dbg_control: 0, sregs0 }
+    let mut cpu = KvmCpu { _vm: vmfd, vcpu, image: image.cast(), message: core::ptr::null_mut() };
+    super::run::until_return(&mut cpu, false);
+    let message = unsafe { &mut *cpu.message };
+    message.operation = vm::op::CONFIGURE;
+    message.args = [ownership.regions_len as u64, ownership.active as u64, 0, 0, 0, 0];
+    for (i, region) in unsafe { core::slice::from_raw_parts(ownership.regions, ownership.regions_len) }.iter().enumerate() {
+        let bytes = &mut message.data[i * 24..i * 24 + 24];
+        bytes[..8].copy_from_slice(&region.first.to_le_bytes());
+        bytes[8..16].copy_from_slice(&region.end.to_le_bytes());
+        bytes[16..24].copy_from_slice(&(region.offset as u64).to_le_bytes());
+    }
+    super::run::until_return(&mut cpu, false);
+    cpu
 }
-
-use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicI32, Ordering};
 // One hosted execution CPU. The signal handler only writes KVM's documented
 // immediate_exit byte; no allocation, locks, or guest-state borrowing.
 static CPU_TID: AtomicI32 = AtomicI32::new(0);
-static IMMEDIATE_EXIT: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
 thread_local! {
+    static IMMEDIATE_EXIT: std::cell::Cell<*mut u8> = const { std::cell::Cell::new(core::ptr::null_mut()) };
     static TIMER: std::cell::Cell<Option<libc::timer_t>> = const { std::cell::Cell::new(None) };
 }
 extern "C" fn alarm_signal(_: libc::c_int) {
-    let pointer = IMMEDIATE_EXIT.load(Ordering::Acquire);
-    if !pointer.is_null() { unsafe { pointer.write_volatile(1); } }
+    let _ = IMMEDIATE_EXIT.try_with(|slot| {
+        let pointer = slot.get();
+        if !pointer.is_null() { unsafe { pointer.write_volatile(1); } }
+    });
 }
 fn install_alarm(vcpu: &mut VcpuFd) {
     unsafe {
@@ -103,8 +85,7 @@ fn install_alarm(vcpu: &mut VcpuFd) {
         sa.sa_sigaction = alarm_signal as *const () as usize;
         libc::sigemptyset(&mut sa.sa_mask);
         assert_eq!(libc::sigaction(libc::SIGURG, &sa, core::ptr::null_mut()), 0);
-        CPU_TID.store(libc::gettid(), Ordering::Release);
-        IMMEDIATE_EXIT.store(&raw mut vcpu.get_kvm_run().immediate_exit, Ordering::Release);
+        IMMEDIATE_EXIT.with(|slot| slot.set(&raw mut vcpu.get_kvm_run().immediate_exit));
         let mut sev: libc::sigevent = core::mem::zeroed();
         sev.sigev_notify = libc::SIGEV_THREAD_ID;
         sev.sigev_signo = libc::SIGURG;
@@ -115,6 +96,7 @@ fn install_alarm(vcpu: &mut VcpuFd) {
     }
 }
 pub(crate) fn arm_alarm(deadline: Option<u64>) {
+    CPU_TID.store(if deadline.is_some() { unsafe { libc::gettid() } } else { 0 }, Ordering::Release);
     TIMER.with(|slot| {
         if let Some(timer) = slot.get() {
             // Convert between clock epochs once, then ask POSIX for a one-shot
@@ -140,10 +122,11 @@ impl Drop for KvmCpu {
     fn drop(&mut self) {
         // Revoke the signal target before VcpuFd unmaps kvm_run. A final alarm
         // during TLS teardown must never write through a dangling pointer.
-        IMMEDIATE_EXIT.store(core::ptr::null_mut(), Ordering::Release);
-        CPU_TID.store(0, Ordering::Release);
+        let _ = IMMEDIATE_EXIT.try_with(|slot| slot.set(core::ptr::null_mut()));
+        let _ = CPU_TID.compare_exchange(unsafe { libc::gettid() }, 0, Ordering::AcqRel, Ordering::Acquire);
         let _ = TIMER.try_with(|slot| {
             if let Some(timer) = slot.take() { unsafe { libc::timer_delete(timer); } }
         });
+        unsafe { libc::munmap(self.image.cast(), vm::IMAGE_LIMIT); }
     }
 }
