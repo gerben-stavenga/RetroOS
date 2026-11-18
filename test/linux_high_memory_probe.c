@@ -74,6 +74,18 @@ __attribute__((force_align_arg_pointer)) void _start(void) {
     check(call(__NR_read, descriptors[0], at + 8191, 2, 0, 0, 0) == 2, 21);
     check(p[8191] == 42 && p[8192] == 43, 22);
     check(call(__NR_write, descriptors[1], base, 1, 0, 0, 0) == -14, 23);
+    // Kernel copies into untouched low RAM must resolve COW explicitly, and
+    // writes to read-only low pointers must return EFAULT like high pointers.
+    long copy_low = map(0, 8192, 3, 0x62);
+    check(copy_low > 0 && copy_low < 0xc0000000L, 56);
+    check(call(__NR_write, descriptors[1], at + 4095, 2, 0, 0, 0) == 2, 57);
+    check(call(__NR_read, descriptors[0], copy_low + 4095, 2, 0, 0, 0) == 2, 58);
+    check(*(volatile unsigned char *)(copy_low + 4095) == 42
+        && *(volatile unsigned char *)(copy_low + 4096) == 43, 59);
+    check(protect(copy_low, 4096, 1) == 0, 60);
+    check(call(__NR_write, descriptors[1], copy_low + 4095, 1, 0, 0, 0) == 1, 61);
+    check(call(__NR_read, descriptors[0], copy_low, 1, 0, 0, 0) == -14, 62);
+    check(unmap(copy_low, 8192) == 0, 63);
     long child = call(__NR_fork, 0, 0, 0, 0, 0, 0);
     check(child >= 0, 24);
     if (child == 0) {

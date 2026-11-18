@@ -244,7 +244,8 @@ unsafe extern "C" fn planar_fault(pointer: *mut u8, wide: u32, address: u32) -> 
     let mut frame = Frame { pointer, wide: wide != 0 };
     let handled = if !(context.base..context.end).contains(&address) { 0 }
         else { u32::from(context.emulate(&mut frame, address)) };
-    if handled != 0 && frame.read(frame.flags_offset()) & 0x100 != 0 {
+    if handled != 0 && (frame.read(frame.flags_offset()) & 0x100 != 0
+        || !crate::arch::memory::can_fault()) {
         context.stepped = true;
         0
     } else { handled }
@@ -394,13 +395,35 @@ impl super::machine::mmio::FaultBus for Context {
     fn offset(&self, address: u32) -> Option<u32> {
         (self.base..self.end).contains(&address).then(|| address - self.base)
     }
-    fn guest_read(&self, address: u32) -> u8 { unsafe { core::ptr::with_exposed_provenance::<u8>(address as usize).read_volatile() } }
-    fn guest_write(&mut self, address: u32, value: u8) { unsafe { core::ptr::with_exposed_provenance_mut::<u8>(address as usize).write_volatile(value); } }
+    fn guest_read(&self, address: u32) -> u8 {
+        arch_abi::GuestBytes::read(&crate::arch::Metal, u64::from(address))
+    }
+    fn guest_read_bytes(&self, address: u32, bytes: &mut [u8]) {
+        arch_abi::GuestBytes::copy_from(&crate::arch::Metal, u64::from(address), bytes,
+            arch_abi::page_supply::PageInput::new()).0.expect("inaccessible VGA instruction");
+    }
+    fn guest_write(&mut self, address: u32, value: u8) {
+        arch_abi::GuestBytes::write(&mut crate::arch::Metal, u64::from(address), value);
+    }
     fn copy_from_ram(&mut self, source: u32, destination: u32, len: u32) -> bool {
         let Some(source_end) = source.checked_add(len) else { return false };
         let Some(destination_end) = destination.checked_add(len) else { return false };
         if destination < self.base || destination_end > self.end
             || source < self.end && source_end > self.base { return false; }
+        // Direct reads are safe only after proving the whole source resident.
+        // Owned readable entries cannot be implicit demand-zero reservations.
+        // Keep reads interleaved with writes: a guest alias may name VRAM.
+        use arch_abi::page_entry::{Backing, Mapping, PageEntry};
+        let mut entries = [PageEntry::Absent; 3];
+        let first = source & !4095;
+        let count = (source_end as u64 - u64::from(first)).div_ceil(4096) as usize;
+        if count > entries.len() { return false; }
+        if arch_abi::Memory::read_mappings(&mut crate::arch::Metal,
+            arch_abi::UserPage::new(u64::from(first)).unwrap(), &mut entries[..count]).is_err()
+            || !entries[..count].iter().all(|entry| matches!(entry,
+                PageEntry::ReadOnly(Mapping { backing: Backing::Owned(_), .. })
+                | PageEntry::Writable(Mapping { backing: Backing::Owned(_), .. })
+                | PageEntry::CopyOnWrite(Mapping { backing: Backing::Owned(_), .. }))) { return false; }
         let planes = unsafe { ::vga::memory::Memory::mapped(self.planes, super::machine::vga::PLANES_LEN) };
         (unsafe { &mut *self.state }).write_sequential_span(planes, (destination - self.base) as usize, len as usize,
             |i| unsafe { core::ptr::with_exposed_provenance::<u8>(source as usize + i).read_volatile() })

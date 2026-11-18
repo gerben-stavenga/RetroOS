@@ -49,28 +49,21 @@ pub fn range(address: u64, length: u64) -> bool {
 }
 pub fn copy_to<A: crate::Arch>(machine: &mut A, address: u64, bytes: &[u8]) -> bool {
     if !range(address, bytes.len() as u64) { return false; }
-    if address < START { machine.copy_to(address, bytes); true }
-    else {
-        // Keep the Arch interface mutable-buffer-only without exposing a guest reference.
-        let mut buffer = bytes.to_vec();
-        machine.high_copy(address, &mut buffer, true)
+    let mut buffer = [0; 4096];
+    for (index, part) in bytes.chunks(buffer.len()).enumerate() {
+        buffer[..part.len()].copy_from_slice(part);
+        if !machine.high_copy(address + (index * buffer.len()) as u64, &mut buffer[..part.len()], true) { return false; }
     }
+    true
 }
 pub fn copy_from<A: crate::Arch>(machine: &mut A, address: u64, bytes: &mut [u8]) -> bool {
     if !range(address, bytes.len() as u64) { return false; }
-    if address < START { machine.copy_from(address, bytes); true }
-    else { machine.high_copy(address, bytes, false) }
+    machine.high_copy(address, bytes, false)
 }
 
 /// Read a guest string without truncating high thread-stack pointers. Stop at
 /// page boundaries so a terminating NUL never requires the following page.
 pub(super) fn copy_cstr<A: crate::Arch>(machine: &mut A, address: u64, bytes: &mut [u8]) -> Result<usize, i32> {
-    if address < START {
-        if !range(address, 1) { return Err(-EFAULT); }
-        let count = bytes.len().min((0xc0000000 - address) as usize);
-        let length = machine.copy_cstr(address, &mut bytes[..count]);
-        return if length == count && count < bytes.len() { Err(-EFAULT) } else { Ok(length) };
-    }
     let mut offset = 0;
     while offset < bytes.len() {
         let pointer = address.checked_add(offset as u64).ok_or(-EFAULT)?;

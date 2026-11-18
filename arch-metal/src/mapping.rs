@@ -29,6 +29,14 @@ pub(crate) struct ReadRun {
 
 // Safety: the call number must name the handler for T.
 pub(crate) unsafe fn invoke<T>(call: u64, arguments: &mut T) {
+    let cs: u16;
+    unsafe { core::arch::asm!("mov {0:x}, cs", out(reg) cs); }
+    if cs & 3 == 0 {
+        let mut request = arch_abi::entry::KernelCall { rax: call,
+            rdx: arguments as *mut T as u64, rbx: 0, rcx: 0, rsi: 0, rdi: 0 };
+        assert!(matches!(crate::traps::arch_dispatch(&mut request), arch_abi::entry::CallOutcome::Complete));
+        return;
+    }
     unsafe { core::arch::asm!("int 0x80", in("eax") call as u32,
         in("edx") arguments as *mut T as usize); }
 }
@@ -187,7 +195,7 @@ fn read<E: Entry>(entries: &[E], page: UserPage) -> Result<PageEntry, MappingErr
 /// batch is `NeedPages`, and the kernel refills it and resumes after the
 /// committed prefix. Filling a large fresh range therefore costs batch pages,
 /// not reserve pages (the reserve only covers one fault's worth).
-fn prepare_tables<E: Entry>(entries: &mut [E], index: usize) -> Result<(), MappingError> {
+pub(crate) fn prepare_tables<E: Entry>(entries: &mut [E], index: usize) -> Result<(), MappingError> {
     let mut chain = [0; 4];
     let mut count = 0;
     let mut parent = paging2::parent_index::<E>(index);
@@ -206,11 +214,38 @@ fn prepare_tables<E: Entry>(entries: &mut [E], index: usize) -> Result<(), Mappi
             paging2::flush_tlb();
         }
         if !entries[parent].hw_writable() {
-            if !crate::memory::input_available() { return Err(MappingError::NeedPages); }
+            if !crate::memory::page_available() { return Err(MappingError::NeedPages); }
             paging2::cow_entry(entries, parent);
         }
     }
     Ok(())
+}
+
+/// Resolve a user buffer without touching its virtual address. Reads need no
+/// materialized tables; writes explicitly privatize tables and COW backing.
+pub(crate) fn resolve(address: u64, write: bool) -> Option<u64> {
+    let page = UserPage::new(address & !4095).ok()?;
+    fn access<E: Entry>(entries: &mut [E], page: UserPage, write: bool) -> Option<u64> {
+        let entry = read(entries, page).ok()?;
+        let mapping = match entry {
+            PageEntry::ReadOnly(m) if !write => m,
+            PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => m,
+            _ => return None,
+        };
+        if !write { return Some(mapping.backing.frame().number()); }
+        let index = page.address() as usize / 4096;
+        prepare_tables(entries, index).expect("guest copy has insufficient supplied table pages");
+        if entries[index].raw() == 0 {
+            let incoming = encode::<E>(page, PageEntry::CopyOnWrite(mapping)).unwrap();
+            paging2::replace_mapping(&mut entries[index], incoming);
+        }
+        if !entries[index].hw_writable() { paging2::cow_entry(entries, index); }
+        Some(entries[index].page())
+    }
+    match paging2::entries() {
+        Entries::E32(e) => access(e, page, write),
+        Entries::E64(e) => access(e, page, write),
+    }
 }
 
 fn replace<E: Entry>(entries: &mut [E], page: UserPage, entry: PageEntry) -> Result<(), MappingError> {

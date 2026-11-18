@@ -386,7 +386,7 @@ impl arch_abi::trap::Machine for crate::backend::Metal {
     }
 }
 
-/// Ring-1 (kernel) trap dispatch: arch calls, page faults, IRQs. Anything
+/// Ring-1 (kernel) trap dispatch: arch calls and IRQs; page faults are bugs. Anything
 /// else from kernel context is a bug.
 pub(crate) fn isr_handler_ring1(regs: &mut Regs) {
     match regs.int_num {
@@ -397,11 +397,7 @@ pub(crate) fn isr_handler_ring1(regs: &mut Regs) {
             }
             panic_with_regs("Unexpected debug exception in kernel", regs);
         }
-        14 => {
-            if !crate::memory::can_fault() || try_handle_page_fault(regs.err_code, false).is_none() {
-                panic_with_regs("Unhandled page fault in kernel", regs);
-            }
-        }
+        14 => panic_with_regs("Page fault in resident kernel", regs),
         #[cfg(not(feature = "kvm"))]
         32..=47 | 0xF8..=0xFE => handle_irq(regs),
         0x80 => unreachable!("kernel calls enter through entry::kernel_call"),
@@ -416,149 +412,41 @@ pub(crate) fn isr_handler_ring1(regs: &mut Regs) {
 /// Try to handle a page fault. Returns Some(()) if resolved, None if not.
 fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
     let _paging = paging2::PagingGuard::lock();
-    // Other CPUs can grow the shared kernel heap while this CPU executes
-    // userspace. Ownership metadata used below must see those mappings.
-    crate::paging2::refresh_kernel_mappings();
     let _reserve = crate::memory::FaultGuard::enter();
-    let _sample = crate::exec_profile::FaultSample::start(error & 4 != 0);
-    use crate::paging2::{KERNEL_BASE, PAGE_TABLE_BASE, page_idx};
-
-    let full_addr = x86::read_cr2_full();
-    if full_addr >= crate::high_paging::START {
-        return crate::high_paging::fault(full_addr, error).then_some(());
+    let _sample = crate::exec_profile::FaultSample::start(true);
+    let address = x86::read_cr2_full();
+    if error & 8 != 0 { return None; }
+    if address >= crate::high_paging::START {
+        return crate::high_paging::fault(address, error).then_some(());
     }
-    // Reject the inaccessible gap rather than truncating to a low address.
-    if full_addr > u32::MAX as u64 { return None; }
-    let fault_addr = full_addr as usize;
-    let present = (error & 1) != 0;
-    let write = (error & 2) != 0;
-    let user = (error & 4) != 0;
-    let instruction_fetch = (error & 0x10) != 0;
-
-    let page_index = page_idx(fault_addr);
-
-    // Null pointer protection (first 64KB and last 64KB)
-    // Skip for legacy mode (VM86/DPMI: legitimate IVT/BDA/conventional memory access)
-    // and supervisor (ring-1 kernel setting up user memory).
-    const NULL_LIMIT: usize = 0x10000;
-    if !legacy_mode && user && (fault_addr < NULL_LIMIT || fault_addr >= (0usize).wrapping_sub(NULL_LIMIT)) {
-        return None; // Let kernel handle (segfault or panic)
-    }
-
-    // User tried to access kernel memory
-    if user && fault_addr >= PAGE_TABLE_BASE {
-        return None; // Let kernel handle (segfault)
-    }
-
-    // Kernel-stack-guard hit: the unmapped page directly below KERNEL_STACK.
-    // Reaching it means ring-1 kernel stack overflow. (The arch-stack guard
-    // is unmapped too but can't be reported here — its overflow #PFs on the
-    // already-overflowed ARCH_STACK and triple-faults.)
-    {
-        let kguard = (&raw const crate::KERNEL_STACK_GUARD) as usize;
-        if fault_addr >= kguard && fault_addr < kguard + 4096 {
-            lib::compact_panic!("KERNEL STACK OVERFLOW at {:#x} (guard {:#x})", fault_addr, kguard);
+    if address >= 0xc0000000 || !legacy_mode && address < 0x10000 { return None; }
+    fn resolve<E: paging2::Entry>(entries: &mut [E], address: usize, error: u64, legacy: bool) -> Option<()> {
+        let index = address / 4096;
+        // Make the recursive walk resident and writable before dereferencing
+        // a leaf. The trap handler must never fault on its own page tables.
+        crate::mapping::prepare_tables(entries, index).expect("guest fault exhausted its reserve");
+        let mut entry = entries[index];
+        if !entry.present() {
+            if entry.raw() != 0 { return None; }
+            let zero = paging2::physical_page((&raw const crate::ZERO_PAGE) as usize);
+            entry = E::new(zero, false, true);
+            entry.set_no_execute(paging2::nx_enabled() && !legacy);
+            paging2::replace_mapping(&mut entries[index], entry);
         }
+        if !entry.user() || error & 16 != 0 && entry.raw() & paging2::flags::NO_EXECUTE != 0 {
+            return None;
+        }
+        if error & 2 != 0 {
+            if !entry.writable() { return None; }
+            if !entry.hw_writable() { paging2::cow_entry(entries, index); }
+        }
+        x86::invlpg(address);
+        Some(())
     }
-
-    // Kernel memory is backed before use. A newly published shared root
-    // may have been missing from this CPU; refresh above makes it visible.
-    if !user && fault_addr >= KERNEL_BASE {
-        return (!present && paging2::kernel_page_resident(fault_addr)).then_some(());
-    }
-
-    // Legacy mode (VM86/DPMI) shares code+data address space, so don't set NX
-    let nx = paging2::nx_enabled() && !legacy_mode;
-    use paging2::Entry as _;
     match paging2::entries() {
-        paging2::Entries::E32(e) => {
-            if present {
-                handle_protection_fault(e, fault_addr, page_index, write, user, instruction_fetch)?;
-            } else if e[page_index].raw() & (paging2::flags::CACHE_DISABLE | paging2::flags::SOFT_RO | paging2::flags::NO_ACCESS) != 0 {
-                return None; // present=0 + PCD = emulated MMIO trap — kernel decodes
-            } else {
-                demand_page(e, page_index, false);
-            }
-        }
-        paging2::Entries::E64(e) => {
-            if present {
-                handle_protection_fault(e, fault_addr, page_index, write, user, instruction_fetch)?;
-            } else if e[page_index].raw() & (paging2::flags::CACHE_DISABLE | paging2::flags::SOFT_RO | paging2::flags::NO_ACCESS) != 0 {
-                return None;
-            } else {
-                demand_page(e, page_index, nx);
-            }
-        }
+        paging2::Entries::E32(e) => resolve(e, address as usize, error, legacy_mode),
+        paging2::Entries::E64(e) => resolve(e, address as usize, error, legacy_mode),
     }
-    // A first user write used to install a read-only zero page, return to the
-    // same instruction, then fault a second time just to make its private copy.
-    // Complete that ordinary write fault before returning to user mode.
-    if !present && write && user && !legacy_mode {
-        match paging2::entries() {
-            paging2::Entries::E32(e) => handle_protection_fault(e, fault_addr, page_index, true, true, false)?,
-            paging2::Entries::E64(e) => handle_protection_fault(e, fault_addr, page_index, true, true, false)?,
-        }
-    }
-    Some(())
-}
-
-/// Handle protection faults (present page, but access denied)
-fn handle_protection_fault<E: paging2::Entry>(
-    entries: &mut [E],
-    _fault_addr: usize,
-    page_index: usize,
-    write: bool,
-    _user: bool,
-    instruction_fetch: bool,
-) -> Option<()> {
-    if instruction_fetch || !write {
-        return None; // Let kernel handle
-    }
-
-    // Walk from leaf upward to find the outermost R/O COW entry.
-    // Must COW top-down: only the outermost share_and_copy establishes
-    // correct refcounts for the levels below.
-    let mut cow_idx = None;
-    let mut idx = page_index;
-    loop {
-        if entries[idx].present() && !entries[idx].hw_writable() {
-            if !entries[idx].writable() {
-                return None;
-            }
-            cow_idx = Some(idx);
-        }
-        let parent = paging2::parent_index::<E>(idx);
-        if parent == idx { break; }
-        idx = parent;
-    }
-    if let Some(idx) = cow_idx {
-        paging2::cow_entry(entries, idx);
-        if idx < paging2::PAGE_TABLE_BASE_IDX { x86::invlpg(page_index * paging2::PAGE_SIZE); }
-        else { paging2::flush_tlb(); }
-        return Some(());
-    }
-
-    None // Unexpected, let kernel handle
-}
-
-
-/// Demand page allocation for not-present pages
-fn demand_page<E: paging2::Entry>(
-    entries: &mut [E],
-    page_index: usize,
-    use_nx: bool,
-) {
-    use crate::paging2::PAGE_TABLE_BASE_IDX;
-
-    let zero_page = paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize);
-    let is_user = page_index < paging2::recursive_idx();
-    let mut e = E::new(zero_page, false, is_user);
-    if use_nx && page_index < PAGE_TABLE_BASE_IDX {
-        e.set_no_execute(true);
-    }
-    paging2::replace_mapping(&mut entries[page_index], e);
-    if page_index < PAGE_TABLE_BASE_IDX { x86::invlpg(page_index * paging2::PAGE_SIZE); }
-    else { paging2::flush_tlb(); }
 }
 
 // =============================================================================
@@ -570,11 +458,7 @@ fn demand_page<E: paging2::Entry>(
 /// don't push ESP/SS.
 pub(crate) fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
     match int_num {
-        14 => {
-            if !crate::memory::can_fault() || try_handle_page_fault(error, false).is_none() {
-                lib::compact_panic!("Unhandled page fault in arch: addr={:#x} err={:#x}", x86::read_cr2(), error);
-            }
-        }
+        14 => panic!("Page fault in resident arch: addr={:#x} err={:#x}", x86::read_cr2_full(), error),
         #[cfg(not(feature = "kvm"))]
         32..=47 | 0xF8..=0xFE => {
             let mut regs = Regs::empty();

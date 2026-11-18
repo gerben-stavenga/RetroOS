@@ -24,6 +24,9 @@ pub(crate) fn invoke(request: Request) -> i32 {
     { self::request(&request) }
     #[cfg(not(feature = "kvm"))]
     {
+        let cs: u16;
+        unsafe { core::arch::asm!("mov {0:x}, cs", out(reg) cs); }
+        if cs & 3 == 0 { return self::request(&request); }
         let mut request = request;
         unsafe { core::arch::asm!("int 0x80",
             in("eax") crate::arch_call::HIGH_MEMORY as u32,
@@ -150,7 +153,7 @@ fn resolve(address: u64, write_access: bool, execute: bool) -> Option<u64> {
                 || execute && entry.raw() & NO_EXECUTE != 0 { return None; }
             if write_access && !entry.hw_writable() {
                 if entry.raw() & FOREIGN != 0 || crate::memory::get_ref_count(entry.page()) > 1 {
-                    let page = allocate(Entry64(0)).ok()?;
+                    let page = allocate(Entry64(0)).expect("user access has no supplied data page");
                     let scratch = (&raw mut crate::SCRATCH).cast::<u8>();
                     with_frame(entry.page(), |p| unsafe { core::ptr::copy_nonoverlapping(p, scratch, 4096); });
                     with_frame(page, |p| unsafe { core::ptr::copy_nonoverlapping(scratch, p, 4096); });
@@ -161,7 +164,7 @@ fn resolve(address: u64, write_access: bool, execute: bool) -> Option<u64> {
             }
             return Some(entry.page());
         }
-        let page = table(entry).ok()?;
+        let page = table(entry).expect("user access has no supplied table page");
         let index = ((address >> (12 + 9 * (level - 1))) & 511) as usize;
         let mut child = read(page, index);
         let result = walk(&mut child, level - 1, address, write_access, execute);
@@ -184,13 +187,28 @@ pub fn fault(address: u64, error: u64) -> bool {
 /// Byte access is independent of mapping policy.
 pub fn request(request: &Request) -> i32 {
     let _paging = paging2::PagingGuard::lock();
-    if !supported() { return -12; }
+    let result = copy_request(request);
+    // A failed copy can still have privatized and written its initial pages.
+    if request.to_user { paging2::flush_tlb(); }
+    result
+}
+fn copy_request(request: &Request) -> i32 {
     let Some(end) = request.address.checked_add(request.length) else { return -22; };
-    if request.address < START || end > END { return -22; }
+    let low = end <= 0xc0000000;
+    if !low && (request.address < START || end > END || !supported()) { return -22; }
     let mut offset = 0;
     while offset < request.length {
         let address = request.address + offset;
-        let Some(page) = resolve(address, request.to_user, false) else { return -14; };
+        let page = if low { crate::mapping::resolve(address, request.to_user) }
+        else if request.to_user { resolve(address, true, false) }
+        else {
+            let page = UserPage::new(address & !4095).unwrap();
+            match read_run(page, 1).ok().map(|(entry, _)| entry) {
+                Some(PageEntry::ReadOnly(m) | PageEntry::Writable(m) | PageEntry::CopyOnWrite(m)) => Some(m.backing.frame().number()),
+                _ => None,
+            }
+        };
+        let Some(page) = page else { return -14; };
         let at = (address & 4095) as usize;
         let count = (request.length - offset).min((4096 - at) as u64) as usize;
         with_frame(page, |p| unsafe {
@@ -200,7 +218,6 @@ pub fn request(request: &Request) -> i32 {
         });
         offset += count as u64;
     }
-    paging2::flush_tlb();
     0
 }
 

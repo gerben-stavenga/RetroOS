@@ -9,6 +9,53 @@ use arch_abi::page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFram
 
 const HI: usize = 0x4000_0000; // sparse high VA (a flat reservation would never fit)
 
+#[test]
+fn copies_use_explicit_backing_and_reject_inaccessible_memory() {
+    use arch_abi::GuestBytes;
+    init();
+    let mut machine = arch::Interp;
+    let address = 0x2200ffe;
+    let bytes: Vec<u8> = (0..4100).map(|i| (i * 37) as u8).collect();
+    let needed = machine.supply_pages(Default::default()).0;
+    let (copied, unused) = machine.copy_to(address, &bytes, test_memory::input(8));
+    assert_eq!(copied, Some(()));
+    assert!(unused.count < 8);
+    assert_eq!(machine.supply_pages(Default::default()).0, needed,
+        "kernel copies must not consume the execution reserve");
+    let mut actual = vec![0; bytes.len()];
+    assert_eq!(machine.copy_from(address, &mut actual, Default::default()).0, Some(()));
+    assert_eq!(actual, bytes);
+
+    let page = UserPage::new(address & !4095).unwrap();
+    let mut child = arch::RootPageTable::default();
+    machine.user_fork(&mut child, test_memory::input(5));
+    let parent = machine.activate(child);
+    assert_eq!(machine.copy_to(address, &[91], test_memory::input(5)).0, Some(()));
+    let mut child = machine.activate(parent);
+    let mut byte = [0];
+    assert_eq!(machine.copy_from(address, &mut byte, Default::default()).0, Some(()));
+    assert_eq!(byte[0], bytes[0], "copy must privatize COW backing");
+    machine.destroy_space(&mut child);
+
+    let mapping = match arch_abi::mapping::read_mapping(&mut machine, page).unwrap() {
+        PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => m,
+        _ => panic!("expected RAM"),
+    };
+    for entry in [PageEntry::ReadOnly(mapping), PageEntry::NoAccess(mapping), PageEntry::Intercepted, PageEntry::Absent] {
+        unsafe { arch_abi::mapping::replace_mapping(&mut machine, page, entry, test_memory::input(5)).0.unwrap(); }
+        assert_eq!(machine.copy_to(address, &[92], test_memory::input(5)).0, None);
+        byte[0] = 99;
+        let read = machine.copy_from(address, &mut byte, Default::default()).0;
+        assert_eq!(read, matches!(entry, PageEntry::ReadOnly(_)).then_some(()));
+        if read.is_none() { assert_eq!(byte[0], 99); }
+    }
+    for address in [0xc0000000, 1 << 47, u64::MAX] {
+        let (result, unused) = machine.copy_from(address, &mut byte, test_memory::input(5));
+        assert_eq!(result, None);
+        assert_eq!(unused.count, 5);
+    }
+}
+
 /// Make space `id` the active one exactly as the kernel does — `Arch::activate`
 /// moves it into the active slot and returns the displaced (previous) space.
 fn switch(root: arch::RootPageTable) -> arch::RootPageTable {

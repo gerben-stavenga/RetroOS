@@ -945,9 +945,9 @@ mod execution_tests {
             crate::sysdesc::gdt_desc(0, 0xfffff, 0xf2, 0xc)];
         crate::desc::load_ldt(&ldt);
         // mov al,[9000h]; adc al,0; int 31h
-        machine.copy_to(0x8000, &[0xa0, 0x00, 0x90, 0, 0, 0x14, 0, 0xcd, 0x31]);
-        machine.copy_to(0x9000, &[0x10]);
-        machine.copy_to(0xa000, &[0x30]);
+        machine.copy_to(0x8000, &[0xa0, 0x00, 0x90, 0, 0, 0x14, 0, 0xcd, 0x31], crate::test_memory::input(5));
+        machine.copy_to(0x9000, &[0x10], crate::test_memory::input(5));
+        machine.copy_to(0xa000, &[0x30], crate::test_memory::input(5));
         let mut regs = Regs::empty();
         regs.set_cs32(0x0f);
         regs.set_ss32(0x17);
@@ -981,8 +981,8 @@ mod execution_tests {
         crate::phys::init_test_ram();
         let mut machine = crate::backend::Interp;
         crate::backend::check_virtual_irq_frame(&mut machine);
-        machine.copy_to(0x7c00, &[0xcd, 0x31]);
-        machine.copy_to(0x7e00, &[0xeb, 0xfe]);
+        machine.copy_to(0x7c00, &[0xcd, 0x31], crate::test_memory::input(5));
+        machine.copy_to(0x7e00, &[0xeb, 0xfe], crate::test_memory::input(5));
         let mut regs = Regs::empty();
         regs.set_cs32(0);
         regs.set_ss32(0);

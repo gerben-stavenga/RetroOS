@@ -21,6 +21,7 @@ fn collect<A: arch_abi::Memory>(machine: &A) -> usize {
 
 pub fn service<A: arch_abi::Memory>(machine: &A) {
     let needed = collect(machine);
+    if needed == 0 { return; }
     let pages = phys_mm::page_batch(needed);
     assert!(SUPPLY_CAPACITY - needed + pages.count >= FAULT_PAGES,
         "physical memory exhausted refilling fault reserve");
@@ -32,20 +33,26 @@ pub fn service<A: arch_abi::Memory>(machine: &A) {
 pub fn with_pages<A: Arch, R>(machine: &mut A, count: usize,
     operation: impl FnOnce(&mut A, PageInput) -> (R, PageInput)) -> R
 {
+    let (result, unused) = operation(machine, input_pages(count));
+    keep_input(unused);
+    collect(machine);
+    result
+}
+
+fn input_pages(count: usize) -> PageInput {
     assert!(count <= SUPPLY_CAPACITY);
-    service(machine);
     let mut input = PageInput::new();
     for _ in 0..count {
         let spare = unsafe { (*(&raw mut SPARES)).take() };
         input.push(spare.or_else(phys_mm::alloc_phys_page)
             .expect("out of physical memory preparing arch input"));
     }
-    let (result, mut unused) = operation(machine, input);
+    input
+}
+fn keep_input(mut unused: PageInput) {
     while let Some(page) = unused.take() {
         unsafe { (*(&raw mut SPARES)).push(page); }
     }
-    collect(machine);
-    result
 }
 pub fn fork<A: Arch>(machine: &mut A, child: &mut A::PageTable) {
     with_pages(machine, 3, |machine, pages| machine.user_fork(child, pages));
@@ -175,7 +182,6 @@ pub fn fresh<A: Arch>(machine: &mut A, vpage: usize, count: usize) {
     if count == 0 { return; }
     let start = page(vpage); start.offset(count - 1).unwrap();
     for index in 0..count {
-        service(machine);
         let frame = allocate_frame(machine).expect("anonymous frame allocation");
         super::platform::write_physical_frame(frame, 0, &[0; 4096]);
         let entry = PageEntry::Writable(Mapping { backing: Backing::Owned(PhysicalFrame::new(frame).unwrap()),
@@ -276,7 +282,6 @@ pub fn private_copy<A: Arch>(machine: &mut A, first: usize, count: usize) {
     for index in 0..count {
         let at = page(first + index);
         let mut mapping = backing(arch_abi::mapping::read_mapping(machine, at).expect("read image mapping")).expect("image backing");
-        service(machine);
         let frame = allocate_frame(machine).expect("private image allocation");
         let mut bytes = [0; 4096];
         super::platform::read_physical_frame(mapping.backing.frame().number(), 0, &mut bytes);
@@ -288,7 +293,8 @@ pub fn private_copy<A: Arch>(machine: &mut A, first: usize, count: usize) {
     }
 }
 
-/// Kernel transfers replenish user backing between page-bounded arch accesses.
+/// Kernel transfers supply explicit backing for page-bounded user accesses.
+/// They never use or replenish the execution fault reserve.
 pub trait GuestBytes {
     /// Copy a high user buffer without narrowing its address. False means EFAULT.
     fn high_copy(&mut self, address: u64, bytes: &mut [u8], to_user: bool) -> bool;
@@ -340,9 +346,12 @@ impl<A: arch_abi::Arch + arch_abi::GuestBytes> GuestBytes for A {
         while !bytes.is_empty() {
             let n = bytes.len().min(4096 - (address as usize & 4095));
             let (part, rest) = bytes.split_at_mut(n);
-            if !with_pages(self, 5, |machine, pages| arch_abi::GuestBytes::high_copy(machine, address, part, to_user, pages)) {
-                return false;
-            }
+            let pages = input_pages(5);
+            let (result, unused) = if to_user {
+                arch_abi::GuestBytes::copy_to(self, address, part, pages)
+            } else { arch_abi::GuestBytes::copy_from(self, address, part, pages) };
+            keep_input(unused);
+            if result.is_none() { return false; }
             address += n as u64;
             bytes = rest;
         }
@@ -350,19 +359,21 @@ impl<A: arch_abi::Arch + arch_abi::GuestBytes> GuestBytes for A {
     }
     fn copy_from(&self, mut address: u64, mut bytes: &mut [u8]) {
         while !bytes.is_empty() {
-            service(self);
             let n = bytes.len().min(4096 - (address as usize & 4095));
             let (part, rest) = bytes.split_at_mut(n);
-            arch_abi::GuestBytes::copy_from(self, address, part);
+            let (result, unused) = arch_abi::GuestBytes::copy_from(self, address, part, input_pages(5));
+            keep_input(unused);
+            result.expect("inaccessible guest read");
             address += n as u64;
             bytes = rest;
         }
     }
     fn copy_to(&mut self, mut address: u64, mut bytes: &[u8]) {
         while !bytes.is_empty() {
-            service(self);
             let n = bytes.len().min(4096 - (address as usize & 4095));
-            arch_abi::GuestBytes::copy_to(self, address, &bytes[..n]);
+            let (result, unused) = arch_abi::GuestBytes::copy_to(self, address, &bytes[..n], input_pages(5));
+            keep_input(unused);
+            result.expect("inaccessible guest write");
             address += n as u64;
             bytes = &bytes[n..];
         }

@@ -703,11 +703,11 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
         .and_then(|voodoo| voodoo.aperture_offset(addr))
     {
         let _sample = super::voodoo_profile::Sample::start(super::voodoo_profile::Stage::Mmio);
-        let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
+        let (segments, def32) = fault_segment_bases(dos, regs);
         let voodoo = dos.pc.voodoo.as_mut().unwrap();
         let mut target = machine::mmio::MmioTarget::Voodoo(voodoo);
         return machine::mmio::handle_mmio_fault(
-            machine, regs, &mut target, cs_base, def32, ds_base, es_base, off,
+            machine, regs, &mut target, &segments, def32, off,
         );
     }
     // Native VGA aperture faults are completed by planar's ring-0 entry.
@@ -720,7 +720,7 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // owner has no software trap: its adapter performs plane routing itself.
     // Resolved before the device is borrowed, so the decode below needs only
     // one match: the bases come from the register frame, not from the VGA.
-    let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
+    let (segments, def32) = fault_segment_bases(dos, regs);
     let Some(dev) = dos.pc.vga.emulated_mut() else {
         return false;
     };
@@ -735,30 +735,29 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     }
     let off = addr - base;
     let mut target = machine::mmio::MmioTarget::Planar { vga: state, base, len };
-    machine::mmio::handle_mmio_fault(machine, regs, &mut target, cs_base, def32, ds_base, es_base, off)
+    machine::mmio::handle_mmio_fault(machine, regs, &mut target, &segments, def32, off)
     }
 }
 
-/// Resolve CS (instruction fetch) plus the DS/ES bases a `movs` needs: source
-/// is DS:(E)SI, destination ES:(E)DI. VM86 segs are shift-by-4; PM segs index
-/// the LDT. Plumbing both is what lets the 32-bit-PM `rep movsd` blit (Doom's
-/// Mode-Y plane copy under CWSDPMI) decode instead of SEGV.
+/// Resolve all instruction operands from DOS's descriptors. Only GDT
+/// selectors need arch's table; LDT descriptors are already owned by DOS.
 fn fault_segment_bases<A: crate::Arch>(
     dos: &thread::DosState<A>,
     regs: &Regs,
-) -> (u32, bool, u32, u32) {
-    if regs.mode() == crate::UserMode::VM86 {
-        ((regs.code_seg() as u32) << 4, false, (regs.ds as u32) << 4, (regs.es as u32) << 4)
-    } else {
-        let cs = regs.code_seg();
-        let ldt = &dos.ldt[..];
-        (
-            mode_transitions::seg_base(ldt, cs),
-            mode_transitions::seg_is_32(ldt, cs),
-            mode_transitions::seg_base(ldt, regs.ds as u16),
-            mode_transitions::seg_base(ldt, regs.es as u16),
-        )
-    }
+) -> ([u32; 6], bool) {
+    let vm86 = regs.mode() == crate::UserMode::VM86;
+    let cs = regs.code_seg();
+    let segments = [regs.es as u16, cs, regs.stack_seg(), regs.ds as u16,
+        regs.fs as u16, regs.gs as u16].map(|sel| {
+        if vm86 { u32::from(sel) << 4 }
+        else if sel == 0 { 0 }
+        else if sel & 4 != 0 { mode_transitions::seg_base(&dos.ldt[..], sel) }
+        else { A::seg_base(sel) }
+    });
+    let def32 = !vm86 && if cs & 4 != 0 {
+        mode_transitions::seg_is_32(&dos.ldt[..], cs)
+    } else { A::seg_is_32(cs) };
+    (segments, def32)
 }
 
 fn set_tf_source<A: crate::Arch>(dos: &mut thread::DosState<A>, source: u8, on: bool) {

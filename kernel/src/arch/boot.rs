@@ -456,6 +456,18 @@ unsafe fn prepare_boot(
     let table = phys_mm::alloc_phys_page().expect("physical aperture table");
     if !arch::aperture::init(table) { phys_mm::free_phys_page(table); }
 
+    // Every core shares these resident kernel tables. Install all parents
+    // before AP startup, so heap growth and device mappings only change leaves;
+    // neither accessing a table nor using another core's allocation can fault.
+    // A 2 MiB chunk needs at most one table in either paging format.
+    let mut table = phys_mm::alloc_resident_page().expect("kernel page table");
+    for page in (LOW_MEM_BASE / PAGE_SIZE..1 << 20).step_by(512) {
+        if paging2::prepare_kernel_mapping(page, 512, table) {
+            table = phys_mm::alloc_resident_page().expect("kernel page table");
+        }
+    }
+    phys_mm::free_phys_page(table);
+
     // APs borrow the BSP bootstrap root, then acknowledge their private roots.
     // Retain the existing identity mapping until every startup has completed.
     unsafe { smp::start(screen, &acpi_rsdp[..acpi_rsdp_len], &mmap_buf[..mmap_count], &boot_modules_raw); }
@@ -475,8 +487,8 @@ unsafe fn prepare_boot(
     }
 
     // GOP machines: map the framebuffer and render the boot backlog NOW —
-    // as early as its dependencies allow (the IDT for the COW page-table
-    // faults, phys_mm for the frames) — so every later init phase can paint
+    // as early as its dependencies allow (resident page tables and physical
+    // storage) — so every later init phase can paint
     // its panics. The mappings land in the dual-use PDPT page that the
     // compat-mode toggle below reuses, so they survive the switch.
     lib::compact_screenln!(screen, "Boot: framebuffer init");

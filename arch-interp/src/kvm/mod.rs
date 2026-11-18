@@ -79,30 +79,38 @@ impl Memory for Interp {
     }
 }
 
-fn transfer(mut address: u64, buffer: *mut u8, length: usize, write: bool) {
-    let end = address.checked_add(length as u64).expect("guest address overflow");
-    assert!(end <= 0xc0000000 || address >= 1 << 39 && end <= 1 << 47, "unsupported guest address");
+fn transfer(mut address: u64, buffer: *mut u8, length: usize, supplied: Option<PageInput>, write: bool) -> (Option<()>, PageInput) {
+    let explicit = supplied.is_some();
+    let mut pages = supplied.unwrap_or_default();
+    let Some(end) = address.checked_add(length as u64) else { return (None, pages); };
+    if !(end <= 0xc0000000 || address >= 1 << 39 && end <= 1 << 47) { return (None, pages); }
     let mut offset = 0;
     while offset < length {
-        let n = (length - offset).min(vm::DATA_SIZE);
-        request(if write { op::COPY_TO } else { op::COPY_FROM }, [address, n as u64, 0, 0, 0, 0], |m| {
+        let n = (length - offset).min(4096 - (address as usize & 4095));
+        let (ok, unused) = request(if write { op::COPY_TO } else { op::COPY_FROM }, [address, n as u64, explicit as u64, 0, 0, 0], |m| {
+            m.put_pages(pages);
             if write { unsafe { core::ptr::copy_nonoverlapping(buffer.add(offset), m.data.as_mut_ptr(), n); } }
         }, |m| {
-            if !write { unsafe { core::ptr::copy_nonoverlapping(m.data.as_ptr(), buffer.add(offset), n); } }
+            let ok = m.result[0] != 0;
+            if ok && !write { unsafe { core::ptr::copy_nonoverlapping(m.data.as_ptr(), buffer.add(offset), n); } }
+            (ok, m.take_pages())
         });
+        pages = unused;
+        if !ok { return (None, pages); }
         address += n as u64;
         offset += n;
     }
+    (Some(()), pages)
 }
 impl GuestBytes for Interp {
     fn read<T: Copy>(&self, address: u64) -> T {
         let mut value = core::mem::MaybeUninit::<T>::uninit();
-        transfer(address, value.as_mut_ptr().cast(), core::mem::size_of::<T>(), false);
+        transfer(address, value.as_mut_ptr().cast(), core::mem::size_of::<T>(), None, false).0.expect("inaccessible guest read");
         unsafe { value.assume_init() }
     }
-    fn write<T: Copy>(&mut self, address: u64, value: T) { transfer(address, (&value as *const T).cast_mut().cast(), core::mem::size_of::<T>(), true); }
-    fn copy_from(&self, address: u64, bytes: &mut [u8]) { transfer(address, bytes.as_mut_ptr(), bytes.len(), false); }
-    fn copy_to(&mut self, address: u64, bytes: &[u8]) { transfer(address, bytes.as_ptr().cast_mut(), bytes.len(), true); }
+    fn write<T: Copy>(&mut self, address: u64, value: T) { transfer(address, (&value as *const T).cast_mut().cast(), core::mem::size_of::<T>(), None, true).0.expect("inaccessible guest write"); }
+    fn copy_from(&self, address: u64, bytes: &mut [u8], pages: PageInput) -> (Option<()>, PageInput) { transfer(address, bytes.as_mut_ptr(), bytes.len(), Some(pages), false) }
+    fn copy_to(&mut self, address: u64, bytes: &[u8], pages: PageInput) -> (Option<()>, PageInput) { transfer(address, bytes.as_ptr().cast_mut(), bytes.len(), Some(pages), true) }
     fn zero(&mut self, address: u64, length: usize) { request(op::ZERO, [address, length as u64, 0, 0, 0, 0], |_| {}, |_| {}); }
     fn copy_within(&mut self, src: u64, dst: u64, length: usize) { request(op::COPY_WITHIN, [src, length as u64, dst, 0, 0, 0], |_| {}, |_| {}); }
     fn copy_cstr(&self, address: u64, bytes: &mut [u8]) -> usize {
@@ -120,19 +128,7 @@ impl GuestBytes for Interp {
         }
         copied
     }
-    fn high_copy(&mut self, mut address: u64, bytes: &mut [u8], write: bool, mut pages: PageInput) -> (bool, PageInput) {
-        for bytes in bytes.chunks_mut(vm::DATA_SIZE) {
-            let source = bytes.as_ptr();
-            let length = bytes.len();
-            let (ok, unused) = request(op::HIGH_COPY, [address, bytes.len() as u64, write as u64, 0, 0, 0],
-                |m| { if write { unsafe { core::ptr::copy_nonoverlapping(source, m.data.as_mut_ptr(), length); } } m.put_pages(pages); },
-                |m| { if !write && m.result[0] != 0 { bytes.copy_from_slice(&m.data[..bytes.len()]); } (m.result[0] != 0, m.take_pages()) });
-            pages = unused;
-            if !ok { return (false, pages); }
-            address += bytes.len() as u64;
-        }
-        (true, pages)
-    }
+
 }
 thread_local! { static LDT: std::cell::Cell<(*const u64, usize, bool)> = const { std::cell::Cell::new((core::ptr::null(), 0, false)) }; }
 fn descriptors_ready() {

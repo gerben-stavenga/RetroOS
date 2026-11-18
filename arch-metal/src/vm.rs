@@ -138,16 +138,16 @@ fn operation(message: &mut Exchange) {
             }
         }
         op::CLEAN => call(arch_call::CLEAN, &mut ()),
-        op::COPY_FROM => machine.copy_from(a[0], &mut message.data[..count]),
-        op::COPY_TO => machine.copy_to(a[0], &message.data[..count]),
+        op::COPY_FROM | op::COPY_TO => {
+            let _reserve = (a[2] == 0).then(crate::memory::FaultGuard::enter);
+            message.result[0] = (crate::high_paging::request(&crate::high_paging::Request {
+                address: a[0], length: a[1], to_user: message.operation == op::COPY_TO,
+                buffer: message.data.as_mut_ptr() as usize, result: 0,
+            }) == 0) as u64;
+        }
         op::COPY_CSTR => message.result[0] = machine.copy_cstr(a[0], &mut message.data[..count]) as u64,
         op::ZERO => machine.zero(a[0], count),
         op::COPY_WITHIN => machine.copy_within(a[0], a[2], count),
-        op::HIGH_COPY => {
-            let request = crate::high_paging::Request { address: a[0], length: a[1], to_user: a[2] != 0,
-                buffer: message.data.as_mut_ptr() as usize, result: 0 };
-            message.result[0] = (crate::high_paging::request(&request) == 0) as u64;
-        }
         op::LOAD_LDT => {
             assert!(count <= 8192);
             unsafe { core::ptr::copy_nonoverlapping(message.data.as_ptr(), (&raw mut LDT).cast::<u8>(), count * 8); }

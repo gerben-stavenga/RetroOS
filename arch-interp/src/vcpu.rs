@@ -1,10 +1,7 @@
 //! Vcpu and guest-memory access for the interpreter backend.
 //!
-//! Mirrors `kernel/src/arch/vcpu.rs` exactly in shape so the kernel is blind to
-//! the backend. The one difference is where the bytes live: on metal a
-//! guest-linear address *is* a host pointer (shared page tables); here it
-//! indexes a flat host-side guest-RAM buffer. The raw access stays confined to
-//! `GuestMem`, so kernel/dos code holds no `unsafe` of its own.
+//! User mappings are walked explicitly, then bytes are copied through their
+//! physical backing. Kernel copies supply their own demand/COW backing.
 
 use crate::paging;
 use crate::space::RootPageTable;
@@ -27,6 +24,21 @@ fn for_chunks(addr: usize, len: usize, write: bool, mut on_chunk: impl FnMut(*mu
         on_chunk(host, off, chunk);
         off += chunk;
     }
+}
+
+#[cfg(feature = "tcg")]
+fn copy_chunks(address: u64, len: usize, write: bool,
+    mut copy: impl FnMut(*mut u8, usize, usize)) -> Option<()>
+{
+    if address.checked_add(len as u64)? > 0xc0000000 { return None; }
+    let mut offset = 0;
+    while offset < len {
+        let at = address as usize + offset;
+        let n = (len - offset).min(4096 - (at & 4095));
+        copy(paging::copy_resolve(at as u32, write)?, offset, n);
+        offset += n;
+    }
+    Some(())
 }
 
 /// Register state + address-space handle for one execution context. The shape
@@ -67,18 +79,17 @@ impl GuestBytes for crate::backend::Interp {
         });
         crate::engine::invalidate_code_range(addr as u32, size as u32);
     }
-    fn copy_from(&self, addr: u64, dst: &mut [u8]) {
-        let addr = low_address(addr, dst.len());
-        for_chunks(addr, dst.len(), false, |host, off, n| unsafe {
-            for i in 0..n { dst[off + i] = (host as *const u8).add(i).read_volatile(); }
-        });
+    fn copy_from(&self, addr: u64, dst: &mut [u8], pages: arch_abi::page_supply::PageInput) -> (Option<()>, arch_abi::page_supply::PageInput) {
+        crate::phys::with_input(pages, || copy_chunks(addr, dst.len(), false, |host, offset, n| unsafe {
+            for i in 0..n { dst[offset + i] = host.add(i).read_volatile(); }
+        }))
     }
-    fn copy_to(&mut self, addr: u64, src: &[u8]) {
-        let addr = low_address(addr, src.len());
-        for_chunks(addr, src.len(), true, |host, off, n| unsafe {
-            for i in 0..n { host.add(i).write_volatile(src[off + i]); }
-        });
-        crate::engine::invalidate_code_range(addr as u32, src.len() as u32);
+    fn copy_to(&mut self, addr: u64, src: &[u8], pages: arch_abi::page_supply::PageInput) -> (Option<()>, arch_abi::page_supply::PageInput) {
+        let result = crate::phys::with_input(pages, || copy_chunks(addr, src.len(), true, |host, offset, n| unsafe {
+            for i in 0..n { host.add(i).write_volatile(src[offset + i]); }
+        }));
+        if addr < 0xc0000000 { crate::engine::invalidate_code_range(addr as u32, src.len() as u32); }
+        result
     }
     fn copy_cstr(&self, addr: u64, dst: &mut [u8]) -> usize {
         let addr = low_address(addr, dst.len());
@@ -187,7 +198,7 @@ impl GuestMem {
         crate::backend::Interp.zero(addr as u64, len);
     }
     pub fn write_bytes(self, addr: usize, src: &[u8]) {
-        crate::backend::Interp.copy_to(addr as u64, src);
+        for (index, byte) in src.iter().enumerate() { crate::backend::Interp.write(addr as u64 + index as u64, *byte); }
     }
     pub fn copy_within(self, src: usize, dst: usize, len: usize) {
         crate::backend::Interp.copy_within(src as u64, dst as u64, len);

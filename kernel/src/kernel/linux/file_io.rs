@@ -32,7 +32,6 @@ pub(super) fn write_user<A: crate::Arch>(machine: &mut A, handle: i32, pointer: 
     if !super::high_memory::range(pointer, length as u64) { return -14; }
     super::vfs::with_file_io(handle, length, |file| write_buffered(machine, length,
         |machine, offset, bytes| {
-            crate::kernel::memory::service(machine);
             if super::high_memory::copy_from(machine, pointer + offset as u64, bytes) { Ok(()) } else { Err(-14) }
         },
         |_, bytes| file.write(bytes))).unwrap_or_else(|error| error)
@@ -48,7 +47,6 @@ pub(super) fn read_user<A: crate::Arch>(machine: &mut A, handle: i32, pointer: u
     super::vfs::with_file_io(handle, length, |file| {
         let mut total = 0;
         while total < length {
-            crate::kernel::memory::service(machine);
             let count = buffer.len().min(length - total);
             let sample = crate::kernel::event_profile::file_io_start();
             let n = file.read(&mut buffer[..count]);

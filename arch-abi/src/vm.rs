@@ -40,7 +40,6 @@ pub mod op {
     pub const FPU_ST0: u64 = 22;
     pub const FPU_POP: u64 = 23;
     pub const TRANSLATE: u64 = 24;
-    pub const HIGH_COPY: u64 = 25;
     pub const DEBUG_WATCH: u64 = 26;
     pub const COPY_CSTR: u64 = 27;
 }

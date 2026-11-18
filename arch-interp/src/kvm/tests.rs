@@ -73,7 +73,7 @@ fn kvm_engine_proofs() {
     // shape, demand-#PF on the first code fetch, the #GP monitor path.
     // 0xB8 0x34 0x12   mov ax, 0x1234
     // 0xCD 0x31        int 0x31
-    mem.copy_to(0x7C00, &[0xB8, 0x34, 0x12, 0xCD, 0x31]);
+    mem.copy_to(0x7C00, &[0xB8, 0x34, 0x12, 0xCD, 0x31], crate::test_memory::input(5));
     let mut r = Regs::empty();
     r.set_cs32(0);
     r.set_ip32(0x7C00);
@@ -93,7 +93,7 @@ fn kvm_engine_proofs() {
     // Absolute one-shot alarms must preempt guest-only computation. An
     // interruption is supplied by the host timer, not a deadline pre-check.
     crate::machine::install_input_sink(receive_input);
-    mem.copy_to(0x7E00, &[0xeb, 0xfe]);
+    mem.copy_to(0x7E00, &[0xeb, 0xfe], crate::test_memory::input(5));
     let mut spinning = r;
     spinning.set_ip32(0x7E00);
     set_regs(spinning);
@@ -111,7 +111,7 @@ fn kvm_engine_proofs() {
     assert!(mem.now() - end < 200_000_000, "one-shot alarm was excessively late");
 
     // A queued event is historical data, not an execution interruption.
-    mem.copy_to(0x7E10, &[0xcd, 0x31]);
+    mem.copy_to(0x7E10, &[0xcd, 0x31], crate::test_memory::input(5));
     crate::machine::post_irq(arch_abi::Irq::Key(0x2e));
     // Let the host signal arrive while outside KVM_RUN.
     std::thread::sleep(std::time::Duration::from_millis(10));
@@ -152,8 +152,8 @@ fn kvm_engine_proofs() {
     // flags load, not feed an invalid VMCS to Intel KVM (DN's CPU probe).
     // mov ax,0x8202; push ax; popf; pushf; pop ax; int 0x31
     mem.copy_to(0x7D00, &[0xB8, 0x02, 0x82, 0x50, 0x9D,
-                        0x9C, 0x58, 0xCD, 0x31]);
-    mem.copy_to(0x6FFE, &[0, 0]); // back the stack used by PUSH/POPF
+                        0x9C, 0x58, 0xCD, 0x31], crate::test_memory::input(5));
+    mem.copy_to(0x6FFE, &[0, 0], crate::test_memory::input(5)); // back the stack used by PUSH/POPF
     let mut probe = r;
     probe.set_ip32(0x7D00);
     set_regs(probe);
@@ -174,7 +174,7 @@ fn kvm_engine_proofs() {
         0x51, 0x9D,             // push cx; popf
         0x31, 0xC8,             // xor ax,cx
         0xCD, 0x31,
-    ]);
+    ], crate::test_memory::input(5));
     let mut probe = r;
     probe.set_ip32(0x7D20);
     set_regs(probe);
@@ -186,12 +186,12 @@ fn kvm_engine_proofs() {
     // Both IRET widths must normalize the stacked FLAGS before re-entry.
     // Return to 0100:6e10, then PUSHF/POP AX reads what the guest observes.
     for op32 in [false, true] {
-        mem.copy_to(0x7E00, if op32 { &[0x66, 0xCF][..] } else { &[0xCF][..] });
-        mem.copy_to(0x7E10, &[0x9C, 0x58, 0xCD, 0x31]);
+        mem.copy_to(0x7E00, if op32 { &[0x66, 0xCF][..] } else { &[0xCF][..] }, crate::test_memory::input(5));
+        mem.copy_to(0x7E10, &[0x9C, 0x58, 0xCD, 0x31], crate::test_memory::input(5));
         if op32 {
-            mem.copy_to(0x6FF0, &[0x10, 0x6E, 0, 0, 0, 1, 0, 0, 2, 0x82, 0, 0]);
+            mem.copy_to(0x6FF0, &[0x10, 0x6E, 0, 0, 0, 1, 0, 0, 2, 0x82, 0, 0], crate::test_memory::input(5));
         } else {
-            mem.copy_to(0x6FF0, &[0x10, 0x6E, 0, 1, 2, 0x82]);
+            mem.copy_to(0x6FF0, &[0x10, 0x6E, 0, 1, 2, 0x82], crate::test_memory::input(5));
         }
         let mut probe = r;
         probe.set_ip32(0x7E00);
@@ -208,7 +208,7 @@ fn kvm_engine_proofs() {
     // A host page-table edit at an unchanged CR3 must invalidate instruction
     // fetches too. Keep both frames alive and exchange their mappings so the
     // allocator cannot accidentally reuse the original physical page.
-    mem.copy_to(0x8C00, &[0xB8, 0x78, 0x56, 0xCD, 0x31]);
+    mem.copy_to(0x8C00, &[0xB8, 0x78, 0x56, 0xCD, 0x31], crate::test_memory::input(5));
     let first_page = arch_abi::UserPage::new(0x7000).unwrap();
     let second_page = arch_abi::UserPage::new(0x8000).unwrap();
     let first = arch_abi::mapping::read_mapping(&mut mem, first_page).unwrap();
@@ -238,7 +238,7 @@ fn kvm_engine_proofs() {
     prog.extend_from_slice(&data.to_le_bytes());
     prog.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
     prog.extend_from_slice(&[0xCD, 0x80]);
-    mem.copy_to(code as u64, &prog);
+    mem.copy_to(code as u64, &prog, crate::test_memory::input(5));
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -256,7 +256,7 @@ fn kvm_engine_proofs() {
     );
 
     // ── PM #GP path: `hlt` at CPL3 → #GP(0) → monitor → KernelEvent::Hlt.
-    mem.copy_to(code as u64, &[0xF4]);
+    mem.copy_to(code as u64, &[0xF4], crate::test_memory::input(5));
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -278,7 +278,7 @@ fn kvm_engine_proofs() {
     prog.extend_from_slice(&data.to_le_bytes());
     prog.extend_from_slice(&[0xCD, 0x80]);
     let mut child_mem = crate::backend::Interp;
-    child_mem.copy_to(code as u64, &prog);
+    child_mem.copy_to(code as u64, &prog, crate::test_memory::input(5));
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -295,7 +295,7 @@ fn kvm_engine_proofs() {
         "parent's page untouched by the child's COW write"
     );
 
-    mem.copy_to(code as u64, &[0xe7, arch_abi::vm::EXIT_PORT as u8, 0xcd, 0x80]);
+    mem.copy_to(code as u64, &[0xe7, arch_abi::vm::EXIT_PORT as u8, 0xcd, 0x80], crate::test_memory::input(5));
     let mut handoff = Regs::empty();
     handoff.init_user_process(code, stack);
     handoff.rax = 0xdeadbeef;
@@ -308,7 +308,7 @@ fn kvm_engine_proofs() {
     let io_prog: &[u8] = &[0xB0, 0x5A, 0xE6, 0xE0, 0xE4, 0xE0, 0xCD, 0x80];
     {
         let label = "monitored port";
-        mem.copy_to(code as u64, io_prog);
+        mem.copy_to(code as u64, io_prog, crate::test_memory::input(5));
         let mut r = Regs::empty();
         r.init_user_process(code, stack);
         set_regs(r);
@@ -338,7 +338,7 @@ fn kvm_engine_proofs() {
     // marker in XMM0; a switch to a clean thread B clobbers XMM0; switching
     // back must restore A's marker — through the XSAVE round-trip.
     // A: mov eax, 0x11223344; movd xmm0, eax; int 0x80
-    mem.copy_to(code as u64, &[0xB8, 0x44, 0x33, 0x22, 0x11, 0x66, 0x0F, 0x6E, 0xC0, 0xCD, 0x80]);
+    mem.copy_to(code as u64, &[0xB8, 0x44, 0x33, 0x22, 0x11, 0x66, 0x0F, 0x6E, 0xC0, 0xCD, 0x80], crate::test_memory::input(5));
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -359,7 +359,7 @@ fn kvm_engine_proofs() {
         "outgoing thread's XMM0 captured into its save area"
     );
     // B: mov eax, 0xDEADBEEF; movd xmm0, eax; int 0x80
-    mem.copy_to(code as u64, &[0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0x66, 0x0F, 0x6E, 0xC0, 0xCD, 0x80]);
+    mem.copy_to(code as u64, &[0xB8, 0xEF, 0xBE, 0xAD, 0xDE, 0x66, 0x0F, 0x6E, 0xC0, 0xCD, 0x80], crate::test_memory::input(5));
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -371,7 +371,7 @@ fn kvm_engine_proofs() {
         "thread B's XMM0 captured on the way out"
     );
     // A resumes: movd eax, xmm0; int 0x80 — the marker must have survived B.
-    mem.copy_to(code as u64, &[0x66, 0x0F, 0x7E, 0xC0, 0xCD, 0x80]);
+    mem.copy_to(code as u64, &[0x66, 0x0F, 0x7E, 0xC0, 0xCD, 0x80], crate::test_memory::input(5));
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
     set_regs(r);
@@ -384,7 +384,7 @@ fn kvm_engine_proofs() {
 
     // TF must start after IRET, not while restoring registers in entry.asm.
     // Re-enter twice to verify one guest instruction per step, then clear TF.
-    mem.copy_to(code as u64, &[0x40, 0x40, 0xcd, 0x80]); // inc eax; inc eax; int 80
+    mem.copy_to(code as u64, &[0x40, 0x40, 0xcd, 0x80], crate::test_memory::input(5)); // inc eax; inc eax; int 80
     let mut stepped = r;
     stepped.set_ip32(code);
     stepped.rax = 10;
@@ -411,9 +411,9 @@ fn kvm_engine_proofs() {
         0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, // mov rax, fs:[0]
         0x65, 0x48, 0x8b, 0x1c, 0x25, 0, 0, 0, 0, // mov rbx, gs:[0]
         0x0f, 0x05,
-    ]);
-    mem.copy_to(fs_base, &0x1234567887654321u64.to_le_bytes());
-    mem.copy_to(gs_base, &0xfedcba9876543210u64.to_le_bytes());
+    ], crate::test_memory::input(5));
+    mem.copy_to(fs_base, &0x1234567887654321u64.to_le_bytes(), crate::test_memory::input(5));
+    mem.copy_to(gs_base, &0xfedcba9876543210u64.to_le_bytes(), crate::test_memory::input(5));
     let mut tls = Regs::empty();
     tls.init_user_process_64(tls_code, stack as u64);
     tls.fs = fs_base;
@@ -431,7 +431,7 @@ fn kvm_engine_proofs() {
     let high = (1u64 << 39) + 0x1234_0000;
     let zero = arch_abi::mapping::read_mapping(&mut mem, UserPage::new(0x7000_0000).unwrap()).unwrap();
     unsafe { mem.fill_mappings(UserPage::new(high).unwrap(), 2, zero, test_memory::input(8)).0.unwrap(); }
-    mem.copy_to(high, &[0x48, 0xff, 0x07, 0x48, 0x8b, 0x07, 0x0f, 0x05]); // inc [rdi]; mov rax,[rdi]; syscall
+    mem.copy_to(high, &[0x48, 0xff, 0x07, 0x48, 0x8b, 0x07, 0x0f, 0x05], crate::test_memory::input(5)); // inc [rdi]; mov rax,[rdi]; syscall
     mem.write::<u64>(high + 4096, 41);
     let mut child = RootPageTable::empty();
     mem.user_fork(&mut child, test_memory::input(8));
@@ -456,7 +456,7 @@ fn kvm_engine_proofs() {
         // syscall; then spend time in guest computation before the next one.
         // The timer must interrupt KVM_RUN, not merely expire in host code.
         mem.copy_to((entry) as u64, &[0xb8, 24, 0, 0, 0, 0x0f, 0x05,
-            0xb9, 0x40, 0x42, 0x0f, 0, 0xff, 0xc9, 0x75, 0xfc, 0xeb, 0xee]);
+            0xb9, 0x40, 0x42, 0x0f, 0, 0xff, 0xc9, 0x75, 0xfc, 0xeb, 0xee], crate::test_memory::input(5));
     }
     let mut contexts = [Regs::empty(); 2];
     for (i, context) in contexts.iter_mut().enumerate() {

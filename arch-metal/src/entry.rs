@@ -27,7 +27,7 @@ fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
 ///
 /// Ring 1 (kernel): IRQ → ACK+queue+return. INT 0x80 → arch call. Trap → panic.
 /// Ring 3 (user): save state, return event to ring-1 kernel.
-/// Ring 0 (boot): page fault → demand paging. IRQ → ACK+queue. Rest → panic.
+/// Ring 0 (boot): IRQ → ACK+queue. Exceptions, including page faults, panic.
 ///
 /// `stack` is the raw saved state on the kernel stack. `from_64` tells us which
 /// union arm holds live data:
@@ -159,8 +159,11 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
             regs.set_pvi_policy(PVI_POLICY);
         }
         crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitFrameIn);
-        if let arch_abi::trap::Outcome::ReturnToKernel(event) = guest_trap(regs) {
-            return_to_kernel(regs, event);
+        match guest_trap(regs) {
+            arch_abi::trap::Outcome::ReturnToKernel(event) => return_to_kernel(regs, event),
+            arch_abi::trap::Outcome::Resume if !crate::memory::can_fault() =>
+                return_to_kernel(regs, arch_abi::KernelEvent::Irq),
+            arch_abi::trap::Outcome::Resume => {},
         }
         crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitDispatch);
     } else {

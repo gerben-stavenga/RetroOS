@@ -484,22 +484,24 @@ pub fn destroy(root: &mut RootPageTable) {
 /// and clear the COW mark. Returns false if `vaddr` isn't a COW page — a
 /// genuine read-only/illegal write the kernel must surface as a fault.
 pub fn space_cow_fault(vaddr: u32) -> bool {
+    cow_fault(active_pd(), vaddr, true)
+}
+fn cow_fault(pd: u64, vaddr: u32, fault: bool) -> bool {
     let _paging = PagingGuard::lock();
-    if !phys::can_fault() { return false; }
-    let pd = active_pd();
+    if fault && !phys::can_fault() { return false; }
     let pde = read_entry(pd, pde_index(vaddr));
     if pde & PRESENT == 0 { return false; }
     let old = pte_raw(pd, vaddr);
     if old & PRESENT == 0 || pde & COW == 0 && old & COW == 0 { return false; }
     // A shared table has hardware W=0; detach even when the leaf itself is RO.
-    let pt = private_table(pd, pde_index(vaddr), true).unwrap();
+    let pt = private_table(pd, pde_index(vaddr), fault).expect("COW has no supplied table page");
     let pte = read_entry(pt, pte_index(vaddr));
     if pte & WRITABLE != 0 { return true; }
     if pte & COW == 0 { return false; }
     let frame = u64::from(pte >> 12);
     let borrowed = pte & TYPED != 0 && pte & SHARED != 0;
     if borrowed || phys::shared(frame) {
-        let new = phys::take_fault().unwrap();
+        let new = if fault { phys::take_fault() } else { phys::take_input() }.expect("COW has no supplied data page");
         unsafe { core::ptr::copy_nonoverlapping(phys::frame_ptr(frame), phys::frame_ptr(new), 4096); }
         write_entry(pt, pte_index(vaddr), ((new as u32) << 12) | ((pte & 0xfff & !COW & !SHARED) | WRITABLE));
         if !borrowed { phys::release(frame); }
@@ -507,6 +509,30 @@ pub fn space_cow_fault(vaddr: u32) -> bool {
         write_entry(pt, pte_index(vaddr), (pte & !COW) | WRITABLE);
     }
     true
+}
+
+/// Explicit kernel copy: inaccessible mappings are reported, and any required
+/// backing comes from the operation's input, never the guest fault reserve.
+pub(crate) fn copy_resolve(vaddr: u32, write: bool) -> Option<*mut u8> {
+    let _paging = PagingGuard::lock();
+    if vaddr >= 0xc0000000 { return None; }
+    let pd = active_pd();
+    let raw = pte_raw(pd, vaddr);
+    if raw & PRESENT == 0 && (raw & TYPED != 0 || raw == ABSENT || raw & CACHE_DISABLE != 0) { return None; }
+    if write && raw & PRESENT != 0 {
+        if raw & (WRITABLE | COW) == 0 { return None; }
+        if raw & COW != 0 || read_entry(pd, pde_index(vaddr)) & COW != 0 {
+            if !cow_fault(pd, vaddr, false) { return None; }
+        }
+    }
+    let physical = if let Some(physical) = translate(pd, vaddr) { physical }
+    else {
+        let table = private_table(pd, pde_index(vaddr), false).expect("copy has no supplied table page");
+        let frame = phys::take_input().expect("copy has no supplied data page");
+        write_entry(table, pte_index(vaddr), (frame as u32) << 12 | ENTRY_FLAGS);
+        (frame as u32) << 12 | (vaddr & 4095)
+    };
+    Some(unsafe { phys::frame_ptr(u64::from(physical >> 12)).add((physical & 4095) as usize) })
 }
 
 /// Resolve user bytes through the active directory, consuming only donated
@@ -707,7 +733,7 @@ mod space_ops {
             0xc7,0,0x78,0x56,0x34,0x12, 0x05,0,0x10,0,0,
             0x49,0x75,0xf2, 0xcd,0x80,
         ];
-        machine.copy_to(code, &program);
+        machine.copy_to(code, &program, crate::test_memory::input(5));
         let mut regs = Regs::empty();
         regs.init_user_process(code as u32, 0x80000);
         let mut exhausted = false;

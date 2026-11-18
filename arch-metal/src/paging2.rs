@@ -527,8 +527,8 @@ static mut KERNEL_ROOT: *mut RawPage = core::ptr::null_mut();
 // observe ownership, retain/copy children, publish the private parent, release
 // old backing. Atomic reference counts alone cannot order these steps.
 // The lock is released before guest execution; different CPUs still run guests
-// concurrently. A synchronous fault through the recursive view reenters on
-// the owning CPU and consumes that CPU's supplied fault pages.
+// concurrently. Nested paging operations on the owning CPU share the lock;
+// every recursive table access must already be resident and writable.
 static PAGING_OWNER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[thread_local]
 static PAGING_DEPTH: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
@@ -1548,7 +1548,7 @@ pub(crate) fn map_boot_mmio(va: usize, phys: u64) -> bool {
 }
 
 /// Ensure the recursive page-table view can represent a kernel virtual range.
-pub(crate) fn prepare_kernel_mapping(vpage_start: usize, count: usize, table: u64) -> bool {
+pub fn prepare_kernel_mapping(vpage_start: usize, count: usize, table: u64) -> bool {
     let _paging = PagingGuard::lock();
     let end = vpage_start.checked_add(count).expect("kernel mapping range overflow");
     assert!(end <= NUM_PAGES, "kernel mapping range outside page tables");
@@ -1846,27 +1846,16 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         memory::release_page(temp_swap(saved));
         return;
     } else {
-        // Leaf: copy old page content into a new physical page.
-        if idx == 0 {
-            // Page 0: can't read from VA 0 (null ptr). Copy via temp_map.
-            let scratch = &raw mut crate::SCRATCH;
-            let saved = temp_swap(old_phys);
-            unsafe { let tp = &raw const TEMP_PAGE; core::ptr::copy_nonoverlapping(
-                (*tp).0.as_ptr(), (*scratch).0.as_mut_ptr(), PAGE_SIZE); }
-            let _ = fresh_temp_page();
-            unsafe { let tp = &raw mut TEMP_PAGE; core::ptr::copy_nonoverlapping(
-                (*scratch).0.as_ptr(), (*tp).0.as_mut_ptr(), PAGE_SIZE); }
-            temp_swap(saved)
-        } else {
-            // Other pages: read directly from user VA
-            let saved = fresh_temp_page();
-            unsafe {
-                let src = (idx * PAGE_SIZE) as *const u8;
-                let tp = &raw mut TEMP_PAGE;
-                core::ptr::copy_nonoverlapping(src, (*tp).0.as_mut_ptr(), PAGE_SIZE);
-            }
-            temp_swap(saved)
-        }
+        // Both frames are reached through the resident physical window.
+        // A COW operation must never dereference a guest virtual address.
+        let scratch = &raw mut crate::SCRATCH;
+        let saved = temp_swap(old_phys);
+        unsafe { core::ptr::copy_nonoverlapping(
+            (&raw const TEMP_PAGE).cast::<u8>(), scratch.cast::<u8>(), PAGE_SIZE); }
+        let _ = fresh_temp_page();
+        unsafe { core::ptr::copy_nonoverlapping(
+            scratch.cast::<u8>(), (&raw mut TEMP_PAGE).cast::<u8>(), PAGE_SIZE); }
+        temp_swap(saved)
     };
 
     let mut incoming = entries[idx];
@@ -1922,6 +1911,13 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
     let ref_count = crate::memory::get_ref_count(entries[parent_idx].page());
 
     if ref_count == 1 {
+        // A formerly shared table can now have one owner while its ancestor
+        // remains hardware read-only. Make the recursive view writable before
+        // clearing children; teardown must not invoke the fault handler.
+        if !entries[parent_idx].hw_writable() {
+            entries[parent_idx].set_hw_writable(true);
+            invalidate_tlb();
+        }
         // Sole owner — walk children
         let child_base = (parent_idx - PAGE_TABLE_BASE_IDX) * epp;
         for j in 0..epp {

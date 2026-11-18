@@ -265,21 +265,20 @@ pub trait Diagnostics {
 /// struct of integers). Reading a `bool`/`char`/fieldless-enum out of guest
 /// memory would be UB; the kernel never does.
 ///
-/// These are raw transfers over the active space. The caller must supply
-/// sufficient fault backing for all pages touched. Kernel bulk transfers split
-/// at page boundaries and replenish their PageSupply between calls.
+/// Transfers walk user mappings explicitly; they never rely on supervisor
+/// page faults. Bulk copies receive owned backing for demand/COW resolution
+/// and return unused pages. Inaccessible memory returns None; a successful
+/// prefix may already have been copied. Callers supply enough backing for the
+/// whole transfer (at most five frames per touched page).
 pub trait GuestBytes {
-    /// Copy a high user buffer through a backend-owned window. False means EFAULT.
-    fn high_copy(&mut self, _address: u64, _buffer: &mut [u8], _to_user: bool, pages: PageInput) -> (bool, PageInput) { (false, pages) }
-
     /// Read a `T` at `addr` (volatile, unaligned, bytewise into a local).
     fn read<T: Copy>(&self, addr: u64) -> T;
     /// Write a `T` at `addr` (volatile, unaligned, bytewise from a local).
     fn write<T: Copy>(&mut self, addr: u64, val: T);
     /// Copy `dst.len()` bytes from guest memory at `addr` into `dst`.
-    fn copy_from(&self, addr: u64, dst: &mut [u8]);
+    fn copy_from(&self, addr: u64, dst: &mut [u8], pages: PageInput) -> (Option<()>, PageInput);
     /// Copy `src` into guest memory at `addr`.
-    fn copy_to(&mut self, addr: u64, src: &[u8]);
+    fn copy_to(&mut self, addr: u64, src: &[u8], pages: PageInput) -> (Option<()>, PageInput);
     /// Copy bytes from guest memory at `addr` into `dst`, stopping before the
     /// first NUL or at `dst.len()`. Returns the number of bytes copied (the
     /// C-string length, capped at `dst.len()`); the NUL is not copied.

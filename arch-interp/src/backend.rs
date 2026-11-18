@@ -171,7 +171,7 @@ pub(crate) fn check_virtual_irq_frame(machine: &mut Interp) {
     let io = arch_abi::IoPolicy::deny_all();
     let limit = core::time::Duration::from_millis(100);
     for opcode in [0xfb, 0x9d, 0xcf] { // STI, POPF, IRET
-        machine.copy_to((CODE) as u64, &[opcode, 0xcd, 0x31]);
+        machine.copy_to((CODE) as u64, &[opcode, 0xcd, 0x31], crate::test_memory::input(5));
         #[cfg(feature = "kvm")]
         crate::mmu_tests::executable(CODE as u64);
         let mut pending = Regs::empty();

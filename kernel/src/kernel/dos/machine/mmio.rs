@@ -429,6 +429,7 @@ pub(in crate::kernel::dos) trait FaultBus {
     fn write8(&mut self, off: u32, value: u8);
     fn offset(&self, address: u32) -> Option<u32>;
     fn guest_read(&self, address: u32) -> u8;
+    fn guest_read_bytes(&self, address: u32, bytes: &mut [u8]);
     fn guest_write(&mut self, address: u32, value: u8);
     /// Forward contiguous RAM-to-device copy. A decline must not read or write
     /// anything. The caller has already limited the string instruction chunk.
@@ -444,28 +445,26 @@ impl<A: crate::Arch> FaultBus for BackendBus<'_, '_, A> {
     fn write8(&mut self, off: u32, value: u8) { self.target.write8(self.machine, off, value); }
     fn offset(&self, address: u32) -> Option<u32> { self.target.offset(address) }
     fn guest_read(&self, address: u32) -> u8 { self.machine.read::<u8>(address as u64) }
+    fn guest_read_bytes(&self, address: u32, bytes: &mut [u8]) {
+        self.machine.copy_from(u64::from(address), bytes);
+    }
     fn guest_write(&mut self, address: u32, value: u8) { self.machine.write(address as u64, value); }
     fn fpu_st0(&self) -> [u8; 10] { self.machine.fpu_st0() }
     fn fpu_pop(&mut self) { self.machine.fpu_pop(); }
     fn end_instruction(&mut self) { self.target.end_instruction(); }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, target: &mut MmioTarget<'_>, cs_base: u32, def32: bool, ds_base: u32, es_base: u32, off: u32) -> bool {
+pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, target: &mut MmioTarget<'_>, segments: &[u32; 6], def32: bool, off: u32) -> bool {
     let mut gprs = [MaybeUninit::uninit(); 16];
     for (i, value) in [regs.rax, regs.rcx, regs.rdx, regs.rbx, regs.frame.rsp,
         regs.rbp, regs.rsi, regs.rdi].into_iter().enumerate() {
         gprs[2 * i].write(value as u32);
         gprs[2 * i + 1].write((value >> 32) as u32);
     }
-    let segments = [es_base, cs_base,
-        super::seg_base_for::<A>(regs, regs.stack_seg()), ds_base,
-        super::seg_base_for::<A>(regs, regs.fs as u16),
-        super::seg_base_for::<A>(regs, regs.gs as u16)];
     let (mut ip, mut flags) = (regs.ip32(), regs.flags32());
     let handled = emulate(&mut BackendBus { machine, target },
         &mut Operands { gprs: &mut gprs, ip: &mut ip, flags: &mut flags },
-        cs_base, def32, &segments, off);
+        segments[1], def32, segments, off);
     for (i, slot) in [&mut regs.rax, &mut regs.rcx, &mut regs.rdx, &mut regs.rbx,
         &mut regs.frame.rsp, &mut regs.rbp, &mut regs.rsi, &mut regs.rdi].into_iter().enumerate() {
         *slot = u64::from(unsafe { gprs[2 * i].assume_init() })
@@ -485,9 +484,10 @@ pub(in crate::kernel::dos) fn emulate(bus: &mut dyn FaultBus, regs: &mut Operand
     // hold a borrow of `regs` while the emulation below mutates it.
     let mut buf = [0u8; 16];
     let code_addr = cs_base.wrapping_add(ip0);
-    for (k, byte) in buf.iter_mut().enumerate() {
-        *byte = bus.guest_read(code_addr.wrapping_add(k as u32));
-    }
+    // Preserve wrapping at the end of the 32-bit linear address space.
+    let first = (0x1_0000_0000u64 - u64::from(code_addr)).min(buf.len() as u64) as usize;
+    bus.guest_read_bytes(code_addr, &mut buf[..first]);
+    if first < buf.len() { bus.guest_read_bytes(0, &mut buf[first..]); }
     if let Some((source, immediate, bytes, len)) = decode_mov_encoding(&|at| buf[at], buf.len(), def32) {
         let value = if source == 255 { immediate } else { regs.get(source, bytes) };
         for b in 0..bytes { bus.write8(off + b, (value >> (b * 8)) as u8); }
@@ -985,6 +985,9 @@ mod tests {
             (0x800..0x820).contains(&address).then(|| address - 0x800)
         }
         fn guest_read(&self, address: u32) -> u8 { self.ram[address as usize] }
+        fn guest_read_bytes(&self, address: u32, bytes: &mut [u8]) {
+            bytes.copy_from_slice(&self.ram[address as usize..address as usize + bytes.len()]);
+        }
         fn guest_write(&mut self, address: u32, value: u8) { self.ram[address as usize] = value; }
         fn fpu_st0(&self) -> [u8; 10] { unreachable!() }
         fn fpu_pop(&mut self) { unreachable!() }
@@ -1000,6 +1003,9 @@ mod tests {
             (0x40000..0x50000).contains(&address).then(|| address - 0x40000)
         }
         fn guest_read(&self, address: u32) -> u8 { self.ram[address as usize] }
+        fn guest_read_bytes(&self, address: u32, bytes: &mut [u8]) {
+            bytes.copy_from_slice(&self.ram[address as usize..address as usize + bytes.len()]);
+        }
         fn guest_write(&mut self, address: u32, value: u8) { self.ram[address as usize] = value; }
         fn copy_from_ram(&mut self, source: u32, destination: u32, len: u32) -> bool {
             if !self.bulk || source as usize + len as usize > self.ram.len()

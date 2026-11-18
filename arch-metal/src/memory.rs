@@ -76,9 +76,12 @@ impl Drop for FaultGuard {
         }
     }
 }
-/// Whether the current operation's caller-supplied batch still holds a page.
-pub(crate) fn input_available() -> bool {
-    unsafe { (*(&raw const INPUT)).count != 0 }
+/// Whether this operation's explicit input or guest fault reserve has backing.
+pub(crate) fn page_available() -> bool {
+    unsafe {
+        if (*supply()).fault_depth != 0 { (*supply()).count != 0 }
+        else { (*(&raw const INPUT)).count != 0 }
+    }
 }
 /// Consume a donated page. Faults use their guaranteed per-core reserve;
 /// ordinary operations must receive a PageInput from their kernel caller.
