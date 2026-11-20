@@ -683,7 +683,7 @@ static WINDOW_REQUEST: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// Rebuild the primary-window list from live personality endpoints. Native
 /// Windows/OS2 adapters can replace this snapshot with multiple WindowIds.
 pub fn refresh_windows<A: crate::Arch>(
-    threads: &[thread::Thread<A>],
+    threads: &thread::ThreadTable<A>,
     focused: usize,
     fullscreen: bool,
 ) {
@@ -740,7 +740,8 @@ pub fn refresh_windows<A: crate::Arch>(
     }
     let mut count = 0;
     let console_foreground = crate::kernel::linux::console_foreground(threads);
-    for (i, t) in threads.iter().enumerate().skip(1) {
+    for i in threads.active_ids().filter(|&tid| tid != 0) {
+        let t = &threads[i];
         if count >= MAX_LIST {
             break;
         }

@@ -436,7 +436,7 @@ impl WindowsState {
 #[allow(clippy::too_many_arguments)] // Shared executable launch context.
 pub fn exec_ne_into<A: crate::Arch>(
     machine: &mut A,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     tid: usize,
     data: Vec<u8>,
     path: &[u8],
@@ -1072,7 +1072,7 @@ pub(super) fn guest_windows_path(path: &[u8]) -> Vec<u8> {
 #[allow(clippy::too_many_arguments)]
 pub fn exec_pe_into<A: crate::Arch>(
     machine: &mut A,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     tid: usize,
     data: Vec<u8>,
     path: &[u8],

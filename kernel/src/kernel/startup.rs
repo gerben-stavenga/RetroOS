@@ -50,7 +50,7 @@ struct StartupState<A: crate::Arch> {
     master_env: alloc::vec::Vec<u8>,
     bios_workspace: crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos_template: crate::kernel::dos::DosTemplate<A>,
-    threads: alloc::vec::Vec<thread::Thread<A>>,
+    threads: thread::ThreadTable<A>,
     screen: crate::kernel::console::Console,
     sb_card: Option<crate::kernel::drivers::sb16::Sb16>,
     sink: Option<crate::kernel::sound::Sink>,
@@ -835,7 +835,7 @@ fn run<A: crate::Arch>(
     master_env: &[u8],
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos_template: &mut crate::kernel::dos::DosTemplate<A>,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     mut screen: crate::kernel::console::Console,
     mut sb: Option<crate::kernel::drivers::sb16::Sb16>,
     mut sink: Option<crate::kernel::sound::Sink>,
@@ -989,7 +989,7 @@ fn run_program_with_screen<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos_template: &mut crate::kernel::dos::DosTemplate<A>,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     path: &[u8],
     cmdline_tail: &[u8],
     cwd: &[u8],
@@ -1036,7 +1036,7 @@ fn run_program<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos_template: &mut crate::kernel::dos::DosTemplate<A>,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     path: &[u8],
     cmdline_tail: &[u8],
     cwd: &[u8],
@@ -1073,7 +1073,7 @@ fn prepare_program<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos_template: &mut crate::kernel::dos::DosTemplate<A>,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     path: &[u8],
     cmdline_tail: &[u8],
     cwd: &[u8],
@@ -1218,7 +1218,7 @@ fn prepare_program<A: crate::Arch>(
 /// already clean, so the ELF loader can write straight into it.
 fn launch_elf<A: crate::Arch>(
     machine: &mut A,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     buf: crate::kernel::exec::ExecutableImage,
     path: &[u8],
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
@@ -1256,7 +1256,7 @@ fn launch_elf<A: crate::Arch>(
 /// Launch a native 32-bit OS/2 LX image as a fresh process.
 fn launch_os2<A: crate::Arch>(
     machine: &mut A,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     buf: alloc::vec::Vec<u8>,
     path: &[u8],
     cwd: &[u8],
@@ -1288,7 +1288,7 @@ fn launch_os2<A: crate::Arch>(
 /// Launch a native 32-bit Windows PE image as a fresh process.
 fn launch_windows<A: crate::Arch>(
     machine: &mut A,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     buf: alloc::vec::Vec<u8>,
     path: &[u8],
     env: &[u8],
@@ -1317,7 +1317,7 @@ fn launch_windows<A: crate::Arch>(
 /// Launch a native 16-bit Windows NE image as a fresh process.
 fn launch_win16<A: crate::Arch>(
     machine: &mut A,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     buf: alloc::vec::Vec<u8>,
     path: &[u8],
     cwd: &[u8],
@@ -1358,7 +1358,7 @@ fn launch_win16<A: crate::Arch>(
 fn present_desktop<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    threads: &[thread::Thread<A>],
+    threads: &thread::ThreadTable<A>,
     display: &mut crate::kernel::display::Display,
     windows: &mut crate::kernel::gui::WindowManager,
     sound: crate::kernel::osd::SoundView,
@@ -1426,7 +1426,7 @@ fn present_desktop<A: crate::Arch>(
 fn event_loop<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     first_tid: usize,
     sb_card: Option<crate::kernel::drivers::sb16::Sb16>,
     sink: &mut Option<crate::kernel::sound::Sink>,
@@ -1472,8 +1472,7 @@ fn event_loop<A: crate::Arch>(
     // hardware with at most one guest owner, and the loop is what outlives
     // every owner. `None` here means a thread currently holds it — or that
     // the kernel mixer owns the card and it never travels at all.
-    let mut sb_handoff = threads
-        .get_mut(first_tid)
+    let mut sb_handoff = thread::get_thread(threads, first_tid)
         .and_then(|t| t.personality.adopt_sb(machine, sb_card));
 
     // Live KLOG writes flush the backing FAT file. DOS programs may issue one
@@ -1775,7 +1774,8 @@ fn event_loop<A: crate::Arch>(
             if software && crate::kernel::midi_bank::get().is_none() {
                 crate::compact_println!("MIDI: HDA synth unavailable: no General MIDI bank");
             } else {
-                for thread in threads.iter_mut() {
+                for tid in threads.active_ids() {
+                    let thread = &mut threads[tid];
                     if let thread::Personality::Dos(dos) = &mut thread.personality {
                         if software {
                             dos.pc.audio.lock().mpu.start_software_route();
@@ -1850,7 +1850,8 @@ fn event_loop<A: crate::Arch>(
             deadlines.include(Some(if end == world_now_ns { end } else { injected_keys.deadline() }));
         }
         let mut blocked_polling = false;
-        for (tid, thread) in threads.iter_mut().enumerate() {
+        for tid in threads.active_ids() {
+            let thread = &mut threads[tid];
             if matches!(thread.kernel.state, thread::ThreadState::Unused | thread::ThreadState::Zombie | thread::ThreadState::OnCpu) { continue; }
             if tid != ctx.tid { thread.personality.advance_background_timers(world_now_ns); }
             deadlines.include(thread.personality.next_deadline(world_now_ns, tid == ctx.tid));
@@ -1956,7 +1957,7 @@ fn event_loop<A: crate::Arch>(
                 ctx.device_cycles = super::dos::planar::collect();
                 event
             };
-            let peers_pending = threads.iter().any(|task| task.kernel.pending_event.is_some());
+            let peers_pending = threads.active_ids().any(|tid| threads[tid].kernel.pending_event.is_some());
             let thread = ctx.thread(threads);
             let clock_read = matches!(&thread.personality, thread::Personality::Linux(_))
                 && matches!(kevent, crate::KernelEvent::Syscall | crate::KernelEvent::SoftInt(0x80))
@@ -2108,7 +2109,7 @@ fn event_loop<A: crate::Arch>(
 
 fn apply_sound_mode_request<A: crate::Arch>(
     machine: &mut A,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     tid: usize,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::Sb16>,
     sink: &mut Option<crate::kernel::sound::Sink>,
@@ -2422,7 +2423,7 @@ fn dispatch<A: crate::Arch>(
 fn switch_focus_and_run<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
@@ -2638,7 +2639,7 @@ fn apply_current_presentation<A: crate::Arch>(
 pub(crate) fn handle_fork_exec<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     vcpu: &mut Regs,
     parent_tid: usize,
     path: &[u8],
@@ -2916,8 +2917,8 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             child.kernel.vcpu.space = discarded_child;
             machine.destroy_space(&mut child.kernel.vcpu.space);
             child.personality = thread::Personality::Linux(crate::kernel::linux::LinuxState::new());
-            child.kernel.state = thread::ThreadState::Unused;
         }
+        threads.release_slot(child_tid);
         let parent = thread::get_thread(threads, parent_tid).unwrap();
         parent.personality.on_resume(machine);
         if let Some(display) = fork_display {

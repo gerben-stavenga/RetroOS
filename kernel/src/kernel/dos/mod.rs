@@ -1247,7 +1247,7 @@ pub(crate) fn initialize_dos_template<A: crate::Arch>(machine: &mut A, regs: &mu
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
 #[allow(clippy::too_many_arguments)]
-pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, policy: LaunchPolicy, vga: DosVideo) {
+pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut thread::ThreadTable<A>, tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, policy: LaunchPolicy, vga: DosVideo) {
     let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
     crate::kernel::memory::map_dos_memory(machine);
@@ -1357,7 +1357,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
 #[inline(never)]
 pub(crate) fn handle_synth_child<A: crate::Arch>(
     machine: &mut A,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     regs: &mut Regs,
     tid: usize,
     pid: i32,
@@ -1414,7 +1414,7 @@ fn init_process_thread_vm86_state<A: crate::Arch>(_machine: &mut A, thread: &mut
 /// Used by the boot/init path; fork+exec uses `exec_dos_into` instead.
 /// Returns the new tid; caller drives the event loop.
 #[allow(clippy::too_many_arguments)]
-pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosTemplate<A>, threads: &mut [thread::Thread<A>], buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
+pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosTemplate<A>, threads: &mut thread::ThreadTable<A>, buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
 
     dos_template.activate_clone(machine);
 

@@ -12,8 +12,8 @@ use crate::kernel::thread;
 /// make it Ready, but neither user execution nor kernel I/O polling is safe
 /// until release_vfork returns that space. Apply this to every selector,
 /// including the child-exit shortcut and explicit window selection.
-pub(crate) fn vfork_suspended<A: crate::Arch>(threads: &[thread::Thread<A>], tid: usize) -> bool {
-    threads.iter().any(|child| matches!(&child.personality,
+pub(crate) fn vfork_suspended<A: crate::Arch>(threads: &thread::ThreadTable<A>, tid: usize) -> bool {
+    threads.active_ids().any(|id| matches!(&threads[id].personality,
         thread::Personality::Linux(linux) if linux.borrows_space_from(tid)))
 }
 
@@ -21,14 +21,13 @@ pub(crate) fn vfork_suspended<A: crate::Arch>(threads: &[thread::Thread<A>], tid
 /// Ready peers run first. Other blocked peers can be activated for kernel I/O
 /// polling; their user code stays parked until the operation completes.
 pub(crate) fn linux_blocked_successor<A: crate::Arch>(
-    threads: &[thread::Thread<A>], current: usize, poll_blocked: bool,
+    threads: &thread::ThreadTable<A>, current: usize, poll_blocked: bool,
 ) -> Option<usize> {
     let thread::Personality::Linux(owner) = &threads[current].personality else { return None; };
     for blocked in [false, true] {
         if blocked && !poll_blocked { break; }
-        for step in 1..threads.len() {
-            let index = (current + step) % threads.len();
-            if index == 0 { continue; }
+        for index in threads.active_after(current) {
+            if index == 0 || index == current { continue; }
             let candidate = &threads[index];
             let thread::Personality::Linux(linux) = &candidate.personality else { continue; };
             if !owner.shares_terminal(linux) { continue; }
@@ -49,7 +48,7 @@ pub(crate) fn linux_blocked_successor<A: crate::Arch>(
 /// two helpers remain runnable. Polling happens after activating that peer's
 /// address space, so its saved user pointers are interpreted correctly.
 pub(crate) fn linux_timeslice_successor<A: crate::Arch>(
-    threads: &[thread::Thread<A>], current: usize, cursor: &mut usize,
+    threads: &thread::ThreadTable<A>, current: usize, cursor: &mut usize,
 ) -> Option<usize> {
     let owner = &threads[current];
     if !matches!(owner.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running) {
@@ -63,7 +62,7 @@ pub(crate) fn linux_timeslice_successor<A: crate::Arch>(
     let start = if threads.get(*cursor).is_some_and(|candidate|
         matches!(&candidate.personality, thread::Personality::Linux(linux) if owner.shares_terminal(linux)))
     { *cursor } else { current };
-    let next = (1..=threads.len()).map(|step| (start + step) % threads.len()).find(|&index| {
+    let next = threads.active_after(start).find(|&index| {
         let candidate = &threads[index];
         let thread::Personality::Linux(linux) = &candidate.personality else { return false; };
         index != 0 && index != current && owner.shares_terminal(linux)
@@ -96,7 +95,7 @@ pub enum Verdict {
 pub fn verdict<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
@@ -124,7 +123,7 @@ pub fn verdict<A: crate::Arch>(
 fn next_after<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
@@ -193,7 +192,7 @@ fn next_after<A: crate::Arch>(
 fn shutdown<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     tid: usize,
     display: &mut Option<crate::kernel::display::Display>,
 ) -> ! {
@@ -249,7 +248,7 @@ fn shutdown<A: crate::Arch>(
 
 /// Honor the F12 window picker's explicit target. This is a pure focus shift:
 /// it does not wake a blocked thread or break waitpid.
-pub(crate) fn focus_request<A: crate::Arch>(threads: &[thread::Thread<A>], tid: usize) -> Option<usize> {
+pub(crate) fn focus_request<A: crate::Arch>(threads: &thread::ThreadTable<A>, tid: usize) -> Option<usize> {
     // Ignore a stale target that is the current owner, out of range, or no
     // longer active.
     if let Some(target) = thread::take_switch_target() {
@@ -259,7 +258,7 @@ pub(crate) fn focus_request<A: crate::Arch>(threads: &[thread::Thread<A>], tid: 
         // it is scheduled round-robin and may consume the request meant to
         // focus itself). That case is a focus-only handoff downstream.
         if (target != tid || crate::kernel::focus::focused() != target)
-            && target < threads.len()
+            && target < thread::MAX_THREADS
             && !vfork_suspended(threads, target)
             && matches!(
                 threads[target].kernel.state,

@@ -4,6 +4,7 @@ use super::setup::{self, KvmCpu};
 use arch_abi::{KernelEvent, vm::{self, Exchange}};
 use kvm_ioctls::VcpuExit;
 use std::os::fd::AsRawFd;
+use core::sync::atomic::Ordering;
 
 pub(super) fn until_return(cpu: &mut KvmCpu, executing: bool) {
     loop {
@@ -53,9 +54,16 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
             (*cpu.message).operation = vm::op::EXECUTE;
             (*cpu.message).regs = (*(&raw const crate::vcpu::REGS)).regs;
         }
-        setup::arm_alarm(Some(crate::machine::now().saturating_add(max_time.as_nanos().min(u64::MAX as u128) as u64)));
+        let now = crate::machine::now();
+        let deadline = now.saturating_add(max_time.as_nanos().min(u64::MAX as u128) as u64);
+        // Clear immediate_exit before inspecting the alarm: an older signal
+        // invalidates its deadline, and a subsequent signal still forces exit.
+        if !setup::alarm_deadline().is_some_and(|armed| now < armed && armed <= deadline) {
+            setup::arm_alarm(deadline);
+        }
+        setup::CPU_TID.store(cpu.tid, Ordering::Release);
         until_return(cpu, true);
-        setup::arm_alarm(None);
+        setup::CPU_TID.store(0, Ordering::Release);
         let message = unsafe { &*cpu.message };
         unsafe { (*(&raw mut crate::vcpu::REGS)).regs = message.regs; }
         KernelEvent::decode(message.result[0] as u32, message.result[1])

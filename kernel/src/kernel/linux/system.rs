@@ -6,9 +6,10 @@ static TASKS: AtomicU16 = AtomicU16::new(1);
 
 /// The event loop owns the task table; publish a count without retaining a
 /// pointer into it while a personality is handling a syscall.
-pub(super) fn refresh_tasks<A: crate::Arch>(threads: &[thread::Thread<A>]) {
+pub(super) fn refresh_tasks<A: crate::Arch>(threads: &thread::ThreadTable<A>) {
     let count: usize = threads
-        .iter()
+        .active_ids()
+        .map(|tid| &threads[tid])
         .filter(|task| {
             !matches!(
                 task.kernel.state,

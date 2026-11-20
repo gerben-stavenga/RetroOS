@@ -95,11 +95,11 @@ fn queue<A: crate::Arch>(task: &mut thread::Thread<A>, signal: u8, sender: i32) 
 /// Process-directed kill, including signal zero liveness probes. All Linux
 /// processes currently have the fixed session credentials. Group selection
 /// uses inherited process-group membership, independently of reusable PIDs.
-pub(crate) fn kill<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>],
+pub(crate) fn kill<A: crate::Arch>(machine: &mut A, threads: &mut thread::ThreadTable<A>,
     caller: usize, regs: &mut Regs, pid: i32, signal: u8) -> Option<thread::KernelAction>
 {
     let mut found = false;
-    for index in 0..threads.len() {
+    for index in threads.active_ids() {
         let id = index as i32;
         let selected = match pid {
             0 => process_group::group(id) == process_group::group(caller as i32),
@@ -125,11 +125,12 @@ pub(crate) fn kill<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Threa
 }
 
 /// Resolve Linux thread IDs across processes; tgkill also verifies the group.
-pub(crate) fn kill_thread<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>],
+pub(crate) fn kill_thread<A: crate::Arch>(machine: &mut A, threads: &mut thread::ThreadTable<A>,
     caller: usize, regs: &mut Regs, group: Option<i32>, target: i32, signal: u8) -> Option<thread::KernelAction>
 {
     let mut found = false;
-    for task in threads.iter_mut() {
+    for tid in threads.active_ids() {
+        let task = &mut threads[tid];
         if !matches!(task.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked)
             || group.is_some_and(|id| id != task.kernel.tid) { continue; }
         let thread::Personality::Linux(linux) = &mut task.personality else { continue; };
@@ -187,7 +188,7 @@ pub(crate) fn child_exited<A: crate::Arch>(parent: &mut thread::Thread<A>, child
 
 /// Called with the task table, without activating any child's address space.
 /// `creator=None` means all threads in the parent process are terminating.
-pub(crate) fn parent_exited<A: crate::Arch>(threads: &mut [thread::Thread<A>], process: usize, creator: Option<i32>) {
+pub(crate) fn parent_exited<A: crate::Arch>(threads: &mut thread::ThreadTable<A>, process: usize, creator: Option<i32>) {
     let live_linux = |task: &thread::Thread<A>| matches!(task.personality, thread::Personality::Linux(_))
         && matches!(task.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked | thread::ThreadState::OnCpu);
     // PID 1 may be DN, not a Linux init. Adopting a daemon into DN makes
@@ -199,7 +200,7 @@ pub(crate) fn parent_exited<A: crate::Arch>(threads: &mut [thread::Thread<A>], p
         adopt = 1;
     } else if let thread::Personality::Linux(owner) = &threads[process].personality {
         let mut parent = threads[process].kernel.parent_tid;
-        for _ in 0..threads.len() {
+        for _ in 0..thread::MAX_THREADS {
             let Some(task) = usize::try_from(parent).ok().and_then(|id| threads.get(id)) else { break; };
             if parent == process as i32 || !live_linux(task) { break; }
             let thread::Personality::Linux(linux) = &task.personality else { break; };
@@ -208,7 +209,8 @@ pub(crate) fn parent_exited<A: crate::Arch>(threads: &mut [thread::Thread<A>], p
             parent = task.kernel.parent_tid;
         }
     }
-    for task in threads.iter_mut() {
+    for tid in threads.active_ids() {
+        let task = &mut threads[tid];
         if task.kernel.parent_tid != process as i32 || matches!(task.kernel.state, thread::ThreadState::Unused | thread::ThreadState::Zombie) { continue; }
         if let thread::Personality::Linux(linux) = &mut task.personality {
             let matches = linux.parent_creator.is_some() && (creator.is_none() || linux.parent_creator == creator);
@@ -226,7 +228,7 @@ pub(crate) fn parent_exited<A: crate::Arch>(threads: &mut [thread::Thread<A>], p
     }
 }
 
-pub(crate) fn notify_thread_exits<A: crate::Arch>(threads: &mut [thread::Thread<A>], process: usize) {
+pub(crate) fn notify_thread_exits<A: crate::Arch>(threads: &mut thread::ThreadTable<A>, process: usize) {
     let exited = match &mut threads[process].personality {
         thread::Personality::Linux(linux) => async_io::take_exited(&mut linux.async_io),
         _ => return,

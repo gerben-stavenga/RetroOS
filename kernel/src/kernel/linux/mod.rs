@@ -88,14 +88,13 @@ pub const CONSOLE_ENDPOINT: crate::kernel::gui::EndpointId =
 static CONSOLE_FOREGROUND: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-pub fn console_foreground<A: crate::Arch>(threads: &[thread::Thread<A>]) -> Option<usize> {
+pub fn console_foreground<A: crate::Arch>(threads: &thread::ThreadTable<A>) -> Option<usize> {
     let live_linux = |t: &thread::Thread<A>| matches!(t.personality, thread::Personality::Linux(_))
         && matches!(t.kernel.state, thread::ThreadState::Running
             | thread::ThreadState::Ready | thread::ThreadState::Blocked);
     let tid = CONSOLE_FOREGROUND.load(core::sync::atomic::Ordering::Relaxed);
     if threads.get(tid).is_some_and(live_linux) { return Some(tid); }
-    threads.iter().enumerate().skip(1).rev()
-        .find(|(_, t)| live_linux(t)).map(|(tid, _)| tid)
+    threads.active_ids().filter(|&tid| tid != 0 && live_linux(&threads[tid])).last()
 }
 
 pub fn foreground_console(tid: usize) {
@@ -496,7 +495,7 @@ pub fn handle_event<A: crate::Arch>(
     }
 }
 
-pub fn refresh_system_tasks<A: crate::Arch>(threads: &[thread::Thread<A>], current: usize, ticks: u64) {
+pub fn refresh_system_tasks<A: crate::Arch>(threads: &thread::ThreadTable<A>, current: usize, ticks: u64) {
     let _sample = super::event_profile::FileIoScope::start(super::event_profile::TASK_SNAPSHOT, 0);
     crate::kernel::fs::processes::PROCESSES.publish(threads, current, ticks);
     system::refresh_tasks(threads);
@@ -508,9 +507,10 @@ pub fn try_vsyscall<A: crate::Arch>(machine: &mut A, regs: &mut Regs, address: u
 }
 
 /// Lock releases can wake another process without borrowing its guest memory.
-pub fn wake_record_locks<A: crate::Arch>(threads: &mut [thread::Thread<A>], current: usize, regs: &mut Regs) {
+pub fn wake_record_locks<A: crate::Arch>(threads: &mut thread::ThreadTable<A>, current: usize, regs: &mut Regs) {
     if !crate::kernel::fs::record_locks::take_changed() { return; }
-    for thread in threads {
+    for tid in threads.active_ids() {
+        let thread = &mut threads[tid];
         if thread.kernel.state != thread::ThreadState::Blocked { continue; }
         if let thread::Personality::Linux(linux) = &mut thread.personality
             && let Some(request) = linux.pending_record_lock
@@ -1140,12 +1140,12 @@ pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs
 
 /// Load an ELF binary into the current address space and initialize the thread.
 /// Caller must have already cleaned/prepared the address space.
-pub(crate) fn exec_elf_image_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: &crate::kernel::exec::ExecutableImage, path: &[u8], args: &[alloc::vec::Vec<u8>], environment: Option<&[u8]>) -> Result<(), i32> {
+pub(crate) fn exec_elf_image_into<A: crate::Arch>(machine: &mut A, threads: &mut thread::ThreadTable<A>, tid: usize, data: &crate::kernel::exec::ExecutableImage, path: &[u8], args: &[alloc::vec::Vec<u8>], environment: Option<&[u8]>) -> Result<(), i32> {
     exec_elf_source_into(machine, threads, tid, data, data.source.as_ref(), path, args, environment)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn exec_elf_source_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: &[u8], source: Option<&crate::kernel::exec::ExecutableFile>, path: &[u8], args: &[alloc::vec::Vec<u8>], environment: Option<&[u8]>) -> Result<(), i32> {
+fn exec_elf_source_into<A: crate::Arch>(machine: &mut A, threads: &mut thread::ThreadTable<A>, tid: usize, data: &[u8], source: Option<&crate::kernel::exec::ExecutableFile>, path: &[u8], args: &[alloc::vec::Vec<u8>], environment: Option<&[u8]>) -> Result<(), i32> {
     // PIE main + dynamic linker load bases. Kept in the low user region
     // (< USER_STACK_TOP) so they don't need the high 64-bit VA range; ld.so
     // mmaps the shared libraries between these and the stack.
@@ -1310,7 +1310,7 @@ fn sys_kill(a: &Args) -> SyscallResult {
 #[inline(never)]
 pub(crate) fn handle_fork<A: crate::Arch>(
     machine: &mut A,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     vcpu: &mut Regs,
     parent_tid: usize,
     child_stack: usize,
@@ -1380,7 +1380,7 @@ pub(crate) fn handle_fork<A: crate::Arch>(
 /// Return the shared image to its suspended owner before child exec/exit
 /// frees memory. A failed exec never reaches this point, so spawn's error
 /// write remains visible in the parent's original address space.
-pub(crate) fn release_vfork<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize) {
+pub(crate) fn release_vfork<A: crate::Arch>(machine: &mut A, threads: &mut thread::ThreadTable<A>, tid: usize) {
     let parent_tid = match &mut threads[tid].personality {
         thread::Personality::Linux(linux) => linux.vfork_parent.take(),
         _ => None,
@@ -1973,7 +1973,7 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
 pub(crate) fn handle_exec<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     vcpu: &mut Regs,
     tid: usize,
     buffer: crate::kernel::exec::ExecutableImage,
@@ -2714,7 +2714,7 @@ fn sys_wait4<A: crate::Arch>(_machine: &mut A, _kt: &mut thread::KernelThread<A>
 #[inline(never)]
 pub(crate) fn handle_wait<A: crate::Arch>(
     machine: &mut A,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     vcpu: &mut Regs,
     tid: usize,
     pid: i32,
@@ -2764,7 +2764,7 @@ pub(crate) fn handle_wait<A: crate::Arch>(
 }
 
 /// Finalize child waits with the parent's root active, after the exit transaction.
-pub(crate) fn reap_waited_child<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], parent: usize) {
+pub(crate) fn reap_waited_child<A: crate::Arch>(machine: &mut A, threads: &mut thread::ThreadTable<A>, parent: usize) {
     let child = match &mut threads[parent].personality {
         thread::Personality::Linux(linux) => linux.reap_child.take(),
         _ => None,
@@ -2805,13 +2805,13 @@ pub(crate) fn reap_waited_child<A: crate::Arch>(machine: &mut A, threads: &mut [
 }
 
 /// Serial diagnostics only: inspect saved process state without switching roots.
-pub(crate) fn debug_processes<A: crate::Arch>(threads: &[thread::Thread<A>], active: usize) {
+pub(crate) fn debug_processes<A: crate::Arch>(threads: &thread::ThreadTable<A>, active: usize) {
     let owner = match &threads[active].personality {
         thread::Personality::Linux(linux) => Some(linux),
         _ => None,
     };
-    for (tid, task) in threads.iter().enumerate().skip(1) {
-        if matches!(task.kernel.state, thread::ThreadState::Unused) { continue; }
+    for tid in threads.active_ids().filter(|&tid| tid != 0) {
+        let task = &threads[tid];
         if let thread::Personality::Linux(linux) = &task.personality {
             let state = match task.kernel.state {
                 thread::ThreadState::Ready => "ready", thread::ThreadState::Running | thread::ThreadState::OnCpu => "running",

@@ -195,7 +195,13 @@ pub(crate) fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
                 regs.rdx = extra as u32 as u64;
                 regs.rcx = extra >> 32;
             } else {
-                super::irq::arm_alarm(Some(super::irq::now(false).saturating_add(max_ns)));
+                let now = super::irq::now(false);
+                let deadline = now.saturating_add(max_ns);
+                // An earlier pending alarm also bounds this execution. An
+                // expired one must be replaced even if its IRQ is still pending.
+                if !super::irq::alarm_deadline().is_some_and(|armed| now < armed && armed <= deadline) {
+                    super::irq::arm_alarm(deadline);
+                }
                 return CallOutcome::Execute;
             }
         },
@@ -338,7 +344,6 @@ pub(crate) fn swap_regs(regs: &mut Regs) {
 #[cfg(not(feature = "kvm"))]
 pub(crate) fn return_to_kernel(regs: &mut Regs, event: arch_abi::KernelEvent) {
     crate::planar::publish();
-    crate::irq::arm_alarm(None);
     crate::traps::swap_regs(regs);
     let (event, extra) = event.encode();
     regs.rax = event as u64;

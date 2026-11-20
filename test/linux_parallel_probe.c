@@ -133,6 +133,17 @@ int main(int argc, char **argv) {
     for (unsigned i=0; i<8; ++i) {
         int status; assert(wait(&status)>0 && WIFEXITED(status) && WEXITSTATUS(status)==0);
     }
+    assert(munmap((void *)high, 2*1024*1024) == 0);
+    // Cross the task-table capacity with few live children: sparse high IDs
+    // and reused slots must remain schedulable, waitable and reapable.
+    for (unsigned i=0; i<1100; ++i) {
+        pid_t child = fork(); assert(child >= 0);
+        if (!child) _exit(23);
+        int status;
+        assert(waitpid(child, &status, 0) == child);
+        assert(WIFEXITED(status) && WEXITSTATUS(status) == 23);
+    }
+    fprintf(stderr,"PARALLEL_SLOT_REUSE_PASS children=1100\n");
     fprintf(stderr,"PARALLEL_PROCESS_PASS pinned=1 cow=1 wait_status=1 shared_descriptors=1 queued_vfork=1 children=%u\n",CHILDREN);
     return 0;
 }

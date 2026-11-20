@@ -3,7 +3,7 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::{any::TypeId, cell::UnsafeCell, sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering}};
 use crate::{Arch, KernelEvent, Regs};
-use super::{exec_ctx::ExecutionContext, thread::{self, Thread, ThreadState}};
+use super::{exec_ctx::ExecutionContext, thread::{self, ThreadTable, ThreadState}};
 
 const PARKED: u32 = 0;
 const IDLE: u32 = 1;
@@ -171,7 +171,7 @@ impl Parallel {
     fn available<A: Arch>(&self, cpu: usize) -> bool {
         cpu == 0 || slots::<A>().get(cpu).is_some_and(|s| s.state.load(Ordering::Acquire) == IDLE)
     }
-    fn affinity<A: Arch>(&mut self, threads: &mut [Thread<A>], tid: usize, current: usize) -> usize {
+    fn affinity<A: Arch>(&mut self, threads: &mut ThreadTable<A>, tid: usize, current: usize) -> usize {
         let owner = match &threads[tid].personality {
             thread::Personality::Linux(linux) => linux.borrowed_space_owner(), _ => None,
         };
@@ -202,16 +202,16 @@ impl Parallel {
         }
         threads[tid].kernel.execution_cpu
     }
-    pub fn pending<A: Arch>(threads: &[Thread<A>], current: usize) -> Option<usize> {
+    pub fn pending<A: Arch>(threads: &ThreadTable<A>, current: usize) -> Option<usize> {
         if threads[current].kernel.pending_event.is_some() { return None; }
-        (1..threads.len()).map(|n| (current + n) % threads.len()).find(|&tid|
+        threads.active_after(current).find(|&tid|
             threads[tid].kernel.pending_event.is_some()
             && matches!(threads[tid].kernel.state, ThreadState::Ready | ThreadState::Running))
     }
     /// Assign runnable processes to CPUs and install the BSP's selected context.
     /// This only transfers ownership; the event loop executes the local context.
     pub fn schedule<A: Arch>(
-        &mut self, machine: &mut A, threads: &mut [Thread<A>], ctx: &mut ExecutionContext<A>,
+        &mut self, machine: &mut A, threads: &mut ThreadTable<A>, ctx: &mut ExecutionContext<A>,
         deadline: u64,
     ) {
         self.kernel_cycles = 0;
@@ -230,7 +230,7 @@ impl Parallel {
         let cpu = self.affinity(threads, current, current);
         if self.available::<A>(cpu) { chosen[cpu] = current; }
         let now = machine.now();
-        for tid in (current + 1..threads.len()).chain(1..=current) {
+        for tid in threads.active_after(current).filter(|&tid| tid != 0) {
             if tid == current || threads[tid].kernel.pending_event.is_some()
                 || !matches!(threads[tid].kernel.state, ThreadState::Ready | ThreadState::Running)
                 || !matches!(&threads[tid].personality, thread::Personality::Linux(linux)
@@ -328,7 +328,7 @@ fn wait_for_slot<A: Arch>(machine: &A, slot: &Slot<A>, deadline: u64) {
 
 /// Acquire completed process states. RUN loans are exclusively worker-owned;
 /// their task-table rows contain only stable metadata and shared console refs.
-pub(crate) fn collect_finished<A: Arch>(threads: &mut [Thread<A>]) {
+pub(crate) fn collect_finished<A: Arch>(threads: &mut ThreadTable<A>) {
     for slot in slots::<A>() {
         if slot.state.load(Ordering::Acquire) != DONE { continue; }
         let tid = slot.tid.load(Ordering::Relaxed);
@@ -350,7 +350,7 @@ pub(crate) fn collect_finished<A: Arch>(threads: &mut [Thread<A>]) {
 }
 
 /// Cross-process mutation acquires just its target's execution ownership.
-pub(crate) fn take_process<A: Arch>(machine: &mut A, threads: &mut [Thread<A>], tid: usize) {
+pub(crate) fn take_process<A: Arch>(machine: &mut A, threads: &mut ThreadTable<A>, tid: usize) {
     if threads[tid].kernel.state != ThreadState::OnCpu { return; }
     let slot = &slots::<A>()[threads[tid].kernel.execution_cpu];
     slot.cancel.store(true, Ordering::Release);
@@ -361,17 +361,17 @@ pub(crate) fn take_process<A: Arch>(machine: &mut A, threads: &mut [Thread<A>], 
     collect_finished::<A>(threads);
     super::platform::refresh_kernel_mappings();
 }
-pub(crate) fn stop_all<A: Arch>(machine: &mut A, threads: &mut [Thread<A>]) {
-    for tid in 1..threads.len() { take_process(machine, threads, tid); }
+pub(crate) fn stop_all<A: Arch>(machine: &mut A, threads: &mut ThreadTable<A>) {
+    for tid in threads.active_ids().filter(|&tid| tid != 0) { take_process(machine, threads, tid); }
 }
 
 /// Lifecycle code keeps one task-table owner. Acquire only rows it can mutate;
 /// unrelated processes continue user execution and kernel handlers throughout.
-pub(crate) fn prepare_action<A: Arch>(machine: &mut A, threads: &mut [Thread<A>], current: usize, action: &thread::KernelAction) {
+pub(crate) fn prepare_action<A: Arch>(machine: &mut A, threads: &mut ThreadTable<A>, current: usize, action: &thread::KernelAction) {
     let retiring_threads = matches!(&threads[current].personality,
         thread::Personality::Linux(linux) if linux.has_exited_threads());
     let related = retiring_threads || matches!(action, thread::KernelAction::Exit(_) | thread::KernelAction::Signal { .. } | thread::KernelAction::ThreadSignal { .. });
-    for tid in 1..threads.len() {
+    for tid in threads.active_ids().filter(|&tid| tid != 0) {
         let selected = match action {
             thread::KernelAction::Shutdown => true,
             thread::KernelAction::Switch(target) | thread::KernelAction::WakeChild(target) => tid == *target,

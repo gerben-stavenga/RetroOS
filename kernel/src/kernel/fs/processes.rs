@@ -90,7 +90,7 @@ fn stat_text(info: Info) -> Vec<u8> {
     text.into_bytes()
 }
 impl ProcessFs {
-    pub fn publish<A: crate::Arch>(&self, threads: &[thread::Thread<A>], current: usize, ticks: u64) {
+    pub fn publish<A: crate::Arch>(&self, threads: &thread::ThreadTable<A>, current: usize, ticks: u64) {
         enter_process(current as i32);
         let mut snapshot = self.tasks.lock();
         // Keep the wall-clock boot epoch stable as the RTC advances. Linux
@@ -103,8 +103,8 @@ impl ProcessFs {
         snapshot.tasks.clear();
         snapshot.tasks.extend(
             threads
-                .iter()
-                .filter(|t| t.kernel.state != thread::ThreadState::Unused)
+                .active_ids()
+                .map(|tid| &threads[tid])
                 .map(|t| Info {
                     pid: t.kernel.tid,
                     parent: t.kernel.parent_tid,

@@ -147,6 +147,28 @@ fn kvm_engine_proofs() {
     drain_input(&mut |event, _| input |= matches!(event, arch_abi::Irq::Key(0x1e)));
     assert!(input, "input was lost during the idle transition");
 
+    // Returning through a software interrupt must leave the one-shot usable by
+    // the next execute. A shorter budget must replace it; a signal delivered
+    // while the host is running must invalidate it before another guest entry.
+    set_regs(spinning);
+    assert!(matches!(execute(core::time::Duration::from_millis(1)), KernelEvent::Irq));
+    set_regs(resumed);
+    assert!(matches!(execute(core::time::Duration::from_secs(2)), KernelEvent::SoftInt(0x31)));
+    let armed = setup::alarm_deadline().expect("software interrupt cancelled the alarm");
+    set_regs(resumed);
+    assert!(matches!(execute(core::time::Duration::from_secs(3)), KernelEvent::SoftInt(0x31)));
+    assert_eq!(setup::alarm_deadline(), Some(armed), "execute replaced an earlier alarm");
+    set_regs(resumed);
+    assert!(matches!(execute(core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
+    assert!(setup::alarm_deadline().is_some_and(|deadline| deadline < armed),
+        "shorter execute budget did not bring the deadline forward");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert_eq!(setup::alarm_deadline(), None, "host-side expiration retained a stale alarm");
+    set_regs(spinning);
+    let started = mem.now();
+    assert!(matches!(execute(core::time::Duration::from_millis(1)), KernelEvent::Irq));
+    assert!(mem.now() - started < 200_000_000, "expired alarm prevented rearming");
+
     // A VM86 POPF with reserved bit 15 set must behave like a hardware
     // flags load, not feed an invalid VMCS to Intel KVM (DN's CPU probe).
     // mov ax,0x8202; push ax; popf; pushf; pop ax; int 0x31

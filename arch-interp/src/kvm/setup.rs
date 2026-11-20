@@ -7,6 +7,7 @@ use arch_abi::vm::{self, Exchange};
 
 pub(super) struct KvmCpu {
     pub _vm: VmFd,
+    pub tid: libc::pid_t,
     pub planar_bound: bool,
     pub vcpu: VcpuFd,
     pub image: *mut u8,
@@ -51,8 +52,9 @@ fn init() -> KvmCpu {
     }
     vcpu.set_cpuid2(&cpuid).expect("KVM_SET_CPUID2");
     super::entry::boot(&vcpu, entry);
-    install_alarm(&mut vcpu);
-    let mut cpu = KvmCpu { planar_bound: false, _vm: vmfd, vcpu, image: image.cast(), message: core::ptr::null_mut() };
+    let tid = unsafe { libc::gettid() };
+    install_alarm(&mut vcpu, tid);
+    let mut cpu = KvmCpu { planar_bound: false, _vm: vmfd, tid, vcpu, image: image.cast(), message: core::ptr::null_mut() };
     super::run::until_return(&mut cpu, false);
     let message = unsafe { &mut *cpu.message };
     message.operation = vm::op::CONFIGURE;
@@ -66,52 +68,62 @@ fn init() -> KvmCpu {
     super::run::until_return(&mut cpu, false);
     cpu
 }
-use core::sync::atomic::{AtomicI32, Ordering};
-// One hosted execution CPU. The signal handler only writes KVM's documented
-// immediate_exit byte; no allocation, locks, or guest-state borrowing.
-static CPU_TID: AtomicI32 = AtomicI32::new(0);
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+// Only the currently executing thread is a target for device-input kicks.
+pub(super) static CPU_TID: AtomicI32 = AtomicI32::new(0);
 thread_local! {
     static IMMEDIATE_EXIT: std::cell::Cell<*mut u8> = const { std::cell::Cell::new(core::ptr::null_mut()) };
     static TIMER: std::cell::Cell<Option<libc::timer_t>> = const { std::cell::Cell::new(None) };
+    static ARMED_DEADLINE: AtomicU64 = const { AtomicU64::new(0) };
 }
 extern "C" fn alarm_signal(_: libc::c_int) {
+    // Signals can arrive outside KVM_RUN too. Invalidate before requesting an
+    // exit so execute cannot reuse an alarm whose signal it has already consumed.
+    let _ = ARMED_DEADLINE.try_with(|deadline| deadline.store(0, Ordering::Relaxed));
     let _ = IMMEDIATE_EXIT.try_with(|slot| {
         let pointer = slot.get();
         if !pointer.is_null() { unsafe { pointer.write_volatile(1); } }
     });
 }
-fn install_alarm(vcpu: &mut VcpuFd) {
+fn install_alarm(vcpu: &mut VcpuFd, tid: libc::pid_t) {
     unsafe {
         let mut sa: libc::sigaction = core::mem::zeroed();
         sa.sa_sigaction = alarm_signal as *const () as usize;
+        // An alarm left armed across a guest return may interrupt host I/O.
+        sa.sa_flags = libc::SA_RESTART;
         libc::sigemptyset(&mut sa.sa_mask);
         assert_eq!(libc::sigaction(libc::SIGURG, &sa, core::ptr::null_mut()), 0);
         IMMEDIATE_EXIT.with(|slot| slot.set(&raw mut vcpu.get_kvm_run().immediate_exit));
         let mut sev: libc::sigevent = core::mem::zeroed();
         sev.sigev_notify = libc::SIGEV_THREAD_ID;
         sev.sigev_signo = libc::SIGURG;
-        sev.sigev_notify_thread_id = libc::gettid();
+        sev.sigev_notify_thread_id = tid;
         let mut timer: libc::timer_t = core::mem::zeroed();
         assert_eq!(libc::timer_create(libc::CLOCK_MONOTONIC, &mut sev, &mut timer), 0);
         TIMER.with(|slot| slot.set(Some(timer)));
     }
 }
-pub(crate) fn arm_alarm(deadline: Option<u64>) {
-    CPU_TID.store(if deadline.is_some() { unsafe { libc::gettid() } } else { 0 }, Ordering::Release);
+pub(super) fn alarm_deadline() -> Option<u64> {
+    let deadline = ARMED_DEADLINE.with(|slot| slot.load(Ordering::Relaxed));
+    (deadline != 0).then_some(deadline)
+}
+
+pub(super) fn arm_alarm(deadline: u64) {
+    // Publish before programming: a signal during/after timer_settime must
+    // invalidate this record, never be overwritten by a stale future deadline.
+    ARMED_DEADLINE.with(|slot| slot.store(deadline, Ordering::Relaxed));
     TIMER.with(|slot| {
-        if let Some(timer) = slot.get() {
-            // Convert between clock epochs once, then ask POSIX for a one-shot
-            // absolute alarm. A zero it_value means cancellation, never "now".
-            let mut clock: libc::timespec = unsafe { core::mem::zeroed() };
-            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock); }
-            let remaining = deadline.map(|end| end.saturating_sub(crate::machine::now()));
-            let nanos = remaining.map_or(0, |delta|
-                (clock.tv_sec as u64).saturating_mul(1_000_000_000)
-                    .saturating_add(clock.tv_nsec as u64).saturating_add(delta.max(1)));
-            let value = libc::timespec { tv_sec: (nanos / 1_000_000_000) as _, tv_nsec: (nanos % 1_000_000_000) as _ };
-            let spec = libc::itimerspec { it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 }, it_value: value };
-            assert_eq!(unsafe { libc::timer_settime(timer, libc::TIMER_ABSTIME, &spec, core::ptr::null_mut()) }, 0);
-        }
+        let timer = slot.get().expect("KVM alarm not initialized");
+        // Convert the host clock epoch and program an absolute one-shot.
+        // A zero it_value would cancel the timer, so use at least one ns.
+        let mut clock: libc::timespec = unsafe { core::mem::zeroed() };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock); }
+        let remaining = deadline.saturating_sub(crate::machine::now());
+        let nanos = (clock.tv_sec as u64).saturating_mul(1_000_000_000)
+            .saturating_add(clock.tv_nsec as u64).saturating_add(remaining.max(1));
+        let value = libc::timespec { tv_sec: (nanos / 1_000_000_000) as _, tv_nsec: (nanos % 1_000_000_000) as _ };
+        let spec = libc::itimerspec { it_interval: libc::timespec { tv_sec: 0, tv_nsec: 0 }, it_value: value };
+        assert_eq!(unsafe { libc::timer_settime(timer, libc::TIMER_ABSTIME, &spec, core::ptr::null_mut()) }, 0);
     });
 }
 pub(crate) fn kick() {

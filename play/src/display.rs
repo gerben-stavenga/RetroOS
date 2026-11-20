@@ -3,10 +3,9 @@
 //! CPU/kernel runs on a worker thread (see `main.rs`).
 //!
 //! Video is pull-based across the thread boundary: each loop iteration asks the
-//! backend for a frame (`request_frame`), the CPU thread renders at its next
-//! slice boundary (the only thread where guest RAM and the captured VGA state
-//! are valid — same pattern as the `--screenshot` dump), and the next iteration
-//! `take_frame`s and blits it. Input crosses the other way through the
+//! backend for a frame (`request_frame`), the CPU thread submits rendering to
+//! the media worker at its next slice boundary, and the next iteration
+//! `take_frame`s and blits the result. Input crosses the other way through the
 //! backend's thread-safe IRQ queue (`post_irq`).
 
 use retroos_arch_interp as arch;

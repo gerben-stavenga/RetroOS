@@ -58,9 +58,9 @@ pub fn enabled() -> bool {
 /// Start exactly one consumer, after platform initialization. Never returns.
 ///
 /// # Safety
-/// Only this CPU may consume mailboxes. `refresh` must synchronize kernel
-/// mappings and invalidate translations before accessing handed-off storage.
-#[allow(dead_code)] // Hosted entry deliberately uses the inline path.
+/// Only this thread may consume mailboxes. `refresh` must synchronize kernel
+/// mappings and invalidate translations before accessing handed-off storage;
+/// it may be empty when the host OS maintains shared process mappings.
 pub unsafe fn worker(refresh: fn()) -> ! {
     unsafe { ON_WORKER = true; }
     REFRESH.store(refresh as usize, Ordering::Relaxed);

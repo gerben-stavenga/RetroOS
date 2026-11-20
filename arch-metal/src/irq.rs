@@ -530,11 +530,14 @@ fn setup_lapic_timer() -> bool {
             && crate::x86::cpu_capabilities().tsc_deadline();
     }
     // One interrupt checks delivery after IF is enabled. There is no boot heartbeat.
-    let init_count = (frequency / 1000).max(1).min(u32::MAX as u64) as u32;
-    lapic_write(LAPIC_DIV_CONF, LAPIC_DIV_1);
-    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR);
-    lapic_write(LAPIC_INIT_COUNT, init_count);
+    init_lapic_alarm();
     unsafe { core::ptr::write_volatile(&raw mut LAPIC_TIMER_ACTIVE, true); }
+    if unsafe { TSC_DEADLINE } {
+        arm_alarm(now(false).saturating_add(1_000_000));
+    } else {
+        let init_count = (frequency / 1000).max(1).min(u32::MAX as u64) as u32;
+        lapic_write(LAPIC_INIT_COUNT, init_count);
+    }
     lib::compact_println!("IRQ: LAPIC alarm (hz={} ref={} tsc_deadline={})", frequency, reference, unsafe { TSC_DEADLINE });
     true
 }
@@ -948,17 +951,12 @@ pub fn handle_irq(regs: &mut Regs) {
     }
     let irq = vector - IRQ_OFFSET;
     if irq == 0 {
+        unsafe { ARMED_DEADLINE = None; }
         IRQ0_HANDLED.fetch_add(1, Ordering::Relaxed);
-        // Before the event loop owns alarms, only a wrapping clock needs
-        // another interrupt. The initial delivery-test alarm otherwise ends.
-        if !unsafe { ALARM_MODE } && let Some(interval) = clock_maintenance_interval() {
-            if lapic_timer_active() {
-                let count = (u128::from(interval) * u128::from(unsafe { LAPIC_HZ }))
-                    .div_ceil(1_000_000_000).clamp(1, u128::from(u32::MAX)) as u32;
-                lapic_write(LAPIC_INIT_COUNT, count);
-            } else {
-                pit_alarm_count((interval * PIT_INPUT_HZ / 1_000_000_000).clamp(1, 65535) as u16);
-            }
+        // Keep sampling wrapping clocks even if the interrupted kernel never
+        // calls execute/idle again. A later execute may bring this alarm forward.
+        if let Some(interval) = clock_maintenance_interval() {
+            arm_alarm(timestamp_ns.saturating_add(interval));
         }
     }
 
@@ -1192,64 +1190,68 @@ fn mouse_packet_byte(byte: u8) -> Option<Irq> {
     }
 }
 
-// Alarm state belongs to this CPU. Programming and sleep run in ring 0 with
-// interrupts masked; input and elapsed alarms survive the return through ring 1.
+// Alarm state belongs to this CPU and is accessed in ring 0 with IF clear.
+// A pending one-shot stays armed across returns to the kernel; its IRQ clears
+// this deadline in either guest or kernel context.
 #[thread_local]
 static mut LAPIC_HZ: u64 = 0;
 #[thread_local]
 static mut TSC_DEADLINE: bool = false;
 #[thread_local]
-static mut ALARM_MODE: bool = false;
+static mut ARMED_DEADLINE: Option<u64> = None;
 const IA32_TSC_DEADLINE: u32 = 0x6e0;
 
+fn init_lapic_alarm() {
+    lapic_write(LAPIC_DIV_CONF, LAPIC_DIV_1);
+    lapic_write(LAPIC_INIT_COUNT, 0);
+    if unsafe { TSC_DEADLINE } {
+        lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | (2 << 17));
+        // Order the xAPIC mode write before accessing the deadline MSR.
+        unsafe {
+            core::arch::asm!("mfence", options(nostack, preserves_flags));
+            crate::x86::wrmsr(IA32_TSC_DEADLINE, 0);
+        }
+    } else {
+        lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR);
+    }
+}
+
+pub(crate) fn alarm_deadline() -> Option<u64> { unsafe { ARMED_DEADLINE } }
+
 #[inline(never)]
-pub fn arm_alarm(deadline: Option<u64>) {
-    unsafe { ALARM_MODE = true; }
+pub(crate) fn arm_alarm(deadline: u64) {
     let current = now(false);
     // Clock wrap maintenance stays internal to the clock driver.
-    let deadline = match (deadline, clock_maintenance_interval()) {
-        (Some(end), Some(interval)) => Some(end.min(current.saturating_add(interval))),
-        (None, Some(interval)) => Some(current.saturating_add(interval)),
-        (deadline, None) => deadline,
-    };
+    let deadline = clock_maintenance_interval()
+        .map_or(deadline, |interval| deadline.min(current.saturating_add(interval)));
+    unsafe { ARMED_DEADLINE = Some(deadline); }
     if lapic_timer_active() {
         if unsafe { TSC_DEADLINE } {
-            lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | (2 << 17));
-            unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)); }
-            let cycles = deadline.map_or(0, |end| {
-                let clock = unsafe { CLOCK };
-                let offset = ((u128::from(end) << 32).div_ceil(u128::from(clock.ns_mult)))
-                    .min(u128::from(u64::MAX)) as u64;
-                clock.epoch.saturating_add(offset).max(crate::x86::rdtsc().saturating_add(1))
-            });
+            let clock = unsafe { CLOCK };
+            let offset = ((u128::from(deadline) << 32).div_ceil(u128::from(clock.ns_mult)))
+                .min(u128::from(u64::MAX)) as u64;
+            let cycles = clock.epoch.saturating_add(offset).max(crate::x86::rdtsc().saturating_add(1));
             unsafe { crate::x86::wrmsr(IA32_TSC_DEADLINE, cycles); }
         } else {
-            lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR);
-            let count = deadline.map_or(0, |end| {
-                (u128::from(end.saturating_sub(current)) * u128::from(unsafe { LAPIC_HZ }))
-                    .div_ceil(1_000_000_000).clamp(1, u128::from(u32::MAX)) as u32
-            });
+            let count = (u128::from(deadline.saturating_sub(current)) * u128::from(unsafe { LAPIC_HZ }))
+                .div_ceil(1_000_000_000).clamp(1, u128::from(u32::MAX)) as u32;
             lapic_write(LAPIC_INIT_COUNT, count);
         }
     } else {
-        // Channel 0 has no gate pin. Mask its IRQ when disarmed; the next
-        // programming replaces its one-shot count before unmasking it.
+        // Replace the PIT one-shot with IRQ0 masked during programming.
         outb(MASTER_DATA, inb(MASTER_DATA) | 1);
-        if let Some(end) = deadline {
-            let count = (u128::from(end.saturating_sub(current)) * u128::from(PIT_INPUT_HZ))
-                .div_ceil(1_000_000_000).clamp(1, 65535) as u16;
-            pit_alarm_count(count);
-            unmask_irq(0);
-        }
+        let count = (u128::from(deadline.saturating_sub(current)) * u128::from(PIT_INPUT_HZ))
+            .div_ceil(1_000_000_000).clamp(1, 65535) as u16;
+        pit_alarm_count(count);
+        unmask_irq(0);
     }
 }
 
 pub fn idle(max_ns: u64) {
     if max_ns == 0 { return; }
-    arm_alarm(Some(now(false).saturating_add(max_ns)));
+    arm_alarm(now(false).saturating_add(max_ns));
     // INT 80 entered with IF clear; STI/HLT accepts an IRQ atomically.
     unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)); }
-    arm_alarm(None);
 }
 
 fn clock_maintenance_interval() -> Option<u64> {
@@ -1277,9 +1279,7 @@ pub fn init_worker_timer(timer: WorkerTimer) {
     lapic_write(LAPIC_SVR, LAPIC_SW_ENABLE | LAPIC_SPURIOUS_VECTOR);
     lapic_write(LAPIC_LVT_LINT0, LVT_MASKED);
     lapic_write(0x360, LVT_MASKED); // LINT1: no firmware NMI routing on workers.
-    lapic_write(LAPIC_DIV_CONF, LAPIC_DIV_1);
-    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LVT_MASKED);
-    lapic_write(LAPIC_INIT_COUNT, 0);
+    init_lapic_alarm();
     unsafe { LAPIC_TIMER_ACTIVE = true; }
 }
 pub(crate) fn interrupt_processor(processor: u32) {

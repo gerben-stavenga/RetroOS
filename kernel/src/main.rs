@@ -187,6 +187,7 @@ fn main() {
     if let Some(c) = &cwd { config.set_cwd(c.as_bytes()); }
     config.set_c_root(c_root.as_deref().unwrap_or(if root.dir_exists(b"home/retroos") { "/home/retroos" } else { "/" }).as_bytes());
 
+    hosted::start_media_worker();
     let mut machine = arch::Interp;
     // Hosted has no display to arbitrate until `startup` builds a Console;
     // mirroring the metal boot_kernel — one per boot, moved into startup.

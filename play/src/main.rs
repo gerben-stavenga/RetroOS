@@ -6,7 +6,8 @@
 //! Threading: the SDL window (event pump + present) owns the MAIN thread; the
 //! interpreter CPU + kernel run on a worker. All interpreter state — guest RAM,
 //! the device bus — is thread-local, so every `attach_*` happens on the CPU
-//! thread, before `startup()`. The two threads meet only at the backend's
+//! thread, before `startup()`. A separate Linux thread runs the kernel media
+//! worker on shared resident buffers. The window meets the CPU thread at the backend's
 //! thread-safe seams: `post_irq` (input in) and `request_frame`/`take_frame`
 //! (pixels out). The window therefore stays live even when the CPU thread
 //! stalls (disk I/O, a wedged guest).
@@ -122,6 +123,7 @@ fn main() {
             config.set_cwd(c.as_bytes());
         }
         config.set_c_root(c_root.as_deref().unwrap_or(if root.dir_exists(b"home/retroos") { "/home/retroos" } else { "/" }).as_bytes());
+        hosted::start_media_worker();
         let mut machine = arch::Interp;
         kernel::startup(&mut machine, &config, kernel::kernel::startup::Storage::Root(Box::leak(Box::new(root))));
     });

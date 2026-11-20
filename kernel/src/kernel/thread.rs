@@ -875,10 +875,67 @@ impl<A: crate::Arch> Thread<A> {
     }
 }
 
-// The thread table is no longer a global: `startup()` owns a `Vec<Thread>`
-// (built by `init_threading`) and threads `&mut [Thread<A>]` through the event
-// loop and the executors. The table API below takes that slice; the live
-// register frame lives in `ExecutionContext`, never here.
+/// Stable TID slots and their occupied-slot index, owned by the event loop.
+/// Blocked, worker-owned and zombie tasks stay indexed until their slot is freed.
+pub struct ThreadTable<A: crate::Arch> {
+    slots: alloc::vec::Vec<Thread<A>>,
+    occupied: [u64; MAX_THREADS.div_ceil(64)],
+}
+
+impl<A: crate::Arch> core::ops::Index<usize> for ThreadTable<A> {
+    type Output = Thread<A>;
+    fn index(&self, tid: usize) -> &Self::Output { &self.slots[tid] }
+}
+impl<A: crate::Arch> core::ops::IndexMut<usize> for ThreadTable<A> {
+    fn index_mut(&mut self, tid: usize) -> &mut Self::Output { &mut self.slots[tid] }
+}
+
+impl<A: crate::Arch> ThreadTable<A> {
+    pub fn get(&self, tid: usize) -> Option<&Thread<A>> { self.slots.get(tid) }
+
+    /// Snapshot IDs so callers can mutate or reap tasks while traversing them.
+    pub fn active_ids(&self) -> ActiveIds {
+        ActiveIds { words: self.occupied, word: 0 }
+    }
+
+    /// Circular TID order, ending with `current` if it is still occupied.
+    pub fn active_after(&self, current: usize) -> impl Iterator<Item = usize> + use<A> {
+        self.active_ids().filter(move |&tid| tid > current)
+            .chain(self.active_ids().filter(move |&tid| tid <= current))
+    }
+
+    fn occupy(&mut self, tid: usize) {
+        assert_eq!(self.occupied[tid / 64] & (1 << (tid % 64)), 0);
+        self.occupied[tid / 64] |= 1 << (tid % 64);
+    }
+
+    /// Called after releasing a slot's resources, including failed creation.
+    pub(crate) fn release_slot(&mut self, tid: usize) {
+        assert_ne!(tid, 0);
+        self.slots[tid].kernel.state = ThreadState::Unused;
+        self.occupied[tid / 64] &= !(1 << (tid % 64));
+    }
+}
+
+pub struct ActiveIds {
+    words: [u64; MAX_THREADS.div_ceil(64)],
+    word: usize,
+}
+impl Iterator for ActiveIds {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        while self.word < self.words.len() {
+            let bits = &mut self.words[self.word];
+            if *bits != 0 {
+                let tid = self.word * 64 + bits.trailing_zeros() as usize;
+                *bits &= *bits - 1;
+                return Some(tid);
+            }
+            self.word += 1;
+        }
+        None
+    }
+}
 
 /// Console stdin kpipe index (shared by all Linux processes)
 static mut CONSOLE_PIPE: u8 = 0;
@@ -887,8 +944,8 @@ pub fn set_console_pipe(idx: u8) { unsafe { CONSOLE_PIPE = idx; } }
 pub fn console_pipe() -> u8 { unsafe { CONSOLE_PIPE } }
 
 /// Check if threading system is initialized
-pub fn is_initialized<A: crate::Arch>(threads: &[Thread<A>]) -> bool {
-    !threads.is_empty()
+pub fn is_initialized<A: crate::Arch>(threads: &ThreadTable<A>) -> bool {
+    !threads.slots.is_empty()
 }
 
 pub fn prng() -> u64 {
@@ -904,8 +961,8 @@ pub fn prng() -> u64 {
 }
 
 
-/// Get thread by TID. Borrow is tied to the passed slice.
-pub fn get_thread<A: crate::Arch>(threads: &mut [Thread<A>], tid: usize) -> Option<&mut Thread<A>> {
+/// Get thread by TID. Borrow is tied to the task table.
+pub fn get_thread<A: crate::Arch>(threads: &mut ThreadTable<A>, tid: usize) -> Option<&mut Thread<A>> {
     if tid >= MAX_THREADS {
         return None;
     }
@@ -920,15 +977,15 @@ pub fn get_thread<A: crate::Arch>(threads: &mut [Thread<A>], tid: usize) -> Opti
 
 /// Get mutable references to two different threads (for switch_to). Safe
 /// `split_at_mut` — no aliasing, no `unsafe`.
-pub fn get_two_threads<A: crate::Arch>(threads: &mut [Thread<A>], a: usize, b: usize) -> (&mut Thread<A>, &mut Thread<A>) {
+pub fn get_two_threads<A: crate::Arch>(threads: &mut ThreadTable<A>, a: usize, b: usize) -> (&mut Thread<A>, &mut Thread<A>) {
     assert!(a != b && a < MAX_THREADS && b < MAX_THREADS);
     assert!(threads[a].kernel.state != ThreadState::OnCpu && threads[b].kernel.state != ThreadState::OnCpu,
         "cross-process access without acquiring worker ownership");
     if a < b {
-        let (lo, hi) = threads.split_at_mut(b);
+        let (lo, hi) = threads.slots.split_at_mut(b);
         (&mut lo[a], &mut hi[0])
     } else {
-        let (lo, hi) = threads.split_at_mut(a);
+        let (lo, hi) = threads.slots.split_at_mut(a);
         (&mut hi[0], &mut lo[b])
     }
 }
@@ -937,7 +994,7 @@ pub fn get_two_threads<A: crate::Arch>(threads: &mut [Thread<A>], a: usize, b: u
 // Process wrappers reap a leader before issuing group cleanup; immediate reuse
 // can turn that cleanup into a signal against a newly launched unrelated job.
 static NEXT_PROCESS_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
-fn vacant_slot<A: crate::Arch>(threads: &[Thread<A>]) -> Option<usize> {
+fn vacant_slot<A: crate::Arch>(threads: &ThreadTable<A>) -> Option<usize> {
     use core::sync::atomic::Ordering;
     let start = NEXT_PROCESS_SLOT.load(Ordering::Relaxed);
     for offset in 0..MAX_THREADS - 1 {
@@ -952,7 +1009,7 @@ fn vacant_slot<A: crate::Arch>(threads: &[Thread<A>]) -> Option<usize> {
 }
 
 /// Create a new thread with the given root page table.
-pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut [Thread<A>], machine: &mut A, parent_tid: Option<usize>, root: A::PageTable, is_process: bool) -> Option<&'a mut Thread<A>> {
+pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut ThreadTable<A>, machine: &mut A, parent_tid: Option<usize>, root: A::PageTable, is_process: bool) -> Option<&'a mut Thread<A>> {
     let (parent_pid, parent_prio, parent_tidv) = match parent_tid {
         Some(tid) => {
             let p = &threads[tid].kernel;
@@ -961,6 +1018,7 @@ pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut [Thread<A>], machine: 
         None => (0, 0, -1),
     };
     let i = vacant_slot(threads)?;
+    threads.occupy(i);
     let t = &mut threads[i];
     {
             crate::kernel::linux::process_group::create(i, parent_tidv);
@@ -990,7 +1048,7 @@ pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut [Thread<A>], machine: 
 /// The caller COW-forks that live space into the parent's now-parked slot;
 /// this fresh child's empty slot then denotes the still-live address space.
 pub fn reserve_live_child<'a, A: crate::Arch>(
-    threads: &'a mut [Thread<A>],
+    threads: &'a mut ThreadTable<A>,
     machine: &mut A,
     parent_tid: usize,
 ) -> Option<&'a mut Thread<A>> {
@@ -999,6 +1057,7 @@ pub fn reserve_live_child<'a, A: crate::Arch>(
         (p.priority, p.tid)
     };
     let i = vacant_slot(threads)?;
+    threads.occupy(i);
     let t = &mut threads[i];
     {
             crate::kernel::linux::process_group::create(i, parent_tidv);
@@ -1040,18 +1099,18 @@ pub fn save_state<A: crate::Arch>(thread: &mut Thread<A>, regs: &Regs) {
 }
 
 /// Block a thread (waiting for child exit).
-pub fn block_thread<A: crate::Arch>(threads: &mut [Thread<A>], tid: usize) {
+pub fn block_thread<A: crate::Arch>(threads: &mut ThreadTable<A>, tid: usize) {
     threads[tid].kernel.state = ThreadState::Blocked;
 }
 
-pub fn unblock_thread<A: crate::Arch>(threads: &mut [Thread<A>], tid: usize) {
+pub fn unblock_thread<A: crate::Arch>(threads: &mut ThreadTable<A>, tid: usize) {
     if tid < MAX_THREADS && threads[tid].kernel.state == ThreadState::Blocked {
         threads[tid].kernel.state = ThreadState::Ready;
     }
 }
 
 /// Yield a thread: save regs, mark Ready, schedule next.
-pub fn yield_thread<A: crate::Arch>(threads: &mut [Thread<A>], tid: usize, regs: &crate::Regs) -> Option<usize> {
+pub fn yield_thread<A: crate::Arch>(threads: &mut ThreadTable<A>, tid: usize, regs: &crate::Regs) -> Option<usize> {
     {
         let k = &mut threads[tid].kernel;
         k.vcpu.regs = *regs;
@@ -1073,11 +1132,12 @@ pub fn set_return<A: crate::Arch>(thread: &mut Thread<A>, ret: i32) {
 
 /// Schedule next thread (randomly selected from ready threads).
 /// Returns Some(idx) if a switch is needed, None to stay with current.
-pub fn schedule<A: crate::Arch>(threads: &[Thread<A>], current_tid: usize) -> Option<usize> {
+pub fn schedule<A: crate::Arch>(threads: &ThreadTable<A>, current_tid: usize) -> Option<usize> {
     let mut next_idx: usize = usize::MAX;
     let mut count = 0u64;
 
-    for (i, t) in threads.iter().enumerate().take(MAX_THREADS).skip(1) {
+    for i in threads.active_ids().filter(|&tid| tid != 0) {
+        let t = &threads[i];
         if i == current_tid {
             continue;
         }
@@ -1093,8 +1153,8 @@ pub fn schedule<A: crate::Arch>(threads: &[Thread<A>], current_tid: usize) -> Op
     if next_idx == usize::MAX {
         // A worker-owned process is live even when no local row is Ready.
         // Switching acquires just this loan; never report AllDead while APs run.
-        threads.iter().enumerate().skip(1).find_map(|(tid, task)|
-            (tid != current_tid && task.kernel.state == ThreadState::OnCpu
+        threads.active_ids().filter(|&tid| tid != 0).find_map(|tid|
+            (tid != current_tid && threads[tid].kernel.state == ThreadState::OnCpu
                 && !crate::kernel::sched::vfork_suspended(threads, tid)).then_some(tid))
     } else {
         Some(next_idx)
@@ -1103,7 +1163,7 @@ pub fn schedule<A: crate::Arch>(threads: &[Thread<A>], current_tid: usize) -> Op
 
 /// Borrow another thread's `DosState` for a swap-style operation.
 /// Returns the target's DosState if the target is a DOS thread, else an errno.
-pub fn with_target_dos<F: FnOnce(&mut DosState<A>) -> i32, A: crate::Arch>(threads: &mut [Thread<A>], target_tid: i32, f: F) -> i32 {
+pub fn with_target_dos<F: FnOnce(&mut DosState<A>) -> i32, A: crate::Arch>(threads: &mut ThreadTable<A>, target_tid: i32, f: F) -> i32 {
     if target_tid < 0 || (target_tid as usize) >= MAX_THREADS { return -22; } // EINVAL
     let target = &mut threads[target_tid as usize];
     if target.kernel.state == ThreadState::Unused { return -3; } // ESRCH
@@ -1140,7 +1200,7 @@ pub fn take_switch_target() -> Option<usize> {
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 pub fn exit_thread<A: crate::Arch>(
-    threads: &mut [Thread<A>],
+    threads: &mut ThreadTable<A>,
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     tid: usize,
@@ -1263,7 +1323,7 @@ pub fn exit_thread<A: crate::Arch>(
     // A Linux parent's waiters and SIGCHLD survive the child's exec into a
     // different personality (for example native Turbo C). Notify the parent
     // based on its personality, not the image the child exits from.
-    if parent_tid >= 0 && (parent_tid as usize) < threads.len()
+    if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS
         && parent_tid as usize != tid {
         crate::kernel::linux::child_exited(&mut threads[parent_tid as usize], tid as i32, exit_code);
     }
@@ -1297,11 +1357,12 @@ pub fn exit_thread<A: crate::Arch>(
 /// -ECHILD if no children at all. The slot stays in `Zombie` state so the
 /// caller can still inspect the child's per-personality state (e.g. DOS pulls
 /// the final VGA snapshot via `with_target_dos`) before calling `reap`.
-pub fn peek_zombie_child<A: crate::Arch>(threads: &[Thread<A>], current_tid: usize, pid: i32) -> (i32, i32) {
+pub fn peek_zombie_child<A: crate::Arch>(threads: &ThreadTable<A>, current_tid: usize, pid: i32) -> (i32, i32) {
     let current_tid = threads[current_tid].kernel.tid;
     let mut has_children = false;
 
-    for t in threads.iter().take(MAX_THREADS).skip(1) {
+    for tid in threads.active_ids().filter(|&tid| tid != 0) {
+        let t = &threads[tid];
         let k = &t.kernel;
         if k.parent_tid == current_tid && k.state != ThreadState::Unused
             && (pid <= 0 || k.tid == pid) {
@@ -1316,7 +1377,7 @@ pub fn peek_zombie_child<A: crate::Arch>(threads: &[Thread<A>], current_tid: usi
 }
 
 /// Recycle a Zombie thread slot. No-op if the tid isn't a zombie.
-pub fn reap<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut A, tid: i32) {
+pub fn reap<A: crate::Arch>(threads: &mut ThreadTable<A>, machine: &mut A, tid: i32) {
     if tid < 0 || (tid as usize) >= MAX_THREADS { return; }
     {
         let t = &mut threads[tid as usize];
@@ -1330,7 +1391,7 @@ pub fn reap<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut A, tid: i32
             machine.destroy_space(&mut t.kernel.vcpu.space);
             t.personality = Personality::Linux(LinuxState::new());
             crate::kernel::linux::process_group::reap(tid as usize);
-            t.kernel.state = ThreadState::Unused;
+            threads.release_slot(tid as usize);
         }
     }
 }
@@ -1338,8 +1399,8 @@ pub fn reap<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut A, tid: i32
 /// Reap every zombie. The event loop calls this before returning: its
 /// contract is "no thread resources survive the loop" — callers (the DN
 /// restart loop, the cmdline sequence) never inherit zombies to clean up.
-pub fn reap_all_zombies<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut A) {
-    for i in 1..MAX_THREADS {
+pub fn reap_all_zombies<A: crate::Arch>(threads: &mut ThreadTable<A>, machine: &mut A) {
+    for i in threads.active_ids().filter(|&tid| tid != 0) {
         if threads[i].kernel.state == ThreadState::Zombie {
             reap(threads, machine, i as i32);
         }
@@ -1350,7 +1411,7 @@ pub fn reap_all_zombies<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut
 /// Use when there's no per-personality state to grab from the zombie (the
 /// only current caller is Linux sys_wait4, which has nothing to retrieve
 /// once the parent has the exit code).
-pub fn waitpid<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut A, current_tid: usize, pid: i32) -> (i32, i32) {
+pub fn waitpid<A: crate::Arch>(threads: &mut ThreadTable<A>, machine: &mut A, current_tid: usize, pid: i32) -> (i32, i32) {
     let r = peek_zombie_child(threads, current_tid, pid);
     if r.0 >= 0 { reap(threads, machine, r.0); }
     r
@@ -1374,14 +1435,14 @@ pub fn signal_thread<A: crate::Arch>(thread: &Thread<A>, fault_address: usize) {
         thread.kernel.vcpu.regs.rax, thread.kernel.vcpu.regs.rbx, thread.kernel.vcpu.regs.rcx);
 }
 
-/// Build the thread table (heap-allocated `Vec<Thread>`, MAX_THREADS slots).
-/// `startup()` owns the returned table and threads `&mut [Thread<A>]` through the
-/// event loop and executors — it is no longer a global.
-pub fn init_threading<A: crate::Arch>() -> alloc::vec::Vec<Thread<A>> {
-    let mut threads = alloc::vec::Vec::with_capacity(MAX_THREADS);
+/// Build the task table with stable slots and only init/idle occupied.
+pub fn init_threading<A: crate::Arch>() -> ThreadTable<A> {
+    let mut slots = alloc::vec::Vec::with_capacity(MAX_THREADS);
     for _ in 0..MAX_THREADS {
-        threads.push(Thread::empty());
+        slots.push(Thread::empty());
     }
+    let mut threads = ThreadTable { slots, occupied: [0; MAX_THREADS.div_ceil(64)] };
+    threads.occupy(0);
     // Thread 0 is the init/idle thread (uses boot page directory).
     threads[0].kernel.tid = 0;
     threads[0].kernel.pid = 0;
@@ -1393,8 +1454,20 @@ pub fn init_threading<A: crate::Arch>() -> alloc::vec::Vec<Thread<A>> {
 }
 
 #[cfg(test)]
-mod saved_file_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn active_ids_skip_holes_and_reach_the_last_slot() {
+        let expected = [0, 1, 63, 64, 511, MAX_THREADS - 1];
+        let mut words = [0; MAX_THREADS.div_ceil(64)];
+        for tid in expected { words[tid / 64] |= 1 << (tid % 64); }
+        let mut ids = ActiveIds { words, word: 0 };
+        for tid in expected { assert_eq!(ids.next(), Some(tid)); }
+        assert_eq!(ids.next(), None);
+        assert_eq!(ids.next(), None);
+        assert_eq!(ActiveIds { words: [0; MAX_THREADS.div_ceil(64)], word: 0 }.next(), None);
+    }
 
     #[test]
     fn abandoned_parent_table_releases_its_references() {

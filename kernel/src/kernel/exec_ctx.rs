@@ -33,7 +33,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
     /// placeholder would, on metal, swap its empty entries into the live root
     /// and unmap the running thread (`swap_and_activate`). The handle is filled
     /// in with the real entries the first time the thread switches out.
-    pub fn seed(threads: &mut [thread::Thread<A>], tid: usize) -> Self {
+    pub fn seed(threads: &mut thread::ThreadTable<A>, tid: usize) -> Self {
         let t = thread::get_thread(threads, tid).expect("ExecutionContext::seed: invalid thread");
         let regs = t.kernel.vcpu.regs;
         ExecutionContext {
@@ -48,7 +48,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
 
     /// The thread currently holding the CPU. The borrow is tied to the passed
     /// `threads` slice (the loop owns it), not to `self`.
-    pub fn thread<'a>(&self, threads: &'a mut [thread::Thread<A>]) -> &'a mut thread::Thread<A> {
+    pub fn thread<'a>(&self, threads: &'a mut thread::ThreadTable<A>) -> &'a mut thread::Thread<A> {
         thread::get_thread(threads, self.tid).expect("ExecutionContext: current thread vanished")
     }
 
@@ -69,7 +69,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
     /// is. Parks the outgoing thread's registers, loads the incoming thread's,
     /// and `activate`s the incoming address space (the displaced outgoing space
     /// returns and re-parks). Rebuilds the I/O bitmap and runs `on_resume`.
-    pub fn switch_to(&mut self, threads: &mut [thread::Thread<A>], machine: &mut A, new_tid: usize) {
+    pub fn switch_to(&mut self, threads: &mut thread::ThreadTable<A>, machine: &mut A, new_tid: usize) {
         if new_tid == self.tid {
             return;
         }
@@ -85,7 +85,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
     /// Relabel an unchanged live address space after fork/exec. The fork path
     /// has already parked the parent's registers/FPU and installed the
     /// child's, so no CR3 transition is permitted here.
-    pub fn continue_as(&mut self, threads: &mut [thread::Thread<A>], machine: &mut A, tid: usize) {
+    pub fn continue_as(&mut self, threads: &mut thread::ThreadTable<A>, machine: &mut A, tid: usize) {
         thread::get_thread(threads, tid)
             .expect("continue_as: invalid child")
             .personality

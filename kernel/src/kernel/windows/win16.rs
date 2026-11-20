@@ -623,7 +623,7 @@ fn relocate_image<A: crate::Arch>(
 #[allow(clippy::too_many_arguments)] // Shared executable launch context.
 pub(super) fn exec<A: crate::Arch>(
     machine: &mut A,
-    threads: &mut [thread::Thread<A>],
+    threads: &mut thread::ThreadTable<A>,
     tid: usize,
     data: Vec<u8>,
     path: &[u8],
