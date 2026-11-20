@@ -472,6 +472,7 @@ impl<A: crate::Arch> Personality<A> {
 
     /// Park device memory before another thread can overwrite the live store.
     pub fn on_suspend(&mut self, machine: &mut A) {
+        crate::kernel::dos::planar::uninstall(machine);
         if let Self::Dos(d) = self {
             d.pc.audio.lock().sb.sb_suspend(machine);
             d.pc.vga.capture_address_space_vram(machine);
@@ -710,8 +711,6 @@ pub struct Thread<A: crate::Arch> {
 impl<A: crate::Arch> Thread<A> {
     /// Move the live CPU state into this thread, leaving an empty user space.
     pub fn materialize(&mut self, machine: &mut A, regs: Regs) {
-        #[cfg(target_arch = "x86")]
-        crate::kernel::dos::planar::materialize(machine, crate::KernelEvent::Irq);
         self.personality.on_suspend(machine);
         self.kernel.vcpu.regs = regs;
         let mut fx = machine.clean_fx_template();
@@ -728,10 +727,6 @@ impl<A: crate::Arch> Thread<A> {
         machine.switch_fx(&mut fx);
         let _empty = machine.activate(core::mem::take(&mut self.kernel.vcpu.space));
         self.personality.on_resume(machine);
-        #[cfg(target_arch = "x86")]
-        if let Personality::Dos(dos) = &mut self.personality {
-            crate::kernel::dos::planar::resume(machine, dos, &self.kernel.vcpu.regs);
-        }
         self.kernel.vcpu.regs
     }
 

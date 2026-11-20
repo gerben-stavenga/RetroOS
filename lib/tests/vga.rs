@@ -1569,11 +1569,11 @@ fn sequential_write_span_matches_vga_alu_for_every_plane_mask_and_wrap() {
             for (i, value) in source.iter().enumerate() {
                 let (off, maps) = state.cpu_write_address(address + i);
                 let cur = core::array::from_fn(|plane| expected[state.layout().index(plane, off)]);
-                let out = vga::planar_write(cur, state.latches, &state.gc.read(), maps, *value);
+                let out = vga::planar_write(cur, state.latches.read(), &state.gc.read(), maps, *value);
                 for plane in 0..4 { expected[state.layout().index(plane, off)] = out[plane]; }
             }
             let mut reads = 0;
-            assert!(state.write_sequential_span(memory, address, source.len(), |i| {
+            assert!(state.write_sequential_span(memory.planar(), address, source.len(), |i| {
                 reads += 1;
                 source[i]
             }));
@@ -1600,7 +1600,38 @@ fn sequential_write_span_declines_other_addressing_and_alu_modes_without_accesse
         state.gc.set(6, gc6);
         state.gc.set(1, 0); state.gc.set(3, 0); state.gc.set(5, 0); state.gc.set(8, 255);
         state.gc.set(index, value);
-        assert!(!state.write_sequential_span(memory, 0, 32, |_| panic!("declined copy read RAM")));
+        assert!(!state.write_sequential_span(memory.planar(), 0, 32, |_| panic!("declined copy read RAM")));
     }
     assert!(storage.iter().all(|byte| byte.load(Ordering::Relaxed) == 0xA5));
 }
+
+    #[test]
+    fn fast_mask_writes_match_register_file_and_reject_remaps() {
+        for memory_mode in [0, 4, 8, 12] {
+            for (port, value, word) in [
+                (0x3c4, 2, false), (0x3c4, 3, false),
+                (0x3c4, 0x0402, true), (0x3c4, 0x0822, true),
+                (0x3c4, 0x0404, true), (0x3c5, 8, false),
+                (0x3c5, 0x0402, true),
+            ] {
+                let mut actual = ::vga::LegacyVgaState::new_boxed();
+                let mut expected = ::vga::LegacyVgaState::new_boxed();
+                for state in [&mut actual, &mut expected] {
+                    state.seq.set(4, memory_mode);
+                    state.seq_index.set(2);
+                }
+                let before = actual.cpu_aperture();
+                let handled = actual.mask_out(port, value, word);
+                if handled {
+                    expected.port_write(port, value as u8);
+                    if word { expected.port_write(port + 1, (value >> 8) as u8); }
+                }
+                assert_eq!(actual.seq_index.get(), expected.seq_index.get());
+                assert_eq!(actual.seq.read(), expected.seq.read());
+                assert_eq!(actual.cpu_aperture(), before);
+                assert_eq!(handled, port == 0x3c4 && !word
+                    || memory_mode == 4 && (port == 0x3c5 && !word
+                        || port == 0x3c4 && word && value & 31 == 2));
+            }
+        }
+    }

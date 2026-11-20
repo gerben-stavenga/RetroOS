@@ -10,7 +10,7 @@
 //! CPU-local runtime state uses Rust `#[thread_local]` with ELF local-exec TLS.
 //! The startup object copies `.tdata`, zeroes `.tbss`, and sets GS before the
 //! first Rust call. GS:0 contains the linked thread pointer, even under the
-//! initial offset segments. GS:4 holds the espfix trap-stack window base.
+//! initial offset segments.
 //! Descriptor setup changes GS's base from physical
 //! to virtual together with DS/CS; the Rust-visible pointer never changes.
 //! Interrupt entry saves the interrupted GS and installs kernel TLS before
@@ -175,3 +175,5 @@ mod mapping;
 
 #[cfg(feature = "kvm")]
 pub mod vm;
+
+mod planar;

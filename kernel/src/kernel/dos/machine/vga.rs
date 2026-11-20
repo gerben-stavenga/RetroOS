@@ -70,11 +70,7 @@ impl EmulatedVga {
             let mode = active.mode;
             let pages = capture_native_vbe(
                 machine, bios, native.cap_mut(), mode, active.svga.clone());
-            let mut emulated = Self {
-                state: VgaState::Vbe(alloc::boxed::Box::new(active.svga)),
-                svga_pages: pages,
-                svga_vram: alloc::vec::Vec::new(),
-            };
+            let mut emulated = Self::from_state(VgaState::Vbe(alloc::boxed::Box::new(active.svga)), pages);
             materialize_emulated_aperture(&mut emulated, machine);
             return emulated;
         }
@@ -96,11 +92,7 @@ impl EmulatedVga {
             native.cap().bios_restore_checkpoint(machine, bios, checkpoint);
             crate::kernel::drivers::vga_hw::checkpoint_restored(&legacy);
         }
-        let mut emulated = Self {
-            state: VgaState::Legacy(legacy),
-            svga_pages: 0,
-            svga_vram: alloc::vec::Vec::new(),
-        };
+        let mut emulated = Self::from_state(VgaState::Legacy(legacy), 0);
         materialize_emulated_aperture(&mut emulated, machine);
         emulated
     }
@@ -1050,9 +1042,9 @@ pub fn svga_set_curated_mode<A: crate::Arch>(
     } else {
         ::vga::SvgaAccess::Banked { bank: 0 }
     };
-    dev.state = VgaState::Vbe(alloc::boxed::Box::new(::vga::SvgaState::new(
+    dev.set_state(VgaState::Vbe(alloc::boxed::Box::new(::vga::SvgaState::new(
         mode.number, access, mode.svga_config(),
-    )));
+    ))));
     dev.svga_pages = pages;
     dev.svga_vram.clear();
     crate::kernel::memory::reset(machine, A0000 >> 12, WINDOW_PAGES);
@@ -1095,7 +1087,7 @@ fn svga_leave<A: crate::Arch>(machine: &mut A, dev: &mut EmulatedVga) {
     // absent, the only sane "free" for an allocated RAM region.
     crate::kernel::memory::fresh(machine, A0000 >> 12, WINDOW_PAGES);
     crate::kernel::memory::reset(machine, SVGA_LFB_BASE >> 12, pages);
-    dev.state = VgaState::new();
+    dev.set_state(VgaState::new());
     dev.svga_pages = 0;
     dev.svga_vram.clear();
 }
@@ -1231,7 +1223,7 @@ pub fn vram_write<A: crate::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaStat
     let cur = core::array::from_fn(|p| {
         machine.read::<u8>((VGA_VRAM_BASE + layout.index(p, off)) as u64)
     });
-    let out = ::vga::planar_write(cur, vga.latches, &vga.gc.read(), map_mask, byte);
+    let out = ::vga::planar_write(cur, vga.latches.read(), &vga.gc.read(), map_mask, byte);
     for p in 0..4 {
         if out[p] != cur[p] {
             machine.write::<u8>((VGA_VRAM_BASE + layout.index(p, off)) as u64, out[p]);
@@ -1246,33 +1238,8 @@ pub fn vram_write<A: crate::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaStat
 /// byte.
 #[inline(always)]
 pub(in crate::kernel::dos) fn vram_write_live(planes: ::vga::memory::Memory<'_>, vga: &mut LegacyVgaState, off: u32, byte: u8) {
-    let (off, map_mask) = vga.cpu_write_address(off as usize);
-    let layout = vga.layout();
+    vga.registers.write(planes.planar(), off as usize, byte);
 
-    // Ordinary Mode-X drawing is write mode 0 with an unrotated, unmasked CPU
-    // byte and no set/reset. In that configuration the VGA ALU reduces exactly
-    // to assigning the byte to every enabled plane; avoid fetching four old
-    // values and running the general ALU for the overwhelmingly common case.
-    if vga.gc.get(5) & 0x0B == 0
-        && vga.gc.get(3) & 0x1F == 0
-        && vga.gc.get(1) & 0x0F == 0
-        && vga.gc.get(8) == 0xFF
-    {
-        for p in 0..4 {
-            if map_mask & (1 << p) != 0 {
-                planes.put(layout.index(p, off), byte);
-            }
-        }
-        return;
-    }
-
-    let cur = core::array::from_fn(|p| planes.get(layout.index(p, off)).unwrap());
-    let out = ::vga::planar_write(cur, vga.latches, &vga.gc.read(), map_mask, byte);
-    for p in 0..4 {
-        if out[p] != cur[p] {
-            planes.put(layout.index(p, off), out[p]);
-        }
-    }
 }
 
 /// Copy bytes into guest memory, routing any VGA aperture overlap through
@@ -1345,18 +1312,16 @@ pub fn vram_read<A: crate::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaState
 }
 
 pub(in crate::kernel::dos) fn vram_read_live(planes: ::vga::memory::Memory<'_>, vga: &mut LegacyVgaState, off: u32) -> u8 {
-    let (off, read_plane) = vga.cpu_read_address(off as usize);
-    let layout = vga.layout();
-    let cur = core::array::from_fn(|p| planes.get(layout.index(p, off)).unwrap());
-    finish_read(vga, read_plane, cur)
+    vga.registers.read(planes.planar(), off as usize)
+
 }
 
 fn finish_read(vga: &mut LegacyVgaState, read_plane: usize, cur: [u8; 4]) -> u8 {
     let mut gc = vga.gc.read();
     gc[4] = read_plane as u8;
     let (data, latches) = ::vga::planar_read(cur, &gc);
-    vga.latches = latches;
-    vga.latches_valid = true;
+    vga.latches.write(latches);
+    vga.latches_valid.set(1);
     data
 }
 
@@ -1747,7 +1712,7 @@ mod bios_memory_tests {
             assert_eq!(read_guest_byte(&mut memory, &mut device, address + 1), 0xA5);
         }
         assert_eq!(
-            device.emulated().and_then(|dev| dev.state.legacy()).map(|state| state.latches),
+            device.emulated().and_then(|dev| dev.state.legacy()).map(|state| state.latches.read()),
             Some([0xA5; 4]),
         );
     }

@@ -13,7 +13,7 @@ rust_library(
     rustc_flags = [
         "-Crelocation-model=static",
     ] + panic_strategy(),
-    deps = ["//lib:compact_fmt"],
+    deps = ["//lib:compact_fmt", "//lib:planar"],
 )
 
 rust_test(

@@ -1950,18 +1950,9 @@ fn event_loop<A: crate::Arch>(
                 machine.execution_profile_begin();
                 ctx.prepare_io(bios_workspace, &threads[ctx.tid].personality);
                 machine.execution_profile_time(arch_abi::ExecutionProfileStage::PolicyLookup);
-                #[cfg(target_arch = "x86")]
-                if let thread::Personality::Dos(dos) = &mut threads[ctx.tid].personality {
-                    super::dos::planar::resume(machine, dos, &ctx.regs);
-                }
                 let event = machine.execute(&mut ctx.regs, &ctx.io_policy,
                     core::time::Duration::from_nanos(loan_deadline.unwrap().saturating_sub(machine.now())));
-                #[cfg(target_arch = "x86")]
-                let event = {
-                    let (event, cycles) = super::dos::planar::materialize(machine, event);
-                    ctx.device_cycles = cycles;
-                    event
-                };
+                ctx.device_cycles = super::dos::planar::collect();
                 event
             };
             let peers_pending = threads.iter().any(|task| task.kernel.pending_event.is_some());

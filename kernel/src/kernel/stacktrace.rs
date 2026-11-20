@@ -182,7 +182,7 @@ fn print_frame(out: &mut dyn Write, depth: usize, ip: u64) {
 /// saved-bp and return-ip pair, prints the return ip (i.e. the caller's
 /// current IP at the time of the call), and advances.
 ///
-/// Stops at the trap-entry boundary: when a return IP matches `isr_return`,
+/// Stops at the trap-entry boundary: when a return IP matches `stacktrace_marker`,
 /// we've crossed from a kernel frame into arch's trap-handling code. Going
 /// further would require interpreting whatever was in ebp at trap time —
 /// junk for ring-0/arch self-reentry, untrusted for ring-3 user. The trap
@@ -192,12 +192,12 @@ fn walk(out: &mut dyn Write, mut bp: u64, mut depth: usize, user_64: bool) {
     // The trap-entry boundary is an `entry.asm` label (metal only). The hosted
     // process has no such boundary, so the chain just walks to its natural end.
     #[cfg(target_arch = "x86")]
-    let isr_dispatch = {
-        unsafe extern "C" { fn isr_return(); }
-        isr_return as *const () as u64
+    let trap_boundary = {
+        unsafe extern "C" { fn stacktrace_marker(); }
+        stacktrace_marker as *const () as u64
     };
     #[cfg(not(target_arch = "x86"))]
-    let isr_dispatch = 0u64;
+    let trap_boundary = 0u64;
     const MAX_DEPTH: usize = 20;
 
     while depth < MAX_DEPTH && bp >= 0x1000 {
@@ -209,7 +209,7 @@ fn walk(out: &mut dyn Write, mut bp: u64, mut depth: usize, user_64: bool) {
             unsafe { (*frame as u64, *frame.add(1) as u64) }
         };
         if ip == 0 || ip < 0x1000 { break; }
-        if ip == isr_dispatch { break; }
+        if ip == trap_boundary { break; }
         print_frame(out, depth, ip);
         bp = next_bp;
         depth += 1;

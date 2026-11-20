@@ -25,7 +25,7 @@ rust_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//arch-abi",
+        "//arch-abi", "//lib:planar",
         "//lib",
         "@crates//:libc",
         "@crates//:unicorn-engine",
@@ -46,7 +46,7 @@ rust_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//arch-abi",
+        "//arch-abi", "//lib:planar",
         "//lib",
         "@crates//:kvm-bindings",
         "@crates//:kvm-ioctls",
@@ -107,7 +107,7 @@ rust_test(
     ],
     deps = [
         ":arch-interp",
-        "//arch-abi",
+        "//arch-abi", "//lib:planar",
     ],
 )
 

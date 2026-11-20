@@ -9,7 +9,8 @@
 use crate::irq::handle_irq;
 use crate::paging2;
 use crate::x86;
-use arch_abi::{Regs, UserMode};
+use arch_abi::{Regs, UserMode, KernelEvent as KE};
+use arch_abi::monitor::MonitorResult;
 use arch_abi::entry::{KernelCall, CallOutcome};
 
 // =============================================================================
@@ -49,6 +50,7 @@ pub(crate) fn set_execute_regs(regs: *mut Regs) {
 
 /// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
 pub mod arch_call {
+    pub const BIND_PLANAR: u64 = 0x134;
     pub const REARRANGE_MAPPINGS: u64 = 0x133;
     pub const READ_MAPPINGS: u64 = 0x12E;
     pub const REPLACE_MAPPINGS: u64 = 0x12F;
@@ -75,7 +77,6 @@ pub mod arch_call {
     pub const REMAP_PHYSICAL_APERTURE: u64 = 0x121; // EDX/ECX=physical base low/high
     pub const RELEASE_HEAP: u64 = 0x122; // EDX=heap address, ECX=byte length
     pub const IDLE: u64 = 0x126; // EDX:ECX = maximum wait in nanoseconds
-    pub const REPLACE_INTERRUPT_HANDLERS: u64 = 0x124; // EDX=in/out handler pair, ECX=vector
 }
 
 #[thread_local]
@@ -300,11 +301,8 @@ pub(crate) fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
                 }
             }
         }
-        arch_call::REPLACE_INTERRUPT_HANDLERS => unsafe {
-            let handlers = regs.rdx as *mut arch_abi::InterruptHandlers;
-            let previous = crate::descriptors::replace_interrupt_handlers(
-                regs.rcx as u8, core::ptr::read(handlers));
-            core::ptr::write(handlers, previous);
+        arch_call::BIND_PLANAR => unsafe {
+            crate::planar::bind(*(regs.rdx as *const Option<::planar::Binding>));
         },
         _ => lib::compact_panic!("Unknown arch call: {:#x}", regs.rax),
     }
@@ -312,12 +310,15 @@ pub(crate) fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
 }
 
 #[cfg(not(feature = "kvm"))]
-pub(crate) fn dispatch_parked_call() -> CallOutcome {
+pub(crate) fn dispatch_parked_call(frame: &Regs) -> CallOutcome {
     let execute = unsafe { EXECUTE_REGS };
     let parked = if execute.is_null() { &raw mut REGS } else { execute };
     let mut call = KernelCall::from_regs(unsafe { &*parked });
     let outcome = arch_dispatch(&mut call);
     call.write_result(unsafe { &mut *parked });
+    if matches!(outcome, CallOutcome::Execute) {
+        crate::planar::prepare(frame.code_seg(), frame.mode() == arch_abi::UserMode::VM86);
+    }
     outcome
 }
 
@@ -332,14 +333,30 @@ pub(crate) fn swap_regs(regs: &mut Regs) {
     }
 }
 
+/// Native kernel handoff: save the user frame and restore the suspended caller.
+#[cfg(not(feature = "kvm"))]
+pub(crate) fn return_to_kernel(regs: &mut Regs, event: arch_abi::KernelEvent) {
+    crate::planar::publish();
+    crate::irq::arm_alarm(None);
+    crate::traps::swap_regs(regs);
+    let (event, extra) = event.encode();
+    regs.rax = event as u64;
+    regs.rdx = extra as u32 as u64;
+    regs.rcx = extra >> 32;
+}
+
 // =============================================================================
 // Interrupt dispatch
 // =============================================================================
 
-/// Native interrupt-controller and diagnostic adaptation. Guest dispatch
-/// itself returns an outcome and cannot switch to the kernel.
-pub(crate) fn guest_trap(regs: &mut Regs) -> arch_abi::trap::Outcome {
-    use arch_abi::trap::Outcome;
+pub(crate) enum Outcome {
+    Resume,
+    ReturnToKernel(KE),
+}
+
+/// Dispatch a guest trap over canonical registers. Entry owns the return frame
+/// and the transition to the kernel, on both metal and KVM.
+pub(crate) fn guest_trap(regs: &mut Regs) -> Outcome {
     if regs.int_num == 1 && debug_watch_trap(regs, unsafe { x86::read_dr6() }, false) {
         return Outcome::Resume;
     }
@@ -374,16 +391,102 @@ pub(crate) fn guest_trap(regs: &mut Regs) -> arch_abi::trap::Outcome {
                 regs.stack_seg(), sp, stack);
         }
     }
-    let address = if regs.int_num == 14 { x86::read_cr2_full() } else { 0 };
-    arch_abi::trap::handle(&mut crate::backend::Metal, regs, address)
-}
-
-impl arch_abi::trap::Machine for crate::backend::Metal {
-    fn can_fault(&self) -> bool { crate::memory::can_fault() }
-    fn resolve_page_fault(&mut self, regs: &Regs, _address: u64) -> bool {
-        let legacy = is_vm86(regs) || regs.frame.cs & 4 != 0;
-        try_handle_page_fault(regs.err_code, legacy).is_some()
-    }
+    let event = match regs.int_num {
+        // #DB has two owners. PM clients use TF for virtual-IF learning, while
+        // VM86 programs may deliberately single-step through a hooked INT 1
+        // vector (ST3's packer does this). Preserve the latter as a guest CPU
+        // exception so DOS can reflect it through the real-mode IVT.
+        1 => {
+            match regs.mode() {
+                UserMode::VM86 => KE::Exception(1),
+                UserMode::Mode32 => KE::DebugTrap,
+                _ => {
+                    regs.clear_flag32(1 << 8); // stale internal TF
+                    return Outcome::Resume;
+                }
+            }
+        }
+        // The legacy sensitive-instruction decoder uses 32-bit addresses.
+        // A native long-mode #GP must retain its full faulting RIP rather
+        // than decoding unrelated bytes at the truncated low address.
+        13 if regs.mode() == UserMode::Mode64 => KE::Exception(13),
+        13 if !crate::memory::can_fault() => KE::Irq,
+        13 => {
+            // VME raises #GP with VIF=1 && VIP=1 to ask the host to inject the
+            // pending virtual interrupt. It normally lands on STI/POPF/IRET
+            // (monitor Resume), but the STI interrupt-shadow can defer it onto
+            // the *following* instruction (monitor Fault on a plain opcode —
+            // e.g. the `push ds` right after `sti` in the Bochs BIOS INT 9
+            // handler). Either way it's a delivery request, not an instruction
+            // fault: bubble it as an IRQ and let `pick_pending_vec` choose the
+            // highest-priority deliverable line. The Fault path leaves IP on
+            // the (innocent) instruction, so it re-runs after the handler IRETs.
+            const VIF_VIP: u32 = (1 << 19) | (1 << 20);
+            let pending_virtual_irq = regs.flags32() & VIF_VIP == VIF_VIP;
+            // Where this instruction lives, and whether virtual IF was on before
+            // it ran: a PM CLI/STI that toggles virtual IF is a window boundary,
+            // reflected to `dpmi::vif`.
+            let entry_ip = regs.ip32();
+            let vif_was_on = regs.flags32() & (1 << 19) != 0;
+            let stepped = arch_abi::monitor::stepping(regs);
+            let user_was = regs.user_tf();
+            match arch_abi::monitor::monitor(&mut crate::backend::Metal, regs) {
+                MonitorResult::Resume => {
+                    // A PM CLI/STI toggled virtual IF: reflect the window to
+                    // dpmi::vif (which owns the per-space tag/learn policy). VM86
+                    // handles POPF/IRET on its own #GP (VME) and needs no tag.
+                    if regs.mode() != UserMode::VM86
+                        && (regs.flags32() & (1 << 19) != 0) != vif_was_on
+                    {
+                        let flags = regs.flags32();
+                        let vif_now = flags & (1 << 19) != 0;
+                        let viopl = (flags >> 12) & 3;
+                        if viopl >= 2 {
+                            // Repair/reference modes need the CLI boundary in
+                            // ring 1 to learn or step a later POPF/IRET exit.
+                            KE::VifWindow { entry_ip, vif_was_on }
+                        } else if vif_now && flags & (1 << 20) != 0 {
+                            // Strict mode has no learning work. Bubble out only
+                            // when STI made a pending virtual IRQ deliverable.
+                            KE::Irq
+                        } else {
+                            // CLI/STI was fully emulated in ring 0; returning a
+                            // VifWindow to ring 1 would be a pure round trip.
+                            return Outcome::Resume;
+                        }
+                    } else if regs.flags32() & VIF_VIP == VIF_VIP {
+                        KE::Irq
+                    } else if stepped && (regs.user_tf() || regs.forced_tf()) {
+                        KE::EmulatedStep { user_was }
+                    } else {
+                        return Outcome::Resume;
+                    }
+                }
+                // A real fault is reclassified as IRQ delivery only when the
+                // VME pending-interrupt condition held at fault time.
+                MonitorResult::Event(KE::Fault) if pending_virtual_irq => KE::Irq,
+                MonitorResult::Event(e) => e,
+            }
+        }
+        14 => {
+            assert!(crate::memory::can_fault(), "guest page fault without reserved backing");
+            if try_handle_page_fault(regs.err_code, is_vm86(regs) || regs.frame.cs & 4 != 0).is_some() {
+                return Outcome::Resume;
+            } else { KE::PageFault { addr: x86::read_cr2_full() } }
+        }
+        // Vectors 3/4 (#BP/#OF) are only reachable from user INT3/INTO, so
+        // they're soft ints. Other n<32 are genuine CPU exceptions.
+        3 | 4 => KE::SoftInt(regs.int_num as u8),
+        0..=31 => KE::Exception(regs.int_num as u8),
+        // SYSCALL instruction: `syscall_entry_64` tags it with the synthetic
+        // 256, distinct from any IDT vector — keep it before the catch-all so
+        // `INT 0x80` (which lands as SoftInt(0x80)) stays a different event.
+        256 => KE::Syscall,
+        // Direct-IDT soft interrupts: 0x30..=0xFF (plus VM86 INT3/0xCC bypass
+        // of VME landing here too).
+        _ => KE::SoftInt(regs.int_num as u8),
+    };
+    Outcome::ReturnToKernel(event)
 }
 
 /// Ring-1 (kernel) trap dispatch: arch calls and IRQs; page faults are bugs. Anything

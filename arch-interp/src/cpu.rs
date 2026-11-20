@@ -416,7 +416,7 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
             let d = uc.get_data();
             if matches!(d.pending_intr, Some(14) | Some(8)) && !d.pending_is_int {
                 let cr2 = d.pending_cr2;
-                if !crate::phys::can_fault() { break; }
+                assert!(crate::phys::can_fault(), "guest page fault without reserved backing");
                 // Absent VA → demand-commit a fresh frame; present VA → a write to
                 // a read-only page, which is a COW page to privatise (else genuine).
                 let resolved = if crate::paging::space_translate(cr2).is_none() {
@@ -432,6 +432,12 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
                         d.pending_is_int = false;
                         d.pending_err = 0;
                         d.pending_cr2 = 0;
+                    }
+                    // The fault was handled with its guaranteed backing.
+                    // Check the reserve before resuming, not at the next fault.
+                    if !crate::phys::can_fault() {
+                        store_regs(uc, vcpu, mode);
+                        return KernelEvent::Irq;
                     }
                     let eip = uc.reg_read(RegisterX86::EIP).unwrap_or(0);
                     run = uc.emu_start(eip, 0xFFFF_FFFF, 0, 0);
@@ -452,10 +458,6 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
         // A page fault that demand-paging did not resolve is a genuine SEGV: the
         // kernel signals the thread. Carry CR2 + the #PF error code.
         if matches!(uc.get_data().pending_intr, Some(14) | Some(8)) && !uc.get_data().pending_is_int {
-            if !crate::phys::can_fault() {
-                uc.get_data_mut().pending_intr = None;
-                return KernelEvent::Irq;
-            }
             let cr2 = uc.get_data().pending_cr2;
             vcpu.err_code = uc.get_data().pending_err as u64;
             uc.get_data_mut().pending_intr = None;

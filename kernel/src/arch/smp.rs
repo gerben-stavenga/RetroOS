@@ -4,7 +4,7 @@ use arch::{MultibootMmapEntry, smp, x86};
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-const MAX_CPUS: usize = 64;
+const MAX_CPUS: usize = arch::smp::MAX_CORES;
 static READY: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 static TICKS_PER_US: AtomicU32 = AtomicU32::new(0);
 static MEDIA_START: AtomicBool = AtomicBool::new(false);

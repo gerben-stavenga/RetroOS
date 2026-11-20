@@ -255,18 +255,7 @@ fn execution_profile<A: crate::Arch>(machine: &A) {
         send(b"\""); send(name.as_bytes()); send(b"\":{\"calls\":");
         send_u64(calls); send(b",\"cycles\":"); send_u64(cycles); send(b"}");
     }
-    send(b"},\"vga_instructions\":[");
-    let mut first = true;
-    for entry in super::event_profile::vga_instructions().into_iter().filter(|entry| entry.calls != 0) {
-        if !first { send(b","); }
-        first = false;
-        send(b"{\"cs\":"); send_u64(u64::from(entry.cs));
-        send(b",\"ip\":"); send_u64(u64::from(entry.ip));
-        send(b",\"bytes\":"); send_u64(u64::from(entry.bytes));
-        send(b",\"max_count\":"); send_u64(u64::from(entry.max_count));
-        send(b",\"calls\":"); send_u64(entry.calls); send(b"}");
-    }
-    send(b"]}\n");
+    send(b"}}\n");
 }
 
 fn trim(mut bytes: &[u8]) -> &[u8] {

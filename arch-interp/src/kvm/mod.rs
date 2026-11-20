@@ -142,6 +142,9 @@ fn descriptors_ready() {
     });
 }
 impl X86 for Interp {
+    unsafe fn bind_planar(&mut self, binding: Option<planar::Binding>) {
+        unsafe { setup::bind_planar(binding) }
+    }
     fn isa_unmask_irq(&mut self, _: u8) { panic!("hosted has no physical ISA interrupt controller"); }
     fn set_debug_watch(&mut self, addresses: Option<(u32, u32)>) {
         let (n, a, b) = addresses.map_or((0, 0, 0), |(a, b)| (if b == 0 { 1 } else { 2 }, a, b));

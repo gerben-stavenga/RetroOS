@@ -15,12 +15,6 @@ config_setting(
     constraint_values = ["@platforms//os:none"],
 )
 
-nasm_library(
-    name = "planar_entry",
-    srcs = ["src/kernel/dos/planar.asm"],
-    copts = ["-f", "elf32"],
-)
-
 # Raw one-page ELF image, assembled using the existing NASM toolchain.
 nasm_library(
     name = "vdso64",
@@ -79,7 +73,7 @@ rust_library(
         "//lib",
         "//lib:ini",
         "//lib:compact_fmt",
-        "//lib:vga",
+        "//lib:vga", "//lib:planar",
         "//lib:sound",
         "//third_party/voodoo",
         "//third_party/smb2-core",
@@ -163,7 +157,7 @@ rust_binary(
     srcs = ["metal_entry.rs"],
     crate_name = "kernel_metal",
     edition = "2024",
-    compile_data = [":kernel_ld", "//arch-metal:entry", ":planar_entry"],
+    compile_data = [":kernel_ld", "//arch-metal:entry"],
     rustc_flags = [
         "-Cpanic=abort",
         "-Crelocation-model=static",
@@ -174,7 +168,6 @@ rust_binary(
         "-Clinker=rust-lld",
         "-Clink-arg=-T$(location :kernel_ld)",
         "-Clink-arg=$(location //arch-metal:entry)",
-        "-Clink-arg=$(location :planar_entry)",
         "-Clink-arg=-nostdlib",
         "-Clink-arg=-no-pie",
         # Fold identical function bodies to retain the boot footprint limit.
@@ -248,7 +241,7 @@ rust_binary(
         ":hosted",
         "//arch-interp",
         "//lib",
-        "//lib:vga",
+        "//lib:vga", "//lib:planar",
         "//lib:sound",
     ],
 )
@@ -268,7 +261,7 @@ rust_binary(
         ":hosted",
         "//arch-interp:arch-interp-kvm",
         "//lib",
-        "//lib:vga",
+        "//lib:vga", "//lib:planar",
         "//lib:sound",
     ],
 )

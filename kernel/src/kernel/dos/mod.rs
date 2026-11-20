@@ -368,6 +368,7 @@ impl<A: crate::Arch> DosState<A> {
     /// calls separately before `arch_user_clean` unmaps the 0xA0000
     /// framebuffer. Called from `thread::exit_thread`.
     pub fn on_exit(&mut self, machine: &mut A, regs: &mut Regs, capture_vga: bool) {
+        planar::uninstall(machine);
         self.exec_parent = None; // Release descriptors owned by suspended EXEC parents.
         if capture_vga {
             // The live aperture belongs to this address space. Complete the
@@ -404,6 +405,7 @@ impl<A: crate::Arch> DosState<A> {
         self.pc.audio.lock().sb.sb_resume(machine, &mut self.pc.dma);
         self.pc.vga.resume_vram(machine);
         machine.load_ldt(&self.ldt[..]);
+        planar::install(machine, &self.pc.vga);
     }
 
     /// Called when the thread loses focus. Snapshots the VGA framebuffer +
@@ -417,6 +419,7 @@ impl<A: crate::Arch> DosState<A> {
         let display = machine::vga::release_fullscreen(
             &mut self.pc.vga, machine, bios_workspace);
         dpmi::refresh_physical_mappings(machine, self);
+        planar::install(machine, &self.pc.vga);
         display
     }
 
@@ -432,6 +435,7 @@ impl<A: crate::Arch> DosState<A> {
         machine::vga::acquire_fullscreen(
             &mut self.pc.vga, machine, bios_workspace, display);
         dpmi::refresh_physical_mappings(machine, self);
+        planar::install(machine, &self.pc.vga);
     }
 
     /// Acquire a handoff while preserving the adapter's current state. Unlike
@@ -444,6 +448,7 @@ impl<A: crate::Arch> DosState<A> {
     ) {
         machine::vga::acquire_fullscreen_replace(&mut self.pc.vga, machine, display);
         dpmi::refresh_physical_mappings(machine, self);
+        planar::install(machine, &self.pc.vga);
     }
 
 }
@@ -692,9 +697,9 @@ pub fn syscall<A: crate::Arch>(
 }
 
 /// Page-fault hook for the planar VGA trap: when a guest unchained-graphics
-/// access to the A0000 window faults (the window is left unmapped so the planar
-/// write/read logic runs), decode the faulting store/load on hosted backends.
-/// Native VGA is completed in ring 0; Voodoo still delivers PageFault here.
+/// access to the VGA window faults, finish operations declined by the resident
+/// handler (for example, a string destination requiring COW). TCG and Voodoo
+/// use the same decoder here for every intercepted memory access.
 /// Returns true if handled (resume), false → real SEGV.
 pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, addr: u32) -> bool {
     // The Voodoo's aperture is trapped the same way, through the same decoder
@@ -710,12 +715,6 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
             machine, regs, &mut target, &segments, def32, off,
         );
     }
-    // Native VGA aperture faults are completed by planar's ring-0 entry.
-    // Only hosted backends need to deliver their device faults here.
-    #[cfg(target_arch = "x86")]
-    { false }
-    #[cfg(not(target_arch = "x86"))]
-    {
     // The emulated register file is the sole aperture authority. A native
     // owner has no software trap: its adapter performs plane routing itself.
     // Resolved before the device is borrowed, so the decode below needs only
@@ -736,7 +735,6 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     let off = addr - base;
     let mut target = machine::mmio::MmioTarget::Planar { vga: state, base, len };
     machine::mmio::handle_mmio_fault(machine, regs, &mut target, &segments, def32, off)
-    }
 }
 
 /// Resolve all instruction operands from DOS's descriptors. Only GDT

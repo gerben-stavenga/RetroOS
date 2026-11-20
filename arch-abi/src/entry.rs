@@ -4,7 +4,7 @@
 use crate::Regs;
 
 /// Hybrid 32-bit entry layout. Assembly saves the segments and general
-/// registers directly in their canonical `Regs` qword slots, then leaves a
+/// registers in the low halves of their canonical `Regs` slots, then leaves a
 /// 28-byte expansion gap before the native dword interrupt/IRET tail. Rust
 /// widens only that tail for cross-privilege entries. Same-ring ring-0 entries
 /// return before widening and therefore never inspect the absent ESP/SS.
@@ -106,6 +106,40 @@ mod tests {
     }
 
     #[test]
+    fn narrow_entry_initializes_unsaved_slots_only_during_canonicalization() {
+        // Model stack residue in every byte not written by 32-bit assembly.
+        let mut frame = core::mem::MaybeUninit::<StackFrame>::uninit();
+        unsafe {
+            frame.as_mut_ptr().cast::<u8>().write_bytes(0xa5, core::mem::size_of::<StackFrame>());
+            let stack = frame.as_mut_ptr();
+            let raw = &raw mut (*stack).raw32.raw;
+            macro_rules! low { ($field:ident, $value:expr) => {
+                (&raw mut (*raw).$field).cast::<u32>().write($value);
+            }; }
+            // Segment-register moves need only supply the selector bits.
+            low!(gs, 0xa5a50033); low!(fs, 0xa5a50043);
+            low!(es, 0xa5a5002b); low!(ds, 0xa5a5002b);
+            low!(edi, 1); low!(esi, 2); low!(ebp, 3); low!(ebx, 4);
+            low!(edx, 5); low!(ecx, 6); low!(eax, 0x87654321);
+            (*raw).int_num = 0xffffff80; (*raw).err_code = 0;
+            (*raw).eip = 0x1234; (*raw).cs = 0x23; (*raw).eflags = 0x202;
+            (*raw).esp = 0x12345678; (*raw).ss = 0x2b;
+            let regs = (*stack).canonicalize(false);
+            assert_eq!(regs.rax, 0x87654321);
+            assert_eq!([regs.rdi, regs.rsi, regs.rbp, regs.rbx, regs.rdx, regs.rcx], [1, 2, 3, 4, 5, 6]);
+            assert_eq!([regs.gs, regs.fs, regs.es, regs.ds], [0x33, 0x43, 0x2b, 0x2b]);
+            assert_eq!([regs.r8, regs.r9, regs.r10, regs.r11, regs.r12, regs.r13, regs.r14, regs.r15], [0; 8]);
+            assert_eq!(regs.rsp_dummy, 0);
+            assert_eq!(regs.int_num, 0x80);
+            assert_eq!(regs.frame.rsp, 0x12345678);
+            assert_eq!(regs.frame.rip, 0x1234);
+            (*stack).decanonicalize(false);
+            assert_eq!((*raw).eip, 0x1234);
+            assert_eq!((*raw).eax, 0x87654321);
+        }
+    }
+
+    #[test]
     fn wide_frame_preserves_full_addresses_and_syscall_sentinel() {
         let mut frame: StackFrame = unsafe { core::mem::zeroed() };
         let mut regs = Regs::empty();
@@ -176,6 +210,19 @@ impl StackFrame {
     /// SS:ESP; a VM86 frame must also include the four segment words.
     pub unsafe fn canonicalize(&mut self, wide: bool) -> &mut Regs {
         if !wide {
+            // Assembly (and the pre-canonicalization hook) only stores live
+            // dwords. Initialize the rest here, after the hook has declined.
+            let prefix = self as *mut Self as *mut u32;
+            for slot in 0..20 {
+                unsafe { prefix.add(slot * 2 + 1).write(0); }
+                if slot < 4 {
+                    // Only the selector's low 16 bits are meaningful.
+                    let word = unsafe { prefix.add(slot * 2) };
+                    unsafe { word.write(u32::from(word.cast::<u16>().read())); }
+                } else if (4..12).contains(&slot) || slot == 15 {
+                    unsafe { prefix.add(slot * 2).write(0); }
+                }
+            }
             let raw = unsafe { &self.raw32.raw };
             let (vector, error, ip, cs, flags, sp, ss) =
                 (raw.int_num, raw.err_code, raw.eip, raw.cs, raw.eflags, raw.esp, raw.ss);

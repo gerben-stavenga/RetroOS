@@ -21,6 +21,9 @@ use arch_abi::{Arch, KernelEvent, Regs};
 pub struct Metal;
 
 impl X86 for Metal {
+    unsafe fn bind_planar(&mut self, mut binding: Option<::planar::Binding>) {
+        unsafe { invoke(crate::arch_call::BIND_PLANAR, &mut binding); }
+    }
     fn isa_unmask_irq(&mut self, line: u8) {
         #[cfg(not(feature = "kvm"))]
         super::calls::arch_isa_unmask_irq(line);
@@ -57,10 +60,6 @@ impl X86 for Metal {
         // Long mode is toggled per-thread on demand (traps::toggle_mode_if_needed),
         // so CPU support is the whole capability.
         super::paging2::cpu_supports_long_mode()
-    }
-
-    unsafe fn replace_interrupt_handlers(&mut self, vector: u8, handlers: arch_abi::InterruptHandlers) -> arch_abi::InterruptHandlers {
-        super::calls::arch_replace_interrupt_handlers(vector, handlers)
     }
 
     fn switch_fx(&mut self, fx: &mut Self::Fx) {

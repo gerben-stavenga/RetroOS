@@ -2,8 +2,12 @@
 //! Raw stack conversion is shared with KVM in arch_abi::entry.
 #![allow(static_mut_refs)]
 use arch_abi::{Regs, entry::StackFrame};
-use crate::{paging2, x86};
-use crate::traps::{arch_call, handle_ring0, isr_handler_ring1, guest_trap};
+use crate::{descriptors, paging2, x86};
+#[cfg(not(feature = "kvm"))]
+use crate::traps::return_to_kernel;
+#[cfg(feature = "kvm")]
+use crate::vm::return_to_kernel;
+use crate::traps::{arch_call, handle_ring0, isr_handler_ring1, guest_trap, Outcome};
 const VM_FLAG: u64 = 1 << 17;
 fn is_vm86(regs: &Regs) -> bool { regs.mode() == arch_abi::UserMode::VM86 }
 
@@ -40,6 +44,89 @@ fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
 #[allow(private_interfaces)]
 pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     paging2::refresh_kernel_mappings();
+    // Hooks handle application traps only. Supervisor faults always retain
+    // the normal fatal-fault path. Assembly has already established core TLS.
+    let user = unsafe {
+        if from_64 { (*stack).regs.frame.cs & 3 == 3 }
+        else { (*stack).raw32.raw.cs & 3 == 3 || (*stack).raw32.raw.eflags & (1 << 17) != 0 }
+    };
+    if user {
+        if let Some(hook) = unsafe { ENTRY_HOOK } {
+            if unsafe { hook(stack, from_64) } {
+                unsafe { prepare_espfix(stack, from_64); }
+                return from_64;
+            }
+        }
+    }
+    let wide = dispatch(stack, from_64);
+    unsafe { prepare_espfix(stack, wide); }
+    wide
+}
+
+// One fixed buffer, one six-dword slot per core. The shared SS descriptor
+// addresses it through SP; no pointers or per-core descriptors are needed.
+pub(crate) const ESPFIX_BYTES: usize = 24 * crate::smp::MAX_CORES;
+pub(crate) static mut ESPFIX: [[u32; 6]; crate::smp::MAX_CORES] = [[0; 6]; crate::smp::MAX_CORES];
+const _: () = assert!(ESPFIX_BYTES <= 65536);
+unsafe extern "C" {
+    fn espfix_return();
+}
+
+// Work on the native tail so handled hooks need not canonicalize registers.
+unsafe fn return_words(stack: *mut StackFrame, wide: bool) -> (*mut u32, usize) {
+    if wide {
+        (unsafe { &raw mut (*stack).regs.frame.rip }.cast(), 2)
+    } else {
+        (unsafe { &raw mut (*stack).raw32.raw.eip }, 1)
+    }
+}
+unsafe fn write_return(words: *mut u32, stride: usize, frame: [u32; 5]) {
+    for (i, value) in frame.into_iter().enumerate() {
+        unsafe {
+            if stride == 2 { words.add(i * 2).cast::<u64>().write(u64::from(value)); }
+            else { words.add(i).write(value); }
+        }
+    }
+}
+
+unsafe fn prepare_espfix(stack: *mut StackFrame, wide: bool) {
+    let (words, stride) = unsafe { return_words(stack, wide) };
+    let cs = unsafe { words.add(stride).read() } as u16;
+    let flags = unsafe { words.add(2 * stride).read() };
+    // Same-ring entries have no SS:ESP. VM86 and 64-bit stacks restore ESP
+    // without the 16-bit-stack workaround. USER_DS is permanently B=1.
+    if flags & (1 << 17) != 0 || cs & 3 == 0 || cs == arch_abi::USER_CS64 { return; }
+    let ss = unsafe { words.add(4 * stride).read() } as u16;
+    if ss == descriptors::ESPFIX_SS {
+        // Returning to the continuation is itself a 16-bit-stack return.
+        // Restart POP ESP without overwriting the pending application frame.
+        unsafe {
+            words.write(espfix_return as *const () as u32);
+            words.add(3 * stride).write(crate::smp::current_core_id() * 24);
+        }
+        return;
+    }
+    if cs & 3 != 3 { return; }
+    if ss == arch_abi::USER_DS { return; }
+    let descriptor = descriptors::read_descriptor(ss);
+    if descriptor == 0 || descriptor & (1 << 54) != 0 { return; }
+    if wide && descriptors::read_descriptor(cs) & (1 << 53) != 0 { return; }
+    let core = crate::smp::current_core_id() as usize;
+    let offset = (core * 24) as u32;
+    let frame: [u32; 5] = core::array::from_fn(|i| unsafe { words.add(i * stride).read() });
+    let slot = unsafe { (&raw mut ESPFIX).cast::<[u32; 6]>().add(core) };
+    unsafe {
+        slot.write([(frame[3] & 0xffff0000) | (offset + 4),
+            frame[0], frame[1], frame[2], frame[3], frame[4]]);
+        write_return(words, stride, [espfix_return as *const () as u32,
+            u32::from(descriptors::RING1_CS), flags & !((1 << 17) | (1 << 14) | (1 << 9) | (1 << 8)),
+            offset, u32::from(descriptors::ESPFIX_SS)]);
+    }
+}
+
+// Keep the full dispatch's stack frame off the direct-to-IRET path.
+#[inline(never)]
+fn dispatch(stack: *mut StackFrame, from_64: bool) -> bool {
     #[thread_local]
     static mut VIF: bool = false;
     #[thread_local]
@@ -113,26 +200,6 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         && raw_int_num == 0x80
         && regs.rax == arch_call::EXECUTE;
 
-    // 16-bit SS sanity-fix: CPU only loads low 16 bits of SP for B=0 stacks;
-    // upper bits are kernel residue.
-    if !vm86 && regs.frame.ss & 4 != 0 {
-        let ss = regs.frame.ss as u16;
-        let ar: u32;
-        let ok: u8;
-        unsafe {
-            core::arch::asm!(
-                "lar {ar:e}, {sel:e}",
-                "setz {ok}",
-                sel = in(reg) ss as u32,
-                ar = out(reg) ar,
-                ok = out(reg_byte) ok,
-            );
-        }
-        if ok != 0 && ar & (1 << 22) == 0 {
-            regs.frame.rsp &= 0xFFFF;
-        }
-    }
-
     // Only ring 3 / VM86 needs the full user-emulation cleanup (VIF/VIP swap,
     // VM86 seg promotion). Ring 1 kernel just needs the layout normalized.
 
@@ -160,10 +227,10 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         }
         crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitFrameIn);
         match guest_trap(regs) {
-            arch_abi::trap::Outcome::ReturnToKernel(event) => return_to_kernel(regs, event),
-            arch_abi::trap::Outcome::Resume if !crate::memory::can_fault() =>
+            Outcome::ReturnToKernel(event) => return_to_kernel(regs, event),
+            Outcome::Resume if !crate::memory::can_fault() =>
                 return_to_kernel(regs, arch_abi::KernelEvent::Irq),
-            arch_abi::trap::Outcome::Resume => {},
+            Outcome::Resume => {},
         }
         crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitDispatch);
     } else {
@@ -261,15 +328,76 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
 }
 
 
-/// Native kernel handoff: save the user frame and restore the suspended caller.
-#[cfg(not(feature = "kvm"))]
-fn return_to_kernel(regs: &mut Regs, event: arch_abi::KernelEvent) {
-    crate::irq::arm_alarm(None);
-    crate::traps::swap_regs(regs);
-    let (event, extra) = event.encode();
-    regs.rax = event as u64;
-    regs.rdx = extra as u32 as u64;
-    regs.rcx = extra >> 32;
+/// An installed hook sees the native frame before canonicalization. On true,
+/// entry restores it directly; on false, normal trap dispatch continues.
+/// Only the saved low halves are initialized in a 32-bit frame. A handler must
+/// preserve its layout and may update live state, including on partial progress.
+pub(crate) type EntryHook = unsafe extern "C" fn(*mut StackFrame, bool) -> bool;
+
+#[thread_local]
+static mut ENTRY_HOOK: Option<EntryHook> = None;
+
+/// Called at ring 0 with interrupts disabled when installing/removing a hook.
+pub(crate) unsafe fn install_hook(hook: Option<EntryHook>) {
+    unsafe { ENTRY_HOOK = hook; }
+}
+
+/// Borrowed instruction state for a 16/32-bit handler. This does not normalize
+/// virtual flags or convert the native return frame. Selectors are ES/CS/SS/DS/FS/GS.
+pub(crate) struct InstructionState<'a> {
+    pub gprs: [&'a mut u32; 8], // AX, CX, DX, BX, SP, BP, SI, DI
+    pub high: Option<[&'a mut u32; 8]>,
+    pub ip: &'a mut u32,
+    pub flags: &'a mut u32,
+    pub selectors: [u16; 6],
+    pub vector: u64,
+    pub error: u64,
+}
+
+/// Borrow only saved fields, leaving uninitialized halves and the expansion
+/// gap untouched. Edits directly update the native frame, even on a decline.
+///
+/// # Safety
+/// The frame must be a user entry in the selected layout and remain exclusively
+/// borrowed for the returned state's lifetime. Long-mode user code is declined.
+#[inline(always)]
+pub(crate) unsafe fn instruction32<'a>(stack: *mut StackFrame, wide: bool) -> Option<InstructionState<'a>> {
+    if wide {
+        let r = unsafe { &raw mut (*stack).regs };
+        if unsafe { (*r).frame.cs } == u64::from(arch_abi::USER_CS64) { return None; }
+        // x86 is little-endian. The low/high borrows are disjoint and refer to
+        // real 64-bit storage only on this path; narrow entry has no highs.
+        let words = unsafe { [&raw mut (*r).rax, &raw mut (*r).rcx, &raw mut (*r).rdx,
+            &raw mut (*r).rbx, &raw mut (*r).frame.rsp, &raw mut (*r).rbp,
+            &raw mut (*r).rsi, &raw mut (*r).rdi] };
+        Some(InstructionState {
+            gprs: words.map(|p| unsafe { &mut *p.cast::<u32>() }),
+            high: Some(words.map(|p| unsafe { &mut *p.cast::<u32>().add(1) })),
+            ip: unsafe { &mut *(&raw mut (*r).frame.rip).cast::<u32>() },
+            flags: unsafe { &mut *(&raw mut (*r).frame.rflags).cast::<u32>() },
+            selectors: unsafe { [(*r).es as u16, (*r).frame.cs as u16, (*r).frame.ss as u16,
+                (*r).ds as u16, (*r).fs as u16, (*r).gs as u16] },
+            vector: unsafe { (*r).int_num }, error: unsafe { (*r).err_code },
+        })
+    } else {
+        let r = unsafe { &raw mut (*stack).raw32.raw };
+        macro_rules! low { ($field:ident) => { unsafe { (&raw const (*r).$field).cast::<u32>().read() } }; }
+        let selectors = if unsafe { (*r).eflags } & (1 << 17) != 0 {
+            let vm = unsafe { (*stack).raw32.vm86 };
+            [vm.es as u16, unsafe { (*r).cs } as u16, unsafe { (*r).ss } as u16,
+                vm.ds as u16, vm.fs as u16, vm.gs as u16]
+        } else {
+            [low!(es) as u16, unsafe { (*r).cs } as u16, unsafe { (*r).ss } as u16,
+                low!(ds) as u16, low!(fs) as u16, low!(gs) as u16]
+        };
+        macro_rules! word { ($field:ident) => { unsafe { &mut *(&raw mut (*r).$field).cast::<u32>() } }; }
+        Some(InstructionState {
+            gprs: [word!(eax), word!(ecx), word!(edx), word!(ebx), word!(esp),
+                word!(ebp), word!(esi), word!(edi)], high: None,
+            ip: unsafe { &mut (*r).eip }, flags: unsafe { &mut (*r).eflags }, selectors,
+            vector: u64::from(unsafe { (*r).int_num }), error: u64::from(unsafe { (*r).err_code }),
+        })
+    }
 }
 
 /// Normalize a metal syscall before dispatch: the physical entry frame is
@@ -280,15 +408,11 @@ fn kernel_call(frame: &mut Regs) {
     // swap_regs parks the kernel continuation and installs the app frame.
     // The operation reads/writes the parked call, never the app's registers.
     crate::traps::swap_regs(frame);
-    if let arch_abi::entry::CallOutcome::Complete = crate::traps::dispatch_parked_call() {
+    if let arch_abi::entry::CallOutcome::Complete = crate::traps::dispatch_parked_call(frame) {
         crate::traps::swap_regs(frame);
     }
     // execute leaves the app frame in place for the assembly IRET epilogue.
 }
 
-#[cfg(feature = "kvm")]
-fn return_to_kernel(regs: &mut Regs, event: arch_abi::KernelEvent) {
-    crate::vm::return_to_kernel(regs, event);
-}
 #[cfg(feature = "kvm")]
 fn kernel_call(frame: &mut Regs) { crate::vm::requests(frame); }

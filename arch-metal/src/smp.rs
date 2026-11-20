@@ -11,6 +11,9 @@ use crate::{descriptors, paging2, x86};
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+/// Capacity of the fixed per-core arch storage.
+pub const MAX_CORES: usize = 64;
+
 unsafe extern "C" {
     #[cfg(not(feature = "kvm"))]
     static TLS_TEMPLATE: u8;
@@ -41,6 +44,7 @@ pub fn current_core_id() -> u32 {
 pub struct CoreStart {
     pub core_id: u32,
     pub stack_top: u32,
+    /// A resident 16 KiB stack, with 16 bytes reserved above this SP for VM86 expansion.
     pub trap_stack_top: u32,
     pub tls: *mut u8,
     pub entry: extern "C" fn(u32, usize) -> !,
@@ -52,7 +56,7 @@ pub struct CoreStart {
 
 pub fn tls_layout() -> Layout {
     Layout::from_size_align(
-        (&raw const TLS_SIZE) as usize + 8,
+        (&raw const TLS_SIZE) as usize + 4,
         ((&raw const TLS_ALIGN) as usize).max(4),
     )
     .unwrap()
@@ -64,6 +68,7 @@ pub fn tls_layout() -> Layout {
 /// BSP: paging off, boot offset segments. AP: paging on using the BSP root,
 /// flat segments, resident caller-owned stack/TLS. Interrupts remain masked.
 pub unsafe fn init_core(core_id: u32) {
+    assert!((core_id as usize) < MAX_CORES);
     unsafe { CORE_ID = core_id; }
     unsafe { x86::init_cpu_capabilities(core_id == 0); }
     let stack = if core_id == 0 {
@@ -132,6 +137,7 @@ pub unsafe fn start_core(
     delay_us: fn(u32),
 ) -> Result<(), StartError> {
     if start.core_id == 0
+        || start.core_id as usize >= MAX_CORES
         || current_core_id() != 0
         || x86::interrupts_enabled()
         || start.ready.load(Ordering::Acquire) != 0
@@ -158,8 +164,7 @@ pub unsafe fn start_core(
         || start.stack_top & 15 != 0
         || start.trap_stack_top & 15 != 0
         || !valid(start.stack_top.saturating_sub(65536) as usize, 65536)
-        || !valid(start.trap_stack_top.saturating_sub(16368) as usize, 16368)
-        || start.trap_stack_top >> 16 != start.trap_stack_top.saturating_sub(16368) >> 16
+        || !valid(start.trap_stack_top.saturating_sub(16368) as usize, 16384)
     {
         return Err(StartError::InvalidMemory);
     }

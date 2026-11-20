@@ -24,7 +24,7 @@ rust_library(
         "-Cforce-frame-pointers=yes",
         "-Ztls-model=local-exec",
     ],
-    deps = ["//arch-abi", "//lib", "//lib:compact_fmt"],
+    deps = ["//arch-abi", "//lib", "//lib:compact_fmt", "//lib:planar"],
 )
 
 # Compatibility aliases; the driver and its host tests now belong to kernel.
@@ -89,7 +89,7 @@ rust_library(
     crate_features = ["kvm"],
     edition = "2024",
     rustc_flags = ["-Cpanic=abort", "-Crelocation-model=static", "-Cforce-frame-pointers=yes", "-Ztls-model=local-exec"],
-    deps = ["//arch-abi", "//lib", "//lib:compact_fmt"],
+    deps = ["//arch-abi", "//lib", "//lib:compact_fmt", "//lib:planar"],
 )
 rust_binary(
     name = "vm_supervisor",
@@ -102,7 +102,7 @@ rust_binary(
         "-Clink-arg=-T$(location :vm_ld)", "-Clink-arg=$(location :vm_entry)",
         "-Clink-arg=-nostdlib", "-Clink-arg=-no-pie",
     ],
-    deps = [":arch-vm", "//arch-abi", "//lib"],
+    deps = [":arch-vm", "//arch-abi", "//lib:planar", "//lib"],
 )
 
 genrule(

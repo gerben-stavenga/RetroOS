@@ -255,6 +255,9 @@ fn kvm_engine_proofs() {
         "the demand-faulted store landed in guest memory"
     );
 
+    espfix_proof(&mut mem, code, data, stack, false);
+    planar_device_proof(&mut mem, code, stack);
+
     // ── PM #GP path: `hlt` at CPL3 → #GP(0) → monitor → KernelEvent::Hlt.
     mem.copy_to(code as u64, &[0xF4], crate::test_memory::input(5));
     let mut r = Regs::empty();
@@ -447,6 +450,8 @@ fn kvm_engine_proofs() {
     assert_eq!(mem.read::<u64>(high + 4096), 41);
     mem.destroy_space(&mut child);
 
+    espfix_proof(&mut mem, code, data, stack, true);
+
     // A timer interrupt may switch 64-bit contexts only after KVM has
     // delivered any pending syscall #UD to the arch supervisor. Repeatedly switch
     // between distinct code addresses at both timer and syscall boundaries;
@@ -493,4 +498,269 @@ fn kvm_engine_proofs() {
     assert!(alarms > 10, "context switches exercised real alarm preemption");
 
 
+}
+
+/// The native entries execute inside the VM against the owner's exact pages.
+fn planar_device_proof(mem: &mut crate::Interp, code: u32, stack: u32) {
+    use arch_abi::X86;
+    let storage = unsafe { libc::mmap(core::ptr::null_mut(), 65 * 4096,
+        libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+    assert_ne!(storage, libc::MAP_FAILED);
+    let state = unsafe { &*storage.cast::<planar::Registers>() };
+    let planes = unsafe { storage.cast::<u8>().add(4096) };
+    state.enabled.set(1); state.profile_enabled.set(1);
+    state.seq.set(4, 4); state.seq.set(2, 1); state.gc.set(8, 255); state.gc.set(6, 4);
+    let aperture = UserPage::new(0xa0000).unwrap();
+    let mut previous = [PageEntry::Absent; 16];
+    mem.read_mappings(aperture, &mut previous).unwrap();
+    unsafe { mem.fill_mappings(aperture, 16, PageEntry::Intercepted, test_memory::input(8)).0.unwrap(); }
+    let binding = planar::Binding { registers: state, planes };
+    // Two MOV stores separated by a sequencer mask change; then a VGA read.
+    let program = [0xb0, 0x11, 0xa2, 0, 0, 0x0a, 0,
+        0xba, 0xc4, 3, 0, 0, 0x66, 0xb8, 2, 2, 0x66, 0xef,
+        0xb0, 0x22, 0xa2, 0, 0, 0x0a, 0, 0xa0, 0, 0, 0x0a, 0, 0xcd, 0x80];
+    mem.copy_to(code as u64, &program, test_memory::input(5));
+    let mut r = Regs::empty(); r.init_user_process(code, stack); set_regs(r);
+    unsafe { mem.bind_planar(Some(binding)); }
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)), "VGA and port accesses stay in the supervisor");
+    let report = state.profile.take();
+    assert!(report.details[0][0] + report.details[1][0] >= 3);
+    assert_eq!(regs().rax as u8, 0x11);
+    assert_eq!(state.seq.get(2), 2);
+    assert_eq!(state.seq_index.get(), 2);
+    assert_eq!(state.latches.read(), [0x11, 0x22, 0, 0]);
+    let vram = unsafe { planar::Memory::mapped(planes, 4 * 65536) };
+    assert_eq!((vram.get(0), vram.get(1)), (Some(0x11), Some(0x22)));
+
+    // Enter long mode, then run the same 32-bit program in compatibility
+    // mode. Its native tail is now 64-bit; untouched GPR halves must survive.
+    mem.copy_to(0x0061_0000, &[0x0f, 0x05], test_memory::input(5));
+    let mut r = Regs::empty(); r.init_user_process_64(0x0061_0000, u64::from(stack)); set_regs(r);
+    assert!(matches!(run_to_event(), KernelEvent::Syscall));
+    state.seq.set(2, 1);
+    let mut r = Regs::empty(); r.init_user_process(code, stack);
+    r.rdi = 0xabcd_1234_5678_4321; r.r8 = 0xfeed_beef_2345_6789;
+    set_regs(r);
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+    assert_eq!(regs().rdi, 0xabcd_1234_5678_4321);
+    assert_eq!(regs().r8, 0xfeed_beef_2345_6789);
+    assert_eq!(regs().rax as u8, 0x11);
+
+    // VM86 takes the compact native tail, with segment selectors above it.
+    // Use distinct segment bases so a mistaken protected-mode segment read
+    // cannot accidentally pass. The handler remains installed across modes.
+    mem.copy_to(0x92000, &[0xb0, 0x5a, 0xa2, 0x10, 0,
+        0xba, 0xc4, 3, 0xb8, 2, 4, 0xef,
+        0xb0, 0x6b, 0x26, 0xa2, 0x20, 0,
+        0xb9, 4, 0, 0xf3, 0xa4, 0xcd, 0x31], test_memory::input(5));
+    // REP reads plane zero (the default GC read map).
+    for i in 0..4 { vram.put((0x30 + i) * 4, 0x70 + i as u8); }
+    let mut r = Regs::empty();
+    r.frame.cs = 0x9200; r.frame.ss = 0x800; r.frame.rsp = 0x1000;
+    r.frame.rflags = VM_FLAG | (1 << 9) | u64::from(VIF_FLAG) | 2;
+    r.ds = 0xa000; r.es = 0xa001; r.fs = 0x1234; r.gs = 0x5678;
+    r.rsi = 0x30; r.rdi = 0x40;
+    set_regs(r);
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x31)));
+    assert_eq!(vram.get(0x10 * 4 + 1), Some(0x5a));
+    assert_eq!(vram.get(0x30 * 4 + 2), Some(0x6b));
+    for i in 0..4 { assert_eq!(vram.get((0x50 + i) * 4 + 2), Some(0x70 + i as u8)); }
+    assert_eq!((regs().rsi, regs().rdi, regs().rcx), (0x34, 0x44, 0));
+    assert_eq!((regs().ds, regs().es, regs().fs, regs().gs), (0xa000, 0xa001, 0x1234, 0x5678));
+    assert_eq!((regs().frame.ss, regs().frame.rsp), (0x800, 0x1000));
+    state.seq.set(2, 2);
+
+    // Ordinary kernel returns leave the handler installed. Device mode changes
+    // are visible through that same register page without another binding call.
+    state.enabled.set(0);
+    let mut r = Regs::empty(); r.init_user_process(code, stack); set_regs(r);
+    assert!(matches!(run_to_event(), KernelEvent::PageFault { addr: 0xa0000 }));
+    state.enabled.set(1);
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+    state.profile.take();
+
+    // VGA source faults first. The destination's next page still needs COW.
+    mem.copy_to(code as u64, &[0xf3, 0xa5, 0xcd, 0x80], test_memory::input(5));
+    let dest = 0x0040_0ff0;
+    mem.copy_to(dest, &[0; 16], test_memory::input(5));
+    let before = mem.supply_pages(arch_abi::page_supply::PageInput::new()).0;
+    let mut r = Regs::empty(); r.init_user_process(code, stack);
+    r.rsi = 0xa0000; r.rdi = dest; r.rcx = 32; set_regs(r);
+    assert!(matches!(run_to_event(), KernelEvent::PageFault { addr: 0xa0000 }));
+    assert_eq!(regs().rsi, 0xa0010);
+    assert_eq!(regs().rdi, dest + 16);
+    assert_eq!(regs().rcx, 28);
+    assert_eq!(regs().frame.rip, code as u64);
+    assert_eq!(mem.supply_pages(arch_abi::page_supply::PageInput::new()).0, before,
+        "planar does not spend the guest fault reserve");
+    mem.copy_to(dest + 16, &[0; 112], test_memory::input(5));
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+    assert_eq!(regs().rcx, 0);
+    assert_eq!(regs().rdi, dest + 128);
+    // Complete instruction at a page end uses only its fetched page. A split
+    // instruction takes the generic preflight before reading the next page.
+    for start in [code + 4094, code + 4095] {
+        mem.copy_to(u64::from(start), &[0x88, 0x07, 0xcd, 0x80], test_memory::input(5));
+        let mut r = Regs::empty(); r.init_user_process(start, stack);
+        r.rdi = 0xa0080; r.rax = 0x5e; set_regs(r);
+        assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+        assert_eq!(vram.get(0x80 * 4 + 1), Some(0x5e));
+    }
+    // A debugged instruction must leave the device and registers untouched
+    // until the kernel sees its page fault. Clearing TF then resumes normally.
+    mem.copy_to(u64::from(code), &[0x88, 0x07, 0xcd, 0x80], test_memory::input(5));
+    let mut r = Regs::empty(); r.init_user_process(code, stack);
+    r.rdi = 0xa0090; r.rax = 0x73; r.frame.rflags |= 0x100; r.set_user_tf(true);
+    let untouched = vram.get(0x90 * 4 + 1);
+    set_regs(r);
+    assert!(matches!(run_to_event(), KernelEvent::PageFault { addr: 0xa0090 }));
+    assert_eq!(regs().frame.rip, u64::from(code));
+    assert_eq!(vram.get(0x90 * 4 + 1), untouched);
+    let mut r = regs(); r.frame.rflags &= !0x100; r.set_user_tf(false); set_regs(r);
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+    assert_eq!(vram.get(0x90 * 4 + 1), Some(0x73));
+
+    // An instruction fetch from the intercepted aperture is not a data
+    // instruction to emulate, even if a planar handler is installed.
+    let mut r = Regs::empty(); r.init_user_process(0xa0000, stack);
+    // Deliberately do not use set_regs: that fixture marks a RAM code page
+    // executable, whereas this proof must attempt an intercepted fetch.
+    unsafe { (*(&raw mut crate::vcpu::REGS)).regs = r; }
+    assert!(matches!(run_to_event(), KernelEvent::PageFault { addr: 0xa0000 }));
+    assert_eq!(regs().frame.rip, 0xa0000);
+
+    unsafe {
+        mem.bind_planar(None);
+        mem.replace_mappings(aperture, &previous, test_memory::input(8)).0.unwrap();
+        assert_eq!(libc::munmap(storage, 65 * 4096), 0);
+    }
+}
+
+/// Exercise the real two-instruction ring-1 return, in legacy and IA-32e mode.
+fn espfix_proof(mem: &mut crate::Interp, code: u32, data: u32, stack: u32, long: bool) {
+    fn descriptor(base: u32, access: u8) -> u64 {
+        0xffff | (u64::from(base & 0xffff) << 16)
+            | (u64::from((base >> 16) & 255) << 32)
+            | (u64::from(access) << 40) | (u64::from(base >> 24) << 56)
+    }
+    let ldt = [0, descriptor(stack, 0xf3), descriptor(code, 0xfb)];
+    mem.load_ldt(&ldt);
+    for narrow_code in [false, true] {
+        // PUSH/POP uses SP; MOV observes the whole ESP. Neither changes flags.
+        let mut program = vec![0x50, 0x58];
+        if narrow_code { program.push(0x66); }
+        program.push(0x9c); // pushfd
+        if narrow_code { program.extend_from_slice(&[0x66, 0x67]); }
+        program.extend_from_slice(&[0x8f, 0x05]); // pop dword [data+4]
+        program.extend_from_slice(&(data + 4).to_le_bytes());
+        if narrow_code { program.extend_from_slice(&[0x66, 0x67]); }
+        program.extend_from_slice(&[0x89, 0x25]); // mov [absolute address],esp
+        program.extend_from_slice(&data.to_le_bytes());
+        program.extend_from_slice(&[0xcd, 0x80]);
+        mem.copy_to(u64::from(code), &program, crate::test_memory::input(5));
+        let mut r = Regs::empty();
+        r.init_user_process(if narrow_code { 0 } else { code }, 0xabcd_8000);
+        r.frame.ss = 0x0f;
+        if narrow_code { r.frame.cs = 0x17; }
+        r.frame.rflags |= 0x401; // DF and CF must survive the intermediate IRET
+        r.rax = 0x1234_5678; r.rbx = 0x2345_6789; r.rcx = 0x3456_789a;
+        r.rdx = 0x4567_89ab; r.rsi = 0x5678_9abc; r.rdi = 0x6789_abcd;
+        r.rbp = 0x789a_bcde;
+        if long { r.r8 = 0x1234_5678_9abc_def0; r.r15 = 0xfedc_ba98_7654_3210; }
+        mem.write::<u32>(u64::from(stack + 0x7ffc), 0);
+        set_regs(r);
+        assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)), "espfix long={long} code16={narrow_code}");
+        let got = regs();
+        assert_eq!(mem.read::<u32>(u64::from(data)), 0xabcd_8000, "live ESP high half");
+        assert_eq!(got.frame.rsp, r.frame.rsp, "saved ESP high half");
+        assert_eq!([got.rax, got.rbx, got.rcx, got.rdx, got.rsi, got.rdi, got.rbp],
+            [r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp], "register restore");
+        assert_eq!(got.frame.rflags & 0x401, 0x401, "application flags");
+        assert_eq!(mem.read::<u32>(u64::from(data + 4)) & 0x3703, 0x1603,
+            "live flags: IOPL=1, IF=1, TF=0, DF=1, CF=1");
+        if long { assert_eq!([got.r8, got.r15], [r.r8, r.r15]); }
+        // Replay a saved ring-1 continuation through the real exit path.
+        // In particular, returning after POP ESP must restart it.
+        for offset in [0, 1] {
+            espfix_resume(r, offset, long);
+            assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
+            assert_eq!(mem.read::<u32>(u64::from(data)), 0xabcd_8000);
+            assert_eq!(regs().frame.rsp, r.frame.rsp);
+        }
+        let mut stepped = r;
+        stepped.set_user_tf(true);
+        stepped.project_tf();
+        set_regs(stepped);
+        assert!(matches!(run_to_event(), KernelEvent::DebugTrap));
+        assert_eq!(regs().frame.rip, r.frame.rip + 1, "TF starts at the first app instruction");
+        assert_eq!(regs().frame.rsp, r.frame.rsp - if narrow_code { 2 } else { 4 });
+    }
+    mem.load_ldt(&[]);
+}
+
+/// Resolve test breakpoints from the supervisor ELF, without a runtime ABI.
+fn supervisor_symbol(name: &str) -> u64 {
+    let elf = include_bytes!(env!("ARCH_SUPERVISOR_IMAGE"));
+    let word = |i: usize| u32::from_le_bytes(elf[i..i + 4].try_into().unwrap()) as usize;
+    let half = |i: usize| u16::from_le_bytes(elf[i..i + 2].try_into().unwrap()) as usize;
+    let sections = word(32);
+    let size = half(46);
+    for i in 0..half(48) {
+        let section = sections + i * size;
+        if word(section + 4) != 2 { continue; } // SHT_SYMTAB
+        let strings = word(sections + word(section + 24) * size + 16);
+        for offset in (word(section + 16)..word(section + 16) + word(section + 20)).step_by(word(section + 36)) {
+            let start = strings + word(offset);
+            let end = start + elf[start..].iter().position(|&b| b == 0).unwrap();
+            if &elf[start..end] == name.as_bytes() { return word(offset + 4) as u64; }
+        }
+    }
+    panic!("missing supervisor symbol {name}");
+}
+
+fn espfix_resume(r: Regs, offset: u64, long: bool) {
+    let ip = supervisor_symbol("espfix_return") + offset;
+    setup::with(|cpu| {
+        let mut debug = kvm_bindings::kvm_guest_debug::default();
+        debug.control = kvm_bindings::KVM_GUESTDBG_ENABLE | kvm_bindings::KVM_GUESTDBG_USE_HW_BP;
+        debug.arch.debugreg[0] = ip;
+        debug.arch.debugreg[7] = 0x401;
+        cpu.vcpu.set_guest_debug(&debug).unwrap();
+        unsafe { (*cpu.message).operation = op::EXECUTE; (*cpu.message).regs = r; }
+        loop {
+            match cpu.vcpu.run().unwrap() {
+                kvm_ioctls::VcpuExit::Debug(_) => break,
+                kvm_ioctls::VcpuExit::IoOut(0xe9, bytes) => eprint!("{}", String::from_utf8_lossy(bytes)),
+                exit => panic!("expected espfix breakpoint, got {exit:?}"),
+            }
+        }
+        let live = cpu.vcpu.get_regs().unwrap();
+        let segments = cpu.vcpu.get_sregs().unwrap();
+        assert_eq!(live.rip, ip);
+        assert_eq!(segments.cs.selector, 0x51);
+        assert_eq!(segments.ss.selector, 0x49);
+        assert_eq!(segments.ss.db, 0);
+        assert_eq!(segments.efer & (1 << 10) != 0, long);
+        assert_eq!(live.rflags & ((1 << 17) | (1 << 14) | (1 << 9) | (1 << 8)), 0);
+        assert_eq!(live.rflags & (3 << 12), 1 << 12);
+        assert_eq!([live.rax, live.rbx, live.rcx, live.rdx, live.rsi, live.rdi, live.rbp],
+            [r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp]);
+        if offset == 1 { assert_eq!(live.rsp as u32, 0xabcd_0004); }
+        // Save exactly the supervisor context an interrupt would preserve.
+        let mut interrupted = r;
+        interrupted.frame = arch_abi::Frame64 { rip: live.rip,
+            cs: u64::from(segments.cs.selector), rflags: live.rflags,
+            rsp: live.rsp, ss: u64::from(segments.ss.selector) };
+        let physical = segments.ss.base as usize - vm::IMAGE_VIRTUAL + vm::IMAGE_PHYSICAL;
+        let slot = unsafe { cpu.image.add(physical).cast::<[u32; 6]>() };
+        let pending = unsafe { slot.read_unaligned() };
+        cpu.vcpu.set_guest_debug(&kvm_bindings::kvm_guest_debug::default()).unwrap();
+        super::run::until_return(cpu, false);
+        let message = unsafe { &*cpu.message };
+        assert!(matches!(KernelEvent::decode(message.result[0] as u32, message.result[1]), KernelEvent::SoftInt(0x80)));
+        assert_eq!(unsafe { slot.read_unaligned() }, pending);
+        // Submit the saved ring-1 frame as a return destination. Ordinary
+        // guest setup is unnecessary: its code and slot are resident arch data.
+        unsafe { (*(&raw mut crate::vcpu::REGS)).regs = interrupted; }
+    });
 }

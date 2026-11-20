@@ -1060,25 +1060,7 @@ fn guest_outb<A: crate::Arch>(
 /// Select and advance an offset register at the instruction's effective
 /// address width. Shared by trapped INS/OUTS and fault-decoded MMIO strings:
 /// the host-side `Regs` width must not leak into 16/32-bit guest addressing.
-#[inline]
-fn string_index(index: u64, addr32: bool) -> u32 {
-    if addr32 { index as u32 } else { index as u16 as u32 }
-}
-
-#[inline]
-fn set_string_index(index: &mut u64, value: u32, addr32: bool) {
-    if addr32 {
-        *index = (*index & !0xFFFF_FFFF) | value as u64;
-    } else {
-        *index = (*index & !0xFFFF) | (value as u16 as u64);
-    }
-}
-
-#[inline]
-fn step_string_index(index: u32, step: u32, addr32: bool, decrement: bool) -> u32 {
-    let value = if decrement { index.wrapping_sub(step) } else { index.wrapping_add(step) };
-    if addr32 { value } else { value as u16 as u32 }
-}
+use planar::instruction::{string_index, set_string_index, step_string_index};
 
 #[inline]
 fn advance_string_index(index: &mut u64, size: u32, addr32: bool, decrement: bool) {

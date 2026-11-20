@@ -10,7 +10,6 @@ section .note.GNU-stack noalloc noexec nowrite progbits
 section .note.GNU-stack noalloc noexec nowrite progbits
 %endif
 
-ESPFIX_SS_SEL equ 0x48
 ; Constants from linker script
 KERNEL_BASE equ 0xC0B00000
 %ifdef KVM_SUPERVISOR
@@ -261,7 +260,7 @@ common_dispatch:
 ; =============================================================================
 ; 32-bit-only code: entry_wrapper_32, common_call, exit_interrupt_32
 ;
-; Construct canonical Regs directly. The wrapper-owned registers are pushed
+; Reserve the canonical Regs layout. The wrapper-owned registers are stored
 ; into their final qword slots; only the CPU/vector dword tail is widened into
 ; a gap reserved immediately below it. The canonical frame ends at the same
 ; address as the native frame, so no duplicate return frame exists.
@@ -269,52 +268,26 @@ common_dispatch:
 
 global entry_wrapper_32
 entry_wrapper_32:
-    ; CPU pushed (lowest-up): err_code (or none), eip, cs, eflags
-    ; cross-priv adds: esp, ss; VM86 adds: es, ds, fs, gs.
-    ; int_vector pushed int_num; common_dispatch[_no_err] ensured an
-    ; err_code slot above it (either real or duplicated int_num).
-
-    ; A complete cross-privilege dword tail is 28 bytes; its canonical qword
-    ; form is 56 bytes. Reserve exactly that 28-byte widening gap. Same-ring
-    ; ring-0 frames are returned without widening.
-    sub esp, 28
-    ; General registers, reverse canonical order: each low dword followed by
-    ; an explicitly zero high dword in memory.
-    push dword 0
-    push eax
-    push dword 0
-    push ecx
-    push dword 0
-    push edx
-    push dword 0
-    push ebx
-    times 2 push dword 0         ; rsp_dummy
-    push dword 0
-    push ebp
-    push dword 0
-    push esi
-    push dword 0
-    push edi
-    times 16 push dword 0        ; r8-r15
-
-    ; EAX is saved now, so use it to make segment qwords without relying on
-    ; the architecture-specific upper-word behaviour of PUSH segment.
-    xor eax, eax
-    mov ax, ds
-    push dword 0
-    push eax
-    mov ax, es
-    push dword 0
-    push eax
-    mov ax, fs
-    push dword 0
-    push eax
-    mov ax, gs
-    push dword 0
-    push eax
-
-    xor ebx, ebx                  ; ebx = from_64 = false
-    jmp common_call
+    ; One frame layout for the installed hook and canonical dispatch. Reserve
+    ; the canonical prefix plus the native-tail expansion gap, but store only
+    ; live 32-bit state. Rust initializes unused slots only after hook decline.
+    sub esp, 188
+    mov [ss:esp + 96], edi
+    mov [ss:esp + 104], esi
+    mov [ss:esp + 112], ebp
+    mov [ss:esp + 128], ebx
+    mov [ss:esp + 136], edx
+    mov [ss:esp + 144], ecx
+    mov [ss:esp + 152], eax
+    mov eax, ds
+    mov [ss:esp + 24], eax
+    mov eax, es
+    mov [ss:esp + 16], eax
+    mov eax, fs
+    mov [ss:esp + 8], eax
+    mov eax, gs
+    mov [ss:esp], eax
+    xor ebx, ebx                  ; native 32-bit tail
 
 ; -----------------------------------------------------------------------------
 ; common_call: shared dispatch tail. Caller has:
@@ -326,34 +299,16 @@ entry_wrapper_32:
 ; saves it as `isr_handler`'s prev_ebp -- the stack-trace walker can then
 ; chain naturally from a panic into the ring-1 call site. For ring-0 / ring-3
 ; / VM86 the trapped ebp is junk-or-untrusted; the walker stops at the
-; `isr_return` boundary (see stacktrace.rs) and uses regs.rip explicitly.
+; `stacktrace_marker` boundary (see stacktrace.rs) and uses regs.rip explicitly.
 ; -----------------------------------------------------------------------------
 common_call:
     cld
-    ; Set kernel data selectors. SS *must* be reloaded before any push: on
-    ; the 64→32 path the same-privilege long-mode interrupt clears SS.
-    ; A fault in the 32-bit espfix IRET arrives with SS=0x48 and a truncated
-    ; numeric ESP. The CPU pushed the fault frame through the alias base, but
-    ; simply loading flat SS would reinterpret that same ESP in low memory.
-    ; Translate it back to its flat address in the MOV-SS interrupt shadow.
-    mov eax, ss
-    cmp ax, ESPFIX_SS_SEL
-    jne .flat_ss
+    ; Both entry paths arrive with a flat stack ready for 32-bit Rust.
     mov eax, 0x18
-    mov ds, eax
-    mov edx, KERNEL_TLS_SEL
-    mov gs, edx
-    mov edx, [gs:4]             ; CPU-local espfix stack window
-    mov ss, eax
-    add esp, edx
-    jmp .data_segs
-.flat_ss:
-    mov eax, 0x18
-    mov ss, eax
-.data_segs:
     mov ds, eax
     mov es, eax
-    mov fs, eax
+    ; Rust uses DS/ES and GS TLS, never FS. Preserve FS until the common
+    ; epilogue loads the selected return frame's FS selector or base.
     mov eax, KERNEL_TLS_SEL
     mov gs, eax
 
@@ -362,10 +317,10 @@ common_call:
     lea eax, [esp + 4]             ; ptr to StackFrame (skip from_64 we just pushed)
     push eax                      ; stack_ptr
     call isr_handler
+global stacktrace_marker
+stacktrace_marker:                ; exact return address saved by CALL
     add esp, 8                    ; pop args
 
-global isr_return
-isr_return:
     ; AL = 1 → long-mode exit; AL = 0 → 32-bit exit.
     test al, al
     jz exit_interrupt_32
@@ -374,25 +329,6 @@ isr_return:
     jmp 0x10:exit_interrupt_64
 
 exit_interrupt_32:
-    ; espfix (see GDT_ESPFIX_SS in descriptors.rs): IRET to a 16-bit (B=0)
-    ; stack segment restores only SP, leaving the kernel's ESP31:16 in the
-    ; guest's live ESP — which 16-bit DPMI code (DOS/16M stack-switch glue)
-    ; saves with `mov [slot], esp` and later dereferences. Run the pops +
-    ; IRET on the trap-stack alias segment (base = the 64K-aligned
-    ; ARCH_STACK window, kernel.ld) with a 16-bit-truncated ESP: same linear bytes,
-    ; numeric ESP < 0x10000, so the leaked half is 0. Done for every
-    ; CROSS-privilege exit — the aligned stack spans exactly one 64K window,
-    ; and 32-bit/VM86/ring-1 IRETs pop full SS:ESP so the switch is harmless
-    ; there. Same-ring ring-0 returns (saved CS RPL=0) must skip: their IRET
-    ; pops no SS:ESP, so the interrupted kernel code would resume on the
-    ; alias with a truncated ESP, breaking its flat-SS assumptions. MOV SS
-    ; blocks interrupts for the following instruction (IF is 0 here anyway).
-    test byte [esp + 200], 3    ; saved CS at Raw32 offset 200; RPL==0 → ring 0
-    jz .no_espfix
-    mov ax, ESPFIX_SS_SEL       ; ESPFIX_SS_SEL (ring-0 trap-stack alias)
-    mov ss, ax
-    movzx esp, sp
-.no_espfix:
     ; Restore low halves directly from the canonical qword slots, then skip
     ; the entire prefix, expansion gap, and int/error pair in one adjustment.
     mov gs, [esp + 0]
@@ -409,88 +345,76 @@ exit_interrupt_32:
     add esp, 196                ; native eip begins at Raw32 offset 196
     iret                        ; CPU pops eip, cs, eflags [, esp, ss [, vm86 segs]]
 
+; Entry prepares this ring-1 return only for protected-mode 16-bit stacks.
+; SS.B=0 addresses the shared buffer through SP, leaving ESP[31:16] free
+; to carry the application's saved high half. All other registers are live.
+global espfix_return
+espfix_return:
+    pop esp
+    iretd
+
 ; =============================================================================
 ; 64-bit-only code: long-mode interrupt entry, SYSCALL
 ; =============================================================================
 [bits 64]
 
 ; -----------------------------------------------------------------------------
-; Common 64-bit interrupt entry — saves all registers.
+; Common 64-bit interrupt entry — stores all registers in their final slots.
 ; Entered via common_dispatch (below KERNEL_CS64 branch). int_num/err_code
 ; (both 8 bytes) have already been pushed by the vector table + dispatch.
 ; -----------------------------------------------------------------------------
 global entry_wrapper_64
 entry_wrapper_64:
-    ; Stack: int_num, err_code, rip, cs, rflags, rsp, ss (all 64-bit)
-    ; Frame64 is 40 bytes, no padding needed (unlike Frame32 which has 20-byte _pad)
+    ; Same slots as 32-bit entry. These are real 64-bit registers, so save
+    ; their full values, including R8-R15, before entering 32-bit Rust.
+    sub rsp, 160
+    mov [rsp + 152], rax
+    mov [rsp + 144], rcx
+    mov [rsp + 136], rdx
+    mov [rsp + 128], rbx
+    mov qword [rsp + 120], 0      ; unused SP slot; CPU saved the real RSP
+    mov [rsp + 112], rbp
+    mov [rsp + 104], rsi
+    mov [rsp + 96], rdi
+    mov [rsp + 88], r8
+    mov [rsp + 80], r9
+    mov [rsp + 72], r10
+    mov [rsp + 64], r11
+    mov [rsp + 56], r12
+    mov [rsp + 48], r13
+    mov [rsp + 40], r14
+    mov [rsp + 32], r15
 
-    ; Save general purpose registers
-    push rax
-    push rcx
-    push rdx
-    push rbx
-    push rsp                ; dummy rsp
-    push rbp
-    push rsi
-    push rdi
+    mov eax, ds
+    mov [rsp + 24], rax
+    mov eax, es
+    mov [rsp + 16], rax
 
-    ; Save r8-r15
-    push r8
-    push r9
-    push r10
-    push r11
-    push r12
-    push r13
-    push r14
-    push r15
-
-    xor rax, rax
-    mov ax, ds
-    push rax
-    mov ax, es
-    push rax
-
-    ; FS/GS save format depends on user mode (long-mode IDT routes both
-    ; 64-bit users and 32-bit-compat users through here):
-    ;   - 64-bit user (cs=0x33): the meaningful state is the FS_BASE /
-    ;     GS_BASE MSRs (selectors are typically null and unused). rdmsr
-    ;     them and push the 64-bit bases.
-    ;   - 32-bit user (cs=0x23) / compat: TLS rides on the descriptor
-    ;     loaded via `mov fs/gs, sel`, so push the selectors.
-    ; User CS sits at [rsp + 168]: 16 bytes (es+ds we just pushed) + 64
-    ; bytes (r8..r15) + 64 bytes (rax..rdi) + 16 bytes (int_num+err_code)
-    ; below the trap-pushed `cs` slot.
-    cmp qword [rsp + 168], 0x33
+    ; Long-mode users carry FS/GS bases; compatibility users carry selectors.
+    cmp qword [rsp + 184], 0x33
     jne .save_segs_32
-
-    mov ecx, 0xC0000100         ; IA32_FS_BASE
+    mov ecx, 0xC0000100
     rdmsr
     shl rdx, 32
     or rax, rdx
-    push rax
-    mov ecx, 0xC0000101         ; IA32_GS_BASE
+    mov [rsp + 8], rax
+    mov ecx, 0xC0000101
     rdmsr
     shl rdx, 32
     or rax, rdx
-    push rax
+    mov [rsp], rax
     jmp .save_segs_done
 .save_segs_32:
-    xor rax, rax
-    mov ax, fs
-    push rax
-    mov ax, gs
-    push rax
+    mov eax, fs
+    mov [rsp + 8], rax
+    mov eax, gs
+    mov [rsp], rax
 .save_segs_done:
-
-    ; rbp is left untouched -- see common_call's comment for why.
-
-    ; Tell common_call we entered via the 64-bit path (from_64 = 1).
+    ; Interrupt entry cleared SS. Establish it before switching to 32-bit
+    ; code, where the null selector cannot support stack accesses.
+    mov eax, 0x18
+    mov ss, eax
     mov ebx, 1
-
-    ; Far jump to 32-bit common_call (indirect via memory; direct far jmp
-    ; is invalid in long mode). MUST be the m16:32 form (`dword`): a REX.W
-    ; m16:64 far jmp to a compat (L=0) segment triple-faults on AMD (verified
-    ; on a Blade 14 under KVM); TCG/Bochs accept it, which hid this for years.
     jmp far dword [rel far_ptr_32]
 
 exit_interrupt_64:

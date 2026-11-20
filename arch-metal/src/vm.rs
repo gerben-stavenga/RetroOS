@@ -7,6 +7,7 @@ use crate::{mapping, paging2, traps::{arch_call, arch_dispatch}};
 #[unsafe(no_mangle)]
 static mut VM_EXCHANGE: Exchange = Exchange::new();
 static mut REGIONS: [arch_abi::page_supply::FrameRegion; 256] = [arch_abi::page_supply::FrameRegion { first: 0, end: 0, offset: 0 }; 256];
+static mut PLANAR_TABLE: paging2::RawPage = paging2::RawPage([0; 4096]);
 static mut COUNTS_TABLE: paging2::RawPage = paging2::RawPage([0; 4096]);
 static mut LDT: [u64; 8192] = [0; 8192];
 
@@ -29,6 +30,7 @@ fn handoff() {
         in("eax") exchange() as u32, options(nostack, preserves_flags)); }
 }
 pub(crate) fn return_to_kernel(frame: &mut Regs, event: arch_abi::KernelEvent) {
+    crate::planar::publish();
     let message = unsafe { &mut *exchange() };
     message.regs = *frame;
     let (kind, extra) = event.encode();
@@ -45,6 +47,7 @@ pub(crate) fn requests(frame: &mut Regs) {
         message.result = [0; 3];
         if message.operation == op::EXECUTE {
             *frame = message.regs;
+            crate::planar::prepare(frame.code_seg(), frame.mode() == arch_abi::UserMode::VM86);
             // There is no physical device passthrough in this VM. All app
             // port instructions are monitored; F4 can never forge a handoff.
             crate::descriptors::install_io_policy(&arch_abi::IoPolicy::deny_all());
@@ -88,11 +91,21 @@ fn operation(message: &mut Exchange) {
             let table = paging2::physical_page((&raw const COUNTS_TABLE) as usize);
             paging2::prepare_kernel_mapping(vm::COUNTS_VIRTUAL / 4096, count.div_ceil(4096), table);
             assert!(paging2::map_kernel_foreign_range(vm::COUNTS_VIRTUAL / 4096, vm::COUNTS_PHYSICAL / 4096, count.div_ceil(4096)));
+            let table = paging2::physical_page((&raw const PLANAR_TABLE) as usize);
+            paging2::prepare_kernel_mapping(vm::PLANAR_VIRTUAL / 4096, 65, table);
+            assert!(paging2::map_kernel_foreign_range(vm::PLANAR_VIRTUAL / 4096, vm::PLANAR_PHYSICAL / 4096, 65));
             crate::memory::configure(arch_abi::page_supply::FrameOwnership {
                 regions: (&raw const REGIONS).cast(), regions_len: region_count,
                 counts: vm::COUNTS_VIRTUAL as *mut u8, active: count,
                 zero_page: paging2::physical_page((&raw const crate::ZERO_PAGE) as usize),
             });
+        }
+        op::BIND_PLANAR => {
+            let binding = (a[0] != 0).then_some(::planar::Binding {
+                registers: vm::PLANAR_VIRTUAL as *const ::planar::Registers,
+                planes: (vm::PLANAR_VIRTUAL + 4096) as *mut u8,
+            });
+            unsafe { crate::planar::bind(binding); }
         }
         op::READ_MAPPINGS | op::REPLACE_MAPPINGS | op::FILL_MAPPINGS | op::READ_RUN | op::ALIAS | op::SWAP => {
             let page = match UserPage::new(a[0]) { Ok(page) => page, Err(error) => { message.mapping_result(Err(error)); return; } };

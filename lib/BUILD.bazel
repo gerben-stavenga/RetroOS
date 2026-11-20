@@ -79,9 +79,8 @@ rust_test(
 
 # The VGA: registers, plane ALU, DAC, card state, port model and scanout.
 # Its own target rather than part of :lib because it allocates — and it can
-# be, because nothing outside the kernel wants a VGA. The bootloader and the
-# arch backends link :lib for the text console (:lib stays allocation-free);
-# only the kernel links this.
+# its ownership and scanout layer is kernel-side. The allocation-free planar
+# core is shared with the arch supervisor.
 rust_library(
     name = "vga",
     srcs = glob(["vga/src/**/*.rs"]),
@@ -91,7 +90,7 @@ rust_library(
     rustc_flags = [
         "-Crelocation-model=static",
     ] + panic_strategy(),
-    deps = [":lib"],
+    deps = [":lib", ":planar"],
 )
 
 # Emulated sound cards as passive, host-agnostic state machines, plus the
@@ -173,4 +172,19 @@ rust_library(
     crate_name = "ini",
     edition = "2024",
     rustc_flags = ["-Crelocation-model=static"] + panic_strategy(),
+)
+
+# Fixed-layout VGA storage and restartable device instructions; no allocator.
+rust_library(
+    name = "planar",
+    srcs = glob(["planar/src/**/*.rs"]),
+    crate_name = "planar",
+    crate_root = "planar/src/lib.rs",
+    edition = "2024",
+    rustc_flags = ["-Crelocation-model=static"] + panic_strategy(),
+)
+rust_test(
+    name = "planar_test",
+    crate = ":planar",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
 )

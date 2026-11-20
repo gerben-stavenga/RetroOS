@@ -320,17 +320,9 @@ const GDT_TSS32: usize = 7;       // 0x38
 // extenders #GP on the seg-load. The DPMI spec allows hosts to either
 // pre-define selector 40h *or* handle the GP — pre-defining is simpler.
 #[allow(dead_code)] const GDT_BIOS_DATA: usize = 8;   // 0x40 — BIOS Data Area alias
-/// 0x48 — espfix SS: ring-0 data alias of the trap stack (ARCH_STACK, the
-/// TSS.sp0 stack; kernel.ld 64K-aligns it so it spans exactly one 64K
-/// window). IRET to a 16-bit (B=0) stack segment restores only SP and leaves
-/// the KERNEL's ESP31:16 in the live user ESP — the classic espfix leak.
-/// 16-bit DPMI code that saves/restores full ESP (DOS/16M's stack-switch
-/// glue: `mov [slot], esp` … `lds esi, [slot]`) then stores a kernel-stack
-/// pointer and faults dereferencing it. The exit path switches to this
-/// alias and does `movzx esp, sp` before the final pops, so the numeric
-/// kernel ESP at IRET is < 0x10000 and the leaked bits are 0 — what every
-/// 16-bit-era DPMI host effectively provided.
-const GDT_ESPFIX_SS: usize = 9;   // 0x48 — was reserved
+/// One ring-1, 16-bit stack segment covers every core's espfix return slot.
+const GDT_ESPFIX_SS: usize = 9;
+pub(crate) const ESPFIX_SS: u16 = (GDT_ESPFIX_SS as u16 * 8) | 1;
 #[allow(dead_code)] const GDT_RING1_CS: usize = 10;   // 0x50
 #[allow(dead_code)] const GDT_RING1_DS: usize = 11;   // 0x58
 const GDT_LDT: usize = 12;        // 0x60
@@ -394,7 +386,7 @@ static mut GDT: [GdtEntry; GDT_ENTRIES] = [
     GdtEntry::segment64(3),         // 0x30: User Code 64-bit (SYSRET CS)
     GdtEntry::null(),               // 0x38: TSS32 (filled at runtime)
     GdtEntry::segment32(false, 3).with_base(0x400), // 0x40: BIOS Data Area alias (DPMI compat — see GDT_BIOS_DATA)
-    GdtEntry::null(),               // 0x48: reserved (was TSS64 high)
+    GdtEntry::null(),               // 0x48: shared espfix stack (filled at startup)
     GdtEntry::segment32(true, 1),   // 0x50: Ring-1 Code 32-bit (flat, no wrapping yet)
     GdtEntry::segment32(false, 1),  // 0x58: Ring-1 Data (flat, no wrapping yet)
     GdtEntry::null(),               // 0x60: LDT (filled at runtime by load_ldt)
@@ -406,7 +398,7 @@ static mut GDT: [GdtEntry; GDT_ENTRIES] = [
     GdtEntry::null(),               // 0x90: kernel TLS (base filled at runtime)
 ];
 
-// Vector gates are identical on every CPU; initialized once during BSP setup.
+// Fixed shared entry tables; the active device binding is CPU-local.
 static mut IDT32: Idt32 = Idt32 {
     entries: [IdtEntry32::null(); IDT_ENTRIES],
 };
@@ -414,32 +406,6 @@ static mut IDT32: Idt32 = Idt32 {
 static mut IDT64: Idt64 = Idt64 {
     entries: [IdtEntry64::null(); IDT_ENTRIES],
 };
-
-/// Replace both native IDT entries, preserving gate policy, and return their
-/// previous addresses. Both tables change in one interrupt-disabled operation.
-///
-/// # Safety
-/// Run at ring 0 with interrupts disabled and exclusive access to the IDTs.
-/// Each assembly entry must obey its mode's native interrupt-frame and return
-/// conventions, including whether the CPU pushes an error code.
-pub unsafe fn replace_interrupt_handlers(vector: u8, handlers: arch_abi::InterruptHandlers) -> arch_abi::InterruptHandlers {
-    unsafe {
-        let entry32 = &mut IDT32.entries[usize::from(vector)];
-        let entry64 = &mut IDT64.entries[usize::from(vector)];
-        let previous = arch_abi::InterruptHandlers {
-            entry32: u32::from(entry32.offset_low) | (u32::from(entry32.offset_high) << 16),
-            entry64: u64::from(entry64.offset_low)
-                | (u64::from(entry64.offset_mid) << 16)
-                | (u64::from(entry64.offset_high) << 32),
-        };
-        entry32.offset_low = handlers.entry32 as u16;
-        entry32.offset_high = (handlers.entry32 >> 16) as u16;
-        entry64.offset_low = handlers.entry64 as u16;
-        entry64.offset_mid = (handlers.entry64 >> 16) as u16;
-        entry64.offset_high = (handlers.entry64 >> 32) as u32;
-        previous
-    }
-}
 
 #[thread_local]
 pub static mut TSS32: Tss = Tss::new();
@@ -473,8 +439,6 @@ const _: () = {
 /// Setup GDT, IDT, and TSS
 pub fn setup_descriptor_tables(arch_stack_top: u32) {
     unsafe {
-        // GS:4 is the assembly entry ABI for espfix recovery.
-        ((x86::thread_pointer() + 4) as *mut u32).write(arch_stack_top & 0xffff_0000);
         let tss_limit = core::mem::size_of::<Tss>() as u32 - 1;
 
         // Setup TSS32 with packed SS:ESP, VGA IOPB, and interrupt redirection
@@ -483,18 +447,12 @@ pub fn setup_descriptor_tables(arch_stack_top: u32) {
         let tss32_addr = core::ptr::addr_of!(TSS32) as u64;
         GDT[GDT_TSS32] = GdtEntry::tss_low(tss32_addr, tss_limit);
 
-        // espfix SS (see GDT_ESPFIX_SS): alias the ring-0 trap stack (the
-        // TSS.sp0 stack — ARCH_STACK) so the exit path can make the numeric
-        // ESP small before IRET to a 16-bit-stack guest. kernel.ld 64K-aligns
-        // ARCH_STACK, so the whole stack sits in one 64K window and every
-        // ESP's low 16 bits are exactly its offset from the window base.
-        assert!(
-            arch_stack_top & 0xFFFF_0000
-                == arch_stack_top.saturating_sub(0x3FF0) & 0xFFFF_0000,
-            "espfix: trap stack straddles a 64K window (kernel.ld ARCH_STACK)"
-        );
-        GDT[GDT_ESPFIX_SS] =
-            GdtEntry::segment32(false, 0).with_base(arch_stack_top & 0xFFFF_0000);
+        // Identical descriptor on every core; SP selects its 24-byte slot.
+        let mut espfix = GdtEntry::segment32(false, 1)
+            .with_base((&raw const crate::entry::ESPFIX) as u32);
+        espfix.limit_low = (crate::entry::ESPFIX_BYTES - 1) as u16;
+        espfix.granularity = 0; // byte limit, B=0
+        GDT[GDT_ESPFIX_SS] = espfix;
 
         // Setup TSS64 with clean 64-bit address
         TSS64.sp0 = arch_stack_top as u64;
@@ -670,22 +628,22 @@ pub fn load_ldt(base: u32, limit: u32) {
 /// DPL and RPL bits are ignored — this is a pure table lookup.
 ///
 /// Returns 0 for the null selector or out-of-range indices.
-fn read_descriptor(sel: u16) -> u64 {
-    if sel == 0 { return 0; }
-    let idx = (sel >> 3) as usize;
-    let table_base: u32 = if sel & 4 != 0 {
-        // LDT: base encoded in GDT[GDT_LDT] system descriptor
-        let g = unsafe { &GDT[GDT_LDT] };
-        (g.base_low as u32)
-            | ((g.base_mid as u32) << 16)
-            | ((g.base_high as u32) << 24)
+pub(crate) fn read_descriptor(sel: u16) -> u64 {
+    let offset = u32::from(sel & !7);
+    let (base, limit) = if sel & 4 != 0 {
+        let g = unsafe { GDT[GDT_LDT] };
+        if g.access & 0x80 == 0 { return 0; }
+        let base = u32::from(g.base_low)
+            | (u32::from(g.base_mid) << 16) | (u32::from(g.base_high) << 24);
+        let limit = u32::from(g.limit_low) | (u32::from(g.granularity & 15) << 16);
+        let limit = if g.granularity & 0x80 != 0 { (limit << 12) | 4095 } else { limit };
+        (base, limit)
     } else {
-        &raw const GDT as *const _ as u32
+        if offset == 0 { return 0; }
+        ((&raw const GDT) as u32, (GDT_ENTRIES * 8 - 1) as u32)
     };
-    // Limit is stored in the same descriptor; skip the check and let a bad
-    // selector read whatever's there — consistent with the x86 behavior where
-    // the monitor is decoding an already-trapped instruction.
-    unsafe { core::ptr::read_unaligned((table_base + (idx as u32) * 8) as *const u64) }
+    if offset + 7 > limit { return 0; }
+    unsafe { core::ptr::read_unaligned(base.wrapping_add(offset) as *const u64) }
 }
 
 /// Get the linear base address of the segment referenced by `sel`.
@@ -699,6 +657,12 @@ pub fn seg_base(sel: u16) -> u32 {
     let b1 = ((desc >> 32) & 0xFF) as u32;
     let b2 = ((desc >> 56) & 0xFF) as u32;
     b0 | (b1 << 16) | (b2 << 24)
+}
+
+pub(crate) fn seg_limit(sel: u16) -> u32 {
+    let d = read_descriptor(sel);
+    let limit = ((d & 0xffff) | ((d >> 32) & 0xf0000)) as u32;
+    if d & (1 << 55) != 0 { (limit << 12) | 4095 } else { limit }
 }
 
 /// True if the segment's D/B bit is set (32-bit default operand/stack size).

@@ -143,15 +143,6 @@ pub(super) fn file_io() -> [[u64; 3]; FILE_IO_NAMES.len()] { unsafe { *core::ptr
 pub(super) const DEVICE_NAMES: [&str; 7] = ["vga_mov", "vga_generic", "vga_status", "vga_mask", "dma_poll", "vga_palette", "opl_status"];
 static mut DEVICE_ENTRIES: [[u64; 2]; 7] = [[0; 2]; 7];
 #[derive(Clone, Copy)]
-pub(super) struct VgaInstruction { pub cs: u16, pub ip: u32, pub bytes: u32, pub calls: u64, pub max_count: u32 }
-const EMPTY_VGA: VgaInstruction = VgaInstruction { cs: 0, ip: 0, bytes: 0, calls: 0, max_count: 0 };
-static mut VGA_INSTRUCTIONS: [VgaInstruction; 32] = [EMPTY_VGA; 32];
-#[derive(Clone, Copy)]
-struct StatusPoll { cs: u16, ip: u32, calls: u64, high: u64, max_ns: u64 }
-const EMPTY_POLL: StatusPoll = StatusPoll { cs: 0, ip: 0, calls: 0, high: 0, max_ns: 0 };
-static mut STATUS_POLLS: [StatusPoll; 8] = [EMPTY_POLL; 8];
-static mut LAST_STATUS_POLL: Option<(u16, u32, u8, u64)> = None;
-#[derive(Clone, Copy)]
 struct TimedEvent { ns: u64, kind: u32, value: u32 }
 const EMPTY_TIMED: TimedEvent = TimedEvent { ns: 0, kind: 0, value: 0 };
 static mut TIMELINE: alloc::vec::Vec<TimedEvent> = alloc::vec::Vec::new();
@@ -171,46 +162,6 @@ pub(super) fn timed_event(now: u64, kind: u32, value: u32) {
     }
 }
 
-#[cfg(target_arch = "x86")]
-pub(super) fn record_status_poll(cs: u16, ip: u32, status: u8, now: u64) {
-    // Consecutive reads at one instruction, including time spent in timer
-    // handlers between reads. The status level changing ends that wait.
-    let level = status & 8;
-    let start = unsafe {
-        match LAST_STATUS_POLL {
-            Some((old_cs, old_ip, old_level, start))
-                if (cs, ip, level) == (old_cs, old_ip, old_level) => start,
-            _ => { LAST_STATUS_POLL = Some((cs, ip, level, now)); now }
-        }
-    };
-    for entry in unsafe { &mut *core::ptr::addr_of_mut!(STATUS_POLLS) } {
-        if entry.calls == 0 || (entry.cs, entry.ip) == (cs, ip) {
-            entry.cs = cs;
-            entry.ip = ip;
-            entry.calls += 1;
-            entry.high += u64::from(level != 0);
-            entry.max_ns = entry.max_ns.max(now.saturating_sub(start));
-            break;
-        }
-    }
-}
-
-#[cfg(target_arch = "x86")]
-pub(super) fn record_vga_instruction(cs: u16, ip: u32, bytes: u32, count: u32) {
-    // Only the guest CPU writes; the event loop reads after that loan returns.
-    for entry in unsafe { &mut *core::ptr::addr_of_mut!(VGA_INSTRUCTIONS) } {
-        if entry.calls == 0 || (entry.cs == cs && entry.ip == ip && entry.bytes == bytes) {
-            *entry = VgaInstruction { cs, ip, bytes, calls: entry.calls.wrapping_add(1), max_count: entry.max_count.max(count) };
-            return;
-        }
-    }
-}
-
-pub(super) fn vga_instructions() -> [VgaInstruction; 32] {
-    unsafe { *core::ptr::addr_of!(VGA_INSTRUCTIONS) }
-}
-
-#[cfg(target_arch = "x86")]
 pub(super) fn record_device_entries(details: [[u32; 4]; 7]) {
     for (kind, [calls_lo, calls_hi, cycles_lo, cycles_hi]) in details.into_iter().enumerate() {
         unsafe {
@@ -375,9 +326,6 @@ pub(super) fn reset() {
         FILE_IO_MAX = [0; FILE_IO_NAMES.len()];
         (&mut *core::ptr::addr_of_mut!(DIRECTORIES)).clear();
         DEVICE_ENTRIES = [[0; 2]; 7];
-        VGA_INSTRUCTIONS = [EMPTY_VGA; 32];
-        STATUS_POLLS = [EMPTY_POLL; 8];
-        LAST_STATUS_POLL = None;
         (&mut *core::ptr::addr_of_mut!(TIMELINE)).resize(2048, EMPTY_TIMED);
         TIMELINE_USED = 0;
         OPL_INDEX = 0;
@@ -462,16 +410,8 @@ pub(super) fn print() {
     for event in unsafe { &(&*core::ptr::addr_of!(TIMELINE))[..TIMELINE_USED] } {
         crate::compact_println!("[frame-timeline] ns={} kind={} value={}", event.ns, event.kind, event.value);
     }
-    for entry in unsafe { *core::ptr::addr_of!(STATUS_POLLS) }.into_iter().filter(|entry| entry.calls != 0) {
-        crate::compact_println!("[vga-poll] at={:04x}:{:08x} calls={} high={} max_us={}",
-            entry.cs, entry.ip, entry.calls, entry.high, entry.max_ns / 1000);
-    }
     for (name, [calls, cycles]) in DEVICE_NAMES.into_iter().zip(device_entries()) {
         crate::compact_println!("[device-prof] {} calls={} cycles={}", name, calls, cycles);
-    }
-    for entry in vga_instructions().into_iter().filter(|entry| entry.calls != 0) {
-        crate::compact_println!("[vga-instruction] at={:04x}:{:08x} bytes={:08x} calls={} max_count={}",
-            entry.cs, entry.ip, entry.bytes, entry.calls, entry.max_count);
     }
     for c in unsafe { &*core::ptr::addr_of!(COUNTERS) } {
         if c.calls != 0 {

@@ -488,7 +488,7 @@ pub fn space_cow_fault(vaddr: u32) -> bool {
 }
 fn cow_fault(pd: u64, vaddr: u32, fault: bool) -> bool {
     let _paging = PagingGuard::lock();
-    if fault && !phys::can_fault() { return false; }
+    assert!(!fault || phys::can_fault(), "guest page fault without reserved backing");
     let pde = read_entry(pd, pde_index(vaddr));
     if pde & PRESENT == 0 { return false; }
     let old = pte_raw(pd, vaddr);
@@ -593,7 +593,7 @@ pub fn space_demand(vaddr: u32) -> bool {
     if vaddr < NULL_GUARD || (vaddr as usize) >= 0xC000_0000 {
         return false;
     }
-    if !phys::can_fault() { return false; }
+    assert!(phys::can_fault(), "guest page fault without reserved backing");
     let table = private_table(pd, pde_index(page), true).unwrap();
     let frame = phys::take_fault().unwrap();
     write_entry(table, pte_index(page), ((frame as u32) << 12) | ENTRY_FLAGS);
@@ -722,6 +722,14 @@ mod space_ops {
     use arch_abi::{UserPage, page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFrame}};
 
     #[test]
+    #[should_panic(expected = "guest page fault without reserved backing")]
+    fn page_fault_without_reserved_backing_panics() {
+        crate::phys::init_test_ram();
+        while phys::can_fault() { phys::take_fault().unwrap(); }
+        space_demand(0x20000000);
+    }
+
+    #[test]
     fn exhausted_fault_reservoir_returns_before_the_store_and_resumes() {
         use arch_abi::{Arch as _, GuestBytes as _, KernelEvent, Regs};
         crate::phys::init_test_ram();
@@ -745,7 +753,8 @@ mod space_ops {
                     if !phys::can_fault() {
                         exhausted = true;
                         assert_eq!(regs.frame.rip, code as u64 + 10);
-                        assert!(space_translate(regs.rax as u32).is_none(), "uncompleted store must remain unmapped");
+                        assert!(space_translate(regs.rax as u32).is_some(), "fault must be resolved before returning");
+                        assert_eq!(machine.read::<u32>(regs.rax), 0, "store must not resume without sufficient backing");
                         phys::refill_test_reserve();
                     }
                 }

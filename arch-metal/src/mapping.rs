@@ -221,6 +221,33 @@ pub(crate) fn prepare_tables<E: Entry>(entries: &mut [E], index: usize) -> Resul
     Ok(())
 }
 
+/// Preflight a direct supervisor access to resident, owned user RAM. Unlike
+/// resolving a kernel copy, this never materializes tables or COW backing.
+/// Callers keep the paging guard across the check and the memory access.
+pub(crate) fn resident(address: u32, len: u32, write: bool) -> bool {
+    let Some(end) = address.checked_add(len) else { return false };
+    if end > 0xc0000000 { return false; }
+    fn check<E: Entry>(entries: &[E], index: usize, write: bool) -> bool {
+        let parent = paging2::parent_index::<E>(index);
+        // Parents must be present before their children can even be read
+        // through the recursive mapping. Writes must not cross a COW parent.
+        if parent != index && !check(entries, parent, write) { return false; }
+        let entry = entries[index];
+        entry.present() && (!write || entry.hw_writable())
+    }
+    fn range<E: Entry>(entries: &[E], address: u32, end: u32, write: bool) -> bool {
+        for index in address as usize / 4096..(end as usize).div_ceil(4096) {
+            if !check(entries, index, write) || entries[index].raw() & FOREIGN != 0
+                || write && !entries[index].writable() { return false; }
+        }
+        true
+    }
+    match paging2::entries() {
+        Entries::E32(e) => range(e, address, end, write),
+        Entries::E64(e) => range(e, address, end, write),
+    }
+}
+
 /// Resolve a user buffer without touching its virtual address. Reads need no
 /// materialized tables; writes explicitly privatize tables and COW backing.
 pub(crate) fn resolve(address: u64, write: bool) -> Option<u64> {

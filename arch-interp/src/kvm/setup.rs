@@ -7,6 +7,7 @@ use arch_abi::vm::{self, Exchange};
 
 pub(super) struct KvmCpu {
     pub _vm: VmFd,
+    pub planar_bound: bool,
     pub vcpu: VcpuFd,
     pub image: *mut u8,
     pub message: *mut Exchange,
@@ -51,7 +52,7 @@ fn init() -> KvmCpu {
     vcpu.set_cpuid2(&cpuid).expect("KVM_SET_CPUID2");
     super::entry::boot(&vcpu, entry);
     install_alarm(&mut vcpu);
-    let mut cpu = KvmCpu { _vm: vmfd, vcpu, image: image.cast(), message: core::ptr::null_mut() };
+    let mut cpu = KvmCpu { planar_bound: false, _vm: vmfd, vcpu, image: image.cast(), message: core::ptr::null_mut() };
     super::run::until_return(&mut cpu, false);
     let message = unsafe { &mut *cpu.message };
     message.operation = vm::op::CONFIGURE;
@@ -129,4 +130,38 @@ impl Drop for KvmCpu {
         });
         unsafe { libc::munmap(self.image.cast(), vm::IMAGE_LIMIT); }
     }
+}
+
+/// Map the owner's resident pages into the supervisor for the duration of a
+/// loan. No host pointer appears in a VM request or in supervisor storage.
+pub(super) unsafe fn bind_planar(binding: Option<planar::Binding>) {
+    with(|cpu| {
+        if binding.is_none() && !cpu.planar_bound { return; }
+        if let Some(b) = binding {
+            assert!(!cpu.planar_bound, "detach planar storage before replacing it");
+            for (slot, host, physical, size) in [
+                (3, b.registers as u64, vm::PLANAR_PHYSICAL, 4096),
+                (4, b.planes as u64, vm::PLANAR_PHYSICAL + 4096, 4 * 65536),
+            ] {
+                assert!(host != 0 && host % 4096 == 0);
+                unsafe { cpu._vm.set_user_memory_region(kvm_userspace_memory_region {
+                    slot, flags: 0, guest_phys_addr: physical, memory_size: size, userspace_addr: host,
+                }) }.expect("map borrowed planar storage");
+            }
+        }
+        let message = unsafe { &mut *cpu.message };
+        message.operation = vm::op::BIND_PLANAR;
+        message.page_count = 0;
+        message.args = [binding.is_some() as u64, 0, 0, 0, 0, 0];
+        super::run::until_return(cpu, false);
+        if binding.is_none() {
+            // Revoke the VM aliases before releasing the owner's loan.
+            for slot in [3, 4] {
+                unsafe { cpu._vm.set_user_memory_region(kvm_userspace_memory_region {
+                    slot, ..Default::default()
+                }) }.expect("unmap borrowed planar storage");
+            }
+        }
+        cpu.planar_bound = binding.is_some();
+    })
 }

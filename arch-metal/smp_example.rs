@@ -170,7 +170,7 @@ fn allocate_core(
         assert!(storage as usize >= arch_metal::heap_base());
         storage
     };
-    // A 16 KiB-aligned trap stack fits wholly within one 64 KiB espfix window.
+    // Separate resident stack for ring-0 trap entry.
     let trap = allocate(Layout::from_size_align(16384, 16384).unwrap());
     let tls = allocate(smp::tls_layout());
     let stack = allocate(Layout::from_size_align(65536, 16).unwrap());

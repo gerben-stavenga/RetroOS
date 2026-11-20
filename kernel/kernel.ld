@@ -78,7 +78,7 @@ SECTIONS
         BOOT_TLS_BASE = .;
         . += TLS_SIZE;
         BOOT_TLS_TP = .;
-        . += 8; /* self pointer, espfix stack window */
+        . += 4; /* self pointer */
         /* ARCH_STACK is preceded by a guard page that
          * boot.rs unmaps. Its overflow can't be reported — #PF would be
          * delivered on the overflowed stack itself — but the unmapped guard
@@ -86,16 +86,10 @@ SECTIONS
          * KERNEL_STACK is NOT here; see .kstack above.
          * Addresses are linker symbols — Rust references them via extern. */
         . = ALIGN(4K);
-        /* espfix invariant (see GDT_ESPFIX_SS in arch-metal/descriptors.rs):
-         * ARCH_STACK is the ring-0 trap stack (TSS.sp0) — 16K-ALIGN it so
-         * the whole 16 KB stack sits inside one 64K segment window and every
-         * ESP's low 16 bits equal its offset from the window base, letting
-         * the exit path truncate ESP against the aliased SS. The guard page
-         * stays directly below the aligned base. */
+        /* Keep the guard page directly below the trap stack. */
         . += 0x1000;
-        . = ALIGN(16K);
         ARCH_STACK_GUARD   = . - 0x1000;
-        ARCH_STACK         = .;     . += 0x4000;   /* 16 KB, 16K-aligned */
+        ARCH_STACK         = .;     . += 0x4000;   /* 16 KB */
         ARCH_STACK_TOP     = .;
         KERNEL_CORE_END = .;
         /* Keep this unique input section LAST, outside the .bss.* wildcard.

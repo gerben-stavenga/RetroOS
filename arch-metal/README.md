@@ -13,9 +13,17 @@ allocation policy, CPU discovery and scheduling belong to the kernel.
 
 The kernel's boot policy is `kernel/src/arch/smp.rs`. The BSP initializes the
 kernel physical allocator and heap, then allocates and touches resident AP
-stacks/TLS. Each AP receives a 64 KiB kernel stack, a 16 KiB trap stack contained
-within one 64 KiB window, TLS and an initial fault-page reserve. These allocations
+stacks/TLS. Each AP receives a 64 KiB kernel stack, a 16 KiB trap stack,
+TLS and an initial fault-page reserve. These allocations
 need contiguous virtual addresses, not contiguous physical pages.
+
+Returns to protected-mode 16-bit stacks use a shared espfix buffer, with one
+24-byte slot per core. A single ring-1, 16-bit stack segment covers the buffer;
+SP selects the slot. The normal exit restores registers and returns to a
+`pop esp; iretd` continuation, preserving the application's upper ESP bits.
+Interruptions there use normal ring-1 handling on the ring-0 TSS stack. Exit
+restarts the continuation without overwriting its slot when returning to that
+segment. Other stack modes return directly.
 
 `smp::start_core(apic_id, page_phys, CoreStart { .. }, delay_us)` starts a known,
 stopped AP. Hardware APIC IDs and logical core IDs are separate. Startup requests

@@ -124,13 +124,14 @@ pub trait X86 {
     /// registers); a no-op on backends with no debug-register feature.
     fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>);
 
-    /// Replace both native IDT entries, returning the previous handler pair.
-    /// Backends without a native IDT leave this operation unused.
-    ///
+    /// Install the active context’s planar handler, or remove it on suspension.
     /// # Safety
-    /// Each entry must obey its mode's interrupt-frame and return conventions.
-    /// Restore both entries before their code or associated state expires.
-    unsafe fn replace_interrupt_handlers(&mut self, _vector: u8, handlers: crate::InterruptHandlers) -> crate::InterruptHandlers { handlers }
+    /// Binding storage must remain resident and valid until detached on this CPU.
+    /// Only scanout reads may run concurrently with execution. The kernel may
+    /// program registers between execute calls; detach before freeing storage.
+    unsafe fn bind_planar(&mut self, binding: Option<planar::Binding>);
+
+
 }
 
 /// User address spaces, their mappings and supplied backing storage.

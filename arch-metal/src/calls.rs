@@ -25,18 +25,6 @@ pub fn do_arch_execute_raw(max_ns: u64) -> (u32, u64) {
     (event, u64::from(extra) | (u64::from(extra_high) << 32))
 }
 
-pub fn arch_replace_interrupt_handlers(vector: u8, mut handlers: arch_abi::InterruptHandlers) -> arch_abi::InterruptHandlers {
-    unsafe {
-        core::arch::asm!(
-            "int 0x80",
-            in("eax") crate::arch_call::REPLACE_INTERRUPT_HANDLERS as u32,
-            in("edx") &mut handlers as *mut arch_abi::InterruptHandlers as u32,
-            in("ecx") u32::from(vector),
-        );
-    }
-    handlers
-}
-
 /// Exchange the active address space with `space`.
 pub fn arch_activate(space: &mut super::RootPageTable) {
     unsafe {

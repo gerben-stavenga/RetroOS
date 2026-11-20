@@ -106,6 +106,8 @@ pub(crate) struct FirmwareCheckpoint(Vec<u8>);
 
 /// Software VGA state owned by the core INT 10h/video-BIOS driver.
 pub struct EmulatedVga {
+    /// Stable device storage borrowed by the installed planar handler.
+    pub(crate) planar: vga::registers::RegisterFile,
     /// Registers plus a suspended VRAM snapshot. Empty `planes` means this
     /// device occupies the shared live store; capacity is retained for saving.
     pub state: vga::VgaState,
@@ -202,20 +204,28 @@ impl EmulatedVga {
 
     /// Construct the conventional initial PC text display image without
     /// publishing it into any particular guest address space.
-    pub fn initial_mode3() -> Self {
-        Self {
-            state: vga::VgaState::new_mode3(),
-            svga_pages: 0,
-            svga_vram: Vec::new(),
-        }
+    pub fn initial_mode3() -> Self { Self::from_state(vga::VgaState::new_mode3(), 0) }
+
+    pub(crate) fn from_state(state: vga::VgaState, svga_pages: usize) -> Self {
+        let planar = match state.legacy() {
+            Some(legacy) => legacy.registers.share(),
+            None => { let registers = vga::registers::RegisterFile::default(); registers.enabled.set(0); registers },
+        };
+        Self { state, planar, svga_pages, svga_vram: Vec::new() }
+    }
+
+    pub(crate) fn set_state(&mut self, mut state: vga::VgaState) {
+        if let Some(legacy) = state.legacy_mut() {
+            self.planar.copy_from(&legacy.registers);
+            legacy.registers = self.planar.share();
+        } else { self.planar.enabled.set(0); }
+        self.state = state;
     }
 
     pub(crate) fn clone_for_fork(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-            svga_pages: self.svga_pages,
-            svga_vram: self.svga_vram.clone(),
-        }
+        let mut child = Self::from_state(self.state.clone(), self.svga_pages);
+        child.svga_vram = self.svga_vram.clone();
+        child
     }
 }
 
@@ -1985,6 +1995,24 @@ mod nvidia_tests {
             banked_pitch: 640, linear_pitch: 640, framebuffer_bytes: 640 * 480 * 2,
             palette_capable: true,
         })
+    }
+
+    #[test]
+    fn mode_changes_keep_the_installed_register_page_and_fork_gets_its_own() {
+        let mut device = EmulatedVga::initial_mode3();
+        let installed = device.planar.share();
+        assert!(installed.same_device(&device.state.legacy().unwrap().registers));
+        device.set_state(vga::VgaState::Vbe(alloc::boxed::Box::new(surface())));
+        assert!(installed.same_device(&device.planar));
+        assert_eq!(installed.enabled.get(), 0);
+        device.set_state(vga::VgaState::new_mode3());
+        assert!(installed.same_device(&device.state.legacy().unwrap().registers));
+        assert_eq!(installed.enabled.get(), 1);
+        let child = device.clone_for_fork();
+        assert!(!installed.same_device(&child.planar));
+        assert!(child.planar.same_device(&child.state.legacy().unwrap().registers));
+        child.planar.seq.set(2, 7);
+        assert_ne!(installed.seq.get(2), 7);
     }
 
     #[test]

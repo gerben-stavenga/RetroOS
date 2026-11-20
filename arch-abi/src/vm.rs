@@ -6,6 +6,8 @@ use crate::{Regs, page_entry::PageEntry, page_supply::{PageInput, SUPPLY_CAPACIT
 pub const INTERRUPT_VECTOR: u32 = 32;
 pub const EXIT_PORT: u16 = 0xf4;
 pub const PANIC_PORT: u16 = 0xf5;
+pub const PLANAR_PHYSICAL: u64 = 0x3100_0000;
+pub const PLANAR_VIRTUAL: usize = 0xe020_0000;
 pub const COUNTS_PHYSICAL: u64 = 0x3000_0000;
 pub const COUNTS_VIRTUAL: usize = 0xe000_0000;
 pub const IMAGE_PHYSICAL: usize = 0x1000;
@@ -15,6 +17,7 @@ pub const DATA_SIZE: usize = 65536;
 pub const MAPPINGS: usize = 128;
 
 pub mod op {
+    pub const BIND_PLANAR: u64 = 28;
     pub const CONFIGURE: u64 = 0;
     pub const EXECUTE: u64 = 1;
     pub const SUPPLY: u64 = 2;

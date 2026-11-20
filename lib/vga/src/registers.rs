@@ -1,57 +1,8 @@
-//! The device's register storage. The guest and scanout access the same cells;
-//! no renderer publication, spinlock, or mutable slice aliases these bytes.
+//! Shared storage ownership for the VGA model and scanout.
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::AtomicU8;
+pub use planar::{Byte, Bytes, Word, Dword, Registers};
 
-#[derive(Debug)]
-pub struct Word(AtomicU16);
-impl Word {
-    pub fn new(value: u16) -> Self { Self(AtomicU16::new(value)) }
-    pub fn get(&self) -> u16 { self.0.load(Ordering::Relaxed) }
-    pub fn set(&self, value: u16) { self.0.store(value, Ordering::Relaxed); }
-}
-#[derive(Debug)]
-pub struct Dword(AtomicU32);
-impl Dword {
-    pub fn new(value: u32) -> Self { Self(AtomicU32::new(value)) }
-    pub fn get(&self) -> u32 { self.0.load(Ordering::Relaxed) }
-    pub fn set(&self, value: u32) { self.0.store(value, Ordering::Relaxed); }
-}
-
-#[derive(Debug)]
-pub struct Byte(AtomicU8);
-impl Byte {
-    pub fn new(value: u8) -> Self { Self(AtomicU8::new(value)) }
-    #[inline] pub fn get(&self) -> u8 { self.0.load(Ordering::Relaxed) }
-    #[inline] pub fn set(&self, value: u8) { self.0.store(value, Ordering::Relaxed); }
-}
-#[repr(transparent)]
-#[derive(Debug)]
-pub struct Bytes<const N: usize>([AtomicU8; N]);
-impl<const N: usize> Bytes<N> {
-    pub fn new(values: [u8; N]) -> Self { Self(values.map(AtomicU8::new)) }
-    #[inline] pub fn get(&self, index: usize) -> u8 { self.0[index].load(Ordering::Relaxed) }
-    #[inline] pub fn set(&self, index: usize, value: u8) { self.0[index].store(value, Ordering::Relaxed); }
-    pub fn read(&self) -> [u8; N] { core::array::from_fn(|i| self.get(i)) }
-    pub fn write(&self, values: [u8; N]) { self.write_range(0, &values); }
-    pub fn write_range(&self, start: usize, values: &[u8]) {
-        assert!(start <= N && values.len() <= N - start);
-        for (i, value) in values.iter().enumerate() { self.set(start + i, *value); }
-    }
-}
-
-pub struct Registers {
-    pub misc_output: Byte,
-    pub feature_ctl: Byte,
-    pub cga_mode_ctl: Byte,
-    pub cga_color_select: Byte,
-    pub seq: Bytes<5>,
-    pub crtc: Bytes<25>,
-    pub gc: Bytes<9>,
-    pub ac: Bytes<21>,
-    pub dac: Bytes<768>,
-    pub dac_mask: Byte,
-}
 /// Cloning a saved process creates an independent device. Scanout explicitly
 /// shares the original register file with `share`, retaining its lifetime.
 pub struct RegisterFile(Arc<Registers>);
@@ -83,6 +34,10 @@ impl RegisterFile {
                     }
                 };
             }
+            core::ptr::addr_of_mut!((*p).profile).write(planar::Profile::new());
+            byte!(enabled, 1); byte!(profile_enabled, 0);
+            byte!(seq_index, 0); byte!(gc_index, 0); byte!(latches_valid, 1);
+            bytes!(latches, 4, |_| 0);
             byte!(misc_output, 0); byte!(feature_ctl, 0);
             byte!(cga_mode_ctl, 0); byte!(cga_color_select, 0); byte!(dac_mask, 255);
             bytes!(seq, 5, |_| 0); bytes!(crtc, 25, |_| 0);

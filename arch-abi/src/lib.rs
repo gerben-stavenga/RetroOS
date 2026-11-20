@@ -12,14 +12,6 @@ pub mod page_entry;
 pub mod mapping;
 pub use mapping::{MappingError, MappingFailure, UserPage};
 
-/// Native interrupt entries for protected mode and long mode.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct InterruptHandlers {
-    pub entry32: u32,
-    pub entry64: u64,
-}
-
 /// Flat, exclusive cycle totals for one guest-entry path. Each elapsed
 /// interval belongs to exactly one phase field, so those values may be summed.
 /// Fault details are nested measurements, excluded from total_cycles.
@@ -1065,7 +1057,5 @@ pub enum Irq {
 pub mod page_supply;
 
 pub mod entry;
-
-pub mod trap;
 
 pub mod vm;

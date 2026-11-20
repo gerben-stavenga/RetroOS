@@ -451,92 +451,8 @@ pub fn load_font_map(
 //   gc[7] Color Don't Care gc[8] Bit Mask
 //   map_mask = seq[2] & 0x0F (per-plane write enable)
 
-#[inline]
-fn vga_alu(func: u8, val: u8, latch: u8) -> u8 {
-    match func & 3 {
-        0 => val,
-        1 => val & latch,
-        2 => val | latch,
-        _ => val ^ latch,
-    }
-}
+pub use planar::{planar_write, planar_read};
 
-/// Apply one CPU store of `cpu` at a plane offset whose current plane bytes are
-/// `cur` and whose VGA latches (loaded by the most recent read) are `latches`.
-/// Returns the new 4 plane bytes. Planes not selected by the map mask are
-/// returned unchanged. Implements write modes 0/1/2/3 incl. set/reset, ALU
-/// function, and the bit mask. Write mode 1 is the latched copy (the `cpu`
-/// value is ignored — the latches are written straight through), which is how
-/// Mode X plane-parallel blits move 4 pixels per store.
-pub fn planar_write(cur: [u8; 4], latches: [u8; 4], gc: &[u8; 9], map_mask: u8, cpu: u8) -> [u8; 4] {
-    let write_mode = gc[5] & 3;
-    let rotate = (gc[3] & 7) as u32;
-    let func = (gc[3] >> 3) & 3;
-    let bit_mask = gc[8];
-    let esr = gc[1] & 0x0F;
-    let sr = gc[0] & 0x0F;
-    let rotated = cpu.rotate_right(rotate);
-
-    let mut out = cur;
-    for p in 0..4 {
-        if map_mask & (1 << p) == 0 {
-            continue;
-        }
-        let latch = latches[p];
-        out[p] = match write_mode {
-            // Write mode 0: per-plane set/reset or rotated CPU data, through the
-            // ALU against the latch, then merged with the latch by the bit mask.
-            0 => {
-                let val = if esr & (1 << p) != 0 {
-                    if sr & (1 << p) != 0 { 0xFF } else { 0x00 }
-                } else {
-                    rotated
-                };
-                let v = vga_alu(func, val, latch);
-                (v & bit_mask) | (latch & !bit_mask)
-            }
-            // Write mode 1: latched copy — write the latch directly (CPU ignored).
-            1 => latch,
-            // Write mode 2: each CPU bit selects the whole plane (0x00/0xFF),
-            // through the ALU and bit mask. Used for fast solid-colour fills.
-            2 => {
-                let val = if cpu & (1 << p) != 0 { 0xFF } else { 0x00 };
-                let v = vga_alu(func, val, latch);
-                (v & bit_mask) | (latch & !bit_mask)
-            }
-            // Write mode 3: rotated CPU data AND bit-mask forms the effective
-            // mask; the colour comes from set/reset (always, no enable gate).
-            _ => {
-                let eff_mask = rotated & bit_mask;
-                let val = if sr & (1 << p) != 0 { 0xFF } else { 0x00 };
-                let v = vga_alu(func, val, latch);
-                (v & eff_mask) | (latch & !eff_mask)
-            }
-        };
-    }
-    out
-}
-
-/// Read one offset: always loads all 4 plane bytes into the latches (returned
-/// as the second tuple element) and returns the byte the CPU sees. Read mode 0
-/// returns the plane chosen by Read Map Select; read mode 1 returns the
-/// color-compare result (1 bits where all don't-care planes match Color Compare).
-pub fn planar_read(cur: [u8; 4], gc: &[u8; 9]) -> (u8, [u8; 4]) {
-    let data = if (gc[5] >> 3) & 1 == 0 {
-        cur[(gc[4] & 3) as usize]
-    } else {
-        let cc = gc[2] & 0x0F;
-        let dc = gc[7] & 0x0F;
-        let mut r = 0xFFu8;
-        for (p, &plane) in cur.iter().enumerate() {
-            if dc & (1 << p) != 0 {
-                r &= if cc & (1 << p) != 0 { plane } else { !plane };
-            }
-        }
-        r
-    };
-    (data, cur)
-}
 
 /// The 16 standard CGA/EGA text colours as 6-bit DAC triples (R,G,B each 0..63),
 /// in attribute-index order (0 = black … 15 = white). These occupy DAC entries
@@ -2617,27 +2533,7 @@ impl AcState {
 /// Physical representation currently stored in the VGA's 256 KiB VRAM
 /// backing. This is state, not something callers may infer from registers:
 /// the register write and the byte permutation form one atomic card operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VramLayout {
-    /// Four adjacent bytes are the four maps at one offset:
-    /// `index = 4 * offset + plane`. Chain-4's standard 64K window is the
-    /// first 64K of this ordering.
-    PlaneMinor,
-    /// Two complete 128K plane sets. Set 0 interleaves maps 0/1 and set 1
-    /// interleaves maps 2/3:
-    /// `index = (plane >> 1) * 128K + 2 * offset + (plane & 1)`.
-    OddEven,
-}
-
-impl VramLayout {
-    #[inline]
-    pub const fn index(self, plane: usize, offset: usize) -> usize {
-        match self {
-            Self::PlaneMinor => 4 * offset + plane,
-            Self::OddEven => (plane >> 1) * 0x20000 + 2 * offset + (plane & 1),
-        }
-    }
-}
+pub use planar::VramLayout;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VramTransition {
@@ -2667,18 +2563,7 @@ impl VramTransition {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ApertureRange {
-    pub start_page: u16,
-    pub end_page: u16,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CpuAperture {
-    None,
-    Direct { range: ApertureRange, pages: u16 },
-    Trapped { range: ApertureRange },
-}
+pub use planar::{ApertureRange, CpuAperture};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortWrite {
@@ -2707,9 +2592,7 @@ pub struct LegacyVgaState {
     panning_frame: u64,
     scanout_pan: u8,
     // ── Port index / state ──
-    pub seq_index: u8,
     pub crtc_index: u8,
-    pub gc_index: u8,
     /// AC port flip-flop + latched index. The real card's own copy is
     /// tracked by `drivers::vga_hw`.
     pub ac_state: AcState,
@@ -2731,16 +2614,7 @@ pub struct LegacyVgaState {
     pub dac_read_index: u8,
     pub dac_rsub: u8,
     pub dac_wsub: u8,
-    /// VGA read latches: the 4 plane bytes loaded by the most recent VRAM read
-    /// (one per plane). Write mode 1 (latched copy) writes these straight
-    /// through; write modes 0/2/3 ALU the new value against them. Only used on
-    /// the trapped planar write path (see `vram_write`/`vram_read`).
-    pub latches: [u8; 4],
-    /// Whether `latches` came from the live card/model rather than the
-    /// zero-filled construction fallback. Emulated reads make it valid;
-    /// hardware capture does so only when the card or firmware checkpoint
-    /// provides an exact extraction path.
-    pub latches_valid: bool,
+
 }
 
 impl core::ops::Deref for LegacyVgaState {
@@ -2804,9 +2678,7 @@ impl LegacyVgaState {
             scanout_start: 0,
             panning_frame: u64::MAX,
             scanout_pan: 0,
-            seq_index: 0,
             crtc_index: 0,
-            gc_index: 0,
             ac_state: AcState::new(),
             ac_pas_valid: true,
             dac_index: 0,
@@ -2814,8 +2686,6 @@ impl LegacyVgaState {
             dac_read_index: 0,
             dac_rsub: 0,
             dac_wsub: 0,
-            latches: [0; 4],
-            latches_valid: true,
         }
     }
 
@@ -2824,9 +2694,9 @@ impl LegacyVgaState {
             planes: alloc::vec::Vec::new(), registers: self.registers.share(),
             scanout_frame: u64::MAX, scanout_start: 0,
             panning_frame: u64::MAX, scanout_pan: 0,
-            seq_index: 0, crtc_index: 0, gc_index: 0, ac_state: AcState::new(),
+            crtc_index: 0, ac_state: AcState::new(),
             ac_pas_valid: true, dac_index: 0, dac_state: 0, dac_read_index: 0,
-            dac_rsub: 0, dac_wsub: 0, latches: [0; 4], latches_valid: false,
+            dac_rsub: 0, dac_wsub: 0,
         }
     }
 
@@ -2877,150 +2747,6 @@ impl LegacyVgaState {
         else { self.scanout_pan }
     }
 
-    fn decoded_aperture(&self) -> ApertureRange {
-        let (start_page, end_page) = match (self.gc.get(6) >> 2) & 3 {
-            0 => (0xA0, 0xC0),
-            1 => (0xA0, 0xB0),
-            2 => (0xB0, 0xB8),
-            _ => (0xB8, 0xC0),
-        };
-        ApertureRange { start_page, end_page }
-    }
-
-    /// Complete physical ordering implied by the sequencer memory-mode
-    /// register. Chain-4 and sequential access use plane-minor storage;
-    /// odd/even access interleaves the selected plane pair into its 128K set.
-    pub fn layout(&self) -> VramLayout {
-        if self.seq.get(4) & 0x08 != 0 || self.seq.get(4) & 0x04 != 0 {
-            VramLayout::PlaneMinor
-        } else {
-            VramLayout::OddEven
-        }
-    }
-
-    /// Shared CPU address translation for reads and writes. Plane selection
-    /// is separate: it must never change the byte offset within a plane.
-    /// Chain-4 consumes A1:A0 to select the plane. Otherwise,
-    /// GC6 controls address pairing independently of the read/write plane
-    /// selectors. Normalize paired word-mode addresses to our compact text
-    /// backing on both paths, even when only one side selects odd/even planes.
-    /// Byte-mode scanout (Jazz's scrolling playfield) uses the full offset.
-    fn cpu_offset(&self, address: usize) -> usize {
-        if self.seq.get(4) & 0x08 != 0 {
-            return (address >> 2) & 0xFFFF;
-        }
-        let paired = self.gc.get(6) & 0x02 != 0;
-        let address = if paired { address & !1 } else { address };
-        let address = if paired && self.crtc.get(0x17) & 0x40 == 0 { address >> 1 } else { address };
-        address & 0xFFFF
-    }
-
-    /// Resolve one CPU read in the decoded VGA aperture to the logical plane
-    /// byte selected by the sequencer/graphics-controller addressing mode.
-    /// The returned offset is always an offset *within a plane*; callers then
-    /// use `layout()` to locate that byte in the physical backing.
-    pub fn cpu_read_address(&self, address: usize) -> (usize, usize) {
-        let offset = self.cpu_offset(address);
-        if self.seq.get(4) & 0x08 != 0 {
-            return (offset, address & 3);
-        }
-        if self.gc.get(5) & 0x10 != 0 {
-            return (offset, usize::from(self.gc.get(4) & 2) | (address & 1));
-        }
-        (offset, usize::from(self.gc.get(4) & 3))
-    }
-
-    /// Resolve one CPU write to its logical per-plane offset and effective map
-    /// mask. Chain-4 selects one map with A1:A0; odd/even selects one map from
-    /// each pair with A0; sequential addressing leaves the sequencer map mask
-    /// untouched.
-    pub fn cpu_write_address(&self, address: usize) -> (usize, u8) {
-        let offset = self.cpu_offset(address);
-        let map_mask = self.seq.get(2) & 0x0F;
-        if self.seq.get(4) & 0x08 != 0 {
-            let plane = address & 3;
-            return (offset, map_mask & (1 << plane));
-        }
-        if self.seq.get(4) & 0x04 == 0 {
-            let parity_mask = if address & 1 == 0 { 0x05 } else { 0x0A };
-            return (offset, map_mask & parity_mask);
-        }
-        (offset, map_mask)
-    }
-
-    fn simple_alu(&self) -> bool {
-        self.gc.get(5) & 0x0B == 0
-            && self.gc.get(3) & 0x1F == 0
-            && self.gc.get(1) & 0x0F == 0
-            && self.gc.get(8) == 0xFF
-    }
-
-    /// Consecutive CPU writes with fixed, sequential planar addressing. The
-    /// guest cannot change registers during this instruction chunk; scanout
-    /// reads these atomic bytes independently. Declining performs no accesses.
-    pub fn write_sequential_span(&self, memory: memory::Memory<'_>, address: usize,
-        len: usize, mut read: impl FnMut(usize) -> u8) -> bool {
-        if self.seq.get(4) & 0x0c != 4 || self.gc.get(6) & 2 != 0 || !self.simple_alu()
-            || memory.len() < 4 * 65536 { return false; }
-        let memory = memory.range(0, 4 * 65536);
-        let mask = self.seq.get(2) & 15;
-        if mask.count_ones() == 1 {
-            let plane = mask.trailing_zeros() as usize;
-            for i in 0..len {
-                memory.put(((address.wrapping_add(i) & 65535) * 4) + plane, read(i));
-            }
-        } else {
-            for i in 0..len {
-                let value = read(i);
-                let offset = (address.wrapping_add(i) & 65535) * 4;
-                for plane in 0..4 {
-                    if mask & (1 << plane) != 0 { memory.put(offset + plane, value); }
-                }
-            }
-        }
-        true
-    }
-
-    fn direct_layout(&self) -> Option<VramLayout> {
-        if !self.simple_alu() {
-            return None;
-        }
-        // Chain-4 overrides both odd/even controls. A standard VGA exposes
-        // only one 64K chained page even when GC6 decodes 128K.
-        if self.seq.get(4) & 0x08 != 0 {
-            return (self.seq.get(2) & 0x0F == 0x0F).then_some(self.layout());
-        }
-        // A direct odd/even alias is valid only for the conventional matched
-        // read/write setup, compact word-mode offsets and plane set 0. Other
-        // legal combinations remain trapped and use layout-aware indexing.
-        let write_oe = self.seq.get(4) & 0x04 == 0;
-        let read_oe = self.gc.get(5) & 0x10 != 0;
-        if write_oe && read_oe
-            && self.crtc.get(0x17) & 0x40 == 0
-            && self.gc.get(6) & 0x02 != 0
-            && self.seq.get(2) & 0x0F == 0x03
-            && self.gc.get(4) & 0x02 == 0
-        {
-            return Some(self.layout());
-        }
-        None
-    }
-
-    pub fn cpu_aperture(&self) -> CpuAperture {
-        let range = self.decoded_aperture();
-        match self.direct_layout() {
-            Some(VramLayout::PlaneMinor) => CpuAperture::Direct {
-                range,
-                pages: 16.min(range.end_page - range.start_page),
-            },
-            Some(VramLayout::OddEven) => CpuAperture::Direct {
-                range,
-                pages: (range.end_page - range.start_page).min(32),
-            },
-            None => CpuAperture::Trapped { range },
-        }
-    }
-
     /// Emulated register-file write — the absent-card half of the VGA
     /// passthrough-vs-facade split (`VgaAdapter`).
     /// This per-thread struct IS the hardware then: `emulate_outb` routes the
@@ -3045,9 +2771,9 @@ impl LegacyVgaState {
                 self.ac_state.pending_data = !self.ac_state.pending_data;
             }
             0x3C2 => self.misc_output.set(v),
-            0x3C4 => self.seq_index = v,
+            0x3C4 => self.seq_index.set(v),
             0x3C5 => {
-                let i = (self.seq_index & 0x1F) as usize;
+                let i = (self.seq_index.get() & 0x1F) as usize;
                 if i < 5 {
                     self.seq.set(i, v);
                 }
@@ -3072,9 +2798,9 @@ impl LegacyVgaState {
                     self.dac_index = self.dac_index.wrapping_add(1);
                 }
             }
-            0x3CE => self.gc_index = v,
+            0x3CE => self.gc_index.set(v),
             0x3CF => {
-                let i = (self.gc_index & 0x0F) as usize;
+                let i = (self.gc_index.get() & 0x0F) as usize;
                 if i < 9 {
                     self.gc.set(i, v);
                 }
@@ -3139,9 +2865,9 @@ impl LegacyVgaState {
                 if i < 21 { self.ac.get(i) } else { 0 }
             }
             0x3C2 => 0, // input status 0: no interrupt pending, monitor present
-            0x3C4 => self.seq_index,
+            0x3C4 => self.seq_index.get(),
             0x3C5 => {
-                let i = (self.seq_index & 0x1F) as usize;
+                let i = (self.seq_index.get() & 0x1F) as usize;
                 if i < 5 { self.seq.get(i) } else { 0 }
             }
             0x3C6 => self.dac_mask.get(),
@@ -3158,9 +2884,9 @@ impl LegacyVgaState {
             }
             0x3CA => self.feature_ctl.get(),
             0x3CC => self.misc_output.get(),
-            0x3CE => self.gc_index,
+            0x3CE => self.gc_index.get(),
             0x3CF => {
-                let i = (self.gc_index & 0x0F) as usize;
+                let i = (self.gc_index.get() & 0x0F) as usize;
                 if i < 9 { self.gc.get(i) } else { 0 }
             }
             0x3D4 => self.crtc_index,

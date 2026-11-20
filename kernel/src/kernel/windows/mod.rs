@@ -247,6 +247,8 @@ impl<A: crate::Arch> WindowsProcess<A> {
         self.state.on_resume(machine);
         if let Some(dos) = &mut self.dos {
             dos.ldt[..self.state.ldt.len()].copy_from_slice(&self.state.ldt);
+            dos.pc.vga.resume_vram(machine);
+            crate::kernel::dos::planar::install(machine, &dos.pc.vga);
         }
     }
     pub fn on_exit(&mut self, machine: &mut A, regs: &mut Regs) {

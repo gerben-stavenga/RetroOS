@@ -79,9 +79,9 @@ pub fn write_latches_and_readback(state: &mut LegacyVgaState) {
     unsafe { core::ptr::write_volatile(p, 0); }
     for plane in 0..4u8 {
         outb(0x3CE, 4); outb(0x3CF, plane);
-        state.latches[plane as usize] = unsafe { core::ptr::read_volatile(p) };
+        state.latches.set(plane as usize, unsafe { core::ptr::read_volatile(p) });
     }
-    state.latches_valid = true;
+    state.latches_valid.set(1);
 }
 
 fn flip_flop_probe(plane_enable_before: u8) -> u8 {
@@ -191,7 +191,7 @@ pub fn save(
     if state.planes.is_empty() {
         state.planes = alloc::vec![0u8; 4 * 65536];
     }
-    state.latches_valid = false;
+    state.latches_valid.set(0);
     // Reading the AC address register does not disturb its flip-flop. Defer
     // the first 3DA read until all Cirrus hidden state has been captured.
     let plat = crate::kernel::platform::get();
@@ -200,9 +200,9 @@ pub fn save(
     state.ac_pas_valid = plat.host != crate::kernel::platform::Host::Qemu;
 
     // Capture index registers BEFORE the save loops overwrite them.
-    state.seq_index = inb(0x3C4);
+    state.seq_index.set(inb(0x3C4));
     state.crtc_index = inb(0x3D4);
-    state.gc_index = inb(0x3CE);
+    state.gc_index.set(inb(0x3CE));
 
     // Save all registers
     state.misc_output.set(inb(0x3CC));
@@ -223,14 +223,14 @@ pub fn save(
         for plane in 0..4u8 {
             outb(0x3CF, plane);
             outb(0x3D4, 0x22);
-            state.latches[plane as usize] = inb(0x3D5);
+            state.latches.set(plane as usize, inb(0x3D5));
         }
         // Only the QEMU compatibility aperture reads below need the original
         // read-map selection before the flat plane walk takes control.
         if QEMU_COMPAT {
             outb(0x3CF, state.gc.get(4));
         }
-        state.latches_valid = true;
+        state.latches_valid.set(1);
     } else {
         // Provisional only; the checkpoint oracle corrects it after this save.
         state.ac_state.pending_data = false;
@@ -360,9 +360,9 @@ pub fn save(
     outb(0x3CE, 5); outb(0x3CF, state.gc.get(5));
     outb(0x3CE, 6); outb(0x3CF, state.gc.get(6));
     // Restore the program's tracked index registers
-    outb(0x3C4, state.seq_index);
+    outb(0x3C4, state.seq_index.get());
     outb(0x3D4, state.crtc_index);
-    outb(0x3CE, state.gc_index);
+    outb(0x3CE, state.gc_index.get());
 
     // SeaVGABIOS traffic can bypass the trapped-port AC tracker, leaving its
     // PAS bit stale even though the outgoing owner was visibly scanning out.
@@ -465,10 +465,10 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
     // in forced flat-planar write mode 0 here, so the staging writes
     // land verbatim.
     {
-        if state.latches_valid {
+        if state.latches_valid.get() != 0 {
             for plane in 0..4u8 {
                 outb(0x3C4, 2); outb(0x3C5, 1 << plane);
-                unsafe { core::ptr::write_volatile(vga_window, state.latches[plane as usize]); }
+                unsafe { core::ptr::write_volatile(vga_window, state.latches.get(plane as usize)); }
             }
             unsafe { let _ = core::ptr::read_volatile(vga_window as *const u8); }
             for plane in 0..4u8 {
@@ -607,9 +607,9 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
     outb(0x3C4, 1); outb(0x3C5, state.seq.get(1));
 
     // Restore index registers
-    outb(0x3C4, state.seq_index);
+    outb(0x3C4, state.seq_index.get());
     outb(0x3D4, state.crtc_index);
-    outb(0x3CE, state.gc_index);
+    outb(0x3CE, state.gc_index.get());
 }
 
 /// Re-enable Attribute Controller palette output after a broken firmware

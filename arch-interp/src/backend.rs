@@ -14,6 +14,7 @@ pub struct Interp;
 
 #[cfg(feature = "tcg")]
 impl X86 for Interp {
+    unsafe fn bind_planar(&mut self, _: Option<planar::Binding>) {}
     fn isa_unmask_irq(&mut self, line: u8) { crate::calls::arch_isa_unmask_irq(line) }
 
     type Fx = crate::machine::FxState;
