@@ -8,6 +8,16 @@ pub(crate) use setup::kick;
 use arch_abi::{Memory, X86, GuestBytes, UserPage, MappingError, MappingFailure, page_entry::PageEntry, page_supply::PageInput, vm::{self, Exchange, op}};
 use crate::{backend::Interp, space::RootPageTable};
 
+pub(crate) fn supply_status() -> arch_abi::page_supply::SupplyStatus {
+    setup::with(|cpu| {
+        let returned = unsafe { (*cpu.message).supply_returned as usize };
+        arch_abi::page_supply::SupplyStatus {
+            needed: arch_abi::page_supply::SUPPLY_CAPACITY - cpu.reserve().len(),
+            returned,
+        }
+    })
+}
+
 fn request<R>(operation: u64, args: [u64; 6], prepare: impl FnOnce(&mut Exchange), finish: impl FnOnce(&mut Exchange) -> R) -> R {
     setup::with(|cpu| {
         let message = unsafe { &mut *cpu.message };
@@ -79,28 +89,162 @@ impl Memory for Interp {
     }
 }
 
-fn transfer(mut address: u64, buffer: *mut u8, length: usize, supplied: Option<PageInput>, write: bool) -> (Option<()>, PageInput) {
-    let explicit = supplied.is_some();
-    let mut pages = supplied.unwrap_or_default();
-    let Some(end) = address.checked_add(length as u64) else { return (None, pages); };
-    if !(end <= 0xc0000000 || address >= 1 << 39 && end <= 1 << 47) { return (None, pages); }
-    let mut offset = 0;
-    while offset < length {
-        let n = (length - offset).min(4096 - (address as usize & 4095));
-        let (ok, unused) = request(if write { op::COPY_TO } else { op::COPY_FROM }, [address, n as u64, explicit as u64, 0, 0, 0], |m| {
-            m.put_pages(pages);
-            if write { unsafe { core::ptr::copy_nonoverlapping(buffer.add(offset), m.data.as_mut_ptr(), n); } }
-        }, |m| {
-            let ok = m.result[0] != 0;
-            if ok && !write { unsafe { core::ptr::copy_nonoverlapping(m.data.as_ptr(), buffer.add(offset), n); } }
-            (ok, m.take_pages())
-        });
-        pages = unused;
-        if !ok { return (None, pages); }
-        address += n as u64;
-        offset += n;
+// Hosted byte access walks arch-owned live tables through the RAM mapping.
+// setup::with excludes supervisor execution and other CPUs' paging mutations.
+struct PhysicalAccess<'a> {
+    cpu: &'a mut setup::KvmCpu,
+    pages: Option<PageInput>,
+    ownership: arch_abi::page_supply::FrameOwnership,
+}
+impl<'a> PhysicalAccess<'a> {
+    fn new(cpu: &'a mut setup::KvmCpu, pages: Option<PageInput>) -> Self {
+        let mut ownership = crate::phys::ownership();
+        ownership.zero_page = unsafe { (*cpu.message).memory.zero_page };
+        Self { cpu, pages, ownership }
     }
-    (Some(()), pages)
+    fn resolve(&mut self, address: u64, write: bool) -> Option<*mut u8> {
+        let page = self.resolve_page(address, write)?;
+        Some(unsafe { self.cpu.frame(page).add(address as usize & 4095) })
+    }
+
+    /// Resolve without dereferencing a guest virtual address. The caller holds
+    /// the paging lock and invalidates translations after any table writes.
+    fn resolve_page(&mut self, address: u64, write: bool) -> Option<u64> {
+        use arch_abi::vm::UserMemory;
+        const PRESENT: u64 = 1;
+        const READ_WRITE: u64 = 2;
+        const USER: u64 = 4;
+        const FOREIGN: u64 = 1 << 11;
+        const NO_ACCESS: u64 = 1 << 10;
+        const SOFT_RO: u64 = 1 << 9;
+        let UserMemory { low_root, high_root, zero_page } = unsafe { (*self.cpu.message).memory };
+        const RESERVED: u64 = 1 << 10;
+        const BLOCKED: u64 = 1 << 8;
+        UserPage::new(address & !4095).ok()?;
+        let low = address < 0xc000_0000;
+        if !low && high_root == 0 { return None; }
+        let levels = if low { 3 } else { 4 };
+        let root = if low { low_root } else { high_root };
+        let mask = 0x000f_ffff_ffff_f000;
+        let zero = (zero_page << 12) | PRESENT | USER | FOREIGN;
+        let index = |level| ((address >> (12 + 9 * level)) & 511u64) as usize;
+        // Check the semantic leaf before consuming any donated backing.
+        let mut table = root;
+        let mut leaf = 0;
+        for level in (0..levels).rev() {
+            let entry = self.read_entry(table, index(level));
+            if entry & PRESENT == 0 {
+                leaf = if low {
+                    if level != 0 || entry == 0 { zero } else { return None; }
+                } else {
+                    if entry & RESERVED == 0 || entry & BLOCKED != 0 { return None; }
+                    (entry & !RESERVED) | PRESENT
+                };
+                break;
+            }
+            if level == 0 { leaf = entry; break; }
+            table = (entry & mask) >> 12;
+        }
+        if write && leaf & SOFT_RO != 0 { return None; }
+        if !write { return Some((leaf & mask) >> 12); }
+
+        table = root;
+        for level in (1..levels).rev() {
+            let at = index(level);
+            let old = self.read_entry(table, at);
+            let mut entry = old;
+            if entry & PRESENT == 0 {
+                let page = self.take_page().expect("guest copy has insufficient supplied table pages");
+                let fill = if low { 0 } else { entry };
+                for i in 0..512 { self.write_entry(page, i, fill); }
+                entry = (page << 12) | PRESENT | READ_WRITE | USER;
+            } else if entry & READ_WRITE == 0 {
+                let old_page = (entry & mask) >> 12;
+                if self.references(old_page) == 1 && entry & FOREIGN == 0 {
+                    entry |= READ_WRITE;
+                } else {
+                    let page = self.take_page().expect("guest copy has insufficient supplied table pages");
+                    for i in 0..512 {
+                        let mut child = self.read_entry(old_page, i);
+                        let owns = child & FOREIGN == 0 && if low {
+                            child & (PRESENT | NO_ACCESS) != 0
+                        } else { child & PRESENT != 0 || level == 1 && child & RESERVED != 0 };
+                        if owns {
+                            child &= !READ_WRITE;
+                            self.retain((child & mask) >> 12);
+                            self.write_entry(old_page, i, child);
+                        }
+                        self.write_entry(page, i, child);
+                    }
+                    if entry & FOREIGN == 0 { self.release(old_page); }
+                    entry = (page << 12) | PRESENT | READ_WRITE | USER;
+                }
+            }
+            if entry != old { self.write_entry(table, at, entry); }
+            table = (entry & mask) >> 12;
+        }
+        let at = index(0);
+        let old = self.read_entry(table, at);
+        let mut entry = if low && old == 0 { zero }
+            else if !low && old & PRESENT == 0 { (old & !RESERVED) | PRESENT }
+            else { old };
+        if entry & READ_WRITE == 0 {
+            let old_page = (entry & mask) >> 12;
+            if entry & FOREIGN != 0 || self.references(old_page) > 1 {
+                let page = self.take_page().expect("guest copy has insufficient supplied data pages");
+                self.copy_page(old_page, page);
+                if entry & FOREIGN == 0 { self.release(old_page); }
+                entry = (entry & !mask & !FOREIGN) | (page << 12);
+            }
+            entry |= READ_WRITE;
+        }
+        if entry != old { self.write_entry(table, at, entry); }
+        Some((entry & mask) >> 12)
+    }
+
+    fn read_entry(&self, page: u64, index: usize) -> u64 {
+        unsafe { self.cpu.frame(page).cast::<u64>().add(index).read_volatile() }
+    }
+    fn write_entry(&mut self, page: u64, index: usize, entry: u64) {
+        unsafe {
+            self.cpu.frame(page).cast::<u64>().add(index).write_volatile(entry);
+            (*self.cpu.message).tables_changed = 1;
+        }
+    }
+    fn take_page(&mut self) -> Option<u64> {
+        match &mut self.pages { Some(pages) => pages.take(), None => self.cpu.reserve().take() }
+    }
+    fn copy_page(&mut self, from: u64, to: u64) {
+        unsafe { core::ptr::copy_nonoverlapping(self.cpu.frame(from), self.cpu.frame(to), 4096); }
+    }
+    fn references(&self, page: u64) -> u8 { unsafe { self.ownership.references(page) } }
+    fn retain(&mut self, page: u64) { assert!(unsafe { self.ownership.retain(page) }); }
+    fn release(&mut self, page: u64) {
+        // COW replaces only shared backing. Exclusive frames are reused.
+        assert!(!unsafe { self.ownership.release_shared(page) });
+    }
+}
+fn valid_range(address: u64, length: usize) -> bool {
+    address.checked_add(length as u64).is_some_and(|end|
+        end <= 0xc0000000 || address >= 1 << 39 && end <= 1 << 47)
+}
+fn transfer(address: u64, buffer: *mut u8, length: usize, supplied: Option<PageInput>, write: bool) -> (Option<()>, PageInput) {
+    if !valid_range(address, length) { return (None, supplied.unwrap_or_default()); }
+    setup::with(|cpu| {
+        let mut access = PhysicalAccess::new(cpu, supplied);
+        let mut offset = 0;
+        while offset < length {
+            let at = address + offset as u64;
+            let n = (length - offset).min(4096 - (at as usize & 4095));
+            let Some(pointer) = access.resolve(at, write) else { return (None, access.pages.unwrap_or_default()); };
+            for i in 0..n { unsafe {
+                if write { pointer.add(i).write_volatile(buffer.add(offset + i).read()); }
+                else { buffer.add(offset + i).write(pointer.add(i).read_volatile()); }
+            } }
+            offset += n;
+        }
+        (Some(()), access.pages.unwrap_or_default())
+    })
 }
 impl GuestBytes for Interp {
     fn read<T: Copy>(&self, address: u64) -> T {
@@ -108,25 +252,68 @@ impl GuestBytes for Interp {
         transfer(address, value.as_mut_ptr().cast(), core::mem::size_of::<T>(), None, false).0.expect("inaccessible guest read");
         unsafe { value.assume_init() }
     }
-    fn write<T: Copy>(&mut self, address: u64, value: T) { transfer(address, (&value as *const T).cast_mut().cast(), core::mem::size_of::<T>(), None, true).0.expect("inaccessible guest write"); }
+    fn write<T: Copy>(&mut self, address: u64, value: T) { transfer(address, (&value as *const T).cast_mut().cast(), core::mem::size_of::<T>(), None, true).0.unwrap_or_else(|| panic!("inaccessible guest write at {address:#x}")); }
     fn copy_from(&self, address: u64, bytes: &mut [u8], pages: PageInput) -> (Option<()>, PageInput) { transfer(address, bytes.as_mut_ptr(), bytes.len(), Some(pages), false) }
     fn copy_to(&mut self, address: u64, bytes: &[u8], pages: PageInput) -> (Option<()>, PageInput) { transfer(address, bytes.as_ptr().cast_mut(), bytes.len(), Some(pages), true) }
-    fn zero(&mut self, address: u64, length: usize) { request(op::ZERO, [address, length as u64, 0, 0, 0, 0], |_| {}, |_| {}); }
-    fn copy_within(&mut self, src: u64, dst: u64, length: usize) { request(op::COPY_WITHIN, [src, length as u64, dst, 0, 0, 0], |_| {}, |_| {}); }
+    fn zero(&mut self, address: u64, length: usize) {
+        assert!(valid_range(address, length), "invalid guest zero range");
+        setup::with(|cpu| {
+            let mut access = PhysicalAccess::new(cpu, None);
+            let mut offset = 0;
+            while offset < length {
+                let at = address + offset as u64;
+                let n = (length - offset).min(4096 - (at as usize & 4095));
+                let p = access.resolve(at, true).expect("inaccessible guest zero");
+                for i in 0..n { unsafe { p.add(i).write_volatile(0); } }
+                offset += n;
+            }
+        });
+    }
+    fn copy_within(&mut self, src: u64, dst: u64, length: usize) {
+        assert!(valid_range(src, length) && valid_range(dst, length), "invalid guest copy range");
+        setup::with(|cpu| {
+            let mut access = PhysicalAccess::new(cpu, None);
+            let mut remaining = length;
+            while remaining != 0 {
+                let backwards = dst > src;
+                let (s, d, n) = if backwards {
+                    let s_end = src + remaining as u64;
+                    let d_end = dst + remaining as u64;
+                    let n = remaining.min(((s_end - 1) as usize & 4095) + 1)
+                        .min(((d_end - 1) as usize & 4095) + 1);
+                    (s_end - n as u64, d_end - n as u64, n)
+                } else {
+                    let offset = (length - remaining) as u64;
+                    let s = src + offset; let d = dst + offset;
+                    (s, d, remaining.min(4096 - (s as usize & 4095)).min(4096 - (d as usize & 4095)))
+                };
+                let to = access.resolve(d, true).expect("inaccessible guest copy destination");
+                let from = access.resolve(s, false).expect("inaccessible guest copy source");
+                for step in 0..n {
+                    let i = if backwards { n - step - 1 } else { step };
+                    unsafe { to.add(i).write_volatile(from.add(i).read_volatile()); }
+                }
+                remaining -= n;
+            }
+        });
+    }
     fn copy_cstr(&self, address: u64, bytes: &mut [u8]) -> usize {
-        let mut copied = 0;
-        for chunk in bytes.chunks_mut(vm::DATA_SIZE) {
-            let next = address.checked_add(copied as u64).expect("guest address overflow");
-            let length = chunk.len();
-            let n = request(op::COPY_CSTR, [next, length as u64, 0, 0, 0, 0], |_| {}, |m| {
-                let n = m.result[0] as usize;
-                chunk[..n].copy_from_slice(&m.data[..n]);
-                n
-            });
-            copied += n;
-            if n != length { break; }
-        }
-        copied
+        setup::with(|cpu| {
+            let mut access = PhysicalAccess::new(cpu, None);
+            let mut copied = 0;
+            while copied < bytes.len() {
+                let at = address.checked_add(copied as u64).expect("guest string address overflow");
+                let p = access.resolve(at, false).expect("inaccessible guest string");
+                let n = (bytes.len() - copied).min(4096 - (at as usize & 4095));
+                for i in 0..n {
+                    let b = unsafe { p.add(i).read_volatile() };
+                    if b == 0 { return copied + i; }
+                    bytes[copied + i] = b;
+                }
+                copied += n;
+            }
+            copied
+        })
     }
 
 }
@@ -180,8 +367,7 @@ pub fn fx_switch(fx: &mut crate::machine::FxState) {
 pub fn fpu_st0() -> [u8; 10] { request(op::FPU_ST0, [0; 6], |_| {}, |m| m.data[..10].try_into().unwrap()) }
 pub fn fpu_pop() { empty(op::FPU_POP); }
 
-// Compatibility for the internal byte-view helpers: translations are resolved
-// by arch, never by a host page-table walker.
+// Internal byte views use the same host-side translation as GuestBytes.
 pub(crate) mod paging {
     pub const PAGING_PAGES: usize = 1;
     pub unsafe fn initialize(storage: u64) {
@@ -194,7 +380,7 @@ pub(crate) mod paging {
     }
     pub fn space_resolve(address: u32) -> *mut u8 { resolve(address, false) }
     fn resolve(address: u32, write: bool) -> *mut u8 {
-        let page = super::request(super::op::TRANSLATE, [address as u64, 0, write as u64, 0, 0, 0], |_| {}, |m| m.result[0]);
-        unsafe { crate::phys::frame_ptr(page).add(address as usize & 4095) }
+        super::setup::with(|cpu| super::PhysicalAccess::new(cpu, None)
+            .resolve(address as u64, write).expect("inaccessible guest memory"))
     }
 }

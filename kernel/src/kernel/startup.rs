@@ -1948,12 +1948,12 @@ fn event_loop<A: crate::Arch>(
             } else if threads[ctx.tid].personality.timer_due(machine.now()) {
                 crate::KernelEvent::Irq
             } else {
-                super::memory::service(machine);
                 machine.execution_profile_begin();
                 ctx.prepare_io(bios_workspace, &threads[ctx.tid].personality);
                 machine.execution_profile_time(arch_abi::ExecutionProfileStage::PolicyLookup);
-                let event = machine.execute(&mut ctx.regs, &ctx.io_policy,
+                let (event, supply) = machine.execute(&mut ctx.regs, &ctx.io_policy,
                     core::time::Duration::from_nanos(loan_deadline.unwrap().saturating_sub(machine.now())));
+                super::memory::replenish(machine, supply);
                 ctx.device_cycles = super::dos::planar::collect();
                 event
             };

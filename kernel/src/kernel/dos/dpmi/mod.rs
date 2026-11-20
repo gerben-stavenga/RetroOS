@@ -182,14 +182,6 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &
 // INT 31h — DPMI services API
 // ============================================================================
 
-/// PM client-initiated INT 31h — the DPMI service API, dispatched by AX.
-/// Caller (`dos::syscall`) has already classified the trap as client-side
-/// (CS not in the kernel's stub LDT slots).
-///
-/// Wrapper: any INT 31h handler may edit the LDT (descriptor alloc / set base /
-/// set limit), so unconditionally tell the backend to re-materialize its
-/// descriptor tables after dispatch — cheap (INT 31h is rare vs guest
-/// instructions) and catches every early-return path in the inner dispatch.
 /// Null out any segment register still holding a just-freed selector,
 /// otherwise the IRET back to user mode reloads it and GP-faults in the
 /// exit stub. Every path that frees an LDT descriptor (0001h, 0101h) must
@@ -203,8 +195,10 @@ fn scrub_freed_selector(regs: &mut Regs, sel: u16) {
 
 #[inline(never)]
 pub(super) fn dpmi_api<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+    let function = regs.rax as u16;
     let action = dpmi_api_inner(machine, dos, regs);
-    machine.on_ldt_changed();
+    // Virtual interrupt enable/disable only changes saved registers.
+    if !matches!(function, 0x0900 | 0x0901) { machine.on_ldt_changed(); }
     action
 }
 

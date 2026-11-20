@@ -1,6 +1,6 @@
-//! KVM kernel transition. All paging, descriptors, traps and return processing
-//! remain the metal implementation; only the suspended kernel lives elsewhere.
-use arch_abi::{GuestBytes, Regs, UserPage, MappingError, MappingFailure};
+//! KVM kernel transition. The supervisor owns recursive paging, descriptors,
+//! traps and guest return. Host byte access uses its live physical tables.
+use arch_abi::{Regs, UserPage, MappingError, MappingFailure};
 use arch_abi::vm::{self, Exchange, op};
 use crate::{mapping, paging2, traps::{arch_call, arch_dispatch}};
 
@@ -16,12 +16,20 @@ pub unsafe fn boot() -> ! {
     unsafe { crate::smp::init_core(0); }
     paging2::finish_setup_paging();
     unsafe { crate::boot_mem::BootMemory::new().finish(); }
+    unsafe {
+        (*exchange()).memory = paging2::user_memory();
+        (*exchange()).reserve_address = (crate::memory::reserve_address() - vm::IMAGE_VIRTUAL + vm::IMAGE_PHYSICAL) as u64;
+    }
     unsafe extern "C" { fn vm_supervisor_start() -> !; }
     unsafe { vm_supervisor_start() }
 }
 
 fn exchange() -> *mut Exchange { &raw mut VM_EXCHANGE }
 fn handoff() {
+    let status = crate::memory::supply_status();
+    unsafe {
+        (*exchange()).supply_returned = status.returned as u64;
+    }
     // A user OUT on this port stays denied in the TSS. Only this CPL0
     // instruction denotes a completed arch call or a returned kernel event.
     // Unlike ordinary port I/O, the host reads and replaces the mailbox while
@@ -44,6 +52,10 @@ pub(crate) fn requests(frame: &mut Regs) {
     loop {
         handoff();
         let message = unsafe { &mut *exchange() };
+        if message.tables_changed != 0 {
+            paging2::flush_tlb();
+            message.tables_changed = 0;
+        }
         message.result = [0; 3];
         if message.operation == op::EXECUTE {
             *frame = message.regs;
@@ -76,7 +88,6 @@ fn batch(message: &mut Exchange, result: Result<(), MappingFailure>) {
 fn operation(message: &mut Exchange) {
     let a = message.args;
     let count = usize::try_from(a[1]).unwrap();
-    let mut machine = crate::Metal;
     match message.operation {
         op::CONFIGURE => {
             let region_count = a[0] as usize;
@@ -151,16 +162,6 @@ fn operation(message: &mut Exchange) {
             }
         }
         op::CLEAN => call(arch_call::CLEAN, &mut ()),
-        op::COPY_FROM | op::COPY_TO => {
-            let _reserve = (a[2] == 0).then(crate::memory::FaultGuard::enter);
-            message.result[0] = (crate::high_paging::request(&crate::high_paging::Request {
-                address: a[0], length: a[1], to_user: message.operation == op::COPY_TO,
-                buffer: message.data.as_mut_ptr() as usize, result: 0,
-            }) == 0) as u64;
-        }
-        op::COPY_CSTR => message.result[0] = machine.copy_cstr(a[0], &mut message.data[..count]) as u64,
-        op::ZERO => machine.zero(a[0], count),
-        op::COPY_WITHIN => machine.copy_within(a[0], a[2], count),
         op::LOAD_LDT => {
             assert!(count <= 8192);
             unsafe { core::ptr::copy_nonoverlapping(message.data.as_ptr(), (&raw mut LDT).cast::<u8>(), count * 8); }
@@ -187,11 +188,6 @@ fn operation(message: &mut Exchange) {
         }
         op::FPU_ST0 => message.data[..10].copy_from_slice(&crate::x86::fpu_st0()),
         op::FPU_POP => crate::x86::fpu_pop(),
-        op::TRANSLATE => {
-            let _ = machine.read::<u8>(a[0]);
-            if a[2] != 0 { let byte = machine.read::<u8>(a[0]); machine.write(a[0], byte); }
-            message.result[0] = paging2::physical_page(a[0] as usize);
-        }
         _ => panic!("unknown VM arch call {}", message.operation),
     }
 }

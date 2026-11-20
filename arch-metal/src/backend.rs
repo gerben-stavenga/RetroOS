@@ -164,7 +164,7 @@ impl Arch for Metal {
     }
 
     #[allow(clippy::deref_addrof)]
-    fn execute(&mut self, regs: &mut Regs, io: &arch_abi::IoPolicy, max_time: core::time::Duration) -> KernelEvent {
+    fn execute(&mut self, regs: &mut Regs, io: &arch_abi::IoPolicy, max_time: core::time::Duration) -> (KernelEvent, arch_abi::page_supply::SupplyStatus) {
         super::descriptors::install_io_policy(io);
         super::exec_profile::time(ExecutionProfileStage::PolicyInstall);
         // The ring transitions exchange their physical frames directly with
@@ -177,7 +177,7 @@ impl Arch for Metal {
         super::exec_profile::time(ExecutionProfileStage::BridgeOut);
         let ev = KernelEvent::decode(event, extra);
         super::exec_profile::time(ExecutionProfileStage::Decode);
-        ev
+        (ev, super::memory::supply_status())
     }
 
     fn now(&self) -> u64 { super::irq::now(false) }

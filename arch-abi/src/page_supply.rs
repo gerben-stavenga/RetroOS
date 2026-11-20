@@ -5,6 +5,14 @@ use core::sync::atomic::{AtomicU8, Ordering};
 pub const FAULT_PAGES: usize = 5; // data + up to four x86 page-table levels
 pub const SUPPLY_CAPACITY: usize = 64;
 
+/// Owner-core reserve status on return from execution. Retired pages remain
+/// owned by arch until transferred through `Memory::supply_pages`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SupplyStatus {
+    pub needed: usize,
+    pub returned: usize,
+}
+
 #[derive(Clone, Copy)]
 pub struct FrameRegion { pub first: u64, pub end: u64, pub offset: usize }
 
@@ -72,11 +80,32 @@ impl FrameOwnership {
 
 }
 
+/// Fixed-width donated-page stack shared by the hosted arch and its supervisor.
+/// Access is exclusive to the owning CPU while it is stopped in the host.
+#[repr(C, align(8))]
+pub struct PageReserve {
+    pages: [u64; SUPPLY_CAPACITY],
+    count: u64,
+}
+impl PageReserve {
+    pub const fn new() -> Self { Self { pages: [0; SUPPLY_CAPACITY], count: 0 } }
+    pub fn len(&self) -> usize { self.count as usize }
+    pub fn take(&mut self) -> Option<u64> {
+        if self.count == 0 { return None; }
+        self.count -= 1;
+        Some(self.pages[self.count as usize])
+    }
+    pub fn donate(&mut self, page: u64) {
+        assert!(page != 0 && self.len() < SUPPLY_CAPACITY, "invalid frame donation");
+        self.pages[self.count as usize] = page;
+        self.count += 1;
+    }
+}
+
 /// Owner-core-only exchange state. Kernel supplies owned pages; arch consumes
 /// them without allocating. Retired pages remain owned until returned to kernel.
 pub struct PageSupply {
-    pub pages: [u64; SUPPLY_CAPACITY],
-    pub count: usize,
+    pub reserve: PageReserve,
     pub returned_head: u64,
     pub returned_count: usize,
     pub fault_depth: usize,
@@ -86,20 +115,15 @@ pub struct PageSupply {
     pub ownership: FrameOwnership,
 }
 impl PageSupply {
-    pub const fn new() -> Self { Self { pages: [0; SUPPLY_CAPACITY], count: 0,
+    pub fn status(&self) -> SupplyStatus {
+        SupplyStatus { needed: SUPPLY_CAPACITY - self.reserve.len(), returned: self.returned_count }
+    }
+    pub const fn new() -> Self { Self { reserve: PageReserve::new(),
         returned_head: 0, returned_count: 0,
         fault_depth: 0, fault_pages_used: 0, fault_pages_current: 0,
         fault_pages_peak: 0, ownership: FrameOwnership::EMPTY } }
-    pub fn take(&mut self) -> Option<u64> {
-        if self.count == 0 { return None; }
-        self.count -= 1;
-        Some(self.pages[self.count])
-    }
-    pub fn donate(&mut self, page: u64) {
-        assert!(page != 0 && self.count < SUPPLY_CAPACITY, "invalid frame donation");
-        self.pages[self.count] = page;
-        self.count += 1;
-    }
+    pub fn take(&mut self) -> Option<u64> { self.reserve.take() }
+    pub fn donate(&mut self, page: u64) { self.reserve.donate(page); }
 }
 impl Default for PageSupply { fn default() -> Self { Self::new() } }
 

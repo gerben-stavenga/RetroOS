@@ -134,8 +134,8 @@ fn run_linux<A: Arch>(machine: &mut A, loan: &mut Loan<A>, slot: &Slot<A>) -> Ke
     loop {
         if slot.cancel.load(Ordering::Acquire) { return KernelEvent::Irq; }
         super::platform::refresh_kernel_mappings();
-        super::memory::service(machine);
-        let event = machine.execute(&mut loan.regs, &arch_abi::IoPolicy::deny_all(), core::time::Duration::from_nanos(loan.deadline.saturating_sub(machine.now())));
+        let (event, supply) = machine.execute(&mut loan.regs, &arch_abi::IoPolicy::deny_all(), core::time::Duration::from_nanos(loan.deadline.saturating_sub(machine.now())));
+        super::memory::replenish(machine, supply);
         if !matches!(event, KernelEvent::Syscall | KernelEvent::SoftInt(0x80) | KernelEvent::Irq) {
             return event;
         }

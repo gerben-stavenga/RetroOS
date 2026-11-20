@@ -7,6 +7,11 @@ static mut SUPPLY: PageSupply = PageSupply::new();
 static mut INPUT: PageInput = PageInput::new();
 
 fn supply() -> *mut PageSupply { &raw mut SUPPLY }
+pub(crate) fn supply_status() -> arch_abi::page_supply::SupplyStatus {
+    unsafe { (*supply()).status() }
+}
+#[cfg(feature = "kvm")]
+pub(crate) fn reserve_address() -> usize { unsafe { &raw mut (*supply()).reserve as usize } }
 /// Kernel supplies resident ownership metadata, never executable callbacks.
 pub fn configure(ownership: FrameOwnership) {
     unsafe { (*supply()).ownership = ownership; }
@@ -29,7 +34,7 @@ pub(crate) fn with_input<R>(pages: PageInput, operation: impl FnOnce() -> R) -> 
 pub fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
     let state = unsafe { &mut *supply() };
     assert!(state.fault_depth == 0);
-    while state.count < state.pages.len() {
+    while state.reserve.len() < arch_abi::page_supply::SUPPLY_CAPACITY {
         let Some(page) = pages.take() else { break; };
         state.donate(page);
     }
@@ -48,11 +53,11 @@ pub fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
         state.returned_count -= 1;
         pages.push(page);
     }
-    (state.pages.len() - state.count, pages)
+    (arch_abi::page_supply::SUPPLY_CAPACITY - state.reserve.len(), pages)
 }
 pub fn fault_pages_used() -> usize { unsafe { (*supply()).fault_pages_used } }
 pub fn can_fault() -> bool {
-    unsafe { (*supply()).fault_depth != 0 || (*supply()).count >= FAULT_PAGES }
+    unsafe { (*supply()).fault_depth != 0 || (*supply()).reserve.len() >= FAULT_PAGES }
 }
 pub struct FaultGuard;
 impl FaultGuard {
@@ -79,7 +84,7 @@ impl Drop for FaultGuard {
 /// Whether this operation's explicit input or guest fault reserve has backing.
 pub(crate) fn page_available() -> bool {
     unsafe {
-        if (*supply()).fault_depth != 0 { (*supply()).count != 0 }
+        if (*supply()).fault_depth != 0 { (*supply()).reserve.len() != 0 }
         else { (*(&raw const INPUT)).count != 0 }
     }
 }
@@ -105,7 +110,7 @@ pub fn release_page(page: u64) {
     if !unsafe { (*supply()).ownership.release_shared(page) } { return; }
     unsafe {
         let state = &mut *supply();
-        if state.count < state.pages.len() { state.donate(page); return; }
+        if state.reserve.len() < arch_abi::page_supply::SUPPLY_CAPACITY { state.donate(page); return; }
         // The last reference becomes a returned-page list link. Preserve the
         // temporary window even when a COW operation already owns its mapping.
         let saved = paging2::temp_swap(page);

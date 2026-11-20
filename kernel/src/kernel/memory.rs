@@ -1,7 +1,7 @@
 //! Kernel-owned physical pages supplied to arch as owned batches.
 use crate::Arch;
 use super::phys_mm;
-use arch_abi::page_supply::{PageInput, SUPPLY_CAPACITY, FAULT_PAGES};
+use arch_abi::page_supply::{PageInput, SupplyStatus, SUPPLY_CAPACITY, FAULT_PAGES};
 #[thread_local]
 static mut SPARES: PageInput = PageInput::new();
 
@@ -21,6 +21,19 @@ fn collect<A: arch_abi::Memory>(machine: &A) -> usize {
 
 pub fn service<A: arch_abi::Memory>(machine: &A) {
     let needed = collect(machine);
+    replenish(machine, SupplyStatus { needed, returned: 0 });
+}
+
+/// Execution already reports the reserve; only enter arch to transfer pages.
+pub fn replenish<A: arch_abi::Memory>(machine: &A, status: SupplyStatus) {
+    let SupplyStatus { mut needed, mut returned } = status;
+    while returned != 0 {
+        let (remaining, pages) = machine.supply_pages(PageInput::new());
+        assert!(pages.count != 0 && pages.count <= returned, "invalid retired-page count");
+        returned -= pages.count;
+        needed = remaining;
+        release(pages);
+    }
     if needed == 0 { return; }
     let pages = phys_mm::page_batch(needed);
     assert!(SUPPLY_CAPACITY - needed + pages.count >= FAULT_PAGES,

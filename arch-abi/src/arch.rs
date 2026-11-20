@@ -3,7 +3,7 @@
 //! Arch owns execution and lifecycle. X86, Memory and Diagnostics
 //! group its supporting capabilities.
 
-use crate::page_supply::PageInput;
+use crate::page_supply::{PageInput, SupplyStatus};
 use crate::{Regs, KernelEvent, ExecutionProfile, ExecutionProfileStage};
 use crate::page_entry::PageEntry;
 use crate::mapping::{MappingError, MappingFailure, UserPage};
@@ -13,9 +13,10 @@ use crate::mapping::{MappingError, MappingFailure, UserPage};
 pub trait Arch: Sized + X86 + Memory + Diagnostics + 'static {
     /// Run the active space with `regs` until an interruption (IRQ, syscall,
     /// exception, or monitored instruction), and return that event with the
-    /// post-run registers. The time limit bounds this call only; zero returns
+    /// post-run registers and page-supply status. Replenish the reserve from
+    /// this status before executing again. The time limit bounds this call only; zero returns
     /// `Irq` without executing instructions. IRQ data belongs to device drivers.
-    fn execute(&mut self, regs: &mut Regs, io: &crate::IoPolicy, max_time: core::time::Duration) -> KernelEvent;
+    fn execute(&mut self, regs: &mut Regs, io: &crate::IoPolicy, max_time: core::time::Duration) -> (KernelEvent, SupplyStatus);
 
     /// Halt this core until an interruption or max_time elapses. Zero returns
     /// immediately. Device data remains with its owner; this returns `Irq`.

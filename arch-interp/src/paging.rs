@@ -747,7 +747,8 @@ mod space_ops {
         let mut exhausted = false;
         let mut finished = false;
         for _ in 0..1000 {
-            let event = machine.execute(&mut regs, &arch_abi::IoPolicy::default(), std::time::Duration::from_millis(10));
+            let (event, supply) = machine.execute(&mut regs, &arch_abi::IoPolicy::default(), std::time::Duration::from_millis(10));
+            assert_eq!(supply, phys::supply_status());
             match event {
                 KernelEvent::Irq => {
                     if !phys::can_fault() {

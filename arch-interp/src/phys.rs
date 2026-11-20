@@ -160,6 +160,12 @@ thread_local! {
 #[cfg(feature = "tcg")]
 fn supply() -> *mut PageSupply { SUPPLY.with(|s| s.get()) }
 #[cfg(feature = "tcg")]
+pub(crate) fn supply_status() -> arch_abi::page_supply::SupplyStatus {
+    unsafe { (*supply()).status() }
+}
+#[cfg(feature = "kvm")]
+pub(crate) use crate::kvm::supply_status;
+#[cfg(feature = "tcg")]
 pub(crate) fn with_input<R>(pages: PageInput, operation: impl FnOnce() -> R) -> (R, PageInput) {
     struct Restore(PageInput);
     impl Drop for Restore {
@@ -184,7 +190,7 @@ pub(crate) fn configure(ownership: arch_abi::page_supply::FrameOwnership) { OWNE
 #[cfg(feature = "tcg")]
 pub(crate) fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
     let state = unsafe { &mut *supply() };
-    while state.count < state.pages.len() {
+    while state.reserve.len() < arch_abi::page_supply::SUPPLY_CAPACITY {
         let Some(page) = pages.take() else { break; };
         state.donate(page);
     }
@@ -194,10 +200,10 @@ pub(crate) fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
         state.returned_count -= 1;
         pages.push(page);
     }
-    (state.pages.len() - state.count, pages)
+    (arch_abi::page_supply::SUPPLY_CAPACITY - state.reserve.len(), pages)
 }
 #[cfg(feature = "tcg")]
-pub(crate) fn can_fault() -> bool { unsafe { (*supply()).count >= FAULT_PAGES } }
+pub(crate) fn can_fault() -> bool { unsafe { (*supply()).reserve.len() >= FAULT_PAGES } }
 #[cfg(feature = "tcg")]
 pub(crate) fn take_input() -> Option<u64> {
     INPUT.with(|p| p.borrow_mut().take()).map(zero)
@@ -229,7 +235,7 @@ pub(crate) fn release(page: u64) {
     unsafe {
         let state = &mut *supply();
         if !state.ownership.release_shared(page) { return; }
-        if state.count < state.pages.len() { state.donate(page); }
+        if state.reserve.len() < arch_abi::page_supply::SUPPLY_CAPACITY { state.donate(page); }
         else {
             frame_ptr(page).cast::<u64>().write(state.returned_head);
             state.returned_head = page;

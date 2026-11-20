@@ -262,12 +262,23 @@ fn kvm_engine_proofs() {
     mem.copy_to(code as u64, &prog, crate::test_memory::input(5));
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
-    set_regs(r);
-    match run_to_event() {
-        KernelEvent::SoftInt(0x80) => {}
-        ev => panic!("PM int 0x80: expected SoftInt(0x80), got {ev:?}"),
+    crate::mmu_tests::executable(code as u64);
+    crate::phys::refill_test_reserve();
+    let io = arch_abi::IoPolicy::deny_all();
+    let (_, before) = mem.execute(&mut r, &io, core::time::Duration::ZERO);
+    assert_eq!(before.needed, 0);
+    let mut finished = false;
+    for _ in 0..1000 {
+        let (event, supply) = mem.execute(&mut r, &io, core::time::Duration::from_millis(100));
+        assert_eq!(supply.needed, mem.supply_pages(PageInput::new()).0);
+        if matches!(event, KernelEvent::Irq) { continue; }
+        assert!(matches!(event, KernelEvent::SoftInt(0x80)), "PM int 0x80: {event:?}");
+        assert!(supply.needed > 0, "guest demand fault must consume reserve pages");
+        finished = true;
+        break;
     }
-    let r = regs();
+    assert!(finished);
+    set_regs(r);
     assert_eq!(r.code_seg(), USER_CS, "still flat user CS");
     assert_eq!(r.frame.ss as u16, USER_DS, "still flat user SS");
     assert_eq!(
@@ -450,13 +461,16 @@ fn kvm_engine_proofs() {
     assert_eq!(regs().r15, tls.r15);
     assert_eq!((regs().fs, regs().gs), (fs_base, gs_base));
 
-    // Full-width paging is performed inside arch, including kernel copies,
-    // execution above 512 GiB, and COW after a fork.
+    // Host copies and supervisor execution share the same full-width tables,
+    // including mappings above 512 GiB and COW after a fork.
     let high = (1u64 << 39) + 0x1234_0000;
     let zero = arch_abi::mapping::read_mapping(&mut mem, UserPage::new(0x7000_0000).unwrap()).unwrap();
     unsafe { mem.fill_mappings(UserPage::new(high).unwrap(), 2, zero, test_memory::input(8)).0.unwrap(); }
+    let before = run::vm_entries();
     mem.copy_to(high, &[0x48, 0xff, 0x07, 0x48, 0x8b, 0x07, 0x0f, 0x05], crate::test_memory::input(5)); // inc [rdi]; mov rax,[rdi]; syscall
     mem.write::<u64>(high + 4096, 41);
+    assert_eq!(mem.read::<u64>(high + 4096), 41);
+    assert_eq!(run::vm_entries(), before, "high-address copies must stay on the host");
     let mut child = RootPageTable::empty();
     mem.user_fork(&mut child, test_memory::input(8));
     let parent = mem.activate(child);
@@ -784,4 +798,59 @@ fn espfix_resume(r: Regs, offset: u64, long: bool) {
         // guest setup is unnecessary: its code and slot are resident arch data.
         unsafe { (*(&raw mut crate::vcpu::REGS)).regs = interrupted; }
     });
+}
+
+#[test]
+fn host_byte_access_never_enters_the_vm() {
+    use arch_abi::page_entry::PageEntry;
+    crate::phys::init_test_ram();
+    let mut mem = crate::Interp;
+    let address = 0x0450_0ffe;
+    let mut expected: Vec<u8> = (0..9000).map(|i| (i % 251) as u8).collect();
+    let before = run::vm_entries();
+    let reserve = supply_status();
+    assert_eq!(mem.copy_to(address, &expected, test_memory::input(8)).0, Some(()));
+    assert_eq!(supply_status(), reserve, "explicit backing must not consume the fault reserve");
+    mem.copy_within(address + 7, address + 101, 8300);
+    expected.copy_within(7..8307, 101);
+    mem.copy_within(address + 77, address + 3, 8450);
+    expected.copy_within(77..8527, 3);
+    mem.zero(address + 4093, 8);
+    expected[4093..4101].fill(0);
+    mem.write::<u32>(address + 8190, u32::from_le_bytes(*b"abc\0"));
+    expected[8190..8194].copy_from_slice(b"abc\0");
+    assert_eq!(mem.read::<u32>(address + 8190), u32::from_le_bytes(*b"abc\0"));
+    let mut string = [0; 16];
+    assert_eq!(mem.copy_cstr(address + 8190, &mut string), 3);
+    assert_eq!(&string[..3], b"abc");
+    let mut actual = vec![0; expected.len()];
+    assert_eq!(mem.copy_from(address, &mut actual, PageInput::new()).0, Some(()));
+    assert_eq!(actual, expected);
+    assert_eq!(run::vm_entries(), before, "byte access must not resume the supervisor");
+
+    let mut child = RootPageTable::empty();
+    mem.user_fork(&mut child, test_memory::input(8));
+    let parent = mem.activate(child);
+    let before = run::vm_entries();
+    assert_eq!(mem.copy_to(address, &[222], test_memory::input(5)).0, Some(()));
+    assert_eq!(mem.read::<u8>(address), 222);
+    assert_eq!(run::vm_entries(), before, "COW must resolve on the host too");
+    let mut child = mem.activate(parent);
+    assert_eq!(mem.read::<u8>(address), expected[0]);
+    mem.destroy_space(&mut child);
+
+    let page = UserPage::new(address & !4095).unwrap();
+    let mapping = match arch_abi::mapping::read_mapping(&mut mem, page).unwrap() {
+        PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => m,
+        other => panic!("expected RAM: {other:?}"),
+    };
+    for entry in [PageEntry::ReadOnly(mapping), PageEntry::NoAccess(mapping), PageEntry::Intercepted, PageEntry::Absent] {
+        unsafe { arch_abi::mapping::replace_mapping(&mut mem, page, entry, test_memory::input(5)).0.unwrap(); }
+        let before = run::vm_entries();
+        assert_eq!(mem.copy_to(address, &[1], test_memory::input(5)).0, None);
+        let mut byte = [0];
+        assert_eq!(mem.copy_from(address, &mut byte, PageInput::new()).0,
+            matches!(entry, PageEntry::ReadOnly(_)).then_some(()));
+        assert_eq!(run::vm_entries(), before, "protection checks must stay on the host");
+    }
 }

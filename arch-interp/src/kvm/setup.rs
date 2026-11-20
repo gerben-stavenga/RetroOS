@@ -13,6 +13,18 @@ pub(super) struct KvmCpu {
     pub image: *mut u8,
     pub message: *mut Exchange,
 }
+impl KvmCpu {
+    pub(super) fn frame(&self, page: u64) -> *mut u8 {
+        let address = usize::try_from(page.checked_mul(4096).expect("physical address overflow")).unwrap();
+        if address < vm::IMAGE_LIMIT { unsafe { self.image.add(address) } }
+        else { crate::phys::frame_ptr(page) }
+    }
+    pub(super) fn reserve(&mut self) -> &mut arch_abi::page_supply::PageReserve {
+        let address = unsafe { (*self.message).reserve_address as usize };
+        assert!(address % 8 == 0 && address + core::mem::size_of::<arch_abi::page_supply::PageReserve>() <= vm::IMAGE_LIMIT);
+        unsafe { &mut *self.image.add(address).cast() }
+    }
+}
 thread_local! { static KVM: RefCell<Option<KvmCpu>> = const { RefCell::new(None) }; }
 // All VM CPUs share donated RAM and reference counts. Serialize supervisor
 // transitions, including fault handling, just as the metal paging lock does.

@@ -691,6 +691,16 @@ pub(crate) fn init_secondary() {
     }
 }
 
+#[cfg(feature = "kvm")]
+pub(crate) fn user_memory() -> arch_abi::vm::UserMemory {
+    assert!(is_pae(), "KVM supervisor requires PAE");
+    arch_abi::vm::UserMemory {
+        low_root: physical_page((&raw const ROOT) as usize),
+        high_root: physical_page((&raw const PML4) as usize),
+        zero_page: physical_page((&raw const crate::ZERO_PAGE) as usize),
+    }
+}
+
 /// Get the root CR3 value (constant PD/PML4 phys).
 /// For legacy: PD phys. For PAE: HW_PDPT phys. For compat: PML4 phys.
 #[allow(dead_code)]

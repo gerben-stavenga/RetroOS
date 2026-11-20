@@ -1769,9 +1769,10 @@ fn run_bios<A: Arch>(
     io: &arch_abi::IoPolicy,
     returned: impl Fn(&Regs, &crate::KernelEvent) -> bool,
 ) -> Result<(), BiosError> {
+    crate::kernel::memory::service(machine);
     loop {
-        crate::kernel::memory::service(machine);
-        let event = machine.execute(regs, io, core::time::Duration::from_millis(10));
+        let (event, supply) = machine.execute(regs, io, core::time::Duration::from_millis(10));
+        crate::kernel::memory::replenish(machine, supply);
         if returned(regs, &event) {
             return Ok(());
         }

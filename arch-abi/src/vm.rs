@@ -31,10 +31,6 @@ pub mod op {
     pub const FORK: u64 = 10;
     pub const CLEAN: u64 = 11;
     pub const DESTROY: u64 = 12;
-    pub const COPY_FROM: u64 = 13;
-    pub const COPY_TO: u64 = 14;
-    pub const ZERO: u64 = 15;
-    pub const COPY_WITHIN: u64 = 16;
     pub const LOAD_LDT: u64 = 17;
     pub const TLS: u64 = 18;
     pub const SEGMENT: u64 = 19;
@@ -42,9 +38,21 @@ pub mod op {
     pub const FX_SWITCH: u64 = 21;
     pub const FPU_ST0: u64 = 22;
     pub const FPU_POP: u64 = 23;
-    pub const TRANSLATE: u64 = 24;
     pub const DEBUG_WATCH: u64 = 26;
-    pub const COPY_CSTR: u64 = 27;
+}
+
+/// Physical roots of the active user space. Frame numbers, never host pointers.
+/// KVM uses a low PAE tree and a high x86-64 tree, both with 64-bit entries.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct UserMemory {
+    pub low_root: u64,
+    pub high_root: u64,
+    pub zero_page: u64,
+}
+impl UserMemory {
+    pub const EMPTY: Self = Self { low_root: 0, high_root: 0, zero_page: 0 };
+
 }
 
 #[repr(C, align(16))]
@@ -52,6 +60,10 @@ pub struct Exchange {
     pub operation: u64,
     pub args: [u64; 6],
     pub result: [u64; 3],
+    pub supply_returned: u64,
+    pub memory: UserMemory,
+    pub reserve_address: u64,
+    pub tables_changed: u64,
     pub regs: Regs,
     pub pages: [u64; SUPPLY_CAPACITY],
     pub page_count: u64,
@@ -61,7 +73,7 @@ pub struct Exchange {
 }
 impl Exchange {
     pub const fn new() -> Self {
-        Self { operation: 0, args: [0; 6], result: [0; 3], regs: Regs::empty(),
+        Self { operation: 0, args: [0; 6], result: [0; 3], supply_returned: 0, memory: UserMemory::EMPTY, reserve_address: 0, tables_changed: 0, regs: Regs::empty(),
             pages: [0; SUPPLY_CAPACITY], page_count: 0, root: [0; 768],
             entries: [PageEntry::Absent; MAPPINGS], data: [0; DATA_SIZE] }
     }

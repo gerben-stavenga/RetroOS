@@ -10,6 +10,39 @@ use arch_abi::page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFram
 const HI: usize = 0x4000_0000; // sparse high VA (a flat reservation would never fit)
 
 #[test]
+fn execute_reports_supply_without_running_and_after_retiring_pages() {
+    use arch_abi::{Arch as _, GuestBytes as _, KernelEvent, Regs};
+    use arch_abi::page_supply::{PageInput, SUPPLY_CAPACITY};
+    init();
+    let mut machine = arch::Interp;
+    let mut regs = Regs::empty();
+    regs.set_ip32(0x1234);
+    let io = arch_abi::IoPolicy::deny_all();
+    let (_, before) = machine.execute(&mut regs, &io, core::time::Duration::ZERO);
+    assert_eq!(before.needed, machine.supply_pages(PageInput::new()).0);
+    assert_eq!(before.returned, 0);
+    for index in 0..SUPPLY_CAPACITY * 3 {
+        assert_eq!(machine.copy_to(HI as u64 + (index * 4096) as u64, &[1], test_memory::input(5)).0, Some(()));
+    }
+    machine.free_user_pages();
+    let (event, supply) = machine.execute(&mut regs, &io, core::time::Duration::ZERO);
+    assert!(matches!(event, KernelEvent::Irq));
+    assert_eq!(regs.ip32(), 0x1234);
+    assert!(supply.returned > SUPPLY_CAPACITY, "retired frames must span multiple batches");
+    let mut returned = supply.returned;
+    while returned != 0 {
+        let (needed, mut pages) = machine.supply_pages(PageInput::new());
+        assert_eq!(needed, supply.needed);
+        assert_eq!(pages.count, returned.min(SUPPLY_CAPACITY));
+        returned -= pages.count;
+        while let Some(page) = pages.take() { test_memory::free_phys_page(page); }
+    }
+    let (_, after) = machine.execute(&mut regs, &io, core::time::Duration::ZERO);
+    assert_eq!(after.needed, supply.needed);
+    assert_eq!(after.returned, 0);
+}
+
+#[test]
 fn copies_use_explicit_backing_and_reject_inaccessible_memory() {
     use arch_abi::GuestBytes;
     init();

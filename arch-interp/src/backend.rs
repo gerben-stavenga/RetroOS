@@ -137,7 +137,7 @@ impl Memory for Interp {
 
 impl Arch for Interp {
     #[allow(clippy::deref_addrof)]
-    fn execute(&mut self, regs: &mut Regs, _io: &arch_abi::IoPolicy, max_time: core::time::Duration) -> KernelEvent {
+    fn execute(&mut self, regs: &mut Regs, _io: &arch_abi::IoPolicy, max_time: core::time::Duration) -> (KernelEvent, arch_abi::page_supply::SupplyStatus) {
         crate::suite_control::gate();
         // Bridge the loop-owned registers to the backend's live frame for the
         // run, then read them
@@ -146,7 +146,7 @@ impl Arch for Interp {
         core::mem::swap(&mut live.regs, regs);
         let ev = crate::engine::execute(max_time);
         core::mem::swap(&mut live.regs, regs);
-        ev
+        (ev, crate::phys::supply_status())
     }
 
     fn now(&self) -> u64 { crate::machine::now() }
@@ -187,7 +187,7 @@ pub(crate) fn check_virtual_irq_frame(machine: &mut Interp) {
         } else {
             machine.write::<u16>(0x7000, 0x202);
         }
-        let event = machine.execute(&mut pending, &io, limit);
+        let (event, _) = machine.execute(&mut pending, &io, limit);
         assert!(matches!(event, KernelEvent::Irq),
             "opcode {opcode:x} must return when VIP becomes deliverable: {event:?}, regs={pending:?}");
         assert_eq!(pending.ip32(), (CODE + 1) as u32);
@@ -196,12 +196,12 @@ pub(crate) fn check_virtual_irq_frame(machine: &mut Interp) {
         // A different context has no pending indication and must run normally.
         let mut other = pending;
         other.clear_flag32(eflags::VIP_FLAG);
-        assert!(matches!(machine.execute(&mut other, &io, limit), KernelEvent::SoftInt(0x31)));
+        assert!(matches!(machine.execute(&mut other, &io, limit).0, KernelEvent::SoftInt(0x31)));
         assert_eq!(pending.ip32(), (CODE + 1) as u32);
 
         // Pending alone must not interrupt execution while guest IF is off.
         pending.clear_flag32(eflags::VIF_FLAG);
-        assert!(matches!(machine.execute(&mut pending, &io, limit), KernelEvent::SoftInt(0x31)));
+        assert!(matches!(machine.execute(&mut pending, &io, limit).0, KernelEvent::SoftInt(0x31)));
         assert_ne!(pending.flags32() & eflags::VIP_FLAG, 0);
     }
 }

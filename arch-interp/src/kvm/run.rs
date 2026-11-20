@@ -6,8 +6,15 @@ use kvm_ioctls::VcpuExit;
 use std::os::fd::AsRawFd;
 use core::sync::atomic::Ordering;
 
+#[cfg(test)]
+thread_local! { static VM_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn vm_entries() -> u64 { VM_ENTRIES.with(|n| n.get()) }
+
 pub(super) fn until_return(cpu: &mut KvmCpu, executing: bool) {
     loop {
+        #[cfg(test)]
+        VM_ENTRIES.with(|n| n.set(n.get() + 1));
         match cpu.vcpu.run() {
             Ok(VcpuExit::IoOut(vm::EXIT_PORT, bytes)) => {
                 assert_eq!(bytes.len(), 4);

@@ -966,7 +966,7 @@ mod execution_tests {
             }
             regs.set_ip32(0x8000);
             regs.set_flags32(eflags::VIF_FLAG | 2 | carry);
-            assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
+            assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)).0, KernelEvent::SoftInt(0x31)));
             assert_eq!(regs.rax as u8, expected);
         }
     }
@@ -995,11 +995,11 @@ mod execution_tests {
         let io = arch_abi::IoPolicy::deny_all();
 
         regs.set_ip32(0x7c00);
-        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::ZERO), KernelEvent::Irq));
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::ZERO).0, KernelEvent::Irq));
         assert_eq!(regs.ip32(), 0x7c00, "zero budget must not retire instructions");
         crate::machine::post_irq(Irq::Key(0x2e));
         regs.set_ip32(0x7c00);
-        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)).0, KernelEvent::SoftInt(0x31)));
         let mut queued = 0;
         drain_input(&mut |event, _| {
             assert!(matches!(event, Irq::Key(0x2e)));
@@ -1008,9 +1008,9 @@ mod execution_tests {
         assert_eq!(queued, 1);
 
         regs.set_ip32(0x7e00);
-        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(1)), KernelEvent::Irq));
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(1)).0, KernelEvent::Irq));
         regs.set_ip32(0x7c00);
-        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)).0, KernelEvent::SoftInt(0x31)));
 
 
         let poster = std::thread::spawn(|| {
@@ -1018,10 +1018,10 @@ mod execution_tests {
             crate::machine::post_irq(Irq::Key(0xae));
         });
         regs.set_ip32(0x7e00);
-        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)), KernelEvent::Irq));
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)).0, KernelEvent::Irq));
         poster.join().unwrap();
         regs.set_ip32(0x7c00);
-        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
+        assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)).0, KernelEvent::SoftInt(0x31)));
         drain_input(&mut |event, _| assert!(matches!(event, Irq::Key(0xae))));
     }
 }
