@@ -7,11 +7,11 @@ use crate::Regs;
 /// registers in the low halves of their canonical `Regs` slots, then leaves a
 /// 28-byte expansion gap before the native dword interrupt/IRET tail. Rust
 /// widens only that tail for cross-privilege entries. Same-ring ring-0 entries
-/// return before widening and therefore never inspect the absent ESP/SS.
+/// return before widening: their ESP/SS slots do not describe saved registers.
 ///
 /// VM86 segs (es, ds, fs, gs) the CPU pushes above the IRET frame for VM86
 /// entries are *not* part of `Raw32` — they form the second component of the
-/// 32-bit `StackFrame` arm `Frame32`, valid only when EFLAGS.VM is
+/// 32-bit `StackFrame` arm `Frame32`, meaningful only when EFLAGS.VM is
 /// set on entry/exit.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -106,7 +106,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_entry_initializes_unsaved_slots_only_during_canonicalization() {
+    fn narrow_entry_normalizes_unsaved_slots_only_during_canonicalization() {
         // Model stack residue in every byte not written by 32-bit assembly.
         let mut frame = core::mem::MaybeUninit::<StackFrame>::uninit();
         unsafe {
@@ -161,7 +161,7 @@ mod tests {
 }
 
 /// 4 VM86 segment selectors the CPU pushes above the IRET frame on a VM86
-/// trap. Bytes are valid only when EFLAGS.VM is set on entry/exit; otherwise
+/// trap. Values describe registers only when EFLAGS.VM is set; otherwise
 /// kernel-stack residue.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -169,7 +169,7 @@ pub struct Vm86Segs {
     pub es: u32, pub ds: u32, pub fs: u32, pub gs: u32,
 }
 
-/// Explicit C layout: the optional VM86 words immediately follow Raw32.
+/// Explicit C layout: the reserved VM86 words immediately follow Raw32.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Frame32 {
@@ -179,12 +179,13 @@ pub struct Frame32 {
 
 /// Stack-side view of a saved interrupt frame. Two arms: `regs` is the
 /// canonical 64-bit form (216B); the 32-bit arm is `Frame32` — its
-/// 216-byte hybrid slot plus the optional VM86 seg tail. `isr_handler` picks
+/// 216-byte hybrid slot plus the reserved VM86 seg tail. `isr_handler` picks
 /// the live arm via `from_64`.
 ///
-/// Storage must cover the selected frame and the VM86 tail when present.
-/// Native stacks reserve space above their IRET frame; KVM uses its mapped
-/// supervisor stack. Same-ring 32-bit traps must bypass canonicalization.
+/// Assembly hands Rust an exclusive borrow of the entire initialized frame,
+/// including the reserved VM86 tail. Unsaved fields contain unspecified values;
+/// their storage exists even when the selected mode does not use them.
+/// Same-ring 32-bit traps must bypass canonicalization because ESP/SS are unsaved.
 #[repr(C)]
 pub union StackFrame {
     pub regs: Regs,
@@ -206,24 +207,23 @@ impl StackFrame {
     /// Canonicalize a cross-privilege frame without moving its register prefix.
     ///
     /// # Safety
-    /// `wide` selects the live assembly layout. A 32-bit frame must include
-    /// SS:ESP; a VM86 frame must also include the four segment words.
+    /// `wide` must select the saved assembly layout. A 32-bit frame must be a
+    /// cross-privilege entry, with saved SS:ESP and VM86 segments if VM is set.
     pub unsafe fn canonicalize(&mut self, wide: bool) -> &mut Regs {
         if !wide {
-            // Assembly (and the pre-canonicalization hook) only stores live
-            // dwords. Initialize the rest here, after the hook has declined.
-            let prefix = self as *mut Self as *mut u32;
-            for slot in 0..20 {
-                unsafe { prefix.add(slot * 2 + 1).write(0); }
-                if slot < 4 {
-                    // Only the selector's low 16 bits are meaningful.
-                    let word = unsafe { prefix.add(slot * 2) };
-                    unsafe { word.write(u32::from(word.cast::<u16>().read())); }
-                } else if (4..12).contains(&slot) || slot == 15 {
-                    unsafe { prefix.add(slot * 2).write(0); }
-                }
+            // Normalize unsaved values after the hook has declined.
+            let raw = unsafe { &mut self.raw32.raw };
+            for selector in [&mut raw.gs, &mut raw.fs, &mut raw.es, &mut raw.ds] {
+                *selector &= 0xffff;
             }
-            let raw = unsafe { &self.raw32.raw };
+            for reg in [&mut raw.r15, &mut raw.r14, &mut raw.r13, &mut raw.r12,
+                &mut raw.r11, &mut raw.r10, &mut raw.r9, &mut raw.r8, &mut raw.esp_dummy] {
+                *reg = 0;
+            }
+            for reg in [&mut raw.edi, &mut raw.esi, &mut raw.ebp, &mut raw.ebx,
+                &mut raw.edx, &mut raw.ecx, &mut raw.eax] {
+                *reg &= 0xffff_ffff;
+            }
             let (vector, error, ip, cs, flags, sp, ss) =
                 (raw.int_num, raw.err_code, raw.eip, raw.cs, raw.eflags, raw.esp, raw.ss);
             let vm = if flags & (1 << 17) != 0 { Some(unsafe { self.raw32.vm86 }) } else { None };
@@ -246,8 +246,7 @@ impl StackFrame {
     /// Convert canonical registers to the layout consumed by the IRET path.
     ///
     /// # Safety
-    /// The canonical arm must be initialized. Storage must include the VM86
-    /// tail if the destination flags request VM86.
+    /// The frame must contain canonical register values in the `regs` arm.
     pub unsafe fn decanonicalize(&mut self, wide: bool) {
         if wide { return; }
         let regs = unsafe { self.regs };

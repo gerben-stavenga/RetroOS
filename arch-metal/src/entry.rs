@@ -40,15 +40,20 @@ fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
 /// the kernel run on it, then denormalize back if exiting to 32-bit user.
 ///
 /// Returns true if the kernel wants to iret to long mode (the 64-bit exit path).
+///
+/// # Safety
+/// Assembly supplies exclusive, initialized storage for the entire `StackFrame`,
+/// including the reserved VM86 tail. Unsaved fields contain unspecified values.
+/// `from_64` selects the saved layout; core TLS and flat segments are installed.
 #[unsafe(no_mangle)]
 #[allow(private_interfaces)]
-pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
+pub unsafe extern "C" fn isr_handler(stack: &mut StackFrame, from_64: bool) -> bool {
     paging2::refresh_kernel_mappings();
     // Hooks handle application traps only. Supervisor faults always retain
     // the normal fatal-fault path. Assembly has already established core TLS.
     let user = unsafe {
-        if from_64 { (*stack).regs.frame.cs & 3 == 3 }
-        else { (*stack).raw32.raw.cs & 3 == 3 || (*stack).raw32.raw.eflags & (1 << 17) != 0 }
+        if from_64 { stack.regs.frame.cs & 3 == 3 }
+        else { stack.raw32.raw.cs & 3 == 3 || stack.raw32.raw.eflags & (1 << 17) != 0 }
     };
     if user {
         if let Some(hook) = unsafe { ENTRY_HOOK } {
@@ -73,60 +78,64 @@ unsafe extern "C" {
 }
 
 // Work on the native tail so handled hooks need not canonicalize registers.
-unsafe fn return_words(stack: *mut StackFrame, wide: bool) -> (*mut u32, usize) {
-    if wide {
-        (unsafe { &raw mut (*stack).regs.frame.rip }.cast(), 2)
+unsafe fn prepare_espfix(stack: &mut StackFrame, long_mode: bool) {
+    if long_mode {
+        let frame = unsafe { &mut stack.regs.frame };
+        if frame.cs & 3 == 0 || frame.cs as u16 == arch_abi::USER_CS64 { return; }
+        if frame.ss as u16 == descriptors::ESPFIX_SS {
+            // Resume the existing slot by repeating POP ESP.
+            frame.rip = espfix_return as *const () as u64;
+            frame.rsp = u64::from(crate::smp::current_core_id() * 24);
+            return;
+        }
+        if frame.cs & 3 != 3 || frame.ss as u16 == arch_abi::USER_DS { return; }
+        let descriptor = descriptors::read_descriptor(frame.ss as u16);
+        if descriptor == 0 || descriptor & (1 << 54) != 0 { return; }
+        if descriptors::read_descriptor(frame.cs as u16) & (1 << 53) != 0 { return; }
+        let core = crate::smp::current_core_id() as usize;
+        let offset = (core * 24) as u32;
+        // This core exclusively owns its slot.
+        unsafe { (&raw mut ESPFIX).cast::<[u32; 6]>().add(core).write([
+            (frame.rsp as u32 & 0xffff0000) | (offset + 4),
+            frame.rip as u32, frame.cs as u32, frame.rflags as u32,
+            frame.rsp as u32, frame.ss as u32,
+        ]); }
+        frame.rip = espfix_return as *const () as u64;
+        frame.cs = u64::from(descriptors::RING1_CS);
+        frame.rflags &= !((1 << 17) | (1 << 14) | (1 << 9) | (1 << 8));
+        frame.rsp = u64::from(offset);
+        frame.ss = u64::from(descriptors::ESPFIX_SS);
     } else {
-        (unsafe { &raw mut (*stack).raw32.raw.eip }, 1)
-    }
-}
-unsafe fn write_return(words: *mut u32, stride: usize, frame: [u32; 5]) {
-    for (i, value) in frame.into_iter().enumerate() {
-        unsafe {
-            if stride == 2 { words.add(i * 2).cast::<u64>().write(u64::from(value)); }
-            else { words.add(i).write(value); }
+        let frame = unsafe { &mut stack.raw32.raw };
+        // Ring-0 entries do not save SS:ESP. VM86 restores the whole ESP.
+        if frame.eflags & (1 << 17) != 0 || frame.cs & 3 == 0 { return; }
+        if frame.ss as u16 == descriptors::ESPFIX_SS {
+            // Resume the existing slot by repeating POP ESP.
+            frame.eip = espfix_return as *const () as u32;
+            frame.esp = crate::smp::current_core_id() * 24;
+            return;
         }
-    }
-}
-
-unsafe fn prepare_espfix(stack: *mut StackFrame, wide: bool) {
-    let (words, stride) = unsafe { return_words(stack, wide) };
-    let cs = unsafe { words.add(stride).read() } as u16;
-    let flags = unsafe { words.add(2 * stride).read() };
-    // Same-ring entries have no SS:ESP. VM86 and 64-bit stacks restore ESP
-    // without the 16-bit-stack workaround. USER_DS is permanently B=1.
-    if flags & (1 << 17) != 0 || cs & 3 == 0 || cs == arch_abi::USER_CS64 { return; }
-    let ss = unsafe { words.add(4 * stride).read() } as u16;
-    if ss == descriptors::ESPFIX_SS {
-        // Returning to the continuation is itself a 16-bit-stack return.
-        // Restart POP ESP without overwriting the pending application frame.
-        unsafe {
-            words.write(espfix_return as *const () as u32);
-            words.add(3 * stride).write(crate::smp::current_core_id() * 24);
-        }
-        return;
-    }
-    if cs & 3 != 3 { return; }
-    if ss == arch_abi::USER_DS { return; }
-    let descriptor = descriptors::read_descriptor(ss);
-    if descriptor == 0 || descriptor & (1 << 54) != 0 { return; }
-    if wide && descriptors::read_descriptor(cs) & (1 << 53) != 0 { return; }
-    let core = crate::smp::current_core_id() as usize;
-    let offset = (core * 24) as u32;
-    let frame: [u32; 5] = core::array::from_fn(|i| unsafe { words.add(i * stride).read() });
-    let slot = unsafe { (&raw mut ESPFIX).cast::<[u32; 6]>().add(core) };
-    unsafe {
-        slot.write([(frame[3] & 0xffff0000) | (offset + 4),
-            frame[0], frame[1], frame[2], frame[3], frame[4]]);
-        write_return(words, stride, [espfix_return as *const () as u32,
-            u32::from(descriptors::RING1_CS), flags & !((1 << 17) | (1 << 14) | (1 << 9) | (1 << 8)),
-            offset, u32::from(descriptors::ESPFIX_SS)]);
+        if frame.cs & 3 != 3 || frame.ss as u16 == arch_abi::USER_DS { return; }
+        let descriptor = descriptors::read_descriptor(frame.ss as u16);
+        if descriptor == 0 || descriptor & (1 << 54) != 0 { return; }
+        let core = crate::smp::current_core_id() as usize;
+        let offset = (core * 24) as u32;
+        // This core exclusively owns its slot.
+        unsafe { (&raw mut ESPFIX).cast::<[u32; 6]>().add(core).write([
+            (frame.esp & 0xffff0000) | (offset + 4),
+            frame.eip, frame.cs, frame.eflags, frame.esp, frame.ss,
+        ]); }
+        frame.eip = espfix_return as *const () as u32;
+        frame.cs = u32::from(descriptors::RING1_CS);
+        frame.eflags &= !((1 << 17) | (1 << 14) | (1 << 9) | (1 << 8));
+        frame.esp = offset;
+        frame.ss = u32::from(descriptors::ESPFIX_SS);
     }
 }
 
 // Keep the full dispatch's stack frame off the direct-to-IRET path.
 #[inline(never)]
-fn dispatch(stack: *mut StackFrame, from_64: bool) -> bool {
+fn dispatch(stack: &mut StackFrame, from_64: bool) -> bool {
     #[thread_local]
     static mut VIF: bool = false;
     #[thread_local]
@@ -154,10 +163,10 @@ fn dispatch(stack: *mut StackFrame, from_64: bool) -> bool {
     // kernel or ring 3 user → arch ring 0) get full canonicalization.
     let (vm86, raw_cs, raw_int_num, raw_err_code, raw_eip) = if from_64 {
         // EFLAGS.VM is reserved in long mode -- 64-bit entry is never VM86.
-        let r = unsafe { &(*stack).regs };
+        let r = unsafe { &stack.regs };
         (false, r.frame.cs, r.int_num, r.err_code, r.frame.rip)
     } else {
-        let r = unsafe { &(*stack).raw32.raw };
+        let r = unsafe { &stack.raw32.raw };
         (r.eflags as u64 & VM_FLAG != 0, r.cs as u64, r.int_num as u64, r.err_code as u64, r.eip as u64)
     };
     // Mask int_num to 8 bits to undo sign-extension from `push imm8` for
@@ -185,7 +194,7 @@ fn dispatch(stack: *mut StackFrame, from_64: bool) -> bool {
         // SS/ESP, so Raw32's esp/ss slots and the bytes beyond line up
         // with it. Dump the words so the panic names the bad frame.
         if !from_64 && !(raw_int_num == 14 || (32..=47).contains(&raw_int_num)) {
-            let p = unsafe { core::ptr::addr_of!((*stack).raw32.raw.esp) };
+            let p = unsafe { core::ptr::addr_of!(stack.raw32.raw.esp) };
             lib::compact_println!("ring0 fault: words above the trap frame (iret-target frame):");
             for i in 0..10 {
                 lib::compact_println!("  [esp+{:2}] = {:#010x}", i * 4, unsafe { p.add(i).read_volatile() });
@@ -195,7 +204,7 @@ fn dispatch(stack: *mut StackFrame, from_64: bool) -> bool {
         return from_64;
     }
 
-    let regs = unsafe { (*stack).canonicalize(from_64) };
+    let regs = unsafe { stack.canonicalize(from_64) };
     let execute_entry = !from_ring3
         && raw_int_num == 0x80
         && regs.rax == arch_call::EXECUTE;
@@ -318,7 +327,7 @@ fn dispatch(stack: *mut StackFrame, from_64: bool) -> bool {
         regs.frame.rflags = (regs.frame.rflags & !(3 << 12)) | (1 << 12);
     }
 
-    unsafe { (*stack).decanonicalize(to_64); }
+    unsafe { stack.decanonicalize(to_64); }
     if from_ring3 {
         crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitFrameOut);
     } else if execute_entry {
@@ -330,9 +339,10 @@ fn dispatch(stack: *mut StackFrame, from_64: bool) -> bool {
 
 /// An installed hook sees the native frame before canonicalization. On true,
 /// entry restores it directly; on false, normal trap dispatch continues.
-/// Only the saved low halves are initialized in a 32-bit frame. A handler must
-/// preserve its layout and may update live state, including on partial progress.
-pub(crate) type EntryHook = unsafe extern "C" fn(*mut StackFrame, bool) -> bool;
+/// Only the saved low halves describe registers in a 32-bit frame; unsaved
+/// fields contain unspecified values. A handler must preserve the layout and
+/// may update live state, including on partial progress.
+pub(crate) type EntryHook = unsafe extern "C" fn(&mut StackFrame, bool) -> bool;
 
 #[thread_local]
 static mut ENTRY_HOOK: Option<EntryHook> = None;
@@ -354,48 +364,54 @@ pub(crate) struct InstructionState<'a> {
     pub error: u64,
 }
 
-/// Borrow only saved fields, leaving uninitialized halves and the expansion
-/// gap untouched. Edits directly update the native frame, even on a decline.
+/// Borrow only saved fields, leaving unsaved halves and the expansion gap
+/// untouched. Edits directly update the native frame, even on a decline.
 ///
 /// # Safety
-/// The frame must be a user entry in the selected layout and remain exclusively
-/// borrowed for the returned state's lifetime. Long-mode user code is declined.
+/// The frame must be a user entry in the selected layout. Long-mode user code
+/// is declined. All returned borrows belong to the supplied frame.
 #[inline(always)]
-pub(crate) unsafe fn instruction32<'a>(stack: *mut StackFrame, wide: bool) -> Option<InstructionState<'a>> {
+pub(crate) unsafe fn instruction32(stack: &mut StackFrame, wide: bool) -> Option<InstructionState<'_>> {
+    // x86 is little-endian. Split each slot into disjoint, lifetime-bound halves.
+    #[inline(always)]
+    fn halves(slot: &mut u64) -> (&mut u32, &mut u32) {
+        let [low, high] = unsafe { &mut *(slot as *mut u64).cast::<[u32; 2]>() };
+        (low, high)
+    }
     if wide {
-        let r = unsafe { &raw mut (*stack).regs };
-        if unsafe { (*r).frame.cs } == u64::from(arch_abi::USER_CS64) { return None; }
-        // x86 is little-endian. The low/high borrows are disjoint and refer to
-        // real 64-bit storage only on this path; narrow entry has no highs.
-        let words = unsafe { [&raw mut (*r).rax, &raw mut (*r).rcx, &raw mut (*r).rdx,
-            &raw mut (*r).rbx, &raw mut (*r).frame.rsp, &raw mut (*r).rbp,
-            &raw mut (*r).rsi, &raw mut (*r).rdi] };
+        let r = unsafe { &mut stack.regs };
+        if r.frame.cs == u64::from(arch_abi::USER_CS64) { return None; }
+        let words = [&mut r.rax, &mut r.rcx, &mut r.rdx, &mut r.rbx,
+            &mut r.frame.rsp, &mut r.rbp, &mut r.rsi, &mut r.rdi].map(halves);
+        let [(ax, ah), (cx, ch), (dx, dh), (bx, bh),
+            (sp, sph), (bp, bph), (si, sih), (di, dih)] = words;
         Some(InstructionState {
-            gprs: words.map(|p| unsafe { &mut *p.cast::<u32>() }),
-            high: Some(words.map(|p| unsafe { &mut *p.cast::<u32>().add(1) })),
-            ip: unsafe { &mut *(&raw mut (*r).frame.rip).cast::<u32>() },
-            flags: unsafe { &mut *(&raw mut (*r).frame.rflags).cast::<u32>() },
-            selectors: unsafe { [(*r).es as u16, (*r).frame.cs as u16, (*r).frame.ss as u16,
-                (*r).ds as u16, (*r).fs as u16, (*r).gs as u16] },
-            vector: unsafe { (*r).int_num }, error: unsafe { (*r).err_code },
+            gprs: [ax, cx, dx, bx, sp, bp, si, di],
+            high: Some([ah, ch, dh, bh, sph, bph, sih, dih]),
+            ip: halves(&mut r.frame.rip).0,
+            flags: halves(&mut r.frame.rflags).0,
+            selectors: [r.es as u16, r.frame.cs as u16, r.frame.ss as u16,
+                r.ds as u16, r.fs as u16, r.gs as u16],
+            vector: r.int_num, error: r.err_code,
         })
     } else {
-        let r = unsafe { &raw mut (*stack).raw32.raw };
-        macro_rules! low { ($field:ident) => { unsafe { (&raw const (*r).$field).cast::<u32>().read() } }; }
-        let selectors = if unsafe { (*r).eflags } & (1 << 17) != 0 {
-            let vm = unsafe { (*stack).raw32.vm86 };
-            [vm.es as u16, unsafe { (*r).cs } as u16, unsafe { (*r).ss } as u16,
+        let frame = unsafe { &mut stack.raw32 };
+        let r = &mut frame.raw;
+        let selectors = if r.eflags & (1 << 17) != 0 {
+            let vm = &frame.vm86;
+            [vm.es as u16, r.cs as u16, r.ss as u16,
                 vm.ds as u16, vm.fs as u16, vm.gs as u16]
         } else {
-            [low!(es) as u16, unsafe { (*r).cs } as u16, unsafe { (*r).ss } as u16,
-                low!(ds) as u16, low!(fs) as u16, low!(gs) as u16]
+            [r.es as u16, r.cs as u16, r.ss as u16,
+                r.ds as u16, r.fs as u16, r.gs as u16]
         };
-        macro_rules! word { ($field:ident) => { unsafe { &mut *(&raw mut (*r).$field).cast::<u32>() } }; }
         Some(InstructionState {
-            gprs: [word!(eax), word!(ecx), word!(edx), word!(ebx), word!(esp),
-                word!(ebp), word!(esi), word!(edi)], high: None,
-            ip: unsafe { &mut (*r).eip }, flags: unsafe { &mut (*r).eflags }, selectors,
-            vector: u64::from(unsafe { (*r).int_num }), error: u64::from(unsafe { (*r).err_code }),
+            gprs: [halves(&mut r.eax).0, halves(&mut r.ecx).0,
+                halves(&mut r.edx).0, halves(&mut r.ebx).0, &mut r.esp,
+                halves(&mut r.ebp).0, halves(&mut r.esi).0, halves(&mut r.edi).0],
+            high: None,
+            ip: &mut r.eip, flags: &mut r.eflags, selectors,
+            vector: u64::from(r.int_num), error: u64::from(r.err_code),
         })
     }
 }

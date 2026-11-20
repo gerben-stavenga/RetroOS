@@ -23,7 +23,7 @@ KERNEL_TLS_SEL equ 0x91       ; GDT slot 18, DPL/RPL 1 (descriptors.rs)
 extern BOOT_GDT            ; boot GDT table (descriptors.rs)
 extern KERNEL_STACK_TOP    ; top of kernel stack (kernel.ld)
 extern boot_kernel         ; consumer-provided Rust entry point
-extern isr_handler         ; arch-metal ISR dispatcher (traps.rs)
+extern isr_handler         ; arch-metal ISR dispatcher (entry.rs)
 extern TLS_TEMPLATE, TLS_FILE_SIZE, TLS_SIZE
 extern BOOT_TLS_BASE, BOOT_TLS_TP
 
@@ -270,7 +270,7 @@ global entry_wrapper_32
 entry_wrapper_32:
     ; One frame layout for the installed hook and canonical dispatch. Reserve
     ; the canonical prefix plus the native-tail expansion gap, but store only
-    ; live 32-bit state. Rust initializes unused slots only after hook decline.
+    ; live 32-bit state. Rust normalizes unsaved slots only after hook decline.
     sub esp, 188
     mov [ss:esp + 96], edi
     mov [ss:esp + 104], esi
@@ -291,7 +291,8 @@ entry_wrapper_32:
 
 ; -----------------------------------------------------------------------------
 ; common_call: shared dispatch tail. Caller has:
-;   - pushed StackFrame — canonical Regs for 64-bit, hybrid Raw32 for 32-bit
+;   - exclusive, initialized StackFrame storage, including the reserved VM86 tail
+;   - saved Regs for 64-bit or hybrid Raw32 for 32-bit; unsaved fields are residue
 ;   - set ebx = from_64 flag
 ;
 ; ebp is left untouched between trap entry and `call isr_handler`. For ring-1

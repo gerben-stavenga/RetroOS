@@ -35,7 +35,7 @@ pub(crate) unsafe fn bind(binding: Option<::planar::Binding>) {
 }
 
 /// Installed with the device binding; entry itself has no device policy.
-unsafe extern "C" fn instruction_hook(stack: *mut arch_abi::entry::StackFrame, wide: bool) -> bool {
+unsafe extern "C" fn instruction_hook(stack: &mut arch_abi::entry::StackFrame, wide: bool) -> bool {
     let Some(state) = (unsafe { crate::entry::instruction32(stack, wide) }) else { return false };
     instruction(state)
 }
