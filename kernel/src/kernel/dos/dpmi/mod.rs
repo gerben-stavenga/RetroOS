@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+use arch_abi::eflags;
 use crate::Regs;
 use alloc::boxed::Box;
 use crate::kernel::thread;
@@ -153,8 +154,8 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &
         }
     }
 
-    regs.frame.rflags &= !(machine::VM_FLAG as u64);
-    regs.frame.rflags |= machine::VIF_FLAG as u64;
+    regs.frame.rflags &= !(eflags::VM_FLAG as u64);
+    regs.frame.rflags |= eflags::VIF_FLAG as u64;
     regs.frame.cs = cs_sel as u64;
     regs.frame.rip = ret_ip as u64;
     regs.frame.ss = ss_sel as u64;
@@ -212,7 +213,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         Some(d) => d,
         None => {
             crate::compact_println!("DPMI: INT 31h from client but no DPMI state!");
-            regs.set_flag32(1);
+            regs.set_flag32(eflags::CF_FLAG);
             return thread::KernelAction::Done;
         }
     };
@@ -224,7 +225,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         // Returns: AX = base selector
         0x0000 => {
             let count = (regs.rcx & 0xFFFF) as usize;
-            if count == 0 { regs.set_flag32(1); return thread::KernelAction::Done; }
+            if count == 0 { regs.set_flag32(eflags::CF_FLAG); return thread::KernelAction::Done; }
             // DPMI 0.9 §0000: allocated descriptors should match the
             // client's bitness — 16-bit clients get D=0, 32-bit get D=1.
             // Borland's dpmiload (16-bit client) inspects descriptor flags
@@ -240,9 +241,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     }
                     let sel = idx_to_sel(idx);
                     regs.rax = (regs.rax & !0xFFFF) | sel as u64;
-                    regs.clear_flag32(1);
+                    regs.clear_flag32(eflags::CF_FLAG);
                 }
-                None => regs.set_flag32(1),
+                None => regs.set_flag32(eflags::CF_FLAG),
             }
         }
         // AX=0001h — Free LDT Descriptor
@@ -256,12 +257,12 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     "[DPMI] 0001 ignoring non-owned/free selector sel={:04X} idx={} caller={:04X}:{:04X}",
                     sel, idx, regs.code_seg(), regs.ip32() as u16,
                 );
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
                 return thread::KernelAction::Done;
             }
             free_ldt(&mut dos.ldt[..], &mut dos.ldt_alloc, idx);
             scrub_freed_selector(regs, sel);
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0002h — Segment to Descriptor
         // BX = real-mode segment. Returns: AX = selector (maps 64KB at seg<<4)
@@ -273,7 +274,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     let sel = idx_to_sel(idx);
                     regs.rax = (regs.rax & !0xFFFF) | sel as u64;
                     dos_trace!("[DPMI] 0002 seg={:04X} -> reuse sel={:04X} base={:08X}", seg, sel, base);
-                    regs.clear_flag32(1);
+                    regs.clear_flag32(eflags::CF_FLAG);
                     return thread::KernelAction::Done;
                 }
             }
@@ -282,16 +283,16 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 let sel = idx_to_sel(idx);
                 regs.rax = (regs.rax & !0xFFFF) | sel as u64;
                 dos_trace!("[DPMI] 0002 seg={:04X} -> sel={:04X} base={:08X}", seg, sel, base);
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0003h — Get Selector Increment Value
         // Returns: AX = 8
         0x0003 => {
             regs.rax = (regs.rax & !0xFFFF) | 8;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0006h — Get Segment Base Address
         // BX = selector. Returns: CX:DX = base
@@ -302,9 +303,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 dos_trace!("[DPMI] 0006 sel={:04X} -> base={:08X}", sel, base);
                 regs.rcx = (regs.rcx & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;
                 regs.rdx = (regs.rdx & !0xFFFF) | (base & 0xFFFF) as u64;
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0007h — Set Segment Base Address
@@ -330,9 +331,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     }
                 set_desc_base(&mut dos.ldt[idx], base);
                 dos_trace!("[DPMI] 0007 sel={:04X} base={:08X}", sel, base);
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0008h — Set Segment Limit
@@ -342,9 +343,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let limit = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
                 set_desc_limit(&mut dos.ldt[idx], limit);
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0009h — Set Descriptor Access Rights
@@ -360,9 +361,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 dos.ldt[idx] &= !0x00F0_FF00_0000_0000;
                 dos.ldt[idx] |= ((0x10 | client_dpl(cl)) as u64) << 40;
                 dos.ldt[idx] |= ((ch & 0xD0) as u64) << 48;
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=000Ah — Create Alias Descriptor (data alias of code segment)
@@ -381,12 +382,12 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     regs.rax = (regs.rax & !0xFFFF) | new_sel as u64;
                     dos_trace!("[DPMI] 000A alias src_sel={:04X} -> new_sel={:04X} base={:08X}",
                         sel, new_sel, desc_base(desc));
-                    regs.clear_flag32(1);
+                    regs.clear_flag32(eflags::CF_FLAG);
                 } else {
-                    regs.set_flag32(1);
+                    regs.set_flag32(eflags::CF_FLAG);
                 }
             } else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=000Bh — Get Descriptor
@@ -399,9 +400,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 machine.write::<u64>(dest as u64, desc);
                 dos_trace!("[DPMI] 000B sel={:04X} -> base={:08X} raw={:016X}", sel,
                     desc_base(desc), desc);
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=000Ch — Set Descriptor
@@ -419,9 +420,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 dos.ldt[idx] = new_desc;
                 dos_trace!("[DPMI] 000C sel={:04X} base={:08X} raw={:016X}", sel,
                     desc_base(new_desc), new_desc);
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0100h — Allocate DOS Memory Block
@@ -439,17 +440,17 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                         regs.rdx = (regs.rdx & !0xFFFF) | sel as u64;
                         dos_trace!("[DPMI] 0100 alloc paragraphs={:04X} -> seg={:04X} sel={:04X} base={:08X}",
                             paragraphs, seg, sel, base);
-                        regs.clear_flag32(1);
+                        regs.clear_flag32(eflags::CF_FLAG);
                     } else {
                         let _ = dos::dos_free_block(machine, dos, regs, seg);
                         regs.rax = (regs.rax & !0xFFFF) | 8;
-                        regs.set_flag32(1);
+                        regs.set_flag32(eflags::CF_FLAG);
                     }
                 }
                 Err(max) => {
                     regs.rax = (regs.rax & !0xFFFF) | 8;
                     regs.rbx = (regs.rbx & !0xFFFF) | max as u64;
-                    regs.set_flag32(1);
+                    regs.set_flag32(eflags::CF_FLAG);
                 }
             }
         }
@@ -460,7 +461,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             let idx = sel_to_idx(sel);
             if !ldt_is_allocated(&dos.ldt_alloc, idx) {
                 regs.rax = (regs.rax & !0xFFFF) | 9;
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             } else {
                 let base = desc_base(dos.ldt[idx]);
                 let seg = (base >> 4) as u16;
@@ -468,11 +469,11 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     Ok(()) => {
                         free_ldt(&mut dos.ldt[..], &mut dos.ldt_alloc, idx);
                         scrub_freed_selector(regs, sel);
-                        regs.clear_flag32(1);
+                        regs.clear_flag32(eflags::CF_FLAG);
                     }
                     Err(err) => {
                         regs.rax = (regs.rax & !0xFFFF) | err as u64;
-                        regs.set_flag32(1);
+                        regs.set_flag32(eflags::CF_FLAG);
                     }
                 }
             }
@@ -485,7 +486,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             let idx = sel_to_idx(sel);
             if !ldt_is_allocated(&dos.ldt_alloc, idx) {
                 regs.rax = (regs.rax & !0xFFFF) | 9;
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             } else {
                 let base = desc_base(dos.ldt[idx]);
                 let seg = (base >> 4) as u16;
@@ -493,12 +494,12 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     Ok(()) => {
                         let limit = (paragraphs as u32).saturating_mul(16).saturating_sub(1);
                         dos.ldt[idx] = make_data_desc(base, limit);
-                        regs.clear_flag32(1);
+                        regs.clear_flag32(eflags::CF_FLAG);
                     }
                     Err((err, max)) => {
                         regs.rax = (regs.rax & !0xFFFF) | err as u64;
                         regs.rbx = (regs.rbx & !0xFFFF) | max as u64;
-                        regs.set_flag32(1);
+                        regs.set_flag32(eflags::CF_FLAG);
                     }
                 }
             }
@@ -511,7 +512,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             let seg = machine::read_u16(machine, 0, (int_num as u32) * 4 + 2);
             regs.rcx = (regs.rcx & !0xFFFF) | seg as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | off as u64;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0201h — Set Real Mode Interrupt Vector
         // BL = interrupt number, CX:DX = seg:off
@@ -522,7 +523,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             dos_trace!("[DPMI] 0201 set RM vec {:02X} = {:04X}:{:04X}", int_num, seg, off);
             machine::write_u16(machine, 0, (int_num as u32) * 4, off);
             machine::write_u16(machine, 0, (int_num as u32) * 4 + 2, seg);
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0202h — Get Processor Exception Handler Vector
         // BL = exception number (00H-1FH), including CPU-reserved slots.
@@ -532,9 +533,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 let (sel, off) = dpmi.exc_vectors[index];
                 regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
                 regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0203h — Set Processor Exception Handler Vector
@@ -547,9 +548,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 dpmi.exc_vectors[index] = (regs.rcx as u16, off);
                 dos_trace!("[DPMI] 0203 set exception {:02X} = {:04X}:{:08X}",
                     exc, regs.rcx as u16, off);
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0210h — Get Extended Processor Exception Handler Vector (PM)
@@ -561,10 +562,10 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 let (sel, off) = dpmi.pm_exc_vectors[index];
                 regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
                 regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
                 regs.rax = 0x8021;
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0211h — Get Extended Processor Exception Handler Vector (RM)
@@ -576,10 +577,10 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 let (sel, off) = dpmi.rm_exc_vectors[index];
                 regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
                 regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
                 regs.rax = 0x8021;
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0212h — Set Extended Processor Exception Handler Vector (PM)
@@ -592,10 +593,10 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 dpmi.pm_exc_vectors[index] = (regs.rcx as u16, regs.rdx as u32);
                 dos_trace!("[DPMI] 0212 set PM exception {:02X} = {:04X}:{:08X}",
                     exc, regs.rcx as u16, regs.rdx as u32);
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
                 regs.rax = 0x8021;
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0213h — Set Extended Processor Exception Handler Vector (RM)
@@ -608,10 +609,10 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 dpmi.rm_exc_vectors[index] = (regs.rcx as u16, regs.rdx as u32);
                 dos_trace!("[DPMI] 0213 set RM exception {:02X} = {:04X}:{:08X}",
                     exc, regs.rcx as u16, regs.rdx as u32);
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
                 regs.rax = 0x8021;
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0204h — Get Protected Mode Interrupt Vector
@@ -623,7 +624,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             let (sel, off) = dos.pm_vectors[int_num as usize];
             regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
             regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0205h — Set Protected Mode Interrupt Vector
         // BL = interrupt number, CX:EDX = selector:offset
@@ -636,7 +637,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             let off = if dpmi.client_use32 { regs.rdx as u32 } else { regs.rdx as u16 as u32 };
             dos_trace!("[DPMI] 0205 set vec {:02X} = {:04X}:{:#X}", int_num, sel, off);
             dos.pm_vectors[int_num as usize] = (sel, off);
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0300h — Simulate Real Mode Interrupt
         // BL = interrupt number, ES:EDI = real-mode call structure (50 bytes)
@@ -687,9 +688,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     let rm_off = dos::ctrl_slot_off(dos::SLOT_CB_ENTRY_BASE + i as u8);
                     regs.rcx = (regs.rcx & !0xFFFF) | dos::CTRL_STUB_SEG as u64;
                     regs.rdx = (regs.rdx & !0xFFFF) | rm_off as u64;
-                    regs.clear_flag32(1);
+                    regs.clear_flag32(eflags::CF_FLAG);
                 }
-                None => regs.set_flag32(1),
+                None => regs.set_flag32(eflags::CF_FLAG),
             }
         }
         // AX=0304h — Free Real Mode Callback Address
@@ -702,9 +703,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             if off >= cb_base && off < cb_end {
                 let idx = ((off - cb_base) / 2) as usize;
                 dpmi.callbacks[idx] = None;
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
         // AX=0400h — Get DPMI Version
@@ -721,7 +722,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             // Report 0x08/0x70 (matching real-mode BIOS mapping) so DJGPP hooks
             // IRQ 1 as INT 9 (keyboard), IRQ 0 as INT 8 (timer), etc.
             regs.rdx = (regs.rdx & !0xFFFF) | ((0x08 << 8) | 0x70) as u64;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0401h — Get DPMI Capabilities (DPMI 1.0)
         // ES:(E)DI = 128-byte buffer for host major/minor + vendor string.
@@ -742,7 +743,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             machine.write::<u8>(dest as u64, 1);        // host major = 1
             machine.write::<u8>((dest as usize + 1) as u64, 0);    // host minor = 0
             machine.copy_to((dest as usize + 2) as u64, VENDOR);
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0500h — Get Free Memory Information
         // ES:EDI = 48-byte buffer. Report actual backing, not fictitious swap.
@@ -751,7 +752,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             for (i, value) in memory::info(machine, &dos.memory, dpmi).into_iter().enumerate() {
                 machine.write::<u32>((dest as usize + i * 4) as u64, value);
             }
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0501h — Allocate Memory Block
         // BX:CX = size in bytes. Returns: BX:CX = linear address, SI:DI = handle
@@ -761,7 +762,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 Ok(base) => base,
                 Err(error) => {
                     regs.rax = (regs.rax & !0xFFFF) | u64::from(error);
-                    regs.set_flag32(1);
+                    regs.set_flag32(eflags::CF_FLAG);
                     return thread::KernelAction::Done;
                 }
             };
@@ -774,7 +775,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             regs.rcx = (regs.rcx & !0xFFFF) | (base & 0xFFFF) as u64;
             regs.rsi = (regs.rsi & !0xFFFF) | ((handle >> 16) & 0xFFFF) as u64;
             regs.rdi = (regs.rdi & !0xFFFF) | (handle & 0xFFFF) as u64;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0502h — Free Memory Block
         // SI:DI = handle
@@ -782,10 +783,10 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             let handle = ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
             if let Err(error) = memory::free(machine, &mut dos.memory, dpmi, handle) {
                 regs.rax = (regs.rax & !0xFFFF) | u64::from(error);
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
                 return thread::KernelAction::Done;
             }
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0503h — Resize Memory Block
         // BX:CX = new size, SI:DI = handle
@@ -797,7 +798,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 Ok(base) => base,
                 Err(error) => {
                     regs.rax = (regs.rax & !0xFFFF) | u64::from(error);
-                    regs.set_flag32(1);
+                    regs.set_flag32(eflags::CF_FLAG);
                     return thread::KernelAction::Done;
                 }
             };
@@ -805,43 +806,43 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             regs.rcx = (regs.rcx & !0xFFFF) | (base & 0xFFFF) as u64;
             regs.rsi = (regs.rsi & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;
             regs.rdi = (regs.rdi & !0xFFFF) | (base & 0xFFFF) as u64;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0600h-0601h — Lock/Unlock Linear Region (no-op, all memory is locked)
         0x0600 | 0x0601 => {
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0702h — Mark Page as Demand Paging Candidate
         // AX=0703h — Discard Page Contents
         // This host does not implement demand-paged VM, so these are advisory no-ops.
         0x0702 | 0x0703 => {
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0900h — Get and Disable Virtual Interrupt State
         // Returns: AL = previous state (1=enabled, 0=disabled)
         0x0900 => {
-            let prev = if regs.frame.rflags & (machine::VIF_FLAG as u64) != 0 { 1u64 } else { 0u64 };
-            regs.frame.rflags &= !(machine::VIF_FLAG as u64);
+            let prev = if regs.frame.rflags & (eflags::VIF_FLAG as u64) != 0 { 1u64 } else { 0u64 };
+            regs.frame.rflags &= !(eflags::VIF_FLAG as u64);
             regs.rax = (regs.rax & !0xFF) | prev;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             super::mode_transitions::if_record(7, regs, prev != 0, false, None);
         }
         // AX=0901h — Get and Enable Virtual Interrupt State
         0x0901 => {
-            let prev = if regs.frame.rflags & (machine::VIF_FLAG as u64) != 0 { 1u64 } else { 0u64 };
-            regs.frame.rflags |= machine::VIF_FLAG as u64;
+            let prev = if regs.frame.rflags & (eflags::VIF_FLAG as u64) != 0 { 1u64 } else { 0u64 };
+            regs.frame.rflags |= eflags::VIF_FLAG as u64;
             regs.rax = (regs.rax & !0xFF) | prev;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             super::mode_transitions::if_record(8, regs, prev != 0, true, None);
         }
         // AX=0902h — Get Virtual Interrupt State
         0x0902 => {
-            regs.rax = (regs.rax & !0xFF) | if regs.frame.rflags & (machine::VIF_FLAG as u64) != 0 { 1 } else { 0 };
-            regs.clear_flag32(1);
+            regs.rax = (regs.rax & !0xFF) | if regs.frame.rflags & (eflags::VIF_FLAG as u64) != 0 { 1 } else { 0 };
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0A00h — Get Vendor-Specific API Entry Point (not supported)
         0x0A00 => {
-            regs.set_flag32(1);
+            regs.set_flag32(eflags::CF_FLAG);
         }
         // AX=0305h — Get State Save/Restore Addresses
         // AX=0 means "no client buffer needed"; host keeps state internally.
@@ -857,7 +858,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             regs.rsi = (regs.rsi & !0xFFFF) | super::mode_transitions::SPECIAL_STUB_SEL as u64;
             regs.rdi = (regs.rdi & !0xFFFF_FFFF)
                 | (dos::STUB_BASE + dos::slot_offset(dos::SLOT_SAVE_RESTORE) as u32) as u64;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0306h — Get Raw Mode Switch Addresses
         // Returns real-to-PM and PM-to-real switch entry points
@@ -868,12 +869,12 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             // SI:(E)DI = PM-to-real entry in the special-stub segment.
             regs.rsi = (regs.rsi & !0xFFFF) | super::mode_transitions::SPECIAL_STUB_SEL as u64;
             regs.rdi = (regs.rdi & !0xFFFFFFFF) | (dos::STUB_BASE + dos::slot_offset(dos::SLOT_PM_TO_REAL) as u32) as u64;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0507h — Set Page Attributes (DPMI 1.0)
         // All our memory is committed, so this is a no-op.
         0x0507 => {
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0E00h — Get Coprocessor Status
         // AX=0E01h — Set Coprocessor Emulation
@@ -882,10 +883,10 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             regs.rax = (regs.rax & !0xFFFF) | 0x0E00;
             // BX: bit 0 = MPv (FPU exists), bits 4-7 = FPU type (4=487SX+)
             regs.rbx = (regs.rbx & !0xFFFF) | 0x0041;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         0x0E01 => {
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0800h — Map Physical Address.
         // BX:CX = physical address, SI:DI = size; returns BX:CX = linear.
@@ -895,14 +896,14 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             let size =
                 ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
             let Some(slot) = dpmi.free_phys_slot() else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
                 regs.rax = (regs.rax & !0xFFFF) | 0x8012;
                 return thread::KernelAction::Done;
             };
             let Some((virtual_base, page_count, returned_linear)) =
                 physical_mapping_layout(dos.dpmi_phys_next, physical, size)
             else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
                 regs.rax = (regs.rax & !0xFFFF) | 0x8012;
                 return thread::KernelAction::Done;
             };
@@ -930,7 +931,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 "[DPMI] 0800 map phys={:#x} size={:#x} -> linear={:#x} pages={}",
                 physical, size, returned_linear, page_count
             );
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AX=0801h — Free Physical Address Mapping. BX:CX is the exact
         // (possibly unaligned) address previously returned by AX=0800h.
@@ -939,7 +940,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
             let Some((slot, mapping)) = dpmi.physical_mapping(returned_linear)
             else {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
                 regs.rax = (regs.rax & !0xFFFF) | 0x8021;
                 return thread::KernelAction::Done;
             };
@@ -952,13 +953,13 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 "[DPMI] 0801 unmap linear={:#x} pages={}",
                 returned_linear, mapping.page_count
             );
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         _ => {
             dos_trace!("  DPMI: unhandled INT 31h AX={:04X} BX={:04X} CX={:04X} DX={:04X} CS:EIP={:04x}:{:#x}",
                 ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
                 regs.code_seg(), regs.ip32());
-            regs.set_flag32(1);
+            regs.set_flag32(eflags::CF_FLAG);
             regs.rax = (regs.rax & !0xFFFF) | 0x8001; // unsupported function
         }
     }

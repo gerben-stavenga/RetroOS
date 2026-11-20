@@ -1,4 +1,5 @@
 //! BIOS keyboard services: INT 09h and INT 16h.
+use arch_abi::eflags;
 use crate::Regs;
 use crate::kernel::dos::{dos, machine, DosState};
 use crate::kernel::dos::dosabi::STUB_SEG;
@@ -53,7 +54,7 @@ pub(super) fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u
     // queued in the vkbd and never surfaced as an INT 09). Native-BIOS boots
     // were unaffected because there the ROM's own `sti` did this, which is
     // what made it look like a firmware bug.
-    regs.frame.rflags |= machine::VIF_FLAG as u64;
+    regs.frame.rflags |= eflags::VIF_FLAG as u64;
 
     let ah = (regs.rax >> 8) as u8;
     let head: u16 = bda_field!(machine, kb_head);
@@ -81,7 +82,7 @@ pub(super) fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u
         }
         0x01 | 0x11 => {
             // Peek: ZF in the caller's stacked FLAGS (popped on return).
-            vm86_set_return_flag(machine, regs, 0x40, head == tail);
+            vm86_set_return_flag(machine, regs, eflags::ZF_FLAG as u16, head == tail);
             if head != tail {
                 let key: u16 = machine.read((Bda::BASE + head as usize) as u64);
                 let key = if ah == 0x01 { conventional(key) } else { key };
@@ -122,14 +123,14 @@ pub(super) fn int09<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs
             regs.ds, regs.es, regs.fs, regs.gs,
         ];
         regs.rax = (regs.rax & !0xFFFF) | u64::from(0x4F00 | u16::from(sc));
-        let flags = (machine::vm86_flags(regs) as u16) | 1;
+        let flags = (machine::vm86_flags(regs) as u16) | eflags::CF_FLAG as u16;
         vm86_push(machine, regs, flags);
         vm86_push(machine, regs, dos::CTRL_STUB_SEG);
         vm86_push(machine, regs,
             dos::ctrl_slot_off(dos::SLOT_KBD_INTERCEPT_RETURN));
         machine::set_vm86_cs(regs, int15_seg);
         machine::set_vm86_ip(regs, int15_off);
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
         return true;
     }
     finish_int09(machine, dos, sc, true);
@@ -142,7 +143,7 @@ pub(in crate::kernel::dos) fn int09_intercept_return<A: crate::Arch>(
     dos: &mut DosState<A>,
     regs: &mut Regs,
 ) {
-    let accepted = machine::vm86_flags(regs) & 1 != 0;
+    let accepted = machine::vm86_flags(regs) & eflags::CF_FLAG != 0;
     let sc = regs.rax as u8;
     finish_int09(machine, dos, sc, accepted);
     let [rax, rbx, rcx, rdx, rsi, rdi, rbp, ds, es, fs, gs] = dos.int09_registers;

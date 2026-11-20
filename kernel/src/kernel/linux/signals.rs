@@ -1,4 +1,5 @@
 //! Linux x86-64 signal frames, masks and rt_sigreturn ABI.
+use arch_abi::eflags;
 use super::{Args, LinuxState, SyscallResult, async_io, high_memory, thread};
 use crate::Regs;
 use alloc::{collections::BTreeMap, vec::Vec};
@@ -400,7 +401,7 @@ fn deliver_frame<A: crate::Arch>(
     }
     regs.frame.rsp = base;
     regs.frame.rip = action.handler;
-    regs.frame.rflags &= !(0x100 | 0x400); // clear TF and DF on handler entry
+    regs.frame.rflags &= !u64::from(eflags::TF_FLAG | eflags::DF_FLAG); // clear TF and DF on handler entry
     regs.rdi = signal as u64;
     regs.rsi = base + INFO as u64;
     regs.rdx = base + UC as u64;
@@ -470,7 +471,8 @@ fn restore<A: crate::Arch>(
     regs.rcx = general[14];
     regs.frame.rsp = general[15];
     regs.frame.rip = general[16];
-    const USER_FLAGS: u64 = 0x254dd5;
+    const USER_FLAGS: u64 = (eflags::STATUS_MASK | eflags::TF_FLAG | eflags::DF_FLAG
+        | eflags::NT_FLAG | eflags::RF_FLAG | eflags::AC_FLAG | eflags::ID_FLAG) as u64;
     regs.frame.rflags = (original.frame.rflags & !USER_FLAGS) | (general[17] & USER_FLAGS);
     state.locals.entry(tid).or_default().mask = word(&frame, MASK) & !UNBLOCKABLE;
     machine.switch_fx(&mut fx);

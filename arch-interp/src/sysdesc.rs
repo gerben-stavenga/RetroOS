@@ -9,26 +9,7 @@
 //! programming of GDTR/LDTR (Unicorn MMR writes vs `KVM_SET_SREGS`) stays in
 //! the engines.
 
-// ── EFLAGS bits + the virtual-IF projection ─────────────────────────────────
-
-pub(crate) const IF_FLAG: u32 = 1 << 9;
-/// Only the KVM engine masks TF out of the flags it hands the vcpu (TCG drives
-/// stepping through Unicorn's own TF); gated so a TCG-only build doesn't see it
-/// as dead.
-#[cfg(feature = "kvm")]
-pub(crate) const TF_FLAG: u32 = 1 << 8;
-/// NT (Nested Task, EFLAGS bit 14). Strip it on protected-mode entry to avoid
-/// a native IRET attempting a task-switch return (Borland RTE 204 in DN).
-/// VM86 must retain NT: DOS CPU probes toggle it through emulated POPF/PUSHF
-/// to distinguish a 386 from a 286. VM86 IRET is also emulated at IOPL=1.
-pub(crate) const NT_FLAG: u32 = 1 << 14;
-/// VIF (EFLAGS bit 19) — the kernel's canonical store for the guest's virtual
-/// interrupt flag, shared with arch-metal. Both engines run the guest with its
-/// IF in the native bit-9 slot, so the entry/exit boundary mirrors between the
-/// two: bit 9 ← VIF on the way into the guest, VIF ← bit 9 on the way out.
-pub(crate) const VIF_FLAG: u32 = 1 << 19;
-pub(crate) const VM_FLAG: u64 = 1 << 17;
-pub(crate) const IOPL_MASK: u64 = 3 << 12;
+use arch_abi::eflags::{IF_FLAG, VIF_FLAG};
 
 /// Entry: project the guest's virtual IF (VIF/bit 19) into the bit-9 (IF) slot
 /// the executing CPU runs with.

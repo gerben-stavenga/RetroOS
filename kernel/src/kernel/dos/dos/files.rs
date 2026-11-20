@@ -1,5 +1,6 @@
 //! DOS file handles, path resolution, directory searches and timestamps.
 
+use arch_abi::eflags;
 use crate::Regs;
 use super::clock::unix_to_dos_datetime;
 use crate::kernel::thread;
@@ -35,7 +36,7 @@ pub(super) fn finish_file_read<A: crate::Arch>(
         }
     }
     regs.rax = (regs.rax & !0xFFFF) | got as u64;
-    regs.clear_flag32(1);
+    regs.clear_flag32(eflags::CF_FLAG);
 }
 
 /// Complete an image-backed CD read only after its modeled transfer deadline.

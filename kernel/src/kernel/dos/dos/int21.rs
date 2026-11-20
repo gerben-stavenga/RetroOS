@@ -1,11 +1,12 @@
 //! INT 21h DOS service dispatch.
 
+use arch_abi::eflags;
 use core::sync::atomic::{AtomicU16, Ordering};
 use crate::Regs;
 use crate::kernel::thread;
 use crate::kernel::dos::{
     dfs, dos_alloc_block, dos_free_block, dos_resize_block, dpmi,
-    machine, seg_offset,
+    seg_offset,
 };
 use crate::kernel::dos::ems::{EMS_DEVICE_HANDLE, EMS_ENABLED};
 use crate::kernel::dos::machine::{clear_bios_keyboard_buffer, read_u16, write_u16};
@@ -65,9 +66,9 @@ pub(super) fn int_21h<A: crate::Arch>(
             if dl == 0xFF {
                 if let Some(ch) = poll_dos_console_char(machine, dos, regs) {
                     regs.rax = (regs.rax & !0xFF) | ch as u64;
-                    regs.clear_flag32(0x40); // clear ZF = char available
+                    regs.clear_flag32(eflags::ZF_FLAG); // clear ZF = char available
                 } else {
-                    regs.set_flag32(0x40); // set ZF = no char available
+                    regs.set_flag32(eflags::ZF_FLAG); // set ZF = no char available
                 }
             } else {
                 dos_putchar(machine, dos, dl);
@@ -157,7 +158,7 @@ pub(super) fn int_21h<A: crate::Arch>(
         // AH=0x25: Set interrupt vector (AL=int, DS:DX=handler)
         0x25 => {
             let int_num = regs.rax as u8;
-            if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+            if dos.dpmi.is_some() && regs.frame.rflags as u32 & eflags::VM_FLAG == 0 {
                 // 16-bit DPMI clients pass a 16-bit handler offset in DX; the
                 // high EDX bits are undefined. Storing the full EDX captures
                 // stale garbage that later makes the default-stub check in
@@ -191,7 +192,7 @@ pub(super) fn int_21h<A: crate::Arch>(
         // guest's perspective (kernel services calls synchronously), so
         // point at a permanently-zero byte inside SYSPSP.
         0x34 => {
-            if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+            if dos.dpmi.is_some() && regs.frame.rflags as u32 & eflags::VM_FLAG == 0 {
                 regs.es = dpmi::LOW_MEM_SEL as u64;
                 // Full 32-bit write: the offset via LOW_MEM_SEL is a linear
                 // address, and PM clients may capture the whole register (LES
@@ -217,7 +218,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             if let Some(cwd) = dos.dfs.get_cwd_for(drive) {
                 if cwd.len() >= dfs::DFS_CWD_MAX {
                     regs.rax = (regs.rax & !0xffff) | 206;
-                    regs.set_flag32(1);
+                    regs.set_flag32(eflags::CF_FLAG);
                     return thread::KernelAction::Done;
                 }
                 let addr = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
@@ -241,9 +242,9 @@ pub(super) fn int_21h<A: crate::Arch>(
             if sub_ah == 0x06 {
                 if let Some(ch) = poll_dos_console_char(machine, dos, regs) {
                     regs.rax = (regs.rax & !0xFF) | ch as u64;
-                    regs.clear_flag32(0x40);
+                    regs.clear_flag32(eflags::ZF_FLAG);
                 } else {
-                    regs.set_flag32(0x40); // ZF=1
+                    regs.set_flag32(eflags::ZF_FLAG); // ZF=1
                 }
             }
             return thread::KernelAction::Done;
@@ -262,7 +263,7 @@ pub(super) fn int_21h<A: crate::Arch>(
         // AH=0x2F: Get DTA address (returns ES:BX)
         0x2F => {
             let dta = dos.dta;
-            if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+            if dos.dpmi.is_some() && regs.frame.rflags as u32 & eflags::VM_FLAG == 0 {
                 regs.es = dpmi::LOW_MEM_SEL as u64;
                 // Full 32-bit write (see AH=34): a linear offset — and the DTA
                 // commonly exceeds 0xFFFF, which the 16-bit merge also mangled.
@@ -284,7 +285,7 @@ pub(super) fn int_21h<A: crate::Arch>(
         // AH=0x35: Get interrupt vector (AL=int, returns ES:BX=handler)
         0x35 => {
             let int_num = regs.rax as u8;
-            if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+            if dos.dpmi.is_some() && regs.frame.rflags as u32 & eflags::VM_FLAG == 0 {
                 let (sel, off) = dos.pm_vectors[int_num as usize];
                 regs.es = sel as u64;
                 let client_use32 = dos.dpmi.as_ref().map(|d| d.client_use32).unwrap_or(false);
@@ -1179,7 +1180,7 @@ pub(super) fn int_21h<A: crate::Arch>(
         // any linear address.
         0x52 => {
             let lol_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, lol) as u32;
-            if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+            if dos.dpmi.is_some() && regs.frame.rflags as u32 & eflags::VM_FLAG == 0 {
                 regs.es = dpmi::LOW_MEM_SEL as u64;
                 // Full 32-bit write (see AH=34): the offset is a linear address.
                 regs.rbx = lol_addr as u64;
@@ -1657,7 +1658,7 @@ pub(super) fn int_21h<A: crate::Arch>(
                 //   size; DPMILOAD just needs a plausible pointer.
                 0x06 => {
                     let syspsp_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32;
-                    if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
+                    if dos.dpmi.is_some() && regs.frame.rflags as u32 & eflags::VM_FLAG == 0 {
                         regs.ds = dpmi::LOW_MEM_SEL as u64;
                         // Full 32-bit write (see AH=34): DOS/16M's DPMILOAD
                         // stores this DS:ESI whole (LDS ESI) and dereferences
@@ -1680,7 +1681,7 @@ pub(super) fn int_21h<A: crate::Arch>(
             lfn::dispatch(machine, kt, dos, regs)
         }
         0xFF => {
-            regs.set_flag32(1);
+            regs.set_flag32(eflags::CF_FLAG);
             return thread::KernelAction::Done;
         }
         _ => DosExit::Error(1),
@@ -1702,9 +1703,9 @@ pub(super) fn int_21h<A: crate::Arch>(
     };
     if failed {
         dos.last_dos_error = regs.rax as u16;
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
     } else {
-        regs.clear_flag32(1);
+        regs.clear_flag32(eflags::CF_FLAG);
     }
     thread::KernelAction::Done
 }

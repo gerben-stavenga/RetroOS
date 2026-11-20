@@ -1,5 +1,6 @@
 //! DOS console input, output and keyboard continuations.
 
+use arch_abi::eflags;
 use crate::Regs;
 use crate::kernel::thread;
 use crate::kernel::dos::machine;
@@ -90,7 +91,7 @@ pub(super) fn launch_int16_read<A: crate::Arch>(machine: &mut A, regs: &mut Regs
     // branch on exactly that (`test al,al`) — the enhanced call's AL=0xE0
     // marker would send them down the plain-ASCII path instead.
     regs.rax &= !0xFF00;
-    regs.frame.rflags |= machine::VIF_FLAG as u64; // guest VIF=1 while INT 16 runs
+    regs.frame.rflags |= eflags::VIF_FLAG as u64; // guest VIF=1 while INT 16 runs
 }
 
 /// Protected-mode counterpart to the guest INT 16h round-trip. PMDOS clients

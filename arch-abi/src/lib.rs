@@ -452,6 +452,34 @@ pub const USER_CS: u16 = 0x20 | 3; // Ring 3
 pub const USER_DS: u16 = 0x28 | 3; // Ring 3
 pub const USER_CS64: u16 = 0x30 | 3; // Ring 3
 
+/// Architectural EFLAGS bits, also used in the low half of RFLAGS.
+pub mod eflags {
+    pub const CF_FLAG: u32 = 1 << 0;
+    /// Reserved bit 1 reads as one.
+    pub const FIXED_ONE: u32 = 1 << 1;
+    pub const PF_FLAG: u32 = 1 << 2;
+    pub const AF_FLAG: u32 = 1 << 4;
+    pub const ZF_FLAG: u32 = 1 << 6;
+    pub const SF_FLAG: u32 = 1 << 7;
+    pub const TF_FLAG: u32 = 1 << 8;
+    pub const IF_FLAG: u32 = 1 << 9;
+    pub const DF_FLAG: u32 = 1 << 10;
+    pub const OF_FLAG: u32 = 1 << 11;
+    pub const IOPL_SHIFT: u32 = 12;
+    pub const IOPL_MASK: u32 = 3 << IOPL_SHIFT;
+    pub const NT_FLAG: u32 = 1 << 14;
+    pub const RF_FLAG: u32 = 1 << 16;
+    pub const VM_FLAG: u32 = 1 << 17;
+    pub const AC_FLAG: u32 = 1 << 18;
+    pub const VIF_FLAG: u32 = 1 << 19;
+    pub const VIP_FLAG: u32 = 1 << 20;
+    pub const ID_FLAG: u32 = 1 << 21;
+
+    pub const STATUS_MASK: u32 = CF_FLAG | PF_FLAG | AF_FLAG | ZF_FLAG | SF_FLAG | OF_FLAG;
+    pub const DEFINED_MASK: u32 = STATUS_MASK | FIXED_ONE | TF_FLAG | IF_FLAG | DF_FLAG
+        | IOPL_MASK | NT_FLAG | RF_FLAG | VM_FLAG | AC_FLAG | VIF_FLAG | VIP_FLAG | ID_FLAG;
+}
+
 /// Host-only shadows carried in the high half of canonical RFLAGS. They are
 /// never copied to a hardware interrupt frame. USER_TF is the guest's TF;
 /// FORCED_TF says the personality also needs physical single stepping.
@@ -653,8 +681,8 @@ impl Regs {
     /// Materialize the hardware TF from its two independent owners.
     pub fn project_tf(&mut self) {
         let on = self.user_tf() || self.forced_tf();
-        if on { self.set_flag32(1 << 8); }
-        else { self.clear_flag32(1 << 8); }
+        if on { self.set_flag32(eflags::TF_FLAG); }
+        else { self.clear_flag32(eflags::TF_FLAG); }
     }
 
     pub fn sp32(&self) -> u32 {
@@ -694,7 +722,7 @@ impl Regs {
     pub fn mode(&self) -> UserMode {
         if self.frame.cs == USER_CS64 as u64 {
             UserMode::Mode64
-        } else if self.frame.rflags & (1 << 17) != 0 {
+        } else if self.frame.rflags & u64::from(eflags::VM_FLAG) != 0 {
             UserMode::VM86
         } else {
             UserMode::Mode32
@@ -715,11 +743,9 @@ impl Regs {
     /// on exit if needed). Canonical entry state, so it lives with the contract.
     pub fn init_user_process(&mut self, entry: u32, stack: u32) {
         let ds = USER_DS as u64;
-        const IF_FLAG: u64 = 1 << 9;
         // VIF (bit 19) is the canonical guest interrupt-enable; a fresh Linux
         // process runs with interrupts on. Metal forces real IF=1 regardless,
         // but the interp projects VIF->IF, so without this it would run IF=0.
-        const VIF_FLAG: u64 = 1 << 19;
 
         *self = Self::empty();
         self.gs = ds;
@@ -729,7 +755,7 @@ impl Regs {
         self.frame = Frame64 {
             rip: entry as u64,
             cs: USER_CS as u64,
-            rflags: IF_FLAG | VIF_FLAG,
+            rflags: u64::from(eflags::IF_FLAG | eflags::VIF_FLAG),
             rsp: stack as u64,
             ss: USER_DS as u64,
         };
@@ -738,11 +764,9 @@ impl Regs {
     /// Initialize for a 64-bit user process.
     pub fn init_user_process_64(&mut self, entry: u64, stack: u64) {
         let ds = USER_DS as u64;
-        const IF_FLAG: u64 = 1 << 9;
         // VIF (bit 19) is the canonical guest interrupt-enable; a fresh Linux
         // process runs with interrupts on. Metal forces real IF=1 regardless,
         // but the interp projects VIF->IF, so without this it would run IF=0.
-        const VIF_FLAG: u64 = 1 << 19;
 
         *self = Self::empty();
         self.gs = 0;   // FS/GS are MSR bases in 64-bit mode, 0 = no TLS yet
@@ -752,7 +776,7 @@ impl Regs {
         self.frame = Frame64 {
             rip: entry,
             cs: USER_CS64 as u64,
-            rflags: IF_FLAG | VIF_FLAG,
+            rflags: u64::from(eflags::IF_FLAG | eflags::VIF_FLAG),
             rsp: stack,
             ss: USER_DS as u64,
         };
@@ -768,17 +792,17 @@ mod tf_shadow_tests {
         let mut r = Regs::empty();
         r.set_forced_tf(true);
         r.project_tf();
-        assert_ne!(r.flags32() & (1 << 8), 0);
+        assert_ne!(r.flags32() & eflags::TF_FLAG, 0);
         assert!(!r.user_tf());
 
         r.set_forced_tf(false);
         r.set_user_tf(true);
         r.project_tf();
-        assert_ne!(r.flags32() & (1 << 8), 0);
+        assert_ne!(r.flags32() & eflags::TF_FLAG, 0);
 
         r.set_user_tf(false);
         r.project_tf();
-        assert_eq!(r.flags32() & (1 << 8), 0);
+        assert_eq!(r.flags32() & eflags::TF_FLAG, 0);
     }
 
     #[test]

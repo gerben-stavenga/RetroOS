@@ -1,4 +1,5 @@
 //! BIOS timer IRQ and clock services: INT 08h and INT 1Ah.
+use arch_abi::eflags;
 use crate::Regs;
 use crate::kernel::dos::{dos, machine, DosState};
 use crate::kernel::dos::dosabi::STUB_SEG;
@@ -45,7 +46,7 @@ pub(super) fn int08<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs
 pub(super) fn int1a<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     let rtc = matches!((regs.rax >> 8) as u8, 2 | 4);
     int1a_registers(machine, regs);
-    if rtc { vm86_set_return_flag(machine, regs, 1, false); }
+    if rtc { vm86_set_return_flag(machine, regs, eflags::CF_FLAG as u16, false); }
 }
 
 // Register-only BIOS clock ABI also used by protected-mode Win16 callers.
@@ -74,7 +75,7 @@ pub(crate) fn int1a_registers<A: crate::Arch>(machine: &mut A, regs: &mut Regs) 
                 | ((bcd(hour) as u64) << 8)
                 | bcd(min) as u64;
             regs.rdx = (regs.rdx & !0xFFFF) | ((bcd(sec) as u64) << 8);
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         0x04 => {
             // Read RTC date: CH=century CL=year DH=month DL=day,
@@ -87,7 +88,7 @@ pub(crate) fn int1a_registers<A: crate::Arch>(machine: &mut A, regs: &mut Regs) 
             regs.rdx = (regs.rdx & !0xFFFF)
                 | ((bcd(month) as u64) << 8)
                 | bcd(day) as u64;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         _ => {}
     }

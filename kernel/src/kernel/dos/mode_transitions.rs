@@ -16,6 +16,7 @@
 //! Host continuations save the two cursors and restore them on return. Guest
 //! stacks contain only architectural and DPMI ABI frames.
 
+use arch_abi::eflags;
 use alloc::vec::Vec;
 use crate::Regs;
 use super::dosabi as dos;
@@ -209,7 +210,7 @@ pub(super) fn resume_continuation<A: crate::Arch>(machine: &mut A, dos: &mut thr
     // allocated real-mode callback. Unlike 0300/01/02 calls, its handler owns
     // the returned registers and control image; the host retains ownership of
     // the internal real-mode stack used to enter and leave the callback.
-    let callback_return = save.frame.rflags & machine::VM_FLAG as u64 != 0
+    let callback_return = save.frame.rflags & eflags::VM_FLAG as u64 != 0
         && save.rm_call_struct_addr.is_some();
     let saved_regs = save.rm_call_struct_addr.map(|addr| {
         let saved = machine.read::<RmCallStruct>(addr as u64);
@@ -306,7 +307,7 @@ pub(super) fn enter_pm_at<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &
     regs.project_tf();
     regs.frame.ss  = pm_cursor.0 as u64;
     regs.frame.rsp = pm_cursor.1 as u64;
-    regs.frame.rflags &= !(machine::VM_FLAG as u64);
+    regs.frame.rflags &= !(eflags::VM_FLAG as u64);
     pm_cursor
 }
 
@@ -327,7 +328,7 @@ pub(super) fn enter_rm<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut
     regs.project_tf();
     regs.frame.ss  = rm_dest.0 as u64;
     regs.frame.rsp = rm_dest.1 as u64;
-    regs.frame.rflags |= machine::VM_FLAG as u64;
+    regs.frame.rflags |= eflags::VM_FLAG as u64;
 }
 
 // ─── Dedicated RM stack ───────────────────────────────────────────────
@@ -537,7 +538,7 @@ pub(super) fn if_record(tag: u8, regs: &Regs, if_in: bool, if_out: bool,
 /// The guest's virtual interrupt flag (VIF/bit 19) — the kernel's single store.
 #[inline]
 fn vif(regs: &Regs) -> bool {
-    regs.frame.rflags & (machine::VIF_FLAG as u64) != 0
+    regs.frame.rflags & (eflags::VIF_FLAG as u64) != 0
 }
 
 /// F12 hook for virtual-IF diagnostics. Prints the most recent ring entries
@@ -618,14 +619,14 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::
     // enter with interrupts disabled, textbook INT semantics). Guest TF was
     // cleared through its shadow above. The real
     // IF (bit 9) is the host's, forced =1 at the arch exit.
-    regs.frame.rflags &= !((machine::VM_FLAG | machine::VIF_FLAG | (1u32 << 8)) as u64);
+    regs.frame.rflags &= !((eflags::VM_FLAG | eflags::VIF_FLAG | eflags::TF_FLAG) as u64);
     // ...and drop the *virtual* IOPL to the spec-strict level for the handler
     // body, so `virtual_if_stepping` is off inside it and the handler runs at
     // hardware speed instead of one #DB per instruction.
     //
     // Every hooked handler returns through SLOT_RESUME_CONTINUATION; its host
     // continuation restores the flags from that nesting level.
-    regs.frame.rflags = (regs.frame.rflags & !(machine::IOPL_MASK as u64))
+    regs.frame.rflags = (regs.frame.rflags & !(eflags::IOPL_MASK as u64))
         | machine::IOPL_DEFAULT as u64;
     regs.frame.cs  = sel as u64;
     regs.frame.rip = off as u64;
@@ -843,7 +844,7 @@ pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(machine: &mut A,
     let if_was = vif(regs);
     // vIOPL rides the flags unchanged (no IOPL force): the real IOPL is pinned
     // to 1 at the arch exit, so the RM-handler entry only needs VIF cleared.
-    let new_flags = regs.flags32() & !machine::VIF_FLAG;
+    let new_flags = regs.flags32() & !eflags::VIF_FLAG;
     regs.set_flags32(new_flags);
     if_record(IF_REFLECT_RM, regs, if_was, vif(regs),
         dos.pc.locked_stack.other_stack(regs));
@@ -866,10 +867,9 @@ pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(machine: &mut A,
 /// restores the suspended side. A synthetic host IRET target asks this function
 /// to consume a planted interrupt frame after restoring the continuation.
 pub(super) fn resume_continuation_from_stub<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
-    const STATUS_MASK: u32 = 0x08D5;
     let resume_if_in = vif(regs);
     let resume_other = dos.pc.locked_stack.other_stack(regs);
-    let current_status = regs.flags32() & STATUS_MASK;
+    let current_status = regs.flags32() & eflags::STATUS_MASK;
 
     let save = pop_continuation(dos);
     let resumes_to_host_iret = save.frame.cs as u16 == SPECIAL_STUB_SEL
@@ -894,7 +894,7 @@ pub(super) fn resume_continuation_from_stub<A: crate::Arch>(machine: &mut A, dos
         // context was interruptible, however: the synthetic frame belongs to
         // the inner operation being unwound and must not act as an implicit
         // STI for its caller.
-        machine::apply_guest_flags(regs, (ret_flags & !STATUS_MASK) | current_status);
+        machine::apply_guest_flags(regs, (ret_flags & !eflags::STATUS_MASK) | current_status);
         regs.set_flags32(restore_return_vif(regs.flags32(), continuation_vif));
     }
     // Clear IRQ trace gating when the outermost host entry returns.
@@ -908,25 +908,25 @@ pub(super) fn resume_continuation_from_stub<A: crate::Arch>(machine: &mut A, dos
 #[inline]
 fn restore_return_vif(flags: u32, continuation_vif: bool) -> u32 {
     if continuation_vif {
-        flags | machine::VIF_FLAG
+        flags | eflags::VIF_FLAG
     } else {
-        flags & !machine::VIF_FLAG
+        flags & !eflags::VIF_FLAG
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{restore_return_vif, StackCursors, Side, HOST_STACK_PM32_SEL};
-    use crate::kernel::dos::machine::VIF_FLAG;
+    use arch_abi::eflags;
 
     #[test]
     fn continuation_preserves_disabled_vif() {
-        assert_eq!(restore_return_vif(VIF_FLAG, false) & VIF_FLAG, 0);
+        assert_eq!(restore_return_vif(eflags::VIF_FLAG, false) & eflags::VIF_FLAG, 0);
     }
 
     #[test]
     fn continuation_preserves_enabled_vif() {
-        assert_ne!(restore_return_vif(0, true) & VIF_FLAG, 0);
+        assert_ne!(restore_return_vif(0, true) & eflags::VIF_FLAG, 0);
     }
 
     #[test]

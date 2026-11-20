@@ -1,5 +1,6 @@
 //! INT 2Fh multiplex services and XMS/DPMI discovery.
 
+use arch_abi::eflags;
 use crate::Regs;
 use crate::kernel::thread;
 use crate::kernel::dos::seg_offset;
@@ -31,7 +32,7 @@ pub(super) fn int_2fh<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
             regs.rbx = (regs.rbx & !0xFFFF) | 1; // one CD-ROM drive
             regs.rcx = (regs.rcx & !0xFFFF) | 3; // first drive is D: (A:=0)
             regs.rax = (regs.rax & !0xFF) | 0xFF; // conventional installed marker
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
         // AX=1501h — one five-byte record: subunit byte followed by the
@@ -43,7 +44,7 @@ pub(super) fn int_2fh<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
             let far_ptr = ((header >> 4) << 16) | (header & 0xF);
             machine.write::<u8>(dest as u64, 0); // driver subunit zero
             machine.write::<u32>((dest + 1) as u64, far_ptr);
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
         // AX=150Bh — MSCDEX v2+ drive check. BX is the MSCDEX signature;
@@ -52,21 +53,21 @@ pub(super) fn int_2fh<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
             regs.rbx = (regs.rbx & !0xFFFF) | 0xADAD;
             let supported = regs.rcx as u16 == 3;
             regs.rax = (regs.rax & !0xFFFF) | if supported { 0x5AD8 } else { 0 };
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
         // AX=150Ch — report the MSCDEX 2.00 interface level. Do not advertise
         // the v2.10 device-request extensions until AX=1510h is implemented.
         0x150C => {
             regs.rbx = (regs.rbx & !0xFFFF) | 0x0200;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
         // AX=150Dh — return one byte per installed CD-ROM drive at ES:BX.
         0x150D => {
             let dest = seg_offset(dos, regs, regs.es as u16, regs.rbx as u32);
             machine.write::<u8>(dest as u64, 3); // D: (A:=0)
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
         // AX=1687h — DPMI installation check

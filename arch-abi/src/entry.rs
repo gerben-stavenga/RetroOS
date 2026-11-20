@@ -1,6 +1,7 @@
 //! Frame layout and in-place conversion for the shared x86 entry assembly.
 //! No interrupt dispatch, paging, allocation, or virtual-interrupt policy.
 
+use crate::eflags;
 use crate::Regs;
 
 /// Hybrid 32-bit entry layout. Assembly saves the segments and general
@@ -72,7 +73,7 @@ mod tests {
             expected.int_num = 0x80;
             expected.err_code = 0x42;
             expected.frame = crate::Frame64 {
-                rip: 0x123456, cs: 0x23, rflags: 2 | if vm86 { 1 << 17 } else { 0 },
+                rip: 0x123456, cs: 0x23, rflags: 2 | if vm86 { u64::from(eflags::VM_FLAG) } else { 0 },
                 rsp: 0xabcdef, ss: 0x2b,
             };
             let mut frame: StackFrame = unsafe { core::mem::zeroed() };
@@ -226,7 +227,7 @@ impl StackFrame {
             }
             let (vector, error, ip, cs, flags, sp, ss) =
                 (raw.int_num, raw.err_code, raw.eip, raw.cs, raw.eflags, raw.esp, raw.ss);
-            let vm = if flags & (1 << 17) != 0 { Some(unsafe { self.raw32.vm86 }) } else { None };
+            let vm = if flags & eflags::VM_FLAG != 0 { Some(unsafe { self.raw32.vm86 }) } else { None };
             let regs = unsafe { &mut self.regs };
             regs.int_num = vector as u64;
             regs.err_code = error as u64;
@@ -250,7 +251,7 @@ impl StackFrame {
     pub unsafe fn decanonicalize(&mut self, wide: bool) {
         if wide { return; }
         let regs = unsafe { self.regs };
-        let vm = regs.frame.rflags & (1 << 17) != 0;
+        let vm = regs.frame.rflags & u64::from(eflags::VM_FLAG) != 0;
         let raw = unsafe { &mut self.raw32.raw };
         if vm { raw.gs = 0; raw.fs = 0; raw.es = 0; raw.ds = 0; }
         raw.int_num = regs.int_num as u32;

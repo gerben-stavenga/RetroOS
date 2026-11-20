@@ -1,5 +1,6 @@
 //! x86 CPU control and I/O routines
 
+use arch_abi::eflags;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -341,7 +342,7 @@ fn raw_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
             "pushfd",
             "pop ecx",
             "mov eax, ecx",
-            "xor eax, 0x200000",
+            "xor eax, {id_flag}",
             "push eax",
             "popfd",
             "pushfd",
@@ -349,7 +350,8 @@ fn raw_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
             "push ecx",
             "popfd",
             "xor eax, ecx",
-            "and eax, 0x200000",
+            "and eax, {id_flag}",
+            id_flag = const eflags::ID_FLAG,
             lateout("eax") id_changed,
             lateout("ecx") _,
         );
@@ -616,7 +618,7 @@ pub fn interrupts_enabled() -> bool {
     unsafe {
         asm!("pushfd", "pop {0:e}", out(reg) flags, options(nomem));
     }
-    flags & (1 << 9) != 0
+    flags & eflags::IF_FLAG != 0
 }
 
 /// Halt CPU until next interrupt

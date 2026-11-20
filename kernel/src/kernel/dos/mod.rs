@@ -14,6 +14,7 @@
 //! `BiosDisplayWorkspace`.
 
 extern crate alloc;
+use arch_abi::eflags;
 use alloc::vec::Vec;
 
 /// Track whether we're currently running in a hardware IRQ context.
@@ -101,8 +102,6 @@ use dos::{
 use crate::kernel::thread;
 use crate::Regs;
 
-const TF_FLAG: u32 = 1 << 8;
-const NT_FLAG: u32 = 1 << 14;
 const TF_USER: u8 = 1;
 const TF_LEARNING: u8 = 2;
 const TF_DELAY: u8 = 4;
@@ -790,7 +789,7 @@ fn enter_kernel_tf<A: crate::Arch>(
     // KVM implements single-step through KVM_GUESTDBG and consequently strips
     // TF from the returned RFLAGS. A debug event itself is authoritative that
     // the projected TF was active for the retired instruction.
-    let actual = regs.flags32() & TF_FLAG != 0
+    let actual = regs.flags32() & eflags::TF_FLAG != 0
         || matches!(event, crate::KernelEvent::DebugTrap | crate::KernelEvent::Exception(1));
     let vif = dos.dpmi.as_ref().is_some_and(|d| {
         d.vif.is_carrier_trap(regs)
@@ -957,10 +956,10 @@ fn handle_event_inner<A: crate::Arch>(
             // CLI/STI pairs replace the interrupted client's active repair
             // window: the tagged POPF/IRET after IRET still owns the next #DB.
             // vIOPL=2 learns/caches exits; vIOPL=3 always single-steps them.
-            let viopl = (regs.flags32() >> 12) & 3;
+            let viopl = (regs.flags32() & eflags::IOPL_MASK) >> eflags::IOPL_SHIFT;
             let in_hw_irq = IN_HW_IRQ_CONTEXT.load(core::sync::atomic::Ordering::Relaxed);
             if viopl >= 2 && !in_hw_irq && let Some(dpmi) = dos.dpmi.as_mut() {
-                let vif_now = regs.flags32() & (1 << 19) != 0;
+                let vif_now = regs.flags32() & eflags::VIF_FLAG != 0;
                 if vif_was_on && !vif_now {
                     dpmi.vif.on_cli(machine, regs, entry_ip, viopl == 3);
                 } else if !vif_was_on && vif_now {
@@ -1084,7 +1083,7 @@ fn handle_event_inner<A: crate::Arch>(
             // then emulate that same IRET with NT clear so its own IF image is
             // applied through the ordinary monitor path.
             if n == 10 && regs.err_code == 0
-                && regs.flags32() & NT_FLAG != 0
+                && regs.flags32() & eflags::NT_FLAG != 0
                 && let Some(dpmi) = dos.dpmi.as_mut()
             {
                 dpmi.vif.finish_carrier(regs);
@@ -1333,11 +1332,11 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     // flag from RETROOS.INI [launch] and passes 3 via SYNTH_FORK_EXEC; every other caller
     // passes 1 (spec-conforming). The DOS dispatcher does not look up launch entries itself.
     // The real run IOPL is pinned to 1 at the arch exit; this is the virtual
-    // level the PM gate reads. (Literal mask: `machine` is the arch param here.)
+    // level the PM gate reads.
     let viopl = policy.viopl;
     xms::set_report_limit(current.dos_mut(), policy.xms32k);
     let f = &mut current.kernel.vcpu.regs.frame.rflags;
-    *f = (*f & !(3u64 << 12)) | ((viopl as u64) << 12);
+    *f = (*f & !u64::from(eflags::IOPL_MASK)) | ((viopl as u64) << eflags::IOPL_SHIFT);
     current.kernel.vcpu.regs.set_pvi_policy(viopl == 1);
     let dos_state = current.dos_mut();
     dos_state.dta = (psp_seg as u32) * 16 + 0x80;
@@ -1369,20 +1368,20 @@ pub(crate) fn handle_synth_child<A: crate::Arch>(
         Op::Reap => {
             thread::reap(threads, machine, pid);
             regs.rax &= !0xFFFF;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         Op::Waitpid => {
             let (ctid, _code) = thread::peek_zombie_child(threads, tid, pid);
             if ctid >= 0 {
                 regs.rax &= !0xFFFF;                                    // AX=0 exited
                 regs.rbx = (regs.rbx & !0xFFFF) | (ctid as u16) as u64; // BX=child_pid
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else if ctid == -11 {
                 regs.rax = (regs.rax & !0xFFFF) | 1;                    // AX=1 still running
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | (-ctid) as u64;
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             }
         }
     }
@@ -1470,7 +1469,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
     // which can name `iopl3` to fall back to the always-correct stepping path.
     {
         let f = &mut t.kernel.vcpu.regs.frame.rflags;
-        *f = (*f & !(machine::IOPL_MASK as u64)) | (2u64 << 12);
+        *f = (*f & !(eflags::IOPL_MASK as u64)) | (2u64 << eflags::IOPL_SHIFT);
     }
     t.kernel.vcpu.regs.set_pvi_policy(false);
     t.dos_mut().dta = (psp_seg as u32) * 16 + 0x80;
@@ -1717,7 +1716,7 @@ pub fn audio_service<A: crate::Arch>(
 pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     // Recompute VIP from the DOS PIC at this delivery boundary. Deferred
     // continuations and callbacks must not inherit a stale pending indication.
-    regs.clear_flag32(1 << 20);
+    regs.clear_flag32(eflags::VIP_FLAG);
     // The host tick only wakes the event loop. A guest-programmed one-shot
     // may expire between ticks, including while an I/O handler runs. Latch
     // that edge before deciding which interrupt the next guest entry sees.
@@ -1767,7 +1766,7 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // specified mouse-driver reentrancy guard. `deliver_mouse_callback` clears
     // `pending_cond` for this invocation and sets `cb_in_flight`.
     let mouse = &dos.pc.mouse;
-    let mouse_ready = regs.frame.rflags & (machine::VIF_FLAG as u64) != 0
+    let mouse_ready = regs.frame.rflags & (eflags::VIF_FLAG as u64) != 0
         && !mouse.cb_in_flight
         && mouse.cb_mask & mouse.pending_cond != 0;
     if ipx::deliver_callback(machine, dos, regs) {
@@ -2222,7 +2221,7 @@ pub(crate) fn win16_int21<A: crate::Arch>(
     // creation uses WinExec/CreateProcess instead; never corrupt the NE image.
     if matches!(ah, 0x31 | 0x4b) {
         regs.rax = (regs.rax & !0xffff) | 1;
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
         return thread::KernelAction::Done;
     }
     dos::sync_win16_handles(machine, kt, dos);

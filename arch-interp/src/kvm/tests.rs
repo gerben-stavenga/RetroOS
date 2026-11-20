@@ -7,14 +7,13 @@
 //! phys memfd, so everything runs inside ONE #[test] (Rust runs tests on
 //! separate threads; a second REGS user would race).
 
+use arch_abi::eflags;
 #[cfg(test)]
 use crate::test_memory;
 
 use arch_abi::{Memory as _, Arch as _};
 use super::*;
 use crate::space::RootPageTable;
-const VIF_FLAG: u32 = 1 << 19;
-const VM_FLAG: u64 = 1 << 17;
 use arch_abi::{GuestBytes, KernelEvent, Regs, USER_CS, USER_DS};
 
 static INPUT: std::sync::Mutex<std::vec::Vec<(arch_abi::Irq, u64)>> = std::sync::Mutex::new(std::vec::Vec::new());
@@ -79,7 +78,7 @@ fn kvm_engine_proofs() {
     r.set_ip32(0x7C00);
     r.set_ss32(0);
     r.set_sp32(0x7000);
-    r.set_flags32((VM_FLAG as u32) | VIF_FLAG | 2);
+    r.set_flags32(eflags::VM_FLAG | eflags::VIF_FLAG | 2);
     set_regs(r);
     match run_to_event() {
         KernelEvent::SoftInt(0x31) => {}
@@ -88,7 +87,7 @@ fn kvm_engine_proofs() {
     let r = regs();
     assert_eq!(r.rax as u16, 0x1234, "mov ax retired before the INT");
     assert_eq!(r.ip32(), 0x7C05, "monitor advanced IP past the INT");
-    assert!(r.flags32() & (VM_FLAG as u32) != 0, "still VM86 after the trap");
+    assert!(r.flags32() & eflags::VM_FLAG != 0, "still VM86 after the trap");
 
     // Absolute one-shot alarms must preempt guest-only computation. An
     // interruption is supplied by the host timer, not a deadline pre-check.
@@ -181,7 +180,7 @@ fn kvm_engine_proofs() {
     let event = run_to_event();
     assert!(matches!(event, KernelEvent::SoftInt(0x31)), "D3X CPU probe: {event:?}");
     assert_eq!(regs().rax as u16, 0x4000, "NT must be writable in VM86");
-    assert_eq!(regs().flags32() & 0x4000, 0, "probe restored NT");
+    assert_eq!(regs().flags32() & eflags::NT_FLAG, 0, "probe restored NT");
 
     // Both IRET widths must normalize the stacked FLAGS before re-entry.
     // Return to 0100:6e10, then PUSHF/POP AX reads what the guest observes.
@@ -557,7 +556,7 @@ fn planar_device_proof(mem: &mut crate::Interp, code: u32, stack: u32) {
     for i in 0..4 { vram.put((0x30 + i) * 4, 0x70 + i as u8); }
     let mut r = Regs::empty();
     r.frame.cs = 0x9200; r.frame.ss = 0x800; r.frame.rsp = 0x1000;
-    r.frame.rflags = VM_FLAG | (1 << 9) | u64::from(VIF_FLAG) | 2;
+    r.frame.rflags = u64::from(eflags::VM_FLAG | eflags::IF_FLAG | eflags::VIF_FLAG) | 2;
     r.ds = 0xa000; r.es = 0xa001; r.fs = 0x1234; r.gs = 0x5678;
     r.rsi = 0x30; r.rdi = 0x40;
     set_regs(r);
@@ -610,13 +609,13 @@ fn planar_device_proof(mem: &mut crate::Interp, code: u32, stack: u32) {
     // until the kernel sees its page fault. Clearing TF then resumes normally.
     mem.copy_to(u64::from(code), &[0x88, 0x07, 0xcd, 0x80], test_memory::input(5));
     let mut r = Regs::empty(); r.init_user_process(code, stack);
-    r.rdi = 0xa0090; r.rax = 0x73; r.frame.rflags |= 0x100; r.set_user_tf(true);
+    r.rdi = 0xa0090; r.rax = 0x73; r.frame.rflags |= u64::from(eflags::TF_FLAG); r.set_user_tf(true);
     let untouched = vram.get(0x90 * 4 + 1);
     set_regs(r);
     assert!(matches!(run_to_event(), KernelEvent::PageFault { addr: 0xa0090 }));
     assert_eq!(regs().frame.rip, u64::from(code));
     assert_eq!(vram.get(0x90 * 4 + 1), untouched);
-    let mut r = regs(); r.frame.rflags &= !0x100; r.set_user_tf(false); set_regs(r);
+    let mut r = regs(); r.frame.rflags &= !u64::from(eflags::TF_FLAG); r.set_user_tf(false); set_regs(r);
     assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)));
     assert_eq!(vram.get(0x90 * 4 + 1), Some(0x73));
 
@@ -662,7 +661,7 @@ fn espfix_proof(mem: &mut crate::Interp, code: u32, data: u32, stack: u32, long:
         r.init_user_process(if narrow_code { 0 } else { code }, 0xabcd_8000);
         r.frame.ss = 0x0f;
         if narrow_code { r.frame.cs = 0x17; }
-        r.frame.rflags |= 0x401; // DF and CF must survive the intermediate IRET
+        r.frame.rflags |= u64::from(eflags::DF_FLAG | eflags::CF_FLAG); // DF and CF must survive the intermediate IRET
         r.rax = 0x1234_5678; r.rbx = 0x2345_6789; r.rcx = 0x3456_789a;
         r.rdx = 0x4567_89ab; r.rsi = 0x5678_9abc; r.rdi = 0x6789_abcd;
         r.rbp = 0x789a_bcde;
@@ -675,7 +674,7 @@ fn espfix_proof(mem: &mut crate::Interp, code: u32, data: u32, stack: u32, long:
         assert_eq!(got.frame.rsp, r.frame.rsp, "saved ESP high half");
         assert_eq!([got.rax, got.rbx, got.rcx, got.rdx, got.rsi, got.rdi, got.rbp],
             [r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp], "register restore");
-        assert_eq!(got.frame.rflags & 0x401, 0x401, "application flags");
+        assert_eq!(got.frame.rflags & u64::from(eflags::DF_FLAG | eflags::CF_FLAG), u64::from(eflags::DF_FLAG | eflags::CF_FLAG), "application flags");
         assert_eq!(mem.read::<u32>(u64::from(data + 4)) & 0x3703, 0x1603,
             "live flags: IOPL=1, IF=1, TF=0, DF=1, CF=1");
         if long { assert_eq!([got.r8, got.r15], [r.r8, r.r15]); }
@@ -741,8 +740,8 @@ fn espfix_resume(r: Regs, offset: u64, long: bool) {
         assert_eq!(segments.ss.selector, 0x49);
         assert_eq!(segments.ss.db, 0);
         assert_eq!(segments.efer & (1 << 10) != 0, long);
-        assert_eq!(live.rflags & ((1 << 17) | (1 << 14) | (1 << 9) | (1 << 8)), 0);
-        assert_eq!(live.rflags & (3 << 12), 1 << 12);
+        assert_eq!(live.rflags & u64::from(eflags::VM_FLAG | eflags::NT_FLAG | eflags::IF_FLAG | eflags::TF_FLAG), 0);
+        assert_eq!(live.rflags & u64::from(eflags::IOPL_MASK), 1 << eflags::IOPL_SHIFT);
         assert_eq!([live.rax, live.rbx, live.rcx, live.rdx, live.rsi, live.rdi, live.rbp],
             [r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp]);
         if offset == 1 { assert_eq!(live.rsp as u32, 0xabcd_0004); }

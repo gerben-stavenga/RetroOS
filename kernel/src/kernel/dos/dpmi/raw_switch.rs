@@ -1,4 +1,5 @@
 use crate::Regs;
+use arch_abi::eflags;
 use super::*;
 use super::super::mode_transitions;
 
@@ -21,7 +22,7 @@ fn raw_switch_pm_to_real<A: crate::Arch>(_machine: &mut A, dos: &mut thread::Dos
     let new_ip = regs.rdi as u16;
     dos.pc.locked_stack.suspend_stack(regs);
 
-    regs.frame.rflags |= machine::VM_FLAG as u64;
+    regs.frame.rflags |= eflags::VM_FLAG as u64;
     // VIF is guest state. A raw mode switch must preserve it; bit 9 remains
     // the host's real IF and is projected independently at user entry.
     regs.frame.cs = new_cs as u64;
@@ -150,7 +151,7 @@ pub(in crate::kernel::dos) fn raw_switch_real_to_pm<A: crate::Arch>(_machine: &m
         (esp, eip)
     };
 
-    regs.frame.rflags &= !(machine::VM_FLAG as u64);
+    regs.frame.rflags &= !(eflags::VM_FLAG as u64);
     // Preserve the VIF returned by the real-mode side.
     regs.frame.cs = new_cs as u64;
     regs.frame.rip = new_eip as u64;

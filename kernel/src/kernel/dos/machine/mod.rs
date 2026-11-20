@@ -15,17 +15,10 @@
 
 extern crate alloc;
 
+use arch_abi::eflags;
 use crate::Regs;
 use crate::kernel::bios_display::DosVideo;
 
-pub const IF_FLAG: u32 = 1 << 9;
-/// VIF — the guest's virtual interrupt flag (EFLAGS bit 19). The DOS layer's
-/// single virtual-IF store; bit 9 (IF) is the real interrupt flag only. The
-/// kernel reads/writes the guest's IF here; a flags word the guest *observes*
-/// (a FLAGS pushed into a guest IRET frame) carries VIF in the bit-9 slot via
-/// `guest_flags`.
-pub const VIF_FLAG: u32 = 1 << 19;
-pub const IOPL_MASK: u32 = 3 << 12;
 /// IOPL=1 — the default *virtual* IOPL a process is born with at execv:
 /// spec-CONFORMING (DPMI 0.9 §2.13), so CLI/STI are virtualized but POPF/IRET
 /// are left ignored and no single-stepping is armed (full speed). It is NOT the
@@ -34,8 +27,7 @@ pub const IOPL_MASK: u32 = 3 << 12;
 /// PM gate (`virtual_if_stepping`). Non-conforming clients that re-enable IF via
 /// POPF/IRET (DOOM/DOOM2/HEXEN, marked in RETROOS.INI [launch]) are launched at IOPL=3 so
 /// the monitor steps those re-enables. VM86 is unaffected (the gate is PM-only).
-pub const IOPL_DEFAULT: u32 = 1 << 12;
-pub const VM_FLAG: u32 = 1 << 17;
+pub const IOPL_DEFAULT: u32 = 1 << eflags::IOPL_SHIFT;
 
 
 /// HMA spans 16 pages (64KB) starting at page 0x100. Permanently aliased over
@@ -73,10 +65,10 @@ pub fn vm86_sp(regs: &Regs) -> u16 {
 #[inline]
 pub fn guest_flags(regs: &Regs) -> u32 {
     let f = regs.flags32();
-    let vif = f & VIF_FLAG != 0;
-    (f & !(IF_FLAG | VIF_FLAG | (1 << 8)))
-        | if vif { IF_FLAG } else { 0 }
-        | if regs.user_tf() { 1 << 8 } else { 0 }
+    let vif = f & eflags::VIF_FLAG != 0;
+    (f & !(eflags::IF_FLAG | eflags::VIF_FLAG | eflags::TF_FLAG))
+        | if vif { eflags::IF_FLAG } else { 0 }
+        | if regs.user_tf() { eflags::TF_FLAG } else { 0 }
 }
 
 pub fn vm86_flags(regs: &Regs) -> u32 {
@@ -107,20 +99,20 @@ pub fn set_vm86_flags(regs: &mut Regs, flags: u32) {
     // always runs the guest interruptible, the guest's IF is VIF — so a
     // canonical flags word is well-formed wherever it lands in a frame,
     // and bit 9 never carries guest state.
-    let want_vif = flags & IF_FLAG != 0;
-    let want_tf = flags & (1 << 8) != 0;
+    let want_vif = flags & eflags::IF_FLAG != 0;
+    let want_tf = flags & eflags::TF_FLAG != 0;
     // The guest's IOPL bits (12-13) are NOT real state: under VME the VM86 flags
     // image reads back IOPL=3 regardless of the pinned real IOPL=1 (KVM), while
     // TCG hands back the literal 1. Never trust them — preserve the kernel-owned
     // virtual IOPL already in the frame (restored from the VIOPL stash on entry),
     // the same reason bit 9 (IF) is forced and routed through VIF.
-    let viopl = regs.frame.rflags & (IOPL_MASK as u64);
+    let viopl = regs.frame.rflags & (eflags::IOPL_MASK as u64);
     regs.frame.rflags = (regs.frame.rflags & !0xFFFF)
-        | ((flags as u64 & 0xFFFF) & !((IF_FLAG | IOPL_MASK) as u64))
-        | IF_FLAG as u64
+        | ((flags as u64 & 0xFFFF) & !((eflags::IF_FLAG | eflags::IOPL_MASK) as u64))
+        | eflags::IF_FLAG as u64
         | viopl;
-    if want_vif { regs.frame.rflags |= VIF_FLAG as u64; }
-    else        { regs.frame.rflags &= !(VIF_FLAG as u64); }
+    if want_vif { regs.frame.rflags |= eflags::VIF_FLAG as u64; }
+    else        { regs.frame.rflags &= !(eflags::VIF_FLAG as u64); }
     regs.set_user_tf(want_tf);
     regs.project_tf();
 }
@@ -132,14 +124,14 @@ pub fn set_vm86_flags(regs: &mut Regs, flags: u32) {
 /// `set_vm86_flags`) — never read, never guest-controlled.
 #[inline]
 pub fn apply_guest_flags(regs: &mut Regs, image: u32) {
-    let want_vif = image & IF_FLAG != 0;
-    let want_tf = image & (1 << 8) != 0;
-    let vm = regs.flags32() & VM_FLAG;
+    let want_vif = image & eflags::IF_FLAG != 0;
+    let want_tf = image & eflags::TF_FLAG != 0;
+    let vm = regs.flags32() & eflags::VM_FLAG;
     // Preserve the kernel-owned virtual IOPL (see `set_vm86_flags`): the guest's
     // IOPL bits are a VME artifact under KVM, never trusted — like IF.
-    let viopl = regs.flags32() & IOPL_MASK;
-    let mut nf = (image & !(IF_FLAG | VIF_FLAG | VM_FLAG | IOPL_MASK)) | vm | IF_FLAG | viopl;
-    if want_vif { nf |= VIF_FLAG; }
+    let viopl = regs.flags32() & eflags::IOPL_MASK;
+    let mut nf = (image & !(eflags::IF_FLAG | eflags::VIF_FLAG | eflags::VM_FLAG | eflags::IOPL_MASK)) | vm | eflags::IF_FLAG | viopl;
+    if want_vif { nf |= eflags::VIF_FLAG; }
     regs.set_flags32(nf);
     regs.set_user_tf(want_tf);
     regs.project_tf();
@@ -151,7 +143,7 @@ pub fn apply_guest_flags(regs: &mut Regs, image: u32) {
 /// supplied flags with `set_vm86_flags`; raw switches preserve virtual IF.
 #[inline]
 pub fn vm86_entry_flags(current: u32) -> u32 {
-    VM_FLAG | VIF_FLAG | IF_FLAG | (current & IOPL_MASK)
+    eflags::VM_FLAG | eflags::VIF_FLAG | eflags::IF_FLAG | (current & eflags::IOPL_MASK)
 }
 
 /// Guest-view flags image with the IF slot forced ON — for kernel-built
@@ -159,7 +151,7 @@ pub fn vm86_entry_flags(current: u32) -> u32 {
 /// launched RM helper that waits on a keypress IRQ).
 #[inline]
 pub fn guest_flags_if_on(regs: &Regs) -> u32 {
-    guest_flags(regs) | IF_FLAG
+    guest_flags(regs) | eflags::IF_FLAG
 }
 
 /// Guest-view flags image for an INT-style handler entry: the IF slot and TF
@@ -167,7 +159,7 @@ pub fn guest_flags_if_on(regs: &Regs) -> u32 {
 /// itself would push before vectoring.
 #[inline]
 pub fn guest_flags_handler_entry(regs: &Regs) -> u32 {
-    guest_flags(regs) & !(IF_FLAG | (1 << 8))
+    guest_flags(regs) & !(eflags::IF_FLAG | eflags::TF_FLAG)
 }
 
 pub(crate) mod mmio;
@@ -999,7 +991,7 @@ pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kerne
         let b = guest_inb(machine, bios, pc, port + i as u16);
         machine.write::<u8>((es_base.wrapping_add(di.wrapping_add(i))) as u64, b);
     }
-    let df = regs.flags32() & (1 << 10) != 0;
+    let df = regs.flags32() & eflags::DF_FLAG != 0;
     advance_string_index(&mut regs.rdi, size, addr32, df);
     if rep { dec_rep_count(regs, addr32); }
 }
@@ -1014,7 +1006,7 @@ pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kern
         let b = machine.read::<u8>((ds_base.wrapping_add(si.wrapping_add(i))) as u64);
         guest_outb(machine, bios, pc, regs, port + i as u16, b);
     }
-    let df = regs.flags32() & (1 << 10) != 0;
+    let df = regs.flags32() & eflags::DF_FLAG != 0;
     advance_string_index(&mut regs.rsi, size, addr32, df);
     if rep { dec_rep_count(regs, addr32); }
 }
@@ -1219,17 +1211,16 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
 /// `sti` mid-handler — and the VME pending-interrupt `#GP` that fires there
 /// always has something real to deliver, so it can't spin.
 pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
-    const VIP: u64 = 1 << 20;
-    let vif = regs.frame.rflags & (VIF_FLAG as u64) != 0; // guest virtual interrupt flag
+    let vif = regs.frame.rflags & (eflags::VIF_FLAG as u64) != 0; // guest virtual interrupt flag
     let candidate = pc.vpic.peek();
 
     if !vif {
         // Can't deliver now — latch/clear VIP to mirror whether anything would
         // be deliverable the moment the guest re-enables interrupts.
         if candidate.is_some() {
-            regs.frame.rflags |= VIP;
+            regs.frame.rflags |= u64::from(eflags::VIP_FLAG);
         } else {
-            regs.frame.rflags &= !VIP;
+            regs.frame.rflags &= !u64::from(eflags::VIP_FLAG);
         }
         return None;
     }
@@ -1237,7 +1228,7 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
     // IF=1: deliver the highest-priority deliverable line, else make sure VIP
     // is clear so a VME delivery-#GP doesn't re-fire with nothing to hand over.
     let Some(irq) = candidate else {
-        regs.frame.rflags &= !VIP;
+        regs.frame.rflags &= !u64::from(eflags::VIP_FLAG);
         return None;
     };
 
@@ -1251,7 +1242,7 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
                 crate::compact_dbg_println!("[kbd] spurious IRQ1 cleared");
             }
             pc.vpic.clear_request(1);
-            regs.frame.rflags &= !VIP;
+            regs.frame.rflags &= !u64::from(eflags::VIP_FLAG);
             return None;
         }
         if vkbd::KBD_TRACE {
@@ -1262,7 +1253,7 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
     }
 
     pc.vpic.ack(irq);
-    regs.frame.rflags &= !VIP; // interrupt is being serviced
+    regs.frame.rflags &= !u64::from(eflags::VIP_FLAG); // interrupt is being serviced
     let vec = if irq < 8 { 0x08 + irq } else { 0x70 + (irq - 8) };
     Some(vec)
 }

@@ -968,7 +968,7 @@ mod vm86 {
 
         // VM86 iret frame (32-bit iretd from CPL0 to VM86 pops 9 dwords):
         //   EIP, CS, EFLAGS, ESP, SS, ES, DS, FS, GS
-        let vm_flags = (1u32 << 17) | 2; // VM | reserved
+        let vm_flags = arch_abi::eflags::VM_FLAG | arch_abi::eflags::FIXED_ONE; // VM | reserved
         let frame: [u32; 9] = [
             0x0000,  // EIP
             0x1000,  // CS  (base 0x10000)
@@ -1009,7 +1009,7 @@ mod vm86 {
         let cr2 = uc.reg_read(RegisterX86::CR2).unwrap();
         let eip = uc.reg_read(RegisterX86::EIP).unwrap();
         let ax = uc.reg_read(RegisterX86::EAX).unwrap() & 0xFFFF;
-        let vm = uc.reg_read(RegisterX86::EFLAGS).unwrap() & (1<<17);
+        let vm = uc.reg_read(RegisterX86::EFLAGS).unwrap() & u64::from(arch_abi::eflags::VM_FLAG);
         eprintln!("vm86_paged: r={r:?} ax={ax:#x} vm_flag={vm:#x} intr={} cr2={cr2:#x} eip={eip:#x}",
                   VEC.with(|c| c.get()));
         assert_eq!(ax, 0x1234, "VM86 code ran through the page-table translation");

@@ -1,4 +1,5 @@
 //! BIOS equipment, memory and system services: INT 11h, 12h and 15h.
+use arch_abi::eflags;
 use crate::Regs;
 use crate::kernel::dos::machine::vm86_set_return_flag;
 use super::Bda;
@@ -24,18 +25,18 @@ pub(super) fn int15<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
         0x84 => match regs.rdx as u16 {
             0 => {
                 regs.rax = (regs.rax & !0xFF) | 0xF0;
-                vm86_set_return_flag(machine, regs, 1, false);
+                vm86_set_return_flag(machine, regs, eflags::CF_FLAG as u16, false);
             }
             1 => {
                 regs.rax &= !0xFFFF;
                 regs.rbx &= !0xFFFF;
                 regs.rcx &= !0xFFFF;
                 regs.rdx &= !0xFFFF;
-                vm86_set_return_flag(machine, regs, 1, false);
+                vm86_set_return_flag(machine, regs, eflags::CF_FLAG as u16, false);
             }
             _ => {
                 regs.rax = (regs.rax & !0xFF00) | 0x8600;
-                vm86_set_return_flag(machine, regs, 1, true);
+                vm86_set_return_flag(machine, regs, eflags::CF_FLAG as u16, true);
             }
         },
         // AH=87h block move: the ROM does this via a protected-mode LGDT
@@ -46,7 +47,7 @@ pub(super) fn int15<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
         // sanctioned path). AH=86h = "unsupported", CF set.
         0x89 => {
             regs.rax = (regs.rax & !0xFF00) | 0x8600;
-            vm86_set_return_flag(machine, regs, 1, true);
+            vm86_set_return_flag(machine, regs, eflags::CF_FLAG as u16, true);
         }
         _ => {},
     }
@@ -71,5 +72,5 @@ fn int15_block_move<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     let len = (regs.rcx as usize & 0xFFFF) * 2;
     machine.copy_within(src as u64,dst as u64, len);
     regs.rax &= !0xFF00;       // AH = 0 (success)
-    vm86_set_return_flag(machine, regs, 1, false);  // CF = 0
+    vm86_set_return_flag(machine, regs, eflags::CF_FLAG as u16, false);  // CF = 0
 }

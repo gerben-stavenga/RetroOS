@@ -1,5 +1,6 @@
 //! Resident planar emulation. Entry lends general registers and instruction
 //! operands; this module never owns or rewrites an interrupt frame.
+use arch_abi::eflags;
 use ::planar::instruction::{self, FaultBus, Operands};
 
 #[thread_local]
@@ -44,7 +45,7 @@ unsafe extern "C" fn instruction_hook(stack: &mut arch_abi::entry::StackFrame, w
 fn instruction(state: crate::entry::InstructionState<'_>) -> bool {
     // Only data faults prove the CPU fetched this instruction. Debugging
     // and pending virtual interrupts must go through normal dispatch.
-    if *state.flags & 0x100 != 0 || *state.flags & (3 << 19) == 3 << 19
+    if *state.flags & eflags::TF_FLAG != 0 || *state.flags & (eflags::VIF_FLAG | eflags::VIP_FLAG) == (eflags::VIF_FLAG | eflags::VIP_FLAG)
         || !match state.vector { 14 => state.error & !3 == 4, 13 => state.error == 0, _ => false }
     { return false; }
     handle(&mut Operands { gprs: state.gprs, high: state.high, ip: state.ip, flags: state.flags },
@@ -81,7 +82,7 @@ pub(crate) fn handle(regs: &mut Operands<'_>, selectors: [u16; 6], vector: u64) 
     let Some(context) = (unsafe { (&mut *(&raw mut ACTIVE)).as_mut() }) else { return false };
     let state = unsafe { &*context.state };
     if state.enabled.get() == 0 { return false; }
-    let vm86 = *regs.flags & (1 << 17) != 0;
+    let vm86 = *regs.flags & eflags::VM_FLAG != 0;
     let key = u32::from(selectors[1]) | if vm86 { 0 } else { 1 << 20 };
     if context.cs_mode != key { context.set_code(selectors[1], vm86); }
     let profile = state.profile_enabled.get() != 0;

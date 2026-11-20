@@ -5,6 +5,7 @@
 
 #![allow(static_mut_refs)]
 
+use arch_abi::eflags;
 #[cfg(not(feature = "kvm"))]
 use crate::irq::handle_irq;
 use crate::paging2;
@@ -370,7 +371,7 @@ pub(crate) fn guest_trap(regs: &mut Regs) -> Outcome {
         return Outcome::ReturnToKernel(arch_abi::KernelEvent::Irq);
     }
     if regs.int_num == 10 {
-        let carrier_iret = regs.err_code == 0 && regs.flags32() & (1 << 14) != 0;
+        let carrier_iret = regs.err_code == 0 && regs.flags32() & eflags::NT_FLAG != 0;
         if !carrier_iret {
             let cs_base = if regs.mode() == UserMode::VM86 {
                 (regs.code_seg() as u32) << 4
@@ -401,7 +402,7 @@ pub(crate) fn guest_trap(regs: &mut Regs) -> Outcome {
                 UserMode::VM86 => KE::Exception(1),
                 UserMode::Mode32 => KE::DebugTrap,
                 _ => {
-                    regs.clear_flag32(1 << 8); // stale internal TF
+                    regs.clear_flag32(eflags::TF_FLAG); // stale internal TF
                     return Outcome::Resume;
                 }
             }
@@ -421,13 +422,13 @@ pub(crate) fn guest_trap(regs: &mut Regs) -> Outcome {
             // fault: bubble it as an IRQ and let `pick_pending_vec` choose the
             // highest-priority deliverable line. The Fault path leaves IP on
             // the (innocent) instruction, so it re-runs after the handler IRETs.
-            const VIF_VIP: u32 = (1 << 19) | (1 << 20);
+            const VIF_VIP: u32 = eflags::VIF_FLAG | eflags::VIP_FLAG;
             let pending_virtual_irq = regs.flags32() & VIF_VIP == VIF_VIP;
             // Where this instruction lives, and whether virtual IF was on before
             // it ran: a PM CLI/STI that toggles virtual IF is a window boundary,
             // reflected to `dpmi::vif`.
             let entry_ip = regs.ip32();
-            let vif_was_on = regs.flags32() & (1 << 19) != 0;
+            let vif_was_on = regs.flags32() & eflags::VIF_FLAG != 0;
             let stepped = arch_abi::monitor::stepping(regs);
             let user_was = regs.user_tf();
             match arch_abi::monitor::monitor(&mut crate::backend::Metal, regs) {
@@ -436,16 +437,16 @@ pub(crate) fn guest_trap(regs: &mut Regs) -> Outcome {
                     // dpmi::vif (which owns the per-space tag/learn policy). VM86
                     // handles POPF/IRET on its own #GP (VME) and needs no tag.
                     if regs.mode() != UserMode::VM86
-                        && (regs.flags32() & (1 << 19) != 0) != vif_was_on
+                        && (regs.flags32() & eflags::VIF_FLAG != 0) != vif_was_on
                     {
                         let flags = regs.flags32();
-                        let vif_now = flags & (1 << 19) != 0;
-                        let viopl = (flags >> 12) & 3;
+                        let vif_now = flags & eflags::VIF_FLAG != 0;
+                        let viopl = (flags & eflags::IOPL_MASK) >> eflags::IOPL_SHIFT;
                         if viopl >= 2 {
                             // Repair/reference modes need the CLI boundary in
                             // ring 1 to learn or step a later POPF/IRET exit.
                             KE::VifWindow { entry_ip, vif_was_on }
-                        } else if vif_now && flags & (1 << 20) != 0 {
+                        } else if vif_now && flags & eflags::VIP_FLAG != 0 {
                             // Strict mode has no learning work. Bubble out only
                             // when STI made a pending virtual IRQ deliverable.
                             KE::Irq

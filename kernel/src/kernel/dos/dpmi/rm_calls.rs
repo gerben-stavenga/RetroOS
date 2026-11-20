@@ -1,4 +1,5 @@
 use crate::Regs;
+use arch_abi::eflags;
 use super::*;
 use super::super::mode_transitions;
 use super::super::mode_transitions::RmCallStruct;
@@ -20,7 +21,7 @@ impl Transfer {
             Self::FarCall => flags,
             // DPMI 0300/0302 push the supplied FLAGS unchanged, but enter
             // the RM handler with IF and TF clear.
-            Self::Interrupt(_) | Self::Iret => flags & !(machine::IF_FLAG | (1 << 8)),
+            Self::Interrupt(_) | Self::Iret => flags & !(eflags::IF_FLAG | eflags::TF_FLAG),
         }
     }
 }
@@ -116,7 +117,7 @@ pub(in crate::kernel::dos) fn direct_int21_iret<A: crate::Arch>(
         };
         regs.frame.cs = rm.cs as u64;
         regs.frame.rip = rm.ip as u64;
-        regs.frame.rflags |= machine::VM_FLAG as u64;
+        regs.frame.rflags |= eflags::VM_FLAG as u64;
         machine::set_vm86_flags(regs, Transfer::Iret.entry_flags(rm.flags));
 
         let action = super::super::dos::dispatch_synchronous_rm_int21(
@@ -186,12 +187,12 @@ mod tests {
             for control in [0, 0x100, 0x200, 0x300] {
                 let supplied = 0x0CD7 | control; // arithmetic flags and DF
                 let mut regs = Regs::empty();
-                regs.set_flags32(machine::VM_FLAG | machine::VIF_FLAG | machine::IOPL_DEFAULT);
+                regs.set_flags32(eflags::VM_FLAG | eflags::VIF_FLAG | machine::IOPL_DEFAULT);
                 machine::set_vm86_flags(&mut regs, transfer.entry_flags(supplied));
                 assert_eq!(machine::guest_flags(&regs) & 0x0FD7, 0x0CD7);
-                assert_eq!(regs.flags32() & machine::VIF_FLAG, 0);
+                assert_eq!(regs.flags32() & eflags::VIF_FLAG, 0);
                 assert!(!regs.user_tf());
-                assert_ne!(regs.flags32() & machine::VM_FLAG, 0);
+                assert_ne!(regs.flags32() & eflags::VM_FLAG, 0);
             }
         }
     }
@@ -201,7 +202,7 @@ mod tests {
         for control in [0, 0x100, 0x200, 0x300] {
             let supplied = 0x0CD7 | control;
             let mut regs = Regs::empty();
-            regs.set_flags32(machine::VM_FLAG | machine::VIF_FLAG | machine::IOPL_DEFAULT);
+            regs.set_flags32(eflags::VM_FLAG | eflags::VIF_FLAG | machine::IOPL_DEFAULT);
             machine::set_vm86_flags(&mut regs, Transfer::FarCall.entry_flags(supplied));
             assert_eq!(machine::guest_flags(&regs) & 0x0FD7, u32::from(supplied));
             assert_eq!(regs.user_tf(), control & 0x100 != 0);

@@ -33,14 +33,11 @@
 //! is invalidated per page when code is written. arch's only job is to reflect
 //! the `#GP`/`#DB` and let us drive `regs` + guest memory.
 
+use arch_abi::eflags;
 use crate::{Arch, Regs, UserMode};
 
 // EFLAGS bits.
-const IF_FLAG: u32 = 1 << 9;
-const TF_FLAG: u32 = 1 << 8;
-const NT_FLAG: u32 = 1 << 14;
-const CARRIER_FLAGS: u32 = TF_FLAG | NT_FLAG;
-const VIF_FLAG: u32 = 1 << 19; // our virtual IF (host-only bit)
+const CARRIER_FLAGS: u32 = eflags::TF_FLAG | eflags::NT_FLAG;
 
 /// How a window exits, learned per CLI site.
 #[derive(Clone, Copy)]
@@ -204,7 +201,7 @@ impl VifMap {
     /// An `STI` `#GP`'d: it re-enabled IF on its own. If we were learning, this
     /// site's exit is an STI. (arch has already reflected the fault; we set VIF.)
     pub fn on_sti(&mut self, regs: &mut Regs) {
-        regs.set_flags32(regs.flags32() | VIF_FLAG);
+        regs.set_flags32(regs.flags32() | eflags::VIF_FLAG);
         if let Some(a) = self.active.take()
             && a.learning
         {
@@ -224,7 +221,7 @@ impl VifMap {
             _ => {
                 // Post-tag (or self-heal of a leaked tag): restore VIF, one
                 // instruction late; clear TF.
-                regs.set_flags32(regs.flags32() | VIF_FLAG);
+                regs.set_flags32(regs.flags32() | eflags::VIF_FLAG);
                 self.active = None;
                 self.stats[2] = self.stats[2].wrapping_add(1);
                 DbResult::Resume
@@ -236,16 +233,16 @@ impl VifMap {
     /// away after attributing the event, but leaves NT in the saved frame.
     /// RetroOS has no hardware nested tasks and reserves NT for this purpose.
     pub fn is_carrier_trap(&self, regs: &Regs) -> bool {
-        regs.flags32() & NT_FLAG != 0
+        regs.flags32() & eflags::NT_FLAG != 0
     }
 
     /// Complete a tagged CLI window without touching the saved flags carrier.
     /// This is shared by its ordinary #DB and the #TS fallback for an IRET
     /// attempted during TF's one-instruction delay.
     pub fn finish_carrier(&mut self, regs: &mut Regs) {
-        regs.clear_flag32(NT_FLAG);
+        regs.clear_flag32(eflags::NT_FLAG);
         regs.set_user_tf(false);
-        regs.set_flags32(regs.flags32() | VIF_FLAG);
+        regs.set_flags32(regs.flags32() | eflags::VIF_FLAG);
         regs.project_tf();
         self.active = None;
         self.stats[2] = self.stats[2].wrapping_add(1);
@@ -266,7 +263,7 @@ impl VifMap {
     fn step_learn<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs) -> DbResult {
         const BUDGET: usize = 64;
         for _ in 0..BUDGET {
-            if regs.flags32() & VIF_FLAG != 0 {
+            if regs.flags32() & eflags::VIF_FLAG != 0 {
                 self.active = None;
                 return DbResult::Resume;
             }
@@ -302,14 +299,14 @@ impl VifMap {
             regs.project_tf();
             match monitored {
                 arch_abi::monitor::MonitorResult::Resume => {
-                    if regs.flags32() & VIF_FLAG != 0 {
+                    if regs.flags32() & eflags::VIF_FLAG != 0 {
                         if let Some(a) = self.active {
                             let class = classify_exit(arch, regs, &a, op, op32, sp_before, ip_before);
                             self.sites.insert(a.cli_linear, class);
                         }
                         // A probe carrier was consumed through the monitor, so
                         // no hardware #DB will clear its NT provenance marker.
-                        regs.clear_flag32(NT_FLAG);
+                        regs.clear_flag32(eflags::NT_FLAG);
                         self.active = None;
                         return DbResult::Resume;
                     }
@@ -416,7 +413,7 @@ pub enum DbResult {
 /// Saved flags we intend to re-enable IF from: IF set, reserved bit 1 set, TF
 /// clear. Checks only the low 16 bits, valid for a 16- or 32-bit pushed image.
 fn looks_like_flags(w: u32) -> bool {
-    w & IF_FLAG != 0 && w & 2 != 0 && w & CARRIER_FLAGS == 0
+    w & eflags::IF_FLAG != 0 && w & 2 != 0 && w & CARRIER_FLAGS == 0
 }
 
 fn stack_base<A: Arch>(regs: &Regs) -> u32 {
@@ -598,16 +595,16 @@ mod tests {
     fn nt_distinguishes_vif_carrier_from_guest_tf() {
         let mut vif = VifMap::new();
         let mut regs = Regs::empty();
-        regs.set_flags32(2 | TF_FLAG);
+        regs.set_flags32(2 | eflags::TF_FLAG);
         assert!(!vif.is_carrier_trap(&regs));
 
         // Trap attribution projects physical TF away before VIF consumes it;
         // NT alone must keep identifying the already-attributed carrier.
-        regs.set_flags32(2 | NT_FLAG);
+        regs.set_flags32(2 | eflags::NT_FLAG);
         assert!(vif.is_carrier_trap(&regs));
         vif.finish_carrier(&mut regs);
         assert_eq!(regs.flags32() & CARRIER_FLAGS, 0);
-        assert_ne!(regs.flags32() & VIF_FLAG, 0);
+        assert_ne!(regs.flags32() & eflags::VIF_FLAG, 0);
         assert_eq!(vif.stats[2], 1);
     }
 }

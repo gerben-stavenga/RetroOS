@@ -4,6 +4,7 @@
 //! only in this kernel-owned persistent workspace, synchronously servicing
 //! operations on a move-only `NativeVga`.
 
+use arch_abi::eflags;
 use crate::{Arch, Regs, Vcpu};
 use arch_abi::IoSize;
 use alloc::vec::Vec;
@@ -68,7 +69,8 @@ fn prepare_bios_int10<A: Arch>(machine: &mut A, regs: &mut Regs) {
         rip: 0,
         cs: (base >> 4) as u64,
         // VM, virtual IF, real IF, and kernel IOPL.
-        rflags: (1 << 17) | (1 << 19) | (1 << 9) | (1 << 12) | 2,
+        rflags: u64::from(eflags::VM_FLAG | eflags::VIF_FLAG | eflags::IF_FLAG
+            | (1 << eflags::IOPL_SHIFT) | eflags::FIXED_ONE),
         rsp: 0xF000,
         ss: (base >> 4) as u64,
     };

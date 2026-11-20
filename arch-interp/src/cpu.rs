@@ -15,10 +15,11 @@
 //! * A run ends at the first sensitive event (software `INT`, port `IN`/`OUT`,
 //!   an illegal access → `PageFault`) or the host-time limit (`Irq`).
 
+use arch_abi::eflags;
 use crate::sysdesc::{
     ensure_sys_window, if_to_vif, sys_phys, sys_ptr, vif_to_if, ensure_tables, GDT_ADDR, GDT_BYTES,
-    IOPL_MASK, KERNEL_CS, KERNEL_DS, LDT_ADDR, LDT_SEL, NT_FLAG, RING0_SP_TOP, SYS_BASE,
-    SYS_SIZE, TRAMP_ADDR, VIF_FLAG, VM_FLAG,
+    KERNEL_CS, KERNEL_DS, LDT_ADDR, LDT_SEL, RING0_SP_TOP, SYS_BASE,
+    SYS_SIZE, TRAMP_ADDR,
 };
 use crate::vcpu;
 use arch_abi::monitor::MonitorResult;
@@ -81,7 +82,7 @@ fn reflect_vm86_inline<'a>(uc: &mut Unicorn<'a, Ctx>, vector: u8) {
     let _ = uc.reg_write(R::ESP, sp as u64);
     let _ = uc.reg_write(R::CS, new_cs as u64);
     let _ = uc.reg_write(R::EIP, new_ip as u64);
-    let _ = uc.reg_write(R::EFLAGS, (flags & !0x300) as u64); // clear IF (0x200) + TF (0x100)
+    let _ = uc.reg_write(R::EFLAGS, (flags & !(eflags::IF_FLAG | eflags::TF_FLAG)) as u64); // clear IF and TF
 }
 
 /// Build the Unicorn instance and install the event hooks. Guest physical RAM is
@@ -155,7 +156,7 @@ fn build() -> Unicorn<'static, Ctx> {
         // through IVT[0Dh] — a guest disk/UMB handler — instead of the monitor).
         // #PF (14/8) is excluded above (the paging backend's). PM faults bubble.
         let _ = is_int;
-        let in_vm86 = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0) & VM_FLAG != 0;
+        let in_vm86 = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0) & u64::from(eflags::VM_FLAG) != 0;
         if vector == 0 && in_vm86 {
             // VM86 exceptions normally stay inside the arch backend: reflect
             // straight through IVT[0] so a real-mode runtime's own handler can
@@ -506,7 +507,7 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
                 // OPENS an interrupts-off window, which is what the gate keys
                 // its learned exit breakpoints on.
                 let entry_ip = vcpu.ip32();
-                let vif_was_on = vcpu.flags32() & VIF_FLAG != 0;
+                let vif_was_on = vcpu.flags32() & eflags::VIF_FLAG != 0;
                 let stepped = arch_abi::monitor::stepping(&vcpu.regs);
                 let user_was = vcpu.user_tf();
                 match arch_abi::monitor::monitor(&mut crate::backend::Interp, &mut vcpu.regs) {
@@ -516,13 +517,13 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
                         // policy + the per-space map). VM86 handles POPF/IRET on
                         // its own #GP and needs no tag, so it never reflects.
                         if mode != UserMode::VM86
-                            && (vcpu.flags32() & VIF_FLAG != 0) != vif_was_on
+                            && (vcpu.flags32() & eflags::VIF_FLAG != 0) != vif_was_on
                         {
                             return KernelEvent::VifWindow { entry_ip, vif_was_on };
                         }
                         // Match native VME/PVI: an emulated flag-changing
                         // instruction made the frame's pending IRQ deliverable.
-                        const VIF_VIP: u32 = (1 << 19) | (1 << 20);
+                        const VIF_VIP: u32 = eflags::VIF_FLAG | eflags::VIP_FLAG;
                         if vcpu.flags32() & VIF_VIP == VIF_VIP {
                             return KernelEvent::Irq;
                         }
@@ -756,7 +757,7 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
     // store. Descriptor edits and address-space changes require a full entry.
     if mode == UserMode::Mode32 && !crate::desc::tables_dirty()
         && uc.reg_read(RegisterX86::CR0).unwrap_or(0) & 0x8000_0001 == 0x8000_0001
-        && uc.reg_read(RegisterX86::EFLAGS).unwrap_or(VM_FLAG) & VM_FLAG == 0
+        && uc.reg_read(RegisterX86::EFLAGS).unwrap_or(u64::from(eflags::VM_FLAG)) & u64::from(eflags::VM_FLAG) == 0
         && uc.reg_read(RegisterX86::CR3).unwrap_or(u64::MAX)
             == crate::paging::frame_phys(crate::paging::active_pd()) as u64
         && [
@@ -765,7 +766,7 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             (RegisterX86::FS, r.fs as u16), (RegisterX86::GS, r.gs as u16),
         ].into_iter().all(|(reg, selector)| uc.reg_read(reg).ok() == Some(selector as u64))
     {
-        let flags = vif_to_if((r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32) & !NT_FLAG) | (1 << 12) | 2);
+        let flags = vif_to_if((r.flags32() & !eflags::VM_FLAG & !eflags::IOPL_MASK & !eflags::NT_FLAG) | (1 << eflags::IOPL_SHIFT) | eflags::FIXED_ONE);
         w(uc, RegisterX86::EFLAGS, flags as u64);
         w(uc, RegisterX86::ESP, r.sp32() as u64);
         return r.ip32() as u64;
@@ -784,7 +785,7 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             // interrupt state. NEVER IOPL=3: that lets the guest toggle the real
             // IF behind the kernel's back and bypasses the per-swap-in IO bitmap.
             // Project VIF (bit 19) into the bit-9 IF slot the guest runs with.
-            let flags = vif_to_if((r.flags32() & !(IOPL_MASK as u32)) | (VM_FLAG as u32) | (1 << 12) | 2);
+            let flags = vif_to_if((r.flags32() & !eflags::IOPL_MASK) | eflags::VM_FLAG | (1 << eflags::IOPL_SHIFT) | eflags::FIXED_ONE);
             let frame = [
                 r.ip32() & 0xFFFF,
                 r.code_seg() as u32,
@@ -808,7 +809,7 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             // *virtual* IOPL rides in the saved flags too and must not reach the
             // CPU: the real IOPL is pinned to 1 (never 3 — that would let the
             // client toggle the host's interrupt flag and bypass the I/O bitmap).
-            let flags = vif_to_if((r.flags32() & !(VM_FLAG as u32) & !(IOPL_MASK as u32) & !NT_FLAG) | (1 << 12) | 2);
+            let flags = vif_to_if((r.flags32() & !eflags::VM_FLAG & !eflags::IOPL_MASK & !eflags::NT_FLAG) | (1 << eflags::IOPL_SHIFT) | eflags::FIXED_ONE);
             let frame = [r.ip32(), r.code_seg() as u32, flags, r.sp32(), r.frame.ss as u32];
             let segs = [r.ds as u16, r.es as u16, r.fs as u16, r.gs as u16];
             run_trampoline(uc, &frame, Some(segs))
@@ -818,7 +819,7 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             // run flat-32 at CPL3 via the same trampoline so memory still goes
             // through the page tables. (Smoke paths only.) IOPL=1 like every
             // other ring-3 guest — never IOPL=3.
-            let flags = (r.frame.rflags as u32 & !(IOPL_MASK as u32)) | (1 << 12) | 2;
+            let flags = (r.frame.rflags as u32 & !eflags::IOPL_MASK) | (1 << eflags::IOPL_SHIFT) | eflags::FIXED_ONE;
             use arch_abi::{USER_CS, USER_DS};
             let frame = [r.frame.rip as u32, USER_CS as u32, flags, r.frame.rsp as u32, USER_DS as u32];
             run_trampoline(uc, &frame, Some([USER_DS, USER_DS, USER_DS, USER_DS]))
@@ -855,9 +856,9 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             // across the run, exactly as metal stashes it (see `store_regs` for
             // Mode32: forcing it to 1 here would erase the thread's IF policy on
             // its first exit).
-            let viopl = r.frame.rflags & IOPL_MASK;
+            let viopl = r.frame.rflags & u64::from(eflags::IOPL_MASK);
             let uc_fl = if_to_vif(rd(uc, RegisterX86::EFLAGS) as u32) as u64;
-            r.frame.rflags = (uc_fl & !IOPL_MASK) | viopl | VM_FLAG | tf_shadows;
+            r.frame.rflags = (uc_fl & !u64::from(eflags::IOPL_MASK)) | viopl | u64::from(eflags::VM_FLAG) | tf_shadows;
         }
         UserMode::Mode32 => {
             // PM client: a far jump / mov may have reloaded any selector — read
@@ -884,9 +885,9 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             // hardware step, and it is the monitor that clears it when the window
             // closes. (Nothing else can set it: the client's own PUSHF/POPF go
             // through the monitor while a window is open.)
-            let viopl = r.frame.rflags & IOPL_MASK;
+            let viopl = r.frame.rflags & u64::from(eflags::IOPL_MASK);
             let uc_fl = if_to_vif(rd(uc, RegisterX86::EFLAGS) as u32) as u64;
-            r.frame.rflags = (uc_fl & !IOPL_MASK) | viopl | tf_shadows;
+            r.frame.rflags = (uc_fl & !u64::from(eflags::IOPL_MASK)) | viopl | tf_shadows;
             // On a 16-bit stack/code segment only SP / IP are meaningful. The
             // ring-0 → ring-3 `iretd` trampoline leaves the high half of ESP
             // (and possibly EIP) holding stale bits from the trampoline's own
@@ -907,6 +908,7 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
 
 #[cfg(test)]
 mod execution_tests {
+    use arch_abi::eflags;
     use arch_abi::{Arch as _, GuestBytes, Irq, KernelEvent, Regs};
 
     #[test]
@@ -963,7 +965,7 @@ mod execution_tests {
                 crate::desc::mark_ldt_dirty();
             }
             regs.set_ip32(0x8000);
-            regs.set_flags32((1 << 19) | 2 | carry);
+            regs.set_flags32(eflags::VIF_FLAG | 2 | carry);
             assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)), KernelEvent::SoftInt(0x31)));
             assert_eq!(regs.rax as u8, expected);
         }
@@ -989,7 +991,7 @@ mod execution_tests {
         regs.set_cs32(0);
         regs.set_ss32(0);
         regs.set_sp32(0x7000);
-        regs.set_flags32((1 << 17) | (1 << 19) | 2);
+        regs.set_flags32(eflags::VM_FLAG | eflags::VIF_FLAG | 2);
         let io = arch_abi::IoPolicy::deny_all();
 
         regs.set_ip32(0x7c00);

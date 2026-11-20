@@ -19,6 +19,7 @@
 //! IVT reflect) return [`MonitorResult::Resume`]; those needing kernel help
 //! (port emulation, soft INT dispatch, idle) return a typed [`KernelEvent`].
 
+use crate::eflags::{self, IF_FLAG, TF_FLAG, IOPL_MASK, VM_FLAG, RF_FLAG, VIP_FLAG, OF_FLAG, VIF_FLAG};
 use crate::{X86, GuestBytes, IoSize, KernelEvent, Regs, UserMode};
 
 /// Result of one monitor decode step. `Resume` is the fast path — the caller
@@ -29,22 +30,8 @@ pub enum MonitorResult {
     Event(KernelEvent),
 }
 
-// =============================================================================
-// EFLAGS bits the monitor cares about
-// =============================================================================
-
-const IF_FLAG:   u32 = 1 << 9;   // real IF (host-only); never guest state
-const TF_FLAG:   u32 = 1 << 8;
-const IOPL_MASK: u32 = 3 << 12;
-const VM_FLAG:   u32 = 1 << 17;
-const RF_FLAG:   u32 = 1 << 16;
-const VIP_FLAG:  u32 = 1 << 20;
-const OF_FLAG:   u32 = 1 << 11;
-/// VIF — the guest's virtual interrupt flag. EFLAGS bit 19. This is the single
-/// canonical store the kernel reads/writes; bit 9 (IF) is the real interrupt
-/// flag only. The guest *observes* its virtual-IF in the bit-9 position (PUSHF
-/// result / a popped IRET frame), so we translate at those points only.
-const VIF_FLAG:  u32 = 1 << 19;
+// VIF is the guest's virtual interrupt flag; IF is the real interrupt flag.
+// Guest PUSHF/POPF/IRET translate between the two positions.
 /// Flags VM86/PM user code cannot modify via POPF/IRET: IOPL, VM, and the real
 /// IF (the guest's IF intent lands in VIF instead — see `apply_guest_flags`).
 const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG | IF_FLAG;
@@ -81,7 +68,7 @@ fn apply_guest_flags(regs: &mut Regs, popped: u32, op32: bool, instruction: Flag
     if !op32 || matches!(instruction, FlagLoad::Popf) { nf &= !RF_FLAG; }
     if want_vif { nf |= VIF_FLAG; } else { nf &= !VIF_FLAG; }
     // Architectural fixed bits: 1 reads as one; 3, 5, 15 and 22..31 as zero.
-    nf = (nf & 0x003f_7fd7) | 2;
+    nf = (nf & eflags::DEFINED_MASK) | eflags::FIXED_ONE;
     regs.set_flags32(nf);
     regs.set_user_tf(want_tf);
     regs.project_tf();
@@ -542,11 +529,11 @@ mod tests {
     #[test]
     fn popped_reserved_flags_do_not_stick() {
         let mut r = Regs::empty();
-        r.set_flags32(VM_FLAG | IF_FLAG | (1 << 12) | 2);
+        r.set_flags32(VM_FLAG | IF_FLAG | (1 << eflags::IOPL_SHIFT) | 2);
         apply_guest_flags(&mut r, 0xffff_ffff, true, FlagLoad::Popf);
         assert_eq!(guest_flags(&r) & !0x003f_7fd7, 0);
         assert_ne!(guest_flags(&r) & 2, 0);
-        assert_eq!(r.flags32() & IOPL_MASK, 1 << 12);
+        assert_eq!(r.flags32() & IOPL_MASK, 1 << eflags::IOPL_SHIFT);
         assert_ne!(r.flags32() & VM_FLAG, 0);
         assert!(r.user_tf());
         apply_guest_flags(&mut r, 0, false, FlagLoad::Popf);
@@ -555,7 +542,7 @@ mod tests {
 
     #[test]
     fn flag_load_width_and_instruction_semantics() {
-        const AC_ID: u32 = (1 << 18) | (1 << 21);
+        const AC_ID: u32 = eflags::AC_FLAG | eflags::ID_FLAG;
         for instruction in [FlagLoad::Popf, FlagLoad::Iret] {
             for op32 in [false, true] {
                 let mut r = Regs::empty();

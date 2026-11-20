@@ -166,8 +166,7 @@ impl Diagnostics for Interp {
 #[cfg(test)]
 pub(crate) fn check_virtual_irq_frame(machine: &mut Interp) {
     use arch_abi::GuestBytes;
-    const VIP: u32 = 1 << 20;
-    const VIF: u32 = 1 << 19;
+    use arch_abi::eflags;
     const CODE: usize = 0x7f00;
     let io = arch_abi::IoPolicy::deny_all();
     let limit = core::time::Duration::from_millis(100);
@@ -180,7 +179,7 @@ pub(crate) fn check_virtual_irq_frame(machine: &mut Interp) {
         pending.set_ss32(0);
         pending.set_sp32(0x7000);
         pending.set_ip32(CODE as u32);
-        pending.set_flags32((1 << 17) | (1 << 12) | VIP | 2);
+        pending.set_flags32(eflags::VM_FLAG | (1 << eflags::IOPL_SHIFT) | eflags::VIP_FLAG | 2);
         if opcode == 0xcf {
             machine.write::<u16>(0x7000, (CODE + 1) as u16);
             machine.write::<u16>(0x7002, 0);
@@ -192,17 +191,17 @@ pub(crate) fn check_virtual_irq_frame(machine: &mut Interp) {
         assert!(matches!(event, KernelEvent::Irq),
             "opcode {opcode:x} must return when VIP becomes deliverable: {event:?}, regs={pending:?}");
         assert_eq!(pending.ip32(), (CODE + 1) as u32);
-        assert_eq!(pending.flags32() & (VIF | VIP), VIF | VIP);
+        assert_eq!(pending.flags32() & (eflags::VIF_FLAG | eflags::VIP_FLAG), eflags::VIF_FLAG | eflags::VIP_FLAG);
 
         // A different context has no pending indication and must run normally.
         let mut other = pending;
-        other.clear_flag32(VIP);
+        other.clear_flag32(eflags::VIP_FLAG);
         assert!(matches!(machine.execute(&mut other, &io, limit), KernelEvent::SoftInt(0x31)));
         assert_eq!(pending.ip32(), (CODE + 1) as u32);
 
         // Pending alone must not interrupt execution while guest IF is off.
-        pending.clear_flag32(VIF);
+        pending.clear_flag32(eflags::VIF_FLAG);
         assert!(matches!(machine.execute(&mut pending, &io, limit), KernelEvent::SoftInt(0x31)));
-        assert_ne!(pending.flags32() & VIP, 0);
+        assert_ne!(pending.flags32() & eflags::VIP_FLAG, 0);
     }
 }

@@ -1,5 +1,6 @@
 //! DOS program execution, parent restoration and COM/MZ loaders.
 
+use arch_abi::eflags;
 use crate::Regs;
 use crate::kernel::thread;
 use crate::kernel::dos::{
@@ -61,7 +62,7 @@ pub(super) fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name
     // Verify the file exists (DFS resolve → VFS → would-be open); ENOENT else.
     if dfs_open_existing(dos, prog_name).is_err() {
         regs.rax = (regs.rax & !0xFFFF) | 2; // ENOENT
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
         return thread::KernelAction::Done;
     }
     // Carry the absolute DOS path (the launcher's namespace), NOT the VFS path.
@@ -76,20 +77,20 @@ pub(super) fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name
         Ok(n) => { path[..n].copy_from_slice(&dos_abs[..n]); n }
         Err(_) => {
             regs.rax = (regs.rax & !0xFFFF) | 2; // ENOENT
-            regs.set_flag32(1);
+            regs.set_flag32(eflags::CF_FLAG);
             return thread::KernelAction::Done;
         }
     };
 
     fn on_error(regs: &mut Regs, err: i32) {
         regs.rax = (regs.rax & !0xFFFF) | err as u64;
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
     }
 
     fn on_success(regs: &mut Regs, child_tid: i32) {
         regs.rax &= !0xFFFF;                            // AX=0 success
         regs.rbx = (regs.rbx & !0xFFFF) | ((child_tid as u16) as u64);
-        regs.clear_flag32(1);
+        regs.clear_flag32(eflags::CF_FLAG);
     }
 
     let mut cmdtail_buf = [0u8; 128];
@@ -126,7 +127,7 @@ pub(super) fn exec_replace<A: crate::Arch>(
 ) -> thread::KernelAction {
     let fail = |regs: &mut Regs| {
         regs.rax = (regs.rax & !0xFFFF) | 2;
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
         thread::KernelAction::Done
     };
     let mut dos_abs = [0u8; dfs::DFS_PATH_MAX];
@@ -176,7 +177,7 @@ pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::Ker
         // and Watcom tools use 00/03 exclusively; surface others so we notice.
         _ => {
             regs.rax = (regs.rax & !0xFFFF) | 1;
-            regs.set_flag32(1);
+            regs.set_flag32(eflags::CF_FLAG);
             return thread::KernelAction::Done;
         }
     }
@@ -204,14 +205,14 @@ pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::Ker
     let fd = dos_open_program(kt, dos, prog_name);
     if fd < 0 {
         regs.rax = (regs.rax & !0xFFFF) | 2;
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
         return thread::KernelAction::Done;
     }
     let size = crate::kernel::vfs::seek(fd, 0, 2, &kt.fds);
     if size <= 0 {
         crate::kernel::vfs::close(fd, &mut kt.fds);
         regs.rax = (regs.rax & !0xFFFF) | 2;
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
         return thread::KernelAction::Done;
     }
     crate::kernel::vfs::seek(fd, 0, 0, &kt.fds);
@@ -281,7 +282,7 @@ pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::Ker
                 dos.dos_blocks = parent_blocks;
                 crate::kernel::dos::sync_mcb_chain(machine, dos, regs);
                 regs.rax = (regs.rax & !0xFFFF) | 11;
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
                 return thread::KernelAction::Done;
             }
         }
@@ -373,9 +374,9 @@ pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::Ker
     vm86_push(machine, regs, ip);
     regs.ds = psp_seg as u64;
     regs.es = psp_seg as u64;
-    regs.clear_flag32(1);
+    regs.clear_flag32(eflags::CF_FLAG);
     // Children always start in VM86; PM parents resume through the dispatch tail.
-    regs.frame.rflags |= machine::VM_FLAG as u64;
+    regs.frame.rflags |= eflags::VM_FLAG as u64;
     thread::KernelAction::Done
 }
 
@@ -403,14 +404,14 @@ fn exec_load_overlay<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThr
     let fd = dos_open_program(kt, dos, prog_name);
     if fd < 0 {
         regs.rax = (regs.rax & !0xFFFF) | 2;
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
         return thread::KernelAction::Done;
     }
     let size = crate::kernel::vfs::seek(fd, 0, 2, &kt.fds);
     if size <= 0 {
         crate::kernel::vfs::close(fd, &mut kt.fds);
         regs.rax = (regs.rax & !0xFFFF) | 2;
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
         return thread::KernelAction::Done;
     }
     crate::kernel::vfs::seek(fd, 0, 0, &kt.fds);
@@ -442,7 +443,7 @@ fn exec_load_overlay<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThr
             || reloc_end > data.len()
         {
             regs.rax = (regs.rax & !0xFFFF) | 11;
-            regs.set_flag32(1);
+            regs.set_flag32(eflags::CF_FLAG);
             return thread::KernelAction::Done;
         }
 
@@ -462,7 +463,7 @@ fn exec_load_overlay<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThr
         machine.copy_to(load_base as u64, &buf);
     }
 
-    regs.clear_flag32(1);
+    regs.clear_flag32(eflags::CF_FLAG);
     thread::KernelAction::Done
 }
 
@@ -484,7 +485,7 @@ pub(super) fn exec_return<A: crate::Arch>(machine: &mut A, kt: &mut thread::Kern
     // the child's #DB in the restored parent (Zone 66 exits this way).
     // Clear child CF and TF here.  A parent that was genuinely tracing keeps
     // TF in its saved FLAGS word and the dispatch IRET restores it normally.
-    regs.clear_flag32(1);
+    regs.clear_flag32(eflags::CF_FLAG);
     regs.set_user_tf(false);
     regs.project_tf();
     regs.ds = parent.ds as u64;
@@ -493,9 +494,9 @@ pub(super) fn exec_return<A: crate::Arch>(machine: &mut A, kt: &mut thread::Kern
     // was PM, clear VM_FLAG so the dispatch tail runs the PM iret-frame
     // pop on parent's PM stack instead of the VM86 one.
     if parent.pm_mode {
-        regs.frame.rflags &= !(machine::VM_FLAG as u64);
+        regs.frame.rflags &= !(eflags::VM_FLAG as u64);
     } else {
-        regs.frame.rflags |= machine::VM_FLAG as u64;
+        regs.frame.rflags |= eflags::VM_FLAG as u64;
     }
     dos.heap_seg = parent.heap_seg;
     dos.heap_base_seg = parent.heap_base_seg;
@@ -847,7 +848,7 @@ pub(super) fn return_to_psp_parent<A: crate::Arch>(
     write_u16(machine, u32::from(ss), u32::from(sp).wrapping_add(4), 0x0200);
     regs.set_ss32(u32::from(ss));
     regs.set_sp32(u32::from(sp));
-    machine::set_vm86_flags(regs, 0x0200);
+    machine::set_vm86_flags(regs, eflags::IF_FLAG);
     dos.current_psp = child.parent_psp;
     dos.last_child_exit_status = status;
 

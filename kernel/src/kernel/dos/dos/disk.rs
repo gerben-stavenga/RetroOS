@@ -1,5 +1,6 @@
 //! INT 13h floppy BIOS services and CHS translation.
 
+use arch_abi::eflags;
 use crate::Regs;
 use crate::kernel::thread;
 
@@ -34,7 +35,7 @@ pub(super) fn int_13h<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> threa
         // AH=00h Reset Disk
         0x00 => {
             regs.rax &= !0xFF00; // AH=0 success
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AH=08h Get Drive Parameters
         0x08 => {
@@ -42,16 +43,16 @@ pub(super) fn int_13h<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> threa
             regs.rbx &= !0xFF; // BL=drive type (0 for HD)
             regs.rcx = (regs.rcx & !0xFFFF) | ((32 << 8) | 63); // CH=max cyl low, CL=max sect
             regs.rdx = (regs.rdx & !0xFFFF) | ((1 << 8) | 1); // DH=max head, DL=number of drives
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         // AH=15h Get Disk Type
         0x15 => {
             regs.rax = (regs.rax & !0xFF00) | (0x03 << 8); // AH=03 = hard disk
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
         }
         _ => {
             regs.rax = (regs.rax & !0xFF00) | ((DISK_ERR_NOT_READY as u64) << 8);
-            regs.set_flag32(1);
+            regs.set_flag32(eflags::CF_FLAG);
         }
     }
     thread::KernelAction::Done
@@ -76,7 +77,7 @@ fn floppy_int13<A: crate::Arch>(machine: &mut A, regs: &mut Regs, ah: u8, dl: u8
             regs.rdx &= !0xFFFF;
         }
         regs.rax = (regs.rax & !0xFF00) | ((status as u64) << 8);
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
         return;
     }
 
@@ -91,9 +92,9 @@ fn floppy_int13<A: crate::Arch>(machine: &mut A, regs: &mut Regs, ah: u8, dl: u8
             regs.rax = (regs.rax & !0xFF) | last as u64;
             // CF reflects that status; AH untouched per convention.
             if last != 0 {
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
             } else {
-                regs.clear_flag32(1);
+                regs.clear_flag32(eflags::CF_FLAG);
             }
             return; // does not overwrite AH or the stored status below
         }
@@ -151,7 +152,7 @@ fn floppy_int13<A: crate::Arch>(machine: &mut A, regs: &mut Regs, ah: u8, dl: u8
         // AH=15h get disk type: floppy with change-line support.
         0x15 => {
             regs.rax = (regs.rax & !0xFF00) | (0x02 << 8);
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             return; // AH is the answer, not a status
         }
         // AH=16h media change: report-once change line.
@@ -166,9 +167,9 @@ fn floppy_int13<A: crate::Arch>(machine: &mut A, regs: &mut Regs, ah: u8, dl: u8
     FLOPPY_LAST_STATUS[drive].store(status, Ordering::Relaxed);
     regs.rax = (regs.rax & !0xFF00) | ((status as u64) << 8);
     if status == DISK_OK {
-        regs.clear_flag32(1);
+        regs.clear_flag32(eflags::CF_FLAG);
     } else {
-        regs.set_flag32(1);
+        regs.set_flag32(eflags::CF_FLAG);
     }
 }
 

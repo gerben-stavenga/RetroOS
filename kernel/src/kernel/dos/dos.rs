@@ -19,6 +19,7 @@ mod mouse;
 #[path = "dos/lowmem.rs"]
 mod lowmem;
 
+use arch_abi::eflags;
 use crate::Regs;
 use crate::kernel::thread;
 use crate::kernel::dos::{dpmi, machine, mode_transitions, seg_offset};
@@ -81,7 +82,7 @@ fn park_at_slot_resume<A: crate::Arch>(_machine: &mut A, regs: &mut Regs) {
     if regs.mode() == crate::UserMode::VM86 {
         machine::set_vm86_cs(regs, CTRL_STUB_SEG);
         machine::set_vm86_ip(regs, ctrl_slot_off(SLOT_RESUME));
-        regs.frame.rflags |= machine::VIF_FLAG as u64;
+        regs.frame.rflags |= eflags::VIF_FLAG as u64;
     } else {
         regs.set_cs32(super::mode_transitions::SPECIAL_STUB_SEL as u32);
         regs.set_ip32(STUB_BASE + slot_offset(SLOT_RESUME) as u32);
@@ -92,10 +93,9 @@ fn park_at_slot_resume<A: crate::Arch>(_machine: &mut A, regs: &mut Regs) {
 
 /// Arithmetic status bits returned by DOS calls. Control flags such as DF and
 /// the caller's interrupt-enable state come from the saved interrupt frame.
-const DOS_STATUS_MASK: u32 = 0x08D5; // CF, PF, AF, ZF, SF, OF
 
 fn merge_dos_status(saved_flags: u32, completed_flags: u32) -> u32 {
-    (saved_flags & !DOS_STATUS_MASK) | (completed_flags & DOS_STATUS_MASK)
+    (saved_flags & !eflags::STATUS_MASK) | (completed_flags & eflags::STATUS_MASK)
 }
 
 enum ResumeEntry<A: crate::Arch> {
@@ -140,7 +140,7 @@ fn suspend_dos_call<A: crate::Arch>(
         // pop as every synchronous DOS call.
         write_u16(machine, ss, sp, ctrl_slot_off(SLOT_RESUME));
         write_u16(machine, ss, sp.wrapping_add(2), CTRL_STUB_SEG);
-        write_u16(machine, ss, sp.wrapping_add(4), flags | machine::IF_FLAG as u16);
+        write_u16(machine, ss, sp.wrapping_add(4), flags | eflags::IF_FLAG as u16);
         finish_dos_call(machine, dos, regs);
         super::DosReturnFrame::Vm86 { ip, cs, flags }
     } else {
@@ -264,7 +264,7 @@ fn dispatch_kernel_syscall<A: crate::Arch>(
         // INT 25h/26h — Absolute Disk Read/Write — return error
         0x25 | 0x26 => {
             regs.rax = (regs.rax & !0xFF00) | (0x02 << 8); // AH=02 address mark not found
-            regs.set_flag32(1); // CF=1 error
+            regs.set_flag32(eflags::CF_FLAG); // CF=1 error
             thread::KernelAction::Done
         }
         0x28 => thread::KernelAction::Done, // INT 28h — DOS idle
@@ -608,7 +608,7 @@ fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A
     if regs.mode() == crate::UserMode::VM86 {
         machine::vm86_iret(machine, regs);
     } else {
-        let post_handler_status = regs.flags32() & DOS_STATUS_MASK;
+        let post_handler_status = regs.flags32() & eflags::STATUS_MASK;
         let client_use32 = dos.dpmi.as_ref().map_or(dos.pm_dos && A::seg_is_32(regs.code_seg()), |d| d.client_use32);
         let (ret_eip, ret_cs, ret_flags) =
             super::mode_transitions::pop_iret_frame(machine, &dos.ldt[..], regs, client_use32);
@@ -623,7 +623,7 @@ fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A
         // maps the image's IF slot back to VIF.
         machine::apply_guest_flags(
             regs,
-            (ret_flags & !DOS_STATUS_MASK) | post_handler_status,
+            (ret_flags & !eflags::STATUS_MASK) | post_handler_status,
         );
     }
 }
@@ -640,7 +640,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         0x0C => {
             if dos.exec_parent.is_none() { kt.launcher_psp = dos.current_psp; }
             regs.rax &= !0xFFFF;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
         // AH=01h — launch a program. Normally fork+exec, non-blocking;
@@ -671,7 +671,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             let flen = read_asciiz(regs.ds as u16, regs.rdx as u32, &mut filename);
             if flen == 0 {
                 regs.rax = (regs.rax & !0xFFFF) | 2; // ENOENT
-                regs.set_flag32(1);
+                regs.set_flag32(eflags::CF_FLAG);
                 return thread::KernelAction::Done;
             }
             let mut tail = [0u8; 128];
@@ -717,7 +717,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         0x02 | 0x03 => {
             crate::kernel::startup::set_trace(ah == 0x02);
             regs.rax &= !0xFFFF;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
         // AH=05h — SYNTH_REAP: recycle a zombie child. Display disposition
@@ -745,9 +745,9 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             dos.cpu_pacer = super::cpu_pacing::CpuPacer::from_percent(policy.cpu_percent);
             let mode = u64::from(policy.viopl);
             let f = &mut regs.frame.rflags;
-            *f = (*f & !(3u64 << 12)) | (mode << 12);
+            *f = (*f & !u64::from(eflags::IOPL_MASK)) | (mode << eflags::IOPL_SHIFT);
             regs.set_pvi_policy(mode == 1);
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
         // AH=0Ah — SYNTH_LOG_BYTE: mirror AL to the ambient kernel log only.
@@ -758,7 +758,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         0x0A => {
             log_dos_byte(regs.rax as u8);
             regs.rax &= !0xFFFF;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
         // AH=0Bh — SYNTH_TSR_SESSION. AL=0 queries, AL=1 sets.
@@ -767,7 +767,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         0x0B => {
             if regs.rax as u8 == 1 { dos.tsr_session = true; }
             regs.rax = (regs.rax & !0xFFFF) | u64::from(dos.tsr_session);
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
         // AH=06h — SYNTH_VGA_NEEDS_TEXT_MODE: inspect the caller's CURRENT
@@ -779,7 +779,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         0x06 => {
             let needs_mode3 = !super::machine::vga::is_standard_text(&dos.pc.vga);
             regs.rax = (regs.rax & !0xFF) | needs_mode3 as u64;
-            regs.clear_flag32(1);
+            regs.clear_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
         // AH=07h — SYNTH_LOG_LINE: read back the in-memory kernel log as DOS
@@ -801,9 +801,9 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
                         machine.write::<u8>((dest + i as u32) as u64, b);
                     }
                     regs.rcx = (regs.rcx & !0xFFFF) | (display_len as u64 & 0xFFFF);
-                    regs.clear_flag32(1);
+                    regs.clear_flag32(eflags::CF_FLAG);
                 }
-                None => regs.set_flag32(1),
+                None => regs.set_flag32(eflags::CF_FLAG),
             }
             thread::KernelAction::Done
         }
@@ -828,7 +828,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         // the documented subfunctions is a guest bug. Return AX=errno/CF=1.
         _ => {
             regs.rax = (regs.rax & !0xFFFF) | 1; // invalid function
-            regs.set_flag32(1);
+            regs.set_flag32(eflags::CF_FLAG);
             thread::KernelAction::Done
         }
     }
@@ -846,7 +846,7 @@ mod continuation_tests {
         let completed = saved & !1;
         let merged = merge_dos_status(saved, completed);
         assert_eq!(merged & 1, 0);
-        assert_eq!(merged & !super::DOS_STATUS_MASK, saved & !super::DOS_STATUS_MASK);
+        assert_eq!(merged & !super::eflags::STATUS_MASK, saved & !super::eflags::STATUS_MASK);
     }
 }
 

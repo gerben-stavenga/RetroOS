@@ -1,5 +1,6 @@
 //! Novell DOS IPX interface over an OSD-managed RetroOS LAN.
 //! Guest ECBs stay in conventional memory; bounded datagrams use native UDP.
+use arch_abi::eflags;
 use super::{DosState, ResumeCallback, machine, mode_transitions};
 use crate::kernel::net::lan;
 use crate::{Arch, Regs};
@@ -424,7 +425,7 @@ pub(crate) fn api<A: Arch>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
 }
 
 pub(crate) fn deliver_callback<A: Arch>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) -> bool {
-    if dos.ipx.saved.is_some() || machine::guest_flags(regs) & machine::IF_FLAG == 0 {
+    if dos.ipx.saved.is_some() || machine::guest_flags(regs) & eflags::IF_FLAG == 0 {
         return false;
     }
     let Some(done) = dos.ipx.completed.pop_front() else {

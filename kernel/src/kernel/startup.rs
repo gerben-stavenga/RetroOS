@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+use arch_abi::eflags;
 use crate::Regs;
 use crate::kernel::thread;
 use crate::kernel::{
@@ -3162,11 +3163,11 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
     regs: &Regs,
     dos: Option<&thread::DosState<A>>,
 ) {
-    let vm86 = regs.flags32() & (1 << 17) != 0;
+    let vm86 = regs.flags32() & eflags::VM_FLAG != 0;
     if vm86 {
         // The guest's interrupt flag is VIF (bit 19); canonical bit 9 is
         // pinned to 1 and carries nothing.
-        let vif = regs.flags32() & (1 << 19) != 0;
+        let vif = regs.flags32() & eflags::VIF_FLAG != 0;
         let lin = (regs.cs32() << 4) + regs.ip32();
         // Guest reads via arch::mem() (identity on metal, mmap offset on the
         // interpreter) — raw `lin as *const u8` would fault on the interp.
@@ -3292,7 +3293,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
             regs.sp32(),
             fl,
             (fl >> 19) & 1,
-            (fl >> 12) & 3
+            (fl & eflags::IOPL_MASK) >> eflags::IOPL_SHIFT
         );
         crate::compact_dbg_println!(
             "[DBG] AX={:08x} BX={:08x} CX={:08x} DX={:08x} SI={:08x} DI={:08x} BP={:08x}",

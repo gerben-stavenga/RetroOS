@@ -2,13 +2,13 @@
 //! Raw stack conversion is shared with KVM in arch_abi::entry.
 #![allow(static_mut_refs)]
 use arch_abi::{Regs, entry::StackFrame};
+use arch_abi::eflags::{IF_FLAG, TF_FLAG, NT_FLAG, VM_FLAG, VIF_FLAG, VIP_FLAG, IOPL_MASK, IOPL_SHIFT};
 use crate::{descriptors, paging2, x86};
 #[cfg(not(feature = "kvm"))]
 use crate::traps::return_to_kernel;
 #[cfg(feature = "kvm")]
 use crate::vm::return_to_kernel;
 use crate::traps::{arch_call, handle_ring0, isr_handler_ring1, guest_trap, Outcome};
-const VM_FLAG: u64 = 1 << 17;
 fn is_vm86(regs: &Regs) -> bool { regs.mode() == arch_abi::UserMode::VM86 }
 
 fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
@@ -53,7 +53,7 @@ pub unsafe extern "C" fn isr_handler(stack: &mut StackFrame, from_64: bool) -> b
     // the normal fatal-fault path. Assembly has already established core TLS.
     let user = unsafe {
         if from_64 { stack.regs.frame.cs & 3 == 3 }
-        else { stack.raw32.raw.cs & 3 == 3 || stack.raw32.raw.eflags & (1 << 17) != 0 }
+        else { stack.raw32.raw.cs & 3 == 3 || stack.raw32.raw.eflags & VM_FLAG != 0 }
     };
     if user {
         if let Some(hook) = unsafe { ENTRY_HOOK } {
@@ -102,13 +102,13 @@ unsafe fn prepare_espfix(stack: &mut StackFrame, long_mode: bool) {
         ]); }
         frame.rip = espfix_return as *const () as u64;
         frame.cs = u64::from(descriptors::RING1_CS);
-        frame.rflags &= !((1 << 17) | (1 << 14) | (1 << 9) | (1 << 8));
+        frame.rflags &= !u64::from(VM_FLAG | NT_FLAG | IF_FLAG | TF_FLAG);
         frame.rsp = u64::from(offset);
         frame.ss = u64::from(descriptors::ESPFIX_SS);
     } else {
         let frame = unsafe { &mut stack.raw32.raw };
         // Ring-0 entries do not save SS:ESP. VM86 restores the whole ESP.
-        if frame.eflags & (1 << 17) != 0 || frame.cs & 3 == 0 { return; }
+        if frame.eflags & VM_FLAG != 0 || frame.cs & 3 == 0 { return; }
         if frame.ss as u16 == descriptors::ESPFIX_SS {
             // Resume the existing slot by repeating POP ESP.
             frame.eip = espfix_return as *const () as u32;
@@ -127,7 +127,7 @@ unsafe fn prepare_espfix(stack: &mut StackFrame, long_mode: bool) {
         ]); }
         frame.eip = espfix_return as *const () as u32;
         frame.cs = u32::from(descriptors::RING1_CS);
-        frame.eflags &= !((1 << 17) | (1 << 14) | (1 << 9) | (1 << 8));
+        frame.eflags &= !(VM_FLAG | NT_FLAG | IF_FLAG | TF_FLAG);
         frame.esp = offset;
         frame.ss = u32::from(descriptors::ESPFIX_SS);
     }
@@ -167,7 +167,7 @@ fn dispatch(stack: &mut StackFrame, from_64: bool) -> bool {
         (false, r.frame.cs, r.int_num, r.err_code, r.frame.rip)
     } else {
         let r = unsafe { &stack.raw32.raw };
-        (r.eflags as u64 & VM_FLAG != 0, r.cs as u64, r.int_num as u64, r.err_code as u64, r.eip as u64)
+        (r.eflags & VM_FLAG != 0, r.cs as u64, r.int_num as u64, r.err_code as u64, r.eip as u64)
     };
     // Mask int_num to 8 bits to undo sign-extension from `push imm8` for
     // vectors >= 0x80. `syscall_entry_64` pushes 256 (out of IDT range) as a
@@ -221,14 +221,14 @@ fn dispatch(stack: &mut StackFrame, from_64: bool) -> bool {
             || (!vm86 && unsafe { PVI_ACTIVE });
         if !hardware_vif {
             unsafe {
-                if VIF { regs.frame.rflags |= 1 << 19; } else { regs.frame.rflags &= !(1 << 19); }
-                if VIP { regs.frame.rflags |= 1 << 20; } else { regs.frame.rflags &= !(1 << 20); }
+                if VIF { regs.frame.rflags |= u64::from(VIF_FLAG); } else { regs.frame.rflags &= !u64::from(VIF_FLAG); }
+                if VIP { regs.frame.rflags |= u64::from(VIP_FLAG); } else { regs.frame.rflags &= !u64::from(VIP_FLAG); }
             }
         }
         // Restore the per-thread virtual IOPL: the run pinned real IOPL=1 on
         // exit, so the just-pushed frame reads 1; put the virtual level back in
         // bits 12-13 before the dispatch so `virtual_if_stepping` sees it.
-        unsafe { regs.frame.rflags = (regs.frame.rflags & !(3 << 12)) | ((VIOPL as u64) << 12); }
+        unsafe { regs.frame.rflags = (regs.frame.rflags & !u64::from(IOPL_MASK)) | ((VIOPL as u64) << IOPL_SHIFT); }
         unsafe {
             regs.set_user_tf(USER_TF);
             regs.set_forced_tf(FORCED_TF);
@@ -290,12 +290,12 @@ fn dispatch(stack: &mut StackFrame, from_64: bool) -> bool {
             // clear the bits; the next entry restores them into the frame.
             // VME+VM86 leaves bits 19/20 in the frame for the hardware.
             unsafe {
-                VIF = regs.frame.rflags & (1 << 19) != 0;
-                VIP = regs.frame.rflags & (1 << 20) != 0;
+                VIF = regs.frame.rflags & u64::from(VIF_FLAG) != 0;
+                VIP = regs.frame.rflags & u64::from(VIP_FLAG) != 0;
             }
-            regs.frame.rflags &= !((1 << 19) | (1 << 20));
+            regs.frame.rflags &= !u64::from(VIF_FLAG | VIP_FLAG);
         }
-        regs.frame.rflags |= 0x200;
+        regs.frame.rflags |= u64::from(IF_FLAG);
         // Pin IOPL=1 for every ring-3 guest. The whole system runs at IOPL=1:
         // the ring-1 kernel does port I/O directly, while ring-3 guests (VM86
         // and PM/DPMI) sit at CPL(3) > IOPL(1) so every IN/OUT is filtered
@@ -315,7 +315,7 @@ fn dispatch(stack: &mut StackFrame, from_64: bool) -> bool {
         // pin the real run IOPL=1. This replaces the old unconditional squash —
         // the kernel now owns the virtual IOPL and we carry it across the iret
         // like VIF/VIP, while the client always actually runs at IOPL=1.
-        unsafe { VIOPL = ((regs.frame.rflags >> 12) & 3) as u8; }
+        unsafe { VIOPL = ((regs.frame.rflags >> IOPL_SHIFT) & 3) as u8; }
         unsafe {
             USER_TF = regs.user_tf();
             FORCED_TF = regs.forced_tf();
@@ -324,7 +324,7 @@ fn dispatch(stack: &mut StackFrame, from_64: bool) -> bool {
         regs.frame.rflags &= !(arch_abi::USER_TF_SHADOW
             | arch_abi::FORCED_TF_SHADOW
             | arch_abi::PVI_POLICY_SHADOW);
-        regs.frame.rflags = (regs.frame.rflags & !(3 << 12)) | (1 << 12);
+        regs.frame.rflags = (regs.frame.rflags & !u64::from(IOPL_MASK)) | (1 << IOPL_SHIFT);
     }
 
     unsafe { stack.decanonicalize(to_64); }
@@ -397,7 +397,7 @@ pub(crate) unsafe fn instruction32(stack: &mut StackFrame, wide: bool) -> Option
     } else {
         let frame = unsafe { &mut stack.raw32 };
         let r = &mut frame.raw;
-        let selectors = if r.eflags & (1 << 17) != 0 {
+        let selectors = if r.eflags & VM_FLAG != 0 {
             let vm = &frame.vm86;
             [vm.es as u16, r.cs as u16, r.ss as u16,
                 vm.ds as u16, vm.fs as u16, vm.gs as u16]
