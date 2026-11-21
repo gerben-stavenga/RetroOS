@@ -2504,11 +2504,11 @@ fn switch_focus_and_run<A: crate::Arch>(
         let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
         select_window_for_thread(windows, new);
         match transfer {
-            Some(crate::kernel::display::ExitDisplay::DosReplace(returned)) => {
+            Some(crate::kernel::display::ExitDisplay::DosReplace { video, bios_video }) => {
                 let thread::Personality::Dos(dos) = &mut new.personality else {
                     unreachable!("DOS VGA returned to non-DOS parent")
                 };
-                dos.pc.vga.acquire_parent_replace(machine, returned);
+                dos.adopt_child_video(machine, video, bios_video);
                 crate::kernel::dos::snapshot_retained_surface(machine, dos, &new.kernel.vcpu.regs);
                 windows.desktop_mut().damage_surface(
                     crate::kernel::gui::EndpointId(new_tid as u32),
@@ -2578,11 +2578,11 @@ fn switch_focus_and_run<A: crate::Arch>(
                     .acquire_display_restore(machine, bios_workspace, handoff);
             }
         }
-        Some(crate::kernel::display::ExitDisplay::DosReplace(returned)) => {
+        Some(crate::kernel::display::ExitDisplay::DosReplace { video, bios_video }) => {
             let thread::Personality::Dos(dos) = &mut new.personality else {
                 unreachable!("DOS VGA returned to non-DOS parent")
             };
-            dos.pc.vga.acquire_parent_replace(machine, returned);
+            dos.adopt_child_video(machine, video, bios_video);
             crate::kernel::dos::snapshot_retained_surface(machine, dos, &new.kernel.vcpu.regs);
             windows.desktop_mut().damage_surface(
                 crate::kernel::gui::EndpointId(new_tid as u32),

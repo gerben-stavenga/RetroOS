@@ -1229,9 +1229,10 @@ pub fn exit_thread<A: crate::Arch>(
         let child_was_focused = tid == crate::kernel::focus::focused();
         let child = &mut threads[tid];
         let Personality::Dos(child_dos) = &mut child.personality else { unreachable!() };
-        let returned = child_dos.pc.vga.release_for_parent_replace(machine);
+        let bios_video = crate::kernel::dos::BdaVideo::capture(machine);
+        let video = child_dos.pc.vga.release_for_parent_replace(machine);
         assert!(exiting_display.is_none(), "unconsumed exiting display");
-        *exiting_display = Some(crate::kernel::display::ExitDisplay::DosReplace(returned));
+        *exiting_display = Some(crate::kernel::display::ExitDisplay::DosReplace { video, bios_video });
         if child_was_focused {
             crate::kernel::focus::adopt(parent_tid as usize);
         }

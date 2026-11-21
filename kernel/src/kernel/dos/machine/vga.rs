@@ -6,7 +6,7 @@
 //! backends only supply a framebuffer.
 
 use crate::Regs;
-use crate::kernel::dos::bios::{bda_field, Bda};
+use crate::kernel::dos::bios::{bda_field, Bda, BdaVideo};
 use super::*;
 use crate::kernel::bios_display::{DosVideo, FullscreenVga, EmulatedVga};
 
@@ -284,11 +284,14 @@ impl DosVideo {
         })
     }
 
-    pub fn acquire_parent_replace<A: crate::Arch>(&mut self, machine: &mut A, returned: Self) {
+    pub(in crate::kernel::dos) fn acquire_parent_replace<A: crate::Arch>(
+        &mut self, machine: &mut A, returned: Self, bios_video: BdaVideo,
+    ) {
         self.map(|parent| {
             let Self::Vga(saved) = parent else {
                 return (parent, ());
             };
+            bios_video.restore(machine);
             let replacement = match returned {
                 Self::Fullscreen(FullscreenVga::Native(native)) =>
                     Self::Fullscreen(saved.attach_native_replace(machine, native)),

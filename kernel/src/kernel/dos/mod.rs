@@ -38,7 +38,7 @@ macro_rules! dos_trace {
 
 pub(crate) mod cpu_pacing;
 mod bios;
-pub(crate) use bios::Bda;
+pub(crate) use bios::{Bda, BdaVideo};
 mod dpmi;
 pub(crate) mod ipx;
 mod dfs;
@@ -446,6 +446,17 @@ impl<A: crate::Arch> DosState<A> {
         display: crate::kernel::display::DisplayHandoff,
     ) {
         machine::vga::acquire_fullscreen_replace(&mut self.pc.vga, machine, display);
+        dpmi::refresh_physical_mappings(machine, self);
+        planar::install(machine, &self.pc.vga);
+    }
+
+    pub(crate) fn adopt_child_video(
+        &mut self,
+        machine: &mut A,
+        video: DosVideo,
+        bios_video: BdaVideo,
+    ) {
+        self.pc.vga.acquire_parent_replace(machine, video, bios_video);
         dpmi::refresh_physical_mappings(machine, self);
         planar::install(machine, &self.pc.vga);
     }

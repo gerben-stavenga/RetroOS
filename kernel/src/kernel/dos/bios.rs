@@ -132,6 +132,31 @@ const _: () = {
     assert!(offset_of!(Bda, kb_flags3) == 0x96);
 };
 
+const VIDEO_MODE_FIELDS: usize = core::mem::offset_of!(Bda, video_mode);
+const VIDEO_MODE_LEN: usize = core::mem::offset_of!(Bda, crt_palette) + 1 - VIDEO_MODE_FIELDS;
+const VIDEO_GEOMETRY_FIELDS: usize = core::mem::offset_of!(Bda, rows_minus1);
+const VIDEO_GEOMETRY_LEN: usize = core::mem::offset_of!(Bda, cell_height) + 2 - VIDEO_GEOMETRY_FIELDS;
+
+/// BIOS state that follows the VGA across a successful DOS exec return.
+pub struct BdaVideo {
+    mode: [u8; VIDEO_MODE_LEN],
+    geometry: [u8; VIDEO_GEOMETRY_LEN],
+}
+
+impl BdaVideo {
+    pub(crate) fn capture<A: crate::Arch>(machine: &A) -> Self {
+        let mut state = Self { mode: [0; VIDEO_MODE_LEN], geometry: [0; VIDEO_GEOMETRY_LEN] };
+        machine.copy_from((Bda::BASE + VIDEO_MODE_FIELDS) as u64, &mut state.mode);
+        machine.copy_from((Bda::BASE + VIDEO_GEOMETRY_FIELDS) as u64, &mut state.geometry);
+        state
+    }
+
+    pub(super) fn restore<A: crate::Arch>(&self, machine: &mut A) {
+        machine.copy_to((Bda::BASE + VIDEO_MODE_FIELDS) as u64, &self.mode);
+        machine.copy_to((Bda::BASE + VIDEO_GEOMETRY_FIELDS) as u64, &self.geometry);
+    }
+}
+
 impl Bda {
     pub(super) const BASE: usize = 0x400;
 
