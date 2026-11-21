@@ -42,14 +42,17 @@ impl Frame {
         else { self.bytes.as_mut().unwrap()[offset..offset + bytes.len()].copy_from_slice(bytes); }
     }
     pub fn into_reclaimed(mut self) -> Option<u64> {
-        let page = self.physical?;
-        if usize::from(super::phys_mm::get_ref_count(page)) != 1 { return None; }
-        self.physical.take()
+        let page = self.physical.take()?;
+        super::platform::release_frame_reference(page).then_some(page)
     }
 }
 impl Drop for Frame {
     fn drop(&mut self) {
-        if let Some(page) = self.physical { super::phys_mm::free_phys_page(page); }
+        if let Some(page) = self.physical
+            && super::platform::release_frame_reference(page)
+        {
+            super::phys_mm::free_phys_page(page);
+        }
     }
 }
 

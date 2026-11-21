@@ -10,6 +10,7 @@ mod smp;
 use arch::{paging2, descriptors, irq, x86};
 use crate::kernel::phys_mm;
 use arch::MultibootMmapEntry;
+use arch_abi::page_supply::MemoryRegion;
 use paging2::{PAGE_SIZE, LOW_MEM_BASE};
 
 /// Kernel physical load address (must match KERNEL_PHYS in kernel.ld)
@@ -333,6 +334,26 @@ unsafe fn prepare_boot(
 
     // The complete pool is loader-reserved and mapped by minimal arch setup.
     unsafe { arch::smp::init_core(0); }
+    assert!(info.flags & (1 << 6) != 0, "No Multiboot memory map");
+    let mmap_entries = &mmap_buf[..mmap_count];
+    let conventional_end = unsafe {
+        ((LOW_MEM_BASE + 0x413) as *const u16).read_unaligned()
+    } as usize * 1024;
+    let ebda = unsafe {
+        ((LOW_MEM_BASE + 0x40e) as *const u16).read_unaligned()
+    } as usize * 16;
+    let conventional_pages = arch::boot_mem::conventional_pages(conventional_end, ebda);
+    let mut boot_memory = unsafe { arch::boot_mem::BootMemory::new() };
+    let layout = boot_memory.frame_layout(
+        mmap_entries.iter().map(|entry| MemoryRegion {
+            base: entry.base, length: entry.length, usable: entry.typ == 1,
+        }),
+        arch::memory::physical_page_limit(),
+        arch::boot_mem::legacy_low_reservations(conventional_pages)
+            .into_iter().chain(crate::multiboot::module_frame_ranges(&boot_modules_raw)),
+    ).expect("cannot reserve boot RAM layout");
+    boot_memory.finish();
+
     let kernel_size = arch::boot_mem::end() - (&raw const _kernel_start) as usize;
 
     // The text aperture moves with paging: point the terminal at the mapped
@@ -391,10 +412,6 @@ unsafe fn prepare_boot(
     let mut screen_guard = lib::term::term();
     let screen = &mut *screen_guard;
 
-    // Only minimal page tables and permanent low-memory DMA use the BSS pool.
-    // AP stacks/TLS will use resident heap mappings after allocator setup.
-    unsafe { arch::boot_mem::BootMemory::new() }.finish();
-
     lib::compact_screenln!(screen, "\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
     lib::compact_screenln!(screen, "kernel_phys: {:#x}", KERNEL_PHYS);
@@ -402,46 +419,14 @@ unsafe fn prepare_boot(
     let kernel_low_page = (KERNEL_PHYS / PAGE_SIZE) as u64;
     let kernel_high_page = (KERNEL_PHYS + kernel_size).div_ceil(PAGE_SIZE) as u64;
 
-    // Parse Multiboot memory map (the pre-paging copy)
-    assert!(info.flags & (1 << 6) != 0, "No Multiboot memory map");
-    let mmap_entries: &[MultibootMmapEntry] = &mmap_buf[..mmap_count];
-
-    // Reserve a 128 KiB real-mode call area in actual conventional RAM.
-    // BDA/EBDA further restrict E820: firmware may reserve its runtime data
-    // there even when a loader's memory map describes a larger usable range.
-    let conventional_end = unsafe {
-        ((paging2::LOW_MEM_BASE + 0x413) as *const u16).read_unaligned()
-    } as usize * 1024;
-    let ebda = unsafe {
-        ((paging2::LOW_MEM_BASE + 0x40e) as *const u16).read_unaligned()
-    } as usize * 16;
-    let scratch = crate::kernel::bios_display::choose_native_scratch(
-        conventional_end, ebda, |start, end| {
-            let available = mmap_entries.iter().any(|m| m.typ == 1
-                && m.base <= start as u64 && m.base.saturating_add(m.length) >= end as u64);
-            let reserved = mmap_entries.iter().any(|m| m.typ != 1
-                && m.base < end as u64 && m.base.saturating_add(m.length) > start as u64);
-            let mut module = false;
-            crate::multiboot::reserve_modules(&boot_modules_raw, |lo, hi| {
-                module |= lo < (end / 4096) as u64 && hi > (start / 4096) as u64;
-            });
-            available && !reserved && !module
-        },
-    );
-    crate::kernel::bios_display::set_native_scratch(scratch);
-
+    crate::kernel::bios_display::set_native_memory(conventional_pages);
+    let trampoline = smp::trampoline(layout);
+    let trampoline_frame = trampoline.map(|address| u64::from(address) / PAGE_SIZE as u64);
     phys_mm::init_phys_mm(
-        mmap_entries.iter().map(|entry| phys_mm::MemoryRegion {
-            base: entry.base, length: entry.length, usable: entry.typ == 1,
-        }),
-        arch::memory::physical_page_limit(),
-        kernel_low_page,
-        kernel_high_page,
-        paging2::physical_page(&arch::ZERO_PAGE as *const _ as usize),
+        layout,
+        core::iter::once(kernel_low_page..kernel_high_page)
+            .chain(trampoline_frame.map(|page| page..page + 1)),
     );
-    crate::multiboot::reserve_modules(&boot_modules_raw, |start, end| {
-        phys_mm::mark_reserved(start, end)
-    });
     install_physical_memory();
     crate::kernel::memory::set_text_frame(phys_mm::alloc_contig(8).expect("no VGA backing pages"));
 
@@ -450,8 +435,8 @@ unsafe fn prepare_boot(
     ALLOCATOR.end.store(arch::heap_base(), core::sync::atomic::Ordering::Relaxed);
     ALLOCATOR.heap.enable_small_cache();
     phys_mm::complete_initialization();
-    phys_mm::prepare_fault_metadata();
-    arch::memory::configure(phys_mm::ownership());
+    let zero_page = paging2::physical_page(&arch::ZERO_PAGE as *const _ as usize);
+    arch::memory::configure(crate::kernel::platform::init_frame_ownership(layout, zero_page));
     crate::kernel::klog::init();
     let table = phys_mm::alloc_phys_page().expect("physical aperture table");
     if !arch::aperture::init(table) { phys_mm::free_phys_page(table); }
@@ -470,8 +455,9 @@ unsafe fn prepare_boot(
 
     // APs borrow the BSP bootstrap root, then acknowledge their private roots.
     // Retain the existing identity mapping until every startup has completed.
-    unsafe { smp::start(screen, &acpi_rsdp[..acpi_rsdp_len], &mmap_buf[..mmap_count], &boot_modules_raw); }
+    unsafe { smp::start(screen, &acpi_rsdp[..acpi_rsdp_len], trampoline); }
     paging2::finish_setup_paging();
+    if let Some(page) = trampoline_frame { phys_mm::free_phys_page(page); }
 
     let boot_modules = crate::multiboot::handoff_modules(boot_modules_raw);
 
@@ -740,7 +726,6 @@ fn install_physical_memory() {
         unmap: paging2::unmap_kernel_page,
     };
     phys_mm::install_low_dma_memory(&DMA);
-    arch::memory::configure(phys_mm::ownership());
     let (needed, returned) = arch::memory::supply_pages(Default::default());
     assert_eq!(returned.count, 0);
     let (_, unused) = arch::memory::supply_pages(phys_mm::page_batch(needed));

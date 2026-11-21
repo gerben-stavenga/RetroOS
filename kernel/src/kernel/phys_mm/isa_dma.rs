@@ -52,7 +52,6 @@ pub fn dma_channel_buf(ch: usize) -> u64 {
     // The driver maps these frames uncached. Remove the ordinary cached alias;
     // physical ownership stays with the pool, already reserved as kernel BSS.
     for offset in (0..bytes).step_by(PAGE_SIZE) { (memory().unmap)(storage + offset); }
-    debug_assert!((page..page + (bytes / PAGE_SIZE) as u64).all(|p| super::get_ref_count(p) == 1));
     slot.store(page as usize, Ordering::Release);
     page
 }

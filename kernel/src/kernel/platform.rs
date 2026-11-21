@@ -9,6 +9,8 @@
 //! private `static` verdict. Adding an enum variant breaks every policy
 //! site at compile time — deliberately.
 
+use arch_abi::page_supply::{FrameLayout, FrameOwnership};
+
 /// A mode advertised by the machine's physical video BIOS. Its physical base,
 /// bank window and firmware mode number are kernel platform facts, not state
 /// of the VGA emulator.
@@ -829,4 +831,46 @@ pub(crate) fn write_physical_frame(page: u64, offset: usize, bytes: &[u8]) {
         core::ptr::copy_nonoverlapping(
             bytes.as_ptr(), super::phys_mm::direct_pointer(page).add(offset), bytes.len());
     }
+}
+
+static FRAME_OWNERSHIP: spin::Once<FrameOwnership> = spin::Once::new();
+
+pub(crate) fn init_frame_ownership(layout: &'static FrameLayout, zero_page: u64) -> FrameOwnership {
+    *FRAME_OWNERSHIP.call_once(|| {
+        let storage = FrameOwnership::storage_layout(layout.frame_count());
+        let counts = unsafe { alloc::alloc::alloc_zeroed(storage) };
+        assert!(!counts.is_null(), "cannot allocate resident frame references");
+        unsafe { FrameOwnership::from_layout(layout, counts, zero_page) }
+    })
+}
+
+/// Install the permanent hosted RAM view and its frame metadata.
+///
+/// # Safety
+/// The page-aligned RAM mapping must remain writable for the kernel's lifetime.
+#[cfg(not(target_arch = "x86"))]
+pub unsafe fn init_host_ram(
+    base: *mut u8,
+    bytes: usize,
+    layout: &'static FrameLayout,
+) -> FrameOwnership {
+    unsafe { super::phys_mm::init_direct_ram(base, bytes, layout); }
+    init_frame_ownership(layout, u64::MAX)
+}
+
+/// Drop one reference through arch. True transfers the exclusive frame back
+/// to the caller, which may immediately recycle it or return it to the pool.
+pub(crate) fn release_frame_reference(page: u64) -> bool {
+    let ownership = FRAME_OWNERSHIP.get().expect("frame ownership not initialized");
+    unsafe { ownership.release_shared(page) }
+}
+
+#[cfg(target_arch = "x86")]
+pub(crate) fn bootstrap_supply() -> arch_abi::page_supply::PageBootstrap {
+    use arch_abi::page_supply::{FAULT_PAGES, PageBootstrap};
+    let ownership = *FRAME_OWNERSHIP.get().expect("frame ownership not initialized");
+    let pages = core::array::from_fn::<_, FAULT_PAGES, _>(|_| {
+        super::phys_mm::alloc_phys_page().expect("out of AP fault reserve pages")
+    });
+    PageBootstrap { ownership, pages }
 }

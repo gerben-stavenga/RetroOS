@@ -1,6 +1,7 @@
 //! BSP boot policy. Core 1 waits for the resident-buffer media worker;
 //! remaining APs execute pinned Linux processes. Kernel services stay on the BSP.
-use arch::{MultibootMmapEntry, smp, x86};
+use arch::{smp, x86};
+use arch_abi::page_supply::FrameLayout;
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -105,59 +106,23 @@ fn delay(us: u32) {
     }
 }
 
-// Boot info and command line have been copied already. Stay below the EBDA
-// and avoid module pages. The physical allocator permanently excludes <1 MiB.
-fn trampoline(
-    map: &[MultibootMmapEntry],
-    modules: &[Option<crate::multiboot::AcceptedModule>; arch_abi::MAX_BOOT_MODULES],
-) -> Option<u32> {
-    let ebda = unsafe { ((arch::paging2::LOW_MEM_BASE + 0x40e) as *const u16).read_unaligned() }
-        as u64
-        * 16;
-    let ceiling = if ebda >= 0x1000 {
-        ebda.min(0x80000)
-    } else {
-        0x80000
-    };
-    // In PAE bootstrap the first two scratch entries also act as directory
-    // links, so pages 0 and 1 are not identity mappings. Start beyond them.
-    (0x2000..ceiling)
-        .step_by(4096)
-        .find(|&start| {
-            let end = start + 4096;
-            if end > ceiling {
-                return false;
-            }
-            if crate::kernel::bios_display::native_scratch().is_some_and(|scratch| {
-                start < scratch.end as u64 && end > scratch.start as u64
-            }) { return false; }
-            let available = map
-                .iter()
-                .any(|m| m.typ == 1 && m.base <= start && m.base.saturating_add(m.length) >= end);
-            let reserved = map
-                .iter()
-                .any(|m| m.typ != 1 && m.base < end && m.base.saturating_add(m.length) > start);
-            let mut module = false;
-            crate::multiboot::reserve_modules(modules, |lo, hi| {
-                module |= lo < end / 4096 && hi > start / 4096;
-            });
-            available && !reserved && !module
-        })
-        .map(|p| p as u32)
+pub(super) fn trampoline(layout: &FrameLayout) -> Option<u32> {
+    // PAE's bootstrap identity table uses the first two slots as directory links.
+    (2..0x80000 / arch_abi::PAGE_SIZE as u64)
+        .find(|&page| layout.index(page).is_some())
+        .map(|page| (page * arch_abi::PAGE_SIZE as u64) as u32)
 }
 
 pub(super) unsafe fn start(
     screen: &mut lib::term::Term,
     rsdp: &[u8],
-    map: &[MultibootMmapEntry],
-    modules: &[Option<crate::multiboot::AcceptedModule>; arch_abi::MAX_BOOT_MODULES],
+    page: Option<u32>,
 ) {
     let slots = crate::kernel::parallel::provision::<arch::Metal>(MAX_CPUS);
     let mut ids = [0; MAX_CPUS];
     let own = x86::current_apic_id();
     let count = arch::acpi::processor_ids(rsdp, &mut ids)
         .filter(|&n| own.is_some_and(|id| ids[..n].contains(&id)));
-    let page = trampoline(map, modules);
     let mut starts = [None; MAX_CPUS];
     let mut selected = 0;
     let can_start = if count.is_none() {
@@ -214,7 +179,7 @@ pub(super) unsafe fn start(
                     tls,
                     entry: park,
                     argument: &slots[logical] as *const _ as usize,
-                    memory: crate::kernel::phys_mm::bootstrap_supply(),
+                    memory: crate::kernel::platform::bootstrap_supply(),
                     ready: &READY[logical],
                 },
             ));

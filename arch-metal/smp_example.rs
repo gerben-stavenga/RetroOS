@@ -3,6 +3,7 @@
 #![no_main]
 #![feature(thread_local)]
 extern crate alloc;
+use arch_abi::page_supply::{FrameOwnership, MemoryRegion, PageBootstrap};
 use arch_metal::{smp, x86};
 use arch_metal as arch;
 use arch_metal::paging2;
@@ -163,6 +164,7 @@ extern "C" fn secondary(id: u32, argument: usize) -> ! {
 fn allocate_core(
     id: u32,
     ready: &'static AtomicU32,
+    ownership: FrameOwnership,
 ) -> smp::CoreStart {
     let allocate = |layout| {
         let storage = unsafe { alloc::alloc::alloc_zeroed(layout) };
@@ -181,7 +183,10 @@ fn allocate_core(
         trap_stack_top: trap as u32 + 16384 - 16,
         entry: secondary,
         argument: 0xabcdef,
-        memory: phys_mm::bootstrap_supply(),
+        memory: PageBootstrap {
+            ownership,
+            pages: core::array::from_fn(|_| phys_mm::alloc_phys_page().expect("out of AP fault reserve pages")),
+        },
         ready,
     }
 }
@@ -257,32 +262,40 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
             smp::run_secondary();
         }
     }
-    // Close early BSS reservations; AP resources come from resident heap pages.
-    let memory = unsafe { arch_metal::boot_mem::BootMemory::new() };
+    let mut memory = unsafe { arch_metal::boot_mem::BootMemory::new() };
     assert!(arch_metal::boot_mem::allocate_permanent(Layout::new::<u8>()).is_err());
-    memory.finish();
-    // Initialize the common kernel allocator before reserving AP storage.
-    let physical_end = arch_metal::boot_mem::end() - arch_metal::paging2::KERNEL_BASE
-        + arch_metal::paging2::KERNEL_PHYS;
-    phys_mm::init_phys_mm(
-        map[..count].iter().map(|entry| phys_mm::MemoryRegion {
+    let conventional_end = unsafe {
+        ((arch::LOW_MEM_BASE + 0x413) as *const u16).read_unaligned()
+    } as usize * 1024;
+    let ebda = unsafe {
+        ((arch::LOW_MEM_BASE + 0x40e) as *const u16).read_unaligned()
+    } as usize * 16;
+    let conventional_pages = arch::boot_mem::conventional_pages(conventional_end, ebda);
+    let layout = memory.frame_layout(
+        map[..count].iter().map(|entry| MemoryRegion {
             base: entry.base, length: entry.length, usable: entry.typ == 1,
         }),
         arch::memory::physical_page_limit(),
-        0x100,
-        physical_end.div_ceil(4096) as u64,
-        paging2::physical_page(&arch::ZERO_PAGE as *const _ as usize),
-    );
+        arch::boot_mem::legacy_low_reservations(conventional_pages).into_iter(),
+    ).expect("cannot reserve boot RAM layout");
+    memory.finish();
+    let physical_end = arch_metal::boot_mem::end() - arch_metal::paging2::KERNEL_BASE
+        + arch_metal::paging2::KERNEL_PHYS;
+    let image_frames = 0x100..physical_end.div_ceil(4096) as u64;
+    phys_mm::init_phys_mm(layout, [image_frames.clone(), 8..9]);
     install_physical_memory();
     back_heap(arch::heap_base(), arch::heap_base() + 2 * 1024 * 1024);
     phys_mm::complete_initialization();
-    phys_mm::prepare_fault_metadata();
-    arch::memory::configure(phys_mm::ownership());
+    let counts = unsafe { alloc::alloc::alloc_zeroed(FrameOwnership::storage_layout(layout.frame_count())) };
+    assert!(!counts.is_null());
+    let zero_page = paging2::physical_page(&arch::ZERO_PAGE as *const _ as usize);
+    let ownership = unsafe { FrameOwnership::from_layout(layout, counts, zero_page) };
+    arch::memory::configure(ownership);
     let missing = if missing_test {
-        Some(allocate_core(4, &MISSING_READY))
+        Some(allocate_core(4, &MISSING_READY, ownership))
     } else {
         for id in 1..4u32 {
-            starts[id as usize - 1] = Some(allocate_core(id, &READY[id as usize]));
+            starts[id as usize - 1] = Some(allocate_core(id, &READY[id as usize], ownership));
         }
         None
     };
@@ -328,10 +341,9 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
     let ordinary = alloc::boxed::Box::new(0xfeed1234u32);
     assert!((&*ordinary as *const u32 as usize) >= arch_metal::boot_mem::end());
     assert_eq!(*ordinary, 0xfeed1234);
-    assert!(
-        arch_metal::paging2::physical_page((&*ordinary as *const u32) as usize)
-            >= physical_end.div_ceil(4096) as u64
-    );
+    let frame = arch_metal::paging2::physical_page((&*ordinary as *const u32) as usize);
+    assert!(layout.index(frame).is_some() && !image_frames.contains(&frame));
+    assert_ne!(frame, 8); // AP trampoline remains reserved by the example.
     for channel in [1, 5] {
         let dma = phys_mm::dma_channel_buf(channel);
         assert_ne!(dma, 0);
@@ -409,7 +421,6 @@ fn install_physical_memory() {
         unmap: paging2::unmap_kernel_page,
     };
     phys_mm::install_low_dma_memory(&DMA);
-    arch::memory::configure(phys_mm::ownership());
     let (needed, returned) = arch::memory::supply_pages(Default::default());
     assert_eq!(returned.count, 0);
     let (_, unused) = arch::memory::supply_pages(phys_mm::page_batch(needed));

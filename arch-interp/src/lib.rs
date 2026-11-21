@@ -88,7 +88,7 @@ pub use screendump::{enable_live as enable_live_console, request as request_vga_
 // screenshots peek. Presentation (SDL et al.) lives in the consuming binary.
 pub use vga::{peek_frame, publish as publish_frame, recycle_frame, take_frame};
 
-pub use phys::ram as physical_ram;
+pub use phys::{frame_layout, ram as physical_ram};
 
 #[cfg(test)]
 extern crate self as retroos_arch_interp;

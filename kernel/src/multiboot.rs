@@ -172,16 +172,13 @@ pub(crate) fn capture_module(
 }
 
 #[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
-pub(crate) fn reserve_modules(
+pub(crate) fn module_frame_ranges(
     modules: &[Option<AcceptedModule>; arch_abi::MAX_BOOT_MODULES],
-    mut reserve: impl FnMut(u64, u64),
-) {
-    for module in modules.iter().flatten() {
-        reserve(
-            module.start / arch_abi::PAGE_SIZE as u64,
-            (module.start + module.len as u64).div_ceil(arch_abi::PAGE_SIZE as u64),
-        );
-    }
+) -> impl Iterator<Item = (u64, u64)> + '_ {
+    let size = arch_abi::PAGE_SIZE as u64;
+    modules.iter().flatten().map(move |module| {
+        (module.start / size, (module.start + module.len as u64).div_ceil(size))
+    })
 }
 
 #[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
@@ -444,13 +441,7 @@ mod tests {
                 },
             )
         };
-        let mut ranges = [(99, 99); 2];
-        let mut range_count = 0;
-        super::reserve_modules(&modules, |start, end| {
-            ranges[range_count] = (start, end);
-            range_count += 1;
-        });
-        assert_eq!(&ranges[..range_count], &[(0, 1), (1, 2)]);
+        assert!(super::module_frame_ranges(&modules).eq([(0, 1), (1, 2)]));
 
         let handed_off = handoff_modules(modules);
         assert_eq!(handed_off[0].unwrap().physical_start, 0x123);

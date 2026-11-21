@@ -45,12 +45,13 @@ fn init() -> KvmCpu {
     assert_ne!(image, libc::MAP_FAILED);
     let entry = super::entry::load(image.cast());
     let ownership = crate::phys::ownership();
-    assert!(!ownership.counts.is_null() && ownership.counts as usize % 4096 == 0);
+    let counter_layout = arch_abi::page_supply::FrameOwnership::storage_layout(ownership.active);
+    assert!(!ownership.counts.is_null() && (ownership.counts as usize).is_multiple_of(counter_layout.align()));
     for (slot, physical, bytes, host) in [
         (0, 0, vm::IMAGE_LIMIT, image as u64),
         (1, vm::IMAGE_LIMIT as u64, crate::phys::PHYS_SIZE - vm::IMAGE_LIMIT,
             unsafe { crate::phys::region_base().add(vm::IMAGE_LIMIT) } as u64),
-        (2, vm::COUNTS_PHYSICAL, ownership.active.next_multiple_of(4096), ownership.counts as u64),
+        (2, vm::COUNTS_PHYSICAL, counter_layout.size(), ownership.counts as u64),
     ] {
         unsafe { vmfd.set_user_memory_region(kvm_userspace_memory_region {
             slot, flags: 0, guest_phys_addr: physical, memory_size: bytes as u64, userspace_addr: host,

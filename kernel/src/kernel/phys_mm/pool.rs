@@ -1,129 +1,50 @@
 //! Compact metadata for usable RAM only. No allocation inside page operations;
-//! the caller supplies the allocation bitmap and resident reference arena.
+//! the caller supplies the allocation bitmap.
 
-use arch_abi::page_supply::{FrameOwnership, FrameRegion as Region};
+use arch_abi::page_supply::FrameLayout;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-const MAX_REGIONS: usize = 256;
+
 const FREE: u8 = 0;
 const OWNED: u8 = 1;
 
-const EMPTY: Region = Region { first: 0, end: 0, offset: 0 };
-
-pub(super) struct Pool {
-    regions: [Region; MAX_REGIONS],
-    count: usize,
-    pub(super) pages: usize,
+pub(super) struct Pool<'a> {
+    layout: &'a FrameLayout,
     states: *mut u8,
     active: usize,
-    counts: *mut u8,
     free: AtomicUsize,
     next: usize,
-    pub(super) started: bool,
 }
 
-impl Pool {
-    pub(super) const fn new() -> Self {
-        Self { regions: [EMPTY; MAX_REGIONS], count: 0, pages: 0,
-            states: core::ptr::null_mut(), active: 0, counts: core::ptr::null_mut(),
-            free: AtomicUsize::new(0), next: 0, started: false }
-    }
-
-    fn insert(&mut self, at: usize, region: Region) {
-        assert!(self.count < MAX_REGIONS, "too many physical RAM regions");
-        self.regions.copy_within(at..self.count, at + 1);
-        self.regions[at] = region;
-        self.count += 1;
-    }
-
-    fn remove(&mut self, at: usize) {
-        self.regions.copy_within(at + 1..self.count, at);
-        self.count -= 1;
-    }
-
-    pub(super) fn include(&mut self, first: u64, end: u64) {
-        if first >= end { return; }
-        let at = self.regions[..self.count].partition_point(|r| r.first < first);
-        self.insert(at, Region { first, end, offset: 0 });
-        let mut i = 0;
-        while i + 1 < self.count {
-            if self.regions[i].end >= self.regions[i + 1].first {
-                self.regions[i].end = self.regions[i].end.max(self.regions[i + 1].end);
-                self.remove(i + 1);
-            } else { i += 1; }
+impl<'a> Pool<'a> {
+    pub(super) const fn new(layout: &'a FrameLayout) -> Self {
+        Self {
+            layout,
+            states: core::ptr::null_mut(),
+            active: 0,
+            free: AtomicUsize::new(0),
+            next: 0,
         }
-        self.offsets();
-    }
-
-    /// Before the first allocation, reservations can be omitted altogether.
-    /// This also lets the bootstrap bitmap cover free RAM after large modules.
-    pub(super) fn exclude(&mut self, first: u64, end: u64) {
-        if first >= end { return; }
-        assert!(!self.started, "cannot move live physical page metadata");
-        let mut i = 0;
-        while i < self.count {
-            let region = self.regions[i];
-            if first >= region.end || end <= region.first { i += 1; continue; }
-            if first <= region.first && end >= region.end { self.remove(i); continue; }
-            if first > region.first && end < region.end {
-                self.regions[i].end = first;
-                self.insert(i + 1, Region { first: end, ..region });
-                i += 2;
-            } else {
-                self.regions[i].first = region.first.max(end);
-                if first > region.first {
-                    self.regions[i].first = region.first;
-                    self.regions[i].end = first;
-                }
-                i += 1;
-            }
-        }
-        self.offsets();
-    }
-
-    fn offsets(&mut self) {
-        let mut offset = 0usize;
-        for region in &mut self.regions[..self.count] {
-            region.offset = offset;
-            let length = usize::try_from(region.end - region.first)
-                .expect("RAM metadata exceeds kernel address space");
-            offset = offset.checked_add(length).expect("RAM metadata size overflow");
-        }
-        self.pages = offset;
-    }
-
-    fn index(&self, page: u64) -> Option<usize> {
-        let at = self.regions[..self.count].partition_point(|r| r.end <= page);
-        let region = self.regions.get(at).filter(|_| at < self.count)?;
-        (page >= region.first).then(|| region.offset + (page - region.first) as usize)
-    }
-
-    fn page(&self, index: usize) -> u64 {
-        let at = self.regions[..self.count].partition_point(|r| r.offset <= index) - 1;
-        let region = self.regions[at];
-        region.first + (index - region.offset) as u64
     }
 
     pub(super) unsafe fn bootstrap(&mut self, states: *mut u8, bytes: usize) {
         self.states = states;
-        self.active = self.pages.min(bytes * 8);
+        self.active = self.layout.frame_count().min(bytes * 8);
         unsafe { core::ptr::write_bytes(states, 0, bytes); }
         self.free.store(self.active, Ordering::Relaxed);
         self.next = 0;
     }
 
-    /// Buffers are zeroed and remain live for the life of the pool. Copy after
-    /// both allocations: backing their pages has changed bootstrap ownership.
-    pub(super) unsafe fn expand(&mut self, states: *mut u8, counts: *mut u8) {
-        assert!(self.counts.is_null(), "physical metadata already expanded");
+    /// Copy the bootstrap state after allocating the new bitmap, since that
+    /// allocation itself consumes bootstrap frames.
+    pub(super) unsafe fn expand(&mut self, states: *mut u8) {
         unsafe { core::ptr::copy_nonoverlapping(self.states, states, self.active.div_ceil(8)); }
         // Padding bits from the last bootstrap byte must describe free RAM.
         if !self.active.is_multiple_of(8) {
             unsafe { *states.add(self.active / 8) &= (1 << (self.active % 8)) - 1; }
         }
-        self.free.fetch_add(self.pages - self.active, Ordering::Relaxed);
-        self.active = self.pages;
+        self.free.fetch_add(self.layout.frame_count() - self.active, Ordering::Relaxed);
+        self.active = self.layout.frame_count();
         self.states = states;
-        self.counts = counts;
     }
 
     fn state(&self, index: usize) -> u8 {
@@ -145,8 +66,7 @@ impl Pool {
     }
 
     pub(super) fn mark(&mut self, first: u64, end: u64) {
-        for i in 0..self.count {
-            let r = self.regions[i];
+        for &r in self.layout.regions() {
             let lo = first.max(r.first);
             let hi = end.min(r.end);
             if lo >= hi { continue; }
@@ -176,20 +96,17 @@ impl Pool {
     }
 
     pub(super) fn allocate(&mut self) -> Option<u64> {
-        self.started = true;
         if self.free.load(Ordering::Relaxed) == 0 { return None; }
         let next = self.next.min(self.active);
         let index = self.find_free(next, self.active).or_else(|| self.find_free(0, next))?;
         self.set(index, OWNED);
         self.next = index + 1;
-        Some(self.page(index))
+        Some(self.layout.frame(index))
     }
 
     pub(super) fn allocate_contiguous(&mut self, count: usize, limit: u64) -> Option<u64> {
-        self.started = true;
         if count == 0 || count > self.free.load(Ordering::Relaxed) { return None; }
-        for i in 0..self.count {
-            let region = self.regions[i];
+        for &region in self.layout.regions() {
             let end = region.end.min(limit);
             if end <= region.first { continue; }
             let stop = (region.offset + (end - region.first) as usize).min(self.active);
@@ -213,43 +130,22 @@ impl Pool {
     pub(super) fn free_contiguous(&mut self, first: u64, count: usize) {
         let end = first.checked_add(count as u64).expect("DMA range overflow");
         for page in first..end {
-            let index = self.index(page).expect("DMA allocation outside RAM");
-            assert_eq!(self.refs(page), 1, "invalid DMA allocation");
-            self.set(index, FREE);
+            let index = self.layout.index(page).expect("DMA allocation outside RAM");
+            self.release_index(index);
         }
     }
 
-    pub(super) fn ownership(&self, zero_page: u64) -> FrameOwnership {
-        FrameOwnership { regions: self.regions.as_ptr(), regions_len: self.count,
-            counts: self.counts, active: self.active,
-            zero_page }
-    }
-    pub(super) fn refs(&self, page: u64) -> u8 {
-        if self.index(page).is_some_and(|index| self.state(index) == FREE) { return 0; }
-        unsafe { self.ownership(u64::MAX).references(page) }
+    pub(super) fn release(&mut self, page: u64) {
+        let index = self.layout.index(page).expect("release outside managed RAM");
+        self.release_index(index);
     }
 
-    pub(super) unsafe fn install_counts(&mut self, counts: *mut u8) {
-        assert!(self.counts.is_null());
-        self.counts = counts;
-    }
-
-    pub(super) fn retain(&mut self, page: u64) -> bool {
-        if !self.index(page).is_some_and(|index| self.state(index) == OWNED) { return false; }
-        unsafe { self.ownership(u64::MAX).retain(page) }
-    }
-
-    /// Reference metadata stays resident: fault handlers must never allocate it.
-    pub(super) fn release(&mut self, page: u64) -> Option<*mut u8> {
-        let index = self.index(page).expect("release outside managed RAM");
+    fn release_index(&mut self, index: usize) {
         assert_eq!(self.state(index), OWNED, "double release of physical page");
-        if unsafe { self.ownership(u64::MAX).release_shared(page) } {
-            let index = self.index(page).expect("release outside managed RAM");
-            self.set(index, FREE);
-        }
-        None
+        self.set(index, FREE);
     }
 
+    pub(super) fn frame_count(&self) -> usize { self.layout.frame_count() }
     pub(super) fn free_pages(&self) -> usize { self.free.load(Ordering::Relaxed) }
     pub(super) fn managed_pages(&self) -> usize { self.active }
 }
@@ -258,47 +154,52 @@ impl Pool {
 mod tests {
     use super::*;
     use alloc::{vec, vec::Vec};
+    use arch_abi::page_supply::MemoryRegion;
 
-    struct Fixture {
-        pool: Pool,
-        _bootstrap: Vec<u8>,
+    struct Fixture<'a> {
+        pool: Pool<'a>,
         _bitmap: Vec<u8>,
-        _counts: Vec<u8>,
     }
-    impl Fixture {
-        fn new(ranges: &[(u64, u64)], holes: &[(u64, u64)]) -> Self {
-            let mut pool = Pool::new();
-            for &(first, end) in ranges { pool.include(first, end); }
-            for &(first, end) in holes { pool.exclude(first, end); }
-            let mut bootstrap = vec![0; pool.pages.div_ceil(8).min(4096)];
+    impl<'a> Fixture<'a> {
+        fn new(layout: &'a FrameLayout) -> Self {
+            let mut pool = Pool::new(layout);
+            let mut bootstrap = vec![0; layout.frame_count().div_ceil(8).min(4096)];
             unsafe { pool.bootstrap(bootstrap.as_mut_ptr(), bootstrap.len()); }
-            let mut bitmap = vec![0; pool.pages.div_ceil(8)];
-            let mut counts = vec![0; pool.pages];
-            unsafe { pool.expand(bitmap.as_mut_ptr(), counts.as_mut_ptr()); }
-            Self { pool, _bootstrap: bootstrap, _bitmap: bitmap, _counts: counts }
+            let mut bitmap = vec![0; layout.frame_count().div_ceil(8)];
+            unsafe { pool.expand(bitmap.as_mut_ptr()); }
+            Self { pool, _bitmap: bitmap }
         }
-        fn retain(&mut self, page: u64) -> bool {
-            self.pool.retain(page)
-        }
+    }
+
+    fn layout(ranges: &[(u64, u64)], holes: &[(u64, u64)]) -> FrameLayout {
+        let size = arch_abi::PAGE_SIZE as u64;
+        let entries = ranges.iter().map(|&(first, end)| MemoryRegion {
+            base: first * size, length: (end - first) * size, usable: true,
+        });
+        let mut layout = FrameLayout::from_memory_map(entries, u64::MAX);
+        for &(first, end) in holes { layout.exclude(first, end); }
+        layout
     }
 
     #[test]
     fn bitmap_crosses_words_and_excludes_address_holes() {
-        let mut f = Fixture::new(&[(300, 340), (0x100000, 0x100048)], &[(320, 327)]);
+        let layout = layout(&[(300, 340), (0x100000, 0x100048)], &[(320, 327)]);
+        let mut f = Fixture::new(&layout);
         let expected: Vec<_> = (300..320).chain(327..340).chain(0x100000..0x100048).collect();
         assert_eq!(f.pool.free_pages(), expected.len());
         for page in &expected { assert_eq!(f.pool.allocate(), Some(*page)); }
         assert_eq!(f.pool.allocate(), None);
         assert_eq!(f.pool.free_pages(), 0);
-        assert_eq!(f.pool.refs(321), 255);
-        for page in &expected { assert_eq!(f.pool.release(*page), None); }
+        assert_eq!(f.pool.layout.index(321), None);
+        for page in &expected { f.pool.release(*page); }
         assert_eq!(f.pool.free_pages(), expected.len());
         assert_eq!(f.pool.allocate(), Some(300));
     }
 
     #[test]
     fn contiguous_runs_never_cross_physical_holes_or_dma_limit() {
-        let mut f = Fixture::new(&[(256, 258), (300, 320), (0x100000, 0x100010)], &[]);
+        let layout = layout(&[(256, 258), (300, 320), (0x100000, 0x100010)], &[]);
+        let mut f = Fixture::new(&layout);
         f.pool.mark(256, 258);
         assert_eq!(f.pool.allocate_contiguous(10, 0x100000), Some(300));
         f.pool.free_contiguous(300, 10);
@@ -306,35 +207,26 @@ mod tests {
         f.pool.mark(300, 320);
         assert_eq!(f.pool.allocate_contiguous(1, 0x100000), None);
         assert_eq!(f.pool.allocate(), Some(0x100000));
-        assert_eq!(f.pool.refs(0x100000), 1);
     }
 
     #[test]
-    fn shared_counts_disappear_at_one_and_last_release_frees_page() {
-        let mut f = Fixture::new(&[(0x100000000, 0x100000100)], &[]);
+    fn exclusive_release_recycles_high_frames() {
+        let layout = layout(&[(0x100000000, 0x100000002)], &[]);
+        let mut f = Fixture::new(&layout);
         let a = f.pool.allocate().unwrap();
         let b = f.pool.allocate().unwrap();
-        assert!(a > u32::MAX as u64);
-        assert_eq!(f.pool.refs(a), 1);
-        assert!(f.retain(a) && f.retain(b) && f.retain(a));
-        assert_eq!(f.pool.refs(a), 3);
-        assert_eq!(f.pool.release(a), None);
-        assert_eq!(f.pool.release(a), None);
-        assert_eq!(f.pool.refs(a), 1);
-        assert_eq!(f.pool.release(b), None);
-        assert_eq!(f.pool.refs(a), 1);
-        assert_eq!(f.pool.release(a), None);
-        assert_eq!(f.pool.refs(a), 0);
-        assert_eq!(f.pool.free_pages(), f.pool.pages - 1);
-        assert!(!f.retain(a));
+        assert!(a > u32::MAX as u64 && b > a);
+        assert_eq!(f.pool.allocate(), None);
+        f.pool.release(a);
+        assert_eq!(f.pool.free_pages(), 1);
+        assert_eq!(f.pool.allocate(), Some(a));
     }
 
     #[test]
     fn bootstrap_can_start_after_large_boot_modules() {
-        let mut pool = Pool::new();
-        pool.include(256, 0x20000);
-        pool.exclude(512, 0x18000);
-        pool.exclude(512, 512); // empty reservation changes nothing
+        let mut layout = layout(&[(256, 0x20000)], &[(512, 0x18000)]);
+        layout.exclude(512, 512); // empty reservation changes nothing
+        let mut pool = Pool::new(&layout);
         let mut bits = [0u8; 8];
         unsafe { pool.bootstrap(bits.as_mut_ptr(), bits.len()); }
         pool.mark(256, 512);

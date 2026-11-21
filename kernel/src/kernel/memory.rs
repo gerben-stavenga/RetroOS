@@ -190,6 +190,12 @@ pub fn reset<A: Arch>(machine: &mut A, vpage: usize, count: usize) {
     unsafe { fill(machine, page(vpage), count, entry) }.expect("reset mappings");
 }
 
+fn drop_frame_reference(frame: u64) {
+    if super::platform::release_frame_reference(frame) {
+        phys_mm::free_phys_page(frame);
+    }
+}
+
 /// Allocate distinct RAM before creating aliases (EMS/A20/device shadows).
 pub fn fresh<A: Arch>(machine: &mut A, vpage: usize, count: usize) {
     if count == 0 { return; }
@@ -200,7 +206,7 @@ pub fn fresh<A: Arch>(machine: &mut A, vpage: usize, count: usize) {
         let entry = PageEntry::Writable(Mapping { backing: Backing::Owned(PhysicalFrame::new(frame).unwrap()),
             attributes: Attributes::EXECUTABLE });
         let result = unsafe { replace(machine, start.offset(index).unwrap(), entry) };
-        phys_mm::free_phys_page(frame);
+        drop_frame_reference(frame);
         result.expect("map anonymous RAM");
     }
 }
@@ -230,7 +236,7 @@ pub fn protect<A: Arch>(machine: &mut A, vpage: usize, count: usize, writable: b
                 PageEntry::CopyOnWrite(mapping)
             } else { PageEntry::Writable(mapping) };
         let result = unsafe { replace(machine, page, entry) };
-        if let Some(frame) = temporary { phys_mm::free_phys_page(frame); }
+        if let Some(frame) = temporary { drop_frame_reference(frame); }
         result.expect("set protection");
     }
 }
@@ -301,7 +307,7 @@ pub fn private_copy<A: Arch>(machine: &mut A, first: usize, count: usize) {
         super::platform::write_physical_frame(frame, 0, &bytes);
         mapping.backing = Backing::Owned(PhysicalFrame::new(frame).unwrap());
         let result = unsafe { replace(machine, at, PageEntry::Writable(mapping)) };
-        phys_mm::free_phys_page(frame);
+        drop_frame_reference(frame);
         result.expect("install private image");
     }
 }

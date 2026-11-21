@@ -3,6 +3,7 @@
 //! other early storage before opening the tail to permanent low-memory storage.
 //! AP TLS (including CR3 targets) and DMA consume this pool. AP stacks use
 //! resident kernel heap mappings instead.
+use arch_abi::page_supply::{FrameLayout, MemoryRegion};
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -75,6 +76,19 @@ pub(crate) unsafe fn allocate_bootstrap(layout: Layout) -> Result<*mut u8, OutOf
     Ok(at as *mut u8)
 }
 
+/// Complete conventional RAM pages below the firmware data at the top of low memory.
+pub fn conventional_pages(conventional_end: usize, ebda: usize) -> usize {
+    let ceiling = [conventional_end, ebda].into_iter()
+        .filter(|&address| address >= arch_abi::PAGE_SIZE)
+        .fold(0xa0000, usize::min);
+    ceiling / arch_abi::PAGE_SIZE
+}
+
+/// The IVT/BDA and the upper PC memory area, including any page overlapping EBDA.
+pub fn legacy_low_reservations(conventional_pages: usize) -> [(u64, u64); 2] {
+    [(0, 1), (conventional_pages as u64, (0x100000 / arch_abi::PAGE_SIZE) as u64)]
+}
+
 pub struct BootMemory {
     next: usize,
 }
@@ -100,6 +114,26 @@ impl BootMemory {
         self.next = next;
         Ok(at as *mut u8)
     }
+    /// Freeze the usable physical RAM layout in loader-reserved storage.
+    pub fn frame_layout(
+        &mut self,
+        entries: impl Iterator<Item = MemoryRegion> + Clone,
+        limit: u64,
+        reservations: impl Iterator<Item = (u64, u64)>,
+    ) -> Result<&'static FrameLayout, OutOfBootMemory> {
+        let mut layout = FrameLayout::from_memory_map(entries, limit);
+        for (first, end) in reservations {
+            layout.exclude(first, end);
+        }
+        let address = self.allocate(Layout::new::<FrameLayout>())?.cast::<FrameLayout>();
+        // The boot pool gives this object permanent, exclusive storage.
+        // Later reservations advance past it.
+        unsafe {
+            address.write(layout);
+            Ok(&*address)
+        }
+    }
+
     /// Preview a sequence including alignment, without consuming any storage.
     pub fn can_allocate(&self, layouts: &[Layout]) -> bool {
         let mut next = self.next;
@@ -152,10 +186,26 @@ mod tests {
             .unwrap() as usize;
         assert!(ap >= tables + 16384);
         assert_eq!(allocate_permanent(dma), Err(OutOfBootMemory));
+        let size = arch_abi::PAGE_SIZE as u64;
+        let layout = boot.frame_layout(
+            core::iter::once(MemoryRegion { base: 0, length: 260 * size, usable: true }),
+            260,
+            legacy_low_reservations(conventional_pages(0xa0000, 0x9fc00))
+                .into_iter().chain([(257, 259)]),
+        ).unwrap();
+        assert!((layout as *const FrameLayout as usize) >= ap + 65536);
+        assert_eq!(layout.frame_count(), 160);
         boot.finish();
         let channel = allocate_permanent(dma).unwrap() as usize;
         assert!(channel >= ap + 65536);
         assert_eq!(channel % 131072, 0);
+        assert_eq!(layout.index(0), None);
+        assert_eq!(layout.index(1), Some(0));
+        assert_eq!(layout.index(0x9e), Some(157));
+        assert_eq!(layout.index(0x9f), None);
+        assert_eq!(layout.index(256), Some(158));
+        assert_eq!(layout.index(257), None);
+        assert_eq!(layout.index(259), Some(159));
         let next = NEXT.load(Ordering::Relaxed);
         assert_eq!(
             allocate_permanent(Layout::from_size_align(CAPACITY, 1).unwrap()),

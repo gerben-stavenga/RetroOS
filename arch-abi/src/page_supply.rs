@@ -16,6 +16,134 @@ pub struct SupplyStatus {
 #[derive(Clone, Copy)]
 pub struct FrameRegion { pub first: u64, pub end: u64, pub offset: usize }
 
+impl FrameRegion {
+    fn index(regions: &[Self], page: u64) -> Option<usize> {
+        let at = regions.partition_point(|r| r.end <= page);
+        let region = regions.get(at)?;
+        if page < region.first { return None; }
+        Some(region.offset + usize::try_from(page - region.first).ok()?)
+    }
+}
+
+/// Platform-supplied physical byte range. Reservations override usable RAM.
+#[derive(Clone, Copy)]
+pub struct MemoryRegion { pub base: u64, pub length: u64, pub usable: bool }
+
+const MAX_REGIONS: usize = 256;
+
+/// Boot-time layout of the managed RAM frames and their packed metadata indexes.
+pub struct FrameLayout {
+    regions: [FrameRegion; MAX_REGIONS],
+    count: usize,
+    pages: usize,
+}
+
+impl FrameLayout {
+    pub const fn empty() -> Self {
+        Self {
+            regions: [FrameRegion { first: 0, end: 0, offset: 0 }; MAX_REGIONS],
+            count: 0,
+            pages: 0,
+        }
+    }
+
+    pub fn from_memory_map(entries: impl Iterator<Item = MemoryRegion> + Clone, limit: u64) -> Self {
+        let mut layout = Self::empty();
+        let size = crate::PAGE_SIZE as u64;
+        for entry in entries.clone().filter(|entry| entry.usable) {
+            let first = entry.base.div_ceil(size).min(limit);
+            let end = (entry.base.saturating_add(entry.length) / size).min(limit);
+            layout.include(first, end);
+        }
+        for entry in entries.filter(|entry| !entry.usable) {
+            let first = (entry.base / size).min(limit);
+            let end = entry.base.saturating_add(entry.length).div_ceil(size).min(limit);
+            layout.exclude(first, end);
+        }
+        layout
+    }
+
+    pub fn regions(&self) -> &[FrameRegion] {
+        &self.regions[..self.count]
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.pages
+    }
+
+    fn insert(&mut self, at: usize, region: FrameRegion) {
+        assert!(self.count < MAX_REGIONS, "too many physical RAM regions");
+        self.regions.copy_within(at..self.count, at + 1);
+        self.regions[at] = region;
+        self.count += 1;
+    }
+
+    fn remove(&mut self, at: usize) {
+        self.regions.copy_within(at + 1..self.count, at);
+        self.count -= 1;
+    }
+
+    fn include(&mut self, first: u64, end: u64) {
+        if first >= end { return; }
+        let at = self.regions[..self.count].partition_point(|r| r.first < first);
+        self.insert(at, FrameRegion { first, end, offset: 0 });
+        let mut i = 0;
+        while i + 1 < self.count {
+            if self.regions[i].end >= self.regions[i + 1].first {
+                self.regions[i].end = self.regions[i].end.max(self.regions[i + 1].end);
+                self.remove(i + 1);
+            } else { i += 1; }
+        }
+        self.offsets();
+    }
+
+    /// Exclude a reserved physical frame range before publishing the layout.
+    pub fn exclude(&mut self, first: u64, end: u64) {
+        if first >= end { return; }
+        let mut i = 0;
+        while i < self.count {
+            let region = self.regions[i];
+            if first >= region.end || end <= region.first { i += 1; continue; }
+            if first <= region.first && end >= region.end { self.remove(i); continue; }
+            if first > region.first && end < region.end {
+                self.regions[i].end = first;
+                self.insert(i + 1, FrameRegion { first: end, ..region });
+                i += 2;
+            } else {
+                self.regions[i].first = region.first.max(end);
+                if first > region.first {
+                    self.regions[i].first = region.first;
+                    self.regions[i].end = first;
+                }
+                i += 1;
+            }
+        }
+        self.offsets();
+    }
+
+    fn offsets(&mut self) {
+        let mut offset = 0usize;
+        for region in &mut self.regions[..self.count] {
+            region.offset = offset;
+            let length = usize::try_from(region.end - region.first)
+                .expect("RAM metadata exceeds kernel address space");
+            offset = offset.checked_add(length).expect("RAM metadata size overflow");
+        }
+        self.pages = offset;
+    }
+
+    pub fn index(&self, page: u64) -> Option<usize> {
+        FrameRegion::index(self.regions(), page)
+    }
+
+    pub fn frame(&self, index: usize) -> u64 {
+        assert!(index < self.pages);
+        let at = self.regions().partition_point(|r| r.offset <= index) - 1;
+        let region = self.regions[at];
+        region.first + (index - region.offset) as u64
+    }
+}
+
 /// Resident reference-count arena. Allocator bitmaps are separate.
 /// Setup supplies the arena and region index; both remain resident while installed.
 /// Callers must own the frame: zero here denotes one exclusive reference, not free RAM.
@@ -27,17 +155,42 @@ pub struct FrameOwnership {
     pub active: usize,
     pub zero_page: u64,
 }
+// Copies only carry addresses. Access requires the caller to uphold the
+// resident-storage contract, and shared counters are accessed atomically.
+unsafe impl Send for FrameOwnership {}
+unsafe impl Sync for FrameOwnership {}
+
 impl FrameOwnership {
+    /// Pair the frozen RAM layout with the caller's resident counters.
+    ///
+    /// # Safety
+    /// Counters must be zero-initialized storage of `storage_layout` size and
+    /// alignment and remain resident while copies of this descriptor are in use.
+    pub unsafe fn from_layout(layout: &'static FrameLayout, counts: *mut u8, zero_page: u64) -> Self {
+        let regions = layout.regions();
+        Self {
+            regions: regions.as_ptr(),
+            regions_len: regions.len(),
+            counts,
+            active: layout.frame_count(),
+            zero_page,
+        }
+    }
+
+    /// Layout of the zero-initialized counter storage supplied at setup.
+    pub fn storage_layout(frames: usize) -> core::alloc::Layout {
+        let bytes = frames.checked_next_multiple_of(crate::PAGE_SIZE)
+            .expect("frame counter storage size overflow");
+        core::alloc::Layout::from_size_align(bytes, crate::PAGE_SIZE).unwrap()
+    }
+
     pub const EMPTY: Self = Self { regions: core::ptr::null(), regions_len: 0,
         counts: core::ptr::null_mut(), active: 0,
         zero_page: u64::MAX };
     unsafe fn index(&self, page: u64) -> Option<usize> {
         if self.regions_len == 0 { return None; }
         let regions = unsafe { core::slice::from_raw_parts(self.regions, self.regions_len) };
-        let at = regions.partition_point(|r| r.end <= page);
-        let r = regions.get(at)?;
-        if page < r.first { return None; }
-        let index = r.offset + usize::try_from(page - r.first).ok()?;
+        let index = FrameRegion::index(regions, page)?;
         (index < self.active).then_some(index)
     }
     unsafe fn count(&self, index: usize) -> Option<&AtomicU8> {
@@ -153,6 +306,37 @@ impl Default for PageInput { fn default() -> Self { Self::new() } }
 mod tests {
     extern crate std;
     use super::*;
+    #[test]
+    fn frame_ownership_uses_the_frozen_layout_across_gaps() {
+        let size = crate::PAGE_SIZE as u64;
+        let high = 1 << 20;
+        let map = [
+            MemoryRegion { base: 256 * size, length: 6 * size, usable: true },
+            MemoryRegion { base: 258 * size, length: size, usable: false },
+            MemoryRegion { base: high * size, length: 2 * size, usable: true },
+        ];
+        let mut layout = FrameLayout::from_memory_map(map.into_iter(), u64::MAX);
+        layout.exclude(260, 261);
+        let layout = std::boxed::Box::leak(std::boxed::Box::new(layout));
+        let expected = [256, 257, 259, 261, high, high + 1];
+        assert_eq!(layout.frame_count(), expected.len());
+        for (index, frame) in expected.into_iter().enumerate() {
+            assert_eq!(layout.frame(index), frame);
+            assert_eq!(layout.index(frame), Some(index));
+        }
+        assert_eq!(layout.index(258), None);
+        assert_eq!(layout.index(260), None);
+
+        #[repr(align(4096))]
+        struct Counters([u8; crate::PAGE_SIZE]);
+        let mut counters = Counters([0; crate::PAGE_SIZE]);
+        let ownership = unsafe { FrameOwnership::from_layout(layout, counters.0.as_mut_ptr(), 0) };
+        assert_eq!(ownership.regions, layout.regions().as_ptr());
+        assert!(!unsafe { ownership.retain(260) });
+        assert!(unsafe { ownership.retain(high + 1) });
+        assert_eq!(&counters.0[..expected.len()], &[0, 0, 0, 0, 0, 2]);
+    }
+
     #[test]
     fn concurrent_sharing_preserves_the_exclusive_owner() {
         let counts: [AtomicU8; 64] = core::array::from_fn(|_| AtomicU8::new(0));

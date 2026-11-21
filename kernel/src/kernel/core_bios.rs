@@ -9,56 +9,51 @@ use crate::{Arch, Regs, Vcpu};
 use arch_abi::IoSize;
 use alloc::vec::Vec;
 
-// Selected from boot-reported usable conventional RAM, excluding EBDA,
-// reserved ranges and boot modules. The physical allocator excludes all of
-// the first MiB; SMP also excludes this reservation from trampoline selection.
-static NATIVE_SCRATCH: spin::Once<Option<usize>> = spin::Once::new();
-#[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
-pub(crate) fn set_native_scratch(base: Option<usize>) {
-    NATIVE_SCRATCH.call_once(|| base);
+const CONVENTIONAL_PAGES: usize = 0xa0000 / crate::PAGE_SIZE;
+const SCRATCH_BYTES: usize = 0x20000;
+
+struct NativeMemory {
+    scratch_base: usize,
+    conventional_pages: usize,
 }
-pub(crate) fn native_scratch() -> Option<core::ops::Range<usize>> {
-    NATIVE_SCRATCH.get().copied().flatten().map(|base| base..base + 0x20000)
+
+impl NativeMemory {
+    #[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
+    fn new(conventional_pages: usize) -> Option<Self> {
+        let end = conventional_pages * crate::PAGE_SIZE;
+        // The stub and stack occupy the first segment and BIOS buffers the second.
+        let scratch_base = end.checked_sub(SCRATCH_BYTES)? & !0xffff;
+        (scratch_base >= 0x10000).then_some(Self { scratch_base, conventional_pages })
+    }
 }
-/// Choose a segment-aligned area with a full 64 KiB transfer segment.
+
+static NATIVE_MEMORY: spin::Once<Option<NativeMemory>> = spin::Once::new();
+
 #[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
-pub(crate) fn choose_native_scratch(
-    conventional_end: usize,
-    ebda: usize,
-    available: impl Fn(usize, usize) -> bool,
-) -> Option<usize> {
-    let mut ceiling = conventional_end.min(0xa0000);
-    if ebda != 0 { ceiling = ceiling.min(ebda); }
-    (0x10000usize..0x90000).step_by(0x10000).rev().find(|&start| {
-        let end = start + 0x20000;
-        end <= ceiling && available(start, end)
-    })
+pub(crate) fn set_native_memory(conventional_pages: usize) {
+    NATIVE_MEMORY.call_once(|| NativeMemory::new(conventional_pages));
+}
+
+fn native_memory() -> Option<&'static NativeMemory> {
+    NATIVE_MEMORY.get()?.as_ref()
 }
 
 #[cfg(test)]
 mod native_memory_tests {
-    use super::choose_native_scratch;
+    use super::NativeMemory;
 
     #[test]
-    fn scratch_stays_below_bda_and_relocated_ebda() {
-        assert_eq!(choose_native_scratch(0xa0000, 0x9fc00, |_, _| true), Some(0x70000));
-        assert_eq!(choose_native_scratch(0xa0000, 0x80000, |_, _| true), Some(0x60000));
-        assert_eq!(choose_native_scratch(0x70000, 0x9fc00, |_, _| true), Some(0x50000));
-        assert_eq!(choose_native_scratch(0xa0000, 0, |_, _| true), Some(0x80000));
-    }
-
-    #[test]
-    fn scratch_skips_reserved_memory_and_fails_closed() {
-        assert_eq!(choose_native_scratch(0xa0000, 0x9fc00,
-            |start, end| !(start < 0x71000 && end > 0x70000)), Some(0x50000));
-        assert_eq!(choose_native_scratch(0xa0000, 0, |_, _| false), None);
-        assert_eq!(choose_native_scratch(0x20000, 0, |_, _| true), None);
-        assert_eq!(choose_native_scratch(0, 0, |_, _| true), None);
+    fn private_scratch_fits_below_the_first_firmware_page() {
+        assert_eq!(NativeMemory::new(0x9f).unwrap().scratch_base, 0x70000);
+        assert_eq!(NativeMemory::new(0x80).unwrap().scratch_base, 0x60000);
+        assert_eq!(NativeMemory::new(0x70).unwrap().scratch_base, 0x50000);
+        assert_eq!(NativeMemory::new(0xa0).unwrap().scratch_base, 0x80000);
+        assert!(NativeMemory::new(0x20).is_none());
     }
 }
 
 fn scratch_base() -> usize {
-    native_scratch().expect("native BIOS scratch reservation").start
+    native_memory().expect("native BIOS scratch layout").scratch_base
 }
 
 fn prepare_bios_int10<A: Arch>(machine: &mut A, regs: &mut Regs) {
@@ -446,7 +441,7 @@ pub(crate) struct PhysicalVbeState {
 enum PhysicalVideoState { Legacy, Vbe(PhysicalVbeState) }
 
 struct NativeBiosWorkspace<A: Arch> {
-    /// Original firmware IVT/BDA view, used only for native video-ROM calls.
+    /// Persistent firmware view, used only for native video-ROM calls.
     bios_vcpu: Vcpu<A>,
     fx: A::Fx,
     modes: Vec<crate::kernel::platform::VbeMode>,
@@ -545,14 +540,19 @@ impl<A: Arch> NativeBiosWorkspace<A> {
     /// Build the persistent real-mode driver address space from the original
     /// firmware view and park it outside every personality.
     fn new(machine: &mut A) -> Option<Self> {
-        native_scratch()?;
-        // This is the physical firmware environment, not an image of ROM.
-        // Reserved upper memory may contain writable firmware RAM anywhere;
-        // neither E820 nor an option-ROM signature identifies its permissions.
-        // Borrow it without COW: hardware decoding/write protection continues
-        // to enforce actual ROM semantics, and EBDA/SMM see the same RAM.
-        crate::kernel::memory::map_physical(machine, 0, 0xa0, 0, 0);
-        crate::kernel::memory::map_physical(machine, 0xa0, 0x60, 0xa0,
+        let memory = native_memory()?;
+        use crate::kernel::memory::{map_physical, reset};
+
+        // Firmware outside this address space sees the same IVT, BDA and EBDA.
+        map_physical(machine, 0, 1, 0, 0);
+        reset(machine, 1, memory.conventional_pages - 1);
+
+        // Keep the EBDA and other firmware storage at the top of conventional RAM live.
+        let first = memory.conventional_pages;
+        map_physical(machine, first, CONVENTIONAL_PAGES - first, first as u64, 0);
+        // Preserve the physical VGA aperture, ROM and firmware-reserved RAM.
+        // Hardware decoding and protection determine their actual permissions.
+        map_physical(machine, CONVENTIONAL_PAGES, 0x60, CONVENTIONAL_PAGES as u64,
             arch_abi::MAP_PHYS_CACHE_DISABLE);
         let mut bios_space = A::PageTable::default();
         crate::kernel::memory::fork(machine, &mut bios_space);

@@ -124,6 +124,21 @@ mod tests {
 
 pub fn ram() -> (*mut u8, usize) { (region_base(), PHYS_SIZE) }
 
+/// Physical frame layout supplied by the hosted backend at boot.
+pub fn frame_layout() -> &'static arch_abi::page_supply::FrameLayout {
+    use arch_abi::page_supply::{FrameLayout, MemoryRegion};
+    static LAYOUT: std::sync::OnceLock<FrameLayout> = std::sync::OnceLock::new();
+
+    LAYOUT.get_or_init(|| {
+        let mut layout = FrameLayout::from_memory_map(
+            core::iter::once(MemoryRegion { base: 0, length: PHYS_SIZE as u64, usable: true }),
+            (PHYS_SIZE / PAGE) as u64,
+        );
+        layout.exclude(0, (0x100000 / PAGE) as u64);
+        layout
+    })
+}
+
 #[cfg(test)]
 pub fn init_test_ram() {
     static INIT: std::sync::Once = std::sync::Once::new();

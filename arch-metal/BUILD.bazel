@@ -46,7 +46,7 @@ rust_binary(
         "-Clink-arg=-T$(location //kernel:kernel_ld)",
         "-Clink-arg=$(location :entry)", "-Clink-arg=-nostdlib", "-Clink-arg=-no-pie",
     ],
-    deps = [":arch-metal", "//lib", "//kernel:physical_memory"],
+    deps = [":arch-metal", "//arch-abi", "//lib", "//kernel:physical_memory"],
 )
 
 rust_test(
@@ -56,6 +56,7 @@ rust_test(
     crate_root = "boot_mem_test.rs",
     edition = "2024",
     rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
+    deps = ["//arch-abi"],
 )
 
 host_platform_test(
