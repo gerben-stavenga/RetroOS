@@ -4,17 +4,17 @@ use crate::Regs;
 use crate::kernel::dos::machine::vm86_set_return_flag;
 use super::Bda;
 
-pub(super) fn int11<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+pub(super) fn int11<A: crate::Core>(machine: &mut A, regs: &mut Regs) {
     let equipment: u16 = bda_field!(machine, equipment);
     regs.rax = (regs.rax & !0xFFFF) | u64::from(equipment);
 }
 
-pub(super) fn int12<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+pub(super) fn int12<A: crate::Core>(machine: &mut A, regs: &mut Regs) {
     let kb: u16 = bda_field!(machine, mem_size_kb);
     regs.rax = (regs.rax & !0xFFFF) | u64::from(kb);
 }
 
-pub(super) fn int15<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+pub(super) fn int15<A: crate::Core>(machine: &mut A, regs: &mut Regs) {
     match (regs.rax >> 8) as u8 {
         // AH=84h joystick support. We expose no game port, so report all
         // four active-low buttons released and zeroed timing counters.
@@ -59,7 +59,7 @@ pub(super) fn int15<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
 /// 24–31). `CX` = words to copy. We perform the copy directly — the same
 /// operation as XMS AH=0Bh (`copy_within`) — instead of letting the ROM `LGDT`
 /// into protected mode, which is illegal under VM86.
-fn int15_block_move<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+fn int15_block_move<A: crate::Core>(machine: &mut A, regs: &mut Regs) {
     let gdt = ((regs.es as u32) << 4) + (regs.rsi as u32 & 0xFFFF);
     let base = |desc: u32| -> u32 {
         let d = (gdt + desc) as usize;

@@ -150,6 +150,7 @@ http_archive(
         "//stdlib:fatfs-unmount-flush.patch",
         "//stdlib:fatfs-read-kind.patch",
         "//stdlib:fatfs-file-read-kind.patch",
+        "//stdlib:fatfs-unlink.patch",
     ],
     patch_args = ["-p1"],
 )

@@ -33,7 +33,7 @@ pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, instal
 use self::descriptors::{alloc_ldt, alloc_ldt_range, client_dpl, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit};
 mod rm_calls;
 pub(in crate::kernel::dos) use self::rm_calls::callback_entry;
-pub(in crate::kernel::dos) use self::rm_calls::direct_int21_iret;
+pub(in crate::kernel::dos) use self::rm_calls::direct_rm_call;
 use self::rm_calls::{call_real_mode_proc, call_real_mode_proc_iret, simulate_real_mode_int};
 mod exceptions;
 pub(in crate::kernel::dos) use self::exceptions::dispatch_dpmi_exception;
@@ -50,7 +50,7 @@ use self::raw_switch::flat_addr;
 
 /// Switch from VM86 to protected mode.
 /// Called from rm_int31_dispatch when the DPMI entry stub executes.
-pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     let client_type = regs.rax as u16; // AX: 0=16-bit, 1=32-bit
     // DPMI entry is a FAR CALL; the real-mode stack holds the PM return CS:IP.
     let ret_ip = machine::vm86_pop(machine, regs);
@@ -194,7 +194,7 @@ fn scrub_freed_selector(regs: &mut Regs, sel: u16) {
 }
 
 #[inline(never)]
-pub(super) fn dpmi_api<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn dpmi_api<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let function = regs.rax as u16;
     let action = dpmi_api_inner(machine, dos, regs);
     // Virtual interrupt enable/disable only changes saved registers.
@@ -202,7 +202,7 @@ pub(super) fn dpmi_api<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosSta
     action
 }
 
-fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+fn dpmi_api_inner<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {
@@ -963,7 +963,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
 
 /// Replay client mappings after the machine's address decoding changes, for
 /// example when a previously absent emulated aperture acquires backing.
-pub(super) fn refresh_physical_mappings<A: crate::Arch>(
+pub(super) fn refresh_physical_mappings<A: crate::Core>(
     machine: &mut A,
     dos: &mut super::DosState<A>,
 ) {

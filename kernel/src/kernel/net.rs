@@ -30,7 +30,7 @@ pub trait EthernetDevice: Send {
     fn transmit(&mut self, frame: &[u8]) -> bool;
 }
 
-pub fn init<A: crate::Arch>(machine: &mut A) {
+pub fn init<A: crate::Core>(machine: &mut A) {
     if socket_backend_installed() {
         return;
     }

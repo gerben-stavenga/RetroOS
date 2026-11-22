@@ -13,7 +13,7 @@ use crate::kernel::{platform::VgaCap, portio::{inb, outb, outw}};
 
 /// Require one unambiguous I/O-enabled VGA adapter. A secondary NVIDIA GPU
 /// must never make us program NVIDIA registers on the primary Intel/AMD VGA.
-pub(crate) fn primary_nvidia<A: crate::Arch>(machine: &mut A) -> bool {
+pub(crate) fn primary_nvidia<A: crate::Core>(machine: &mut A) -> bool {
     use crate::kernel::pci::read32;
     let mut vendor = None;
     for bus in 0..=255 {

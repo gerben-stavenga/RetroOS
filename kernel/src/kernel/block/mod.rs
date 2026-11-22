@@ -129,7 +129,7 @@ impl Volume {
 /// priority ranking, and this function makes no claim about which disk
 /// matters. Each disk is leaked to `&'static` at boot lifetime, exactly as
 /// `vfs` does with its filesystems.
-pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<&'static dyn Disk> {
+pub fn probe<A: crate::Core>(machine: &mut A) -> Vec<&'static dyn Disk> {
     let mut disks: Vec<&'static dyn Disk> = Vec::new();
     for disk in hdd::probe(machine) {
         disks.push(Box::leak(Box::new(disk)));

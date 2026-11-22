@@ -8,7 +8,7 @@ use arch_abi::vm::{self, Exchange};
 pub(super) struct KvmCpu {
     pub _vm: VmFd,
     pub tid: libc::pid_t,
-    pub planar_bound: bool,
+    pub hook_installed: bool,
     pub vcpu: VcpuFd,
     pub image: *mut u8,
     pub message: *mut Exchange,
@@ -67,7 +67,7 @@ fn init() -> KvmCpu {
     super::entry::boot(&vcpu, entry);
     let tid = unsafe { libc::gettid() };
     install_alarm(&mut vcpu, tid);
-    let mut cpu = KvmCpu { planar_bound: false, _vm: vmfd, tid, vcpu, image: image.cast(), message: core::ptr::null_mut() };
+    let mut cpu = KvmCpu { hook_installed: false, _vm: vmfd, tid, vcpu, image: image.cast(), message: core::ptr::null_mut() };
     super::run::until_return(&mut cpu, false);
     let message = unsafe { &mut *cpu.message };
     message.operation = vm::op::CONFIGURE;
@@ -159,34 +159,42 @@ impl Drop for KvmCpu {
 
 /// Map the owner's resident pages into the supervisor for the duration of a
 /// loan. No host pointer appears in a VM request or in supervisor storage.
-pub(super) unsafe fn bind_planar(binding: Option<planar::Binding>) {
+pub(super) unsafe fn install_trap_hook(hook: Option<arch_abi::entry::TrapHook>) {
     with(|cpu| {
-        if binding.is_none() && !cpu.planar_bound { return; }
-        if let Some(b) = binding {
-            assert!(!cpu.planar_bound, "detach planar storage before replacing it");
-            for (slot, host, physical, size) in [
-                (3, b.registers as u64, vm::PLANAR_PHYSICAL, 4096),
-                (4, b.planes as u64, vm::PLANAR_PHYSICAL + 4096, 4 * 65536),
-            ] {
-                assert!(host != 0 && host % 4096 == 0);
-                unsafe { cpu._vm.set_user_memory_region(kvm_userspace_memory_region {
-                    slot, flags: 0, guest_phys_addr: physical, memory_size: size, userspace_addr: host,
-                }) }.expect("map borrowed planar storage");
-            }
-        }
+        if hook.is_none() && !cpu.hook_installed { return; }
         let message = unsafe { &mut *cpu.message };
-        message.operation = vm::op::BIND_PLANAR;
+        let mut args = [0; 6];
+        if let Some(hook) = hook {
+            assert!(!cpu.hook_installed, "detach trap hook before replacing it");
+            assert!(hook.regions.iter().map(|region| region.bytes).sum::<usize>() <= vm::HOOK_PAGES * 4096);
+            let mut physical = vm::HOOK_PHYSICAL;
+            for (index, region) in hook.regions.into_iter().enumerate() {
+                assert!(region.base as usize % 4096 == 0 && region.bytes % 4096 == 0);
+                assert!(region.bytes == 0 || !region.base.is_null());
+                if region.bytes != 0 {
+                    unsafe { cpu._vm.set_user_memory_region(kvm_userspace_memory_region {
+                        slot: 3 + index as u32, flags: 0, guest_phys_addr: physical,
+                        memory_size: region.bytes as u64, userspace_addr: region.base as u64,
+                    }) }.expect("map trap hook storage");
+                }
+                physical += region.bytes as u64;
+                args[index + 1] = region.bytes as u64;
+            }
+            args[0] = hook.name.len() as u64;
+            assert!(args[0] != 0);
+            message.data[..hook.name.len()].copy_from_slice(hook.name.as_bytes());
+        }
+        message.operation = vm::op::INSTALL_TRAP_HOOK;
         message.page_count = 0;
-        message.args = [binding.is_some() as u64, 0, 0, 0, 0, 0];
+        message.args = args;
         super::run::until_return(cpu, false);
-        if binding.is_none() {
-            // Revoke the VM aliases before releasing the owner's loan.
+        if hook.is_none() {
             for slot in [3, 4] {
                 unsafe { cpu._vm.set_user_memory_region(kvm_userspace_memory_region {
                     slot, ..Default::default()
-                }) }.expect("unmap borrowed planar storage");
+                }) }.expect("unmap trap hook storage");
             }
         }
-        cpu.planar_bound = binding.is_some();
+        cpu.hook_installed = hook.is_some();
     })
 }

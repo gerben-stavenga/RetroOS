@@ -151,7 +151,10 @@ fn main() {
     // frame mailbox for the screenshot path. Only armed when a consumer
     // exists, so headless --cmd runs skip the render work entirely.
     if shot_armed {
-        kernel::kernel::display::set_host_present_sink(arch::publish_frame);
+        kernel::kernel::display::install_external_display(kernel::kernel::display::ExternalDisplay {
+            output: || (b"Capture", 0, 0),
+            present: |_, w, h, mut pixels| arch::publish_frame(w, h, &mut pixels),
+        });
     }
     if let Some(path) = wav {
         arch::attach_audio(&path); // canonical audio device → WAV file
@@ -159,9 +162,9 @@ fn main() {
 
     // Supply the host filesystem directly to shared startup.
     let (ram, bytes) = arch::physical_ram();
-    let ownership = unsafe { kernel::kernel::platform::init_host_ram(ram, bytes, arch::frame_layout()) };
-    let storage = kernel::kernel::phys_mm::alloc_backed_pages(arch::PAGING_PAGES);
-    unsafe { arch::init_guest_ram(storage, ownership); }
+    let paging = arch::boot_paging_frames();
+    unsafe { kernel::kernel::phys_mm::install_direct_ram(ram, bytes); }
+    let ownership = kernel::kernel::platform::init_memory(arch::frame_layout(), &[paging], u64::MAX);
 
     let root = hosted::HostFs::new(input.as_deref().unwrap_or(".")).unwrap_or_else(|e| {
         eprintln!("cannot open host directory: {e}");
@@ -189,14 +192,12 @@ fn main() {
     config.set_c_root(c_root.as_deref().unwrap_or(if root.dir_exists(b"home/retroos") { "/home/retroos" } else { "/" }).as_bytes());
 
     hosted::start_media_worker();
-    let mut machine = arch::Interp;
-    // Hosted has no display to arbitrate until `startup` builds a Console;
-    // mirroring the metal boot_kernel — one per boot, moved into startup.
-    kernel::startup(&mut machine, &config, kernel::kernel::startup::Storage::Root(Box::leak(Box::new(root))));
+    let storage = kernel::kernel::startup::Storage::Root(Box::leak(Box::new(root)));
+    unsafe { arch::boot(ownership, &config, storage, kernel::startup) }
 }
 
 /// Inject the interp backend into the backend-agnostic kernel: its port I/O
-/// (for the deep driver call sites that never see the `&mut Arch`) and the
+/// (for the deep driver call sites that never see the `&mut Core`) and the
 /// host-environment facts the platform probe reads.
 fn install_hosted_backend() {
     arch::install_input_sink(kernel::kernel::irq_dispatch::post);

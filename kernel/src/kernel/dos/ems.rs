@@ -32,7 +32,7 @@ fn ems_base_page() -> usize {
 
 /// Alias a window onto its backing pages. The backing mapping stays live:
 /// multiple physical windows may name the same logical EMS page.
-fn map_ems_window<A: crate::Arch>(machine: &mut A, window: usize, backing: Option<usize>) {
+fn map_ems_window<A: crate::Core>(machine: &mut A, window: usize, backing: Option<usize>) {
     let frame = ems_base_page() + window * 4;
     if let Some(backing) = backing {
         crate::kernel::memory::alias(machine, backing, frame, 4);
@@ -74,7 +74,7 @@ impl EmsState {
     }
 
     /// Remove window aliases before releasing the owning allocations.
-    pub fn free_all_pages<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn free_all_pages<A: crate::Core>(&mut self, machine: &mut A) {
         for window in 0..self.frame.len() {
             if self.frame[window].is_some() {
                 map_ems_window(machine, window, None);
@@ -84,7 +84,7 @@ impl EmsState {
         self.frame = [None; 4];
     }
 
-    fn map<A: crate::Arch>(&mut self, machine: &mut A, window: usize,
+    fn map<A: crate::Core>(&mut self, machine: &mut A, window: usize,
                           handle: u16, logical: u16) -> Result<(), u8> {
         if window >= 4 { return Err(0x8B); }
         let mapping = if logical == 0xFFFF { None } else {
@@ -97,7 +97,7 @@ impl EmsState {
         Ok(())
     }
 
-    fn restore<A: crate::Arch>(&mut self, machine: &mut A, map: PageMap) -> Result<(), u8> {
+    fn restore<A: crate::Core>(&mut self, machine: &mut A, map: PageMap) -> Result<(), u8> {
         // Validate the entire saved context before changing any window.
         for (handle, logical) in map.iter().flatten() {
             let h = self.handles.get(*handle as usize).and_then(Option::as_ref).ok_or(0x83)?;
@@ -113,14 +113,14 @@ impl EmsState {
 }
 
 /// Ensure EMS state exists for current thread
-fn ems_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut EmsState {
+fn ems_state<A: crate::Core>(dos: &mut thread::DosState<A>) -> &mut EmsState {
     if dos.ems.is_none() {
         dos.ems = Some(alloc::boxed::Box::new(EmsState::new()));
     }
     dos.ems.as_deref_mut().unwrap()
 }
 
-fn ems_parts<A: crate::Arch>(dos: &mut thread::DosState<A>)
+fn ems_parts<A: crate::Core>(dos: &mut thread::DosState<A>)
     -> (&mut EmsState, &mut super::memory::DosMemory)
 {
     if dos.ems.is_none() {
@@ -134,7 +134,7 @@ fn backing_vpage(handle: &EmsHandle, logical_page: u16) -> Option<usize> {
     handle.base.map(|base| (base / 4096) as usize + usize::from(logical_page) * 4)
 }
 
-pub(crate) fn int_67h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(crate) fn int_67h<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     dos_trace!("EMS: AH={:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X}",
         ah, regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16);
@@ -154,7 +154,7 @@ pub(crate) fn int_67h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
     result
 }
 
-fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, ah: u8) -> thread::KernelAction {
+fn int_67h_inner<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, ah: u8) -> thread::KernelAction {
     match ah {
         // AH=40h — Get status
         0x40 => {
@@ -446,7 +446,7 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
 
 /// Resolve one packed AH=57h endpoint. Expanded offsets can cross logical
 /// pages, but the initial offset must lie within its first 16 KiB page.
-fn region_address<A: crate::Arch>(machine: &A, ems: &EmsState, descriptor: usize,
+fn region_address<A: crate::Core>(machine: &A, ems: &EmsState, descriptor: usize,
                                   length: usize) -> Result<usize, u8> {
     let kind = machine.read::<u8>(descriptor as u64);
     let handle = machine.read::<u16>((descriptor + 1) as u64);
@@ -498,7 +498,7 @@ fn region_spans(ems: &EmsState, mut address: usize, mut length: usize)
     spans
 }
 
-fn move_region<A: crate::Arch>(machine: &mut A, ems: &EmsState, regs: &Regs) -> Result<(), u8> {
+fn move_region<A: crate::Core>(machine: &mut A, ems: &EmsState, regs: &Regs) -> Result<(), u8> {
     let sub = regs.rax as u8;
     if sub > 1 { return Err(0x8F); }
     let descriptor = ((regs.ds as u16 as usize) << 4) + regs.rsi as u16 as usize;

@@ -2,7 +2,7 @@
 //! snapshots consumed by its compositor. Guest pointers never escape this call.
 use super::*;
 
-pub(super) fn call<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32; 3]) -> u32 {
+pub(super) fn call<A: crate::Core>(machine: &mut A, state: &mut WindowsState, args: [u32; 3]) -> u32 {
     let [op, params, out] = args;
     if op == 0 {
         for (i, n) in [screen_size().0 as u32, screen_size().1 as u32, 32].into_iter().enumerate() {

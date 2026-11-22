@@ -2,7 +2,7 @@ use crate::Regs;
 use super::*;
 use super::super::mode_transitions;
 
-fn dump_selector<A: crate::Arch>(label: &str, dos: &thread::DosState<A>, sel: u16) {
+fn dump_selector<A: crate::Core>(label: &str, dos: &thread::DosState<A>, sel: u16) {
     let idx = sel_to_idx(sel);
     if idx < LDT_ENTRIES {
         let desc = dos.ldt[idx];
@@ -19,7 +19,7 @@ fn dump_selector<A: crate::Arch>(label: &str, dos: &thread::DosState<A>, sel: u1
     }
 }
 
-fn dump_dpmi_fault_context<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs, exc_num: u32) {
+fn dump_dpmi_fault_context<A: crate::Core>(dos: &thread::DosState<A>, regs: &Regs, exc_num: u32) {
     let cs_base = seg_base(&dos.ldt[..], regs.code_seg());
     let ip_addr = cs_base.wrapping_add(regs.ip32());
 
@@ -170,7 +170,7 @@ struct ExcFrame16 {
 ///   [ESP+0x4C] GS + Reserved
 ///   [ESP+0x50] CR2 (valid for #PF)
 ///   [ESP+0x54] PTE (valid for #PF)
-pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, exc_num: u32) -> thread::KernelAction {
+pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, exc_num: u32) -> thread::KernelAction {
     dos_trace!("[DPMI] EXCEPTION {} CS:EIP={:04x}:{:#x} err={:#x} DS={:04x} ES={:04x} FS={:04x} GS={:04x} SS:ESP={:04x}:{:#x}",
         exc_num, regs.code_seg(), regs.ip32(), regs.err_code,
         regs.ds as u16, regs.es as u16, regs.fs as u16, regs.gs as u16,
@@ -431,7 +431,7 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) enum ExcReturnVia { V09, V10 }
 
-pub(super) fn exception_return<A: crate::Arch>(machine: &mut A, 
+pub(super) fn exception_return<A: crate::Core>(machine: &mut A,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
     via: ExcReturnVia,

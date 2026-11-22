@@ -35,6 +35,7 @@ impl RegisterFile {
                 };
             }
             core::ptr::addr_of_mut!((*p).profile).write(planar::Profile::new());
+            core::ptr::addr_of_mut!((*p).trap_mode_bits).write(Dword::new(0));
             byte!(enabled, 1); byte!(profile_enabled, 0);
             byte!(seq_index, 0); byte!(gc_index, 0); byte!(latches_valid, 1);
             bytes!(latches, 4, |_| 0);

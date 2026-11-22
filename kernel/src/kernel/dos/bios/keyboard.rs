@@ -40,7 +40,7 @@ fn conventional(word: u16) -> u16 {
     }
 }
 
-pub(super) fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Parked {
+pub(super) fn int16<A: crate::Core>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Parked {
     // A real INT 16h opens with `STI`, and its wait loop keeps interrupts on
     // (IBM's K16 spins `sti; nop; cli; check-buffer`) — so calling it is how a
     // program with interrupts OFF gets them back on, and the only reason the
@@ -108,7 +108,7 @@ pub(super) fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u
 /// ring for INT 16h. Extended keys (arrows, F-keys) push ascii=0.
 /// Start BIOS INT 9 processing. Returns true when a guest INT 15h/AH=4Fh
 /// intercept was launched and will finish through SLOT_KBD_INTERCEPT_RETURN.
-pub(super) fn int09<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs) -> bool {
+pub(super) fn int09<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs) -> bool {
     let sc = dos.pc.vkbd.read_port60();
     let int15_off = read_u16(machine, 0, 0x15 * 4);
     let int15_seg = read_u16(machine, 0, 0x15 * 4 + 2);
@@ -138,7 +138,7 @@ pub(super) fn int09<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs
 }
 
 /// Continue INT 9 after the guest's INT 15h/AH=4Fh hook returns.
-pub(in crate::kernel::dos) fn int09_intercept_return<A: crate::Arch>(
+pub(in crate::kernel::dos) fn int09_intercept_return<A: crate::Core>(
     machine: &mut A,
     dos: &mut DosState<A>,
     regs: &mut Regs,
@@ -155,7 +155,7 @@ pub(in crate::kernel::dos) fn int09_intercept_return<A: crate::Arch>(
     vm86_iret(machine, regs);
 }
 
-fn finish_int09<A: crate::Arch>(
+fn finish_int09<A: crate::Core>(
     machine: &mut A,
     dos: &mut DosState<A>,
     sc: u8,

@@ -177,7 +177,7 @@ impl SbDevice {
     /// it is handed over idle rather than mid-transfer. The guest keeps
     /// playing into the model, which resumes from exactly the rate, block size
     /// and format the guest last programmed.
-    fn drop_to_facade<A: crate::Arch>(
+    fn drop_to_facade<A: crate::Core>(
         self,
         machine: &mut A,
         b: &Blaster,
@@ -200,7 +200,7 @@ impl SbDevice {
     /// begins the transfer. The DMA side needs nothing here — the virtual 8237
     /// still holds this guest's programming, and the next `maybe_remap`
     /// re-arms the real controller from it.
-    fn present<A: crate::Arch>(self, machine: &mut A, card: Sb16) -> Self {
+    fn present<A: crate::Core>(self, machine: &mut A, card: Sb16) -> Self {
         let Self::Emulated(shadow) = self else {
             panic!("SB already owns the card");
         };
@@ -297,7 +297,7 @@ impl EmulatedSb {
 
 impl SoundBlaster {
     /// Complete the guest IRQ acknowledgement on a passed-through card.
-    pub fn acknowledge_irq<A: crate::Arch>(&self, machine: &mut A, irq: u8) {
+    pub fn acknowledge_irq<A: crate::Core>(&self, machine: &mut A, irq: u8) {
         if irq == self.blaster.irq && let SbDevice::Native { pt, .. } = &self.device {
             machine.isa_unmask_irq(pt.card.irq);
         }
@@ -343,7 +343,7 @@ impl SoundBlaster {
         }
     }
 
-    pub fn set_physical_master<A: crate::Arch>(&self, machine: &mut A, raw: u8) -> bool {
+    pub fn set_physical_master<A: crate::Core>(&self, machine: &mut A, raw: u8) -> bool {
         match &self.device {
             SbDevice::Native { pt, .. } => {
                 pt.set_master(machine, raw);
@@ -353,7 +353,7 @@ impl SoundBlaster {
         }
     }
 
-    pub fn set_physical_source<A: crate::Arch>(&self, machine: &mut A,
+    pub fn set_physical_source<A: crate::Core>(&self, machine: &mut A,
         source: crate::kernel::osd::SbSource, level: u8) -> bool {
         match &self.device {
             SbDevice::Native { pt, .. } => {
@@ -373,7 +373,7 @@ impl SoundBlaster {
     /// state and OMF2's sound-init probe falls into a "wait for the card
     /// to settle" timeout branch (526 `INT 21 AH=2C` calls in the hang
     /// trace). Idempotent.
-    pub fn release_dma_pool<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
+    pub fn release_dma_pool<A: crate::Core>(&mut self, machine: &mut A, _regs: &mut Regs) {
         let Self { blaster, device } = self;
         match device {
             SbDevice::Emulated(emu) => {
@@ -389,7 +389,7 @@ impl SoundBlaster {
     ///
     /// The mirror of `VgaAdapter::present`, and for the same reason — the guest
     /// must not be able to tell that its card changed identity underneath it.
-    pub fn adopt_card<A: crate::Arch>(&mut self, machine: &mut A, card: Sb16) {
+    pub fn adopt_card<A: crate::Core>(&mut self, machine: &mut A, card: Sb16) {
         let dev = core::mem::replace(&mut self.device, SbDevice::Emulated(EmulatedSb::new()));
         self.device = dev.present(machine, card);
     }
@@ -397,7 +397,7 @@ impl SoundBlaster {
     /// Give the card up: snapshot it into the model and hand the silicon on.
     /// The mirror of `VgaAdapter::drop_to_facade`. `None` if this thread never had
     /// it, which is every thread on a machine without a card.
-    pub fn release_card<A: crate::Arch>(&mut self, machine: &mut A) -> Option<Sb16> {
+    pub fn release_card<A: crate::Core>(&mut self, machine: &mut A) -> Option<Sb16> {
         let Self { blaster, device } = self;
         let dev = core::mem::replace(device, SbDevice::Emulated(EmulatedSb::new()));
         let (dev, card) = dev.drop_to_facade(machine, blaster);
@@ -432,7 +432,7 @@ impl SoundBlaster {
     }
 
     /// Read an SB DSP/mixer/OPL port.
-    pub fn sb_read<A: crate::Arch>(&mut self, machine: &mut A, p: u16) -> u8 {
+    pub fn sb_read<A: crate::Core>(&mut self, machine: &mut A, p: u16) -> u8 {
         let Self { blaster, device } = self;
         match device {
             SbDevice::Emulated(emu) => emu.core.port_read(p),
@@ -451,7 +451,7 @@ impl SoundBlaster {
     }
 
     /// Write an SB DSP/mixer/OPL port.
-    pub fn sb_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
+    pub fn sb_write<A: crate::Core>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
         let Self { blaster, device } = self;
         match device {
             SbDevice::Emulated(emu) => emu.write(machine, dma, blaster, p, val),
@@ -477,7 +477,7 @@ impl SoundBlaster {
     ///  - **everything else** (not-yet-armed = programming snapshot,
     ///    non-SB channels, addr/page/status) → `Dma8237::io_read`, i.e.
     ///    the captured guest programming.
-    pub fn dma_read<A: crate::Arch>(&mut self, machine: &mut A, dma: &mut Dma8237, port: u16) -> u8 {
+    pub fn dma_read<A: crate::Core>(&mut self, machine: &mut A, dma: &mut Dma8237, port: u16) -> u8 {
         let Self { blaster, device } = self;
         // Channel-data ports only: DMA1 0x00..=0x07 (addr/count pairs for
         // chan 0..3), DMA2 0xC0..=0xCF (addr/count pairs for chan 4..7,
@@ -535,7 +535,7 @@ impl SoundBlaster {
     /// here: emulated, the virtual-8237 `prog` is already captured (io_write)
     /// and we read the guest ring for the card at playback — there is no chip
     /// to program and no buffer to alias.
-    pub fn maybe_remap<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs, dma: &mut Dma8237) {
+    pub fn maybe_remap<A: crate::Core>(&mut self, machine: &mut A, _regs: &mut Regs, dma: &mut Dma8237) {
         let Self { blaster: b, device } = self;
         let SbDevice::Native { pt, .. } = device else { return };
         // SB uses exactly its BLASTER D (8-bit) or H (16-bit) channel.
@@ -573,7 +573,7 @@ impl SoundBlaster {
     }
 
     /// Release this task's channel binding before another task uses the pool.
-    pub fn sb_suspend<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn sb_suspend<A: crate::Core>(&mut self, machine: &mut A) {
         match &mut self.device {
             SbDevice::Emulated(emu) => emu.unbind_dma(machine),
             SbDevice::Native { pt, .. } => pt.suspend(machine),
@@ -581,7 +581,7 @@ impl SoundBlaster {
     }
 
     /// Task switched back to the foreground: re-materialize the binding.
-    pub fn sb_resume<A: crate::Arch>(&mut self, machine: &mut A, dma: &mut Dma8237) {
+    pub fn sb_resume<A: crate::Core>(&mut self, machine: &mut A, dma: &mut Dma8237) {
         if let SbDevice::Emulated(emu) = &mut self.device {
             let channel = emu.dma_channel;
             if emu.core.playing() && channel < 8 {
@@ -655,7 +655,7 @@ impl EmulatedSb {
     /// Emulated DSP/mixer/FM port write. The card decodes; when it decodes a
     /// start-playback command it hands it back, because only we can read the
     /// guest's DMA controller for the ring that command refers to.
-    fn write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, b: &Blaster, p: u16, val: u8) {
+    fn write<A: crate::Core>(&mut self, machine: &mut A, dma: &Dma8237, b: &Blaster, p: u16, val: u8) {
         let now = machine.now();
         let Some(start) = self.core.port_write(p, val, now) else { return };
         let is16 = start.bits == 16;
@@ -737,14 +737,14 @@ impl EmulatedSb {
         true
     }
 
-    fn bind_dma<A: crate::Arch>(&mut self, machine: &mut A, channel: usize, gpa: u32, len: u32) {
+    fn bind_dma<A: crate::Core>(&mut self, machine: &mut A, channel: usize, gpa: u32, len: u32) {
         if self.dma_binding.as_ref().is_some_and(|binding| binding.matches(channel, gpa as usize, len as usize)) {
             return;
         }
         self.unbind_dma(machine);
         self.dma_binding = crate::kernel::drivers::isa_dma::Binding::new(machine, channel, gpa as usize, len as usize);
     }
-    fn unbind_dma<A: crate::Arch>(&mut self, machine: &mut A) {
+    fn unbind_dma<A: crate::Core>(&mut self, machine: &mut A) {
         if let Some(binding) = self.dma_binding.take() { binding.unbind(machine); }
     }
 
@@ -937,7 +937,7 @@ impl EmulatedSb {
 /// Serve the armed SB channel's live addr/count from the real 8237;
 /// everything else from the captured guest programming.
 #[allow(clippy::too_many_arguments)]
-fn native_dma_read<A: crate::Arch>(
+fn native_dma_read<A: crate::Core>(
 pt: &mut NativeSb,
 machine: &mut A,
     dma: &mut Dma8237,

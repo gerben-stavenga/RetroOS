@@ -1,4 +1,4 @@
-//! Arch interrupt dispatch
+//! Core interrupt dispatch
 //!
 //! Ring-0 interrupt handler. Zero imports from kernel/ — all policy decisions
 //! are returned to the ring-1 kernel as events via the execute() interface.
@@ -15,11 +15,11 @@ use arch_abi::monitor::MonitorResult;
 use arch_abi::entry::{KernelCall, CallOutcome};
 
 // =============================================================================
-// Arch call interface (ring-1 kernel → ring-0 arch via INT 0x80)
+// Core call interface (ring-1 kernel → ring-0 arch via INT 0x80)
 // =============================================================================
 
 // =============================================================================
-// Arch state (Ring 0 maintains state for Ring 1 and Ring 3)
+// Core state (Ring 0 maintains state for Ring 1 and Ring 3)
 // =============================================================================
 
 /// Parked app frame between kernel calls. During a syscall it holds the
@@ -28,7 +28,7 @@ use arch_abi::entry::{KernelCall, CallOutcome};
 #[thread_local]
 static mut REGS: Regs = Regs::empty();
 
-// While Arch::execute is in flight, point directly at the event loop's
+// While Core::execute is in flight, point directly at the event loop's
 // register object.  The ring-1 entry and ring-3 exit can then exchange their
 // physical trap frames with that object instead of bouncing the same 216-byte
 // register file through REGS before and after every run.
@@ -49,9 +49,9 @@ pub(crate) fn set_execute_regs(regs: *mut Regs) {
 }
 
 
-/// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
+/// Core call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
 pub mod arch_call {
-    pub const BIND_PLANAR: u64 = 0x134;
+    pub const INSTALL_TRAP_HOOK: u64 = 0x134;
     pub const REARRANGE_MAPPINGS: u64 = 0x133;
     pub const READ_MAPPINGS: u64 = 0x12E;
     pub const REPLACE_MAPPINGS: u64 = 0x12F;
@@ -65,7 +65,7 @@ pub mod arch_call {
     pub const ACTIVATE: u64 = 0x101;     // EDX=in/out page-table root
     pub const CHECK_ADDRESS_SPACE: u64 = 0x132; // EDX=in/out diagnostic hash
     pub const SWITCH_FX: u64 = 0x102;    // Swap live FPU/SSE with EDX save area
-    pub const FORK: u64 = 0x105;         // COW fork. EDX=out RootPageTable. Returns new root phys in EAX.
+    pub const FORK: u64 = 0x105;         // COW fork. EDX=out AddressSpace. Returns new root phys in EAX.
     pub const CLEAN: u64 = 0x106;        // Free all user pages + flush TLB
     pub const LOAD_LDT: u64 = 0x115;    // EDX=base, ECX=limit → load LDT
     pub const MAP_KERNEL_PHYSICAL: u64 = 0x116; // EDX=vpage_start ECX=num_pages EBX=ppage_lo ESI=ppage_hi EDI=flags
@@ -206,7 +206,7 @@ pub(crate) fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
             }
         },
         arch_call::ACTIVATE => unsafe {
-            (&mut *(regs.rdx as *mut paging2::RootPageTable)).swap_and_activate();
+            (&mut *(regs.rdx as *mut paging2::AddressSpace)).swap_and_activate();
         },
         arch_call::CHECK_ADDRESS_SPACE => {
             let hash = unsafe { &mut *(regs.rdx as *mut u64) };
@@ -226,11 +226,11 @@ pub(crate) fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
         }
         // FORK: EDX=child_root out. COW fork and fill the caller's root.
         arch_call::FORK => {
-            let child_root = regs.rdx as usize as *mut paging2::RootPageTable;
+            let child_root = regs.rdx as usize as *mut paging2::AddressSpace;
             // Some callers provide uninitialized output storage.  fork_current
             // replaces entries (and releases any displaced mapping), so make
             // the output an empty root before exposing it as a reference.  Do
-            // this in place: constructing a RootPageTable value here costs a
+            // this in place: constructing an AddressSpace value here costs a
             // 3 KiB interrupt-stack temporary after fat LTO.
             unsafe {
                 child_root.write_bytes(0, 1);
@@ -308,8 +308,8 @@ pub(crate) fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
                 }
             }
         }
-        arch_call::BIND_PLANAR => unsafe {
-            crate::planar::bind(*(regs.rdx as *const Option<::planar::Binding>));
+        arch_call::INSTALL_TRAP_HOOK => unsafe {
+            crate::entry::install_hook(*(regs.rdx as *const Option<arch_abi::entry::TrapHook>));
         },
         _ => lib::compact_panic!("Unknown arch call: {:#x}", regs.rax),
     }
@@ -317,15 +317,12 @@ pub(crate) fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
 }
 
 #[cfg(not(feature = "kvm"))]
-pub(crate) fn dispatch_parked_call(frame: &Regs) -> CallOutcome {
+pub(crate) fn dispatch_parked_call() -> CallOutcome {
     let execute = unsafe { EXECUTE_REGS };
     let parked = if execute.is_null() { &raw mut REGS } else { execute };
     let mut call = KernelCall::from_regs(unsafe { &*parked });
     let outcome = arch_dispatch(&mut call);
     call.write_result(unsafe { &mut *parked });
-    if matches!(outcome, CallOutcome::Execute) {
-        crate::planar::prepare(frame.code_seg(), frame.mode() == arch_abi::UserMode::VM86);
-    }
     outcome
 }
 
@@ -343,7 +340,6 @@ pub(crate) fn swap_regs(regs: &mut Regs) {
 /// Native kernel handoff: save the user frame and restore the suspended caller.
 #[cfg(not(feature = "kvm"))]
 pub(crate) fn return_to_kernel(regs: &mut Regs, event: arch_abi::KernelEvent) {
-    crate::planar::publish();
     crate::traps::swap_regs(regs);
     let (event, extra) = event.encode();
     regs.rax = event as u64;
@@ -436,7 +432,9 @@ pub(crate) fn guest_trap(regs: &mut Regs) -> Outcome {
             let vif_was_on = regs.flags32() & eflags::VIF_FLAG != 0;
             let stepped = arch_abi::monitor::stepping(regs);
             let user_was = regs.user_tf();
-            match arch_abi::monitor::monitor(&mut crate::backend::Metal, regs) {
+            // The kernel's access is suspended until this trap returns.
+            let mut core = unsafe { crate::backend::Metal::bind_current() };
+            match arch_abi::monitor::monitor(&mut core, regs) {
                 MonitorResult::Resume => {
                     // A PM CLI/STI toggled virtual IF: reflect the window to
                     // dpmi::vif (which owns the per-space tag/learn policy). VM86

@@ -42,7 +42,7 @@ pub fn new() -> Box<dyn Filesystem> {
     let volume = Volume::whole(disk);
     fatfs::format_volume(&mut VolumeIo::new(volume, true), fatfs::FormatVolumeOptions::new())
         .expect("session RAM format failed");
-    Box::new(FatFs::new(VolumeIo::new(volume, true)).expect("session RAM mount failed"))
+    Box::new(FatFs::new_volatile(VolumeIo::new(volume, true)).expect("session RAM mount failed"))
 }
 
 /// Copy boot defaults into writable session memory. Never mutate the boot source.

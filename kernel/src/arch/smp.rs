@@ -24,7 +24,7 @@ extern "C" fn park(id: u32, _argument: usize) -> ! {
         arch::irq::init_worker_timer(timer);
         if arch::paging2::is_pae() { arch::paging2::setup_long_mode_tables(); arch::paging2::flush_tlb(); }
         arch::descriptors::enter_ring1();
-        unsafe { crate::kernel::parallel::worker(arch::Metal, slot) }
+        unsafe { crate::kernel::parallel::worker(arch::Metal::bind_current(), slot) }
     }
     while !MEDIA_START.load(Ordering::Acquire) { core::hint::spin_loop(); }
     fn refresh() {

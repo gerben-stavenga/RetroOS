@@ -1,6 +1,12 @@
 /* Use the host's SQLite runtime without requiring its development package. */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 typedef struct sqlite3 sqlite3;
 extern int sqlite3_open(const char *, sqlite3 **);
 extern int sqlite3_close(sqlite3 *);
@@ -25,7 +31,53 @@ static void count(sqlite3 *db, int expected) {
         exit(2);
     }
 }
+
+/* Recent SQLite tries O_TMPFILE for its subjournal. A successful open must
+ * return a writable file. EOPNOTSUPP lets SQLite use a named temporary file. */
+static void check_tempfile(void) {
+    int fd = open("/home/retroos", O_TMPFILE | O_RDWR | O_EXCL, 0600);
+    if (fd < 0) {
+        if (errno == EOPNOTSUPP) return;
+        perror("open O_TMPFILE");
+    } else {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && write(fd, "x", 1) == 1
+                && close(fd) == 0) return;
+        fputs("O_TMPFILE did not return a writable regular file\n", stderr);
+    }
+    exit(7);
+}
+
+static void check_unlinked_journal(void) {
+    static unsigned char input[61504], output[sizeof(input)];
+    char path[] = "/tmp/retroos-sqlite-XXXXXX";
+    int writer = mkstemp(path);
+    int reader = writer < 0 ? -1 : open(path, O_RDWR);
+    for (size_t i = 0; i < sizeof(input); ++i) input[i] = i % 251;
+    if (reader < 0 || unlink(path) < 0 ||
+            pwrite(writer, input, sizeof(input), 0) != sizeof(input)) {
+        perror("write to unlinked SQLite journal");
+        exit(8);
+    }
+    int replacement = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (replacement < 0 || write(replacement, "new", 3) != 3 ||
+            close(writer) < 0 || pread(reader, output, sizeof(output), 0) != sizeof(output) ||
+            memcmp(input, output, sizeof(input)) != 0 ||
+            close(reader) < 0 || close(replacement) < 0) {
+        fputs("Unlinked journal and recreated name did not retain separate contents\n", stderr);
+        exit(9);
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0 || read(fd, output, sizeof(output)) != 3 || memcmp(output, "new", 3) != 0 ||
+            close(fd) < 0 || unlink(path) < 0) {
+        fputs("Journal close damaged the file at its old path\n", stderr);
+        exit(10);
+    }
+}
+
 int main(void) {
+    check_tempfile();
+    check_unlinked_journal();
     sqlite3 *reader = 0, *writer = 0;
     const char *path = "/home/retroos/wal.sqlite";
     if (sqlite3_open(path, &reader) || sqlite3_open(path, &writer)) return 3;

@@ -37,7 +37,7 @@ fn free_handle_count(xms: &XmsState) -> usize {
     xms.handles.iter().filter(|h| h.is_none()).count()
 }
 
-fn allocate_emb<A: crate::Arch>(
+fn allocate_emb<A: crate::Core>(
     machine: &mut A,
     xms: &mut XmsState,
     memory: &mut super::memory::DosMemory,
@@ -57,7 +57,7 @@ fn allocate_emb<A: crate::Arch>(
     Ok((slot + 1) as u16)
 }
 
-fn resize_emb<A: crate::Arch>(
+fn resize_emb<A: crate::Core>(
     machine: &mut A,
     xms: &mut XmsState,
     memory: &mut super::memory::DosMemory,
@@ -106,7 +106,7 @@ impl XmsState {
 
 }
 
-fn xms_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut XmsState {
+fn xms_state<A: crate::Core>(dos: &mut thread::DosState<A>) -> &mut XmsState {
     if dos.xms.is_none() {
         dos.xms = Some(alloc::boxed::Box::new(XmsState::new()));
     }
@@ -114,11 +114,11 @@ fn xms_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut XmsState {
 }
 
 /// Aladdin compares AH=08 sizes as signed words; keep this opt-in per launch.
-pub(super) fn set_report_limit<A: crate::Arch>(dos: &mut thread::DosState<A>, enabled: bool) {
+pub(super) fn set_report_limit<A: crate::Core>(dos: &mut thread::DosState<A>, enabled: bool) {
     xms_state(dos).report_limit_kb = if enabled { i16::MAX as u16 } else { u16::MAX };
 }
 
-fn xms_parts<A: crate::Arch>(dos: &mut thread::DosState<A>)
+fn xms_parts<A: crate::Core>(dos: &mut thread::DosState<A>)
     -> (&mut XmsState, &mut super::memory::DosMemory)
 {
     if dos.xms.is_none() {
@@ -127,7 +127,7 @@ fn xms_parts<A: crate::Arch>(dos: &mut thread::DosState<A>)
     (dos.xms.as_deref_mut().unwrap(), &mut dos.memory)
 }
 
-pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(crate) fn xms_dispatch<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=00h — Get XMS version
@@ -420,7 +420,7 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
 ///   +06: u32 source offset (or seg:off if handle=0)
 ///   +0A: u16 dest handle (0=conventional)
 ///   +0C: u32 dest offset (or seg:off if handle=0)
-fn xms_move<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+fn xms_move<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     let addr = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32);
 
     let length = machine.read::<u32>(addr as u64) as usize;
@@ -554,7 +554,7 @@ fn umb_avail() -> u64 {
 
 /// Allocate a UMB of at least `paragraphs` size (1 paragraph = 16 bytes).
 /// Returns (segment, paragraphs_allocated) or None.
-fn umb_alloc<A: crate::Arch>(machine: &mut A, paragraphs: u16) -> Option<(u16, u16)> {
+fn umb_alloc<A: crate::Core>(machine: &mut A, paragraphs: u16) -> Option<(u16, u16)> {
     let pages_needed = ((paragraphs as usize) * 16).div_ceil(0x1000);
     if pages_needed == 0 { return None; }
 
@@ -586,7 +586,7 @@ fn umb_alloc<A: crate::Arch>(machine: &mut A, paragraphs: u16) -> Option<(u16, u
 }
 
 /// Free a UMB by segment address.
-fn umb_free<A: crate::Arch>(machine: &mut A, segment: u16) -> bool {
+fn umb_free<A: crate::Core>(machine: &mut A, segment: u16) -> bool {
     let page = (segment / 0x100) as usize;
     if !(UMA_BASE..UMA_END).contains(&page) || segment as usize != page * 0x100 {
         return false;
@@ -602,7 +602,7 @@ fn umb_free<A: crate::Arch>(machine: &mut A, segment: u16) -> bool {
 
 /// Resize a UMB without moving its segment. The implementation may return a
 /// page-rounded block; XMS explicitly returns the actual paragraph count.
-fn umb_resize<A: crate::Arch>(machine: &mut A, segment: u16, paragraphs: u16)
+fn umb_resize<A: crate::Core>(machine: &mut A, segment: u16, paragraphs: u16)
     -> Result<u16, u8>
 {
     let page = (segment / 0x100) as usize;

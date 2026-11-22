@@ -182,6 +182,7 @@ rust_library(
     crate_root = "planar/src/lib.rs",
     edition = "2024",
     rustc_flags = ["-Crelocation-model=static"] + panic_strategy(),
+    deps = ["//arch-abi"],
 )
 rust_test(
     name = "planar_test",

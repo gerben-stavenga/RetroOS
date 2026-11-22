@@ -121,14 +121,14 @@ impl Sb16 {
 
     /// Set the CT1745's stereo master level using its compatibility register.
     /// Native passthrough restores the guest's mixer index after this write.
-    pub fn set_master<A: crate::Arch>(&self, machine: &mut A, raw: u8) {
+    pub fn set_master<A: crate::Core>(&self, machine: &mut A, raw: u8) {
         machine.outb(self.base + MIX_IDX, 0x22);
         machine.outb(self.base + MIX_DATA, raw);
         crate::kernel::osd::observe_sb_master(raw);
     }
 
     /// Set both CT1745 channels for Voice, MIDI/FM, or analog CD input.
-    pub fn set_source<A: crate::Arch>(&self, machine: &mut A,
+    pub fn set_source<A: crate::Core>(&self, machine: &mut A,
         source: crate::kernel::osd::SbSource, level: u8) {
         if !self.is_sb16 { return; }
         let raw = level.min(31) << 3;
@@ -159,7 +159,7 @@ impl Sb16 {
     /// ignored mixer write from changing our view of the physical wiring.
     /// Pre-SB16 cards have no such registers; there is nothing to move, and
     /// their declared wiring stands.
-    pub fn restrap<A: crate::Arch>(&mut self, machine: &mut A, want: SbWiring) -> SbWiring {
+    pub fn restrap<A: crate::Core>(&mut self, machine: &mut A, want: SbWiring) -> SbWiring {
         if self.pnp { return self.wiring(); }
         let got = strap_wiring(machine, self.base, want);
         self.irq = got.irq;
@@ -197,18 +197,18 @@ const BASES: [u16; 4] = [0x220, 0x240, 0x260, 0x280];
 /// can say how it is wired. That is not a defeat to paper over with a default:
 /// a guessed IRQ silently loses every completion interrupt, and a card no
 /// owner can reach is exactly a card nobody holds.
-pub fn scan<A: crate::Arch>(machine: &mut A, declared: Option<SbWiring>) -> Option<Sb16> {
+pub fn scan<A: crate::Core>(machine: &mut A, declared: Option<SbWiring>) -> Option<Sb16> {
     let base = BASES.into_iter().find(|&b| dsp_reset_at(machine, b))?;
     identify(machine, base, declared, false)
 }
 
 /// PnP already selected and verified this DSP. Do not sweep other bases and
 /// accidentally bind a different legacy card instead.
-pub(crate) fn from_pnp<A: crate::Arch>(machine: &mut A, base: u16, wiring: SbWiring) -> Option<Sb16> {
+pub(crate) fn from_pnp<A: crate::Core>(machine: &mut A, base: u16, wiring: SbWiring) -> Option<Sb16> {
     identify(machine, base, Some(wiring), true)
 }
 
-fn identify<A: crate::Arch>(machine: &mut A, base: u16, declared: Option<SbWiring>, pnp: bool) -> Option<Sb16> {
+fn identify<A: crate::Core>(machine: &mut A, base: u16, declared: Option<SbWiring>, pnp: bool) -> Option<Sb16> {
     let dsp_major = dsp_version_major(machine, base);
     let is_sb16 = dsp_major >= 4;
     let Some(w) = (if is_sb16 { Some(read_wiring(machine, base)) } else { declared }) else {
@@ -268,7 +268,7 @@ fn identify<A: crate::Arch>(machine: &mut A, base: u16, declared: Option<SbWirin
 }
 
 /// DSP `0xE1` — get version; the major byte is the generation.
-fn dsp_version_major<A: crate::Arch>(machine: &mut A, base: u16) -> u8 {
+fn dsp_version_major<A: crate::Core>(machine: &mut A, base: u16) -> u8 {
     dsp_write_at(machine, base, 0xE1);
     let major = dsp_read_at(machine, base);
     let _minor = dsp_read_at(machine, base);
@@ -277,7 +277,7 @@ fn dsp_version_major<A: crate::Arch>(machine: &mut A, base: u16) -> u8 {
 
 /// SB16 mixer 0x80/0x81: the IRQ and DMA channels the card is strapped to
 /// (Creative's bit assignments).
-fn read_wiring<A: crate::Arch>(machine: &mut A, base: u16) -> SbWiring {
+fn read_wiring<A: crate::Core>(machine: &mut A, base: u16) -> SbWiring {
     machine.outb(base + 0x04, 0x80);
     let v = machine.inb(base + 0x05);
     let irq = if v & 0x01 != 0 { 9 } else if v & 0x02 != 0 { 5 }
@@ -299,7 +299,7 @@ fn read_wiring<A: crate::Arch>(machine: &mut A, base: u16) -> SbWiring {
 /// count-poll stall). Returns what the card actually accepted (readback):
 /// an emulation that pins its wiring reports the old values, and the caller
 /// proceeds from truth, not intent.
-pub fn strap_wiring<A: crate::Arch>(machine: &mut A, base: u16, want: SbWiring) -> SbWiring {
+pub fn strap_wiring<A: crate::Core>(machine: &mut A, base: u16, want: SbWiring) -> SbWiring {
     let irq_bits: u8 = match want.irq {
         2 | 9 => 0x01,
         5 => 0x02,
@@ -326,7 +326,7 @@ pub fn strap_wiring<A: crate::Arch>(machine: &mut A, base: u16, want: SbWiring) 
     read_wiring(machine, base)
 }
 
-pub(super) fn dsp_reset_at<A: crate::Arch>(machine: &mut A, base: u16) -> bool {
+pub(super) fn dsp_reset_at<A: crate::Core>(machine: &mut A, base: u16) -> bool {
     machine.outb(base + 0x06, 1);
     for _ in 0..1000 {
         core::hint::spin_loop();
@@ -340,7 +340,7 @@ pub(super) fn dsp_reset_at<A: crate::Arch>(machine: &mut A, base: u16) -> bool {
     false
 }
 
-fn dsp_write_at<A: crate::Arch>(machine: &mut A, base: u16, byte: u8) {
+fn dsp_write_at<A: crate::Core>(machine: &mut A, base: u16, byte: u8) {
     for _ in 0..100_000 {
         if machine.inb(base + 0x0C) & 0x80 == 0 {
             machine.outb(base + 0x0C, byte);
@@ -349,7 +349,7 @@ fn dsp_write_at<A: crate::Arch>(machine: &mut A, base: u16, byte: u8) {
     }
 }
 
-fn dsp_read_at<A: crate::Arch>(machine: &mut A, base: u16) -> u8 {
+fn dsp_read_at<A: crate::Core>(machine: &mut A, base: u16) -> u8 {
     for _ in 0..100_000 {
         if machine.inb(base + 0x0E) & 0x80 != 0 {
             return machine.inb(base + 0x0A);
@@ -388,7 +388,7 @@ pub fn zero_channel_buf(card: &Sb16, chan: u8) {
 /// downgrade to some 8-bit path nobody wrote, and not a mode switch behind the
 /// owner's back.
 /// Returns the unique runtime device if this card can drive the mixer sink.
-pub fn open_output<A: crate::Arch>(machine: &mut A, device: &Sb16) -> Option<Sb16Output> {
+pub fn open_output<A: crate::Core>(machine: &mut A, device: &Sb16) -> Option<Sb16Output> {
     if device.dma16 != Some(DMA_CHANNEL as u8) {
         crate::compact_println!(
             "sb16: sink needs 16-bit DMA channel {}, this card has {:?} — output is silent",
@@ -407,7 +407,7 @@ pub fn open_output<A: crate::Arch>(machine: &mut A, device: &Sb16) -> Option<Sb1
 
 /// Map the permanent channel-5 buffer and wake the card up. The ring's
 /// CONTENT is the engine's business; this hands over where it lives.
-fn open_ring<A: crate::Arch>(machine: &mut A, card: &Sb16) -> Option<u32> {
+fn open_ring<A: crate::Core>(machine: &mut A, card: &Sb16) -> Option<u32> {
     // Map the permanent contiguous channel-5 buffer into the stolen low-mem
     // window so the kernel can write PCM; the DSP reads it by physical address.
     let phys_page = card.dma_page(DMA_CHANNEL);
@@ -437,10 +437,10 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &Sb16) -> Option<u32> {
 // ── the four things a `sound::sink::Device` must do ─────────────────────────
 //
 // None of them take a machine handle: port I/O here goes through the injected
-// surface (`kernel::portio`, the same backend functions `Arch::inb/outb` call,
+// surface (`kernel::portio`, the same backend functions `Core::inb/outb` call,
 // installed by the entry crate), exactly as the ATA and PCI-config drivers
 // already reach their hardware. That is what lets the sink contract live in
-// `//lib:sound` without knowing what an `Arch` is.
+// `//lib:sound` without knowing what an `Core` is.
 
 use crate::kernel::portio::{inb, outb};
 

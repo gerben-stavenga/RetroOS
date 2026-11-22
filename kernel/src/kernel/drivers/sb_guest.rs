@@ -30,18 +30,18 @@ use sound::sb::Wiring as Blaster;
 /// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the
 /// "externally owned" mark — COW-fork and address-space teardown both
 /// skip such frames — exactly what an aliased permanent DMA buffer needs.
-/// Arch's `paging2::flags` is private, so the bit is duplicated here per
+/// Core's `paging2::flags` is private, so the bit is duplicated here per
 /// the arch-boundary rule (small primitives are copied, not cross-called).
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
 /// DSP reset: 1 then 0 to `base+6`, the power-on handshake.
-fn dsp_reset<A: crate::Arch>(machine: &mut A, base: u16) {
+fn dsp_reset<A: crate::Core>(machine: &mut A, base: u16) {
     machine.outb(base + 0x06, 1);
     machine.outb(base + 0x06, 0);
 }
 
 /// One DSP command/data byte, once the write buffer says it is ready.
-fn dsp_write<A: crate::Arch>(machine: &mut A, base: u16, byte: u8) {
+fn dsp_write<A: crate::Core>(machine: &mut A, base: u16, byte: u8) {
     for _ in 0..100_000 {
         if machine.inb(base + 0x0C) & 0x80 == 0 {
             break;
@@ -89,12 +89,12 @@ pub struct NativeSb {
 impl NativeSb {
     /// The OSD briefly selects the master register, then puts the guest's
     /// mixer index back so its next data-port access still targets its choice.
-    pub fn set_master<A: crate::Arch>(&self, machine: &mut A, raw: u8) {
+    pub fn set_master<A: crate::Core>(&self, machine: &mut A, raw: u8) {
         self.card.set_master(machine, raw);
         machine.outb(self.card.base + 0x04, self.mixer_idx);
     }
 
-    pub fn set_source<A: crate::Arch>(&self, machine: &mut A,
+    pub fn set_source<A: crate::Core>(&self, machine: &mut A,
         source: crate::kernel::osd::SbSource, level: u8) {
         self.card.set_source(machine, source, level);
         machine.outb(self.card.base + 0x04, self.mixer_idx);
@@ -120,7 +120,7 @@ impl NativeSb {
     /// begins the transfer. The DMA side needs nothing here — the virtual
     /// 8237 still holds the guest's programming, and the next `arm` re-arms
     /// the real controller from it.
-    pub fn adopt<A: crate::Arch>(machine: &mut A, card: Sb16, st: sound::sb::DspState) -> Self {
+    pub fn adopt<A: crate::Core>(machine: &mut A, card: Sb16, st: sound::sb::DspState) -> Self {
         let base = card.base;
         let mixer = |machine: &mut A, index: u8| {
             machine.outb(base + 0x04, index);
@@ -272,7 +272,7 @@ impl NativeSb {
     /// OMF2's sound-init probe falls into a "wait for the card to settle"
     /// timeout branch (526 `INT 21 AH=2C` calls in the hang trace).
     /// Idempotent.
-    pub fn release<A: crate::Arch>(&mut self, machine: &mut A, b: &Blaster) {
+    pub fn release<A: crate::Core>(&mut self, machine: &mut A, b: &Blaster) {
         self.unbind(machine);
         // SB DSP reset: write 1 then 0 to io_base+6. QEMU's sb16 processes
         // this atomically; the hardware ~3 µs hold is irrelevant under
@@ -300,7 +300,7 @@ impl NativeSb {
     /// Read a DSP/mixer/OPL port off the real card. Only the mixer's strap
     /// registers are answered locally — see `trap_mask`; everything else the
     /// card reports is the card's own truth and passes straight through.
-    pub fn read<A: crate::Arch>(&mut self, machine: &mut A, b: &Blaster, p: u16) -> u8 {
+    pub fn read<A: crate::Core>(&mut self, machine: &mut A, b: &Blaster, p: u16) -> u8 {
         if p == b.io_base + 0x05 {
             // Mixer data. Registers 0x80/0x81 report the IRQ and DMA the card
             // is strapped to — physical facts the guest must NOT see: it was
@@ -324,7 +324,7 @@ impl NativeSb {
     /// Write a DSP/mixer/OPL port through to the real card. Only the mixer
     /// strap pair is filtered (see `trap_mask`); every other byte reaches the
     /// silicon verbatim, because the silicon is the card.
-    pub fn write<A: crate::Arch>(&mut self, machine: &mut A, b: &Blaster, p: u16, val: u8) {
+    pub fn write<A: crate::Core>(&mut self, machine: &mut A, b: &Blaster, p: u16, val: u8) {
         if p == b.io_base + 0x04 {
             self.mixer_idx = val;
         } else if p == b.io_base + 0x05 && matches!(self.mixer_idx, 0x80 | 0x81) {
@@ -383,7 +383,7 @@ impl NativeSb {
     /// The virtual controller used to answer a hardcoded 0 here — a value
     /// that never arrives. A driver waiting on TC rather than the completion
     /// IRQ spins forever; SBTEST does exactly that.
-    pub fn tc_status<A: crate::Arch>(&mut self, machine: &mut A, hi: bool) -> u8 {
+    pub fn tc_status<A: crate::Core>(&mut self, machine: &mut A, hi: bool) -> u8 {
         machine.inb(if hi { 0xD0 } else { 0x08 })
     }
 
@@ -394,7 +394,7 @@ impl NativeSb {
     /// virtual-8237 state after a task switch).
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
-    pub fn arm<A: crate::Arch>(&mut self, machine: &mut A,
+    pub fn arm<A: crate::Core>(&mut self, machine: &mut A,
            chan: usize, host: usize, is16: bool,
            gpa: u32, len: u32, mode: u8) -> bool {
         let bufpage = self.card.dma_page(host);
@@ -463,7 +463,7 @@ impl NativeSb {
     /// them, so the partial-end-page neighbour data survives and the guest
     /// can reuse the linear range. The channel buffer is permanent. No-op
     /// when nothing is bound.
-    pub fn unbind<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn unbind<A: crate::Core>(&mut self, machine: &mut A) {
         if self.bound_gpa == 0 { return; }
         let vbase = self.bound_vpage << 12;
         let span  = self.bound_pages * 0x1000;
@@ -485,7 +485,7 @@ impl NativeSb {
     /// the real 8237 channel so the card stops pulling a buffer that's no
     /// longer ours. The virtual 8237 keeps the armed state; `resume`
     /// replays it. Must run with this task's address space active.
-    pub fn suspend<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn suspend<A: crate::Core>(&mut self, machine: &mut A) {
         if self.bound_gpa == 0 { return; }
         mask_real_8237(machine, self.bound_host);
         self.unbind(machine);
@@ -495,7 +495,7 @@ impl NativeSb {
 
 /// Mask host DMA channel `chan` on the real 8237 — stops the card pulling
 /// the channel buffer while the owning task is backgrounded.
-fn mask_real_8237<A: crate::Arch>(machine: &mut A, chan: u8) {
+fn mask_real_8237<A: crate::Core>(machine: &mut A, chan: u8) {
     if (4..8).contains(&chan) { machine.outb(0xD4, 0x04 | (chan - 4)); }
     else if chan < 4 { machine.outb(0x0A, 0x04 | chan); }
 }
@@ -506,7 +506,7 @@ fn mask_real_8237<A: crate::Arch>(machine: &mut A, chan: u8) {
 /// consumes the buffer, so it's exact for both progress and (terminal-
 /// count) completion. Channel-native units (bytes for 0-3, words 5-7),
 /// matching what the guest programmed.
-pub fn real_8237_count<A: crate::Arch>(machine: &mut A, host: u8) -> u16 {
+pub fn real_8237_count<A: crate::Core>(machine: &mut A, host: u8) -> u16 {
     let (clr_ff, cnt) = if host < 4 {
         (0x0Cu16, (host as u16) * 2 + 1)
     } else {
@@ -523,7 +523,7 @@ pub fn real_8237_count<A: crate::Arch>(machine: &mut A, host: u8) -> u16 {
 /// addressed; 16-bit channels (5-7) are word-addressed (addr/count in
 /// words, page bit16 implied). Standard sequence: mask, clear flip-flop,
 /// mode, addr lo/hi, page, count lo/hi, unmask.
-fn program_real_8237<A: crate::Arch>(machine: &mut A, chan: u8, phys: u32, len: u32, mode: u8, is16: bool) {
+fn program_real_8237<A: crate::Core>(machine: &mut A, chan: u8, phys: u32, len: u32, mode: u8, is16: bool) {
     // Standard PC/AT page-register ports indexed by absolute channel.
     const PAGE: [u8; 8] = [0x87, 0x83, 0x81, 0x82, 0x8F, 0x8B, 0x89, 0x8A];
     if is16 {

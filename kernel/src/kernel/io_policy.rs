@@ -33,7 +33,7 @@ pub(super) struct PolicyKey {
 /// Compact identity of everything that can alter a guest's direct-I/O grant.
 /// Reading this on every entry is cheap; rebuilding 124 bitmap bytes and all
 /// of the individual port grants is not.
-pub(super) fn key<A: crate::Arch>(
+pub(super) fn key<A: crate::Core>(
     personality: &Personality<A>,
     bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
 ) -> PolicyKey {

@@ -24,11 +24,11 @@ pub(super) fn encode_with(text: &[u8], wide: bool, page: Encoding) -> Vec<u16> {
     else { page.encode(&text, b'?').0.into_iter().map(u16::from).collect() }
 }
 
-pub(super) fn copy<A: crate::Arch>(m: &mut A, out: usize, cap: usize, text: &[u8], wide: bool) -> u32 {
+pub(super) fn copy<A: crate::Core>(m: &mut A, out: usize, cap: usize, text: &[u8], wide: bool) -> u32 {
     copy_with(m, out, cap, text, wide, ansi())
 }
 
-pub(super) fn copy_with<A: crate::Arch>(m: &mut A, out: usize, cap: usize, text: &[u8], wide: bool, page: Encoding) -> u32 {
+pub(super) fn copy_with<A: crate::Core>(m: &mut A, out: usize, cap: usize, text: &[u8], wide: bool, page: Encoding) -> u32 {
     let value = encode_with(text, wide, page);
     if cap <= value.len() || out == 0 { return (value.len() + 1) as u32; }
     for (i, &unit) in value.iter().enumerate() {

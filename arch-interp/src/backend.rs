@@ -1,20 +1,26 @@
 //! Hosted implementation of the shared arch-abi traits.
 
 #[cfg(feature = "tcg")]
-use crate::space::RootPageTable;
+use crate::space::AddressSpace;
 use crate::vcpu::{self};
 #[cfg(feature = "tcg")]
 use arch_abi::{X86, Memory};
-use arch_abi::{Arch, Diagnostics, KernelEvent, Regs};
+use arch_abi::{Core, Diagnostics, KernelEvent, Regs};
 
-/// The interpreter backend handle. Zero-sized today (state lives in module
-/// statics); it gains fields as the globals migrate into it.
-pub struct Interp;
+/// Handle to the hosted CPU state on the current host thread.
+pub struct Interp {
+    _local: core::marker::PhantomData<*mut ()>,
+}
 
+impl Interp {
+    pub(crate) const fn local() -> Self {
+        Self { _local: core::marker::PhantomData }
+    }
+}
 
 #[cfg(feature = "tcg")]
 impl X86 for Interp {
-    unsafe fn bind_planar(&mut self, _: Option<planar::Binding>) {}
+    unsafe fn install_trap_hook(&mut self, hook: Option<arch_abi::entry::TrapHook>) { crate::cpu::install_trap_hook(hook); }
     fn isa_unmask_irq(&mut self, line: u8) { crate::calls::arch_isa_unmask_irq(line) }
 
     type Fx = crate::machine::FxState;
@@ -106,9 +112,9 @@ impl Memory for Interp {
         })
     }
 
-    type PageTable = RootPageTable;
+    type AddressSpace = AddressSpace;
 
-    fn activate(&mut self, incoming: RootPageTable) -> RootPageTable {
+    fn activate(&mut self, incoming: AddressSpace) -> AddressSpace {
         let old = crate::paging::activate(incoming);
         crate::engine::flush();
         crate::desc::mark_ldt_dirty();
@@ -118,7 +124,7 @@ impl Memory for Interp {
     fn supply_pages(&self, pages: arch_abi::page_supply::PageInput) -> (usize, arch_abi::page_supply::PageInput) {
         crate::phys::supply_pages(pages)
     }
-    fn user_fork(&mut self, child: &mut RootPageTable, pages: arch_abi::page_supply::PageInput) -> ((), arch_abi::page_supply::PageInput) {
+    fn user_fork(&mut self, child: &mut AddressSpace, pages: arch_abi::page_supply::PageInput) -> ((), arch_abi::page_supply::PageInput) {
         crate::phys::with_input(pages, || {
             crate::calls::arch_user_fork(child)
         })
@@ -126,7 +132,7 @@ impl Memory for Interp {
 
     fn free_user_pages(&mut self) { crate::calls::arch_free_user_pages() }
 
-    fn destroy_space(&mut self, root: &mut Self::PageTable) {
+    fn destroy_space(&mut self, root: &mut Self::AddressSpace) {
         crate::paging::destroy(root);
         crate::engine::flush();
     }
@@ -135,7 +141,7 @@ impl Memory for Interp {
 
 }
 
-impl Arch for Interp {
+impl Core for Interp {
     #[allow(clippy::deref_addrof)]
     fn execute(&mut self, regs: &mut Regs, _io: &arch_abi::IoPolicy, max_time: core::time::Duration) -> (KernelEvent, arch_abi::page_supply::SupplyStatus) {
         crate::suite_control::gate();
@@ -144,7 +150,7 @@ impl Arch for Interp {
         // back. Swap, not copy — `Regs` is Copy but swap keeps a single source.
         let live = unsafe { &mut *(&raw mut vcpu::REGS) };
         core::mem::swap(&mut live.regs, regs);
-        let ev = crate::engine::execute(max_time);
+        let ev = crate::engine::execute(self, max_time);
         core::mem::swap(&mut live.regs, regs);
         (ev, crate::phys::supply_status())
     }

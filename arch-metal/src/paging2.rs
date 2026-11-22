@@ -35,7 +35,7 @@
 //! live in this constant page and are automatically shared by all
 //! processes. Only user entries differ per-process.
 //!
-//! Per-thread storage (`RootPageTable`):
+//! Per-thread storage (`AddressSpace`):
 //! - Legacy: 768 saved PD entries (user PD[0..768])
 //! - PAE/Compat: 3 saved PDPT entries + CR3 + 255 high PML4 entries
 //!
@@ -143,10 +143,9 @@ pub const BOOT_IDENTITY_END: usize = 4 * 1024 * 1024;
 /// - PAE/Compat: 3 low PDPT entries, CR3, then PML4[1..256].
 ///   The high entries fit within the legacy variant's existing 3 KiB storage.
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub union RootPageTable {
-    pub e32: [Entry32; 768],    // Legacy: user PD entries
-    pub e64: [Entry64; 259],      // Low PDPT[0..3], CR3, high PML4[1..256]
+pub union AddressSpace {
+    pub(crate) e32: [Entry32; 768],    // Legacy: user PD entries
+    pub(crate) e64: [Entry64; 259],      // Low PDPT[0..3], CR3, high PML4[1..256]
 }
 
 /// Hardware PDPT for PAE mode (32 bytes, loaded by CPU on CR3 reload).
@@ -156,79 +155,18 @@ struct HwPdpt([u64; 4]);
 #[thread_local]
 static mut HW_PDPT: HwPdpt = HwPdpt([0; 4]);
 
-impl Default for RootPageTable {
-    fn default() -> Self { RootPageTable::empty() }
+impl Default for AddressSpace {
+    fn default() -> Self { AddressSpace::empty() }
 }
 
-impl RootPageTable {
+impl AddressSpace {
     pub const fn empty() -> Self {
-        RootPageTable { e32: [Entry32(0); 768] }
-    }
-
-    /// Initialize from the current (active) address space.
-    /// Saves current user entries from the constant root.
-    /// Save user entries from the constant root into this struct.
-    pub fn save(&mut self) {
-        let _paging = PagingGuard::lock();
-        crate::high_paging::save(self);
-        match cpu_mode() {
-            CpuMode::Legacy => {
-                if let Entries::E32(e) = entries() {
-                    let root = root_base();
-                    let user_count = recursive_idx() - root;
-                    for i in 0..user_count {
-                        unsafe { let _ = replace_entry(&mut self.e32[i], e[root + i]); }
-                    }
-                }
-            }
-            CpuMode::Pae | CpuMode::Compat => {
-                if let Entries::E64(e) = entries() {
-                    let root = root_base();
-                    let user_count = recursive_idx() - root;
-                    for i in 0..user_count {
-                        unsafe { let _ = replace_entry(&mut self.e64[i], e[root + i]); }
-                    }
-                    // Always save PML4 phys (from PDPT[4] back-pointer),
-                    // so cr3() works regardless of which mode we restore in.
-                    let pml4_page = e[root + 4].page();
-                    unsafe { let _ = replace_entry(&mut self.e64[3], Entry64(pml4_page * PAGE_SIZE as u64)); }
-                }
-            }
-        }
-    }
-
-    /// Load user entries from this struct into the constant root.
-    /// Does NOT reload CR3 — call activate() for that, or use with
-    /// toggle_cr3() when a mode switch follows.
-    pub fn load_entries(&self) {
-        let _paging = PagingGuard::lock();
-        crate::high_paging::load(self);
-        match cpu_mode() {
-            CpuMode::Legacy => {
-                if let Entries::E32(e) = entries() {
-                    let root = root_base();
-                    let user_count = recursive_idx() - root;
-                    for i in 0..user_count {
-                        let _ = replace_entry(&mut e[root + i], unsafe { self.e32[i] });
-                    }
-                }
-            }
-            CpuMode::Pae | CpuMode::Compat => {
-                if let Entries::E64(e) = entries() {
-                    let root = root_base();
-                    let user_count = recursive_idx() - root;
-                    for i in 0..user_count {
-                        let _ = replace_entry(&mut e[root + i], unsafe { self.e64[i] });
-                    }
-                    // Debug removed
-                }
-            }
-        }
+        AddressSpace { e32: [Entry32(0); 768] }
     }
 
     /// Swap user entries between self and the constant root page, then reload CR3.
     /// On return, self holds the old root entries and the constant root has self's former entries.
-    pub fn swap_and_activate(&mut self) {
+    pub(crate) fn swap_and_activate(&mut self) {
         let _paging = PagingGuard::lock();
         crate::high_paging::swap(self);
         match cpu_mode() {
@@ -261,21 +199,11 @@ impl RootPageTable {
         unsafe { crate::x86::write_cr3(self.cr3() as u32); }
     }
 
-    /// Load user entries into constant root and reload CR3.
-    /// Use when no mode toggle is needed.
-    pub fn activate(&self) {
-        self.load_entries();
-        if cpu_mode() == CpuMode::Pae {
-            sync_hw_pdpt();
-        }
-        unsafe { crate::x86::write_cr3(self.cr3() as u32); }
-    }
-
     /// CR3 value for this address space.
     /// - Legacy: constant PD phys
     /// - PAE: constant hardware PDPT phys
     /// - Compat: PML4 phys from e64[3] (saved from PDPT[4] back-pointer)
-    pub fn cr3(&self) -> u64 {
+    fn cr3(&self) -> u64 {
         match cpu_mode() {
             CpuMode::Legacy => current_root_phys(),
             CpuMode::Pae => {
@@ -722,7 +650,6 @@ pub fn root_cr3() -> u64 {
 /// CR3 for the TARGET mode after a toggle.
 /// PAE→compat (want_64=true): PML4 phys
 /// compat→PAE (want_64=false): HW_PDPT phys
-/// Call load_entries() + sync_hw_pdpt() before this when going to PAE.
 pub fn toggle_cr3(want_64: bool) -> u32 {
     if want_64 {
         // Target is long/compat mode → CR3 = PML4 phys
@@ -742,14 +669,29 @@ pub fn toggle_cr3(want_64: bool) -> u32 {
 /// hardware may set Accessed there; copying the raw entry makes a subsequent
 /// MOV CR3 fail its PDPTR check on strict implementations.
 fn hardware_pdpte(entry: Entry64) -> u64 {
-    let mut mask = Entry64::ADDR_MASK
-        | flags::PRESENT
-        | flags::WRITE_THROUGH
-        | flags::CACHE_DISABLE;
-    if nx_enabled() {
-        mask |= flags::NO_EXECUTE;
+    encode_pae_pdpte(entry.0, crate::x86::cpu_capabilities().physical_address_bits())
+        .expect("virtual root has a directory outside the CPU's physical address width")
+}
+
+/// Legacy PAE reserves bit 63 even with NXE enabled. A present entry's full
+/// directory address must fit MAXPHYADDR. An absent entry becomes zero.
+#[inline]
+fn encode_pae_pdpte(raw: u64, physical_bits: u32) -> Option<u64> {
+    const PRESENT: u64 = 1;
+    const CACHE_FLAGS: u64 = (1 << 3) | (1 << 4);
+    const DIRECTORY_ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+
+    if !(32..=52).contains(&physical_bits) {
+        return None;
     }
-    entry.0 & mask
+    if raw & PRESENT == 0 {
+        return Some(0);
+    }
+    let directory = raw & DIRECTORY_ADDRESS;
+    if directory >= 1u64 << physical_bits {
+        return None;
+    }
+    Some(directory | (raw & (PRESENT | CACHE_FLAGS)))
 }
 
 pub fn sync_hw_pdpt() {
@@ -1729,7 +1671,7 @@ pub fn pde_index<E: Entry>(page: usize) -> usize {
 /// Fork the current address space (COW).
 /// Marks parent user entries R/O, increments ref counts, and fills
 /// `child_root` with the child's user root entries.
-pub fn fork_current(child_root: &mut RootPageTable) {
+pub(crate) fn fork_current(child_root: &mut AddressSpace) {
     let _paging = PagingGuard::lock();
     crate::high_paging::fork(child_root);
     let user_count = recursive_idx() - root_base();

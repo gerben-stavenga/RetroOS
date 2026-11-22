@@ -40,24 +40,34 @@ fn with_pool<R>(operation: impl FnOnce(&mut Pool<'static>) -> R) -> R {
 
 
 /// Install the finalized RAM layout and mark the occupied boot frames.
-pub fn init_phys_mm(layout: &'static FrameLayout, occupied: impl IntoIterator<Item = core::ops::Range<u64>>) {
+pub fn bootstrap<'a>(layout: &'static FrameLayout, occupied: &'a [core::ops::Range<u64>]) -> Bootstrap<'a> {
     let _guard = lock_pool();
     let mut pool = Pool::new(layout);
     unsafe { pool.bootstrap((&raw mut BOOTSTRAP_STATES).cast(), BOOTSTRAP_BYTES); }
     for range in occupied { pool.mark(range.start, range.end); }
     unsafe { *(&raw mut POOL) = Some(pool); }
+    Bootstrap { occupied }
 }
 
-/// Allocate full metadata after the heap is enabled. No mutable pool borrow
-/// survives an allocation: backing metadata pages recursively calls this pool.
-pub fn complete_initialization() {
-    let pages = with_pool(|pool| pool.frame_count());
-    assert!(pages != 0, "firmware supplied no usable RAM");
-    let state_layout = Layout::array::<u8>(pages.div_ceil(8)).expect("page state size overflow");
-    unsafe {
-        let states = alloc_zeroed(state_layout);
+#[must_use]
+pub struct Bootstrap<'a> {
+    occupied: &'a [core::ops::Range<u64>],
+}
+
+impl Bootstrap<'_> {
+    /// Back the full bitmap through the kernel heap, which can draw frames from
+    /// the bootstrap bitmap while this allocation is in progress.
+    pub fn finish(self) {
+        let pages = with_pool(|pool| pool.frame_count());
+        assert!(pages != 0, "firmware supplied no usable RAM");
+        let layout = Layout::array::<u8>(pages.div_ceil(8)).expect("page state size overflow");
+        let states = unsafe { alloc_zeroed(layout) };
         assert!(!states.is_null(), "cannot allocate physical page states");
-        with_pool(|pool| pool.expand(states));
+        with_pool(|pool| {
+            unsafe { pool.expand(states); }
+            // Some boot reservations may lie beyond the bootstrap bitmap.
+            for range in self.occupied { pool.mark(range.start, range.end); }
+        });
     }
 }
 
@@ -125,17 +135,15 @@ static DIRECT_BYTES: AtomicUsize = AtomicUsize::new(0);
 /// # Safety
 /// The page-aligned mapping must remain writable for the lifetime of the kernel.
 /// Call once, before any architecture or kernel memory allocation.
-pub unsafe fn init_direct_ram(base: *mut u8, bytes: usize, layout: &'static FrameLayout) {
+pub unsafe fn install_direct_ram(base: *mut u8, bytes: usize) {
     assert!(!base.is_null() && (base as usize).is_multiple_of(PAGE_SIZE));
     assert!(bytes.is_multiple_of(PAGE_SIZE));
     DIRECT_BASE.store(base as usize, Ordering::Release);
     DIRECT_BYTES.store(bytes, Ordering::Release);
-    init_phys_mm(layout, []);
-    complete_initialization();
 }
 
 /// Allocate and zero frames from directly mapped RAM.
-pub fn alloc_backed_pages(count: usize) -> u64 {
+fn alloc_direct_pages(count: usize) -> u64 {
     assert!(DIRECT_BASE.load(Ordering::Acquire) != 0 && count != 0, "direct RAM not initialized");
     let page = if count == 1 { alloc_phys_page() } else { alloc_contig(count) }
         .expect("physical RAM exhausted");
@@ -162,7 +170,7 @@ pub fn direct_frame(base: core::ptr::NonNull<u8>) -> u64 {
 pub fn alloc_shared_pages(count: usize) -> core::ptr::NonNull<u8> {
     assert!(count != 0);
     if DIRECT_BASE.load(Ordering::Acquire) != 0 {
-        return core::ptr::NonNull::new(direct_pointer(alloc_backed_pages(count))).unwrap();
+        return core::ptr::NonNull::new(direct_pointer(alloc_direct_pages(count))).unwrap();
     }
     let layout = Layout::from_size_align(count.checked_mul(PAGE_SIZE).unwrap(), PAGE_SIZE).unwrap();
     core::ptr::NonNull::new(unsafe { alloc_zeroed(layout) })

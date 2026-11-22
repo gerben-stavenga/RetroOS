@@ -43,7 +43,7 @@ pub use klog::line;
 
 /// Save one stable pre-launch snapshot through the normal C: write policy.
 /// A failed export must not prevent the interactive startup program running.
-pub fn save_boot_snapshot<A: crate::Arch>(machine: &mut A) -> Result<(), i32> {
+pub fn save_boot_snapshot<A: crate::Core>(machine: &mut A) -> Result<(), i32> {
     use crate::kernel::vfs;
 
     // Copy before filesystem I/O, which can itself append diagnostics. Start

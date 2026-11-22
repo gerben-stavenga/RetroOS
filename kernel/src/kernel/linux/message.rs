@@ -1,14 +1,14 @@
 //! Linux scatter/gather socket messages, with explicit 32/64-bit ABI layouts.
 use super::{Args, EFAULT, EINVAL, SyscallResult, net, read_sockaddr, sock_handle, thread};
 use alloc::vec::Vec;
-fn word<A: crate::Arch>(machine: &mut A, at: u64, wide: bool) -> u64 {
+fn word<A: crate::Core>(machine: &mut A, at: u64, wide: bool) -> u64 {
     if wide {
         machine.read::<u64>(at)
     } else {
         machine.read::<u32>(at) as u64
     }
 }
-fn send<A: crate::Arch>(machine: &mut A, h: i32, header: u64, flags: i32, wide: bool) -> i32 {
+fn send<A: crate::Core>(machine: &mut A, h: i32, header: u64, flags: i32, wide: bool) -> i32 {
     if header == 0 {
         return -EFAULT;
     }
@@ -43,7 +43,7 @@ fn send<A: crate::Arch>(machine: &mut A, h: i32, header: u64, flags: i32, wide: 
     // One send per message: iovecs form a single UDP datagram.
     net::sendto(h, &data, flags, &address[..n])
 }
-pub(super) fn sendmsg<A: crate::Arch>(
+pub(super) fn sendmsg<A: crate::Core>(
     machine: &mut A,
     kt: &thread::KernelThread<A>,
     args: &Args,
@@ -55,7 +55,7 @@ pub(super) fn sendmsg<A: crate::Arch>(
     };
     SyscallResult::val(send(machine, h, args.a1, args.a2 as i32, wide))
 }
-pub(super) fn sendmmsg<A: crate::Arch>(
+pub(super) fn sendmmsg<A: crate::Core>(
     machine: &mut A,
     kt: &thread::KernelThread<A>,
     args: &Args,
@@ -84,12 +84,12 @@ pub(super) fn sendmmsg<A: crate::Arch>(
 
 /// Receive one message, scattering bytes without turning UDP iovecs into
 /// separate receives. Ancillary data is absent in the current network stack.
-pub(super) fn recvmsg<A: crate::Arch>(
+pub(super) fn recvmsg<A: crate::Core>(
     machine: &mut A, kt: &thread::KernelThread<A>, args: &Args, wide: bool,
 ) -> SyscallResult {
     SyscallResult::val(receive(machine, kt, args, wide))
 }
-fn receive<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, args: &Args, wide: bool) -> i32 {
+fn receive<A: crate::Core>(machine: &mut A, kt: &thread::KernelThread<A>, args: &Args, wide: bool) -> i32 {
     let h = match sock_handle(kt, args.a0) { Ok(h) => h, Err(e) => return e };
     let flags = args.a2 as u32;
     if flags & !(2 | 0x20 | 0x40) != 0 { return -95; }
@@ -144,7 +144,7 @@ fn receive<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, args: 
     if datagram && flags & 0x20 != 0 { n } else { copied as i32 }
 }
 
-fn gather_prefix<A: crate::Arch>(machine: &mut A, iov: u64, count: u64, wide: bool, partial: bool) -> Result<Vec<u8>, i32> {
+fn gather_prefix<A: crate::Core>(machine: &mut A, iov: u64, count: u64, wide: bool, partial: bool) -> Result<Vec<u8>, i32> {
     if count > 1024 { return Err(-EINVAL); }
     if count != 0 && iov == 0 { return Err(-EFAULT); }
     let unit = if wide { 8 } else { 4 };
@@ -164,7 +164,7 @@ fn gather_prefix<A: crate::Arch>(machine: &mut A, iov: u64, count: u64, wide: bo
     }
     Ok(bytes)
 }
-pub(super) fn writev<A: crate::Arch>(machine: &mut A, handle: i32, args: &Args, wide: bool) -> SyscallResult {
+pub(super) fn writev<A: crate::Core>(machine: &mut A, handle: i32, args: &Args, wide: bool) -> SyscallResult {
     // TCP and Unix streams can return a short write. The scratch-buffer size
     // is not a protocol message limit; only datagrams require all-or-nothing.
     let stream = match crate::kernel::net::socket_kind(handle) {

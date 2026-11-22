@@ -26,7 +26,7 @@ impl State {
     }
 }
 
-pub(super) fn prctl<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+pub(super) fn prctl<A: crate::Core>(machine: &mut A, kt: &thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let caller = async_io::current_id(&linux.async_io, kt.tid);
     match a.a0 {
         1 => {
@@ -63,7 +63,7 @@ pub(super) fn due(linux: &LinuxState) -> bool {
         && target(linux, signal).is_some())
 }
 
-fn queue<A: crate::Arch>(task: &mut thread::Thread<A>, signal: u8, sender: i32) {
+fn queue<A: crate::Core>(task: &mut thread::Thread<A>, signal: u8, sender: i32) {
     let thread::Personality::Linux(linux) = &mut task.personality else { return; };
     linux.parent_death.owner = task.kernel.tid;
     let signal = signal as usize;
@@ -95,7 +95,7 @@ fn queue<A: crate::Arch>(task: &mut thread::Thread<A>, signal: u8, sender: i32) 
 /// Process-directed kill, including signal zero liveness probes. All Linux
 /// processes currently have the fixed session credentials. Group selection
 /// uses inherited process-group membership, independently of reusable PIDs.
-pub(crate) fn kill<A: crate::Arch>(machine: &mut A, threads: &mut thread::ThreadTable<A>,
+pub(crate) fn kill<A: crate::Core>(machine: &mut A, threads: &mut thread::ThreadTable<A>,
     caller: usize, regs: &mut Regs, pid: i32, signal: u8) -> Option<thread::KernelAction>
 {
     let mut found = false;
@@ -125,7 +125,7 @@ pub(crate) fn kill<A: crate::Arch>(machine: &mut A, threads: &mut thread::Thread
 }
 
 /// Resolve Linux thread IDs across processes; tgkill also verifies the group.
-pub(crate) fn kill_thread<A: crate::Arch>(machine: &mut A, threads: &mut thread::ThreadTable<A>,
+pub(crate) fn kill_thread<A: crate::Core>(machine: &mut A, threads: &mut thread::ThreadTable<A>,
     caller: usize, regs: &mut Regs, group: Option<i32>, target: i32, signal: u8) -> Option<thread::KernelAction>
 {
     let mut found = false;
@@ -172,7 +172,7 @@ pub(crate) fn kill_thread<A: crate::Arch>(machine: &mut A, threads: &mut thread:
 /// Async waiters use SIGCHLD to retry waitpid(WNOHANG), even when they are
 /// currently parked in epoll rather than a blocking wait4. Queue only after
 /// publishing the zombie, so the handler can observe the completed child.
-pub(crate) fn child_exited<A: crate::Arch>(parent: &mut thread::Thread<A>, child: i32, code: i32) {
+pub(crate) fn child_exited<A: crate::Core>(parent: &mut thread::Thread<A>, child: i32, code: i32) {
     if !matches!(parent.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked) {
         return;
     }
@@ -188,7 +188,7 @@ pub(crate) fn child_exited<A: crate::Arch>(parent: &mut thread::Thread<A>, child
 
 /// Called with the task table, without activating any child's address space.
 /// `creator=None` means all threads in the parent process are terminating.
-pub(crate) fn parent_exited<A: crate::Arch>(threads: &mut thread::ThreadTable<A>, process: usize, creator: Option<i32>) {
+pub(crate) fn parent_exited<A: crate::Core>(threads: &mut thread::ThreadTable<A>, process: usize, creator: Option<i32>) {
     let live_linux = |task: &thread::Thread<A>| matches!(task.personality, thread::Personality::Linux(_))
         && matches!(task.kernel.state, thread::ThreadState::Ready | thread::ThreadState::Running | thread::ThreadState::Blocked | thread::ThreadState::OnCpu);
     // PID 1 may be DN, not a Linux init. Adopting a daemon into DN makes
@@ -228,7 +228,7 @@ pub(crate) fn parent_exited<A: crate::Arch>(threads: &mut thread::ThreadTable<A>
     }
 }
 
-pub(crate) fn notify_thread_exits<A: crate::Arch>(threads: &mut thread::ThreadTable<A>, process: usize) {
+pub(crate) fn notify_thread_exits<A: crate::Core>(threads: &mut thread::ThreadTable<A>, process: usize) {
     let exited = match &mut threads[process].personality {
         thread::Personality::Linux(linux) => async_io::take_exited(&mut linux.async_io),
         _ => return,
@@ -236,7 +236,7 @@ pub(crate) fn notify_thread_exits<A: crate::Arch>(threads: &mut thread::ThreadTa
     for id in exited { parent_exited(threads, process, Some(id)); }
 }
 
-pub(super) fn poll<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, regs: &mut Regs) -> Option<thread::KernelAction> {
+pub(super) fn poll<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, regs: &mut Regs) -> Option<thread::KernelAction> {
     if linux.parent_death.pending == 0 && linux.parent_death.directed.is_empty() && !linux.parent_death.stopped { return None; }
     let caller = async_io::current_id(&linux.async_io, kt.tid);
     let directed = linux.parent_death.directed.keys().find(|&&(target, signal)| target == caller

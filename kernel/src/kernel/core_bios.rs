@@ -5,7 +5,7 @@
 //! operations on a move-only `NativeVga`.
 
 use arch_abi::eflags;
-use crate::{Arch, Regs, Vcpu};
+use crate::{Core, Regs, Vcpu};
 use arch_abi::IoSize;
 use alloc::vec::Vec;
 
@@ -56,7 +56,7 @@ fn scratch_base() -> usize {
     native_memory().expect("native BIOS scratch layout").scratch_base
 }
 
-fn prepare_bios_int10<A: Arch>(machine: &mut A, regs: &mut Regs) {
+fn prepare_bios_int10<A: Core>(machine: &mut A, regs: &mut Regs) {
     let base = scratch_base();
     machine.write::<[u8; 4]>(base as u64, [0xCD, 0x10, 0xCD, 0x31]);
     *regs = Regs::empty();
@@ -172,7 +172,7 @@ impl DosVideo {
     pub fn is_native(&self) -> bool { self.native().is_some() }
     pub fn is_fullscreen(&self) -> bool { matches!(self, Self::Fullscreen(_)) }
 
-    pub(crate) fn native_legacy_vga<A: Arch>(&self, bios: &BiosDisplayWorkspace<A>) -> bool {
+    pub(crate) fn native_legacy_vga<A: Core>(&self, bios: &BiosDisplayWorkspace<A>) -> bool {
         matches!(self,
             Self::Fullscreen(FullscreenVga::Native(_))
                 if bios.native_legacy_active())
@@ -230,7 +230,7 @@ impl EmulatedVga {
 /// can flow through backend-independent scheduling code; only a native-BIOS
 /// platform has an execution workspace inside it. The interior is deliberately
 /// private and can only be opened by a [`VgaCap`](crate::kernel::platform::VgaCap).
-pub struct BiosDisplayWorkspace<A: Arch> {
+pub struct BiosDisplayWorkspace<A: Core> {
     /// State of the one physical display. VBE state belongs here regardless
     /// of whether its implementation is GOP or a real-mode video BIOS.
     active: PhysicalVideoState,
@@ -440,7 +440,7 @@ pub(crate) struct PhysicalVbeState {
 #[derive(Clone, Debug)]
 enum PhysicalVideoState { Legacy, Vbe(PhysicalVbeState) }
 
-struct NativeBiosWorkspace<A: Arch> {
+struct NativeBiosWorkspace<A: Core> {
     /// Persistent firmware view, used only for native video-ROM calls.
     bios_vcpu: Vcpu<A>,
     fx: A::Fx,
@@ -450,7 +450,7 @@ struct NativeBiosWorkspace<A: Arch> {
     nvidia_workarounds: bool,
 }
 
-impl<A: Arch> BiosDisplayWorkspace<A> {
+impl<A: Core> BiosDisplayWorkspace<A> {
     pub fn new(machine: &mut A) -> Self {
         let native = (crate::kernel::platform::get().firmware
             == crate::kernel::platform::Firmware::NativeBios)
@@ -536,7 +536,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     }
 }
 
-impl<A: Arch> NativeBiosWorkspace<A> {
+impl<A: Core> NativeBiosWorkspace<A> {
     /// Build the persistent real-mode driver address space from the original
     /// firmware view and park it outside every personality.
     fn new(machine: &mut A) -> Option<Self> {
@@ -554,7 +554,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         // Hardware decoding and protection determine their actual permissions.
         map_physical(machine, CONVENTIONAL_PAGES, 0x60, CONVENTIONAL_PAGES as u64,
             arch_abi::MAP_PHYS_CACHE_DISABLE);
-        let mut bios_space = A::PageTable::default();
+        let mut bios_space = A::AddressSpace::default();
         crate::kernel::memory::fork(machine, &mut bios_space);
         machine.free_user_pages();
 
@@ -1500,21 +1500,21 @@ impl<A: Arch> NativeBiosWorkspace<A> {
 /// BIOS display object owns the active Legacy/VBE state; its optional native
 /// workspace is only the isolated real-mode execution engine.
 impl crate::kernel::platform::VgaCap {
-    fn bios<'a, A: Arch>(
+    fn bios<'a, A: Core>(
         &self,
         bios: &'a mut BiosDisplayWorkspace<A>,
     ) -> Result<&'a mut NativeBiosWorkspace<A>, BiosError> {
         bios.native.as_mut().ok_or(BiosError::NoNativeBios)
     }
 
-    fn bios_ref<'a, A: Arch>(
+    fn bios_ref<'a, A: Core>(
         &self,
         bios: &'a BiosDisplayWorkspace<A>,
     ) -> Result<&'a NativeBiosWorkspace<A>, BiosError> {
         bios.native.as_ref().ok_or(BiosError::NoNativeBios)
     }
 
-    pub fn bios_mode<A: Arch>(
+    pub fn bios_mode<A: Core>(
         &self,
         bios: &BiosDisplayWorkspace<A>,
         number: u16,
@@ -1522,14 +1522,14 @@ impl crate::kernel::platform::VgaCap {
         self.bios_ref(bios).ok()?.mode(number)
     }
 
-    pub fn bios_modes<'a, A: Arch>(
+    pub fn bios_modes<'a, A: Core>(
         &self,
         bios: &'a BiosDisplayWorkspace<A>,
     ) -> Option<&'a [crate::kernel::platform::VbeMode]> {
         Some(self.bios_ref(bios).ok()?.modes())
     }
 
-    pub(crate) fn bios_checkpoint<A: Arch>(
+    pub(crate) fn bios_checkpoint<A: Core>(
         &self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1537,7 +1537,7 @@ impl crate::kernel::platform::VgaCap {
         self.bios(bios).ok()?.checkpoint(machine, self)
     }
 
-    pub(crate) fn bios_restore_checkpoint<A: Arch>(
+    pub(crate) fn bios_restore_checkpoint<A: Core>(
         &self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1550,7 +1550,7 @@ impl crate::kernel::platform::VgaCap {
             ));
     }
 
-    pub fn bios_set_mode<A: Arch>(
+    pub fn bios_set_mode<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1560,7 +1560,7 @@ impl crate::kernel::platform::VgaCap {
             .unwrap_or_else(|error| lib::compact_panic!("native BIOS mode {:#x} failed: {:?}", mode, error))
     }
 
-    pub fn bios_set_mode_request<A: Arch>(
+    pub fn bios_set_mode_request<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1571,7 +1571,7 @@ impl crate::kernel::platform::VgaCap {
     }
 
     /// Guest INT 10h mode selection may legitimately be rejected by firmware.
-    pub fn guest_bios_set_mode<A: Arch>(
+    pub fn guest_bios_set_mode<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1583,7 +1583,7 @@ impl crate::kernel::platform::VgaCap {
     }
 
     /// Guest VBE 4F02h preserves the complete request and reports failure in AX.
-    pub fn guest_bios_set_mode_request<A: Arch>(
+    pub fn guest_bios_set_mode_request<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1613,7 +1613,7 @@ impl crate::kernel::platform::VgaCap {
         Ok(())
     }
 
-    pub fn bios_set_bank<A: Arch>(
+    pub fn bios_set_bank<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1622,7 +1622,7 @@ impl crate::kernel::platform::VgaCap {
         self.bios(bios)?.set_bank(machine, self, bank)
     }
 
-    pub fn guest_bios_window<A: Arch>(
+    pub fn guest_bios_window<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1633,7 +1633,7 @@ impl crate::kernel::platform::VgaCap {
         native.as_mut().ok_or(BiosError::NoNativeBios)?.window(machine, self, state, set)
     }
 
-    pub fn guest_bios_display_start<A: Arch>(
+    pub fn guest_bios_display_start<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1644,7 +1644,7 @@ impl crate::kernel::platform::VgaCap {
         native.as_mut().ok_or(BiosError::NoNativeBios)?.display_start(machine, self, state, caller)
     }
 
-    pub fn guest_bios_scan_line_length<A: Arch>(
+    pub fn guest_bios_scan_line_length<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1655,7 +1655,7 @@ impl crate::kernel::platform::VgaCap {
         native.as_mut().ok_or(BiosError::NoNativeBios)?.scan_line_length(machine, self, state, caller)
     }
 
-    pub(crate) fn bios_indexed_palette_call<A: Arch>(
+    pub(crate) fn bios_indexed_palette_call<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1672,7 +1672,7 @@ impl crate::kernel::platform::VgaCap {
         )
     }
 
-    pub fn bios_palette_call<A: Arch>(
+    pub fn bios_palette_call<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1686,7 +1686,7 @@ impl crate::kernel::platform::VgaCap {
         )
     }
 
-    pub fn bios_font_call<A: Arch>(
+    pub fn bios_font_call<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1696,7 +1696,7 @@ impl crate::kernel::platform::VgaCap {
         self.bios(bios)?.font_call(machine, self, caller, font)
     }
 
-    pub fn bios_present<A: Arch>(
+    pub fn bios_present<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1711,7 +1711,7 @@ impl crate::kernel::platform::VgaCap {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn bios_present_packed<A: Arch>(
+    pub(crate) fn bios_present_packed<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1726,7 +1726,7 @@ impl crate::kernel::platform::VgaCap {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn bios_present_packed_regions<A: Arch>(
+    pub(crate) fn bios_present_packed_regions<A: Core>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1742,7 +1742,7 @@ impl crate::kernel::platform::VgaCap {
         )
     }
 
-    pub fn bios_discover_vbe<A: Arch>(
+    pub fn bios_discover_vbe<A: Core>(
         &self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
@@ -1751,7 +1751,7 @@ impl crate::kernel::platform::VgaCap {
     }
 }
 
-fn run_bios_int10<A: Arch>(
+fn run_bios_int10<A: Core>(
     machine: &mut A,
     regs: &mut Regs,
     io: &arch_abi::IoPolicy,
@@ -1763,7 +1763,7 @@ fn run_bios_int10<A: Arch>(
     })
 }
 
-fn run_bios<A: Arch>(
+fn run_bios<A: Core>(
     machine: &mut A,
     regs: &mut Regs,
     io: &arch_abi::IoPolicy,
@@ -1801,7 +1801,7 @@ fn run_bios<A: Arch>(
     }
 }
 
-fn call_bank<A: Arch>(
+fn call_bank<A: Core>(
     machine: &mut A,
     regs: &mut Regs,
     bank: u16,

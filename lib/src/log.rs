@@ -115,7 +115,7 @@ pub fn debug_byte(b: u8) {
 
 /// Submit a byte in kernel context. Partial lines stay in the caller's buffer.
 /// The output lock covers the complete prefixed line in both the ring and UART.
-/// Arch/NMI handlers must not call this blocking kernel logger. Sinks must not
+/// Core/NMI handlers must not call this blocking kernel logger. Sinks must not
 /// recurse into logging; completed-line callbacks run after releasing the lock.
 pub fn stream(b: u8) {
     use core::sync::atomic::Ordering;

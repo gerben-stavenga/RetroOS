@@ -18,7 +18,7 @@ impl State {
     }
 
     /// Guest aliases must already be unmapped (or the whole space freed).
-    pub fn release<A: crate::Arch>(&mut self, machine: &mut A, start: usize, end: usize) {
+    pub fn release<A: crate::Core>(&mut self, machine: &mut A, start: usize, end: usize) {
         self.aliases.retain(|alias| {
             if alias.address >= start && alias.address < end {
                 vfs::mapping::release(machine, alias.key);
@@ -27,7 +27,7 @@ impl State {
         });
     }
 
-    pub fn map<A: crate::Arch>(&mut self, machine: &mut A, handle: i32, offset: usize,
+    pub fn map<A: crate::Core>(&mut self, machine: &mut A, handle: i32, offset: usize,
         base: usize, size: usize, protection: u64) -> Result<(), i32>
     {
         let may_write = vfs::mapping::validate(handle, offset, size, true).is_ok();

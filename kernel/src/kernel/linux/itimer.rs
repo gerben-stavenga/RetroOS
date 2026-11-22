@@ -32,7 +32,7 @@ fn duration(seconds: i64, micros: i64) -> Option<u64> {
         .checked_mul(1_000_000_000)?
         .checked_add(micros as u64 * 1000)
 }
-fn store<A: crate::Arch>(machine: &mut A, pointer: u64, timer: Timer, now: u64) {
+fn store<A: crate::Core>(machine: &mut A, pointer: u64, timer: Timer, now: u64) {
     for (offset, nanos) in [
         (0, timer.interval),
         (16, timer.deadline.map_or(0, |end| end.saturating_sub(now))),
@@ -42,7 +42,7 @@ fn store<A: crate::Arch>(machine: &mut A, pointer: u64, timer: Timer, now: u64) 
         machine.write::<u64>(pointer + offset as u64 + 8, micros % 1_000_000);
     }
 }
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     linux: &mut LinuxState,
     set: bool,
@@ -98,7 +98,7 @@ pub(super) fn call<A: crate::Arch>(
     SyscallResult::val(0)
 }
 
-pub(super) fn poll<A: crate::Arch>(
+pub(super) fn poll<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     linux: &mut LinuxState,

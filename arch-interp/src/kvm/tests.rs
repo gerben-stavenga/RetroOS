@@ -11,9 +11,9 @@ use arch_abi::eflags;
 #[cfg(test)]
 use crate::test_memory;
 
-use arch_abi::{Memory as _, Arch as _};
+use arch_abi::{Memory as _, Core as _};
 use super::*;
-use crate::space::RootPageTable;
+use crate::space::AddressSpace;
 use arch_abi::{GuestBytes, KernelEvent, Regs, USER_CS, USER_DS};
 
 static INPUT: std::sync::Mutex<std::vec::Vec<(arch_abi::Irq, u64)>> = std::sync::Mutex::new(std::vec::Vec::new());
@@ -43,7 +43,7 @@ fn set_regs(regs: Regs) {
     crate::mmu_tests::executable(base + regs.frame.rip);
     // Seed the backend's live frame directly (arch-level proof, below the
     // kernel loop where `execute` would swap them in). Space is unchanged —
-    // the active one, set via `Arch::activate` where a test needs to switch.
+    // the active one, set via `Core::activate` where a test needs to switch.
     unsafe { (*core::ptr::addr_of_mut!(crate::vcpu::REGS)).regs = regs; }
 }
 
@@ -63,7 +63,7 @@ fn kvm_engine_proofs() {
         return;
     }
     crate::phys::init_test_ram();
-    let mut mem = crate::backend::Interp;
+    let mut mem = crate::backend::Interp::local();
     crate::backend::check_virtual_irq_frame(&mut mem);
 
     // ── VM86: `int 0x31` (the trapped DPMI stub vector) from real-mode code.
@@ -303,16 +303,16 @@ fn kvm_engine_proofs() {
     // ── COW: fork the space, write to a shared page in the child, verify the
     // parent's copy is untouched (the #PF → space_cow_fault path under KVM).
     mem.write::<u32>(data as u64, 0x1111_1111);
-    let mut child = RootPageTable::empty();
+    let mut child = AddressSpace::empty();
     mem.user_fork(&mut child, test_memory::input(5));
-    let parent = crate::backend::Interp.activate(child);
+    let parent = crate::backend::Interp::local().activate(child);
     // In the child: increment the shared dword, then int 0x80.
     // 0xFF 0x05 <addr>   inc dword [data]
     // 0xCD 0x80          int 0x80
     let mut prog = vec![0xFF, 0x05];
     prog.extend_from_slice(&data.to_le_bytes());
     prog.extend_from_slice(&[0xCD, 0x80]);
-    let mut child_mem = crate::backend::Interp;
+    let mut child_mem = crate::backend::Interp::local();
     child_mem.copy_to(code as u64, &prog, crate::test_memory::input(5));
     let mut r = Regs::empty();
     r.init_user_process(code, stack);
@@ -322,7 +322,7 @@ fn kvm_engine_proofs() {
         ev => panic!("COW child: expected SoftInt(0x80), got {ev:?}"),
     }
     assert_eq!(child_mem.read::<u32>(data as u64), 0x1111_1112, "child sees its increment");
-    crate::backend::Interp.activate(parent);
+    crate::backend::Interp::local().activate(parent);
     set_regs(Regs::empty());
     assert_eq!(
         mem.read::<u32>(data as u64),
@@ -381,7 +381,7 @@ fn kvm_engine_proofs() {
     // Address-space activation must not exchange FPU or register state.
     // The XMM0 assertion below observes the marker across this round-trip.
     let before_activation = regs();
-    let previous = mem.activate(RootPageTable::default());
+    let previous = mem.activate(AddressSpace::default());
     let mut empty = mem.activate(previous);
     mem.destroy_space(&mut empty);
     assert_eq!(regs().frame.rip, before_activation.frame.rip);
@@ -471,7 +471,7 @@ fn kvm_engine_proofs() {
     mem.write::<u64>(high + 4096, 41);
     assert_eq!(mem.read::<u64>(high + 4096), 41);
     assert_eq!(run::vm_entries(), before, "high-address copies must stay on the host");
-    let mut child = RootPageTable::empty();
+    let mut child = AddressSpace::empty();
     mem.user_fork(&mut child, test_memory::input(8));
     let parent = mem.activate(child);
     let mut high_regs = Regs::empty();
@@ -537,7 +537,6 @@ fn kvm_engine_proofs() {
 
 /// The native entries execute inside the VM against the owner's exact pages.
 fn planar_device_proof(mem: &mut crate::Interp, code: u32, stack: u32) {
-    use arch_abi::X86;
     let storage = unsafe { libc::mmap(core::ptr::null_mut(), 65 * 4096,
         libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
     assert_ne!(storage, libc::MAP_FAILED);
@@ -556,7 +555,7 @@ fn planar_device_proof(mem: &mut crate::Interp, code: u32, stack: u32) {
         0xb0, 0x22, 0xa2, 0, 0, 0x0a, 0, 0xa0, 0, 0, 0x0a, 0, 0xcd, 0x80];
     mem.copy_to(code as u64, &program, test_memory::input(5));
     let mut r = Regs::empty(); r.init_user_process(code, stack); set_regs(r);
-    unsafe { mem.bind_planar(Some(binding)); }
+    unsafe { planar::bind(mem, Some(binding)); }
     assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x80)), "VGA and port accesses stay in the supervisor");
     let report = state.profile.take();
     assert!(report.details[0][0] + report.details[1][0] >= 3);
@@ -665,7 +664,7 @@ fn planar_device_proof(mem: &mut crate::Interp, code: u32, stack: u32) {
     assert_eq!(regs().frame.rip, 0xa0000);
 
     unsafe {
-        mem.bind_planar(None);
+        planar::bind(mem, None);
         mem.replace_mappings(aperture, &previous, test_memory::input(8)).0.unwrap();
         assert_eq!(libc::munmap(storage, 65 * 4096), 0);
     }
@@ -804,7 +803,7 @@ fn espfix_resume(r: Regs, offset: u64, long: bool) {
 fn host_byte_access_never_enters_the_vm() {
     use arch_abi::page_entry::PageEntry;
     crate::phys::init_test_ram();
-    let mut mem = crate::Interp;
+    let mut mem = crate::Interp::local();
     let address = 0x0450_0ffe;
     let mut expected: Vec<u8> = (0..9000).map(|i| (i % 251) as u8).collect();
     let before = run::vm_entries();
@@ -828,7 +827,7 @@ fn host_byte_access_never_enters_the_vm() {
     assert_eq!(actual, expected);
     assert_eq!(run::vm_entries(), before, "byte access must not resume the supervisor");
 
-    let mut child = RootPageTable::empty();
+    let mut child = AddressSpace::empty();
     mem.user_fork(&mut child, test_memory::input(8));
     let parent = mem.activate(child);
     let before = run::vm_entries();

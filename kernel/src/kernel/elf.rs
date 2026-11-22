@@ -66,7 +66,7 @@ pub struct LoadedElf {
 /// modern distro binary or the dynamic linker itself). Relocations are NOT
 /// applied here — for dynamically-linked images the interpreter (ld.so) does
 /// that; `load_bias` only places the segments.
-pub(crate) fn load_elf_source<A: crate::Arch>(machine: &mut A, elf_data: &[u8], load_bias: usize, source: Option<&crate::kernel::exec::ExecutableFile>) -> Result<LoadedElf, ElfError> {
+pub(crate) fn load_elf_source<A: crate::Core>(machine: &mut A, elf_data: &[u8], load_bias: usize, source: Option<&crate::kernel::exec::ExecutableFile>) -> Result<LoadedElf, ElfError> {
     let elf = lib::elf::Elf::parse(elf_data)?;
     // Adjacent PT_LOAD segments may share a page. Allocate the union before
     // copying any payload, so a later segment cannot clear an earlier one.

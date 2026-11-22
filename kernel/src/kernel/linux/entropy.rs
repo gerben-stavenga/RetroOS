@@ -47,7 +47,7 @@ impl Request {
 
     /// None means a blocking caller must wait while interrupt sources collect
     /// entropy. A nonblocking caller gets EAGAIN; no weak fallback is exposed.
-    pub fn step<A: crate::Arch>(self, machine: &mut A) -> Option<i32> {
+    pub fn step<A: crate::Core>(self, machine: &mut A) -> Option<i32> {
         match self.bytes_with(crate::kernel::random::fill) {
             Ok(bytes) => {
                 if !bytes.is_empty() && !high_memory::copy_to(machine, self.address, &bytes) {

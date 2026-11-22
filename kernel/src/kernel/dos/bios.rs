@@ -144,14 +144,14 @@ pub struct BdaVideo {
 }
 
 impl BdaVideo {
-    pub(crate) fn capture<A: crate::Arch>(machine: &A) -> Self {
+    pub(crate) fn capture<A: crate::Core>(machine: &A) -> Self {
         let mut state = Self { mode: [0; VIDEO_MODE_LEN], geometry: [0; VIDEO_GEOMETRY_LEN] };
         machine.copy_from((Bda::BASE + VIDEO_MODE_FIELDS) as u64, &mut state.mode);
         machine.copy_from((Bda::BASE + VIDEO_GEOMETRY_FIELDS) as u64, &mut state.geometry);
         state
     }
 
-    pub(super) fn restore<A: crate::Arch>(&self, machine: &mut A) {
+    pub(super) fn restore<A: crate::Core>(&self, machine: &mut A) {
         machine.copy_to((Bda::BASE + VIDEO_MODE_FIELDS) as u64, &self.mode);
         machine.copy_to((Bda::BASE + VIDEO_GEOMETRY_FIELDS) as u64, &self.geometry);
     }
@@ -160,33 +160,33 @@ impl BdaVideo {
 impl Bda {
     pub(super) const BASE: usize = 0x400;
 
-    pub(crate) fn video_mode<A: crate::Arch>(machine: &A) -> u8 {
+    pub(crate) fn video_mode<A: crate::Core>(machine: &A) -> u8 {
         machine.read((Self::BASE + core::mem::offset_of!(Self, video_mode)) as u64)
     }
 
-    pub(crate) fn tick_count<A: crate::Arch>(machine: &A) -> u32 {
+    pub(crate) fn tick_count<A: crate::Core>(machine: &A) -> u32 {
         machine.read((Self::BASE + core::mem::offset_of!(Self, tick_count)) as u64)
     }
 
-    pub(crate) fn set_page0_cursor<A: crate::Arch>(machine: &mut A, col: u8, row: u8) {
+    pub(crate) fn set_page0_cursor<A: crate::Core>(machine: &mut A, col: u8, row: u8) {
         let addr = Self::BASE + core::mem::offset_of!(Self, cursor_pos);
         machine.write::<u16>(addr as u64, u16::from_le_bytes([col, row]));
     }
 
-    pub(crate) fn keyboard_buffer_nonempty<A: crate::Arch>(machine: &A) -> bool {
+    pub(crate) fn keyboard_buffer_nonempty<A: crate::Core>(machine: &A) -> bool {
         let head: u16 = machine.read((Self::BASE + core::mem::offset_of!(Self, kb_head)) as u64);
         let tail: u16 = machine.read((Self::BASE + core::mem::offset_of!(Self, kb_tail)) as u64);
         head != tail
     }
 
-    pub(crate) fn clear_keyboard_buffer<A: crate::Arch>(machine: &mut A) {
+    pub(crate) fn clear_keyboard_buffer<A: crate::Core>(machine: &mut A) {
         let first = core::mem::offset_of!(Self, kb_ring) as u16;
         machine.write::<u16>((Self::BASE + core::mem::offset_of!(Self, kb_head)) as u64, first);
         machine.write::<u16>((Self::BASE + core::mem::offset_of!(Self, kb_tail)) as u64, first);
         machine.copy_to((Self::BASE + core::mem::offset_of!(Self, kb_ring)) as u64, &[0; 32]);
     }
 
-    pub(crate) fn pop_keyboard_word<A: crate::Arch>(machine: &mut A) -> Option<u16> {
+    pub(crate) fn pop_keyboard_word<A: crate::Core>(machine: &mut A) -> Option<u16> {
         let head_addr = Self::BASE + core::mem::offset_of!(Self, kb_head);
         let tail_addr = Self::BASE + core::mem::offset_of!(Self, kb_tail);
         let head: u16 = machine.read(head_addr as u64);
@@ -202,11 +202,11 @@ impl Bda {
         Some(word)
     }
 
-    pub(crate) fn keyboard_flags<A: crate::Arch>(machine: &A) -> u8 {
+    pub(crate) fn keyboard_flags<A: crate::Core>(machine: &A) -> u8 {
         machine.read((Self::BASE + core::mem::offset_of!(Self, kb_flags)) as u64)
     }
 
-    pub(crate) fn set_keyboard_flags<A: crate::Arch>(machine: &mut A, flags: u8) {
+    pub(crate) fn set_keyboard_flags<A: crate::Core>(machine: &mut A, flags: u8) {
         machine.write((Self::BASE + core::mem::offset_of!(Self, kb_flags)) as u64, flags);
     }
 }
@@ -239,7 +239,7 @@ pub(super) mod video;
 /// kernel-DOS IVT redirects written after this overwrite their vectors with
 /// identical values — the layering matches a real machine (BIOS first, DOS
 /// on top). This is deliberately identical with or without a platform ROM.
-pub(super) fn install<A: crate::Arch>(machine: &mut A) {
+pub(super) fn install<A: crate::Core>(machine: &mut A) {
     crate::compact_dbg_println!("DOS: installing substitute BIOS (vga_passthrough={})",
         crate::kernel::platform::get().vga_passthrough);
     // Serviced vectors use their own trap stub; unused vectors remain NULL.
@@ -276,7 +276,7 @@ pub(super) fn install<A: crate::Arch>(machine: &mut A) {
 }
 
 /// Seed the BDA fields a real POST would have set.
-fn seed_bda<A: crate::Arch>(machine: &mut A) {
+fn seed_bda<A: crate::Core>(machine: &mut A) {
     // Zero the whole BDA first: on a UEFI machine this low page holds
     // whatever the firmware left behind (a real POST cleared it), and guests
     // read unseeded fields directly — DOS/4GW #DE'd converting a leftover
@@ -319,7 +319,7 @@ fn seed_bda<A: crate::Arch>(machine: &mut A) {
 /// FLAGS/CS/IP; the stub's `CD 31` trapped with IP = vector*2 + 2. Unless a
 /// service parks or chains, the frame is popped here — IRET semantics, like
 /// the old C BIOS's `interrupt` handlers.
-pub(super) fn dispatch<A: crate::Arch>(
+pub(super) fn dispatch<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut super::DosState<A>,

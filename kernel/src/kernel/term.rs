@@ -54,7 +54,7 @@ pub fn mark_dirty() {
 
 /// Render the terminal into its back buffer, commit it to the retained surface,
 /// and pass the completed desktop shadow to the display boundary.
-pub fn present<A: crate::Arch>(
+pub fn present<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut Display,
@@ -71,7 +71,7 @@ pub fn present<A: crate::Arch>(
 /// Event-loop publication through the desktop that outlives every focused
 /// personality. Focusing an endpoint forces one frame even when the shared
 /// terminal cells themselves did not change.
-pub fn present_on<A: crate::Arch>(
+pub fn present_on<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut Display,

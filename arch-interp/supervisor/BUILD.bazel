@@ -1,0 +1,17 @@
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+package(default_visibility = ["//arch-interp:__pkg__"])
+
+rust_binary(
+    name = "vm_supervisor",
+    srcs = ["vm_main.rs"],
+    edition = "2024",
+    compile_data = ["//arch-metal:vm_ld", "//arch-metal:vm_entry"],
+    rustc_flags = [
+        "-Cpanic=abort", "-Crelocation-model=static",
+        "-Clink-self-contained=+linker", "-Clinker-flavor=ld.lld", "-Clinker=rust-lld",
+        "-Clink-arg=-T$(location //arch-metal:vm_ld)", "-Clink-arg=$(location //arch-metal:vm_entry)",
+        "-Clink-arg=-nostdlib", "-Clink-arg=-no-pie",
+    ],
+    deps = ["//arch-metal:arch-vm", "//arch-abi", "//lib:planar", "//lib"],
+)

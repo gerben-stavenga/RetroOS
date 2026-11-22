@@ -10,7 +10,7 @@ unsafe impl GlobalAlloc for NoAllocation {
 static ALLOCATOR: NoAllocation = NoAllocation;
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn boot_kernel(_: u32, _: u32, _: u32) -> ! {
-    unsafe { arch_metal::vm::boot() }
+    unsafe { arch_metal::vm::boot(&[(planar::TRAP_NAME, planar::instruction::trap_handler)]) }
 }
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {

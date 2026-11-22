@@ -147,7 +147,7 @@ pub(in crate::kernel::windows) fn enqueue(
     user_objects::keyboard_state(state, tid, &keys);
 }
 
-pub(super) fn read<A: crate::Arch>(
+pub(super) fn read<A: crate::Core>(
     machine: &mut A,
     queue: &mut Queue,
     p: &[u32; 10],

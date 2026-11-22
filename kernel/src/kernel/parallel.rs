@@ -2,7 +2,7 @@
 //! Lifecycle actions acquire affected process loans while unrelated CPUs run.
 use alloc::{boxed::Box, vec::Vec};
 use core::{any::TypeId, cell::UnsafeCell, sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering}};
-use crate::{Arch, KernelEvent, Regs};
+use crate::{Core, KernelEvent, Regs};
 use super::{exec_ctx::ExecutionContext, thread::{self, ThreadTable, ThreadState}};
 
 const PARKED: u32 = 0;
@@ -39,8 +39,8 @@ pub fn on_worker() -> bool { unsafe { ON_WORKER } }
 static PROFILE_CPU: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 pub(crate) fn profile_cpu() -> usize { PROFILE_CPU.get() }
 
-struct Loan<A: Arch> {
-    space: A::PageTable,
+struct Loan<A: Core> {
+    space: A::AddressSpace,
     fx: A::Fx,
     regs: Regs,
     event: KernelEvent,
@@ -56,7 +56,7 @@ pub(crate) struct WorkerStats {
     pub handler_ns: u64,
     pub lock_wait_ns: u64,
 }
-pub struct Slot<A: Arch> {
+pub struct Slot<A: Core> {
     state: AtomicU32,
     cancel: AtomicBool,
     pub processor: AtomicU32,
@@ -68,8 +68,8 @@ pub struct Slot<A: Arch> {
 // Only cancel/state/processor atomics are accessed by the BSP during
 // execution. Shared Linux descriptors have their own Arc/Mutex protection;
 // each process owns its remaining mutable Linux state.
-unsafe impl<A: Arch> Sync for Slot<A> where A::PageTable: Send, A::Fx: Send {}
-impl<A: Arch> Slot<A> {
+unsafe impl<A: Core> Sync for Slot<A> where A::Fx: Send {}
+impl<A: Core> Slot<A> {
     fn new() -> Self { Self {
         state: AtomicU32::new(PARKED), cancel: AtomicBool::new(false),
         processor: AtomicU32::new(0), tid: AtomicUsize::new(0),
@@ -79,7 +79,7 @@ impl<A: Arch> Slot<A> {
     } }
 }
 /// BSP boot only, before any worker starts. Storage remains resident forever.
-pub fn provision<A: Arch>(count: usize) -> &'static [Slot<A>] {
+pub fn provision<A: Core>(count: usize) -> &'static [Slot<A>] {
     assert!(count <= MAX_CPUS && SLOTS.load(Ordering::Relaxed) == 0);
     let mut slots = Vec::with_capacity(count);
     for _ in 0..count { slots.push(Slot::<A>::new()); }
@@ -89,7 +89,7 @@ pub fn provision<A: Arch>(count: usize) -> &'static [Slot<A>] {
     COUNT.store(count, Ordering::Release);
     slots
 }
-fn slots<A: Arch>() -> &'static [Slot<A>] {
+fn slots<A: Core>() -> &'static [Slot<A>] {
     if BACKEND.get() != Some(&TypeId::of::<A>()) { return &[]; }
     let count = COUNT.load(Ordering::Acquire);
     // The TypeId check proves this is exactly the A used to allocate the array.
@@ -97,14 +97,14 @@ fn slots<A: Arch>() -> &'static [Slot<A>] {
 }
 pub fn enable() { START.store(true, Ordering::Release); }
 pub fn started() -> bool { START.load(Ordering::Acquire) }
-pub fn disable<A: Arch>(slot: &Slot<A>) { slot.state.store(DISABLED, Ordering::Release); }
+pub fn disable<A: Core>(slot: &Slot<A>) { slot.state.store(DISABLED, Ordering::Release); }
 
 /// AP ring-1 loop. Owns the process state while running the normal Linux
 /// handlers. Shared task-table actions and device polling remain outside it.
 /// # Safety
 /// This CPU exclusively consumes slot. Stacks/TLS/slot storage are resident.
-pub unsafe fn worker<A: Arch>(mut machine: A, slot: &'static Slot<A>) -> !
-where A::PageTable: Send, A::Fx: Send {
+pub unsafe fn worker<A: Core>(mut machine: A, slot: &'static Slot<A>) -> !
+where A::Fx: Send {
     unsafe { ON_WORKER = true; }
     PROFILE_CPU.set(slots::<A>().iter().position(|s| core::ptr::eq(s, slot)).expect("unknown worker slot"));
     slot.state.store(IDLE, Ordering::Release);
@@ -130,7 +130,7 @@ where A::PageTable: Send, A::Fx: Send {
     }
 }
 
-fn run_linux<A: Arch>(machine: &mut A, loan: &mut Loan<A>, slot: &Slot<A>) -> KernelEvent {
+fn run_linux<A: Core>(machine: &mut A, loan: &mut Loan<A>, slot: &Slot<A>) -> KernelEvent {
     loop {
         if slot.cancel.load(Ordering::Acquire) { return KernelEvent::Irq; }
         super::platform::refresh_kernel_mappings();
@@ -167,11 +167,11 @@ impl Parallel {
     pub fn batches(&self) -> usize { self.batches }
     /// BSP preparation and rendezvous, excluded from guest/arch execution.
     pub fn take_kernel_cycles(&mut self) -> u64 { core::mem::take(&mut self.kernel_cycles) }
-    pub fn enabled<A: Arch>(&self) -> bool { slots::<A>().iter().any(|s| matches!(s.state.load(Ordering::Acquire), IDLE | RUN | DONE)) }
-    fn available<A: Arch>(&self, cpu: usize) -> bool {
+    pub fn enabled<A: Core>(&self) -> bool { slots::<A>().iter().any(|s| matches!(s.state.load(Ordering::Acquire), IDLE | RUN | DONE)) }
+    fn available<A: Core>(&self, cpu: usize) -> bool {
         cpu == 0 || slots::<A>().get(cpu).is_some_and(|s| s.state.load(Ordering::Acquire) == IDLE)
     }
-    fn affinity<A: Arch>(&mut self, threads: &mut ThreadTable<A>, tid: usize, current: usize) -> usize {
+    fn affinity<A: Core>(&mut self, threads: &mut ThreadTable<A>, tid: usize, current: usize) -> usize {
         let owner = match &threads[tid].personality {
             thread::Personality::Linux(linux) => linux.borrowed_space_owner(), _ => None,
         };
@@ -202,7 +202,7 @@ impl Parallel {
         }
         threads[tid].kernel.execution_cpu
     }
-    pub fn pending<A: Arch>(threads: &ThreadTable<A>, current: usize) -> Option<usize> {
+    pub fn pending<A: Core>(threads: &ThreadTable<A>, current: usize) -> Option<usize> {
         if threads[current].kernel.pending_event.is_some() { return None; }
         threads.active_after(current).find(|&tid|
             threads[tid].kernel.pending_event.is_some()
@@ -210,7 +210,7 @@ impl Parallel {
     }
     /// Assign runnable processes to CPUs and install the BSP's selected context.
     /// This only transfers ownership; the event loop executes the local context.
-    pub fn schedule<A: Arch>(
+    pub fn schedule<A: Core>(
         &mut self, machine: &mut A, threads: &mut ThreadTable<A>, ctx: &mut ExecutionContext<A>,
         deadline: u64,
     ) {
@@ -313,7 +313,7 @@ impl Parallel {
     }
 }
 
-fn wait_for_slot<A: Arch>(machine: &A, slot: &Slot<A>, deadline: u64) {
+fn wait_for_slot<A: Core>(machine: &A, slot: &Slot<A>, deadline: u64) {
     let mut watchdog = deadline.max(machine.now()).saturating_add(1_000_000_000);
     let mut spins = 0u32;
     while slot.state.load(Ordering::Acquire) != DONE {
@@ -328,7 +328,7 @@ fn wait_for_slot<A: Arch>(machine: &A, slot: &Slot<A>, deadline: u64) {
 
 /// Acquire completed process states. RUN loans are exclusively worker-owned;
 /// their task-table rows contain only stable metadata and shared console refs.
-pub(crate) fn collect_finished<A: Arch>(threads: &mut ThreadTable<A>) {
+pub(crate) fn collect_finished<A: Core>(threads: &mut ThreadTable<A>) {
     for slot in slots::<A>() {
         if slot.state.load(Ordering::Acquire) != DONE { continue; }
         let tid = slot.tid.load(Ordering::Relaxed);
@@ -350,7 +350,7 @@ pub(crate) fn collect_finished<A: Arch>(threads: &mut ThreadTable<A>) {
 }
 
 /// Cross-process mutation acquires just its target's execution ownership.
-pub(crate) fn take_process<A: Arch>(machine: &mut A, threads: &mut ThreadTable<A>, tid: usize) {
+pub(crate) fn take_process<A: Core>(machine: &mut A, threads: &mut ThreadTable<A>, tid: usize) {
     if threads[tid].kernel.state != ThreadState::OnCpu { return; }
     let slot = &slots::<A>()[threads[tid].kernel.execution_cpu];
     slot.cancel.store(true, Ordering::Release);
@@ -361,13 +361,13 @@ pub(crate) fn take_process<A: Arch>(machine: &mut A, threads: &mut ThreadTable<A
     collect_finished::<A>(threads);
     super::platform::refresh_kernel_mappings();
 }
-pub(crate) fn stop_all<A: Arch>(machine: &mut A, threads: &mut ThreadTable<A>) {
+pub(crate) fn stop_all<A: Core>(machine: &mut A, threads: &mut ThreadTable<A>) {
     for tid in threads.active_ids().filter(|&tid| tid != 0) { take_process(machine, threads, tid); }
 }
 
 /// Lifecycle code keeps one task-table owner. Acquire only rows it can mutate;
 /// unrelated processes continue user execution and kernel handlers throughout.
-pub(crate) fn prepare_action<A: Arch>(machine: &mut A, threads: &mut ThreadTable<A>, current: usize, action: &thread::KernelAction) {
+pub(crate) fn prepare_action<A: Core>(machine: &mut A, threads: &mut ThreadTable<A>, current: usize, action: &thread::KernelAction) {
     let retiring_threads = matches!(&threads[current].personality,
         thread::Personality::Linux(linux) if linux.has_exited_threads());
     let related = retiring_threads || matches!(action, thread::KernelAction::Exit(_) | thread::KernelAction::Signal { .. } | thread::KernelAction::ThreadSignal { .. });
@@ -398,7 +398,7 @@ pub fn peak_workers() -> usize { PEAK.load(Ordering::Relaxed) }
 /// BSP snapshots only. DONE/IDLE publishes the worker's completed counters;
 /// never read the loan while its CPU owns RUN. Totals are since boot and are
 /// separate from the BSP wall-time ledger.
-pub(crate) fn worker_stats<A: Arch>() -> Vec<(usize, WorkerStats)> {
+pub(crate) fn worker_stats<A: Core>() -> Vec<(usize, WorkerStats)> {
     slots::<A>().iter().enumerate().filter_map(|(cpu, slot)| {
         if !matches!(slot.state.load(Ordering::Acquire), DONE | IDLE) { return None; }
         let stats = unsafe { (*slot.loan.get()).stats };
@@ -407,7 +407,7 @@ pub(crate) fn worker_stats<A: Arch>() -> Vec<(usize, WorkerStats)> {
 }
 
 /// CPUs eligible for Linux execution; the dedicated media core is excluded.
-pub fn cpu_mask<A: Arch>() -> u64 {
+pub fn cpu_mask<A: Core>() -> u64 {
     let mut mask = 1u64;
     for (cpu, slot) in slots::<A>().iter().enumerate().skip(1) {
         if matches!(slot.state.load(Ordering::Acquire), IDLE | RUN | DONE) { mask |= 1u64 << cpu; }

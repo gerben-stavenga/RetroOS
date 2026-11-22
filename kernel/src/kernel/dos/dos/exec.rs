@@ -26,7 +26,7 @@ const EXEC_SAVED_IVT_VECTORS: [u8; 11] =
 // INT 2Eh — COMMAND.COM internal execute
 // ============================================================================
 
-pub(super) fn int_2eh<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn int_2eh<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     // DS:SI = pointer to command-line length byte + text (same as PSP:80h format)
     // Treat as COMMAND.COM /C — fork-exec the program in a fresh address space.
     let addr = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32);
@@ -49,7 +49,7 @@ pub(super) fn int_2eh<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelTh
 /// Open a DOS program file by literal name. No extension probing, no
 /// PATH search -- those are shell concerns and live in COMMAND.COM,
 /// matching real DOS where INT 21h AH=4B takes a fully-qualified name.
-fn dos_open_program<A: crate::Arch>(kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, name: &[u8]) -> i32 {
+fn dos_open_program<A: crate::Core>(kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, name: &[u8]) -> i32 {
     match dfs_open_existing(dos, name) {
         Ok((path, len)) => crate::kernel::vfs::open(&path[..len], &mut kt.fds),
         Err(_) => -2,
@@ -58,7 +58,7 @@ fn dos_open_program<A: crate::Arch>(kt: &mut thread::KernelThread<A>, dos: &mut 
 
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
-pub(super) fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cmdtail: &[u8], mut policy: crate::kernel::dos::LaunchPolicy, regs: &mut Regs, _kt: &mut thread::KernelThread<A>) -> thread::KernelAction {
+pub(super) fn fork_exec<A: crate::Core>(dos: &mut thread::DosState<A>, prog_name: &[u8], cmdtail: &[u8], mut policy: crate::kernel::dos::LaunchPolicy, regs: &mut Regs, _kt: &mut thread::KernelThread<A>) -> thread::KernelAction {
     // Verify the file exists (DFS resolve → VFS → would-be open); ENOENT else.
     if dfs_open_existing(dos, prog_name).is_err() {
         regs.rax = (regs.rax & !0xFFFF) | 2; // ENOENT
@@ -117,7 +117,7 @@ pub(super) fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name
 /// Replace a one-shot shell's process, retaining its TID for a Win32
 /// CreateProcess caller. DOS INT 21h EXEC is nested and returns to the shell;
 /// it cannot provide this process-level replacement.
-pub(super) fn exec_replace<A: crate::Arch>(
+pub(super) fn exec_replace<A: crate::Core>(
     machine: &mut A,
     dos: &mut thread::DosState<A>,
     prog_name: &[u8],
@@ -168,7 +168,7 @@ pub(super) fn exec_replace<A: crate::Arch>(
 /// Non-DOS formats (ELF, BAT) should be routed through COMMAND.COM /C.
 /// A batch shell keeps its DOS children in this address space so resident
 /// drivers remain visible; standalone commands may fork into new threads.
-pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn exec_program<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let al = regs.rax as u8;
     match al {
         0x00 => {}                                  // load & execute — fall through
@@ -389,7 +389,7 @@ pub(super) fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::Ker
 /// For MZ .EXE the load module is copied at load_seg:0 and each relocation
 /// entry gets `reloc_factor` added (NOT load_seg — the spec leaves it to
 /// the caller, e.g. Borland C passes the segment of the overlay frame).
-fn exec_load_overlay<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+fn exec_load_overlay<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     // ASCIIZ filename at DS:DX
     let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
     let mut filename = [0u8; 128];
@@ -469,7 +469,7 @@ fn exec_load_overlay<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThr
 
 /// Return from an EXEC'd child to the parent.
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
-pub(super) fn exec_return<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs, parent: ExecParent,
+pub(super) fn exec_return<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs, parent: ExecParent,
                preserve_pm_env: bool) -> thread::KernelAction {
     if !preserve_pm_env { dos.ipx.release(machine, dos.current_psp); }
     let mut parent = parent;
@@ -618,7 +618,7 @@ fn fill_env(env: &mut [u8], parent_env: &[u8], prog_name: &[u8]) {
 
 /// Initialize a freshly-allocated PSP at `psp_seg` to point at its env
 /// block at `env_seg`, with parent_psp / JFT / cmdline default fields set.
-fn init_psp<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, psp_seg: u16, env_seg: u16, parent_psp: u16) {
+fn init_psp<A: crate::Core>(machine: &mut A, _regs: &mut Regs, psp_seg: u16, env_seg: u16, parent_psp: u16) {
     let mut jft = [0xFFu8; 20];
     jft[0] = 0; jft[1] = 1; jft[2] = 2;   // stdin/stdout/stderr → SFT 0/1/2
     let mut cmdline = [0u8; 127];
@@ -649,7 +649,7 @@ pub(in crate::kernel::dos) fn is_mz_exe(data: &[u8]) -> bool {
 /// separate AH=48-style allocations on `dos`'s MCB chain, exactly like
 /// real DOS does on `INT 21h AH=4B EXEC`. Returns `(env_seg, psp_seg,
 /// end_seg)`.
-fn alloc_program_blocks<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, prog_paras: u16)
+fn alloc_program_blocks<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, prog_paras: u16)
     -> Result<(u16, u16, u16), ()>
 {
     let env_seg = dos_alloc_block(machine, dos, regs, ENV_PARAS).map_err(|_| ())?;
@@ -661,7 +661,7 @@ fn alloc_program_blocks<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosSt
 /// Populate the env block + PSP + load module for a freshly-allocated
 /// program. Common to `load_exe` and `load_com`. Sets `dos.current_psp`
 /// and re-syncs the MCB chain so block ownership reflects the new PSP.
-fn populate_program<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &mut thread::DosState<A>, env_seg: u16, psp_seg: u16,
+fn populate_program<A: crate::Core>(machine: &mut A, regs: &mut Regs, dos: &mut thread::DosState<A>, env_seg: u16, psp_seg: u16,
                     parent: &ParentRef, prog_name: &[u8]) {
     // Build the env arena in a local buffer, write it to guest memory, and
     // read the BLASTER config from the same buffer (no second guest read).
@@ -695,7 +695,7 @@ fn populate_program<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &mut 
 /// Load a .COM binary. Allocates env + program block (1000h paragraphs =
 /// 64 KB, the standard .COM arena), populates env/PSP/code. Stack at
 /// PSP:COM_SP (top of 64 KB segment), code at (psp+0x10):0000.
-pub(in crate::kernel::dos) fn load_com<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &mut thread::DosState<A>, parent: &ParentRef,
+pub(in crate::kernel::dos) fn load_com<A: crate::Core>(machine: &mut A, regs: &mut Regs, dos: &mut thread::DosState<A>, parent: &ParentRef,
                        data: &[u8], prog_name: &[u8]) -> Loaded {
     let (env_seg, psp_seg, end_seg) = alloc_program_blocks(machine, dos, regs, 0x1000)
         .expect("load_com: allocation failed");
@@ -725,7 +725,7 @@ pub(in crate::kernel::dos) fn load_com<A: crate::Arch>(machine: &mut A, regs: &m
 ///   0x14: initial IP
 ///   0x16: initial CS (relative to load segment)
 ///   0x18: relocation table offset
-pub(in crate::kernel::dos) fn load_exe<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &mut thread::DosState<A>, parent: &ParentRef,
+pub(in crate::kernel::dos) fn load_exe<A: crate::Core>(machine: &mut A, regs: &mut Regs, dos: &mut thread::DosState<A>, parent: &ParentRef,
                        data: &[u8], prog_name: &[u8]) -> Option<Loaded> {
     if data.len() < 28 { return None; }
 
@@ -816,7 +816,7 @@ pub(in crate::kernel::dos) fn load_exe<A: crate::Arch>(machine: &mut A, regs: &m
 /// PSP's saved INT 21h frame as its return context, replacing that frame's
 /// destination with the child's INT 22h address. Keeping the return in the
 /// ordinary IRET path also restores the parent's stack and flags together.
-pub(super) fn return_to_psp_parent<A: crate::Arch>(
+pub(super) fn return_to_psp_parent<A: crate::Core>(
     machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, status: u16,
     resident_paras: Option<u16>,
 ) -> bool {
@@ -868,7 +868,7 @@ pub(super) fn return_to_psp_parent<A: crate::Arch>(
 
 /// Terminate a DOS program while retaining `keep` paragraphs from its PSP.
 /// INT 27h and INT 21h/AH=31h differ only in how that count is supplied.
-pub(super) fn terminate_resident<A: crate::Arch>(
+pub(super) fn terminate_resident<A: crate::Core>(
     machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs, keep: u16,
 ) -> thread::KernelAction {
     if dos.exec_parent.as_ref().is_some_and(|parent| parent.child_psp == dos.current_psp)

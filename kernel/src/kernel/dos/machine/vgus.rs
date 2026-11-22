@@ -85,7 +85,7 @@ impl Gus {
     /// Program-exit / exec cleanup: drop the whole chip so the next program
     /// sees a power-on card (same lifecycle as the SB's `release_dma_pool`
     /// and the per-program OPL chip).
-    pub fn reset<A: crate::Arch>(&mut self, machine: &mut A, vpic: &mut VirtualPic) {
+    pub fn reset<A: crate::Core>(&mut self, machine: &mut A, vpic: &mut VirtualPic) {
         let _ = machine; // stream lifecycle is the mixer pump's (it parks on idle)
         // Lower the GF1 line as well as dropping the chip. A voice/timer event
         // may already have latched the IRQ in the vPIC's IRR; dropping the card
@@ -158,7 +158,7 @@ impl Gus {
     }
 
     /// Guest IN from a decoded port.
-    pub fn io_read<A: crate::Arch>(&mut self, machine: &mut A, p: u16) -> u8 {
+    pub fn io_read<A: crate::Core>(&mut self, machine: &mut A, p: u16) -> u8 {
         let _ = machine;
         let v = self.card.port_in(p);
         let (reg, voice) = self.card.sel();
@@ -170,7 +170,7 @@ impl Gus {
     }
 
     /// Guest OUT to a decoded port.
-    pub fn io_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, vpic: &mut VirtualPic, p: u16, val: u8) {
+    pub fn io_write<A: crate::Core>(&mut self, machine: &mut A, dma: &Dma8237, vpic: &mut VirtualPic, p: u16, val: u8) {
         let (reg, voice) = self.card.sel();
         if super::PORT_TRACE {
             crate::compact_dbg_println!("[gus] out {:03X} <- {:02X} (reg {:02X}v{})", p, val, reg, voice);
@@ -202,7 +202,7 @@ impl Gus {
     /// This host moves a controller-sized transfer in one go, bounded by the
     /// returned card window. Terminal count is reported only if that whole
     /// transfer moved. Other hosts can feed partial completions into advance.
-    fn service_dma<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237) {
+    fn service_dma<A: crate::Core>(&mut self, machine: &mut A, dma: &Dma8237) {
         let ch = self.dma_ch as usize;
         let Some(request) = self.card.advance(0, None) else { return };
         if ch >= 8 {

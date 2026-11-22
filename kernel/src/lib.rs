@@ -1,7 +1,7 @@
-//! RetroOS kernel — a pure library over the `arch_abi::Arch` trait.
+//! RetroOS kernel — a pure library over the `arch_abi::Core` trait.
 //!
 //! The kernel is generic over its arch backend: every function that touches
-//! the machine takes `machine: &mut A` with `A: Arch`, and thread state
+//! the machine takes `machine: &mut A` with `A: Core`, and thread state
 //! carries `Vcpu<A>` / `A::Fx`. No backend crate is linked here —
 //! composition happens in the ENTRY crates, which pick the backend and call
 //! `startup`:
@@ -66,11 +66,11 @@ pub use arch_abi::{
 
 pub use kernel::memory::GuestBytes;
 /// Kernel operations include replenishing user backing between bounded arch calls.
-pub trait Arch: arch_abi::Arch + GuestBytes {
+pub trait Core: arch_abi::Core + GuestBytes {
     fn monitor(&mut self, regs: &mut Regs) -> arch_abi::monitor::MonitorResult;
     fn reflect_vm86_int(&mut self, regs: &mut Regs, vector: u8);
 }
-impl<A: arch_abi::Arch + arch_abi::GuestBytes> Arch for A {
+impl<A: arch_abi::Core + arch_abi::GuestBytes> Core for A {
     fn monitor(&mut self, regs: &mut Regs) -> arch_abi::monitor::MonitorResult {
         kernel::memory::service(self);
         arch_abi::monitor::monitor(self, regs)

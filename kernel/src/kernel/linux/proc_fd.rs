@@ -78,7 +78,7 @@ pub(super) fn follow_directory_link(fds: &[thread::FdKind], buf: &mut [u8], len:
 /// Reopen the pipe object behind a descriptor link, retaining an endpoint
 /// independently of the descriptor that named it. Bash process substitution
 /// uses these opens rather than dup().
-pub(super) fn open_pipe<A: crate::Arch>(
+pub(super) fn open_pipe<A: crate::Core>(
     kt: &mut thread::KernelThread<A>, path: &[u8], flags: u32,
 ) -> Option<i32> {
     let fd = fd_path(path)?;
@@ -107,7 +107,7 @@ pub(super) fn open_pipe<A: crate::Arch>(
 fn absolute(path: &[u8]) -> Vec<u8> {
     [b"/".as_slice(), path].concat()
 }
-fn target<A: crate::Arch>(
+fn target<A: crate::Core>(
     kt: &thread::KernelThread<A>,
     linux: &LinuxState,
     fd: usize,
@@ -130,14 +130,14 @@ fn target<A: crate::Arch>(
         thread::FdKind::ConsoleOut => Some(b"/dev/console".to_vec()),
     }
 }
-pub(super) fn readlink<A: crate::Arch>(
+pub(super) fn readlink<A: crate::Core>(
     kt: &thread::KernelThread<A>,
     linux: &LinuxState,
     path: &[u8],
 ) -> Option<Option<Vec<u8>>> {
     fd_path(path).map(|fd| fd.and_then(|fd| target(kt, linux, fd)))
 }
-pub(super) fn stat<A: crate::Arch>(
+pub(super) fn stat<A: crate::Core>(
     kt: &thread::KernelThread<A>,
     linux: &LinuxState,
     path: &[u8],
@@ -172,7 +172,7 @@ pub(super) fn stat<A: crate::Arch>(
     })())
 }
 
-pub(super) fn getdents<A: crate::Arch>(
+pub(super) fn getdents<A: crate::Core>(
     machine: &mut A,
     kt: &thread::KernelThread<A>,
     linux: &LinuxState,

@@ -35,7 +35,7 @@ fn parse(name: &str) -> Result<Converter, u32> {
     Ok(converter)
 }
 
-pub(super) fn dispatch<A: crate::Arch>(machine: &mut A, state: &mut Os2State, regs: &Regs, ordinal: u16) -> u32 {
+pub(super) fn dispatch<A: crate::Core>(machine: &mut A, state: &mut Os2State, regs: &Regs, ordinal: u16) -> u32 {
     let a = arg32(machine, regs, 0);
     match ordinal {
         1 => {
@@ -85,7 +85,7 @@ pub(super) fn dispatch<A: crate::Arch>(machine: &mut A, state: &mut Os2State, re
     }
 }
 
-fn convert<A: crate::Arch>(machine: &mut A, regs: &Regs, converter: Converter, to_ucs: bool) -> u32 {
+fn convert<A: crate::Core>(machine: &mut A, regs: &Regs, converter: Converter, to_ucs: bool) -> u32 {
     let args: [usize; 5] = core::array::from_fn(|i| arg32(machine, regs, i + 1) as usize);
     if args.contains(&0) { return INVALID; }
     let [input_pointer, input_count, output_pointer, output_count, substitutions] = args;

@@ -45,7 +45,7 @@ pub(super) enum DosExit {
     Errno(i32),
 }
 
-pub(super) fn int_21h<A: crate::Arch>(
+pub(super) fn int_21h<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
@@ -839,7 +839,7 @@ pub(super) fn int_21h<A: crate::Arch>(
         // byte. Our DTA write mirrors that prefix.
         0x11 | 0x12 => {
             #[inline(never)]
-            fn fcb_find<A: crate::Arch>(
+            fn fcb_find<A: crate::Core>(
                 machine: &mut A,
                 dos: &mut thread::DosState<A>,
                 regs: &mut Regs,
@@ -974,7 +974,7 @@ pub(super) fn int_21h<A: crate::Arch>(
         //          2=set filename only if specified, 3=set extension only if specified
         0x29 => {
             #[inline(never)]
-            fn parse_fcb<A: crate::Arch>(
+            fn parse_fcb<A: crate::Core>(
                 machine: &mut A,
                 dos: &mut thread::DosState<A>,
                 regs: &mut Regs,
@@ -1584,7 +1584,7 @@ pub(super) fn int_21h<A: crate::Arch>(
         // Action: bit0=open-if-exists, bit1=replace-if-exists, bit4=create-if-not-exists
         0x6C => {
             #[inline(never)]
-            fn extended_open<A: crate::Arch>(
+            fn extended_open<A: crate::Core>(
                 machine: &mut A,
                 kt: &mut thread::KernelThread<A>,
                 dos: &mut thread::DosState<A>,
@@ -1725,7 +1725,7 @@ pub(in crate::kernel::dos) fn int21_is_synchronous(ah: u8) -> bool {
 /// Dispatch a synchronous real-mode INT 21h register image without attaching
 /// interrupt/continuation frames. The caller supplies a VM86-flavoured Regs
 /// value, so pointer translation retains real-mode segment semantics.
-pub(in crate::kernel::dos) fn dispatch_synchronous_rm_int21<A: crate::Arch>(
+pub(in crate::kernel::dos) fn dispatch_synchronous_rm_int21<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,

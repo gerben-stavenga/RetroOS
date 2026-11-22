@@ -206,7 +206,7 @@ impl Os2State {
     pub fn cwd_str(&self) -> &[u8] { &self.cwd[..self.cwd_len] }
     pub fn exec_path_str(&self) -> &[u8] { &self.exec_path[..self.exec_path_len] }
 
-    pub fn on_resume<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn on_resume<A: crate::Core>(&mut self, machine: &mut A) {
         machine.load_ldt(&self.ldt);
         if self.exec_process.as_ref().is_some_and(|process|
             process.pid == 0 || !process.synchronous || process.exit_code.is_some()) {
@@ -338,7 +338,7 @@ impl Os2State {
 
 /// Publish the foremost native Presentation Manager window into the shared
 /// desktop. PM owns its pixels; the compositor owns placement and visibility.
-pub fn render<A: crate::Arch>(
+pub fn render<A: crate::Core>(
     _machine: &mut A,
     _bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     state: &mut Os2State,
@@ -524,7 +524,7 @@ fn resolve_export(modules: &[Module], module_index: usize, ordinal: Option<u16>,
     })
 }
 
-fn map_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i32> {
+fn map_module<A: crate::Core>(machine: &mut A, module: &Module) -> Result<(), i32> {
     let image = lx::Image::parse(&module.data).map_err(|_| 8)?;
     for object_number in 1..=image.header.object_count {
         let object = image.object(object_number).map_err(|_| 8)?;
@@ -553,7 +553,7 @@ fn map_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i3
     Ok(())
 }
 
-fn apply_fixups<A: crate::Arch>(machine: &mut A, modules: &[Module], module_index: usize) -> Result<(), i32> {
+fn apply_fixups<A: crate::Core>(machine: &mut A, modules: &[Module], module_index: usize) -> Result<(), i32> {
     let module = modules.get(module_index).ok_or(8)?;
     let image = lx::Image::parse(&module.data).map_err(|_| 8)?;
     let imports = image.import_modules().map_err(|_| 8)?;
@@ -612,7 +612,7 @@ fn apply_fixups<A: crate::Arch>(machine: &mut A, modules: &[Module], module_inde
     Ok(())
 }
 
-fn protect_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i32> {
+fn protect_module<A: crate::Core>(machine: &mut A, module: &Module) -> Result<(), i32> {
     let image = lx::Image::parse(&module.data).map_err(|_| 8)?;
     for object in image.objects().map_err(|_| 8)? {
         let base = module.bias.checked_add(object.address).ok_or(8)? as usize;
@@ -646,7 +646,7 @@ fn vfs_image_path(path: &[u8], personality: Option<thread::PersonalityName>) -> 
 /// Load an LX program and all of its DLL imports into the active address
 /// space, relocate them, and initialize `tid` as an OS/2 process.
 #[allow(clippy::too_many_arguments)]
-pub fn exec_lx_into<A: crate::Arch>(
+pub fn exec_lx_into<A: crate::Core>(
     machine: &mut A,
     threads: &mut thread::ThreadTable<A>,
     tid: usize,
@@ -1034,7 +1034,7 @@ fn gate_from_event(state: &Os2State, cs: u16, ip: u32) -> Option<Gate> {
     state.gates.iter().copied().find(|g| g.cs == cs && g.return_ip == ip)
 }
 
-fn finish_call<A: crate::Arch>(machine: &A, regs: &mut Regs, result: u32) {
+fn finish_call<A: crate::Core>(machine: &A, regs: &mut Regs, result: u32) {
     let sp = regs.sp() as usize;
     let return_eip = machine.read::<u32>(sp as u64);
     regs.rax = result as u64;
@@ -1044,7 +1044,7 @@ fn finish_call<A: crate::Arch>(machine: &A, regs: &mut Regs, result: u32) {
     regs.frame.rsp = regs.frame.rsp.wrapping_add(4);
 }
 
-fn finish_gate<A: crate::Arch>(machine: &A, state: &Os2State, regs: &mut Regs, gate: Gate, result: u32) {
+fn finish_gate<A: crate::Core>(machine: &A, state: &Os2State, regs: &mut Regs, gate: Gate, result: u32) {
     if gate.far16_args == 0 {
         finish_call(machine, regs, result);
     } else {
@@ -1056,15 +1056,15 @@ fn finish_gate<A: crate::Arch>(machine: &A, state: &Os2State, regs: &mut Regs, g
     }
 }
 
-fn arg32<A: crate::Arch>(machine: &A, regs: &Regs, n: usize) -> u32 {
+fn arg32<A: crate::Core>(machine: &A, regs: &Regs, n: usize) -> u32 {
     machine.read::<u32>((regs.sp() as usize + 4 + n * 4) as u64)
 }
 
-fn c_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
+fn c_string<A: crate::Core>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
     Ok(crate::kernel::text::Encoding::oem().decode(&raw_string(machine, address)?, false).unwrap().into_bytes())
 }
 
-fn raw_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
+fn raw_string<A: crate::Core>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
     if address == 0 { return Err(ERROR_INVALID_PARAMETER); }
     let mut out = Vec::new();
     for i in 0..1024 {
@@ -1115,7 +1115,7 @@ fn os2_error(error: i32) -> u32 {
     }
 }
 
-fn dos_open<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, state: &Os2State, regs: &Regs) -> u32 {
+fn dos_open<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, state: &Os2State, regs: &Regs) -> u32 {
     let phandle = arg32(machine, regs, 1) as usize;
     let paction = arg32(machine, regs, 2) as usize;
     let actions = arg32(machine, regs, 5);
@@ -1144,7 +1144,7 @@ fn dos_open<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, s
     NO_ERROR
 }
 
-fn dos_open_l<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, state: &Os2State, regs: &Regs) -> u32 {
+fn dos_open_l<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, state: &Os2State, regs: &Regs) -> u32 {
     // LONGLONG cbFile occupies argument slots 3 and 4; the remaining Open
     // parameters are therefore shifted by one compared with DosOpen.
     let phandle = arg32(machine, regs, 1) as usize;
@@ -1173,7 +1173,7 @@ fn dos_open_l<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
     NO_ERROR
 }
 
-fn dos_read<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, regs: &Regs) -> u32 {
+fn dos_read<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, regs: &Regs) -> u32 {
     let fd = arg32(machine, regs, 0) as usize;
     let address = arg32(machine, regs, 1) as usize;
     let length = arg32(machine, regs, 2) as usize;
@@ -1191,7 +1191,7 @@ fn dos_read<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, r
     NO_ERROR
 }
 
-fn dos_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, regs: &mut Regs) -> u32 {
+fn dos_write<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, regs: &mut Regs) -> u32 {
     let handle = arg32(machine, regs, 0) as usize;
     let buffer = arg32(machine, regs, 1) as usize;
     let length = arg32(machine, regs, 2) as usize;
@@ -1225,7 +1225,7 @@ fn selector_base(state: &Os2State, selector: u16) -> Option<u32> {
     Some((((desc >> 16) & 0xffff) | (((desc >> 32) & 0xff) << 16) | (((desc >> 56) & 0xff) << 24)) as u32)
 }
 
-fn write_pm_message<A: crate::Arch>(machine: &mut A, address: usize, message: PmMessage) {
+fn write_pm_message<A: crate::Core>(machine: &mut A, address: usize, message: PmMessage) {
     machine.write::<u32>(address as u64, message.hwnd);
     machine.write::<u32>((address + 4) as u64, message.message);
     machine.write::<u32>((address + 8) as u64, message.mp1);
@@ -1235,7 +1235,7 @@ fn write_pm_message<A: crate::Arch>(machine: &mut A, address: usize, message: Pm
     machine.write::<u32>((address + 24) as u64, 0);
 }
 
-fn fill_pm_rect<A: crate::Arch>(machine: &A, state: &mut Os2State, regs: &Regs) -> u32 {
+fn fill_pm_rect<A: crate::Core>(machine: &A, state: &mut Os2State, regs: &Regs) -> u32 {
     let hps = arg32(machine, regs, 0);
     let rect = arg32(machine, regs, 1) as usize;
     let color = arg32(machine, regs, 2).to_le_bytes();
@@ -1288,7 +1288,7 @@ fn create_pm_window(state: &mut Os2State, class: &[u8], id: u32, width: u32, hei
     hwnd
 }
 
-fn begin_wndproc<A: crate::Arch>(
+fn begin_wndproc<A: crate::Core>(
     machine: &mut A,
     regs: &mut Regs,
     state: &mut Os2State,
@@ -1311,7 +1311,7 @@ fn begin_wndproc<A: crate::Arch>(
     true
 }
 
-fn alloc_os2_memory<A: crate::Arch>(machine: &mut A, state: &mut Os2State, out: usize, requested: u32) -> u32 {
+fn alloc_os2_memory<A: crate::Core>(machine: &mut A, state: &mut Os2State, out: usize, requested: u32) -> u32 {
     let Some(size) = requested.max(1).checked_add(4095).map(|n|n & !4095) else {return ERROR_NOT_ENOUGH_MEMORY;};
     let Some(end) = state.heap_next.checked_add(size) else { return ERROR_NOT_ENOUGH_MEMORY; };
     if end >= USER_LIMIT { return ERROR_NOT_ENOUGH_MEMORY; }
@@ -1404,7 +1404,7 @@ fn load_pm_bitmap(state: &mut Os2State, id: u16) -> u32 {
     handle
 }
 
-fn draw_pm_bitmap<A: crate::Arch>(machine: &A, state: &mut Os2State, regs: &Regs) -> u32 {
+fn draw_pm_bitmap<A: crate::Core>(machine: &A, state: &mut Os2State, regs: &Regs) -> u32 {
     let hps = arg32(machine, regs, 0);
     let handle = arg32(machine, regs, 1);
     let destination = arg32(machine, regs, 3) as usize;
@@ -1427,7 +1427,7 @@ fn draw_pm_bitmap<A: crate::Arch>(machine: &A, state: &mut Os2State, regs: &Regs
     1
 }
 
-fn dispatch_api<A: crate::Arch>(
+fn dispatch_api<A: crate::Core>(
     machine: &mut A, kt: &mut thread::KernelThread<A>, state: &mut Os2State,
     regs: &mut Regs, api: Api,
 ) -> u32 {
@@ -1839,7 +1839,7 @@ fn dispatch_api<A: crate::Arch>(
     }
 }
 
-pub fn handle_event<A: crate::Arch>(
+pub fn handle_event<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     state: &mut Os2State,

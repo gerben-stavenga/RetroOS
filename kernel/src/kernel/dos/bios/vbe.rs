@@ -182,7 +182,7 @@ fn substitute_vbe_mode_for_output(
     })
 }
 
-fn available_vbe_mode<A: crate::Arch>(
+fn available_vbe_mode<A: crate::Core>(
     bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     number: u16,
 ) -> Option<crate::kernel::platform::VbeMode> {
@@ -193,7 +193,7 @@ fn available_vbe_mode<A: crate::Arch>(
     }
 }
 
-pub(super) fn vbe<A: crate::Arch>(
+pub(super) fn vbe<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut DosState<A>,
@@ -279,7 +279,7 @@ pub(super) fn vbe<A: crate::Arch>(
 
 /// Direct PM display-start uses a dword address in DX:CX, whereas INT 10h
 /// uses pixel/scanline coordinates. Resolve it using the active logical pitch.
-fn translate_pm_display_start<A: crate::Arch>(
+fn translate_pm_display_start<A: crate::Core>(
     bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &DosState<A>,
     regs: &mut Regs,
@@ -363,7 +363,7 @@ mod tests {
 
 /// VBE 4F08h — Set/Get DAC palette format. Changing the exposed width never
 /// rewrites the canonical eight-bit palette/ramp.
-fn vbe_dac_format<A: crate::Arch>(
+fn vbe_dac_format<A: crate::Core>(
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut DosState<A>,
     regs: &mut Regs,
@@ -396,7 +396,7 @@ fn vbe_dac_format<A: crate::Arch>(
 /// bytes (Blue, Green, Red, align), in the width selected through 4F08h.
 /// Native modes retain their shadow in the BIOS display service; detached
 /// modes retain a complete private copy in `EmulatedVga`.
-fn vbe_palette<A: crate::Arch>(
+fn vbe_palette<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut DosState<A>,
@@ -468,7 +468,7 @@ fn vbe_palette<A: crate::Arch>(
 /// VBE 4F00h — controller info into ES:DI, with VideoModePtr naming stable
 /// personality-owned low memory. The list must outlive and not alias this
 /// output block: clients routinely reuse the block for subsequent 4F01h calls.
-fn vbe_controller_info<A: crate::Arch>(
+fn vbe_controller_info<A: crate::Core>(
     machine: &mut A,
     dos: &DosState<A>,
     regs: &mut Regs,
@@ -510,7 +510,7 @@ fn vbe_controller_info<A: crate::Arch>(
 /// modes retain only validated geometry, pitch, pixel format and apertures;
 /// vendor identity, executable pointers and private controller fields never
 /// cross out of the firmware workspace.
-fn synthetic_vbe_mode_info<A: crate::Arch>(
+fn synthetic_vbe_mode_info<A: crate::Core>(
     machine: &mut A,
     dos: &DosState<A>,
     regs: &mut Regs,
@@ -619,7 +619,7 @@ fn emulated_vbe_display_start(pc: &mut machine::PcMachine, regs: &mut Regs) -> b
     }
 }
 
-fn vbe_scan_line<A: crate::Arch>(
+fn vbe_scan_line<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut DosState<A>,
@@ -645,7 +645,7 @@ fn vbe_scan_line<A: crate::Arch>(
 
 /// VBE 4F02h — set mode (BX). The substitute exposes both the bank window and
 /// its RAM-backed PhysBasePtr; native firmware receives the request unchanged.
-fn vbe_set_mode<A: crate::Arch>(
+fn vbe_set_mode<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut DosState<A>,
@@ -682,7 +682,7 @@ fn vbe_set_mode<A: crate::Arch>(
 }
 
 /// VBE 4F05h — window control. BH=0 set / 1 get; BL=window (we only do A); DX=bank.
-pub(in crate::kernel::dos) fn vbe_window<A: crate::Arch>(
+pub(in crate::kernel::dos) fn vbe_window<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut DosState<A>,

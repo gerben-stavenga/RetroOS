@@ -1,5 +1,5 @@
 //! Kernel cache storage. Contents are physical frames; only ownership and
-//! indexes occupy permanent kernel address space. Arch supplies mechanisms.
+//! indexes occupy permanent kernel address space. Core supplies mechanisms.
 use alloc::boxed::Box;
 use spin::Once;
 

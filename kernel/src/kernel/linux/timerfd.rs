@@ -11,7 +11,7 @@ const SECOND: u64 = 1_000_000_000;
 
 pub(super) struct Timer {
     realtime: bool,
-    /// First unread expiry, in `Arch::now` nanoseconds.
+    /// First unread expiry, in `Core::now` nanoseconds.
     expiry: Option<u64>,
     interval: u64,
     pub(super) nonblocking: bool,
@@ -82,7 +82,7 @@ impl Timer {
 }
 
 /// Read a struct itimerspec { it_interval, it_value }.
-pub(super) fn read_spec<A: crate::Arch>(machine: &mut A, address: u64) -> Result<Spec, i32> {
+pub(super) fn read_spec<A: crate::Core>(machine: &mut A, address: u64) -> Result<Spec, i32> {
     let mut bytes = [0; 32];
     if !high_memory::copy_from(machine, address, &mut bytes) { return Err(-EFAULT); }
     let half = |at: usize| {
@@ -93,7 +93,7 @@ pub(super) fn read_spec<A: crate::Arch>(machine: &mut A, address: u64) -> Result
     };
     Ok((half(0)?, half(16)?))
 }
-pub(super) fn write_spec<A: crate::Arch>(machine: &mut A, address: u64, (interval, value): Spec) -> bool {
+pub(super) fn write_spec<A: crate::Core>(machine: &mut A, address: u64, (interval, value): Spec) -> bool {
     let mut bytes = [0; 32];
     for (at, ns) in [(0, interval), (16, value)] {
         bytes[at..at + 8].copy_from_slice(&(ns / SECOND).to_le_bytes());

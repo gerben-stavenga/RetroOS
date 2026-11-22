@@ -121,7 +121,7 @@ pub(super) fn exec(state: &State, parent: i32, process: i32) -> State {
         state.locals.get(&parent).map_or(0, |local| local.mask);
     copy
 }
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     kt: &thread::KernelThread<A>,
     linux: &mut LinuxState,
@@ -231,7 +231,7 @@ pub(super) fn call<A: crate::Arch>(
     SyscallResult::val(result)
 }
 
-pub(super) fn deliver_fault<A: crate::Arch>(
+pub(super) fn deliver_fault<A: crate::Core>(
     machine: &mut A,
     linux: &mut LinuxState,
     process: i32,
@@ -268,7 +268,7 @@ pub(super) fn disposition(linux: &LinuxState, tid: i32, signal: usize) -> Option
     Some(linux.signals.actions[signal].handler == 1)
 }
 
-pub(super) fn deliver<A: crate::Arch>(
+pub(super) fn deliver<A: crate::Core>(
     machine: &mut A,
     linux: &mut LinuxState,
     process: i32,
@@ -281,7 +281,7 @@ pub(super) fn deliver<A: crate::Arch>(
 }
 
 /// `status` is siginfo's si_status slot (offset 24); only SIGCHLD sets it.
-fn deliver_frame<A: crate::Arch>(
+fn deliver_frame<A: crate::Core>(
     machine: &mut A,
     linux: &mut LinuxState,
     process: i32,
@@ -409,7 +409,7 @@ fn deliver_frame<A: crate::Arch>(
     true
 }
 
-pub(super) fn deliver_child_exit<A: crate::Arch>(
+pub(super) fn deliver_child_exit<A: crate::Core>(
     machine: &mut A, linux: &mut LinuxState, process: i32, regs: &mut Regs,
     child: i32, exit_code: i32,
 ) -> bool {
@@ -418,7 +418,7 @@ pub(super) fn deliver_child_exit<A: crate::Arch>(
     deliver_frame(machine, linux, process, regs, 17, if signaled { 2 } else { 1 }, child as u64, status)
 }
 
-fn restore<A: crate::Arch>(
+fn restore<A: crate::Core>(
     machine: &mut A,
     state: &mut State,
     tid: i32,

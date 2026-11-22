@@ -28,7 +28,9 @@ mod imp {
 
 #[cfg(feature = "kvm")]
 mod imp {
-    pub use crate::kvm::execute;
+    pub fn execute(_core: &mut crate::Interp, max_time: core::time::Duration) -> arch_abi::KernelEvent {
+        crate::kvm::execute(max_time)
+    }
 }
 
 pub(crate) use imp::*;

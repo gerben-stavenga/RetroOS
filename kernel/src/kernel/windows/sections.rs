@@ -12,7 +12,7 @@ pub(super) struct State {
     handles: Vec<Option<Arc<Section>>>,
     views: Vec<(u32, u32, Arc<Section>)>,
 }
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     state: &mut WindowsState,

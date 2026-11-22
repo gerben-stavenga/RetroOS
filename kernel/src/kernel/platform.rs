@@ -214,6 +214,7 @@ pub struct ProbedPlatform {
 pub enum AudioToken {
     Hda(&'static mut crate::kernel::drivers::hda::Hda),
     Ac97(&'static mut crate::kernel::drivers::ac97::Ac97),
+    Host(crate::kernel::sound::HostDevice),
     None,
 }
 
@@ -240,6 +241,8 @@ pub enum AudioHw {
     Hda,
     /// An AC'97 codec on PCI.
     Ac97,
+    /// The executable supplied a host PCM output.
+    Host,
     /// A backend installed a sink behind the canonical port window (hosted).
     PortWindow,
     /// Nothing answered.
@@ -256,6 +259,7 @@ impl AudioHw {
             AudioHw::Sb => Audio::NativeSb,
             AudioHw::Hda => Audio::EmulatedHda,
             AudioHw::Ac97 => Audio::EmulatedAc97,
+            AudioHw::Host => Audio::EmulatedHost,
             AudioHw::PortWindow => Audio::EmulatedPortWindow,
             AudioHw::None => Audio::EmulatedSilent,
         }
@@ -290,6 +294,8 @@ pub enum Audio {
     /// No card or codec; rendering goes to the canonical audio port window
     /// (the interpreter's WAV sink answered the signature probe).
     EmulatedPortWindow,
+    /// Emulated devices mixed into the host PCM output.
+    EmulatedHost,
     /// Nothing answers. Emulation still satisfies device detection (games
     /// configure and run); playback is dropped.
     EmulatedSilent,
@@ -302,6 +308,7 @@ impl Audio {
             Self::SbSink => "SbSink",
             Self::EmulatedHda => "EmulatedHda",
             Self::EmulatedAc97 => "EmulatedAc97",
+            Self::EmulatedHost => "EmulatedHost",
             Self::EmulatedPortWindow => "EmulatedPortWindow",
             Self::EmulatedSilent => "EmulatedSilent",
         }
@@ -378,7 +385,7 @@ static mut PLATFORM: Option<Platform> = None;
 /// Probe the machine and freeze the result. Called exactly once, early in
 /// `startup` — after the heap, before threading (still single-threaded, so
 /// the write-once static needs no lock).
-pub fn probe<A: crate::Arch>(
+pub fn probe<A: crate::Core>(
     machine: &mut A,
     boot: &crate::BootConfig,
 ) -> ProbedPlatform {
@@ -505,7 +512,7 @@ pub fn probe<A: crate::Arch>(
 /// pre-SB16 card's are physical jumpers that only `SB_AUDIO=native <irq> <dma>`
 /// can describe. The capability is returned to the caller to give to an owner;
 /// `None` means no card anyone can drive, whatever the mode says.
-pub fn apply_audio_mode<A: crate::Arch>(
+pub fn apply_audio_mode<A: crate::Core>(
     machine: &mut A,
     mixed: bool,
     declared: Option<crate::kernel::drivers::sb16::SbWiring>,
@@ -644,7 +651,10 @@ pub fn get() -> &'static Platform {
 /// Probe audio once. PCI drivers return their initialized capability together
 /// with the fact recorded in `Platform`; SB presence is separate because its
 /// wiring and ownership policy cannot be settled until RETROOS.INI is mounted.
-fn probe_audio<A: crate::Arch>(machine: &mut A) -> (AudioHw, AudioToken) {
+fn probe_audio<A: crate::Core>(machine: &mut A) -> (AudioHw, AudioToken) {
+    if let Some(device) = crate::kernel::sound::take_host_output() {
+        return (AudioHw::Host, AudioToken::Host(device));
+    }
     // Defer all Sound Blaster probing until RETROOS.INI is available, so
     // ISA PnP discovery precedes the legacy DSP sweep in apply_audio_mode.
     if let Some(device) = crate::kernel::drivers::hda::probe(machine) {
@@ -835,27 +845,20 @@ pub(crate) fn write_physical_frame(page: u64, offset: usize, bytes: &[u8]) {
 
 static FRAME_OWNERSHIP: spin::Once<FrameOwnership> = spin::Once::new();
 
-pub(crate) fn init_frame_ownership(layout: &'static FrameLayout, zero_page: u64) -> FrameOwnership {
+/// Start the frame pool, graduate to its full bitmap, then provision arch's
+/// resident reference tracking. The kernel heap must be ready to grow.
+pub fn init_memory(
+    layout: &'static FrameLayout,
+    occupied: &[core::ops::Range<u64>],
+    zero_page: u64,
+) -> FrameOwnership {
+    super::phys_mm::bootstrap(layout, occupied).finish();
     *FRAME_OWNERSHIP.call_once(|| {
         let storage = FrameOwnership::storage_layout(layout.frame_count());
         let counts = unsafe { alloc::alloc::alloc_zeroed(storage) };
         assert!(!counts.is_null(), "cannot allocate resident frame references");
         unsafe { FrameOwnership::from_layout(layout, counts, zero_page) }
     })
-}
-
-/// Install the permanent hosted RAM view and its frame metadata.
-///
-/// # Safety
-/// The page-aligned RAM mapping must remain writable for the kernel's lifetime.
-#[cfg(not(target_arch = "x86"))]
-pub unsafe fn init_host_ram(
-    base: *mut u8,
-    bytes: usize,
-    layout: &'static FrameLayout,
-) -> FrameOwnership {
-    unsafe { super::phys_mm::init_direct_ram(base, bytes, layout); }
-    init_frame_ownership(layout, u64::MAX)
 }
 
 /// Drop one reference through arch. True transfers the exclusive frame back

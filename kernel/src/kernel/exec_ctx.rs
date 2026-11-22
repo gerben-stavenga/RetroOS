@@ -1,7 +1,7 @@
 //! The event loop's current thread and live register frame.
 //!
 //! Switching materializes the old thread and resumes the new one. The event
-//! loop calls `Arch::execute` itself; this context only holds registers and
+//! loop calls `Core::execute` itself; this context only holds registers and
 //! caches the personality's I/O policy. Display focus is managed separately.
 
 use crate::kernel::thread;
@@ -10,11 +10,11 @@ use crate::kernel::thread;
 /// (expensive; bring-up diagnostics).
 const ASSERT_ADDR_HASH: bool = false;
 
-pub struct ExecutionContext<A: crate::Arch> {
+pub struct ExecutionContext<A: crate::Core> {
     pub tid: usize,
     /// The running thread's REGISTERS (loop-owned, disjoint from the threads
     /// array). Its ADDRESS SPACE is not here — it lives in the backend as the
-    /// single active space ([`crate::Arch::activate`]); guest memory is reached
+    /// single active space ([`crate::Core::activate`]); guest memory is reached
     /// through `machine`. `PhantomData` keeps `A` in the type.
     pub regs: crate::Regs,
     pub device_cycles: u64,
@@ -23,7 +23,7 @@ pub struct ExecutionContext<A: crate::Arch> {
     _a: core::marker::PhantomData<A>,
 }
 
-impl<A: crate::Arch> ExecutionContext<A> {
+impl<A: crate::Core> ExecutionContext<A> {
     /// Seed the loan from the first thread: take its registers into the loan.
     ///
     /// It does NOT `activate` the thread's space. The first thread runs on the
@@ -96,7 +96,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
 
 /// Verify that saved CPU state still matches the hash recorded on the last
 /// switch-out. Print a diff-style dump on mismatch.
-pub(crate) fn verify_kernel_cpu_hash<A: crate::Arch>(k: &thread::KernelThread<A>, tag: &str) {
+pub(crate) fn verify_kernel_cpu_hash<A: crate::Core>(k: &thread::KernelThread<A>, tag: &str) {
     if k.cpu_hash == 0 { return; }
     let actual = thread::hash_regs(&k.vcpu.regs);
     if actual == k.cpu_hash { return; }

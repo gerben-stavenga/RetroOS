@@ -68,7 +68,7 @@ fn open(name: Vec<u16>, flags: u32, kind: u32, create: impl FnOnce() -> Result<V
 }
 fn fold(c: u16) -> u16 { if (65..=90).contains(&c) { c + 32 } else { c } }
 fn path(text: &str) -> Vec<u16> { text.encode_utf16().collect() }
-fn attributes<A: crate::Arch>(machine: &A, state: &State, address: u32) -> Result<(Vec<u16>, u32), u32> {
+fn attributes<A: crate::Core>(machine: &A, state: &State, address: u32) -> Result<(Vec<u16>, u32), u32> {
     if address == 0 { return Ok((Vec::new(), 0)); }
     if machine.read::<u32>(address as u64) != 24 { return Err(INVALID); }
     let root = machine.read::<u32>((address as usize + 4) as u64);
@@ -104,17 +104,17 @@ pub(super) fn ready(state: &State, handle: u32, id: u32, consume: bool) -> Optio
         _ => return None,
     })
 }
-pub(super) fn release<A: crate::Arch>(machine: &mut A, state: &mut WindowsState) {
+pub(super) fn release<A: crate::Core>(machine: &mut A, state: &mut WindowsState) {
     let views = core::mem::take(&mut state.threads.named.views);
     for (base, object) in views {
         memory::call(machine, state, Api::MemoryRelease, base, 0, 1); drop(object);
     }
     state.threads.named.handles.clear(); collect();
 }
-pub(super) fn call<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32; 6]) -> u32 {
+pub(super) fn call<A: crate::Core>(machine: &mut A, state: &mut WindowsState, args: [u32; 6]) -> u32 {
     let result = execute(machine, state, args); collect(); result.unwrap_or_else(|s|s)
 }
-fn execute<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, args: [u32; 6]) -> Result<u32,u32> {
+fn execute<A: crate::Core>(machine: &mut A, state: &mut WindowsState, args: [u32; 6]) -> Result<u32,u32> {
     let [op, handle, a, b, c, out] = args;
     let _serial = WAIT_LOCK.lock();
     let id = machine.read::<u32>((state.teb_base + 0x24) as u64);

@@ -19,7 +19,7 @@ pub enum Storage {
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
 /// Each phase is a named function below; this stays short enough to read as
 /// the boot story. Called from enter_ring1 — we are already at ring 1.
-pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig,
+pub fn startup<A: crate::Core>(machine: &mut A, boot: &crate::BootConfig,
     storage: Storage) -> ! {
     let mut state = core::mem::MaybeUninit::<StartupState<A>>::uninit();
     prepare_startup(machine, boot, storage, &mut state);
@@ -46,7 +46,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig,
     )
 }
 
-struct StartupState<A: crate::Arch> {
+struct StartupState<A: crate::Core> {
     master_env: alloc::vec::Vec<u8>,
     bios_workspace: crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos_template: crate::kernel::dos::DosTemplate<A>,
@@ -60,7 +60,7 @@ struct StartupState<A: crate::Arch> {
 /// the caller's one persistent state slot.  This call boundary lets probe and
 /// formatting temporaries leave the stack before the non-returning flow.
 #[inline(never)]
-fn prepare_startup<A: crate::Arch>(
+fn prepare_startup<A: crate::Core>(
     machine: &mut A,
     boot: &crate::BootConfig,
     storage: Storage,
@@ -164,7 +164,7 @@ struct PreparedAudio {
 /// Resolve audio policy and transfer each hardware capability to its runtime
 /// owner before the first guest starts.
 #[inline(never)]
-fn prepare_audio<A: crate::Arch>(
+fn prepare_audio<A: crate::Core>(
     machine: &mut A,
     boot: &crate::BootConfig,
     audio: crate::kernel::platform::AudioToken,
@@ -369,7 +369,7 @@ fn configure_config_serial(boot: &crate::BootConfig, master_env: &[u8]) {
 /// line, or fw_cfg `opt/mcp`) wins over RETROOS.INI `MCP=`. The port must not
 /// share the ambient log UART: the stream may contain arbitrary
 /// bytes.
-fn configure_serial_control<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[u8]) {
+fn configure_serial_control<A: crate::Core>(machine: &mut A, boot: &crate::BootConfig, master_env: &[u8]) {
     if let Some(port) = boot.mcp_port {
         start_serial_control(machine, boot, master_env, port);
         return;
@@ -393,7 +393,7 @@ fn config_serial_port(master_env: &[u8]) -> Option<arch_abi::ComPort> {
         .and_then(arch_abi::ComPort::parse_ascii)
 }
 
-fn start_serial_control<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[u8], port: arch_abi::ComPort) {
+fn start_serial_control<A: crate::Core>(machine: &mut A, boot: &crate::BootConfig, master_env: &[u8], port: arch_abi::ComPort) {
     if boot.serial_console_port == Some(port)
         || config_serial_port(master_env) == Some(port)
     {
@@ -409,7 +409,7 @@ fn start_serial_control<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfi
 
 /// Freeze the machine facts before any subsystem derives policy from them.
 #[inline(never)]
-fn discover_platform<A: crate::Arch>(
+fn discover_platform<A: crate::Core>(
     machine: &mut A,
     boot: &crate::BootConfig,
 ) -> crate::kernel::platform::ProbedPlatform {
@@ -419,7 +419,7 @@ fn discover_platform<A: crate::Arch>(
 /// Consume the probed display capability and leave the persistent BIOS
 /// workspace in the caller's final slot.
 #[inline(never)]
-fn select_display<A: crate::Arch>(
+fn select_display<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: crate::kernel::display::Display,
@@ -447,7 +447,7 @@ fn select_display<A: crate::Arch>(
 }
 
 #[inline(never)]
-fn load_midi_bank<A: crate::Arch>(
+fn load_midi_bank<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     screen: &mut crate::kernel::console::Console,
@@ -500,7 +500,7 @@ struct BootMounts {
 /// Establish the complete mount namespace. Disk and partition discovery are
 /// boot temporaries and are dropped before audio and guest construction.
 #[inline(never)]
-fn prepare_storage<A: crate::Arch>(
+fn prepare_storage<A: crate::Core>(
     machine: &mut A,
     boot: &crate::BootConfig,
     disks: alloc::vec::Vec<&'static dyn crate::kernel::block::Disk>,
@@ -829,7 +829,7 @@ mod launch_directive_tests {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run<A: crate::Arch>(
+fn run<A: crate::Core>(
     machine: &mut A,
     boot: &crate::BootConfig,
     master_env: &[u8],
@@ -985,7 +985,7 @@ fn run<A: crate::Arch>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_program_with_screen<A: crate::Arch>(
+fn run_program_with_screen<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos_template: &mut crate::kernel::dos::DosTemplate<A>,
@@ -1032,7 +1032,7 @@ fn run_program_with_screen<A: crate::Arch>(
 /// through the DOS VM86 loader. `cmdline_tail`/`env` apply only to the DOS
 /// path (PSP:0080h cmdline + environment).
 #[allow(clippy::too_many_arguments)]
-fn run_program<A: crate::Arch>(
+fn run_program<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos_template: &mut crate::kernel::dos::DosTemplate<A>,
@@ -1069,7 +1069,7 @@ fn run_program<A: crate::Arch>(
 /// are gone before the event loop is entered.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn prepare_program<A: crate::Arch>(
+fn prepare_program<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos_template: &mut crate::kernel::dos::DosTemplate<A>,
@@ -1216,7 +1216,7 @@ fn prepare_program<A: crate::Arch>(
 /// the shared console pipe, stdout/stderr go to the console — mirroring the
 /// hosted bare-ELF path (`host_run_elf`). The fresh empty address space is
 /// already clean, so the ELF loader can write straight into it.
-fn launch_elf<A: crate::Arch>(
+fn launch_elf<A: crate::Core>(
     machine: &mut A,
     threads: &mut thread::ThreadTable<A>,
     buf: crate::kernel::exec::ExecutableImage,
@@ -1226,7 +1226,7 @@ fn launch_elf<A: crate::Arch>(
 ) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
-        let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
+        let t = thread::create_thread(threads, machine, None, A::AddressSpace::default(), true)
             .expect("create ELF thread");
         t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
         t.kernel.fds[1] = thread::FdKind::ConsoleOut;
@@ -1254,7 +1254,7 @@ fn launch_elf<A: crate::Arch>(
 }
 
 /// Launch a native 32-bit OS/2 LX image as a fresh process.
-fn launch_os2<A: crate::Arch>(
+fn launch_os2<A: crate::Core>(
     machine: &mut A,
     threads: &mut thread::ThreadTable<A>,
     buf: alloc::vec::Vec<u8>,
@@ -1265,7 +1265,7 @@ fn launch_os2<A: crate::Arch>(
 ) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
-        let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
+        let t = thread::create_thread(threads, machine, None, A::AddressSpace::default(), true)
             .expect("create OS/2 thread");
         t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
         t.kernel.fds[1] = thread::FdKind::ConsoleOut;
@@ -1286,7 +1286,7 @@ fn launch_os2<A: crate::Arch>(
 }
 
 /// Launch a native 32-bit Windows PE image as a fresh process.
-fn launch_windows<A: crate::Arch>(
+fn launch_windows<A: crate::Core>(
     machine: &mut A,
     threads: &mut thread::ThreadTable<A>,
     buf: alloc::vec::Vec<u8>,
@@ -1295,7 +1295,7 @@ fn launch_windows<A: crate::Arch>(
 ) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
-        let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
+        let t = thread::create_thread(threads, machine, None, A::AddressSpace::default(), true)
             .expect("create Windows thread");
         t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
         t.kernel.fds[1] = thread::FdKind::ConsoleOut;
@@ -1315,7 +1315,7 @@ fn launch_windows<A: crate::Arch>(
 }
 
 /// Launch a native 16-bit Windows NE image as a fresh process.
-fn launch_win16<A: crate::Arch>(
+fn launch_win16<A: crate::Core>(
     machine: &mut A,
     threads: &mut thread::ThreadTable<A>,
     buf: alloc::vec::Vec<u8>,
@@ -1325,7 +1325,7 @@ fn launch_win16<A: crate::Arch>(
 ) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
-        let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
+        let t = thread::create_thread(threads, machine, None, A::AddressSpace::default(), true)
             .expect("create Win16 thread");
         t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
         t.kernel.fds[1] = thread::FdKind::ConsoleOut;
@@ -1355,7 +1355,7 @@ fn launch_win16<A: crate::Arch>(
 /// moved together with execution by `switch_focus_and_run` for now). The
 /// loop's `display` is `Some` exactly while it is compositing Linux, OSD, or
 /// state-only DOS VGA; fullscreen DOS owns the output and leaves it `None`.
-fn present_desktop<A: crate::Arch>(
+fn present_desktop<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &thread::ThreadTable<A>,
@@ -1380,6 +1380,9 @@ fn present_desktop<A: crate::Arch>(
         canvas_height,
     );
     let osd_sample = crate::kernel::osd_profile::Sample::start(machine);
+    if crate::kernel::osd::is_open() {
+        crate::kernel::osd::set_display_output(display.output());
+    }
     windows.sync_osd(
         canvas_width,
         canvas_height,
@@ -1423,7 +1426,7 @@ fn present_desktop<A: crate::Arch>(
         presented);
 }
 
-fn event_loop<A: crate::Arch>(
+fn event_loop<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut thread::ThreadTable<A>,
@@ -1539,6 +1542,9 @@ fn event_loop<A: crate::Arch>(
         let serial_dump = crate::kernel::serial_control::poll(machine, events, injected_due, &mut stats);
         let osd_dump = DEBUG_DUMP_REQUESTED.swap(false, core::sync::atomic::Ordering::Relaxed);
         if serial_dump || osd_dump {
+            let focused = crate::kernel::focus::focused();
+            let target = crate::kernel::linux::console_kill_target(threads, focused);
+            crate::compact_dbg_println!("[DEBUG DUMP] current={} focused={} terminal_task={}", ctx.tid, focused, target);
             crate::kernel::linux::debug_processes(threads, ctx.tid);
             let thread = ctx.thread(threads);
             let dos = match &thread.personality {
@@ -1548,6 +1554,7 @@ fn event_loop<A: crate::Arch>(
                 | thread::Personality::Windows(_) => None,
             };
             dump_interrupted_thread(machine, &ctx.regs, dos);
+            if osd_dump { crate::kernel::klog::sync_live(); }
         }
         stats.part(machine, PROFILE_SERIAL_CONTROL);
         if network_due {
@@ -1837,6 +1844,21 @@ fn event_loop<A: crate::Arch>(
         }
         stats.part(machine, PROFILE_INPUT);
 
+        let kill = crate::kernel::osd::take_kill_request()
+            .map(|focused| crate::kernel::linux::console_kill_target(threads, focused))
+            .filter(|&tid| {
+            threads.get(tid).is_some_and(|task| matches!(task.kernel.state,
+                thread::ThreadState::Ready | thread::ThreadState::Running
+                | thread::ThreadState::Blocked | thread::ThreadState::OnCpu))
+                && !crate::kernel::sched::vfork_suspended(threads, tid)
+        });
+        if let Some(tid) = kill
+            && tid != ctx.tid
+        {
+            switch_focus_and_run(machine, &mut *bios_workspace, threads, &mut ctx, tid,
+                &mut exiting_display, &mut sb_handoff, &mut display, &mut windows);
+        }
+
         let deadline_sample = super::event_profile::FileIoScope::start(super::event_profile::LOOP_DEADLINES, 0);
         let mut deadlines = Deadlines::new(world_now_ns);
         deadlines.include(Some(writeback.deadline()));
@@ -1860,15 +1882,17 @@ fn event_loop<A: crate::Arch>(
         }
         if blocked_polling { deadlines.include(Some(blocked_io_service.deadline())); }
         drop(deadline_sample);
-        if deadlines.immediate() { continue; }
+        if kill.is_none() && deadlines.immediate() { continue; }
 
-        if let Some(next) = crate::kernel::parallel::Parallel::pending(threads, ctx.tid) {
+        if kill.is_none()
+            && let Some(next) = crate::kernel::parallel::Parallel::pending(threads, ctx.tid)
+        {
             switch_focus_and_run(machine, &mut *bios_workspace, threads, &mut ctx, next,
                 &mut exiting_display, &mut sb_handoff, &mut display, &mut windows);
             continue;
         }
 
-        if threads[ctx.tid].kernel.pending_event.is_none() && quantum_due {
+        if kill.is_none() && threads[ctx.tid].kernel.pending_event.is_none() && quantum_due {
             // Draining a parallel batch can span the quantum boundary. Keep
             // that request until pending events are dispatched, or ready
             // peers that did not fit in the batch can starve indefinitely.
@@ -1882,7 +1906,7 @@ fn event_loop<A: crate::Arch>(
 
         // A blocked thread holds the console but not the CPU: wait for input
         // to unblock it (above) or the F12 window picker to move on.
-        if threads[ctx.tid].kernel.state == thread::ThreadState::Blocked {
+        if kill.is_none() && threads[ctx.tid].kernel.state == thread::ThreadState::Blocked {
             let dependency_wait = match &threads[ctx.tid].personality {
                 thread::Personality::Linux(linux) => linux.waits_for_record_lock(),
                 thread::Personality::Windows(windows) => windows.waits_for_child(),
@@ -1912,7 +1936,7 @@ fn event_loop<A: crate::Arch>(
 
         // Keep servicing input, audio and real-time virtual devices while a
         // DOS client's explicit CPU duty limit delays its next guest slice.
-        let paced = matches!(&threads[ctx.tid].personality, thread::Personality::Dos(dos)
+        let paced = kill.is_none() && matches!(&threads[ctx.tid].personality, thread::Personality::Dos(dos)
             if dos.cpu_pacer.limited());
         let run_started = if paced {
             let now = world_now_ns;
@@ -1936,6 +1960,15 @@ fn event_loop<A: crate::Arch>(
         let loan_deadline = deadlines.next();
         let mut scheduled = false;
         let (action, hide_window, old_endpoint) = loop {
+            if kill.is_some() {
+                let target = ctx.thread(threads);
+                // DOS critical termination restores the parent's pre-child
+                // VGA state. Other personalities receive the SIGKILL status.
+                let code = if matches!(target.personality, thread::Personality::Dos(_)) {
+                    0x0200
+                } else { -9 };
+                break (thread::KernelAction::Exit(code), false, target.window_endpoint());
+            }
             stats.pre_run(machine, &ctx.regs);
             let event_sample = super::event_profile::Sample::start(machine);
             ctx.device_cycles = 0;
@@ -2107,7 +2140,7 @@ fn event_loop<A: crate::Arch>(
     }
 }
 
-fn apply_sound_mode_request<A: crate::Arch>(
+fn apply_sound_mode_request<A: crate::Core>(
     machine: &mut A,
     threads: &mut thread::ThreadTable<A>,
     tid: usize,
@@ -2220,7 +2253,7 @@ fn apply_sound_mode_request<A: crate::Arch>(
     }
 }
 
-fn try_sound_view<A: crate::Arch>(
+fn try_sound_view<A: crate::Core>(
     audio: &crate::kernel::media::AudioService<crate::kernel::sound::Engine>,
     handoff: Option<&crate::kernel::drivers::sb16::Sb16>,
     personality: Option<&thread::Personality<A>>,
@@ -2263,7 +2296,7 @@ fn sound_view(
                 Audio::NativeSb if sink.is_some_and(crate::kernel::sound::Sink::is_hda) =>
                     SoundView::KernelHda { can_native: false, can_sb: false },
                 Audio::EmulatedAc97 => SoundView::KernelAc97,
-                Audio::EmulatedPortWindow => SoundView::KernelHost,
+                Audio::EmulatedPortWindow | Audio::EmulatedHost => SoundView::KernelHost,
                 Audio::EmulatedSilent => SoundView::KernelSilent,
                 Audio::NativeSb | Audio::SbSink => SoundView::KernelSilent,
             },
@@ -2275,7 +2308,7 @@ fn sound_view(
 /// is the Windows stack just below 0xBFF00000. Stops at the first link that
 /// leaves the mapped stack or jumps by more than 64 KiB, so a garbage frame
 /// pointer is not chased into an unmapped page.
-fn dump_fault_stack<A: crate::Arch>(machine: &A, regs: &Regs) {
+fn dump_fault_stack<A: crate::Core>(machine: &A, regs: &Regs) {
     let rsp = regs.frame.rsp as u32;
     if !(0xbf00_0000..0xbff0_0000).contains(&rsp) {
         return;
@@ -2322,30 +2355,13 @@ fn dump_fault_stack<A: crate::Arch>(machine: &A, regs: &Regs) {
 /// and `signal_thread` wants the whole `Thread` for its diagnostics;
 /// everything else is the personality's call.
 #[inline(never)]
-fn dispatch<A: crate::Arch>(
+fn dispatch<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     thread: &mut thread::Thread<A>,
     regs: &mut Regs,
     kevent: crate::KernelEvent,
 ) -> thread::KernelAction {
-    // The F12 monitor's Kill acts on the focused thread — which, under today's
-    // focus/execution coupling, is exactly this one. Turn it into an ordinary
-    // Exit so `exit_thread` does all teardown and hands focus back to the
-    // parent, the same path SEGV takes below.
-    if crate::kernel::osd::take_kill_request() {
-        // DOS exit type decides the VGA return contract: normal termination
-        // transfers the live adapter, while type 02h restores the parent's
-        // pre-child recovery image. Preserve Unix status for Linux, but encode
-        // an OSD kill as DOS critical termination.
-        let code = match thread.personality {
-            thread::Personality::Dos(_) => 0x0200,
-            thread::Personality::Linux(_)
-            | thread::Personality::Os2(_)
-            | thread::Personality::Windows(_) => -9,
-        };
-        return thread::KernelAction::Exit(code);
-    }
     if let crate::KernelEvent::PageFault { addr } = kevent {
         // A VGA planar-trap access (A0000 unmapped while unchained graphics
         // needs the write/read planar logic) is emulated here on hosted
@@ -2420,7 +2436,7 @@ fn dispatch<A: crate::Arch>(
 /// the incoming parent is marked to adopt that still-live adapter; on an
 /// error or ordinary background switch it restores its detached snapshot.
 #[allow(clippy::too_many_arguments)]
-fn switch_focus_and_run<A: crate::Arch>(
+fn switch_focus_and_run<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut thread::ThreadTable<A>,
@@ -2604,7 +2620,7 @@ fn switch_focus_and_run<A: crate::Arch>(
     *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
 }
 
-fn select_window_for_thread<A: crate::Arch>(windows: &mut crate::kernel::gui::WindowManager, thread: &thread::Thread<A>) {
+fn select_window_for_thread<A: crate::Core>(windows: &mut crate::kernel::gui::WindowManager, thread: &thread::Thread<A>) {
     if matches!(thread.personality, thread::Personality::Linux(_)) {
         crate::kernel::linux::foreground_console(thread.kernel.tid as usize);
     }
@@ -2612,7 +2628,7 @@ fn select_window_for_thread<A: crate::Arch>(windows: &mut crate::kernel::gui::Wi
     windows.select_window(window);
 }
 
-fn apply_current_presentation<A: crate::Arch>(
+fn apply_current_presentation<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     personality: &mut thread::Personality<A>,
@@ -2636,7 +2652,7 @@ fn apply_current_presentation<A: crate::Arch>(
 /// Blocks parent, returns child tid on success, None on error (caller stays on parent).
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-pub(crate) fn handle_fork_exec<A: crate::Arch>(
+pub(crate) fn handle_fork_exec<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut thread::ThreadTable<A>,
@@ -3144,7 +3160,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
 ///
 /// `dos` (when present) adds virtual PIC/PIT state — useful for diagnosing
 /// stuck IRQ delivery (e.g. an in-service bit never cleared by a missed EOI).
-pub fn arch_dump_exception<A: crate::Arch>(
+pub fn arch_dump_exception<A: crate::Core>(
     machine: &mut A,
     dos: &thread::DosState<A>,
     regs: &Regs,
@@ -3159,7 +3175,7 @@ pub(crate) fn request_debug_dump() {
     DEBUG_DUMP_REQUESTED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
+pub(crate) fn dump_interrupted_thread<A: crate::Core>(
     machine: &mut A,
     regs: &Regs,
     dos: Option<&thread::DosState<A>>,
@@ -3325,7 +3341,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
 /// so hangs that look like "timer stopped" usually show up as a stuck in-
 /// service bit (a higher-priority pending line is blocked by it) or a
 /// requested-but-masked line.
-fn dump_virtual_hw<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>) {
+fn dump_virtual_hw<A: crate::Core>(machine: &mut A, dos: &thread::DosState<A>) {
     let (mirr, misr, mimr, sirr, sisr, simr) = dos.pc.vpic.debug_state();
     crate::compact_dbg_println!(
         "[DBG] vpic master irr={:#04x} isr={:#04x} imr={:#04x}  slave irr={:#04x} isr={:#04x} imr={:#04x}",
@@ -3615,24 +3631,24 @@ impl EventStats {
 
     /// Called by the event-loop control handler, before changing recording
     /// state. Publish the current boundary, not last iteration's snapshot.
-    pub(super) fn control_checkpoint(&mut self, machine: &mut impl crate::Arch) {
+    pub(super) fn control_checkpoint(&mut self, machine: &mut impl crate::Core) {
         if !self.active { return; }
         self.mark(machine, PROFILE_SERIAL_CONTROL);
         let totals = self.totals(machine.now().saturating_sub(self.started_ns));
         unsafe { core::ptr::write_volatile(&raw mut PROFILE_TOTALS, totals); }
     }
 
-    pub(super) fn control_start(&mut self, machine: &mut impl crate::Arch) {
+    pub(super) fn control_start(&mut self, machine: &mut impl crate::Core) {
         self.active = false;
         self.slice_begin(machine);
     }
 
-    pub(super) fn control_stop(&mut self, machine: &mut impl crate::Arch) {
+    pub(super) fn control_stop(&mut self, machine: &mut impl crate::Core) {
         self.control_checkpoint(machine);
         self.active = false;
     }
 
-    fn new<A: crate::Arch>(_machine: &mut A) -> Self {
+    fn new<A: crate::Core>(_machine: &mut A) -> Self {
         let now = crate::kernel::event_profile::cycles();
         Self {
             active: false,
@@ -3647,7 +3663,7 @@ impl EventStats {
 
     /// Start an iteration and charge everything after the prior dispatch to
     /// scheduler/control. The disabled path performs no timestamp read.
-    fn slice_begin<A: crate::Arch>(&mut self, machine: &mut A) {
+    fn slice_begin<A: crate::Core>(&mut self, machine: &mut A) {
         if !profile_enabled() {
             self.active = false;
             return;
@@ -3683,7 +3699,7 @@ impl EventStats {
             stopped_ns: self.started_ns.saturating_add(elapsed_ns), cycles }
     }
 
-    fn idle<A: crate::Arch>(&mut self, machine: &mut A, deadline: Option<u64>) {
+    fn idle<A: crate::Core>(&mut self, machine: &mut A, deadline: Option<u64>) {
         let max_time = core::time::Duration::from_nanos(deadline.map_or(1_000_000, |end| end.saturating_sub(machine.now())).min(1_000_000));
         if !self.active { machine.idle(max_time); return; }
         let start = crate::kernel::event_profile::cycles();
@@ -3691,7 +3707,7 @@ impl EventStats {
         self.idle_cycles = self.idle_cycles.wrapping_add(crate::kernel::event_profile::cycles().wrapping_sub(start));
     }
 
-    fn mark<A: crate::Arch>(&mut self, _machine: &mut A, bucket: usize) {
+    fn mark<A: crate::Core>(&mut self, _machine: &mut A, bucket: usize) {
         if !self.active {
             return;
         }
@@ -3705,15 +3721,15 @@ impl EventStats {
         self.last_tsc = now;
     }
 
-    fn part<A: crate::Arch>(&mut self, machine: &mut A, bucket: usize) {
+    fn part<A: crate::Core>(&mut self, machine: &mut A, bucket: usize) {
         self.mark(machine, bucket);
     }
 
-    fn pre_run<A: crate::Arch>(&mut self, machine: &mut A, _regs: &Regs) {
+    fn pre_run<A: crate::Core>(&mut self, machine: &mut A, _regs: &Regs) {
         self.mark(machine, PROFILE_LOOP);
     }
 
-    fn post_run<A: crate::Arch>(
+    fn post_run<A: crate::Core>(
         &mut self,
         _machine: &mut A,
         _event: &crate::KernelEvent,
@@ -3738,7 +3754,7 @@ impl EventStats {
         }
     }
 
-    fn after_dispatch<A: crate::Arch>(&mut self, machine: &mut A) {
+    fn after_dispatch<A: crate::Core>(&mut self, machine: &mut A) {
         self.mark(machine, PROFILE_DISPATCH);
     }
 

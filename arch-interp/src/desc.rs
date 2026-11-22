@@ -203,3 +203,13 @@ pub fn seg_is_32(sel: u16) -> bool {
         }
     })
 }
+
+
+pub(crate) fn seg_limit(sel: u16) -> u32 {
+    if sel & 4 == 0 { return u32::MAX; }
+    DESC.with(|desc| {
+        let Some(entry) = desc.borrow().ldt_desc(usize::from(sel >> 3)) else { return 0 };
+        let limit = (entry as u32 & 65535) | ((entry >> 32) as u32 & 0x000f_0000);
+        if entry & (1 << 55) != 0 { (limit << 12) | 4095 } else { limit }
+    })
+}

@@ -440,7 +440,7 @@ fn path_conn(path: &OutputPath, i: usize) -> u8 {
 /// Find and initialize the preferred usable HDA controller. Real laptops often
 /// expose GPU HDMI before their analog codec, so candidates are ranked and
 /// tried in order rather than accepting the first PCI class match.
-pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<&'static mut Hda> {
+pub fn probe<A: crate::Core>(machine: &mut A) -> Option<&'static mut Hda> {
     let mut devices = [HdaPciDevice::EMPTY; MAX_HDA_CONTROLLERS];
     let n = collect_hda_controllers(machine, &mut devices);
     sort_hda_controllers(&mut devices, n);
@@ -464,7 +464,7 @@ fn install(device: Hda) -> &'static mut Hda {
     }
 }
 
-fn collect_hda_controllers<A: crate::Arch>(
+fn collect_hda_controllers<A: crate::Core>(
     machine: &mut A,
     out: &mut [HdaPciDevice; MAX_HDA_CONTROLLERS],
 ) -> usize {
@@ -541,7 +541,7 @@ fn sort_hda_controllers(devices: &mut [HdaPciDevice; MAX_HDA_CONTROLLERS], n: us
 /// quiescing the controller before power-off is the real fix). Still attempted for
 /// hardware that resets anyway, with the NSR bit logged so the bring-up
 /// trace is honest. Returns false if the function has no PM capability.
-fn pci_pm_power_cycle<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool {
+fn pci_pm_power_cycle<A: crate::Core>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool {
     // Status register bit 4 (dword 0x04, bit 20): capability list present.
     if crate::kernel::pci::read32(machine, bus, dev, func, 0x04) & (1 << 20) == 0 {
         return false;
@@ -586,7 +586,7 @@ fn pci_pm_power_cycle<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u
 
 /// Bring up the controller + codec output path at `bus:dev.func`. Returns true
 /// on success.
-fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Option<Hda> {
+fn bring_up<A: crate::Core>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Option<Hda> {
     // Enable memory space + bus master and suppress INTx: playback progress is
     // polled from SDLPIB, so this sink deliberately generates no interrupts.
     let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);

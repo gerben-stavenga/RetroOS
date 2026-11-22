@@ -21,7 +21,7 @@ enum Layout {
     Native32,
 }
 impl Request {
-    pub fn read<A: crate::Arch>(
+    pub fn read<A: crate::Core>(
         machine: &A,
         kt: &thread::KernelThread<A>,
         args: &Args,
@@ -110,7 +110,7 @@ impl Request {
             Ok(_) => Some(0),
         }
     }
-    pub fn step<A: crate::Arch>(self, machine: &mut A) -> Option<i32> {
+    pub fn step<A: crate::Core>(self, machine: &mut A) -> Option<i32> {
         if !self.query {
             return self.acquire();
         }
@@ -167,7 +167,7 @@ impl Request {
     }
 }
 
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     linux: &mut super::LinuxState,

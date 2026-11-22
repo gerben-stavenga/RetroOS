@@ -35,7 +35,7 @@ fn atom_for(name: &[u16]) -> Option<Atom> {
         .ok()
         .map(|a| Atom(u32::from(a)))
 }
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     args: [u32; 5],

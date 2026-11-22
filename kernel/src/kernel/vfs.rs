@@ -387,11 +387,11 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
-    /// A path-based backend entry; VFS assigns its mount and node identity.
+    /// Preserve the backend inode. VFS supplies the mount when it lists the entry.
     pub fn new(name: Vec<u8>, stat: Stat) -> Self {
         Self { name_len: name.len(), name, short_name: None, size: stat.size,
             is_dir: stat.is_dir, is_symlink: stat.is_symlink, mode: stat.mode,
-            dos_attributes: None, mtime: stat.mtime.unwrap_or(0), node: 0, mount_idx: 0 }
+            dos_attributes: None, mtime: stat.mtime.unwrap_or(0), node: stat.ino, mount_idx: 0 }
     }
 }
 
@@ -1159,11 +1159,10 @@ impl Vfs {
             sources.push((idx, subpath.to_vec()));
             let mut batch: Vec<DirEntry> = Vec::new();
             let mut cookie = READDIR_START;
-            let directory_node = if subpath.is_empty() {
-                fs.root_node()
-            } else {
-                self.cached_directory_node(dir, idx)
-            };
+            // A backend can report inode identities and still list by path.
+            let directory_node = fs.root_node().and_then(|root| {
+                if subpath.is_empty() { Some(root) } else { self.cached_directory_node(dir, idx) }
+            });
             loop {
                 batch.clear();
                 let next = if let Some(node) = directory_node {
@@ -2027,10 +2026,15 @@ impl Vfs {
             let name_id = self.backend_path_id(midx, path);
             for index in 0..self.file_table.len() {
                 let entry = &self.file_table[index];
-                if entry.refcount != 0 && entry.mount_idx == midx
+                if entry.refcount != 0 && !entry.unlinked && entry.mount_idx == midx
                     && self.backend_path_id(midx, &entry.path) == name_id {
-                    self.file_table[index].unlinked = true;
-                    self.file_table[index].mtime_dirty = false;
+                    let entry = &mut self.file_table[index];
+                    if entry.cache_path_based && let Some(identity) = fs.file_identity(entry.vnode.handle) {
+                        entry.cache_id = identity;
+                        entry.cache_path_based = false;
+                    }
+                    entry.unlinked = true;
+                    entry.mtime_dirty = false;
                 }
             }
             self.modes.remove(path);
@@ -2627,7 +2631,7 @@ pub fn set_handle_mtime(fd: i32, mtime: u32, fds: &[FdKind; MAX_FDS]) -> i32 {
 
 /// Write to an open file descriptor.
 #[inline(never)]
-pub fn write<A: crate::Arch>(machine: &mut A, fd: i32, data: &[u8], fds: &[FdKind; MAX_FDS]) -> i32 {
+pub fn write<A: crate::Core>(machine: &mut A, fd: i32, data: &[u8], fds: &[FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
         Ok(handle) => write_by_handle(machine, handle, data),
         Err(e) => e,
@@ -2958,7 +2962,7 @@ pub fn read_at_by_handle(handle: i32, offset: u32, buf: &mut [u8]) -> i32 {
 }
 
 /// Write to a VFS file table entry by handle index.
-pub fn write_by_handle<A: crate::Arch>(machine: &mut A, handle: i32, data: &[u8]) -> i32 {
+pub fn write_by_handle<A: crate::Core>(machine: &mut A, handle: i32, data: &[u8]) -> i32 {
     let _ = machine;
     with_file_io(handle, data.len(), |file| file.write(data)).unwrap_or_else(|error| error)
 }

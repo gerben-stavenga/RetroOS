@@ -124,6 +124,12 @@ mod tests {
 
 pub fn ram() -> (*mut u8, usize) { (region_base(), PHYS_SIZE) }
 
+/// Paging storage owned by arch before the kernel starts allocating frames.
+pub fn boot_paging_frames() -> core::ops::Range<u64> {
+    let first = (arch_abi::vm::IMAGE_LIMIT / PAGE) as u64;
+    first..first + crate::paging::PAGING_PAGES as u64
+}
+
 /// Physical frame layout supplied by the hosted backend at boot.
 pub fn frame_layout() -> &'static arch_abi::page_supply::FrameLayout {
     use arch_abi::page_supply::{FrameLayout, MemoryRegion};
@@ -134,7 +140,7 @@ pub fn frame_layout() -> &'static arch_abi::page_supply::FrameLayout {
             core::iter::once(MemoryRegion { base: 0, length: PHYS_SIZE as u64, usable: true }),
             (PHYS_SIZE / PAGE) as u64,
         );
-        layout.exclude(0, (0x100000 / PAGE) as u64);
+        layout.exclude(0, (arch_abi::vm::IMAGE_LIMIT / PAGE) as u64);
         layout
     })
 }
@@ -147,7 +153,7 @@ pub fn init_test_ram() {
     use std::cell::Cell;
     READY.with(|ready| {
         if ready.replace(true) { return; }
-        unsafe { crate::vcpu::init_guest_ram(test_memory::alloc_backed_pages(crate::paging::PAGING_PAGES), test_memory::ownership()); }
+        unsafe { crate::vcpu::boot_cpu(test_memory::alloc_backed_pages(crate::paging::PAGING_PAGES), test_memory::ownership()); }
         refill_test_reserve();
         #[cfg(feature = "tcg")]
         {
@@ -272,4 +278,4 @@ pub(crate) fn refill_test_reserve() {
 #[cfg(feature = "kvm")]
 pub(crate) fn ownership() -> arch_abi::page_supply::FrameOwnership { OWNERSHIP.with(|slot| slot.get()) }
 #[cfg(all(feature = "kvm", test))]
-pub(crate) fn supply_pages(pages: PageInput) -> (usize, PageInput) { arch_abi::Memory::supply_pages(&crate::Interp, pages) }
+pub(crate) fn supply_pages(pages: PageInput) -> (usize, PageInput) { arch_abi::Memory::supply_pages(&crate::Interp::local(), pages) }

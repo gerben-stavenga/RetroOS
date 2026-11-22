@@ -310,3 +310,65 @@ const _: () = {
     assert!(core::mem::offset_of!(KernelCall, rdx) == 24);
     assert!(core::mem::offset_of!(KernelCall, rdi) == 40);
 };
+
+/// Borrowed operands of a user trap in a 16- or 32-bit execution context.
+/// Selectors are in ES, CS, SS, DS, FS, GS order.
+pub struct InstructionState<'a> {
+    pub gprs: [&'a mut u32; 8],
+    pub high: Option<[&'a mut u32; 8]>,
+    pub ip: &'a mut u32,
+    pub flags: &'a mut u32,
+    pub selectors: [u16; 6],
+    pub vector: u64,
+    pub error: u64,
+    pub address: u64,
+}
+
+/// Services available to an installed trap handler. Resident accesses must
+/// decline if completing them would need paging or copy-on-write.
+/// # Safety
+/// A successful preflight must remain valid for the hook invocation, and
+/// any direct RAM view must be readable for the full returned span.
+pub unsafe trait TrapAccess {
+    fn segment(&self, selector: u16) -> (u32, u32, bool);
+    fn resident(&self, address: u32, len: u32, write: bool) -> bool;
+    /// Return a contiguous read view of ordinary RAM when available.
+    /// The view is valid only for this hook invocation.
+    fn direct_ram(&self, _address: u32, _len: u32) -> Option<*const u8> { None }
+    /// # Safety
+    /// The CPU must have fetched the instruction at `address` for this trap.
+    /// The caller may read only within that page and the code segment limit.
+    unsafe fn fetched_code(&self, _address: u32) -> Option<*const u8> { None }
+    /// # Safety
+    /// The byte must have passed a read preflight in this hook invocation.
+    unsafe fn read(&self, address: u32) -> u8;
+    /// # Safety
+    /// The range must have passed a read preflight in this hook invocation.
+    unsafe fn read_bytes(&self, address: u32, bytes: &mut [u8]) {
+        for (offset, byte) in bytes.iter_mut().enumerate() {
+            *byte = unsafe { self.read(address + offset as u32) };
+        }
+    }
+    /// # Safety
+    /// The byte must have passed a write preflight in this hook invocation.
+    unsafe fn write(&mut self, address: u32, byte: u8);
+    fn fpu_st0(&self) -> [u8; 10];
+    fn fpu_pop(&mut self);
+}
+
+pub type TrapHandler = unsafe fn(InstructionState<'_>, &mut dyn TrapAccess, [*mut u8; 2]) -> bool;
+
+/// Resident, page-aligned state lent to a trap handler.
+#[derive(Clone, Copy)]
+pub struct HookRegion {
+    pub base: *mut u8,
+    pub bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct TrapHook {
+    /// The name under which the handler is linked in a separate execution image.
+    pub name: &'static str,
+    pub handler: TrapHandler,
+    pub regions: [HookRegion; 2],
+}

@@ -7,7 +7,7 @@ use crate::kernel::dos::machine;
 use crate::kernel::dos::machine::{pop_bios_keyboard_word, read_u16};
 use super::lowmem::{CTRL_STUB_SEG, SLOT_RESUME, ctrl_slot_off};
 
-pub(super) fn poll_dos_console_char<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> Option<u8> {
+pub(super) fn poll_dos_console_char<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> Option<u8> {
     if let Some(ch) = dos.dos_pending_char.take() {
         return Some(ch);
     }
@@ -27,7 +27,7 @@ pub(super) fn poll_dos_console_char<A: crate::Arch>(machine: &mut A, dos: &mut t
 /// On completion, writes count to buffer[1] and appends 0x0D at
 /// buffer[count+2], echoes CR+LF. Returns `Some(next)` while still
 /// gathering input; `None` once Enter is pressed.
-pub(super) fn buffered_input_resume<A: crate::Arch>(_machine: &mut A, buf_lin: u32, max_chars: u8, count: u8) -> crate::kernel::dos::ResumeCallback<A> {
+pub(super) fn buffered_input_resume<A: crate::Core>(_machine: &mut A, buf_lin: u32, max_chars: u8, count: u8) -> crate::kernel::dos::ResumeCallback<A> {
     crate::kernel::dos::ResumeCallback(alloc::boxed::Box::new(move |machine: &mut A,
               _kt: &mut thread::KernelThread<A>,
               dos: &mut thread::DosState<A>,
@@ -77,7 +77,7 @@ pub(super) fn buffered_input_resume<A: crate::Arch>(_machine: &mut A, buf_lin: u
 /// `SLOT_RESUME` stub. Mirrors what a real `INT 16h` does: push FLAGS/CS/IP
 /// (the return frame, pointing back at SLOT_RESUME) and enter `IVT[0x16]`.
 /// IF is forced so the guest's wait loop can receive the keypress IRQ.
-pub(super) fn launch_int16_read<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+pub(super) fn launch_int16_read<A: crate::Core>(machine: &mut A, regs: &mut Regs) {
     let ivt_off = read_u16(machine, 0, 0x16 * 4);
     let ivt_seg = read_u16(machine, 0, 0x16 * 4 + 2);
     let ret_flags = machine::guest_flags_if_on(regs) as u16;
@@ -97,7 +97,7 @@ pub(super) fn launch_int16_read<A: crate::Arch>(machine: &mut A, regs: &mut Regs
 /// Protected-mode counterpart to the guest INT 16h round-trip. PMDOS clients
 /// cannot enter a real-mode IVT handler directly, so the continuation polls
 /// the same BIOS buffer while preserving the DOS character-read ABI.
-pub(super) fn dos_char_resume<A: crate::Arch>(
+pub(super) fn dos_char_resume<A: crate::Core>(
     _machine: &mut A,
     echo: bool,
     func: u8,
@@ -128,7 +128,7 @@ pub(super) fn dos_char_resume<A: crate::Arch>(
 /// / `int 21h`, the second call carrying no `mov ah,7` of its own. Handing back
 /// the INT 16h scancode in AH turned that into function 50h (set PSP), so the
 /// scancode was never delivered and its menus ignored every arrow key.
-pub(super) fn int16_finish_resume<A: crate::Arch>(_machine: &mut A, echo: bool, func: u8) -> crate::kernel::dos::ResumeCallback<A> {
+pub(super) fn int16_finish_resume<A: crate::Core>(_machine: &mut A, echo: bool, func: u8) -> crate::kernel::dos::ResumeCallback<A> {
     crate::kernel::dos::ResumeCallback(alloc::boxed::Box::new(move |machine: &mut A,
               _kt: &mut thread::KernelThread<A>,
               dos: &mut thread::DosState<A>,
@@ -157,7 +157,7 @@ pub(super) fn log_dos_byte(c: u8) {
     }
 }
 
-pub(super) fn dos_putchar<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, c: u8) {
+pub(super) fn dos_putchar<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, c: u8) {
     // Mirror to the log stream. This is the half worth keeping: the log is
     // unowned and non-ephemeral, so a program's output survives the scroll and
     // shows up in order next to everything else, whoever holds the screen.

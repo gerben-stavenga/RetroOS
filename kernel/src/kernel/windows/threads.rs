@@ -53,7 +53,7 @@ pub(super) struct State {
     polling: bool,
 }
 
-fn ensure<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, t: &mut State, regs: &Regs) {
+fn ensure<A: crate::Core>(machine: &mut A, state: &mut WindowsState, t: &mut State, regs: &Regs) {
     if !t.contexts.is_empty() {
         return;
     }
@@ -169,7 +169,7 @@ fn multiple(t: &mut State, handles: &[u32], all: bool, id: u32) -> Result<Option
     }
 }
 
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     kt: &mut thread::KernelThread<A>,
@@ -258,7 +258,7 @@ pub(super) fn call<A: crate::Arch>(
     None
 }
 
-pub(super) fn schedule<A: crate::Arch>(
+pub(super) fn schedule<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     regs: &mut Regs,
@@ -373,7 +373,7 @@ pub(super) fn schedule<A: crate::Arch>(
 }
 
 /// TlsFree clears the released slot in every thread’s stable TEB.
-pub(super) fn clear_tls<A: crate::Arch>(machine: &mut A, threads: &mut State, index: u32) -> u32 {
+pub(super) fn clear_tls<A: crate::Core>(machine: &mut A, threads: &mut State, index: u32) -> u32 {
     if index >= 1088 {
         return 0xc000000d;
     }
@@ -394,7 +394,7 @@ pub(super) fn clear_tls<A: crate::Arch>(machine: &mut A, threads: &mut State, in
     0
 }
 
-pub(super) fn event<A: crate::Arch>(
+pub(super) fn event<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     op: u32,
@@ -449,7 +449,7 @@ pub(super) fn event<A: crate::Arch>(
     0
 }
 
-pub(super) fn poll<A: crate::Arch>(
+pub(super) fn poll<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     state: &mut WindowsState,
@@ -522,7 +522,7 @@ mod tests {
 }
 
 /// Unnamed native synchronization objects; wait policy remains shared with events.
-pub(super) fn sync<A: crate::Arch>(
+pub(super) fn sync<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     args: [u32; 6],
@@ -636,7 +636,7 @@ pub(super) fn set_signal(t: &mut State, handle: u32, signaled: bool) {
 
 // Execution mechanism only: NT argument/attribute handling and DLL lifecycle
 // remain in RETROOS.DLL and Wine respectively.
-fn native<A: crate::Arch>(
+fn native<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     regs: &Regs,

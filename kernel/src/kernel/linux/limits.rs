@@ -19,7 +19,7 @@ fn range(pointer: u64, size: u64) -> bool {
             .is_some_and(|end| end <= 0xc0000000)
 }
 
-pub(super) fn prlimit<A: crate::Arch>(
+pub(super) fn prlimit<A: crate::Core>(
     machine: &mut A,
     kt: &thread::KernelThread<A>,
     args: &Args,
@@ -50,7 +50,7 @@ pub(super) fn prlimit<A: crate::Arch>(
     SyscallResult::val(0)
 }
 
-pub(super) fn getrlimit<A: crate::Arch>(machine: &mut A, args: &Args, wide: bool) -> SyscallResult {
+pub(super) fn getrlimit<A: crate::Core>(machine: &mut A, args: &Args, wide: bool) -> SyscallResult {
     let Some((soft, hard)) = values(args.a0) else {
         return SyscallResult::val(-EINVAL);
     };

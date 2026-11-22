@@ -212,7 +212,8 @@ pub fn is_fat(volume: &Volume) -> bool {
 /// cluster chain again and again, quadratically. Keeping the `File` object
 /// alive across calls lets fatfs's existing fast paths do their job: seeking
 /// to the position a previous read already left it at is then a no-op.
-type CachedFile<T> = fatfs::File<'static, T, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>;
+type OpenFile<'a, T> = fatfs::File<'a, T, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>;
+type CachedFile<T> = OpenFile<'static, T>;
 
 /// `File` borrows `&FileSystem`, which contains `RefCell`s for its own
 /// internal caching — so `File` is `!Send` on its own (a `&T` is `Send` only
@@ -225,15 +226,21 @@ type CachedFile<T> = fatfs::File<'static, T, fatfs::DefaultTimeProvider, fatfs::
 struct SendFile<T: fatfs::ReadWriteSeek + 'static>(CachedFile<T>);
 unsafe impl<T: fatfs::ReadWriteSeek + 'static> Send for SendFile<T> {}
 
+enum OpenName {
+    Named(Vec<u8>),
+    Unlinked(u32),
+}
+
 struct FatState<T: fatfs::ReadWriteSeek + 'static> {
     media: Option<fatfs::FileSystem<T>>,
-    opens: BTreeMap<u32, Vec<u8>>,
+    opens: BTreeMap<u32, OpenName>,
     // SAFETY (the 'static above): every `FatFs<T>` this backs is Box::leak'd
     // at mount time (see fs/disk.rs, startup.rs) and never moved for the life
     // of the kernel. The `media` field these files borrow from remains stable
     // until shutdown clears every cached handle before taking it. Access
     // is still funneled through `self.state`'s Mutex like everything else.
     handles: BTreeMap<u32, SendFile<T>>,
+    unlinked: BTreeMap<u32, SendFile<T>>,
     next_handle: u32,
 }
 
@@ -248,13 +255,30 @@ impl<T: fatfs::ReadWriteSeek + 'static> FatState<T> {
         // readers of the file before changing its metadata, not only the fd
         // used for the write. VFS supplies resolved long names here.
         let opens = &self.opens;
-        self.handles.retain(|id, _| !opens.get(id).is_some_and(|p| p.eq_ignore_ascii_case(path)));
+        self.handles.retain(|id, _| !matches!(
+            opens.get(id), Some(OpenName::Named(name)) if name.eq_ignore_ascii_case(path)
+        ));
+    }
+
+    fn edit_file(&mut self, handle: u32, edit: impl FnOnce(&mut OpenFile<'_, T>) -> i32) -> i32 {
+        match self.opens.get(&handle) {
+            Some(OpenName::Unlinked(id)) => edit(&mut self.unlinked.get_mut(id).unwrap().0),
+            Some(OpenName::Named(path)) => {
+                let path = path.clone();
+                self.invalidate_file(&path);
+                let Some(path) = path_str(&path) else { return -5; };
+                let Ok(mut file) = self.media().root_dir().open_file(path) else { return -5; };
+                edit(&mut file)
+            }
+            None => -9,
+        }
     }
 }
 
 pub struct FatFs<T: fatfs::ReadWriteSeek + 'static> {
     state: Mutex<FatState<T>>,
     writable: bool,
+    retain_unlinked: bool,
 }
 
 impl<T: fatfs::ReadWriteSeek + 'static> FatFs<T> {
@@ -265,8 +289,15 @@ impl<T: fatfs::ReadWriteSeek + 'static> FatFs<T> {
     pub fn new_with_policy(io: T, writable: bool) -> Result<Self, fatfs::Error<T::Error>> {
         let media = fatfs::FileSystem::new(io, fatfs::FsOptions::new())?;
         Ok(Self { state: Mutex::new(FatState {
-            media: Some(media), opens: BTreeMap::new(), handles: BTreeMap::new(), next_handle: 1,
-        }), writable })
+            media: Some(media), opens: BTreeMap::new(), handles: BTreeMap::new(),
+            unlinked: BTreeMap::new(), next_handle: 1,
+        }), writable, retain_unlinked: false })
+    }
+
+    pub(super) fn new_volatile(io: T) -> Result<Self, fatfs::Error<T::Error>> {
+        let mut fs = Self::new(io)?;
+        fs.retain_unlinked = true;
+        Ok(fs)
     }
 
     pub fn geometry(&self) -> Option<(u16, u16, u16, u16)> {
@@ -309,6 +340,21 @@ pub(super) fn unix_from_ymd_hms(year: u16, month: u16, day: u16, hour: u16, min:
     let days = era * 146097 + doe - 719468;
     let secs = days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
     u32::try_from(secs).unwrap_or(0)
+}
+
+fn read_file<T: fatfs::ReadWriteSeek>(file: &mut OpenFile<'_, T>, offset: u32, buf: &mut [u8]) -> i32 {
+    if fatfs::Seek::seek(file, fatfs::SeekFrom::Start(u64::from(offset))).is_err() {
+        return -5;
+    }
+    let mut done = 0;
+    while done < buf.len() {
+        match fatfs::Read::read(file, &mut buf[done..]) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(_) => return if done == 0 { -5 } else { done as i32 },
+        }
+    }
+    done as i32
 }
 
 fn path_str(path: &[u8]) -> Option<&str> {
@@ -641,6 +687,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
         if !self.writable { return 0; }
         let mut state = self.state.lock();
         state.handles.clear();
+        state.unlinked.clear();
         state.opens.clear();
         let Some(media) = state.media.take() else { return 0 };
         let unmounted = media.unmount().is_ok();
@@ -714,7 +761,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
         };
         let handle = state.next_handle;
         state.next_handle = state.next_handle.checked_add(1).unwrap_or(1);
-        state.opens.insert(handle, path.to_vec());
+        state.opens.insert(handle, OpenName::Named(path.to_vec()));
         state.handles.insert(handle, SendFile(file));
         Some(Vnode {
             handle: handle as u64,
@@ -732,41 +779,30 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
         // (handle created before this cache existed, or already evicted)
         // falls back to the always-correct, always-slower open-by-path path.
         if let Some(file) = state.handles.get_mut(&inner) {
-            if fatfs::Seek::seek(&mut file.0, fatfs::SeekFrom::Start(offset as u64)).is_err() {
-                return -5;
-            }
-            let mut done = 0;
-            while done < buf.len() {
-                match fatfs::Read::read(&mut state.handles.get_mut(&inner).unwrap().0, &mut buf[done..]) {
-                    Ok(0) => break,
-                    Ok(n) => done += n,
-                    Err(_) => return if done == 0 { -5 } else { done as i32 },
-                }
-            }
-            return done as i32;
+            return read_file(&mut file.0, offset, buf);
         }
-        let Some(path) = state.opens.get(&inner) else {
-            return -9;
-        };
-        let media = state.media();
-        let Some(path) = path_str(path) else {
-            return -5;
-        };
-        let Ok(mut file) = media.root_dir().open_file(path) else {
-            return -5;
-        };
-        if fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(offset as u64)).is_err() {
-            return -5;
-        }
-        let mut done = 0;
-        while done < buf.len() {
-            match fatfs::Read::read(&mut file, &mut buf[done..]) {
-                Ok(0) => break,
-                Ok(n) => done += n,
-                Err(_) => return if done == 0 { -5 } else { done as i32 },
+        match state.opens.get(&inner) {
+            Some(OpenName::Unlinked(id)) => {
+                let id = *id;
+                read_file(&mut state.unlinked.get_mut(&id).unwrap().0, offset, buf)
             }
+            Some(OpenName::Named(path)) => {
+                let Some(path) = path_str(path) else { return -5; };
+                let Ok(mut file) = state.media().root_dir().open_file(path) else { return -5; };
+                read_file(&mut file, offset, buf)
+            }
+            None => -9,
         }
-        done as i32
+    }
+
+    fn file_identity(&self, handle: u64) -> Option<u64> {
+        let state = self.state.lock();
+        let OpenName::Unlinked(id) = state.opens.get(&u32::try_from(handle).ok()?)? else {
+            return None;
+        };
+        // VFS path identities are odd. Give the detached file a distinct key
+        // shared by all descriptors so reusing the old name cannot alias it.
+        Some(u64::from(*id) * 2)
     }
 
     fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
@@ -826,78 +862,73 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
     fn clunk(&self, handle: u64) -> i32 {
         let inner = u32::try_from(handle).unwrap_or(0);
         let mut state = self.state.lock();
-        state.opens.remove(&inner);
         state.handles.remove(&inner);
+        if let Some(OpenName::Unlinked(id)) = state.opens.remove(&inner)
+            && !state.opens.values().any(|entry| matches!(entry, OpenName::Unlinked(peer) if *peer == id))
+        {
+            let mut file = state.unlinked.remove(&id).unwrap().0;
+            if fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(0)).is_err()
+                || file.truncate().is_err()
+            {
+                return -5;
+            }
+        }
         0
     }
 
     fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {
         let inner = u32::try_from(handle).unwrap_or(0);
-        let mut state = self.state.lock();
-        let Some(path) = state.opens.get(&inner).cloned() else {
-            return -9;
-        };
-        if data.is_empty() { return 0; }
-        state.invalidate_file(&path);
-        let media = state.media();
-        let Some(path) = path_str(&path) else {
-            return -5;
-        };
-        let Ok(mut file) = media.root_dir().open_file(path) else {
-            return -5;
-        };
-        // fatfs clamps seeks past EOF. Linux/DOS positioned writes must
-        // extend to the requested offset first, or an assembler's initial
-        // header hole silently shifts every subsequent section toward zero.
-        let Ok(position) = fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(offset as u64))
-            else { return -5; };
-        let mut gap = u64::from(offset).saturating_sub(position);
-        let zeros = [0; 4096];
-        while gap != 0 {
-            let count = gap.min(zeros.len() as u64) as usize;
-            match fatfs::Write::write(&mut file, &zeros[..count]) {
-                Ok(0) | Err(_) => return -28,
-                Ok(n) => gap -= n as u64,
+        self.state.lock().edit_file(inner, |file| {
+            if data.is_empty() { return 0; }
+            // fatfs clamps seeks past EOF. Linux/DOS positioned writes must
+            // extend to the requested offset first, or an assembler's initial
+            // header hole silently shifts every subsequent section toward zero.
+            let Ok(position) = fatfs::Seek::seek(file, fatfs::SeekFrom::Start(offset as u64))
+                else { return -5; };
+            let mut gap = u64::from(offset).saturating_sub(position);
+            let zeros = [0; 4096];
+            while gap != 0 {
+                let count = gap.min(zeros.len() as u64) as usize;
+                match fatfs::Write::write(file, &zeros[..count]) {
+                    Ok(0) | Err(_) => return -28,
+                    Ok(n) => gap -= n as u64,
+                }
             }
-        }
-        let mut done = 0;
-        while done < data.len() {
-            match fatfs::Write::write(&mut file, &data[done..]) {
-                Ok(0) => break, // media full / fixed size reached
-                Ok(n) => done += n,
-                Err(_) => return if done == 0 { -28 } else { done as i32 },
+            let mut done = 0;
+            while done < data.len() {
+                match fatfs::Write::write(file, &data[done..]) {
+                    Ok(0) => break, // media full / fixed size reached
+                    Ok(n) => done += n,
+                    Err(_) => return if done == 0 { -28 } else { done as i32 },
+                }
             }
-        }
-        if fatfs::Write::flush(&mut file).is_err() {
-            return -5;
-        }
-        done as i32
+            if fatfs::Write::flush(file).is_err() {
+                return -5;
+            }
+            done as i32
+        })
     }
 
     fn resize(&self, handle: u64, size: u32) -> i32 {
         let inner = u32::try_from(handle).unwrap_or(0);
-        let mut state = self.state.lock();
-        let Some(path) = state.opens.get(&inner).cloned() else { return -9; };
-        state.invalidate_file(&path);
-        let Some(path) = path_str(&path) else { return -5; };
-        let media = state.media();
-        let Ok(mut file) = media.root_dir().open_file(path) else { return -5; };
-        let Ok(length) = fatfs::Seek::seek(&mut file, fatfs::SeekFrom::End(0)) else { return -5; };
-        if u64::from(size) < length {
-            if fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(u64::from(size))).is_err()
-                || file.truncate().is_err() { return -5; }
-        } else {
-            let zeros = [0; 4096];
-            let mut remaining = u64::from(size) - length;
-            while remaining != 0 {
-                let count = remaining.min(zeros.len() as u64) as usize;
-                match fatfs::Write::write(&mut file, &zeros[..count]) {
-                    Ok(0) | Err(_) => return -28,
-                    Ok(written) => remaining -= written as u64,
+        self.state.lock().edit_file(inner, |file| {
+            let Ok(length) = fatfs::Seek::seek(file, fatfs::SeekFrom::End(0)) else { return -5; };
+            if u64::from(size) < length {
+                if fatfs::Seek::seek(file, fatfs::SeekFrom::Start(u64::from(size))).is_err()
+                    || file.truncate().is_err() { return -5; }
+            } else {
+                let zeros = [0; 4096];
+                let mut remaining = u64::from(size) - length;
+                while remaining != 0 {
+                    let count = remaining.min(zeros.len() as u64) as usize;
+                    match fatfs::Write::write(file, &zeros[..count]) {
+                        Ok(0) | Err(_) => return -28,
+                        Ok(written) => remaining -= written as u64,
+                    }
                 }
             }
-        }
-        fatfs::Write::flush(&mut file).map_or(-5, |_| 0)
+            fatfs::Write::flush(file).map_or(-5, |_| 0)
+        })
     }
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
@@ -923,7 +954,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
         drop(dir);
         let handle = state.next_handle;
         state.next_handle = state.next_handle.checked_add(1).unwrap_or(1);
-        state.opens.insert(handle, path.to_vec());
+        state.opens.insert(handle, OpenName::Named(path.to_vec()));
         Some(Vnode {
             handle: handle as u64,
             size: 0,
@@ -936,16 +967,30 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
     }
 
     fn remove(&self, path: &[u8]) -> i32 {
-        let state = self.state.lock();
-        let media = state.media();
-        let Some(path) = path_str(path) else {
-            return -5;
+        let mut state = self.state.lock();
+        let Some(text) = path_str(path) else { return -5; };
+        state.invalidate_file(path);
+        let matches_path = |entry: &OpenName| {
+            matches!(entry, OpenName::Named(name) if name.eq_ignore_ascii_case(path))
         };
-        if media.root_dir().remove(path).is_ok() {
-            0
-        } else {
-            -2
+        if self.retain_unlinked
+            && let Some((&id, _)) = state.opens.iter().find(|(_, entry)| matches_path(entry))
+        {
+            let file = match state.media().root_dir().unlink_file(text) {
+                Ok(file) => file,
+                Err(fatfs::Error::NotFound) => return -2,
+                Err(_) => return -5,
+            };
+            // The file borrows the same stable media as an ordinary cached
+            // handle. All detached handles share this file and its size.
+            let file: CachedFile<T> = unsafe { core::mem::transmute(file) };
+            state.unlinked.insert(id, SendFile(file));
+            for entry in state.opens.values_mut().filter(|entry| matches_path(entry)) {
+                *entry = OpenName::Unlinked(id);
+            }
+            return 0;
         }
+        if state.media().root_dir().remove(text).is_ok() { 0 } else { -2 }
     }
 
     fn mkdir(&self, path: &[u8]) -> i32 {

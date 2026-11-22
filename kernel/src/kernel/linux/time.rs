@@ -1,6 +1,6 @@
 //! Linux time structures have ABI-sized words, independent of kernel bitness.
 use super::{Args, EFAULT, EINVAL, SyscallResult, high_memory};
-// Compatibility timestamps use milliseconds (Arch::now / 1_000_000), not 100 Hz.
+// Compatibility timestamps use milliseconds (Core::now / 1_000_000), not 100 Hz.
 const TICK_NS: u64 = 1_000_000;
 fn monotonic_pair(milliseconds: u64) -> (u64, u64) {
     (milliseconds / 1000, (milliseconds % 1000) * TICK_NS)
@@ -20,7 +20,7 @@ fn pair(seconds: u64, fraction: u64, wide: bool) -> ([u8; 16], usize) {
         (out, 8)
     }
 }
-fn store<A: crate::Arch>(machine: &mut A, pointer: u64, seconds: u64, fraction: u64, wide: bool) -> bool {
+fn store<A: crate::Core>(machine: &mut A, pointer: u64, seconds: u64, fraction: u64, wide: bool) -> bool {
     let (bytes, n) = pair(seconds, fraction, wide);
     high_memory::copy_to(machine, pointer, &bytes[..n])
 }
@@ -29,7 +29,7 @@ fn realtime() -> u64 {
 }
 /// CLOCK_REALTIME in nanoseconds (second resolution: the RTC is the source).
 pub(super) fn realtime_ns() -> u64 { realtime().saturating_mul(1_000_000_000) }
-pub(super) fn clock_gettime<A: crate::Arch>(
+pub(super) fn clock_gettime<A: crate::Core>(
     machine: &mut A,
     args: &Args,
     wide: bool,
@@ -47,7 +47,7 @@ pub(super) fn clock_gettime<A: crate::Arch>(
     };
     SyscallResult::val(if store(machine, args.a1, seconds, nanos, wide) { 0 } else { -EFAULT })
 }
-pub(super) fn clock_getres<A: crate::Arch>(
+pub(super) fn clock_getres<A: crate::Core>(
     machine: &mut A,
     args: &Args,
     wide: bool,
@@ -67,7 +67,7 @@ pub(super) fn clock_getres<A: crate::Arch>(
     }
     SyscallResult::val(0)
 }
-pub(super) fn gettimeofday<A: crate::Arch>(
+pub(super) fn gettimeofday<A: crate::Core>(
     machine: &mut A,
     args: &Args,
     wide: bool,
@@ -80,7 +80,7 @@ pub(super) fn gettimeofday<A: crate::Arch>(
     }
     SyscallResult::val(0)
 }
-pub(super) fn time<A: crate::Arch>(machine: &mut A, args: &Args, wide: bool) -> SyscallResult {
+pub(super) fn time<A: crate::Core>(machine: &mut A, args: &Args, wide: bool) -> SyscallResult {
     let seconds = realtime();
     if args.a0 != 0 {
         let bytes = seconds.to_le_bytes();

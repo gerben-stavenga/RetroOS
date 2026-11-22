@@ -1,5 +1,5 @@
 //! Kernel-owned physical pages supplied to arch as owned batches.
-use crate::Arch;
+use crate::Core;
 use super::phys_mm;
 use arch_abi::page_supply::{PageInput, SupplyStatus, SUPPLY_CAPACITY, FAULT_PAGES};
 #[thread_local]
@@ -43,7 +43,7 @@ pub fn replenish<A: arch_abi::Memory>(machine: &A, status: SupplyStatus) {
 }
 
 /// Each operation owns its input batch and returns the unused frames.
-pub fn with_pages<A: Arch, R>(machine: &mut A, count: usize,
+pub fn with_pages<A: Core, R>(machine: &mut A, count: usize,
     operation: impl FnOnce(&mut A, PageInput) -> (R, PageInput)) -> R
 {
     let (result, unused) = operation(machine, input_pages(count));
@@ -67,7 +67,7 @@ fn keep_input(mut unused: PageInput) {
         unsafe { (*(&raw mut SPARES)).push(page); }
     }
 }
-pub fn fork<A: Arch>(machine: &mut A, child: &mut A::PageTable) {
+pub fn fork<A: Core>(machine: &mut A, child: &mut A::AddressSpace) {
     with_pages(machine, 3, |machine, pages| machine.user_fork(child, pages));
 }
 
@@ -78,8 +78,8 @@ pub(crate) fn allocate_frame<A: arch_abi::Memory>(machine: &A) -> Option<u64> {
 
 /// Install one mapping with explicit table backing and retry only uncompleted work.
 /// # Safety
-/// The entry's backing must satisfy Arch::replace_mappings's requirements.
-pub unsafe fn replace<A: Arch>(machine: &mut A, page: arch_abi::UserPage,
+/// The entry's backing must satisfy Core::replace_mappings's requirements.
+pub unsafe fn replace<A: Core>(machine: &mut A, page: arch_abi::UserPage,
     entry: arch_abi::page_entry::PageEntry) -> Result<(), arch_abi::MappingError>
 {
     loop {
@@ -90,8 +90,8 @@ pub unsafe fn replace<A: Arch>(machine: &mut A, page: arch_abi::UserPage,
 
 /// Install a batch, resuming after the committed prefix if table backing runs out.
 /// # Safety
-/// Every entry must satisfy Arch::replace_mappings's requirements.
-pub unsafe fn replace_batch<A: Arch>(machine: &mut A, mut page: arch_abi::UserPage,
+/// Every entry must satisfy Core::replace_mappings's requirements.
+pub unsafe fn replace_batch<A: Core>(machine: &mut A, mut page: arch_abi::UserPage,
     mut entries: &[arch_abi::page_entry::PageEntry]) -> Result<(), arch_abi::MappingError>
 {
     while !entries.is_empty() {
@@ -109,7 +109,7 @@ pub unsafe fn replace_batch<A: Arch>(machine: &mut A, mut page: arch_abi::UserPa
 
 /// File-cache mapping composition: the cache keeps shared backing alive, while
 /// a private mapping retains a reference and starts writable views as COW.
-pub fn map_cached_frame<A: Arch>(machine: &mut A, vpage: usize, frame: u64,
+pub fn map_cached_frame<A: Core>(machine: &mut A, vpage: usize, frame: u64,
     shared: bool, writable: bool, executable: bool) -> bool
 {
     use arch_abi::{UserPage, page_entry::{Backing, Mapping, PageEntry, PhysicalFrame}};
@@ -127,22 +127,45 @@ pub fn map_cached_frame<A: Arch>(machine: &mut A, vpage: usize, frame: u64,
 /// allocation; allocation and mapping are separate architecture mechanisms.
 /// # Safety
 /// The allocation must outlive all aliases; synchronize access with user code.
-pub unsafe fn map_shared_pages<A: Arch>(machine: &mut A, vpage: usize,
+pub unsafe fn map_shared_pages<A: Core>(machine: &mut A, vpage: usize,
     base: core::ptr::NonNull<u8>, count: usize)
 {
-    use arch_abi::{UserPage, page_entry::{Attributes, Backing, Mapping, PageEntry}};
+    unsafe { map_shared_backing(machine, vpage, base, count, Attributes::EXECUTABLE, PageEntry::Writable); }
+}
+
+/// Reserve a user's virtual range with borrowed device backing. Native user
+/// execution cannot access the backing through this range.
+/// # Safety
+/// The allocation must outlive the mappings.
+pub(crate) unsafe fn map_protected_shared_pages<A: Core>(machine: &mut A, vpage: usize,
+    base: core::ptr::NonNull<u8>, count: usize)
+{
+    unsafe { map_shared_backing(machine, vpage, base, count, Attributes::default(), PageEntry::NoAccess); }
+}
+
+unsafe fn map_shared_backing<A: Core>(machine: &mut A, vpage: usize,
+    base: core::ptr::NonNull<u8>, count: usize, attributes: Attributes,
+    access: fn(Mapping) -> PageEntry,
+)
+{
     let start = UserPage::new((vpage as u64).checked_mul(4096).expect("mapping address overflow")).unwrap();
     if count != 0 { start.offset(count - 1).unwrap(); }
-    for index in 0..count {
-        let pointer = unsafe { core::ptr::NonNull::new_unchecked(base.as_ptr().add(index * 4096)) };
-        let frame = unsafe { super::platform::physical_frame(pointer) };
-        let entry = PageEntry::Writable(Mapping { backing: Backing::Borrowed(frame), attributes: Attributes::EXECUTABLE });
-        unsafe { replace(machine, start.offset(index).unwrap(), entry) }.expect("cannot map shared backing");
+    let mut entries = [PageEntry::Absent; 64];
+    for first in (0..count).step_by(entries.len()) {
+        let length = (count - first).min(entries.len());
+        let batch = &mut entries[..length];
+        for (offset, entry) in batch.iter_mut().enumerate() {
+            let index = first + offset;
+            let pointer = unsafe { core::ptr::NonNull::new_unchecked(base.as_ptr().add(index * 4096)) };
+            let frame = unsafe { super::platform::physical_frame(pointer) };
+            *entry = access(Mapping { backing: Backing::Borrowed(frame), attributes });
+        }
+        unsafe { replace_batch(machine, start.offset(first).unwrap(), batch) }.expect("cannot map shared backing");
     }
 }
 
 /// Borrow physical backing into user mappings.
-pub fn map_physical<A: Arch>(machine: &mut A, vpage: usize, count: usize, physical: u64, flags: u64) {
+pub fn map_physical<A: Core>(machine: &mut A, vpage: usize, count: usize, physical: u64, flags: u64) {
     use arch_abi::{UserPage, page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFrame}};
     let start = UserPage::new((vpage as u64).checked_mul(4096).expect("mapping address overflow")).unwrap();
     if count != 0 { start.offset(count - 1).unwrap(); }
@@ -174,7 +197,7 @@ fn backing(entry: PageEntry) -> Option<Mapping> {
     }
 }
 static ZERO_FRAME: spin::Once<PhysicalFrame> = spin::Once::new();
-pub fn zero_mapping<A: Arch>(machine: &A, executable: bool) -> Mapping {
+pub fn zero_mapping<A: Core>(machine: &A, executable: bool) -> Mapping {
     let frame = *ZERO_FRAME.call_once(|| {
         let frame = allocate_frame(machine).expect("zero frame allocation");
         super::platform::write_physical_frame(frame, 0, &[0; 4096]);
@@ -184,7 +207,7 @@ pub fn zero_mapping<A: Arch>(machine: &A, executable: bool) -> Mapping {
 }
 
 /// Personality policy: discard contents and allow subsequent anonymous writes.
-pub fn reset<A: Arch>(machine: &mut A, vpage: usize, count: usize) {
+pub fn reset<A: Core>(machine: &mut A, vpage: usize, count: usize) {
     if count == 0 { return; }
     let entry = PageEntry::CopyOnWrite(zero_mapping(machine, true));
     unsafe { fill(machine, page(vpage), count, entry) }.expect("reset mappings");
@@ -197,7 +220,7 @@ fn drop_frame_reference(frame: u64) {
 }
 
 /// Allocate distinct RAM before creating aliases (EMS/A20/device shadows).
-pub fn fresh<A: Arch>(machine: &mut A, vpage: usize, count: usize) {
+pub fn fresh<A: Core>(machine: &mut A, vpage: usize, count: usize) {
     if count == 0 { return; }
     let start = page(vpage); start.offset(count - 1).unwrap();
     for index in 0..count {
@@ -213,7 +236,7 @@ pub fn fresh<A: Arch>(machine: &mut A, vpage: usize, count: usize) {
 
 /// Change access while keeping contents and cache attributes. Owned storage is
 /// made COW when write access is granted; externally owned storage stays shared.
-pub fn protect<A: Arch>(machine: &mut A, vpage: usize, count: usize, writable: bool, executable: bool) {
+pub fn protect<A: Core>(machine: &mut A, vpage: usize, count: usize, writable: bool, executable: bool) {
     for index in 0..count {
         let page = page(vpage + index);
         let old = arch_abi::mapping::read_mapping(machine, page).expect("read protection");
@@ -242,7 +265,7 @@ pub fn protect<A: Arch>(machine: &mut A, vpage: usize, count: usize, writable: b
 }
 
 /// Request aliases; arch owns overlap handling, COW, and frame references.
-pub fn alias<A: Arch>(machine: &mut A, source: usize, destination: usize, count: usize) {
+pub fn alias<A: Core>(machine: &mut A, source: usize, destination: usize, count: usize) {
     if count == 0 || source == destination { return; }
     loop {
         match with_pages(machine, 5, |machine, pages| machine.alias_mappings(page(source), page(destination), count, pages)) {
@@ -253,7 +276,7 @@ pub fn alias<A: Arch>(machine: &mut A, source: usize, destination: usize, count:
 }
 
 /// Request pairwise swaps; arch preserves both references across replacement.
-pub fn swap<A: Arch>(machine: &mut A, a: usize, b: usize, count: usize) {
+pub fn swap<A: Core>(machine: &mut A, a: usize, b: usize, count: usize) {
     if count == 0 || a == b { return; }
     loop {
         match with_pages(machine, 5, |machine, pages| machine.swap_mappings(page(a), page(b), count, pages)) {
@@ -264,8 +287,8 @@ pub fn swap<A: Arch>(machine: &mut A, a: usize, b: usize, count: usize) {
 }
 
 /// # Safety
-/// Same backing lifetime requirements as Arch::fill_mappings.
-pub unsafe fn fill<A: Arch>(machine: &mut A, mut start: UserPage, mut count: usize, entry: PageEntry) -> Result<(), arch_abi::MappingError> {
+/// Same backing lifetime requirements as Core::fill_mappings.
+pub unsafe fn fill<A: Core>(machine: &mut A, mut start: UserPage, mut count: usize, entry: PageEntry) -> Result<(), arch_abi::MappingError> {
     while count != 0 {
         match with_pages(machine, 5, |machine, pages| unsafe { machine.fill_mappings(start, count, entry, pages) }) {
             Ok(()) => return Ok(()),
@@ -281,7 +304,7 @@ pub unsafe fn fill<A: Arch>(machine: &mut A, mut start: UserPage, mut count: usi
 /// Construct the DOS personality's memory, independently of host firmware.
 /// A/B are the video aperture; C/E are UMB RAM, D is the EMS frame, and F
 /// contains the substitute BIOS ROM. BIOS installation populates its fonts.
-pub fn map_dos_memory<A: Arch>(machine: &mut A) {
+pub fn map_dos_memory<A: Core>(machine: &mut A) {
     reset(machine, 0, 0xa0);
     fresh(machine, 0, 16);
     fresh(machine, 0xa0, 0x60);
@@ -291,13 +314,13 @@ pub fn map_dos_memory<A: Arch>(machine: &mut A) {
 static TEXT_FRAME: spin::Once<u64> = spin::Once::new();
 pub fn set_text_frame(frame: u64) { TEXT_FRAME.call_once(|| frame); }
 pub fn text_frame() -> u64 { *TEXT_FRAME.get().expect("text screen backing") }
-pub fn map_text_screen<A: Arch>(machine: &mut A) {
+pub fn map_text_screen<A: Core>(machine: &mut A) {
     if let Some(&frame) = TEXT_FRAME.get() { map_physical(machine, 0xb8, 8, frame, 0); }
     else { fresh(machine, 0xb8, 8); }
 }
 
 /// Replace image pages with explicit private RAM before a workspace patches them.
-pub fn private_copy<A: Arch>(machine: &mut A, first: usize, count: usize) {
+pub fn private_copy<A: Core>(machine: &mut A, first: usize, count: usize) {
     for index in 0..count {
         let at = page(first + index);
         let mut mapping = backing(arch_abi::mapping::read_mapping(machine, at).expect("read image mapping")).expect("image backing");
@@ -360,7 +383,7 @@ pub trait GuestBytes {
         }
     }
 }
-impl<A: arch_abi::Arch + arch_abi::GuestBytes> GuestBytes for A {
+impl<A: arch_abi::Core + arch_abi::GuestBytes> GuestBytes for A {
     fn high_copy(&mut self, mut address: u64, mut bytes: &mut [u8], to_user: bool) -> bool {
         while !bytes.is_empty() {
             let n = bytes.len().min(4096 - (address as usize & 4095));

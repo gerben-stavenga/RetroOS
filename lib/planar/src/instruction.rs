@@ -1,4 +1,6 @@
 //! Restartable x86 instructions against a device aperture.
+
+use arch_abi::entry::{InstructionState, TrapAccess};
 #[inline]
 pub fn string_index(index: u64, addr32: bool) -> u32 {
     if addr32 { index as u32 } else { index as u16 as u32 }
@@ -420,7 +422,6 @@ fn string_ready(bus: &dyn FaultBus, mut source: Option<(u32, u32)>,
 #[allow(clippy::too_many_arguments)]
 pub fn emulate(bus: &mut dyn FaultBus, regs: &mut Operands<'_>, cs_base: u32, def32: bool,
     segments: &[u32; 6], off: u32) -> bool {
-    let vm86 = *regs.flags & (1 << 17) != 0;
     let ip0 = if def32 { *regs.ip } else { *regs.ip & 0xFFFF };
     // Pre-read the instruction (max 15 bytes) into a buffer so decoding doesn't
     // hold a borrow of `regs` while the emulation below mutates it.
@@ -431,6 +432,13 @@ pub fn emulate(bus: &mut dyn FaultBus, regs: &mut Operands<'_>, cs_base: u32, de
     if !bus.accessible(code_addr, first as u32, false) || first < buf.len() && !bus.accessible(0, (buf.len() - first) as u32, false) { return false; }
     bus.guest_read_bytes(code_addr, &mut buf[..first]);
     if first < buf.len() { bus.guest_read_bytes(0, &mut buf[first..]); }
+    emulate_code(bus, regs, &buf, def32, segments, off)
+}
+
+fn emulate_code(bus: &mut dyn FaultBus, regs: &mut Operands<'_>, buf: &[u8; 16], def32: bool,
+    segments: &[u32; 6], off: u32) -> bool {
+    let vm86 = *regs.flags & (1 << 17) != 0;
+    let ip0 = if def32 { *regs.ip } else { *regs.ip & 0xFFFF };
     if let Some((source, immediate, bytes, len)) = decode_mov_encoding(&|at| buf[at], buf.len(), def32) {
         let value = if source == 255 { immediate } else { regs.get(source, bytes) };
         for b in 0..bytes { bus.write8(off + b, (value >> (b * 8)) as u8); }
@@ -1230,4 +1238,213 @@ mod tests {
         assert_ne!(*regs.flags & (1 << 11), 0); // signed overflow
         assert_ne!(*regs.flags & (1 << 4), 0); // auxiliary borrow
     }
+}
+
+struct PlanarBus<'a> {
+    registers: &'a crate::Registers,
+    planes: crate::Memory<'a>,
+    aperture: core::ops::Range<u32>,
+    sequential: Option<crate::SequentialWrite>,
+    access: &'a mut dyn TrapAccess,
+}
+
+impl FaultBus for PlanarBus<'_> {
+    fn read8(&mut self, off: u32) -> u8 { self.registers.read(self.planes, off as usize) }
+    fn write8(&mut self, off: u32, value: u8) { self.registers.write(self.planes, off as usize, value); }
+    fn offset(&self, address: u32) -> Option<u32> {
+        self.aperture.contains(&address).then(|| address - self.aperture.start)
+    }
+    fn accessible(&self, address: u32, len: u32, write: bool) -> bool {
+        let Some(end) = address.checked_add(len) else { return false };
+        let mut at = address;
+        while at < end {
+            if self.aperture.contains(&at) {
+                at = end.min(self.aperture.end);
+            } else {
+                let next = end.min((at | 4095).saturating_add(1));
+                if !self.access.resident(at, next - at, write) { return false; }
+                at = next;
+            }
+        }
+        true
+    }
+    fn guest_read(&self, address: u32) -> u8 { unsafe { self.access.read(address) } }
+    fn guest_read_bytes(&self, address: u32, bytes: &mut [u8]) {
+        unsafe { self.access.read_bytes(address, bytes); }
+    }
+    fn guest_write(&mut self, address: u32, value: u8) { unsafe { self.access.write(address, value); } }
+    fn copy_from_ram(&mut self, source: u32, destination: u32, len: u32) -> bool {
+        let Some(end) = source.checked_add(len) else { return false };
+        if destination < self.aperture.start
+            || destination.checked_add(len).is_none_or(|end| end > self.aperture.end)
+            || source < self.aperture.end && end > self.aperture.start
+        {
+            return false;
+        }
+        let Some(write) = self.sequential else { return false; };
+        let offset = (destination - self.aperture.start) as usize;
+        if let Some(pointer) = self.access.direct_ram(source, len) {
+            write.write(self.planes, offset, len as usize, |i| unsafe { pointer.add(i).read_volatile() });
+        } else {
+            if !self.access.resident(source, len, false) { return false; }
+            write.write(self.planes, offset, len as usize, |i| unsafe { self.access.read(source + i as u32) });
+        }
+        true
+    }
+    fn fpu_st0(&self) -> [u8; 10] { self.access.fpu_st0() }
+    fn fpu_pop(&mut self) { self.access.fpu_pop(); }
+}
+
+/// Emulate a data access. Both the installed hook and the kernel use this
+/// function. The caller controls whether guest RAM access may need paging.
+pub fn planar_fault(
+    registers: &crate::Registers, planes: crate::Memory<'_>, access: &mut dyn TrapAccess,
+    regs: &mut Operands<'_>, segments: &[u32; 6], code_limit: u32, default32: bool, address: u32,
+) -> bool {
+    let Some((aperture, sequential)) = registers.trap_mode()
+        .filter(|(range, _)| range.contains(&address)) else { return false };
+    planar_access(registers, planes, access, regs, (segments[1], code_limit, default32),
+        aperture, sequential, address, false, |_| *segments).is_some()
+}
+
+fn planar_access(
+    registers: &crate::Registers, planes: crate::Memory<'_>, access: &mut dyn TrapAccess,
+    regs: &mut Operands<'_>, (code_base, code_limit, default32): (u32, u32, bool),
+    aperture: core::ops::Range<u32>, sequential: Option<crate::SequentialWrite>, address: u32, fetched: bool,
+    segments: impl FnOnce(&dyn TrapAccess) -> [u32; 6],
+) -> Option<usize> {
+    let offset = address - aperture.start;
+    let ip = if default32 { *regs.ip } else { *regs.ip & 65535 };
+    let code = code_base.checked_add(ip)?;
+    let remaining = code_limit.checked_sub(ip)?;
+    let available = (u64::from(remaining) + 1).min(15).min(u64::from(4096 - (code & 4095))) as u32;
+    let pointer = if fetched && !aperture.contains(&code) {
+        unsafe { access.fetched_code(code) }
+    } else {
+        None
+    };
+    if !aperture.contains(&code) && let Some(write) = sequential {
+        let register = |index, width| regs.get(index, width);
+        let store = if let Some(pointer) = pointer {
+            decode_mov_store_from(|i| unsafe { pointer.add(i).read_volatile() },
+                available as usize, default32, register)
+        } else if access.resident(code, available, false) {
+            decode_mov_store_from(|i| unsafe { access.read(code + i as u32) },
+                available as usize, default32, register)
+        } else {
+            None
+        };
+        if let Some((value, bytes, len)) = store
+            && bytes <= aperture.end - address
+        {
+            write.write(planes, offset as usize, bytes as usize, |i| (value >> (i * 8)) as u8);
+            let next = ip.wrapping_add(len);
+            *regs.ip = if default32 { next } else { next & 65535 };
+            return Some(0);
+        }
+    }
+    if remaining < 15 || code.checked_add(16).is_none_or(|end|
+        code < aperture.end && end > aperture.start) { return None; }
+    let segments = segments(access);
+    let mut bus = PlanarBus { registers, planes, aperture, sequential, access };
+    let handled = if let Some(pointer) = pointer {
+        let mut bytes = [0; 16];
+        let first = (4096 - (code & 4095)).min(bytes.len() as u32) as usize;
+        for (i, byte) in bytes[..first].iter_mut().enumerate() {
+            *byte = unsafe { pointer.add(i).read_volatile() };
+        }
+        if first < bytes.len() {
+            let next = code + first as u32;
+            let tail = &mut bytes[first..];
+            if !bus.accessible(next, tail.len() as u32, false) { return None; }
+            bus.guest_read_bytes(next, tail);
+        }
+        emulate_code(&mut bus, regs, &bytes, default32, &segments, offset)
+    } else {
+        emulate(&mut bus, regs, code_base, default32, &segments, offset)
+    };
+    handled.then_some(1)
+}
+
+/// The entry hook is linked into each execution image. The two regions carry
+/// the device's register page and its physical plane storage.
+pub unsafe fn trap_handler(state: InstructionState<'_>, access: &mut dyn TrapAccess, regions: [*mut u8; 2]) -> bool {
+    use arch_abi::eflags::*;
+    let flags = *state.flags;
+    if flags & TF_FLAG != 0 || flags & (VIF_FLAG | VIP_FLAG) == (VIF_FLAG | VIP_FLAG) {
+        return false;
+    }
+    if !match state.vector { 14 => state.error & !3 == 4, 13 => state.error == 0, _ => false } {
+        return false;
+    }
+    let registers = unsafe { &*regions[0].cast::<crate::Registers>() };
+    if registers.enabled.get() == 0 { return false; }
+    let fault = if state.vector == 14 {
+        let Ok(address) = u32::try_from(state.address) else { return false };
+        let Some((aperture, sequential)) = registers.trap_mode()
+            .filter(|(range, _)| range.contains(&address)) else { return false };
+        Some((address, aperture, sequential))
+    } else {
+        if !matches!(*state.gprs[2] as u16, 0x3c4 | 0x3c5) { return false; }
+        None
+    };
+    let start = (registers.profile_enabled.get() != 0).then(cycles);
+    let vm86 = flags & VM_FLAG != 0;
+    let segment = |access: &dyn TrapAccess, sel| {
+        if vm86 { (u32::from(sel) << 4, 65535, false) } else { access.segment(sel) }
+    };
+    let (base, limit, default32) = segment(access, state.selectors[1]);
+    let mut regs = Operands { gprs: state.gprs, high: state.high, ip: state.ip, flags: state.flags };
+    if let Some((address, aperture, sequential)) = fault {
+        let planes = unsafe { crate::Memory::mapped(regions[1], 4 * 65536) };
+        let kind = planar_access(registers, planes, access, &mut regs, (base, limit, default32),
+            aperture, sequential, address, true, |access| state.selectors.map(|sel| segment(access, sel).0));
+        if let (Some(start), Some(kind)) = (start, kind) {
+            registers.profile.record(kind, cycles().wrapping_sub(start));
+        }
+        return kind.is_some();
+    }
+    let ip = *regs.ip;
+    let Some(code) = base.checked_add(ip) else { return false };
+    // Both bytes must be within the current code segment and fetched page.
+    // A code-limit #GP must fall through before we ask for a fetched view.
+    if limit.saturating_sub(ip) < 1 || code & 4095 == 4095
+        || registers.trap_mode().is_some_and(|(range, _)| range.contains(&code))
+    {
+        return false;
+    }
+    let pointer = unsafe { access.fetched_code(code) };
+    if pointer.is_none() && !access.resident(code, 2, false) { return false; }
+    let read = |offset: u32| unsafe {
+        if let Some(pointer) = pointer { pointer.add(offset as usize).read_volatile() }
+        else { access.read(code + offset) }
+    };
+    let first = read(0);
+    let (opcode, operand32, length) = if first == 0x66 {
+        (read(1), !default32, 2)
+    } else {
+        (first, default32, 1)
+    };
+    let port = regs.get(2, 2) as u16;
+    let word = opcode == 0xef && !operand32;
+    if !(opcode == 0xee && matches!(port, 0x3c4 | 0x3c5) || word && port == 0x3c4)
+        || !registers.mask_out(port, regs.get(0, 2) as u16, word)
+    {
+        return false;
+    }
+    let next = ip.wrapping_add(length);
+    *regs.ip = if default32 { next } else { next & 65535 };
+    if let Some(start) = start {
+        registers.profile.record(3, cycles().wrapping_sub(start));
+    }
+    true
+}
+
+fn cycles() -> u64 {
+    #[cfg(target_arch = "x86")]
+    { unsafe { core::arch::x86::_rdtsc() } }
+    #[cfg(target_arch = "x86_64")]
+    { unsafe { core::arch::x86_64::_rdtsc() } }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    { 0 }
 }

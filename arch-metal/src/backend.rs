@@ -1,4 +1,4 @@
-//! `Metal` — the bare-metal `arch_abi::Arch` implementor.
+//! `Metal` — the bare-metal `arch_abi::Core` implementor.
 //!
 //! Mirror of `arch-interp`'s `Interp`: every method delegates to the existing
 //! ring-0 surface (the `int 0x80` call wrappers in `calls.rs`, the `x86`
@@ -9,20 +9,34 @@
 use crate::mapping::{Read, Replace, Fill, ReadRun, invoke};
 use arch_abi::{MappingError, MappingFailure, UserPage};
 use arch_abi::page_entry::PageEntry;
-use super::paging2::RootPageTable;
+use super::paging2::AddressSpace;
 use super::x86::FxState;
 use arch_abi::{X86, Memory, Diagnostics, ExecutionProfile, ExecutionProfileStage};
 
 #[cfg(not(feature = "kvm"))]
-use arch_abi::{Arch, KernelEvent, Regs};
+use arch_abi::{Core, KernelEvent, Regs};
 
 /// Zero-sized handle to the current CPU. Trap state lives in CPU-local TLS;
 /// machine-wide resources remain shared.
-pub struct Metal;
+pub struct Metal {
+    _local: core::marker::PhantomData<*mut ()>,
+}
+
+impl Metal {
+    /// Bind the handle to the current processor.
+    ///
+    /// # Safety
+    /// The caller must have exclusive access to this core for the entire
+    /// lifetime of the handle. A trap may borrow access while execution is
+    /// suspended and must return it before resuming.
+    pub const unsafe fn bind_current() -> Self {
+        Self { _local: core::marker::PhantomData }
+    }
+}
 
 impl X86 for Metal {
-    unsafe fn bind_planar(&mut self, mut binding: Option<::planar::Binding>) {
-        unsafe { invoke(crate::arch_call::BIND_PLANAR, &mut binding); }
+    unsafe fn install_trap_hook(&mut self, mut hook: Option<arch_abi::entry::TrapHook>) {
+        unsafe { invoke(crate::arch_call::INSTALL_TRAP_HOOK, &mut hook); }
     }
     fn isa_unmask_irq(&mut self, line: u8) {
         #[cfg(not(feature = "kvm"))]
@@ -134,14 +148,14 @@ impl Memory for Metal {
         })
     }
 
-    type PageTable = RootPageTable;
+    type AddressSpace = AddressSpace;
 
-    fn activate(&mut self, mut incoming: RootPageTable) -> RootPageTable {
+    fn activate(&mut self, mut incoming: AddressSpace) -> AddressSpace {
         super::calls::arch_activate(&mut incoming);
         incoming
     }
 
-    fn user_fork(&mut self, child: &mut RootPageTable, pages: arch_abi::page_supply::PageInput) -> ((), arch_abi::page_supply::PageInput) {
+    fn user_fork(&mut self, child: &mut AddressSpace, pages: arch_abi::page_supply::PageInput) -> ((), arch_abi::page_supply::PageInput) {
         crate::memory::with_input(pages, || {
             super::calls::arch_user_fork(child)
         })
@@ -149,7 +163,7 @@ impl Memory for Metal {
 
     fn free_user_pages(&mut self) { super::calls::arch_free_user_pages() }
 
-    fn destroy_space(&mut self, _root: &mut RootPageTable) {}
+    fn destroy_space(&mut self, _root: &mut AddressSpace) {}
 
 
     fn supply_pages(&self, pages: arch_abi::page_supply::PageInput) -> (usize, arch_abi::page_supply::PageInput) {
@@ -158,7 +172,7 @@ impl Memory for Metal {
 }
 
 #[cfg(not(feature = "kvm"))]
-impl Arch for Metal {
+impl Core for Metal {
     fn interrupt_processor(&mut self, processor: u32) {
         unsafe { core::arch::asm!("int 0x80", in("eax") crate::arch_call::INTERRUPT_PROCESSOR as u32, in("edx") processor); }
     }

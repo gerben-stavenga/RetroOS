@@ -27,7 +27,34 @@ use arch_abi::{FORCED_TF_SHADOW, IoSize, KernelEvent, Regs, USER_TF_SHADOW, User
 use core::cell::RefCell;
 use core::ffi::c_void;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Prot};
-use unicorn_engine::{RegisterX86, Unicorn};
+use unicorn_engine::{RegisterX86, RegisterX86 as R, Unicorn};
+
+const LIVE_REGS: [R; 16] = [
+    R::EAX, R::ECX, R::EDX, R::EBX, R::ESP, R::EBP, R::ESI, R::EDI,
+    R::EIP, R::EFLAGS, R::ES, R::CS, R::SS, R::DS, R::FS, R::GS,
+];
+
+fn read_registers<const N: usize>(uc: &Unicorn<'_, Ctx>, regs: [R; N]) -> [u32; N] {
+    let ids = regs.map(|reg| reg as i32);
+    // These batches contain only registers at most 32 bits wide.
+    // The Rust batch wrapper allocates a Vec for the output pointers.
+    let mut values = [0u32; N];
+    let mut outputs = values.each_mut().map(|value| (value as *mut u32).cast::<c_void>());
+    let result = unsafe {
+        unicorn_engine::uc_reg_read_batch(uc.get_handle(), ids.as_ptr(), outputs.as_mut_ptr(), N as i32)
+    };
+    assert_eq!(result, uc_error::OK, "read live guest registers");
+    values
+}
+
+fn write_registers<const N: usize>(uc: &mut Unicorn<'_, Ctx>, regs: [R; N], values: [u32; N]) {
+    let ids = regs.map(|reg| reg as i32);
+    let inputs = values.each_ref().map(|value| (value as *const u32).cast_mut().cast::<c_void>());
+    let result = unsafe {
+        unicorn_engine::uc_reg_write_batch(uc.get_handle(), ids.as_ptr(), inputs.as_ptr(), N as i32)
+    };
+    assert_eq!(result, uc_error::OK, "write live guest registers");
+}
 
 /// Per-run hook scratch.
 #[derive(Default)]
@@ -47,6 +74,7 @@ struct Ctx {
     /// (faulting) delivery clobbers CR2 — so we snapshot it when the first fault
     /// fires, before the escalation, rather than reading it back afterwards.
     pending_cr2: u32,
+    trap_hook_enabled: bool,
     input_sequence: u64,
     deadline: u64,
 }
@@ -118,6 +146,21 @@ fn build() -> Unicorn<'static, Ctx> {
     uc.add_intr_hook(|uc, intno| {
         let vector = (intno & 0xFF) as u8;
         let is_int = intno & 0x100 != 0;
+        let error = ((intno >> 16) & 0xffff) as u16;
+        let address = if !is_int && matches!(vector, 14 | 8) {
+            uc.reg_read(RegisterX86::CR2).unwrap_or(0) as u32
+        } else {
+            0
+        };
+        if !is_int && uc.get_data().trap_hook_enabled
+            && uc.get_data().pending.is_none() && uc.get_data().pending_intr.is_none()
+        {
+            if let Some(hook) = TRAP_HOOK.get() {
+                // Unicorn has restored the faulting instruction. Updating
+                // live operands here keeps execution inside this emu_start.
+                if offer_trap(uc, hook, vector, error, address) { return; }
+            }
+        }
         // Debug single-steps are reflected as `KernelEvent::DebugTrap`; DOS
         // attributes the trap to its active TF sources.
         // A page fault is the paging backend's own business: demand-commit or
@@ -133,12 +176,11 @@ fn build() -> Unicorn<'static, Ctx> {
             // escalates to #DF (8) calls this hook twice in one instruction, and
             // the escalation's CR2 is garbage. The first call wins.
             if uc.get_data().pending_intr.is_none() {
-                let cr2 = uc.reg_read(RegisterX86::CR2).unwrap_or(0) as u32;
                 let d = uc.get_data_mut();
                 d.pending_intr = Some(vector);
                 d.pending_is_int = false;
-                d.pending_err = ((intno >> 16) & 0xFFFF) as u16;
-                d.pending_cr2 = cr2;
+                d.pending_err = error;
+                d.pending_cr2 = address;
             }
 
             let _ = uc.emu_stop();
@@ -278,25 +320,22 @@ fn io_with<R>(f: impl FnOnce(&mut Unicorn<'static, Ctx>) -> R) -> R {
 
 /// The guest's x87 ST(0) as its raw 80-bit extended encoding. Non-destructive:
 /// the software core's FPU stack is only read.
-pub fn fpu_st0() -> [u8; 10] {
+pub fn fpu_st0() -> [u8; 10] { io_with(|uc| read_fpu_st0(uc)) }
+fn read_fpu_st0(uc: &Unicorn<'_, Ctx>) -> [u8; 10] {
     let mut out = [0u8; 10];
-    io_with(|uc| {
-        if let Ok(bytes) = uc.reg_read_long(RegisterX86::ST0) {
-            let n = bytes.len().min(10);
-            out[..n].copy_from_slice(&bytes[..n]);
-        }
-    });
+    if let Ok(bytes) = uc.reg_read_long(RegisterX86::ST0) {
+        let n = bytes.len().min(10);
+        out[..n].copy_from_slice(&bytes[..n]);
+    }
     out
 }
 
-/// Pop the guest's x87 stack. `FPSW` bits 13:11 are the stack top, so a pop is
-/// an increment of that field — the same thing `fstp` does to `fpstt`.
-pub fn fpu_pop() {
-    io_with(|uc| {
-        let fpsw = uc.reg_read(RegisterX86::FPSW).unwrap_or(0);
-        let top = ((fpsw >> 11) & 7) + 1;
-        let _ = uc.reg_write(RegisterX86::FPSW, (fpsw & !(7 << 11)) | ((top & 7) << 11));
-    });
+/// Pop the guest's x87 stack by updating FPSW's stack-top field.
+pub fn fpu_pop() { io_with(pop_fpu); }
+fn pop_fpu(uc: &mut Unicorn<'_, Ctx>) {
+    let fpsw = uc.reg_read(RegisterX86::FPSW).unwrap_or(0);
+    let top = ((fpsw >> 11) & 7) + 1;
+    let _ = uc.reg_write(RegisterX86::FPSW, (fpsw & !(7 << 11)) | ((top & 7) << 11));
 }
 
 /// Exchange the software core's x87/SSE registers using the FXSAVE layout.
@@ -362,7 +401,7 @@ pub fn fx_switch(fx: &mut crate::machine::FxState) {
 // `&mut *(&raw mut REGS)` is the `&raw`-first form that avoids a
 // `static_mut_refs` reference; clippy's `deref_addrof` rewrite would reintroduce it.
 #[allow(clippy::deref_addrof)]
-pub fn execute(max_time: core::time::Duration) -> KernelEvent {
+pub fn execute(core: &mut crate::Interp, max_time: core::time::Duration) -> KernelEvent {
     if max_time.is_zero() { return KernelEvent::Irq; }
     let deadline = crate::machine::now().saturating_add(max_time.as_nanos().min(u64::MAX as u128) as u64);
     let input_sequence = crate::machine::input_sequence();
@@ -380,6 +419,7 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
         // monitor calls) is a safe reborrow of it.
         let vcpu = unsafe { &mut *(&raw mut vcpu::REGS) };
         let mode = vcpu.mode();
+        uc.get_data_mut().trap_hook_enabled = mode != UserMode::Mode64;
         // The projected TF in `regs` requests one hardware step. The resulting
         // `#DB` is reflected below as `KernelEvent::DebugTrap`; DOS owns source
         // attribution, so the interpreter only needs to let it run.
@@ -446,11 +486,11 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
                 }
                 break; // genuine fault — handled below as PageFault
             }
+            if uc.get_data().pending.is_some() || uc.get_data().pending_intr.is_some() {
+                break;
+            }
             let eip = uc.reg_read(RegisterX86::EIP).unwrap_or(0);
-            if uc.get_data().pending.is_some()
-                || uc.get_data().pending_intr.is_some()
-                || !(SYS_BASE..SYS_BASE + SYS_SIZE as u64).contains(&eip)
-            {
+            if !(SYS_BASE..SYS_BASE + SYS_SIZE as u64).contains(&eip) {
                 break;
             }
             run = uc.emu_start(eip, 0xFFFF_FFFF, 0, 1);
@@ -510,7 +550,7 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
                 let vif_was_on = vcpu.flags32() & eflags::VIF_FLAG != 0;
                 let stepped = arch_abi::monitor::stepping(&vcpu.regs);
                 let user_was = vcpu.user_tf();
-                match arch_abi::monitor::monitor(&mut crate::backend::Interp, &mut vcpu.regs) {
+                match arch_abi::monitor::monitor(core, &mut vcpu.regs) {
                     MonitorResult::Resume => {
                         // A PM CLI/STI toggled virtual IF: reflect the window
                         // boundary to the DOS personality (dpmi::vif owns the
@@ -743,29 +783,24 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
     }
     let w = |uc: &mut Unicorn<'static, Ctx>, reg, v: u64| { let _ = uc.reg_write(reg, v); };
 
-    w(uc, RegisterX86::EAX, r.rax);
-    w(uc, RegisterX86::EBX, r.rbx);
-    w(uc, RegisterX86::ECX, r.rcx);
-    w(uc, RegisterX86::EDX, r.rdx);
-    w(uc, RegisterX86::ESI, r.rsi);
-    w(uc, RegisterX86::EDI, r.rdi);
-    w(uc, RegisterX86::EBP, r.rbp);
+    write_registers(uc, [R::EAX, R::EBX, R::ECX, R::EDX, R::ESI, R::EDI, R::EBP], [
+        r.rax as u32, r.rbx as u32, r.rcx as u32, r.rdx as u32, r.rsi as u32,
+        r.rdi as u32, r.rbp as u32,
+    ]);
 
     // Most device exits change only general registers and IP. Keep the loaded
     // segment caches and paging context when they still describe this frame;
     // rebuilding them through real mode + IRET flushes the TLB on every VGA
     // store. Descriptor edits and address-space changes require a full entry.
-    if mode == UserMode::Mode32 && !crate::desc::tables_dirty()
-        && uc.reg_read(RegisterX86::CR0).unwrap_or(0) & 0x8000_0001 == 0x8000_0001
-        && uc.reg_read(RegisterX86::EFLAGS).unwrap_or(u64::from(eflags::VM_FLAG)) & u64::from(eflags::VM_FLAG) == 0
-        && uc.reg_read(RegisterX86::CR3).unwrap_or(u64::MAX)
-            == crate::paging::frame_phys(crate::paging::active_pd()) as u64
-        && [
-            (RegisterX86::CS, r.code_seg()), (RegisterX86::SS, r.stack_seg()),
-            (RegisterX86::DS, r.ds as u16), (RegisterX86::ES, r.es as u16),
-            (RegisterX86::FS, r.fs as u16), (RegisterX86::GS, r.gs as u16),
-        ].into_iter().all(|(reg, selector)| uc.reg_read(reg).ok() == Some(selector as u64))
-    {
+    if mode == UserMode::Mode32 && !crate::desc::tables_dirty() && {
+        let [cr0, flags, cr3, cs, ss, ds, es, fs, gs] =
+            read_registers(uc, [R::CR0, R::EFLAGS, R::CR3, R::CS, R::SS, R::DS, R::ES, R::FS, R::GS]);
+        cr0 & 0x8000_0001 == 0x8000_0001
+            && flags & eflags::VM_FLAG == 0
+            && cr3 == crate::paging::frame_phys(crate::paging::active_pd())
+            && [cs, ss, ds, es, fs, gs].map(|seg| seg as u16)
+                == [r.code_seg(), r.stack_seg(), r.ds as u16, r.es as u16, r.fs as u16, r.gs as u16]
+    } {
         let flags = vif_to_if((r.flags32() & !eflags::VM_FLAG & !eflags::IOPL_MASK & !eflags::NT_FLAG) | (1 << eflags::IOPL_SHIFT) | eflags::FIXED_ONE);
         w(uc, RegisterX86::EFLAGS, flags as u64);
         w(uc, RegisterX86::ESP, r.sp32() as u64);
@@ -829,26 +864,29 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
 
 fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
     let tf_shadows = r.frame.rflags & (USER_TF_SHADOW | FORCED_TF_SHADOW);
-    let rd = |uc: &mut Unicorn<'static, Ctx>, reg| uc.reg_read(reg).unwrap_or(0);
-    r.rax = rd(uc, RegisterX86::EAX);
-    r.rbx = rd(uc, RegisterX86::EBX);
-    r.rcx = rd(uc, RegisterX86::ECX);
-    r.rdx = rd(uc, RegisterX86::EDX);
-    r.rsi = rd(uc, RegisterX86::ESI);
-    r.rdi = rd(uc, RegisterX86::EDI);
-    r.rbp = rd(uc, RegisterX86::EBP);
-    r.frame.rsp = rd(uc, RegisterX86::ESP);
-    r.frame.rip = rd(uc, RegisterX86::EIP);
+    let [ax, cx, dx, bx, sp, bp, si, di, ip, flags, es, cs, ss, ds, fs, gs] =
+        read_registers(uc, LIVE_REGS);
+    r.rax = u64::from(ax);
+    r.rbx = u64::from(bx);
+    r.rcx = u64::from(cx);
+    r.rdx = u64::from(dx);
+    r.rsi = u64::from(si);
+    r.rdi = u64::from(di);
+    r.rbp = u64::from(bp);
+    r.frame.rsp = u64::from(sp);
+    r.frame.rip = u64::from(ip);
+    if mode != UserMode::Mode64 {
+        // Far jumps and segment loads may have changed the live selectors.
+        r.set_cs32(cs);
+        r.set_ss32(ss);
+        r.ds = u64::from(ds);
+        r.es = u64::from(es);
+        r.fs = u64::from(fs);
+        r.gs = u64::from(gs);
+    }
 
     match mode {
         UserMode::VM86 => {
-            // Segments may have changed (mov/pop); read them back.
-            r.set_cs32(rd(uc, RegisterX86::CS) as u32);
-            r.set_ss32(rd(uc, RegisterX86::SS) as u32);
-            r.ds = rd(uc, RegisterX86::DS);
-            r.es = rd(uc, RegisterX86::ES);
-            r.fs = rd(uc, RegisterX86::FS);
-            r.gs = rd(uc, RegisterX86::GS);
             // Re-assert VM86 so `regs.mode()` stays VM86 for the kernel. Mirror
             // the emulated IF (bit 9) into the canonical VIF (bit 19) and set the
             // real IF = 1. The guest ran at real IOPL=1; its *virtual* IOPL — the
@@ -857,20 +895,10 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             // Mode32: forcing it to 1 here would erase the thread's IF policy on
             // its first exit).
             let viopl = r.frame.rflags & u64::from(eflags::IOPL_MASK);
-            let uc_fl = if_to_vif(rd(uc, RegisterX86::EFLAGS) as u32) as u64;
+            let uc_fl = u64::from(if_to_vif(flags));
             r.frame.rflags = (uc_fl & !u64::from(eflags::IOPL_MASK)) | viopl | u64::from(eflags::VM_FLAG) | tf_shadows;
         }
         UserMode::Mode32 => {
-            // PM client: a far jump / mov may have reloaded any selector — read
-            // them all back so the kernel sees the live segment state.
-            let cs = rd(uc, RegisterX86::CS) as u16;
-            let ss = rd(uc, RegisterX86::SS) as u16;
-            r.set_cs32(cs as u32);
-            r.set_ss32(ss as u32);
-            r.ds = rd(uc, RegisterX86::DS);
-            r.es = rd(uc, RegisterX86::ES);
-            r.fs = rd(uc, RegisterX86::FS);
-            r.gs = rd(uc, RegisterX86::GS);
             // The guest ran at CPL=3/IOPL=1, so CLI/STI #GP'd into the monitor;
             // mirror the emulated IF (bit 9) into the canonical VIF (bit 19) and
             // set the real IF = 1.
@@ -886,22 +914,22 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             // closes. (Nothing else can set it: the client's own PUSHF/POPF go
             // through the monitor while a window is open.)
             let viopl = r.frame.rflags & u64::from(eflags::IOPL_MASK);
-            let uc_fl = if_to_vif(rd(uc, RegisterX86::EFLAGS) as u32) as u64;
+            let uc_fl = u64::from(if_to_vif(flags));
             r.frame.rflags = (uc_fl & !u64::from(eflags::IOPL_MASK)) | viopl | tf_shadows;
             // On a 16-bit stack/code segment only SP / IP are meaningful. The
             // ring-0 → ring-3 `iretd` trampoline leaves the high half of ESP
             // (and possibly EIP) holding stale bits from the trampoline's own
             // 32-bit stack, since x86 keeps the upper bits when SS/CS are 16-bit.
             // The kernel treats these as flat offsets, so normalize them here.
-            if !crate::desc::seg_is_32(ss) {
+            if !crate::desc::seg_is_32(ss as u16) {
                 r.frame.rsp &= 0xFFFF;
             }
-            if !crate::desc::seg_is_32(cs) {
+            if !crate::desc::seg_is_32(cs as u16) {
                 r.frame.rip &= 0xFFFF;
             }
         }
         UserMode::Mode64 => {
-            r.frame.rflags = rd(uc, RegisterX86::EFLAGS) | tf_shadows;
+            r.frame.rflags = u64::from(flags) | tf_shadows;
         }
     }
 }
@@ -909,7 +937,7 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
 #[cfg(test)]
 mod execution_tests {
     use arch_abi::eflags;
-    use arch_abi::{Arch as _, GuestBytes, Irq, KernelEvent, Regs};
+    use arch_abi::{Core as _, GuestBytes, Irq, KernelEvent, Regs};
 
     #[test]
     fn port_io_stops_before_the_next_instruction() {
@@ -943,7 +971,7 @@ mod execution_tests {
     #[test]
     fn protected_reentry_observes_flags_and_descriptor_changes() {
         crate::phys::init_test_ram();
-        let mut machine = crate::backend::Interp;
+        let mut machine = crate::backend::Interp::local();
         let mut ldt = [0,
             crate::sysdesc::gdt_desc(0, 0xfffff, 0xfa, 0xc),
             crate::sysdesc::gdt_desc(0, 0xfffff, 0xf2, 0xc)];
@@ -983,7 +1011,7 @@ mod execution_tests {
         crate::phys::init_test_ram();
         crate::machine::install_input_sink(receive_input);
         crate::phys::init_test_ram();
-        let mut machine = crate::backend::Interp;
+        let mut machine = crate::backend::Interp::local();
         crate::backend::check_virtual_irq_frame(&mut machine);
         machine.copy_to(0x7c00, &[0xcd, 0x31], crate::test_memory::input(5));
         machine.copy_to(0x7e00, &[0xeb, 0xfe], crate::test_memory::input(5));
@@ -1024,4 +1052,138 @@ mod execution_tests {
         assert!(matches!(machine.execute(&mut regs, &io, core::time::Duration::from_millis(100)).0, KernelEvent::SoftInt(0x31)));
         drain_input(&mut |event, _| assert!(matches!(event, Irq::Key(0xae))));
     }
+
+    #[test]
+    fn planar_hook_handles_raw_page_fault_and_resumes() {
+        use arch_abi::{Memory, UserPage, page_entry::PageEntry};
+        crate::phys::init_test_ram();
+        let mut machine = crate::backend::Interp::local();
+        let layout = std::alloc::Layout::from_size_align(65 * 4096, 4096).unwrap();
+        let storage = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!storage.is_null());
+        let registers = unsafe { &*storage.cast::<planar::Registers>() };
+        let planes = unsafe { storage.add(4096) };
+        registers.enabled.set(1);
+        registers.seq.set(4, 4);
+        registers.seq.set(2, 1);
+        registers.gc.set(8, 255);
+        registers.gc.set(6, 4);
+        let page = UserPage::new(0xa0000).unwrap();
+        unsafe { machine.fill_mappings(page, 16, PageEntry::Intercepted, crate::test_memory::input(5)).0.unwrap(); }
+        // 300 VGA stores exceed the old stop-and-restart loop's limit.
+        // mov al,5a; mov ecx,300; loop over mov [a0000],al; mov al,[a0000]; int 80h
+        let code = [0xb0, 0x5a, 0xb9, 0x2c, 1, 0, 0,
+            0xa2, 0, 0, 0xa, 0, 0xe2, 0xf9, 0xa0, 0, 0, 0xa, 0, 0xcd, 0x80];
+        machine.copy_to(0x12000, &code, crate::test_memory::input(5));
+        let mut regs = Regs::empty();
+        regs.init_user_process(0x12000, 0x80000);
+        let io = arch_abi::IoPolicy::deny_all();
+        let limit = core::time::Duration::from_secs(1);
+        unsafe { planar::bind(&mut machine, Some(planar::Binding { registers, planes })); }
+        let (event, _) = machine.execute(&mut regs, &io, limit);
+        assert!(matches!(event, KernelEvent::SoftInt(0x80)), "{event:?}");
+        assert_eq!(regs.rax as u8, 0x5a);
+        assert_eq!(registers.latches.read(), [0x5a, 0, 0, 0]);
+        unsafe { planar::bind(&mut machine, None); }
+        regs.set_ip32(0x12007);
+        assert!(matches!(machine.execute(&mut regs, &io, limit).0, KernelEvent::PageFault { addr: 0xa0000 }));
+        unsafe { std::alloc::dealloc(storage, layout); }
+    }
+
+}
+
+thread_local! {
+    static TRAP_HOOK: core::cell::Cell<Option<arch_abi::entry::TrapHook>> = const { core::cell::Cell::new(None) };
+}
+
+pub(crate) fn install_trap_hook(hook: Option<arch_abi::entry::TrapHook>) {
+    TRAP_HOOK.set(hook);
+}
+
+struct TrapMemory<'a, 'uc> {
+    uc: &'a mut Unicorn<'uc, Ctx>,
+    read_page: core::cell::Cell<Option<(u32, u32)>>,
+    paging: core::cell::OnceCell<crate::paging::PagingGuard>,
+}
+unsafe impl arch_abi::entry::TrapAccess for TrapMemory<'_, '_> {
+    fn segment(&self, selector: u16) -> (u32, u32, bool) {
+        (crate::desc::seg_base(selector), crate::desc::seg_limit(selector), crate::desc::seg_is_32(selector))
+    }
+    fn resident(&self, address: u32, len: u32, write: bool) -> bool {
+        let Some(end) = address.checked_add(len) else { return false };
+        if write || end > 0xc000_0000 { return false; }
+        self.paging.get_or_init(crate::paging::PagingGuard::lock);
+        // RAM writes need Unicorn's code invalidation. Let the kernel's
+        // ordinary byte access perform it when this is the destination.
+        (address / 4096..end.div_ceil(4096)).all(|page| {
+            crate::paging::space_translate(page * 4096).is_some()
+        })
+    }
+    fn direct_ram(&self, address: u32, len: u32) -> Option<*const u8> {
+        let end = address.checked_add(len)?;
+        if len == 0 || end > 0xc000_0000 { return None; }
+        self.paging.get_or_init(crate::paging::PagingGuard::lock);
+        let page = address & !4095;
+        let physical = crate::paging::space_translate(page)?;
+        let mut next = page + 4096;
+        while next < end {
+            if crate::paging::space_translate(next)? != physical + (next - page) {
+                return None;
+            }
+            next += 4096;
+        }
+        Some(unsafe { crate::phys::region_base().add((physical | (address & 4095)) as usize) })
+    }
+    unsafe fn fetched_code(&self, address: u32) -> Option<*const u8> {
+        self.direct_ram(address, 1)
+    }
+    unsafe fn read(&self, address: u32) -> u8 {
+        let page = address & !4095;
+        let physical = match self.read_page.get() {
+            Some((linear, physical)) if linear == page => physical,
+            _ => {
+                let physical = crate::paging::space_translate(page).expect("preflighted trap access");
+                self.read_page.set(Some((page, physical)));
+                physical
+            }
+        };
+        unsafe { crate::phys::region_base().add((physical | (address & 4095)) as usize).read_volatile() }
+    }
+    unsafe fn write(&mut self, _: u32, _: u8) { unreachable!("only VGA writes are resident"); }
+    fn fpu_st0(&self) -> [u8; 10] { read_fpu_st0(self.uc) }
+    fn fpu_pop(&mut self) { pop_fpu(self.uc); }
+}
+
+fn offer_trap(
+    uc: &mut Unicorn<'_, Ctx>, hook: arch_abi::entry::TrapHook,
+    vector: u8, error: u16, address: u32,
+) -> bool {
+    const GPRS: [R; 8] = [R::EAX, R::ECX, R::EDX, R::EBX, R::ESP, R::EBP, R::ESI, R::EDI];
+    let [ax, cx, dx, bx, sp, bp, si, di, saved_ip, saved_flags, es, cs, ss, ds, fs, gs] =
+        read_registers(uc, LIVE_REGS);
+    if saved_flags & eflags::VM_FLAG == 0 && cs & 3 != 3 { return false; }
+    let original = [ax, cx, dx, bx, sp, bp, si, di];
+    let mut gprs = original;
+    let mut ip = saved_ip;
+    let original_flags = if_to_vif(saved_flags);
+    let mut flags = original_flags;
+    let state = arch_abi::entry::InstructionState {
+        gprs: gprs.each_mut(), high: None, ip: &mut ip, flags: &mut flags,
+        selectors: [es as u16, cs as u16, ss as u16, ds as u16, fs as u16, gs as u16],
+        vector: u64::from(vector), error: u64::from(error), address: u64::from(address),
+    };
+    let mut access = TrapMemory {
+        uc, read_page: core::cell::Cell::new(None), paging: core::cell::OnceCell::new(),
+    };
+    let handled = unsafe { (hook.handler)(state, &mut access, hook.regions.map(|region| region.base)) };
+    drop(access);
+    // A declined REP may have completed an accessible prefix.
+    for ((register, value), previous) in GPRS.into_iter().zip(gprs).zip(original) {
+        if value != previous { uc.reg_write(register, u64::from(value)).expect("restore trap operand"); }
+    }
+    if flags != original_flags {
+        uc.reg_write(R::EFLAGS, u64::from(vif_to_if(flags))).expect("restore trap flags");
+    }
+    if ip != saved_ip { uc.reg_write(R::EIP, u64::from(ip)).expect("restore trap IP"); }
+    handled
 }

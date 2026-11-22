@@ -135,9 +135,10 @@ impl Video {
             };
             present_image(&self.fb, self.format, self.canvas, &mut self.last_output,
                 &mut self.scene, &mut self.composed, &mut self.row,
-                (self.scanout.geo.0, self.scanout.geo.1, self.format, &self.presented), &mut cooperate);
+                Some((self.scanout.geo.0, self.scanout.geo.1, self.format, &self.presented)),
+                &mut cooperate);
         } else {
-            let Some(image) = self.scanout.surface() else { return };
+            let image = self.voodoo.as_ref().and_then(|_| self.scanout.surface());
             present_image(&self.fb, self.format, self.canvas, &mut self.last_output,
                 &mut self.scene, &mut self.composed, &mut self.row, image, &mut media::checkpoint);
         }
@@ -170,14 +171,19 @@ impl Video {
 #[allow(clippy::too_many_arguments)] // Borrows disjoint renderer fields while scanout advances.
 fn present_image(fb: &Framebuffer, format: PixelFormat, canvas: (usize, usize),
     last_output: &mut Option<(usize, usize)>, scene: &mut Option<gui::ResidentScene>,
-    composed: &mut Vec<u8>, row: &mut Vec<u8>,
-    image: (usize, usize, PixelFormat, &[u8]), cooperate: &mut dyn FnMut()) {
-    let (w, h, image_format, pixels) = image;
+    composed: &mut Vec<u8>, row: &mut Vec<u8>, image: Option<(usize, usize, PixelFormat, &[u8])>,
+    cooperate: &mut dyn FnMut()) {
     let (width, height, pixels) = if let Some(scene) = scene {
-        let live = gui::PixelBuffer::new(w, h, w * usize::from(image_format.bytes_per_pixel), image_format, pixels).ok();
+        let live = image.and_then(|(w, h, pixel_format, pixels)| {
+            gui::PixelBuffer::new(w, h, w * usize::from(pixel_format.bytes_per_pixel), pixel_format, pixels).ok()
+        });
         scene.render(live, canvas.0, canvas.1, format, composed);
         (canvas.0, canvas.1, &composed[..])
-    } else { (w, h, pixels) };
+    } else if let Some((width, height, _, pixels)) = image {
+        (width, height, pixels)
+    } else {
+        return;
+    };
     let output = if (width, height) == canvas { canvas }
         else { native_output_size(fb.width, fb.height, width, height) };
     if *last_output != Some(output) {
@@ -261,7 +267,7 @@ impl Display {
         true
     }
 
-    pub(crate) fn publish_composition<'a, A: crate::Arch>(
+    pub(crate) fn publish_composition<'a, A: crate::Core>(
         &mut self, machine: &A, windows: &mut gui::WindowManager, width: usize, height: usize,
         dos_scanout: bool,
         resolve: impl Fn(gui::EndpointId, gui::SurfaceKey) -> Option<gui::PixelBuffer<'a>>,
@@ -326,8 +332,21 @@ mod tests {
         video.composed.resize(32, 0);
         video.render();
         assert!(pixels.iter().all(|&pixel| pixel == 0));
+        // A completed VGA frame has swapped its back buffer into presented.
+        // Its geometry may survive even when the replacement buffer is empty.
+        video.scanout.geo = (4, 2, 4, 2, 4, 2);
+        assert!(video.scanout.surface().is_none());
         video.retire_dos_scanout();
         video.render();
         assert!(pixels.iter().all(|&pixel| pixel == 0x0000ff00));
+
+        // A later terminal frame uses only the compositor's retained pixels.
+        let blue = [0x000000ffu32.to_le_bytes(); 8].concat();
+        windows.desktop_mut().damage_surface(endpoint, gui::SurfaceKey(1));
+        windows.publish_processes(&mut video.scene,
+            |_, _| gui::PixelBuffer::new(4, 2, 16, video.format, &blue).ok(),
+            video.owner, video.format);
+        video.render();
+        assert!(pixels.iter().all(|&pixel| pixel == 0x000000ff));
     }
 }

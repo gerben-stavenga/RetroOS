@@ -286,7 +286,8 @@ print('RESIDENT_BUILD_COMPLETE',flush=True)
                             last_screen = screen
                         if re.search(r'\[mem\] exit tid=1 code=[1-9]', log.read_text(errors='replace')):
                             raise RuntimeError('Codex startup failed; inspect private screen')
-                        ready = 'context left' in screen or re.search(r'gpt-6\.1-sol\s+(?:medium|default)\s+·', screen, re.I)
+                        ready = 'context left' in screen or re.search(
+                            r'(?im)^[ \t]*gpt-[\w.-]+[ \t]+(?:medium|default)[ \t]+·', screen)
                         if args.picker and picker_stage == 'startup' and ready:
                             picker_timings['startup_s'] = time.monotonic() - guest_started
                             if not args.no_profile:
@@ -344,7 +345,8 @@ print('RESIDENT_BUILD_COMPLETE',flush=True)
                                   'typing a draft without submitting', flush=True)
                             control.request('texthex ' + b'RESUME_TYPING_PROBE'.hex())
                             typed_at = time.monotonic()
-                        if typed_at and 'RESUME_TYPING_PROBE' in screen and time.monotonic() - typed_at >= 5 and (not args.background_build or benchmark_done):
+                        draft_visible = re.search(r'(?m)^[ \t]*[›>■][ \t]+RESUME_TYPING_PROBE[ \t]*$', screen)
+                        if typed_at and draft_visible and time.monotonic() - typed_at >= 5 and (not args.background_build or benchmark_done):
                             if not args.no_profile:
                                 control.request('profile dump', timeout=20)
                             print(f'PASS: Codex accepts typing after {"resume" if args.resume else "startup"} at {elapsed:.3f}s', flush=True)

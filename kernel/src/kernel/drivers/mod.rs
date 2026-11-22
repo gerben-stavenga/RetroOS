@@ -7,7 +7,7 @@
 //!
 //! Drivers reach the machine through `kernel::portio` (the injected
 //! `inb`/`outb` table) or `kernel::pci` config space, never through a bespoke
-//! `Arch` method — `trait Arch` stays minimal.
+//! `Core` method — `trait Core` stays minimal.
 
 pub mod ac97;
 pub mod alc298_amp;

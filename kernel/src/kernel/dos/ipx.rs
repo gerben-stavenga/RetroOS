@@ -3,7 +3,7 @@
 use arch_abi::eflags;
 use super::{DosState, ResumeCallback, machine, mode_transitions};
 use crate::kernel::net::lan;
-use crate::{Arch, Regs};
+use crate::{Core, Regs};
 use alloc::{collections::VecDeque, vec::Vec};
 
 const HEADER: usize = 30;
@@ -30,16 +30,16 @@ impl Far {
     fn valid(self, len: usize) -> bool {
         self.offset as usize + len <= 0x10000 && self.linear() + len <= 0xa0000
     }
-    fn byte<A: Arch>(self, m: &A, offset: usize) -> u8 {
+    fn byte<A: Core>(self, m: &A, offset: usize) -> u8 {
         m.read::<u8>((self.linear() + offset) as u64)
     }
-    fn word<A: Arch>(self, m: &A, offset: usize) -> u16 {
+    fn word<A: Core>(self, m: &A, offset: usize) -> u16 {
         m.read::<u16>((self.linear() + offset) as u64)
     }
-    fn put<A: Arch>(self, m: &mut A, offset: usize, value: u8) {
+    fn put<A: Core>(self, m: &mut A, offset: usize, value: u8) {
         m.write::<u8>((self.linear() + offset) as u64, value);
     }
-    fn esr<A: Arch>(self, m: &A) -> Far {
+    fn esr<A: Core>(self, m: &A) -> Far {
         Far {
             offset: self.word(m, 4),
             segment: self.word(m, 6),
@@ -88,7 +88,7 @@ impl IpxState {
             saved: None,
         }
     }
-    fn finish<A: Arch>(&mut self, m: &mut A, request: Pending, code: u8) {
+    fn finish<A: Core>(&mut self, m: &mut A, request: Pending, code: u8) {
         request.ecb.put(m, 9, code);
         request.ecb.put(m, 8, 0);
         let esr = request.ecb.esr(m);
@@ -106,7 +106,7 @@ impl IpxState {
         self.address.is_some()
     }
 
-    pub fn poll<A: Arch>(&mut self, m: &mut A) {
+    pub fn poll<A: Core>(&mut self, m: &mut A) {
         if !self.active {
             return;
         }
@@ -182,7 +182,7 @@ impl IpxState {
         }
     }
 
-    pub fn release<A: Arch>(&mut self, m: &mut A, owner: u16) {
+    pub fn release<A: Core>(&mut self, m: &mut A, owner: u16) {
         let numbers: Vec<_> = self
             .sockets
             .iter()
@@ -195,7 +195,7 @@ impl IpxState {
         self.pending.retain(|p| p.owner != owner);
         self.completed.retain(|p| p.owner != owner);
     }
-    fn close<A: Arch>(&mut self, m: &mut A, number: u16) {
+    fn close<A: Core>(&mut self, m: &mut A, number: u16) {
         self.sockets.retain(|s| s.number != number);
         let mut i = 0;
         while i < self.pending.len() {
@@ -223,7 +223,7 @@ fn valid_packet(packet: &[u8]) -> bool {
     (HEADER..=MAX_PACKET).contains(&packet.len())
         && u16::from_be_bytes([packet[2], packet[3]]) as usize == packet.len()
 }
-fn fragments<A: Arch>(m: &A, ecb: Far) -> Option<Vec<(Far, usize)>> {
+fn fragments<A: Core>(m: &A, ecb: Far) -> Option<Vec<(Far, usize)>> {
     if !ecb.valid(36) {
         return None;
     }
@@ -256,7 +256,7 @@ fn installed(regs: &mut Regs) {
     regs.es = super::dos::CTRL_STUB_SEG as u64;
     regs.rdi = (regs.rdi & !0xffff) | super::dos::ctrl_slot_off(super::dos::SLOT_IPX) as u64;
 }
-pub(crate) fn discover<A: Arch>(
+pub(crate) fn discover<A: Core>(
     m: &mut A,
     dos: &mut DosState<A>,
     regs: &mut Regs,
@@ -271,7 +271,7 @@ pub(crate) fn discover<A: Arch>(
         None
     }
 }
-pub(crate) fn api<A: Arch>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
+pub(crate) fn api<A: Core>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
     let owner = dos.current_psp;
     let state = &mut dos.ipx;
     state.active = true;
@@ -424,7 +424,7 @@ pub(crate) fn api<A: Arch>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
     }
 }
 
-pub(crate) fn deliver_callback<A: Arch>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) -> bool {
+pub(crate) fn deliver_callback<A: Core>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) -> bool {
     if dos.ipx.saved.is_some() || machine::guest_flags(regs) & eflags::IF_FLAG == 0 {
         return false;
     }
@@ -449,7 +449,7 @@ pub(crate) fn deliver_callback<A: Arch>(m: &mut A, dos: &mut DosState<A>, regs: 
     machine::set_vm86_ip(regs, done.esr.offset);
     true
 }
-pub(crate) fn callback_return<A: Arch>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
+pub(crate) fn callback_return<A: Core>(m: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
     for _ in 0..3 {
         let _ = machine::vm86_pop(m, regs);
     }

@@ -19,7 +19,7 @@ pub(super) fn immutable_media_path(path: &[u8]) -> bool {
         || (path.len() > prefix.len() && path.starts_with(prefix) && path[prefix.len()] == b'/')
 }
 
-pub(super) fn finish_file_read<A: crate::Arch>(
+pub(super) fn finish_file_read<A: crate::Core>(
     machine: &mut A,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
@@ -42,7 +42,7 @@ pub(super) fn finish_file_read<A: crate::Arch>(
 /// Complete an image-backed CD read only after its modeled transfer deadline.
 /// The guest remains parked, not the kernel: normal PIT advancement and IRQ0
 /// delivery continue while the DOS call is outstanding.
-pub(super) fn cdrom_read_resume<A: crate::Arch>(
+pub(super) fn cdrom_read_resume<A: crate::Core>(
     _machine: &mut A,
     deadline_ns: u64,
     buf_addr: u32,
@@ -65,7 +65,7 @@ pub(super) fn cdrom_read_resume<A: crate::Arch>(
 /// implicit terminator. Callers use the returned length and never need to
 /// materialize that terminator.
 #[inline(never)]
-pub(super) fn read_asciiz<A: crate::Arch>(machine: &mut A, address: u32, output: &mut [u8]) -> usize {
+pub(super) fn read_asciiz<A: crate::Core>(machine: &mut A, address: u32, output: &mut [u8]) -> usize {
     let mut len = 0;
     while len + 1 < output.len() {
         let byte = machine.read::<u8>((address as usize + len) as u64);
@@ -82,7 +82,7 @@ pub(super) const FIRST_USER_HANDLE: usize = 3;
 /// What a DOS handle refers to, for AH=45h/46h duplication. The std handles'
 /// slots are empty until something redirects them — their implicit console is
 /// made explicit here so a saved copy survives the redirect.
-pub(super) fn dos_dup_fdkind<A: crate::Arch>(kt: &thread::KernelThread<A>, handle: usize) -> Option<thread::FdKind> {
+pub(super) fn dos_dup_fdkind<A: crate::Core>(kt: &thread::KernelThread<A>, handle: usize) -> Option<thread::FdKind> {
     if handle >= thread::MAX_DOS_FDS { return None; }
     match kt.fds[handle] {
         thread::FdKind::None if handle <= 2 => Some(thread::FdKind::ConsoleOut),
@@ -133,7 +133,7 @@ pub(super) fn open_policies(mode: u8) -> Option<(crate::kernel::vfs::OpenAccess,
 /// Make an already-open VFS descriptor visible through DOS's JFT and SFT.
 /// Failure consumes the descriptor, so the three tables cannot disagree.
 #[inline(never)]
-fn publish_file_handle<A: crate::Arch>(
+fn publish_file_handle<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     dos: &thread::DosState<A>,
@@ -151,7 +151,7 @@ fn publish_file_handle<A: crate::Arch>(
 
 /// Apply DOS open/share semantics, then publish the descriptor as a handle.
 #[inline(never)]
-pub(super) fn accept_open_file<A: crate::Arch>(
+pub(super) fn accept_open_file<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     dos: &thread::DosState<A>,
@@ -176,7 +176,7 @@ pub(super) fn accept_open_file<A: crate::Arch>(
 
 /// Create a VFS object and publish its descriptor as a new DOS handle.
 #[inline(never)]
-pub(super) fn create_file_handle<A: crate::Arch>(
+pub(super) fn create_file_handle<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     dos: &thread::DosState<A>,
@@ -201,7 +201,7 @@ pub(super) enum PathTarget { Existing, New }
 /// Read and resolve a DOS path. A new target permits only the final component
 /// to be absent, as required by create and rename destinations.
 #[inline(never)]
-pub(super) fn resolve_guest_path<A: crate::Arch>(
+pub(super) fn resolve_guest_path<A: crate::Core>(
     machine: &mut A,
     dos: &thread::DosState<A>,
     regs: &Regs,
@@ -301,7 +301,7 @@ pub(super) fn dos_wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
 /// Resolve a raw DOS path to a VFS path for OPEN (all components must exist).
 /// Returns a heap-backed VFS path and its length, or a DOS error code.
 /// (2 = file not found, 3 = path not found, 15 = invalid drive).
-pub(crate) fn dfs_open_existing<A: crate::Arch>(dos: &thread::DosState<A>, dos_in: &[u8])
+pub(crate) fn dfs_open_existing<A: crate::Core>(dos: &thread::DosState<A>, dos_in: &[u8])
     -> Result<(alloc::vec::Vec<u8>, usize), i32>
 {
     // An empty name is not a file. `resolve` would fold it into the current
@@ -328,7 +328,7 @@ pub(crate) fn dfs_open_existing<A: crate::Arch>(dos: &thread::DosState<A>, dos_i
 
 /// Resolve a raw DOS path to a VFS path for CREATE (final component may not
 /// exist yet). Intermediate dirs must exist.
-pub(crate) fn dfs_create_path<A: crate::Arch>(dos: &thread::DosState<A>, dos_in: &[u8])
+pub(crate) fn dfs_create_path<A: crate::Core>(dos: &thread::DosState<A>, dos_in: &[u8])
     -> Result<(alloc::vec::Vec<u8>, usize), i32>
 {
     let mut abs = [0u8; dfs::DFS_PATH_MAX];
@@ -354,7 +354,7 @@ pub(super) mod dta {
 }
 
 /// Stamp a search's identity and cursor into the caller's DTA.
-pub(super) fn write_search_state<A: crate::Arch>(machine: &mut A, dta: usize, slot: u8, generation: u8, cursor: u16) {
+pub(super) fn write_search_state<A: crate::Core>(machine: &mut A, dta: usize, slot: u8, generation: u8, cursor: u16) {
     machine.write::<u16>((dta + dta::CURSOR) as u64, cursor);
     machine.write::<u8>((dta + dta::SLOT) as u64, slot);
     machine.write::<u8>((dta + dta::GENERATION) as u64, generation);
@@ -364,7 +364,7 @@ pub(super) fn write_search_state<A: crate::Arch>(machine: &mut A, dta: usize, sl
 /// Recover `(slot, cursor)` from a DTA, or `None` if it holds no live search
 /// of ours — an unpaired FindNext, a DTA the program has since overwritten,
 /// or a stale one whose slot has been recycled.
-fn read_search_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, dta: usize) -> Option<(usize, u16)> {
+fn read_search_state<A: crate::Core>(machine: &mut A, dos: &thread::DosState<A>, dta: usize) -> Option<(usize, u16)> {
     if machine.read::<u16>((dta + dta::MAGIC) as u64) != dta::MAGIC_VALUE {
         return None;
     }
@@ -380,7 +380,7 @@ fn read_search_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>,
 /// Claim a search slot, round-robin. Slots are never explicitly freed — DOS
 /// has no "close search" call — so the oldest simply gets recycled, and its
 /// generation bump invalidates any DTA still pointing at it.
-pub(super) fn alloc_search_slot<A: crate::Arch>(dos: &mut thread::DosState<A>) -> usize {
+pub(super) fn alloc_search_slot<A: crate::Core>(dos: &mut thread::DosState<A>) -> usize {
     let slot = dos.search_next as usize % dos.searches.len();
     dos.search_next = dos.search_next.wrapping_add(1);
     let s = &mut dos.searches[slot];
@@ -403,7 +403,7 @@ mod tests {
 
 /// FindFirst/FindNext helper: resume the search this DTA identifies, writing
 /// the match into the DTA and advancing the cursor kept there.
-pub(super) fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>) -> DosExit {
+pub(super) fn find_matching_file<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>) -> DosExit {
     let dta = dos.dta as usize;
     let Some((slot, cursor)) = read_search_state(machine, dos, dta) else {
         // FindNext with no live search in this DTA.

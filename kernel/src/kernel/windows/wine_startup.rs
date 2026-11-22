@@ -11,7 +11,7 @@ pub(super) fn emit_call(code: &mut Vec<u8>, address: u32, arguments: &[u32]) {
     code.extend_from_slice(&[0xff, 0xd0]);
 }
 
-pub(super) fn bootstrap<A: crate::Arch>(
+pub(super) fn bootstrap<A: crate::Core>(
     machine: &mut A,
     modules: &[Module],
     first: usize,

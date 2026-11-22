@@ -153,7 +153,7 @@ impl State {
         BASE + i as u32 * 4
     }
 }
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     args: [u32; 6],
@@ -379,7 +379,7 @@ impl Drop for Property {
 }
 
 /// Window property storage; names and numeric global atoms address the same key.
-pub(super) fn window_call<A: crate::Arch>(
+pub(super) fn window_call<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     args: [u32; 6],
@@ -549,7 +549,7 @@ fn matches_handle(full: u32, h: u32) -> bool {
     full == h || ((h >> 16 == 0 || h >> 16 == 0xffff) && full as u16 == h as u16)
 }
 
-pub(super) fn tree_call<A: crate::Arch>(
+pub(super) fn tree_call<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     args: [u32; 3],
@@ -1160,7 +1160,7 @@ fn publish_cursor(desktop:&Object,cursor:&Cursor) {
     session::write_object(desktop.offset,&shared);
 }
 
-pub(super) fn cursor_call<A: crate::Arch>(
+pub(super) fn cursor_call<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     args: [u32; 2],

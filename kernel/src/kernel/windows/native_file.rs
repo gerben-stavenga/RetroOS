@@ -2,7 +2,7 @@
 use super::*;
 use crate::kernel::vfs;
 
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     state: &mut WindowsState,

@@ -22,7 +22,7 @@ fn dpmi_install_check(regs: &mut Regs) {
     regs.rdi = (regs.rdi & !0xFFFF) | ctrl_slot_off(SLOT_DPMI_ENTRY) as u64;
 }
 
-pub(super) fn int_2fh<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn int_2fh<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ax = regs.rax as u16;
     match ax {
         // AX=1500h — MSCDEX installation check. The CD-ROM drive remains

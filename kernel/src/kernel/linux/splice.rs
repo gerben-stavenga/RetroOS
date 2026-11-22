@@ -5,7 +5,7 @@ use crate::kernel::kpipe;
 
 pub(super) struct Request { pipe: u8, length: usize, nonblocking: bool }
 impl Request {
-    pub fn new<A: crate::Arch>(kt: &thread::KernelThread<A>, a: &Args) -> Result<Self, i32> {
+    pub fn new<A: crate::Core>(kt: &thread::KernelThread<A>, a: &Args) -> Result<Self, i32> {
         if a.a5 & !15 != 0 { return Err(EINVAL); }
         let pipe = match kt.fds.get(a.a0 as usize) {
             Some(thread::FdKind::PipeRead(pipe)) => *pipe,

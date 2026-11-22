@@ -8,7 +8,7 @@ use crate::kernel::dos::machine::vm86_set_return_flag;
 use super::Bda;
 
 /// Returns true when INT 1Ch was chained using the existing IRET frame.
-pub(super) fn int08<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs) -> bool {
+pub(super) fn int08<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs) -> bool {
     // Timer tick. EOI before the 1C chain (the C BIOS EOI'd after
     // geninterrupt(0x1C) returned; chaining by frame-reuse means we
     // never regain control, so the EOI moves ahead of the handler).
@@ -43,14 +43,14 @@ pub(super) fn int08<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs
 // INT 1Ah: system timer
 // ============================================================================
 
-pub(super) fn int1a<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+pub(super) fn int1a<A: crate::Core>(machine: &mut A, regs: &mut Regs) {
     let rtc = matches!((regs.rax >> 8) as u8, 2 | 4);
     int1a_registers(machine, regs);
     if rtc { vm86_set_return_flag(machine, regs, eflags::CF_FLAG as u16, false); }
 }
 
 // Register-only BIOS clock ABI also used by protected-mode Win16 callers.
-pub(crate) fn int1a_registers<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+pub(crate) fn int1a_registers<A: crate::Core>(machine: &mut A, regs: &mut Regs) {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         0x00 => {
@@ -96,7 +96,7 @@ pub(crate) fn int1a_registers<A: crate::Arch>(machine: &mut A, regs: &mut Regs) 
 
 /// Win16 has no BIOS IRQ0 handler advancing the BDA. Anchor its clock to
 /// monotonic host time; setting BIOS ticks changes this anchor, not the RTC.
-pub(crate) fn win16_int1a<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
+pub(crate) fn win16_int1a<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs) {
     let now=machine.now();
     match (regs.rax>>8) as u8 {
         0 => {

@@ -15,7 +15,7 @@ fn output_ok(pointer: u64, bytes: u64) -> bool {
 
 /// Return the guest process's execution CPU and the single NUMA node.
 /// Kernel services may be handled by the BSP on behalf of that CPU.
-pub(super) fn getcpu<A: crate::Arch>(machine: &mut A, args: &Args, cpu: usize) -> SyscallResult {
+pub(super) fn getcpu<A: crate::Core>(machine: &mut A, args: &Args, cpu: usize) -> SyscallResult {
     if !output_ok(args.a0, 4) || !output_ok(args.a1, 4) {
         return SyscallResult::val(-EFAULT);
     }
@@ -44,7 +44,7 @@ fn entry(regs: &Regs, address: u64) -> Option<u32> {
     }
 }
 
-pub(super) fn emulate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, address: u64, cpu: usize) -> bool {
+pub(super) fn emulate<A: crate::Core>(machine: &mut A, regs: &mut Regs, address: u64, cpu: usize) -> bool {
     let Some(number) = entry(regs, address) else {
         return false;
     };

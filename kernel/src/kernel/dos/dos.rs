@@ -78,7 +78,7 @@ use self::multiplex::int_2fh;
 /// cleared (the trap gate at entry, an exception handler, …): pending
 /// kbd/timer IRQs queue in the vPIC but `pick_pending_vec` gates them on
 /// VIF, and VIF is bit 9 of the saved EFLAGS.
-fn park_at_slot_resume<A: crate::Arch>(_machine: &mut A, regs: &mut Regs) {
+fn park_at_slot_resume<A: crate::Core>(_machine: &mut A, regs: &mut Regs) {
     if regs.mode() == crate::UserMode::VM86 {
         machine::set_vm86_cs(regs, CTRL_STUB_SEG);
         machine::set_vm86_ip(regs, ctrl_slot_off(SLOT_RESUME));
@@ -98,12 +98,12 @@ fn merge_dos_status(saved_flags: u32, completed_flags: u32) -> u32 {
     (saved_flags & !eflags::STATUS_MASK) | (completed_flags & eflags::STATUS_MASK)
 }
 
-enum ResumeEntry<A: crate::Arch> {
+enum ResumeEntry<A: crate::Core> {
     Poll(super::ResumeCallback<A>),
     Int16 { echo: bool, func: u8 },
 }
 
-struct DosSuspension<A: crate::Arch> {
+struct DosSuspension<A: crate::Core> {
     entry: ResumeEntry<A>,
 }
 
@@ -112,7 +112,7 @@ struct DosSuspension<A: crate::Arch> {
 /// frame is popped, so no unfinished interrupt frame remains on the guest
 /// stack while the operation is parked. All mode-dependent framing is confined
 /// here; syscall implementations merely return a `DosSuspension`.
-fn suspend_dos_call<A: crate::Arch>(
+fn suspend_dos_call<A: crate::Core>(
     machine: &mut A,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
@@ -166,7 +166,7 @@ fn suspend_dos_call<A: crate::Arch>(
 /// than a tight `INT 31h` loop: the architecture advances IP past HLT and
 /// returns `KernelEvent::Hlt`, then the DOS event loop calls this function.
 /// Pending IRQs are still delivered normally between polls.
-pub(super) fn poll_suspended_call<A: crate::Arch>(
+pub(super) fn poll_suspended_call<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
@@ -209,7 +209,7 @@ pub(super) fn poll_suspended_call<A: crate::Arch>(
 }
 
 /// Win16 uses the same multiplex services as PMDOS. Buffer offsets are WORDs.
-pub(crate) fn win16_multiplex<A: crate::Arch>(
+pub(crate) fn win16_multiplex<A: crate::Core>(
     machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs,
 ) -> thread::KernelAction {
     let high_bx = regs.rbx & !0xffff;
@@ -228,7 +228,7 @@ pub(crate) fn win16_multiplex<A: crate::Arch>(
 /// Used by both the V86 stub dispatcher and the DPMI PM soft-int fast path.
 /// The caller is responsible for any mode-specific frame housekeeping after
 /// the call (V86 stack pop, PM return-frame restore, etc.).
-fn dispatch_kernel_syscall<A: crate::Arch>(
+fn dispatch_kernel_syscall<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
@@ -306,7 +306,7 @@ fn dispatch_kernel_syscall<A: crate::Arch>(
 /// real services or the IRET/EOI defaults (`bios::dispatch`), which own
 /// their frame pop. Caller (`syscall`) has already checked CS.
 #[inline(never)]
-pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn rm_vector_dispatch<A: crate::Core>(machine: &mut A, bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     debug_assert_eq!(vm86_cs(regs), STUB_SEG, "rm_vector_dispatch: CS must be STUB_SEG");
     let vector = ((ip.wrapping_sub(2)) / 2) as u8;
@@ -371,7 +371,7 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
 /// (XMS, save/restore) have a CS/IP frame to pop; everything else either
 /// switches mode outright or owns its unwind.
 #[inline(never)]
-pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
+pub(super) fn rm_ctrl_dispatch<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
@@ -466,7 +466,7 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
 /// no mode flip, no bounce buffer. `int_21h` reaches `seg_offset()` which
 /// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
 /// On exit `finish_dos_call` does the mode-aware iret-frame pop.
-pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn pmdos_int21_handler<A: crate::Core>(machine: &mut A, bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     // 16-bit DPMI clients issue INT 21h with 16-bit register parameters; the
     // high 16 bits of EAX..EBP are undefined and real (16-bit) DOS never
     // touches them. Zero them for the duration of servicing so every handler's
@@ -532,7 +532,7 @@ pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, bios_display:
 /// subfunctions only touch 16-bit register halves and absolute VGA memory, so
 /// no DS:DX buffer translation is needed. On exit `finish_dos_call` does the
 /// mode-aware iret-frame pop.
-pub(super) fn pmdos_int33_handler<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn pmdos_int33_handler<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let _ = int_33h(machine, dos, regs);
     // INT 33h itself never blocks. A pending DOS operation may belong to an
     // outer call interrupted while parked; it must not suppress this nested
@@ -553,7 +553,7 @@ fn translate_rm_low_pointer(seg: u16, off: u16) -> (u16, u16) {
 /// ES:DI or ES:DX; keeping the client in protected mode lets the BIOS handler
 /// resolve those selectors through the LDT instead of mistaking them for
 /// real-mode paragraphs during generic interrupt reflection.
-pub(super) fn pmdos_int10_handler<A: crate::Arch>(
+pub(super) fn pmdos_int10_handler<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut thread::DosState<A>,
@@ -604,7 +604,7 @@ mod pmdos_translation_tests {
 ///     21 frame).
 ///   - PM: pop the IRET frame `deliver_pm_int` planted on the PM
 ///     stack and merge DOS status flags so CF/AX results survive.
-fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+fn finish_dos_call<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     if regs.mode() == crate::UserMode::VM86 {
         machine::vm86_iret(machine, regs);
     } else {
@@ -631,7 +631,7 @@ fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A
 /// INT 31h from real mode user code. AH selects subfunction.
 /// On success: AX=0, CF=0. On error: AX=errno (unsigned), CF=1.
 #[inline(never)]
-pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn rm_native_syscall<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
         // AH=0Ch — a one-shot command interpreter announces that it is a
@@ -850,7 +850,7 @@ mod continuation_tests {
     }
 }
 
-pub(super) fn init_win16_psp<A: crate::Arch>(machine: &mut A, psp: u16) {
+pub(super) fn init_win16_psp<A: crate::Core>(machine: &mut A, psp: u16) {
     let mut value = lowmem::Psp {
         int_20: [0xcd, 0x20],
         top_of_mem: 0xa000,
@@ -872,7 +872,7 @@ pub(super) fn init_win16_psp<A: crate::Arch>(machine: &mut A, psp: u16) {
 /// Windows file APIs and INT 21h share KernelThread::fds. Refresh DOS's
 /// guest-visible handle metadata before servicing a call, including handles
 /// opened or closed through KERNEL32 since the previous DOS entry.
-pub(super) fn sync_win16_handles<A: crate::Arch>(
+pub(super) fn sync_win16_handles<A: crate::Core>(
     machine: &mut A, kt: &thread::KernelThread<A>, dos: &thread::DosState<A>,
 ) {
     let count = usize::from(lowmem::Psp::max_files(machine, dos.current_psp)).min(thread::MAX_DOS_FDS);

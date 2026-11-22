@@ -112,7 +112,7 @@ impl Mpu {
     /// Per-quantum service: drain the port's MIDI bytes into the synth.
     /// `arrival_frame` is the mix-frame the bytes arrived at — the synth
     /// applies each at that frame.
-    pub fn tick<A: crate::Arch>(&mut self, machine: &mut A, arrival_frame: u64) {
+    pub fn tick<A: crate::Core>(&mut self, machine: &mut A, arrival_frame: u64) {
         let _ = machine;
         if !self.present {
             return;

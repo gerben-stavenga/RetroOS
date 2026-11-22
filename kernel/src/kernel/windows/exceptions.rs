@@ -26,7 +26,7 @@ fn words(r: &Regs) -> [u32; WORDS] {
         r.gs as u32,
     ]
 }
-pub(super) fn deliver<A: crate::Arch>(
+pub(super) fn deliver<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     regs: &mut Regs,
@@ -91,7 +91,7 @@ fn selector(state: &WindowsState, value: u32, kind: u32) -> bool {
             access & 8 == 0 || access & 2 != 0
         }
 }
-pub(super) fn restore<A: crate::Arch>(
+pub(super) fn restore<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     regs: &mut Regs,

@@ -6,7 +6,7 @@ use crate::kernel::dos::{dfs, xms};
 use crate::kernel::dos::machine::write_u16;
 use super::exec::ParentRef;
 
-pub(super) fn psp_struct_seg<A: crate::Arch>(dos: &thread::DosState<A>) -> u16 {
+pub(super) fn psp_struct_seg<A: crate::Core>(dos: &thread::DosState<A>) -> u16 {
     dos.current_psp
 }
 
@@ -81,13 +81,13 @@ impl Psp {
     #[inline]
     pub(super) fn base(psp_seg: u16) -> usize { ((psp_seg as u32) << 4) as usize }
     /// Write the whole PSP at `psp_seg`.
-    pub fn store<A: crate::Arch>(machine: &mut A, psp_seg: u16, psp: Self) { machine.write::<Self>((Self::base(psp_seg)) as u64, psp); }
+    pub fn store<A: crate::Core>(machine: &mut A, psp_seg: u16, psp: Self) { machine.write::<Self>((Self::base(psp_seg)) as u64, psp); }
     /// Read PSP[0x2C] (environment segment or selector).
-    pub fn env_seg<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> u16 {
+    pub fn env_seg<A: crate::Core>(machine: &mut A, psp_seg: u16) -> u16 {
         machine.read::<u16>((Self::base(psp_seg) + core::mem::offset_of!(Self, env_seg)) as u64)
     }
     /// Linear address of the process's active Job File Table.
-    pub fn jft_addr<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> usize {
+    pub fn jft_addr<A: crate::Core>(machine: &mut A, psp_seg: u16) -> usize {
         let base = Self::base(psp_seg);
         let off = machine.read::<u16>((base + core::mem::offset_of!(Self, jft_far_off)) as u64) as usize;
         let seg = machine.read::<u16>((base + core::mem::offset_of!(Self, jft_far_seg)) as u64) as usize;
@@ -95,12 +95,12 @@ impl Psp {
     }
 
     /// Current capacity of the active JFT.
-    pub fn max_files<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> u16 {
+    pub fn max_files<A: crate::Core>(machine: &mut A, psp_seg: u16) -> u16 {
         machine.read::<u16>((Self::base(psp_seg) + core::mem::offset_of!(Self, max_files)) as u64)
     }
 
     /// Segment of an AH=67h-allocated JFT, if the inline table is not active.
-    pub fn external_jft_seg<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> Option<u16> {
+    pub fn external_jft_seg<A: crate::Core>(machine: &mut A, psp_seg: u16) -> Option<u16> {
         let base = Self::base(psp_seg);
         let off = machine.read::<u16>((base + core::mem::offset_of!(Self, jft_far_off)) as u64);
         let seg = machine.read::<u16>((base + core::mem::offset_of!(Self, jft_far_seg)) as u64);
@@ -108,7 +108,7 @@ impl Psp {
     }
 
     /// Select a new active JFT and publish its capacity in the PSP.
-    pub fn set_jft_location<A: crate::Arch>(machine: &mut A, psp_seg: u16, count: u16, off: u16, seg: u16) {
+    pub fn set_jft_location<A: crate::Core>(machine: &mut A, psp_seg: u16, count: u16, off: u16, seg: u16) {
         let base = Self::base(psp_seg);
         machine.write::<u16>((base + core::mem::offset_of!(Self, max_files)) as u64, count);
         machine.write::<u16>((base + core::mem::offset_of!(Self, jft_far_off)) as u64, off);
@@ -120,7 +120,7 @@ impl Psp {
     /// `Err(JftFull)` when the handle has no slot in the table. This is the one
     /// place the active table's bound is checked, so callers that are recording
     /// a handle must deal with a handle DOS cannot represent.
-    pub fn set_jft<A: crate::Arch>(machine: &mut A, psp_seg: u16, idx: usize, val: u8)
+    pub fn set_jft<A: crate::Core>(machine: &mut A, psp_seg: u16, idx: usize, val: u8)
         -> Result<(), JftFull>
     {
         if idx >= Self::max_files(machine, psp_seg) as usize { return Err(JftFull); }
@@ -136,11 +136,11 @@ impl Psp {
     /// std handles and our out-of-band `NULL_FILE_HANDLE` / `EMS_DEVICE_HANDLE`
     /// (98/99), which by construction live outside the JFT. There is nothing to
     /// clear, so the write is skipped and the close still succeeds.
-    pub fn clear_jft<A: crate::Arch>(machine: &mut A, psp_seg: u16, idx: usize) {
+    pub fn clear_jft<A: crate::Core>(machine: &mut A, psp_seg: u16, idx: usize) {
         let _ = Self::set_jft(machine, psp_seg, idx, 0xFF);
     }
     /// Install a command-tail at PSP[0x80] (length byte + bytes + CR).
-    pub fn set_cmdline<A: crate::Arch>(machine: &mut A, psp_seg: u16, tail: &[u8]) {
+    pub fn set_cmdline<A: crate::Core>(machine: &mut A, psp_seg: u16, tail: &[u8]) {
         let n = tail.len().min(126);
         let base = Self::base(psp_seg);
         machine.write::<u8>((base + core::mem::offset_of!(Self, cmdline_len)) as u64, n as u8);
@@ -359,7 +359,7 @@ fn lm_field(field_off: usize) -> usize { LOW_MEM_BASE as usize + field_off }
 /// Update the chain-head pointer that lives at `[LOL - 2]`. Called from
 /// `sync_mcb_chain` so AH=52h-style chain walkers see the current
 /// `heap_base_seg`.
-pub(in crate::kernel::dos) fn set_first_mcb_seg<A: crate::Arch>(machine: &mut A, seg: u16) {
+pub(in crate::kernel::dos) fn set_first_mcb_seg<A: crate::Core>(machine: &mut A, seg: u16) {
     machine.write::<u16>((lm_field(core::mem::offset_of!(LowMem, first_mcb_seg))) as u64, seg);
 }
 
@@ -579,7 +579,7 @@ pub(crate) const SLOT_RESUME_CONTINUATION: u8 = 0x02;
 
 pub(crate) const fn slot_offset(slot: u8) -> u16 { (slot as u16) * 2 }
 
-pub(in crate::kernel::dos) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+pub(in crate::kernel::dos) fn setup_ivt<A: crate::Core>(machine: &mut A, regs: &mut Regs) {
     // Fill the stub array with `CD 31` so any slot reached by an IVT entry
     // (or PM CALL FAR) traps to STUB_INT and the slot dispatcher.
     let stubs = lm_field(core::mem::offset_of!(LowMem, stubs));
@@ -625,7 +625,7 @@ pub(in crate::kernel::dos) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &
     crate::kernel::dos::Bda::set_keyboard_flags(machine, kbd_flags);
 }
 
-fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
+fn setup_lol_sft<A: crate::Core>(machine: &mut A, _regs: &mut Regs) {
     let sft_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, sft) as u32;
     let cds_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cds) as u32;
     let cdrom_header_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cdrom_header) as u32;
@@ -733,7 +733,7 @@ fn sft_entry_addr(handle: usize) -> usize {
 }
 
 /// Populate SFT entry for a newly opened file handle.
-pub(super) fn sft_set_file<A: crate::Arch>(machine: &mut A, handle: u16, size: u32) {
+pub(super) fn sft_set_file<A: crate::Core>(machine: &mut A, handle: u16, size: u32) {
     if handle as usize >= SFT_ENTRIES { return; }
     machine.write::<SftEntry>((sft_entry_addr(handle as usize)) as u64, SftEntry {
         refcount: 1,
@@ -746,7 +746,7 @@ pub(super) fn sft_set_file<A: crate::Arch>(machine: &mut A, handle: u16, size: u
 }
 
 /// Clear SFT entry when a file handle is closed.
-pub(super) fn sft_clear<A: crate::Arch>(machine: &mut A, handle: u16) {
+pub(super) fn sft_clear<A: crate::Core>(machine: &mut A, handle: u16) {
     if handle as usize >= SFT_ENTRIES { return; }
     machine.write::<u16>((sft_entry_addr(handle as usize) + core::mem::offset_of!(SftEntry, refcount)) as u64, 0);
 }

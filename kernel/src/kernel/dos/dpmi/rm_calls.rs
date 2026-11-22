@@ -26,10 +26,21 @@ impl Transfer {
     }
 }
 
-fn transfer<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, transfer: Transfer) -> thread::KernelAction {
+fn transfer<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, transfer: Transfer) -> thread::KernelAction {
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
-    let rm = machine.read::<RmCallStruct>(((struct_addr) as usize) as u64);
+    let rm = machine.read::<RmCallStruct>(u64::from(struct_addr));
+    start_transfer(machine, dos, regs, transfer, struct_addr, rm)
+}
+
+fn start_transfer<A: crate::Core>(
+    machine: &mut A,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+    transfer: Transfer,
+    struct_addr: u32,
+    rm: RmCallStruct,
+) -> thread::KernelAction {
     let rm_stack = if rm.ss == 0 { mode_transitions::rm_stack(dos, regs) }
                    else { (rm.ss, rm.sp as u32) };
     machine.write::<RmCallStruct>(struct_addr as u64, RmCallStruct::capture(regs));
@@ -63,41 +74,62 @@ fn transfer<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs
     thread::KernelAction::Done
 }
 
-pub(super) fn simulate_real_mode_int<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn simulate_real_mode_int<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     transfer(machine, dos, regs, Transfer::Interrupt(regs.rbx as u8))
 }
 
-pub(super) fn call_real_mode_proc<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn call_real_mode_proc<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     transfer(machine, dos, regs, Transfer::FarCall)
 }
 
-pub(super) fn call_real_mode_proc_iret<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn call_real_mode_proc_iret<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     transfer(machine, dos, regs, Transfer::Iret)
 }
 
-/// Execute DPMI 0302h in-place when its target is RetroOS's own unhooked
-/// real-mode INT 21h vector stub. A client-supplied or hooked target must run
-/// as real-mode code, so every other address takes the ordinary mode-switch
-/// path.
+/// Dispatch synchronous calls to known DOS and BIOS stubs without executing
+/// the stub instructions. Calls to guest handlers use the normal VM86 path.
 ///
 /// The fast path still constructs the specified RM call frame and uses the
 /// normal RM DOS dispatcher and continuation unwind. It merely executes the
 /// two known `CD 31h` control stubs without lending the CPU between them.
-pub(in crate::kernel::dos) fn direct_int21_iret<A: crate::Arch>(
+pub(in crate::kernel::dos) fn direct_rm_call<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
 ) -> Option<thread::KernelAction> {
-    if regs.rax as u16 != 0x0302 {
-        return None;
-    }
+    let transfer = match regs.rax as u16 {
+        0x0302 => Transfer::Iret,
+        0x0300 if regs.rbx as u8 == 0x10 && regs.rcx as u16 == 0
+            && !regs.user_tf() && dos.pc.vga.emulated().is_some() => Transfer::Interrupt(0x10),
+        _ => return None,
+    };
     let use32 = dos.dpmi.as_ref()?.client_use32;
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, use32);
     let rm = machine.read::<RmCallStruct>(struct_addr as u64);
-    if rm.cs != dos::STUB_SEG || rm.ip != dos::slot_offset(0x21) {
-        return None;
+    match transfer {
+        Transfer::Interrupt(vector) => {
+            // Only the emulated display-start service is synchronous here.
+            // Keep guest hooks, guest stacks and debugger stepping on the
+            // ordinary path, including a vector redirected to copied code.
+            let stub = dos::slot_offset(vector);
+            let ivt = u64::from(vector) * 4;
+            let target = u32::from(dos::STUB_SEG) << 16 | u32::from(stub);
+            let entry = (u64::from(dos::STUB_SEG) << 4) + u64::from(stub);
+            let resume = (u64::from(dos::CTRL_STUB_SEG) << 4)
+                + u64::from(dos::ctrl_slot_off(dos::SLOT_RESUME_CONTINUATION));
+            if rm.eax as u16 != 0x4f07 || rm.ss != 0 || rm.sp != 0
+                || rm.flags & eflags::TF_FLAG as u16 != 0
+                || machine.read::<u32>(ivt) != target
+                || machine.read::<[u8; 2]>(entry) != [0xcd, 0x31]
+                || machine.read::<[u8; 2]>(resume) != [0xcd, 0x31]
+            {
+                return None;
+            }
+        }
+        Transfer::Iret if rm.cs == dos::STUB_SEG && rm.ip == dos::slot_offset(0x21) => {}
+        _ => return None,
     }
 
     // The unhooked vector is a Rust DOS service, not guest real-mode code.
@@ -106,7 +138,7 @@ pub(in crate::kernel::dos) fn direct_int21_iret<A: crate::Arch>(
     // no observable state. Calls that can block or replace the process retain
     // the framed path below.
     let ah = (rm.eax >> 8) as u8;
-    if super::super::dos::int21_is_synchronous(ah) {
+    if matches!(transfer, Transfer::Iret) && super::super::dos::int21_is_synchronous(ah) {
         let saved = *regs;
         rm.restore(regs);
         regs.frame.ss = if rm.ss == 0 { dos::rm_stack_seg() as u64 } else { rm.ss as u64 };
@@ -137,7 +169,7 @@ pub(in crate::kernel::dos) fn direct_int21_iret<A: crate::Arch>(
     }
 
     let profile_start = crate::kernel::startup::profile_enabled().then(|| crate::kernel::event_profile::cycles());
-    let action = call_real_mode_proc_iret(machine, dos, regs);
+    let action = start_transfer(machine, dos, regs, transfer, struct_addr, rm);
     let dispatch_start = profile_start.map(|_| crate::kernel::event_profile::cycles());
     debug_assert!(matches!(&action, thread::KernelAction::Done));
     machine::set_vm86_ip(regs, machine::vm86_ip(regs).wrapping_add(2));
@@ -212,7 +244,7 @@ mod tests {
 
 /// Real-mode callback entry — real-mode code called one of our callback stubs.
 /// Save real-mode state, fill register structure, switch to PM callback handler.
-pub(in crate::kernel::dos) fn callback_entry<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, cb_idx: usize) {
+pub(in crate::kernel::dos) fn callback_entry<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, cb_idx: usize) {
     let cb = match dos.dpmi.as_ref() {
         Some(d) => d.callbacks[cb_idx],
         None => {

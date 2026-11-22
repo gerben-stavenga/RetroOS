@@ -1,7 +1,7 @@
 //! One frozen packet: every layer belongs to the same stopped profile window.
 use super::{send, send_u64};
 
-pub(super) fn write(machine: &mut impl crate::Arch, stats: &mut crate::kernel::startup::EventStats) {
+pub(super) fn write(machine: &mut impl crate::Core, stats: &mut crate::kernel::startup::EventStats) {
     let totals = crate::kernel::startup::profile_totals();
     unsafe { super::COMPOSITE_REPLY = true; }
     send(b"{\"ok\":true,\"schema_version\":1,\"window\":{\"id\":");

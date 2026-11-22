@@ -1,8 +1,8 @@
 //! Caller-owned saved user page-directory entries.
-pub struct RootPageTable(pub(crate) [u32; 768]);
-impl RootPageTable {
+pub struct AddressSpace(pub(crate) [u32; 768]);
+impl AddressSpace {
     pub const fn empty() -> Self { Self([0; 768]) }
 }
-impl Default for RootPageTable {
+impl Default for AddressSpace {
     fn default() -> Self { Self::empty() }
 }

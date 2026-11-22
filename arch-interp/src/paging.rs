@@ -15,9 +15,9 @@ static PAGING_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 thread_local! {
     static PAGING_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
-struct PagingGuard { _lock: Option<std::sync::MutexGuard<'static, ()>> }
+pub(crate) struct PagingGuard { _lock: Option<std::sync::MutexGuard<'static, ()>> }
 impl PagingGuard {
-    fn lock() -> Self {
+    pub(crate) fn lock() -> Self {
         let lock = if PAGING_DEPTH.with(|depth| depth.get() == 0) {
             Some(PAGING_LOCK.lock().expect("paging operation panicked"))
         } else { None };
@@ -392,7 +392,7 @@ mod integration {
 // Saved roots and fixed live tables.
 
 use std::cell::Cell;
-use crate::space::RootPageTable;
+use crate::space::AddressSpace;
 thread_local! {
     static STORAGE: Cell<u64> = const { Cell::new(u64::MAX) };
 }
@@ -417,7 +417,7 @@ pub fn active_pd() -> u64 {
 }
 fn with_active_pd<R>(f: impl FnOnce(u64) -> R) -> R { f(active_pd()) }
 
-pub fn activate(mut incoming: RootPageTable) -> RootPageTable {
+pub fn activate(mut incoming: AddressSpace) -> AddressSpace {
     let _paging = PagingGuard::lock();
     let pd = active_pd();
     for (i, entry) in incoming.0.iter_mut().enumerate() {
@@ -431,7 +431,7 @@ pub fn space_translate(vaddr: u32) -> Option<u32> { translate(active_pd(), vaddr
 
 /// Share table storage. Leaf references belong to the tables, so retaining a
 /// table does not walk its leaves. Detachment establishes new leaf references.
-pub fn space_fork(child: &mut RootPageTable) {
+pub fn space_fork(child: &mut AddressSpace) {
     let _paging = PagingGuard::lock();
     assert!(child.0.iter().all(|&e| e == 0));
     let pd = active_pd();
@@ -471,7 +471,7 @@ fn release_table(table: u64) {
     }
     phys::release(table);
 }
-pub fn destroy(root: &mut RootPageTable) {
+pub fn destroy(root: &mut AddressSpace) {
     let _paging = PagingGuard::lock();
     for entry in &mut root.0 {
         if *entry & PRESENT != 0 { release_table(u64::from(*entry >> 12)); }
@@ -608,7 +608,7 @@ pub fn space_demand(vaddr: u32) -> bool {
 /// return the frames to the allocator. Kernel windows (high) are left intact.
 pub fn space_clean() {
     let _paging = PagingGuard::lock();
-    let mut old = activate(RootPageTable::empty());
+    let mut old = activate(AddressSpace::empty());
     destroy(&mut old);
 }
 
@@ -731,9 +731,9 @@ mod space_ops {
 
     #[test]
     fn exhausted_fault_reservoir_returns_before_the_store_and_resumes() {
-        use arch_abi::{Arch as _, GuestBytes as _, KernelEvent, Regs};
+        use arch_abi::{Core as _, GuestBytes as _, KernelEvent, Regs};
         crate::phys::init_test_ram();
-        let mut machine = crate::backend::Interp;
+        let mut machine = crate::backend::Interp::local();
         let code = 0x10000;
         // mov eax,20000000; mov ecx,96; store; add eax,4096; dec ecx; jnz store; int 80
         let program = [
@@ -799,7 +799,7 @@ mod space_ops {
         })).unwrap();
         assert_eq!(space_translate(0x41000000), Some((frame * 4096) as u32));
         assert!(!space_cow_fault(0x41000000), "read-only protection denies writes");
-        let mut child = RootPageTable::empty(); space_fork(&mut child); let parent = activate(child);
+        let mut child = AddressSpace::empty(); space_fork(&mut child); let parent = activate(child);
         assert!(!space_cow_fault(0x41000000));
         test_protect(0x41000, 1, true);
         assert!(space_cow_fault(0x41000000));
@@ -826,7 +826,7 @@ mod space_ops {
         }
         unsafe { *phys::frame_ptr(backing).add(23) = 0x31; }
         assert_eq!(space_translate(0xA0017), Some((backing as u32 * 4096) + 23));
-        let mut child = RootPageTable::empty(); space_fork(&mut child); let parent = activate(child);
+        let mut child = AddressSpace::empty(); space_fork(&mut child); let parent = activate(child);
         assert_eq!(pte_raw(active_pd(), 0xB0000), CACHE_DISABLE);
         assert!(!space_demand(0xB0000), "fork must preserve the planar trap");
         for addr in [0xA0017, 0x4100_0017, 0x4103_F000] {
@@ -887,7 +887,7 @@ mod space_ops {
         let p = space_translate(0x10_000).expect("mapped");
         // Write a marker through the frame and confirm fork copies it.
         unsafe { *phys::frame_ptr((p >> 12) as u64) = 0x7E };
-        let mut child = RootPageTable::empty(); space_fork(&mut child); let _parent = activate(child);
+        let mut child = AddressSpace::empty(); space_fork(&mut child); let _parent = activate(child);
         // Fork is COW: the child shares the parent's frame read-only until a
         // write; the first write privatises through the COW fault path.
         let shared = space_translate(0x10_000).expect("child mapped");

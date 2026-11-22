@@ -9,8 +9,8 @@
 //! The Windows tab selects windows, toggles the focused window between its
 //! retained fullscreen/windowed modes, and can terminate its task. Trace toggles the shared DOS/DPMI/Linux
 //! syscall-trace gate, Profile live cycle accounting, Dump the register/VGA
-//! dump, and Disk lists the CD images shipped in `C:\CD`. Kill uses the ordinary exit path (a pending flag the event loop turns into
-//! `Exit` for the focused thread, exactly as the SEGV path does). The Sound tab
+//! dump, and Disk lists the CD images shipped in `C:\CD`. Kill requests an
+//! ordinary scheduler exit for the focused task. The Sound tab
 //! controls the kernel mix gain and, in native SB16 mode, the card's source mixer.
 //! Display selects the fullscreen DOS framebuffer scaling policy.
 //!
@@ -129,6 +129,8 @@ static ACTIVE_TAB: AtomicUsize = AtomicUsize::new(TAB_SOUND);
 static WINDOWS_SEL: AtomicUsize = AtomicUsize::new(0);
 static SOUND_SEL: AtomicUsize = AtomicUsize::new(0);
 static DISPLAY_SEL: AtomicUsize = AtomicUsize::new(0);
+static DISPLAY_OUTPUT: spin::Mutex<(&[u8], usize, usize)> =
+    spin::Mutex::new((b"", 0, 0));
 static SOUND_MODE_REQ: AtomicUsize = AtomicUsize::new(0);
 /// Native SB keeps DSP/OPL direct; this separately selects software MPU on HDA.
 static MIDI_HDA: AtomicBool = AtomicBool::new(false);
@@ -164,7 +166,7 @@ static SB_SOURCE_OVERRIDE: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool
 /// Requested 5-bit level plus one, so zero means no pending write.
 static SB_SOURCE_REQ: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
-static KILL_REQ: AtomicBool = AtomicBool::new(false);
+static KILL_REQ: AtomicUsize = AtomicUsize::new(0);
 static PRESENTATION_REQ: AtomicBool = AtomicBool::new(false);
 static CURRENT_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 
@@ -201,6 +203,14 @@ pub fn take_repaint_request() -> bool {
 }
 
 pub(crate) fn request_repaint() { REPAINT.store(true, Ordering::Relaxed); }
+
+pub(crate) fn set_display_output(output: (&'static [u8], usize, usize)) {
+    let mut previous = DISPLAY_OUTPUT.lock();
+    if *previous != output {
+        *previous = output;
+        request_repaint();
+    }
+}
 
 fn close() {
     crate::kernel::net::lan::scanning(false);
@@ -636,11 +646,10 @@ fn active_tab_name(tab: usize) -> &'static [u8] {
     }
 }
 
-/// Consume a pending "kill the focused task" request. The event loop calls this
-/// each iteration and, when set, exits the focused thread down the ordinary
-/// teardown path.
-pub fn take_kill_request() -> bool {
-    KILL_REQ.swap(false, Ordering::Relaxed)
+/// Take the task that held focus when Kill was selected.
+pub fn take_kill_request() -> Option<usize> {
+    let tid = KILL_REQ.swap(0, Ordering::Relaxed);
+    (tid != 0).then_some(tid)
 }
 
 pub fn take_presentation_request() -> bool {
@@ -682,7 +691,7 @@ static WINDOW_REQUEST: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Rebuild the primary-window list from live personality endpoints. Native
 /// Windows/OS2 adapters can replace this snapshot with multiple WindowIds.
-pub fn refresh_windows<A: crate::Arch>(
+pub fn refresh_windows<A: crate::Core>(
     threads: &thread::ThreadTable<A>,
     focused: usize,
     fullscreen: bool,
@@ -1088,7 +1097,7 @@ fn activate(sound: SoundView) {
                 PRESENTATION_REQ.store(true, Ordering::Relaxed);
             }
             WINDOWS_ITEM_KILL => {
-                KILL_REQ.store(true, Ordering::Relaxed);
+                KILL_REQ.store(crate::kernel::focus::focused(), Ordering::Relaxed);
                 close();
             }
             _ => {}
@@ -1276,7 +1285,7 @@ fn panel_rows(sound: SoundView) -> usize {
         let tab = active_tab();
         let count = active_item_count(tab, sound);
         let visible = if tab == TAB_DISK { count.min(DISK_VISIBLE) } else { count };
-        visible + usize::from(tab == TAB_DISK) + TAB_ROWS + 2
+        visible + usize::from(matches!(tab, TAB_DISK | TAB_DISPLAY)) + TAB_ROWS + 2
     }
 }
 
@@ -1338,9 +1347,8 @@ fn paint_panel(
     } else {
         (count, 0)
     };
-    let subtab_rows = usize::from(tab == TAB_DISK);
-    // Title + two tab rows + (device sub-tabs) + items + footer.
-    let rows = visible + subtab_rows + TAB_ROWS + 2;
+    let extra_rows = usize::from(matches!(tab, TAB_DISK | TAB_DISPLAY));
+    let rows = visible + extra_rows + TAB_ROWS + 2;
     let (cw, sy) = paint_scales(scale_y, canvas_width, canvas_height, rows);
     // Tight box: a two-glyph-pixel margin, just enough to keep strokes
     // off the panel edge (a glyph pixel is cw/8 wide, sy rows tall).
@@ -1378,6 +1386,20 @@ fn paint_panel(
 
     if tab == TAB_DISK {
         paint_disk_subtabs(out, stride, w, h, logical_w, tx, ty, cw, sy, fmt);
+        ty += CELL_H * sy;
+    } else if tab == TAB_DISPLAY {
+        let mut line = Line::new();
+        let (name, width, height) = *DISPLAY_OUTPUT.lock();
+        line.put(b"Output: ");
+        line.put(name);
+        if width != 0 && height != 0 {
+            line.put(b" ");
+            line.put_num(width as u32);
+            line.put(b"x");
+            line.put_num(height as u32);
+        }
+        paint_text(out, stride, w, h, logical_w, tx, ty, cw, sy,
+            line.as_bytes(), ITEM_FG, PANEL_BG, fmt);
         ty += CELL_H * sy;
     }
 

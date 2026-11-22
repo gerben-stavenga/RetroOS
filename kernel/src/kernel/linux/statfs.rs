@@ -1,7 +1,7 @@
 //! Linux filesystem-type/accounting queries used before opening SQLite pools.
 use super::*;
 
-pub(super) fn call<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, linux: &LinuxState,
+pub(super) fn call<A: crate::Core>(machine: &mut A, kt: &thread::KernelThread<A>, linux: &LinuxState,
     a: &Args, wide: bool, descriptor: bool, large32: bool) -> SyscallResult
 {
     let size = if wide { 120 } else if large32 { 84 } else { 64 };

@@ -30,7 +30,7 @@ pub use arch_abi::Irq;
 pub const MSI_VECTOR_BASE: u8 = 0xF8;
 pub const MSI_SOURCE_COUNT: u8 = 7;
 
-/// Device-owned input sink installed during boot. Arch retains no input data.
+/// Device-owned input sink installed during boot. Core retains no input data.
 #[thread_local]
 static mut INPUT_SINK: fn(Irq, u64) = |_, _| {};
 

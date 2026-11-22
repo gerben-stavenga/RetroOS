@@ -174,7 +174,7 @@ pub fn report(message: &str) {
     crate::compact_println!("WiFi: {}", message);
     *STATUS.0.lock() = [message.as_bytes(), b"\n"].concat();
 }
-pub fn init<A: crate::Arch>(machine: &mut A) {
+pub fn init<A: crate::Core>(machine: &mut A) {
     report("no supported native radio detected");
     vfs::mount(b"wificonfig/", &STATUS);
     vfs::hide_mount(b"wificonfig/");
@@ -275,7 +275,7 @@ impl crate::kernel::net::EthernetDevice for Adapter {
 }
 
 /// Persist a radio's binary diagnostics on C:, preserving earlier dumps.
-pub fn save_dump<A: crate::Arch>(machine: &mut A, bytes: &[u8]) -> Result<Vec<u8>, i32> {
+pub fn save_dump<A: crate::Core>(machine: &mut A, bytes: &[u8]) -> Result<Vec<u8>, i32> {
     use crate::kernel::thread::{FdKind, MAX_FDS};
     let root = crate::kernel::dos::c_root();
     if root.is_empty() {

@@ -1,22 +1,9 @@
 //! Canonical kernel sound API — one PCM output path for every personality.
 //!
-//! Like [`vfs`](super::vfs), this is a *kernel* subsystem, not an machine concern.
-//! It canonicalizes any source PCM — the Sound Blaster DSP wire formats today
-//! (8/16-bit, mono/stereo, signed/unsigned); OSS / native producers later — into
-//! one shape (**signed 16-bit, interleaved stereo**) and streams it to the
-//! RetroOS canonical audio device.
-//!
-//! That device sits *below* the machine boundary and is reached through ordinary
-//! port I/O — exactly as `vfs`→`hdd.rs` reaches the ATA disk via `arch::inb/
-//! outb`, never a bespoke `Arch` method (so `trait Arch` stays minimal). The
-//! hosted interpreter backs the port window with a WAV-to-disk sink (see
-//! `machine-interp/src/devices.rs`, where `std` lives); metal leaves the window
-//! unpopulated, so the kernel sound path is inert there and the existing SB
-//! passthrough to a real card still produces sound.
-//!
-//! Routing is decided ONCE at boot (`platform::Audio`): the AC'97 codec
-//! where one was found, the port window where a backend installed a sink,
-//! nowhere otherwise — `play` just matches the type.
+//! The kernel converts source PCM to signed 16-bit interleaved stereo.
+//! Platform startup selects the output device. Native drivers read the mixer's
+//! DMA ring, and the hosted window supplies a PCM device through
+//! [`install_host_output`].
 
 pub(crate) mod pcm;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -28,7 +15,21 @@ use core::sync::atomic::{AtomicU32, Ordering};
 const AUDIO_SIG: u16 = 0x530; // R: signature ('RA'); W: sample rate (Hz)
 const SIGNATURE: u16 = 0x5241; // 'R','A' — RetroOS Audio
 
-pub use sound::sink::Frame;
+pub use sound::sink::{Device, Frame};
+use alloc::boxed::Box;
+
+pub const HOST_BUFFER_BLOCKS: usize = 8;
+pub type HostDevice = Box<dyn Device + Send>;
+static HOST_OUTPUT: spin::Mutex<Option<HostDevice>> = spin::Mutex::new(None);
+
+/// Register the process's PCM output before the kernel probes audio.
+pub fn install_host_output(device: HostDevice) {
+    assert!(HOST_OUTPUT.lock().replace(device).is_none(), "host audio already installed");
+}
+
+pub(crate) fn take_host_output() -> Option<HostDevice> {
+    HOST_OUTPUT.lock().take()
+}
 pub use sound::RATE_FP_SHIFT;
 
 /// Times the play cursor caught the write cursor while a producer was feeding
@@ -110,7 +111,7 @@ pub fn mixing_rate_q16() -> u64 {
 
 /// Does a backend-installed sink answer behind the canonical port window?
 /// Pure probe — called once by `platform::probe`, never cached here.
-pub fn window_present<A: crate::Arch>(machine: &mut A) -> bool {
+pub fn window_present<A: crate::Core>(machine: &mut A) -> bool {
     machine.inw(AUDIO_SIG) == SIGNATURE
 }
 
@@ -121,6 +122,7 @@ enum Output {
     },
     Hda(&'static mut crate::kernel::drivers::hda::Hda),
     Ac97(&'static mut crate::kernel::drivers::ac97::Ac97),
+    Host(HostDevice),
 }
 
 impl sound::sink::Device for Output {
@@ -129,6 +131,7 @@ impl sound::sink::Device for Output {
             Self::Sb { session, .. } => session.rate(),
             Self::Hda(driver) => sound::sink::Device::rate(&**driver),
             Self::Ac97(driver) => sound::sink::Device::rate(&**driver),
+            Self::Host(device) => device.rate(),
         }
     }
 
@@ -137,6 +140,7 @@ impl sound::sink::Device for Output {
             Self::Sb { session, .. } => session.block_frames(),
             Self::Hda(driver) => sound::sink::Device::block_frames(&**driver),
             Self::Ac97(driver) => sound::sink::Device::block_frames(&**driver),
+            Self::Host(device) => device.block_frames(),
         }
     }
 
@@ -145,6 +149,7 @@ impl sound::sink::Device for Output {
             Self::Sb { device, session } => session.start(device.base),
             Self::Hda(driver) => sound::sink::Device::start(&mut **driver),
             Self::Ac97(driver) => sound::sink::Device::start(&mut **driver),
+            Self::Host(device) => device.start(),
         }
     }
 
@@ -153,6 +158,19 @@ impl sound::sink::Device for Output {
             Self::Sb { device, session } => session.halt(device.base),
             Self::Hda(driver) => sound::sink::Device::halt(&mut **driver),
             Self::Ac97(driver) => sound::sink::Device::halt(&mut **driver),
+            Self::Host(device) => device.halt(),
+        }
+    }
+
+    fn submit(&mut self, first_frame: u64, frames: &[Frame]) {
+        if let Self::Host(device) = self {
+            device.submit(first_frame, frames);
+        }
+    }
+
+    fn discard(&mut self) {
+        if let Self::Host(device) = self {
+            device.discard();
         }
     }
 
@@ -161,6 +179,7 @@ impl sound::sink::Device for Output {
             Self::Sb { session, .. } => session.frames_played(),
             Self::Hda(driver) => sound::sink::Device::frames_played(&mut **driver),
             Self::Ac97(driver) => sound::sink::Device::frames_played(&mut **driver),
+            Self::Host(device) => device.frames_played(),
         }
     }
 }
@@ -191,7 +210,7 @@ pub enum OutputSwitch {
 impl Sink {
     /// Build the boot-selected output. HDA may own a parked SB in mixed mode,
     /// or run alongside a native SB owned by a DOS thread.
-    pub fn new<A: crate::Arch>(
+    pub fn new<A: crate::Core>(
         machine: &mut A,
         probed: crate::kernel::platform::AudioToken,
         card: Option<crate::kernel::drivers::sb16::Sb16>,
@@ -220,6 +239,10 @@ impl Sink {
             (Audio::EmulatedAc97, AudioToken::Ac97(dev), _) => {
                 Some((dev.ring(), Output::Ac97(dev)))
             }
+            (Audio::EmulatedHost, AudioToken::Host(device), _) => {
+                let frames = device.block_frames() * HOST_BUFFER_BLOCKS;
+                Some((alloc::vec![[0; 2]; frames].leak(), Output::Host(device)))
+            }
             // The hosted WAV sink is not wired up: it has no ring, no cursor
             // and no completion event, so it cannot answer the `Device`
             // contract, and the kernel-side clock that used to stand in for
@@ -236,7 +259,7 @@ impl Sink {
         Some(sink)
     }
 
-    pub fn new_sb<A: crate::Arch>(
+    pub fn new_sb<A: crate::Core>(
         machine: &mut A,
         device: crate::kernel::drivers::sb16::Sb16,
     ) -> Result<Self, crate::kernel::drivers::sb16::Sb16> {
@@ -265,7 +288,7 @@ impl Sink {
     pub fn into_sb(self) -> Option<crate::kernel::drivers::sb16::Sb16> {
         match self.inner.into_device() {
             Output::Sb { device, .. } => Some(device),
-            Output::Hda(_) | Output::Ac97(_) => None,
+            Output::Hda(_) | Output::Ac97(_) | Output::Host(_) => None,
         }
     }
 
@@ -303,7 +326,7 @@ impl Sink {
 
     /// Move the SB from HDA's parked slot into the kernel output. On failure,
     /// restore the HDA sink with both device tokens still owned.
-    pub fn switch_hda_to_sb<A: crate::Arch>(self, machine: &mut A) -> OutputSwitch {
+    pub fn switch_hda_to_sb<A: crate::Core>(self, machine: &mut A) -> OutputSwitch {
         if !self.is_hda() {
             return OutputSwitch::Unchanged(self);
         }
@@ -336,11 +359,11 @@ impl Sink {
     pub fn sb_port(&self) -> Option<u16> {
         match self.inner.device_ref() {
             Output::Sb { device, .. } => Some(device.base),
-            Output::Hda(_) | Output::Ac97(_) => None,
+            Output::Hda(_) | Output::Ac97(_) | Output::Host(_) => None,
         }
     }
 
-    pub fn set_sb_master<A: crate::Arch>(&self, machine: &mut A, raw: u8) -> bool {
+    pub fn set_sb_master<A: crate::Core>(&self, machine: &mut A, raw: u8) -> bool {
         match self.inner.device_ref() {
             Output::Sb { device, .. } => {
                 device.set_master(machine, raw);
@@ -350,11 +373,11 @@ impl Sink {
                 card.set_master(machine, raw);
                 true
             }),
-            Output::Ac97(_) => false,
+            Output::Ac97(_) | Output::Host(_) => false,
         }
     }
 
-    pub fn set_sb_source<A: crate::Arch>(&self, machine: &mut A,
+    pub fn set_sb_source<A: crate::Core>(&self, machine: &mut A,
         source: crate::kernel::osd::SbSource, level: u8) -> bool {
         match self.inner.device_ref() {
             Output::Sb { device, .. } => {
@@ -365,7 +388,7 @@ impl Sink {
                 card.set_source(machine, source, level);
                 true
             }),
-            Output::Ac97(_) => false,
+            Output::Ac97(_) | Output::Host(_) => false,
         }
     }
 
@@ -672,7 +695,7 @@ impl Engine {
         self.sink.is_some() || pcm::needs_clock() || self.source.as_ref().is_some_and(|source|
             source.try_lock().is_none_or(|source| source.needs_clock()))
     }
-    pub(crate) fn poll_inline_due<A: crate::Arch>(&mut self, machine: &mut A, now: u64) {
+    pub(crate) fn poll_inline_due<A: crate::Core>(&mut self, machine: &mut A, now: u64) {
         let active = self.needs_inline_clock();
         if !active || !self.inline_clock_active { self.last_ns = now; }
         self.inline_clock_active = active;
@@ -693,7 +716,7 @@ impl Engine {
     }
     /// The same mixer, device clocks and permanent DMA buffer on one core.
     /// Hosted backends without an ISA pool read their active guest directly.
-    pub fn poll_inline<A: crate::Arch>(&mut self, machine: &mut A, now: u64) {
+    pub fn poll_inline<A: crate::Core>(&mut self, machine: &mut A, now: u64) {
         self.advance(now, crate::kernel::event_profile::cycles(), |source, now, span| source.mix_guest(machine, now, span));
     }
     fn advance(&mut self, now: u64, stamp: u64,

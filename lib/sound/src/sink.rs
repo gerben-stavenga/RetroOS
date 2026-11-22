@@ -64,6 +64,13 @@ pub trait Device {
     /// this, it just stops feeding.
     fn halt(&mut self);
 
+    /// Deliver already converted frames to a software output. DMA devices
+    /// consume the sink's ring directly.
+    fn submit(&mut self, _first_frame: u64, _frames: &[Frame]) {}
+
+    /// Abandon software-queued frames when the producer resets its frontier.
+    fn discard(&mut self) {}
+
     /// Frames played since the last poll: exact cursor delta, in order, never
     /// lost, never duplicated during the ring's polling horizon.
     ///
@@ -88,6 +95,14 @@ impl<T: Device + ?Sized> Device for &mut T {
 
     fn halt(&mut self) {
         (**self).halt();
+    }
+
+    fn submit(&mut self, first_frame: u64, frames: &[Frame]) {
+        (**self).submit(first_frame, frames);
+    }
+
+    fn discard(&mut self) {
+        (**self).discard();
     }
 
     fn frames_played(&mut self) -> u64 {
@@ -178,10 +193,17 @@ impl<D: Device> Sink<D> {
             self.written_frames,
             self.consumed_frames(),
         );
+        let first_frame = self.written_frames;
+        let at = self.write_pos;
         for &(left, right) in frames {
             self.buf[self.write_pos] = [scale(left, gain_q16), scale(right, gain_q16)];
             self.write_pos = (self.write_pos + 1) % self.buf.len();
             self.written_frames += 1;
+        }
+        let contiguous = frames.len().min(self.buf.len() - at);
+        self.dev.submit(first_frame, &self.buf[at..at + contiguous]);
+        if contiguous < frames.len() {
+            self.dev.submit(first_frame + contiguous as u64, &self.buf[..frames.len() - contiguous]);
         }
     }
 
@@ -224,6 +246,7 @@ impl<D: Device> Sink<D> {
     /// that silence here would be hidden priming and would reduce the space
     /// available to the first real submission.
     pub fn resync(&mut self) {
+        self.dev.discard();
         let ring_frames = self.buf.len();
         self.write_pos = (self.played_frames % ring_frames as u64) as usize;
         self.written_frames = self.played_frames;

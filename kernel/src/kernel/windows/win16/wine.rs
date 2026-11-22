@@ -20,7 +20,7 @@ fn patch_calls(code: &mut [u8], normal: u32, registers: u32, flat_cs: u16) -> Re
     Ok(offset / 32)
 }
 
-fn map_code<A: crate::Arch>(machine: &mut A, address: u32, bytes: &[u8]) -> Result<(), i32> {
+fn map_code<A: crate::Core>(machine: &mut A, address: u32, bytes: &[u8]) -> Result<(), i32> {
     if bytes.len() > 4096 { return Err(-8); }
     machine.zero(address as u64, 4096);
     machine.copy_to(address as u64, bytes);
@@ -28,7 +28,7 @@ fn map_code<A: crate::Arch>(machine: &mut A, address: u32, bytes: &[u8]) -> Resu
     Ok(())
 }
 
-pub(super) fn start<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
+pub(super) fn start<A: crate::Core>(machine: &mut A, windows: &mut WindowsState,
     regs: &mut Regs, tid: usize, _target: &Regs) -> Result<(), i32>
 {
     let normal = super::super::export_address(&windows.modules, b"KRNL386.EXE16", b"RetroWineCallFrom16")?;

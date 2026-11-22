@@ -43,7 +43,7 @@ pub trait Backing {
     fn swap_pages(&mut self, from: usize, to: usize, count: usize);
 }
 
-impl<A: crate::Arch> Backing for A {
+impl<A: crate::Core> Backing for A {
     fn free_page_count(&self) -> usize { crate::kernel::phys_mm::free_page_count() }
     fn allocate_pages(&mut self, base: usize, count: usize) { crate::kernel::memory::fresh(self, base, count); }
     fn discard_pages(&mut self, base: usize, count: usize) { crate::kernel::memory::reset(self, base, count); }

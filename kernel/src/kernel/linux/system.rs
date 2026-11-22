@@ -6,7 +6,7 @@ static TASKS: AtomicU16 = AtomicU16::new(1);
 
 /// The event loop owns the task table; publish a count without retaining a
 /// pointer into it while a personality is handling a syscall.
-pub(super) fn refresh_tasks<A: crate::Arch>(threads: &thread::ThreadTable<A>) {
+pub(super) fn refresh_tasks<A: crate::Core>(threads: &thread::ThreadTable<A>) {
     let count: usize = threads
         .active_ids()
         .map(|tid| &threads[tid])
@@ -24,7 +24,7 @@ pub(super) fn refresh_tasks<A: crate::Arch>(threads: &thread::ThreadTable<A>) {
     TASKS.store(count.min(u16::MAX as usize) as u16, Ordering::Relaxed);
 }
 
-pub(super) fn sysinfo<A: crate::Arch>(machine: &mut A, args: &Args, wide: bool) -> SyscallResult {
+pub(super) fn sysinfo<A: crate::Core>(machine: &mut A, args: &Args, wide: bool) -> SyscallResult {
     let size = if wide { 112 } else { 64 };
     if args.a0 == 0 || args.a0.checked_add(size).is_none_or(|end| end > 0xc0000000) {
         return SyscallResult::val(-EFAULT);

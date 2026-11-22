@@ -55,7 +55,7 @@ fn resolve_links(keys: &[Key], input: &[u16], open_link: bool) -> Result<Vec<u16
     }
     Err(0xc0000280)
 }
-pub(super) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args: [u32; 7]) -> u32 {
+pub(super) fn call<A: crate::Core>(machine: &mut A, handles: &mut Handles, args: [u32; 7]) -> u32 {
     let [op, handle, name, length, data, size, info] = args;
     if length > 32766 || length & 1 != 0 || size > 16 * 1024 * 1024 {
         return 0xc000000d;

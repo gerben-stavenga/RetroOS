@@ -12,7 +12,7 @@ use crate::kernel::thread;
 /// make it Ready, but neither user execution nor kernel I/O polling is safe
 /// until release_vfork returns that space. Apply this to every selector,
 /// including the child-exit shortcut and explicit window selection.
-pub(crate) fn vfork_suspended<A: crate::Arch>(threads: &thread::ThreadTable<A>, tid: usize) -> bool {
+pub(crate) fn vfork_suspended<A: crate::Core>(threads: &thread::ThreadTable<A>, tid: usize) -> bool {
     threads.active_ids().any(|id| matches!(&threads[id].personality,
         thread::Personality::Linux(linux) if linux.borrows_space_from(tid)))
 }
@@ -20,7 +20,7 @@ pub(crate) fn vfork_suspended<A: crate::Arch>(threads: &thread::ThreadTable<A>, 
 /// A blocked Linux process may need a peer on its terminal to make progress.
 /// Ready peers run first. Other blocked peers can be activated for kernel I/O
 /// polling; their user code stays parked until the operation completes.
-pub(crate) fn linux_blocked_successor<A: crate::Arch>(
+pub(crate) fn linux_blocked_successor<A: crate::Core>(
     threads: &thread::ThreadTable<A>, current: usize, poll_blocked: bool,
 ) -> Option<usize> {
     let thread::Personality::Linux(owner) = &threads[current].personality else { return None; };
@@ -47,7 +47,7 @@ pub(crate) fn linux_blocked_successor<A: crate::Arch>(
 /// order: always preferring ready peers would starve a blocked UI whenever
 /// two helpers remain runnable. Polling happens after activating that peer's
 /// address space, so its saved user pointers are interpreted correctly.
-pub(crate) fn linux_timeslice_successor<A: crate::Arch>(
+pub(crate) fn linux_timeslice_successor<A: crate::Core>(
     threads: &thread::ThreadTable<A>, current: usize, cursor: &mut usize,
 ) -> Option<usize> {
     let owner = &threads[current];
@@ -92,7 +92,7 @@ pub enum Verdict {
 /// didn't already pick a successor.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-pub fn verdict<A: crate::Arch>(
+pub fn verdict<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut thread::ThreadTable<A>,
@@ -120,7 +120,7 @@ pub fn verdict<A: crate::Arch>(
 /// Map a personality action to the next thread to run. `None` = stay on
 /// the current thread.
 #[allow(clippy::too_many_arguments)]
-fn next_after<A: crate::Arch>(
+fn next_after<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut thread::ThreadTable<A>,
@@ -189,7 +189,7 @@ fn next_after<A: crate::Arch>(
 
 /// The DOS syscall cannot publish its farewell while it holds a personality
 /// borrow. Here the active display and native BIOS workspace are both in hand.
-fn shutdown<A: crate::Arch>(
+fn shutdown<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut thread::ThreadTable<A>,
@@ -248,7 +248,7 @@ fn shutdown<A: crate::Arch>(
 
 /// Honor the F12 window picker's explicit target. This is a pure focus shift:
 /// it does not wake a blocked thread or break waitpid.
-pub(crate) fn focus_request<A: crate::Arch>(threads: &thread::ThreadTable<A>, tid: usize) -> Option<usize> {
+pub(crate) fn focus_request<A: crate::Core>(threads: &thread::ThreadTable<A>, tid: usize) -> Option<usize> {
     // Ignore a stale target that is the current owner, out of range, or no
     // longer active.
     if let Some(target) = thread::take_switch_target() {

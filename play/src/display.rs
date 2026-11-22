@@ -2,40 +2,69 @@
 //! SDL's event pump belongs to the thread that created the window — while the
 //! CPU/kernel runs on a worker thread (see `main.rs`).
 //!
-//! Video is pull-based across the thread boundary: each loop iteration asks the
-//! backend for a frame (`request_frame`), the CPU thread submits rendering to
-//! the media worker at its next slice boundary, and the next iteration
-//! `take_frame`s and blits the result. Input crosses the other way through the
-//! backend's thread-safe IRQ queue (`post_irq`).
+//! The kernel publishes its latest completed frame. The window reads it
+//! and applies the selected scaling when presenting fullscreen DOS.
 
 use retroos_arch_interp as arch;
 
 use arch::Irq;
-use sdl2::event::Event;
+use kernel::kernel::display::{ExternalDisplay, FrameLayout};
+use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::{Mod, Scancode};
 use sdl2::mouse::MouseButton;
-use sdl2::pixels::PixelFormatEnum;
+use sdl2::pixels::{Color, PixelFormatEnum};
+use sdl2::rect::Rect;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
-/// Default window size: 2× a 320×200 mode-13h frame. Other modes are scaled to
-/// fill (SDL stretches the texture to the canvas).
-const WIN_W: u32 = 640;
-const WIN_H: u32 = 400;
 /// Main-loop period: pump input + present at ~60 Hz.
 const TICK: Duration = Duration::from_millis(16);
+
+struct Frame {
+    layout: FrameLayout,
+    width: usize,
+    height: usize,
+    pixels: Vec<u32>,
+}
+
+static FRAME: Mutex<Option<Frame>> = Mutex::new(None);
+static VIEWPORT: AtomicU64 = AtomicU64::new(0);
+
+pub const ENDPOINT: ExternalDisplay = ExternalDisplay {
+    output: || {
+        let size = VIEWPORT.load(Ordering::Relaxed);
+        (b"Host", (size >> 32) as usize, size as u32 as usize)
+    },
+    present: |layout, width, height, pixels| {
+        *FRAME.lock().unwrap() = Some(Frame { layout, width, height, pixels });
+    },
+};
+
+fn report_viewport((width, height): (u32, u32)) {
+    VIEWPORT.store((u64::from(width) << 32) | u64::from(height), Ordering::Relaxed);
+}
 
 /// Create the window and run the pump/present loop forever. Quits the process
 /// on window close. Panics on SDL failure — a play run with no usable display
 /// is a hard configuration error, not something to limp past.
-pub fn run() -> ! {
-    let sdl = sdl2::init().expect("SDL init");
+pub fn run(sdl: &sdl2::Sdl) -> ! {
     let video = sdl.video().expect("SDL video");
+    // Keep a large restored size in case the window manager ignores maximize.
+    // Leave room for decorations even if SDL only reports the full display.
+    let (width, height) = video.display_usable_bounds(0)
+        .or_else(|_| video.display_bounds(0))
+        .map(|area| (area.width() - area.width() / 10, area.height() - area.height() / 10))
+        .unwrap_or((960, 600));
     let window = video
-        .window("RetroOS — DOS", WIN_W, WIN_H)
+        .window("RetroOS — DOS", width, height)
         .position_centered()
+        .resizable()
         .build()
         .expect("SDL window");
+    sdl2::hint::set("SDL_RENDER_SCALE_QUALITY", "nearest");
     let mut canvas = window.into_canvas().build().expect("SDL canvas");
+    canvas.window_mut().maximize();
     let texture_creator = canvas.texture_creator();
     let mut event_pump = sdl.event_pump().expect("SDL event pump");
 
@@ -49,13 +78,21 @@ pub fn run() -> ! {
     // Pointer captured (SDL relative mode): grabbed on first click, released
     // with Ctrl+F10 (the DOSBox convention).
     let mut captured = false;
-    // Last presented frame dimensions — window resizes on change.
-    let mut last_dims = (0usize, 0usize);
+    let mut texture = None;
+    let mut source = (width, height);
+    let mut layout = FrameLayout::Desktop;
+    let mut pane = canvas.output_size().unwrap_or_else(|_| canvas.window().size());
+    report_viewport(pane);
+    let mut target = Rect::new(0, 0, pane.0, pane.1);
 
     loop {
+        let mut redraw = false;
         for event in event_pump.poll_iter() {
             match event {
                 Event::Quit { .. } => std::process::exit(0),
+                Event::Window { win_event: WindowEvent::Exposed, .. } => {
+                    redraw = true;
+                }
                 Event::KeyDown { scancode: Some(Scancode::F10), keymod, .. }
                     if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD) =>
                 {
@@ -74,11 +111,13 @@ pub fn run() -> ! {
                     }
                 }
                 Event::MouseMotion { xrel, yrel, .. } => {
-                    // Scale window-pixel deltas to the INT 33h space the
-                    // kernel's MouseState lives in (640×200 over the window).
+                    // Convert window coordinates through the rendered picture,
+                    // then to the INT 33h space (640×200).
                     let (w, h) = canvas.window().size();
-                    acc.0 += xrel as f32 * 640.0 / w.max(1) as f32;
-                    acc.1 += yrel as f32 * 200.0 / h.max(1) as f32;
+                    acc.0 += xrel as f32 * 640.0 * pane.0 as f32
+                        / (w.max(1) as f32 * target.width() as f32);
+                    acc.1 += yrel as f32 * 200.0 * pane.1 as f32
+                        / (h.max(1) as f32 * target.height() as f32);
                     let (dx, dy) = (acc.0 as i16, acc.1 as i16);
                     if dx != 0 || dy != 0 {
                         acc.0 -= dx as f32;
@@ -109,39 +148,52 @@ pub fn run() -> ! {
             }
         }
 
-        // Blit the latest frame the kernel's display tick published (PIT-tick
-        // cadence; one loop-period of latency, by design).
-        if let Some((w, h, fb)) = arch::take_frame() {
-            // Integer scaling: size the window to a whole multiple of the
-            // frame so glyph columns stay crisp. The old fixed 640-wide
-            // window forced 720x400 text into a 0.89x downscale — every
-            // 9-dot cell lost a column and text read "thin". Scale to
-            // ~800px tall: text (400) -> 2x, mode 13h (200) -> 4x.
-            if (w, h) != last_dims {
-                last_dims = (w, h);
-                let scale = (800 / h as u32).max(1);
-                let _ = canvas
-                    .window_mut()
-                    .set_size(w as u32 * scale, h as u32 * scale);
+        let viewport = canvas.output_size().unwrap_or_else(|_| canvas.window().size());
+        if viewport.0 == 0 || viewport.1 == 0 {
+            std::thread::sleep(TICK);
+            continue;
+        }
+        if viewport != pane {
+            pane = viewport;
+            report_viewport(pane);
+            redraw = true;
+        }
+
+        let frame = FRAME.lock().unwrap().take();
+        if let Some(Frame { layout: new_layout, width, height, pixels }) = frame {
+            layout = new_layout;
+            let dimensions = (width as u32, height as u32);
+            if texture.is_none() || dimensions != source {
+                source = dimensions;
+                texture = Some(texture_creator.create_texture_streaming(
+                    PixelFormatEnum::RGB888, source.0, source.1,
+                ).expect("texture"));
             }
-            // A fresh streaming texture each frame keeps this trivial across
-            // mode/size changes; at 320×200/720×400 it's negligible. RGB888 is
-            // SDL's *alpha-less* 32-bit format (X8R8G8B8) whose channel masks
-            // are exactly our 0x00RRGGBB u32 — a byte-for-byte memcpy on a
-            // little-endian host, and the window stays opaque. (ARGB8888 with
-            // our alpha=0 makes a compositing WM render the window invisible.)
-            let mut texture = texture_creator
-                .create_texture_streaming(PixelFormatEnum::RGB888, w as u32, h as u32)
-                .expect("texture");
+            // SDL RGB888 is the kernel's opaque XRGB8888 pixel layout.
             let bytes =
-                unsafe { core::slice::from_raw_parts(fb.as_ptr() as *const u8, fb.len() * 4) };
-            let _ = texture.update(None, bytes, w * 4);
-            let _ = canvas.copy(&texture, None, None); // stretch to the window
+                unsafe { core::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), pixels.len() * 4) };
+            texture.as_mut().unwrap().update(None, bytes, width * 4).expect("upload frame");
+            redraw = true;
+        }
+        if redraw {
+            target = picture_rect(pane, source, layout);
+            canvas.set_draw_color(Color::BLACK);
+            canvas.clear();
+            if let Some(texture) = &texture {
+                canvas.copy(texture, None, target).expect("present frame");
+            }
             canvas.present();
-            arch::recycle_frame(fb);
         }
         std::thread::sleep(TICK);
     }
+}
+
+fn picture_rect(
+    (width, height): (u32, u32), (source_w, source_h): (u32, u32), layout: FrameLayout,
+) -> Rect {
+    let (w, h) = layout.output_size((width as usize, height as usize), (source_w as usize, source_h as usize));
+    let (w, h) = (w.max(1) as u32, h.max(1) as u32);
+    Rect::new(((width - w) / 2) as i32, ((height - h) / 2) as i32, w, h)
 }
 
 /// SDL button → INT 33h mask bit (0 = left, 1 = right, 2 = middle).

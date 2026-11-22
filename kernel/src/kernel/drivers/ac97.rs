@@ -77,12 +77,12 @@ pub struct Ac97 {
 static mut AC97: Option<Ac97> = None;
 
 /// Find an AC'97 codec (class 0x04, subclass 0x01) anywhere on PCI.
-fn scan<A: crate::Arch>(machine: &mut A) -> Option<(u8, u8, u8)> {
+fn scan<A: crate::Core>(machine: &mut A) -> Option<(u8, u8, u8)> {
     crate::kernel::pci::find_class(machine, 0x04, 0x01)
 }
 
 /// Bring up the selected codec and return its unique runtime capability.
-pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<&'static mut Ac97> {
+pub fn probe<A: crate::Core>(machine: &mut A) -> Option<&'static mut Ac97> {
     let (bus, dev, func) = scan(machine)?;
     let device = bring_up(machine, bus, dev, func)?;
     unsafe {
@@ -94,7 +94,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<&'static mut Ac97> {
 }
 
 /// Bring up the codec at `bus:dev.func`.
-fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Option<Ac97> {
+fn bring_up<A: crate::Core>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Option<Ac97> {
     // Enable I/O space + bus-master and suppress INTx: playback progress is
     // polled from CIV/PICB, so this sink deliberately generates no interrupts.
     let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);

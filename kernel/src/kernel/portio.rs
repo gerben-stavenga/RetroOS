@@ -2,7 +2,7 @@
 //! PCI config) that run DEEP below any `machine: &mut A` parameter — the VFS
 //! read path reaches the disk from call sites that never see the arch handle.
 //!
-//! The canonical port surface is `Arch::inb/outb/...`; these hooks are the
+//! The canonical port surface is `Core::inb/outb/...`; these hooks are the
 //! same backend functions, installed once by the ENTRY crate before
 //! `startup` (composition-root dependency injection, no `cfg`). Reads
 //! before installation return the ISA "no device" pattern; writes drop.

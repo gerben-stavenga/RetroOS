@@ -46,7 +46,7 @@ impl Anonymous {
     }
 }
 
-pub(super) fn call<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args) -> SyscallResult {
+pub(super) fn call<A: crate::Core>(machine: &mut A, linux: &LinuxState, a: &Args) -> SyscallResult {
     if a.a0 >= high_memory::START {
         let Some(length) = a.a1.checked_add(4095).map(|n| n & !4095) else { return SyscallResult::val(-EINVAL); };
         if a.a0 & 4095 != 0 || !high_memory::range(a.a0, length) { return SyscallResult::val(-EINVAL); }

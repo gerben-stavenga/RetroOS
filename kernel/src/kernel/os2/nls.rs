@@ -1,7 +1,7 @@
 //! Single-byte NLS services backed by shared regional profiles.
 use super::*;
 
-pub(super) fn dispatch<A: crate::Arch>(machine: &mut A, regs: &Regs, api: Api) -> u32 {
+pub(super) fn dispatch<A: crate::Core>(machine: &mut A, regs: &Regs, api: Api) -> u32 {
     let length = arg32(machine, regs, 0) as usize;
     let country = arg32(machine, regs, 1) as usize;
     let buffer = arg32(machine, regs, 2) as usize;

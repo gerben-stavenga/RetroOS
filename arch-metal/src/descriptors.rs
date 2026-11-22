@@ -659,12 +659,6 @@ pub fn seg_base(sel: u16) -> u32 {
     b0 | (b1 << 16) | (b2 << 24)
 }
 
-pub(crate) fn seg_limit(sel: u16) -> u32 {
-    let d = read_descriptor(sel);
-    let limit = ((d & 0xffff) | ((d >> 32) & 0xf0000)) as u32;
-    if d & (1 << 55) != 0 { (limit << 12) | 4095 } else { limit }
-}
-
 /// True if the segment's D/B bit is set (32-bit default operand/stack size).
 /// The null selector reports true — matches x86 behavior for a flat 32-bit
 /// kernel where CS=0 never actually happens.

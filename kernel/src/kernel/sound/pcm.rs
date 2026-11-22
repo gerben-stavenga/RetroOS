@@ -58,7 +58,7 @@ pub(super) fn mix(frames: &mut [(i32,i32)], rate: u32, base: u64) {
         if let Some(mut stream) = stream.try_lock() { stream.mix(frames,rate,base); }
     }
 }
-pub(crate) fn call<A: crate::Arch>(machine: &mut A, handles: &mut Handles, args: [u32;6]) -> u32 {
+pub(crate) fn call<A: crate::Core>(machine: &mut A, handles: &mut Handles, args: [u32;6]) -> u32 {
     let [op,handle,data,size,_,out] = args;
     if op == 0 {
         if data == 0 || out == 0 { return INVALID; }

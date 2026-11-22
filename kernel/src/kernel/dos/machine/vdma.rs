@@ -155,7 +155,7 @@ impl Dma8237 {
         }
     }
 
-    pub fn io_read<A: crate::Arch>(&mut self, _machine: &mut A, port: u16) -> u8 {
+    pub fn io_read<A: crate::Core>(&mut self, _machine: &mut A, port: u16) -> u8 {
         // Page registers read back the latched value.
         if let Some(&(_, chan)) = DMA_PAGE_PORT.iter().find(|&&(p, _)| p == port) {
             return self.ch[chan].prog.page;

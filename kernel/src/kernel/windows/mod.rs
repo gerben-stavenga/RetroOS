@@ -43,7 +43,7 @@ const TEB_SIZE: usize = 8192;
 // TEB scratch string used by Wine's ANSI-to-Unicode filename conversion.
 const TEB_STATIC_STRING: u32 = 0xbf8;
 const TEB_STATIC_BUFFER: u32 = 0xc00;
-fn initialize_teb_string<A: crate::Arch>(machine: &mut A) {
+fn initialize_teb_string<A: crate::Core>(machine: &mut A) {
     machine.write::<u16>(((TEB_BASE + TEB_STATIC_STRING) as usize) as u64, 0);
     machine.write::<u16>(((TEB_BASE + TEB_STATIC_STRING + 2) as usize) as u64, 522);
     machine.write::<u32>(((TEB_BASE + TEB_STATIC_STRING + 4) as usize) as u64, TEB_BASE + TEB_STATIC_BUFFER);
@@ -230,11 +230,11 @@ struct Callback {
 }
 
 /// Windows API state plus optional protected-mode DOS services for NE programs.
-pub struct WindowsProcess<A: crate::Arch> {
+pub struct WindowsProcess<A: crate::Core> {
     state: WindowsState,
     dos: Option<alloc::boxed::Box<crate::kernel::dos::DosState<A>>>,
 }
-impl<A: crate::Arch> WindowsProcess<A> {
+impl<A: crate::Core> WindowsProcess<A> {
     pub(crate) fn next_deadline(&self, now: u64) -> Option<u64> {
         [threads::next_deadline(&self.state.threads).filter(|&end| end > now),
             user_queue::next_deadline(&self.state.user_queues, now),
@@ -257,14 +257,14 @@ impl<A: crate::Arch> WindowsProcess<A> {
         if let Some(dos) = &mut self.dos { dos.on_exit(machine, regs, false); }
     }
 }
-impl<A: crate::Arch> From<WindowsState> for WindowsProcess<A> {
+impl<A: crate::Core> From<WindowsState> for WindowsProcess<A> {
     fn from(state: WindowsState) -> Self { Self { state, dos: None } }
 }
-impl<A: crate::Arch> core::ops::Deref for WindowsProcess<A> {
+impl<A: crate::Core> core::ops::Deref for WindowsProcess<A> {
     type Target = WindowsState;
     fn deref(&self) -> &WindowsState { &self.state }
 }
-impl<A: crate::Arch> core::ops::DerefMut for WindowsProcess<A> {
+impl<A: crate::Core> core::ops::DerefMut for WindowsProcess<A> {
     fn deref_mut(&mut self) -> &mut WindowsState { &mut self.state }
 }
 
@@ -391,7 +391,7 @@ impl WindowsState {
     pub fn exec_path_str(&self) -> &[u8] {
         &self.exec_path[..self.exec_path_len]
     }
-    pub fn on_resume<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn on_resume<A: crate::Core>(&mut self, machine: &mut A) {
         machine.load_ldt(&self.ldt);
     }
     pub fn repaint_osd(&mut self) {
@@ -434,7 +434,7 @@ impl WindowsState {
 }
 
 #[allow(clippy::too_many_arguments)] // Shared executable launch context.
-pub fn exec_ne_into<A: crate::Arch>(
+pub fn exec_ne_into<A: crate::Core>(
     machine: &mut A,
     threads: &mut thread::ThreadTable<A>,
     tid: usize,
@@ -451,7 +451,7 @@ pub fn exec_ne_into<A: crate::Arch>(
 /// Publish guest-owned top-level surfaces. USER32 owns placement and window
 /// policy; the desktop composes every surface rather than discarding all but
 /// the last one (for example, a game's floating status/tool window).
-pub fn render<A: crate::Arch>(
+pub fn render<A: crate::Core>(
     _machine: &mut A,
     _bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     state: &mut WindowsState,
@@ -607,7 +607,7 @@ fn load_dependency(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i
     Err(2)
 }
 
-fn map_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i32> {
+fn map_module<A: crate::Core>(machine: &mut A, module: &Module) -> Result<(), i32> {
     let image = pe::Image::parse(&module.data).map_err(|_| 8)?;
     let end = module.base.checked_add(image.header.size_image).ok_or(8)?;
     if end >= USER_LIMIT {
@@ -647,7 +647,7 @@ fn map_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i3
     Ok(())
 }
 
-fn protect_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i32> {
+fn protect_module<A: crate::Core>(machine: &mut A, module: &Module) -> Result<(), i32> {
     let image = pe::Image::parse(&module.data).map_err(|_| 8)?;
     for section in image.sections().map_err(|_| 8)? {
         let size = section.virtual_size.max(section.raw_size) as usize;
@@ -709,7 +709,7 @@ fn protection_flags(protection: u32) -> Option<(bool, bool)> {
     }
 }
 
-fn change_protection<A: crate::Arch>(machine: &mut A, state: &mut WindowsState,
+fn change_protection<A: crate::Core>(machine: &mut A, state: &mut WindowsState,
                                    address: u32, size: u32, protection: u32) -> Result<u32,u32> {
     let (write,execute) = protection_flags(protection).ok_or(ERROR_INVALID_PARAMETER)?;
     let end = address.checked_add(size).filter(|&end| size != 0 && end < USER_LIMIT)
@@ -784,7 +784,7 @@ fn resolve_export(modules: &[Module], mut index: usize, symbol: &pe::ImportSymbo
     }
 }
 
-fn apply_imports<A: crate::Arch>(machine: &mut A, modules: &[Module], index: usize) -> Result<(), i32> {
+fn apply_imports<A: crate::Core>(machine: &mut A, modules: &[Module], index: usize) -> Result<(), i32> {
     let image = pe::Image::parse(&modules[index].data).map_err(|_| 8)?;
     for import in image.imports().map_err(|_| 8)? {
         let target_index = find_module(modules, &import.module).ok_or(2)?;
@@ -826,7 +826,7 @@ fn dll_initializers(modules: &[Module], start: usize) -> Result<Vec<(u32, u32)>,
     Ok(output)
 }
 
-fn rollback_modules<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, start: usize) {
+fn rollback_modules<A: crate::Core>(machine: &mut A, state: &mut WindowsState, start: usize) {
     for module in &state.modules[start..] {
         if let Ok(image) = pe::Image::parse(&module.data) {
             crate::kernel::memory::reset(machine, module.base as usize / 4096, (image.header.size_image as usize).div_ceil(4096));
@@ -838,7 +838,7 @@ fn rollback_modules<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, s
 }
 
 /// Map a DLL requested after startup, retaining the process's import gates.
-fn load_library<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, name: &[u8]) -> Result<(u32,Vec<(u32,u32)>),u32> {
+fn load_library<A: crate::Core>(machine: &mut A, state: &mut WindowsState, name: &[u8]) -> Result<(u32,Vec<(u32,u32)>),u32> {
     let file=name.rsplit(|&b|b==b'/' || b==b'\\').next().unwrap_or(name);
     if let Some(index)=find_module(&state.modules,file) {return Ok((state.modules[index].base,Vec::new()));}
     let raw=if file.contains(&b'.') {name.to_vec()} else {let mut path=name.to_vec();path.extend_from_slice(b".DLL");path};
@@ -878,7 +878,7 @@ fn load_library<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, name:
 /// Guest code that calls each real DLL entry with DLL_PROCESS_ATTACH, then
 /// jumps to the executable. Each DllMain is stdcall and removes its own
 /// arguments, so the stack the executable sees is unchanged.
-fn dll_startup_stub<A: crate::Arch>(
+fn dll_startup_stub<A: crate::Core>(
     machine: &mut A,
     dlls: &[(u32, u32)],
     exe_entry: u32,
@@ -887,7 +887,7 @@ fn dll_startup_stub<A: crate::Arch>(
     dll_startup_stub_at(machine, dlls, exe_entry, 0x7ff2_0000, abort)
 }
 
-fn dll_startup_stub_at<A: crate::Arch>(machine: &mut A, dlls: &[(u32,u32)], exe_entry: u32, stub: u32, abort: u32) -> Result<u32,i32> {
+fn dll_startup_stub_at<A: crate::Core>(machine: &mut A, dlls: &[(u32,u32)], exe_entry: u32, stub: u32, abort: u32) -> Result<u32,i32> {
     let mut code = Vec::new();
     for &(base, entry) in dlls {
         code.extend_from_slice(&[0x68, 0, 0, 0, 0]);
@@ -963,7 +963,7 @@ const API_SPECS: &[(&[u8], &[u8], Api, u32)] = &[
 
 /// Real DLL functions execute as guest code. Only explicit INT 83h exports
 /// register kernel gates, identically for startup imports and LoadLibrary.
-fn register_module_gates<A: crate::Arch>(machine: &A, module: &Module, gates: &mut Vec<Gate>) -> Result<(), i32> {
+fn register_module_gates<A: crate::Core>(machine: &A, module: &Module, gates: &mut Vec<Gate>) -> Result<(), i32> {
     // Only RETROOS.DLL defines kernel gates; other DLL exports are guest code.
     if !module.name.eq_ignore_ascii_case(b"RETROOS.DLL") { return Ok(()); }
     let image = pe::Image::parse(&module.data).map_err(|_| 8)?;
@@ -1070,7 +1070,7 @@ pub(super) fn guest_windows_path(path: &[u8]) -> Vec<u8> {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn exec_pe_into<A: crate::Arch>(
+pub fn exec_pe_into<A: crate::Core>(
     machine: &mut A,
     threads: &mut thread::ThreadTable<A>,
     tid: usize,
@@ -1207,15 +1207,15 @@ pub fn exec_pe_into<A: crate::Arch>(
     Ok(())
 }
 
-pub(super) fn arg<A: crate::Arch>(machine: &A, regs: &Regs, n: usize) -> u32 {
+pub(super) fn arg<A: crate::Core>(machine: &A, regs: &Regs, n: usize) -> u32 {
     machine.read::<u32>((regs.sp() as usize + 4 + n * 4) as u64)
 }
 
-pub(super) fn c_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
+pub(super) fn c_string<A: crate::Core>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
     Ok(encoding::ansi().decode(&raw_string(machine, address)?, false).unwrap().into_bytes())
 }
 
-pub(super) fn raw_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
+pub(super) fn raw_string<A: crate::Core>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
     if address == 0 {
         return Err(ERROR_INVALID_PARAMETER);
     }
@@ -1230,7 +1230,7 @@ pub(super) fn raw_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Ve
     Err(ERROR_INVALID_PARAMETER)
 }
 
-fn finish<A: crate::Arch>(machine: &A, regs: &mut Regs, gate: Gate, result: u32) {
+fn finish<A: crate::Core>(machine: &A, regs: &mut Regs, gate: Gate, result: u32) {
     let sp = regs.sp() as usize;
     let ret = machine.read::<u32>(sp as u64);
     if ret < 0x1000 {
@@ -1275,7 +1275,7 @@ fn fail(state: &mut WindowsState, error: u32, result: u32) -> u32 {
     result
 }
 
-fn io_write<A: crate::Arch>(
+fn io_write<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     handle: usize,
@@ -1418,7 +1418,7 @@ fn put_pixel(state: &mut WindowsState, dc: u32, x: i32, y: i32, color: u32) {
     }
 }
 
-fn dispatch<A: crate::Arch>(
+fn dispatch<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     state: &mut WindowsState,
@@ -1537,7 +1537,7 @@ fn dispatch<A: crate::Arch>(
 
 // Keep Windows-only call frames off the shared DOS/Linux event dispatcher.
 #[inline(never)]
-pub fn handle_event<A: crate::Arch>(
+pub fn handle_event<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
@@ -1788,13 +1788,13 @@ mod damage_tests {
 
 }
 
-pub(crate) fn poll_threads<A: crate::Arch>(machine:&mut A,kt:&mut thread::KernelThread<A>,process:&mut WindowsProcess<A>,regs:&mut Regs) {
+pub(crate) fn poll_threads<A: crate::Core>(machine:&mut A,kt:&mut thread::KernelThread<A>,process:&mut WindowsProcess<A>,regs:&mut Regs) {
     shared_data::update(machine);
     user_queue::poll(machine,&mut process.state);
     threads::poll(machine,kt,&mut process.state,regs);
 }
 
-fn initialize_environment<A: crate::Arch>(machine:&mut A,state:&mut WindowsState)->Result<(),i32> {
+fn initialize_environment<A: crate::Core>(machine:&mut A,state:&mut WindowsState)->Result<(),i32> {
     shared_data::initialize(machine);
     let text=alloc::string::String::from_utf8_lossy(&state.environment);
     let units:Vec<u16>=text.encode_utf16().collect();
@@ -1817,7 +1817,7 @@ fn process_cwd(path:&[u8])->Vec<u8> {
     if path.last()!=Some(&b'\\'){path.push(b'\\');}
     path
 }
-fn initialize_process_strings<A:crate::Arch>(machine:&mut A,state:&mut WindowsState)->Result<(),i32>{
+fn initialize_process_strings<A:crate::Core>(machine:&mut A,state:&mut WindowsState)->Result<(),i32>{
     machine.write::<u32>(PROCESS_DATA as u64,4096);
     machine.write::<u32>((PROCESS_DATA+4) as u64,0x298);
     machine.write::<u32>((PROCESS_DATA+8) as u64,1);

@@ -38,7 +38,7 @@ pub struct VirtualRtc {
 }
 
 impl VirtualRtc {
-    pub fn new<A: crate::Arch>(machine: &mut A) -> Self {
+    pub fn new<A: crate::Core>(machine: &mut A) -> Self {
         Self {
             // Power-on defaults of a typical PC RTC: reg A = 0x26 (32 kHz time
             // base, 1024 Hz periodic rate), reg B = 0x02 (24-hour, BCD).
@@ -73,7 +73,7 @@ impl VirtualRtc {
         }
     }
 
-    pub fn write<A: crate::Arch>(&mut self, machine: &mut A, idx: u8, val: u8) {
+    pub fn write<A: crate::Core>(&mut self, machine: &mut A, idx: u8, val: u8) {
         match idx {
             0x0A => self.reg_a = val & 0x7F, // UIP is read-only
             0x0B => {

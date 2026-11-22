@@ -125,7 +125,7 @@ pub(super) fn set_desc_limit(desc: &mut u64, limit: u32) {
 /// post-construction step out of `DosState::new()` lets that large state be
 /// returned directly into its destination instead of duplicated on the
 /// kernel stack.
-pub(in crate::kernel::dos) fn install_kernel_ldt_slots<A: crate::Arch>(dos: &mut thread::DosState<A>) {
+pub(in crate::kernel::dos) fn install_kernel_ldt_slots<A: crate::Core>(dos: &mut thread::DosState<A>) {
     // Reserve + install each kernel slot.
     let mark = |dos: &mut thread::DosState<A>, idx: usize, desc: u64| {
         dos.ldt[idx] = desc;
@@ -150,7 +150,7 @@ pub(in crate::kernel::dos) fn install_kernel_ldt_slots<A: crate::Arch>(dos: &mut
 /// traps to its own CD 31 slot in the vector-stub segment; `vector_stub_reflect`
 /// then reflects the interrupt to the real-mode IVT. Called from thread init
 /// and from the EXEC path so a child never inherits a DPMI parent's hooks.
-pub(in crate::kernel::dos) fn reset_pm_vectors<A: crate::Arch>(dos: &mut thread::DosState<A>) {
+pub(in crate::kernel::dos) fn reset_pm_vectors<A: crate::Core>(dos: &mut thread::DosState<A>) {
     for i in 0..256 {
         dos.pm_vectors[i] = (mode_transitions::VECTOR_STUB_SEL, dos::STUB_BASE + (i as u32) * 2);
     }

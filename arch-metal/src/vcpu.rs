@@ -49,7 +49,7 @@ impl GuestBytes for crate::backend::Metal {
     }
 }
 
-/// Arch-internal monitor accesses use the already donated execution reserve.
+/// Core-internal monitor accesses use the already donated execution reserve.
 fn transfer(mut address: u64, mut buffer: *mut u8, mut len: usize, to_user: bool) {
     while len != 0 {
         let n = len.min(4096 - (address as usize & 4095));

@@ -63,6 +63,8 @@ pub struct Registers {
     pub ac: Bytes<21>,
     pub dac: Bytes<768>,
     pub dac_mask: Byte,
+    #[doc(hidden)]
+    pub trap_mode_bits: Dword,
 }
 #[inline]
 fn vga_alu(func: u8, val: u8, latch: u8) -> u8 {
@@ -429,6 +431,35 @@ impl Registers {
         }
     }
 
+    /// Publish the prepared aperture and write mode after programming VGA
+    /// registers or installing their mappings. Mask-only hook writes leave
+    /// the mode intact and the handler reads the current mask from SEQ[2].
+    pub fn refresh_trap_mode(&self) {
+        let aperture = if self.direct_layout().is_none() {
+            let range = self.decoded_aperture();
+            u32::from(range.start_page) | (u32::from(range.end_page) << 8)
+        } else {
+            0
+        };
+        let sequential = u32::from(self.sequential_write().is_some()) << 16;
+        self.trap_mode_bits.set((1 << 31) | sequential | aperture);
+    }
+
+    fn trap_mode(&self) -> Option<(core::ops::Range<u32>, Option<SequentialWrite>)> {
+        if self.enabled.get() == 0 { return None; }
+        let bits = self.trap_mode_bits.get();
+        if bits == 0 {
+            let CpuAperture::Trapped { range } = self.cpu_aperture() else { return None };
+            return Some(((u32::from(range.start_page) << 12)..(u32::from(range.end_page) << 12),
+                self.sequential_write()));
+        }
+        let start = (bits & 255) << 12;
+        let end = ((bits >> 8) & 255) << 12;
+        if start == end { return None; }
+        let write = (bits & (1 << 16) != 0).then(|| SequentialWrite { mask: self.seq.get(2) & 15 });
+        Some((start..end, write))
+    }
+
     /// Reset the same device allocation during a BIOS mode change.
     pub fn copy_from(&self, source: &Self) {
         macro_rules! byte { ($($field:ident),*) => { $(self.$field.set(source.$field.get());)* }; }
@@ -436,18 +467,26 @@ impl Registers {
         byte!(enabled, seq_index, gc_index, latches_valid, misc_output, feature_ctl,
             cga_mode_ctl, cga_color_select, dac_mask);
         bytes!(latches, seq, crtc, gc, ac, dac);
+        self.refresh_trap_mode();
     }
 }
-/// Published at a kernel return, read and cleared by that CPU's kernel owner.
+/// Written by the executing CPU and read and cleared by its kernel owner.
 /// Fixed-width atomics keep the same layout in the 32-bit VM and 64-bit host.
 #[repr(C)]
 pub struct Profile([Dword; 30]);
 impl Profile {
     pub const fn new() -> Self { Self([const { Dword::new(0) }; 30]) }
-    pub fn publish(&self, report: Report) {
-        self.0[0].set(report.cycles as u32);
-        self.0[1].set((report.cycles >> 32) as u32);
-        for (cell, value) in self.0[2..].iter().zip(report.details.into_iter().flatten()) { cell.set(value); }
+    pub(crate) fn record(&self, kind: usize, cycles: u64) {
+        fn add(words: &[Dword], value: u64) {
+            let sum = (u64::from(words[0].get()) | u64::from(words[1].get()) << 32)
+                .wrapping_add(value);
+            words[0].set(sum as u32);
+            words[1].set((sum >> 32) as u32);
+        }
+        add(&self.0[..2], cycles);
+        let base = 2 + kind * 4;
+        add(&self.0[base..base + 2], 1);
+        add(&self.0[base + 2..base + 4], cycles);
     }
     pub fn take(&self) -> Report {
         let mut report = Report { cycles: u64::from(self.0[0].get()) | (u64::from(self.0[1].get()) << 32), ..Report::default() };
@@ -455,4 +494,25 @@ impl Profile {
         for cell in &self.0 { cell.set(0); }
         report
     }
+}
+
+pub const TRAP_NAME: &str = "vga-planar";
+
+/// Lend the active VGA to the execution context until it is suspended.
+/// # Safety
+/// Both regions must remain resident and valid until detached.
+pub unsafe fn bind(arch: &mut impl arch_abi::X86, binding: Option<Binding>) {
+    use arch_abi::entry::{HookRegion, TrapHook};
+    let hook = binding.map(|binding| {
+        unsafe { (&*binding.registers).refresh_trap_mode(); }
+        TrapHook {
+            name: TRAP_NAME,
+            handler: instruction::trap_handler,
+            regions: [
+                HookRegion { base: binding.registers.cast_mut().cast(), bytes: 4096 },
+                HookRegion { base: binding.planes, bytes: 4 * 65536 },
+            ],
+        }
+    });
+    unsafe { arch.install_trap_hook(hook); }
 }

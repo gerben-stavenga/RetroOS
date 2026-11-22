@@ -44,15 +44,15 @@ pub(super) fn shift_state() -> u16 {
         | (((crate::kernel::keyboard::control_state() >> 5) as u16 & 1) << 5)
         | (((crate::kernel::keyboard::control_state() >> 7) as u16 & 1) << 6)
 }
-fn word<A: crate::Arch>(m: &A, s: &Os2State, r: &Regs, off: usize) -> u16 {
+fn word<A: crate::Core>(m: &A, s: &Os2State, r: &Regs, off: usize) -> u16 {
     m.read::<u16>((stack_linear(s, r) + 4 + off) as u64)
 }
-fn pointer<A: crate::Arch>(m: &A, s: &Os2State, r: &Regs, off: usize) -> usize {
+fn pointer<A: crate::Core>(m: &A, s: &Os2State, r: &Regs, off: usize) -> usize {
     selector_base(s, word(m, s, r, off + 2))
         .unwrap_or(0)
         .wrapping_add(word(m, s, r, off) as u32) as usize
 }
-pub(super) fn kbd<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) -> u32 {
+pub(super) fn kbd<A: crate::Core>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) -> u32 {
     let out = pointer(m, s, r, if ordinal == 4 { 4 } else { 2 });
     match ordinal {
         10 => {
@@ -141,7 +141,7 @@ fn paint(s: &mut Os2State) {
     );
     crate::kernel::term::mark_dirty();
 }
-fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) -> u32 {
+fn video<A: crate::Core>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) -> u32 {
     let out = pointer(m, s, r, 2);
     match ordinal {
         1 => {}
@@ -291,7 +291,7 @@ fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) ->
     }
     NO_ERROR
 }
-pub(super) fn alloc_shared<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs) -> u32 {
+pub(super) fn alloc_shared<A: crate::Core>(m: &mut A, s: &mut Os2State, r: &Regs) -> u32 {
     let name = arg32(m, r, 1);
     let result = alloc_os2_memory(m, s, arg32(m, r, 0) as usize, arg32(m, r, 2));
     if result == 0 && name != 0 && let Ok(mut name) = c_string(m, name) {
@@ -301,7 +301,7 @@ pub(super) fn alloc_shared<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs
     }
     result
 }
-pub(super) fn get_shared<A: crate::Arch>(m: &mut A, s: &Os2State, r: &Regs) -> u32 {
+pub(super) fn get_shared<A: crate::Core>(m: &mut A, s: &Os2State, r: &Regs) -> u32 {
     let Ok(mut name) = c_string(m, arg32(m, r, 1)) else {
         return ERROR_INVALID_PARAMETER;
     };
@@ -312,7 +312,7 @@ pub(super) fn get_shared<A: crate::Arch>(m: &mut A, s: &Os2State, r: &Regs) -> u
     m.write::<u32>(arg32(m, r, 0) as u64, *address);
     NO_ERROR
 }
-fn copy_string<A: crate::Arch>(m: &mut A, out: usize, cap: usize, bytes: &[u8]) -> u32 {
+fn copy_string<A: crate::Core>(m: &mut A, out: usize, cap: usize, bytes: &[u8]) -> u32 {
     let bytes = crate::kernel::text::Encoding::oem().encode(&alloc::string::String::from_utf8_lossy(bytes), b'?').0;
     if cap <= bytes.len() { return 111; }
     m.copy_to(out as u64, &bytes);
@@ -353,7 +353,7 @@ mod path_tests {
     }
 }
 
-fn file_info<A: crate::Arch>(
+fn file_info<A: crate::Core>(
     m: &mut A,
     out: usize,
     cap: usize,
@@ -388,7 +388,7 @@ fn file_info<A: crate::Arch>(
     }
     NO_ERROR
 }
-fn find_output<A: crate::Arch>(
+fn find_output<A: crate::Core>(
     m: &mut A,
     find: &mut Find,
     out: usize,
@@ -455,7 +455,7 @@ fn wildcard(pattern: &[u8], name: &[u8]) -> bool {
 /// DosExecPgm uses two NUL-terminated argument strings (argv[0], then tail).
 /// The shared launcher owns the address-space transition; no DOS stub is run
 /// for a native PE/LX child.
-pub(super) fn exec_program<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs)
+pub(super) fn exec_program<A: crate::Core>(m: &mut A, s: &mut Os2State, r: &Regs)
     -> Result<thread::KernelAction, u32> {
     let flags = arg32(m, r, 2);
     // Debug and asynchronous-result modes need DosWaitChild/trace support.
@@ -512,7 +512,7 @@ pub(super) fn exec_program<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs
 fn exec_error(regs: &mut Regs, error: i32) { regs.rax = error.unsigned_abs() as u64; }
 fn exec_success(regs: &mut Regs, _tid: i32) { regs.rax = 0; }
 
-fn search_path<A: crate::Arch>(m: &mut A, s: &Os2State, r: &Regs) -> u32 {
+fn search_path<A: crate::Core>(m: &mut A, s: &Os2State, r: &Regs) -> u32 {
     let flags = arg32(m, r, 0);
     if flags & !7 != 0 { return ERROR_INVALID_PARAMETER; }
     let Ok(path) = c_string(m, arg32(m, r, 1)) else { return ERROR_INVALID_PARAMETER; };
@@ -546,7 +546,7 @@ fn search_path<A: crate::Arch>(m: &mut A, s: &Os2State, r: &Regs) -> u32 {
     ERROR_FILE_NOT_FOUND
 }
 
-pub(super) fn dispatch<A: crate::Arch>(
+pub(super) fn dispatch<A: crate::Core>(
     m: &mut A,
     kt: &mut thread::KernelThread<A>,
     s: &mut Os2State,
@@ -1078,7 +1078,7 @@ pub(super) fn dispatch<A: crate::Arch>(
     }
 }
 
-pub(super) fn begin_dll_init<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &mut Regs) {
+pub(super) fn begin_dll_init<A: crate::Core>(m: &mut A, s: &mut Os2State, r: &mut Regs) {
     if s.dll_saved.is_some() {
         return;
     }
@@ -1093,7 +1093,7 @@ pub(super) fn begin_dll_init<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &mu
     r.frame.rsp = stack as u64;
     r.frame.rip = entry as u64;
 }
-fn load_module<A: crate::Arch>(m: &mut A, s: &mut Os2State, path: &[u8]) -> Result<u32, u32> {
+fn load_module<A: crate::Core>(m: &mut A, s: &mut Os2State, path: &[u8]) -> Result<u32, u32> {
     let name = module_name(
         path.rsplit(|&b| b == b'/' || b == b'\\')
             .next()

@@ -16,7 +16,7 @@ use paging2::{PAGE_SIZE, LOW_MEM_BASE};
 /// Kernel physical load address (must match KERNEL_PHYS in kernel.ld)
 pub const KERNEL_PHYS: usize = 0x0010_0000;
 
-/// Heap growth belongs to the kernel. Arch only installs supplied frames.
+/// Heap growth belongs to the kernel. Core only installs supplied frames.
 struct KernelHeap {
     heap: lib::heap::Heap,
     growing: core::sync::atomic::AtomicBool,
@@ -304,7 +304,7 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, magic: u32, info: *const u8) 
     // The arch backend handle, threaded as `&mut` through the kernel from here
     // on so its mutable state is borrow-checked rather than global. Lives for
     // the rest of the kernel's life (startup never returns).
-    let mut machine = arch::Metal;
+    let mut machine = unsafe { arch::Metal::bind_current() };
     lib::compact_screenln!(&mut *lib::term::term(), "Heap base: {:#x}", arch::heap_base());
     let disks = crate::kernel::block::probe(&mut machine);
     crate::kernel::startup::startup(&mut machine, config, crate::kernel::startup::Storage::Disks(disks));
@@ -422,21 +422,16 @@ unsafe fn prepare_boot(
     crate::kernel::bios_display::set_native_memory(conventional_pages);
     let trampoline = smp::trampoline(layout);
     let trampoline_frame = trampoline.map(|address| u64::from(address) / PAGE_SIZE as u64);
-    phys_mm::init_phys_mm(
-        layout,
-        core::iter::once(kernel_low_page..kernel_high_page)
-            .chain(trampoline_frame.map(|page| page..page + 1)),
-    );
-    install_physical_memory();
-    crate::kernel::memory::set_text_frame(phys_mm::alloc_contig(8).expect("no VGA backing pages"));
-
-    // All heap pages are mapped before donation to the allocator. Backing
-    // stays resident across frees, so other CPUs never retain recycled mappings.
+    // The heap maps backing frames from the bootstrap pool as it grows.
     ALLOCATOR.end.store(arch::heap_base(), core::sync::atomic::Ordering::Relaxed);
     ALLOCATOR.heap.enable_small_cache();
-    phys_mm::complete_initialization();
+    let mut occupied = [kernel_low_page..kernel_high_page, 0..0];
+    if let Some(page) = trampoline_frame { occupied[1] = page..page + 1; }
     let zero_page = paging2::physical_page(&arch::ZERO_PAGE as *const _ as usize);
-    arch::memory::configure(crate::kernel::platform::init_frame_ownership(layout, zero_page));
+    let ownership = crate::kernel::platform::init_memory(layout, &occupied, zero_page);
+    arch::memory::configure(ownership);
+    install_isa_dma_memory();
+    crate::kernel::memory::set_text_frame(phys_mm::alloc_contig(8).expect("no VGA backing pages"));
     crate::kernel::klog::init();
     let table = phys_mm::alloc_phys_page().expect("physical aperture table");
     if !arch::aperture::init(table) { phys_mm::free_phys_page(table); }
@@ -714,8 +709,8 @@ fn fatal_finish() -> ! {
 }
 
 
-/// Bind kernel-owned allocation policy to the privileged paging/trap mechanisms.
-fn install_physical_memory() {
+/// Provide the ISA DMA driver with the platform boot pool.
+fn install_isa_dma_memory() {
     static DMA: phys_mm::LowDmaMemory = phys_mm::LowDmaMemory {
         reserve: |layout| {
             let storage = arch::boot_mem::allocate_permanent(layout).ok()? as usize;
@@ -726,8 +721,5 @@ fn install_physical_memory() {
         unmap: paging2::unmap_kernel_page,
     };
     phys_mm::install_low_dma_memory(&DMA);
-    let (needed, returned) = arch::memory::supply_pages(Default::default());
-    assert_eq!(returned.count, 0);
-    let (_, unused) = arch::memory::supply_pages(phys_mm::page_batch(needed));
-    assert_eq!(unused.count, 0);
+
 }

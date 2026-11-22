@@ -82,7 +82,7 @@ fn channel_ports(interface: u8, secondary: bool, command: u32, control: u32)
     Some((io_bar(command, 7)?, io_bar(control, 3)? + 2))
 }
 
-fn channels<A: crate::Arch>(machine: &mut A) -> alloc::vec::Vec<Arc<Channel>> {
+fn channels<A: crate::Core>(machine: &mut A) -> alloc::vec::Vec<Arc<Channel>> {
     let mut channels = alloc::vec::Vec::<Arc<Channel>>::new();
     for (bus, dev, func) in pci::find_classes(machine, 1, 1) {
         let interface = (pci::read32(machine, bus, dev, func, 8) >> 8) as u8;
@@ -386,7 +386,7 @@ impl Ata {
 pub type AtaDisk = Storage<Ata>;
 
 impl Storage<Ata> {
-    fn probe<A: crate::Arch>(machine: &mut A, channel: Arc<Channel>, index: usize, drive: u8) -> Option<Self> {
+    fn probe<A: crate::Core>(machine: &mut A, channel: Arc<Channel>, index: usize, drive: u8) -> Option<Self> {
         let mut ata = Ata::probe(channel, drive)?;
         let sectors = ata.addressing.capacity();
         let name = alloc::format!("ata{}", index * 2 + usize::from(drive));
@@ -410,7 +410,7 @@ impl Storage<Ata> {
 
 /// Reset each channel once, before configuring either drive. Resetting for
 /// the slave probe would undo the master's newly selected DMA mode.
-pub fn probe<A: crate::Arch>(machine: &mut A) -> alloc::vec::Vec<AtaDisk> {
+pub fn probe<A: crate::Core>(machine: &mut A) -> alloc::vec::Vec<AtaDisk> {
     let mut disks = alloc::vec::Vec::new();
     for (index, channel) in channels(machine).into_iter().enumerate() {
         let ctrl = channel.ctrl;
@@ -461,7 +461,7 @@ impl Hardware for Ata {
 struct BusMaster { base: u16, dma: Region }
 
 impl BusMaster {
-    fn probe<A: crate::Arch>(machine: &mut A, ata: &Ata) -> Option<(Self, Buffer)> {
+    fn probe<A: crate::Core>(machine: &mut A, ata: &Ata) -> Option<(Self, Buffer)> {
         let (bus, dev, func) = ata.channel.pci?;
         // IDE bus-master registers are standard; transfer timings are not.
         // PIIX3/PIIX4 provide independent master/slave MWDMA2 timings.

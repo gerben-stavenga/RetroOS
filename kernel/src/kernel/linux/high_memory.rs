@@ -47,7 +47,7 @@ pub fn range(address: u64, length: u64) -> bool {
     address.checked_add(length).is_some_and(|end|
         (address != 0 || length == 0) && (end <= 0xc0000000 || address >= START && end <= END))
 }
-pub fn copy_to<A: crate::Arch>(machine: &mut A, address: u64, bytes: &[u8]) -> bool {
+pub fn copy_to<A: crate::Core>(machine: &mut A, address: u64, bytes: &[u8]) -> bool {
     if !range(address, bytes.len() as u64) { return false; }
     let mut buffer = [0; 4096];
     for (index, part) in bytes.chunks(buffer.len()).enumerate() {
@@ -56,14 +56,14 @@ pub fn copy_to<A: crate::Arch>(machine: &mut A, address: u64, bytes: &[u8]) -> b
     }
     true
 }
-pub fn copy_from<A: crate::Arch>(machine: &mut A, address: u64, bytes: &mut [u8]) -> bool {
+pub fn copy_from<A: crate::Core>(machine: &mut A, address: u64, bytes: &mut [u8]) -> bool {
     if !range(address, bytes.len() as u64) { return false; }
     machine.high_copy(address, bytes, false)
 }
 
 /// Read a guest string without truncating high thread-stack pointers. Stop at
 /// page boundaries so a terminating NUL never requires the following page.
-pub(super) fn copy_cstr<A: crate::Arch>(machine: &mut A, address: u64, bytes: &mut [u8]) -> Result<usize, i32> {
+pub(super) fn copy_cstr<A: crate::Core>(machine: &mut A, address: u64, bytes: &mut [u8]) -> Result<usize, i32> {
     let mut offset = 0;
     while offset < bytes.len() {
         let pointer = address.checked_add(offset as u64).ok_or(-EFAULT)?;
@@ -75,7 +75,7 @@ pub(super) fn copy_cstr<A: crate::Arch>(machine: &mut A, address: u64, bytes: &m
     Ok(offset)
 }
 
-pub fn mmap<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+pub fn mmap<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     if a.a0 < START && a.a1 <= 0xc0000000 && a.a0 <= u32::MAX as u64 {
         let low = sys_mmap2(machine, kt, linux, a, a.a5 as usize);
         // Additional V8 isolates can exhaust the low window with reservations
@@ -112,7 +112,7 @@ pub fn mmap<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
     } else { linux_trace!("[LINUX-HIGH] allocation failed {}", result); SyscallResult::val(result) }
 }
 
-pub fn change<A: crate::Arch>(machine: &mut A, a: &Args, operation: u32) -> SyscallResult {
+pub fn change<A: crate::Core>(machine: &mut A, a: &Args, operation: u32) -> SyscallResult {
     if a.a0 & 4095 != 0 { return SyscallResult::val(-EINVAL); }
     let Some(length) = a.a1.checked_add(4095).map(|n| n & !4095)
         else { return SyscallResult::val(-EINVAL); };
@@ -121,7 +121,7 @@ pub fn change<A: crate::Arch>(machine: &mut A, a: &Args, operation: u32) -> Sysc
     SyscallResult::val(apply(machine, a.a0, length, operation, if operation == 1 { a.a2 as u32 } else { 0 }))
 }
 
-pub fn unmap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args) -> SyscallResult {
+pub fn unmap<A: crate::Core>(machine: &mut A, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let result = change(machine, a, 2);
     if result.retval == 0 {
         let end = a.a0 + ((a.a1 + 4095) & !4095);
@@ -132,7 +132,7 @@ pub fn unmap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args) 
 }
 
 /// Linux reservation/protection/discard policy over architecture mapping data.
-fn apply<A: crate::Arch>(machine: &mut A, address: u64, length: u64, operation: u32, protection: u32) -> i32 {
+fn apply<A: crate::Core>(machine: &mut A, address: u64, length: u64, operation: u32, protection: u32) -> i32 {
     use arch_abi::{UserPage, page_entry::{Backing, PageEntry}};
     use crate::kernel::memory;
     let Ok(start) = UserPage::new(address) else { return -EINVAL; };

@@ -19,7 +19,7 @@ fn errno(rc: i32) -> Result<(), u16> {
     if rc >= 0 { Ok(()) } else { Err(dos_error_from_errno(rc)) }
 }
 
-fn string<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs, seg: u16, off: u32) -> Result<Vec<u8>, u16> {
+fn string<A: crate::Core>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs, seg: u16, off: u32) -> Result<Vec<u8>, u16> {
     let address = seg_offset(dos, regs, seg, off) as usize;
     let mut name = Vec::new();
     for i in 0..=PATH_MAX {
@@ -30,7 +30,7 @@ fn string<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Reg
     Err(206)
 }
 
-fn put_string<A: crate::Arch>(machine: &mut A, address: usize, value: &[u8]) {
+fn put_string<A: crate::Core>(machine: &mut A, address: usize, value: &[u8]) {
     machine.copy_to(address as u64, value);
     machine.write::<u8>((address + value.len()) as u64, 0);
 }
@@ -71,7 +71,7 @@ fn find_data(found: &Found, format: u16) -> Result<Vec<u8>, u16> {
     Ok(out)
 }
 
-pub(super) fn dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> DosExit {
+pub(super) fn dispatch<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> DosExit {
     match call(machine, kt, dos, regs) {
         Ok(Some(ax)) => DosExit::Ax(ax),
         Ok(None) => DosExit::Ok,
@@ -80,7 +80,7 @@ pub(super) fn dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelT
 }
 
 #[inline(never)]
-fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> Result<Option<u16>, u16> {
+fn call<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> Result<Option<u16>, u16> {
     match regs.rax as u8 {
         0x39..=0x3b => {
             let name = string(machine, dos, regs, regs.ds as u16, regs.rdx as u32)?;
@@ -252,7 +252,7 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
 }
 
 #[inline(never)]
-fn open<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> Result<u16, u16> {
+fn open<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> Result<u16, u16> {
     let action = regs.rdx as u16;
     if !matches!(action, 1 | 2 | 0x10 | 0x11 | 0x12) { return Err(1); }
     let flags = regs.rbx as u16;

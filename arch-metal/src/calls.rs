@@ -26,11 +26,11 @@ pub fn do_arch_execute_raw(max_ns: u64) -> (u32, u64) {
 }
 
 /// Exchange the active address space with `space`.
-pub fn arch_activate(space: &mut super::RootPageTable) {
+pub(crate) fn arch_activate(space: &mut super::AddressSpace) {
     unsafe {
         core::arch::asm!("int 0x80",
             in("eax") crate::arch_call::ACTIVATE as u32,
-            in("edx") space as *mut super::RootPageTable as u32,
+            in("edx") space as *mut super::AddressSpace as u32,
         );
     }
 }
@@ -58,7 +58,7 @@ pub fn arch_switch_fx(fx: &mut crate::FxState) {
 
 /// COW fork the current address space. Fills child root.
 /// Caller must save parent root after (fork modifies entries for COW).
-pub fn arch_user_fork(child_root: &mut super::RootPageTable) {
+pub(crate) fn arch_user_fork(child_root: &mut super::AddressSpace) {
     unsafe {
         core::arch::asm!(
             "int 0x80",

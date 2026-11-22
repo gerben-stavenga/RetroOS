@@ -70,7 +70,7 @@ pub(crate) fn read(handle: u64, bytes: &mut [u8]) -> i32 {
 
 pub(super) fn pending() -> bool { PENDING.load(Ordering::Acquire) }
 
-pub(super) fn poll(machine: &mut impl crate::Arch, stats: &mut crate::kernel::startup::EventStats) -> bool {
+pub(super) fn poll(machine: &mut impl crate::Core, stats: &mut crate::kernel::startup::EventStats) -> bool {
     if !PENDING.swap(false, Ordering::AcqRel) { return false; }
     let mut dump = false;
     for _ in 0..MAX_CLIENTS {

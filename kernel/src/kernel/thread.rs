@@ -116,12 +116,12 @@ pub(crate) struct SavedFdTable {
     cloexec: FdSet,
 }
 impl SavedFdTable {
-    pub(crate) fn capture<A: crate::Arch>(thread: &KernelThread<A>) -> Self {
+    pub(crate) fn capture<A: crate::Core>(thread: &KernelThread<A>) -> Self {
         let saved = Self { fds: copy_fds(&thread.fds), cloexec: thread.cloexec };
         for &fd in saved.fds.iter() { fd.retain(); }
         saved
     }
-    pub(crate) fn restore<A: crate::Arch>(mut self, thread: &mut KernelThread<A>) {
+    pub(crate) fn restore<A: crate::Core>(mut self, thread: &mut KernelThread<A>) {
         thread.close_all_fds();
         core::mem::swap(&mut self.fds, &mut thread.fds);
         core::mem::swap(&mut self.cloexec, &mut thread.cloexec);
@@ -293,7 +293,7 @@ pub enum PersonalityName {
 }
 
 #[allow(clippy::large_enum_variant)] // see the note on Linux below
-pub enum Personality<A: crate::Arch> {
+pub enum Personality<A: crate::Core> {
     /// DOS mode: VM86 (real mode) or DPMI (32-bit protected mode)
     Dos(alloc::boxed::Box<DosState<A>>),
     /// Linux userspace (32 or 64-bit, distinguished by CS descriptor).
@@ -309,7 +309,7 @@ pub enum Personality<A: crate::Arch> {
     Windows(crate::kernel::windows::WindowsProcess<A>),
 }
 
-impl<A: crate::Arch> Personality<A> {
+impl<A: crate::Core> Personality<A> {
     pub fn surface_buffer<'a>(
         &'a self,
         key: crate::kernel::gui::SurfaceKey,
@@ -367,14 +367,14 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
-    pub fn set_physical_sb_master<A2: crate::Arch>(&self, machine: &mut A2, raw: u8) -> bool {
+    pub fn set_physical_sb_master<A2: crate::Core>(&self, machine: &mut A2, raw: u8) -> bool {
         match self {
             Self::Dos(dos) => dos.pc.audio.lock().sb.set_physical_master(machine, raw),
             Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => false,
         }
     }
 
-    pub fn set_physical_sb_source<A2: crate::Arch>(&self, machine: &mut A2,
+    pub fn set_physical_sb_source<A2: crate::Core>(&self, machine: &mut A2,
         source: crate::kernel::osd::SbSource, level: u8) -> bool {
         match self {
             Self::Dos(dos) => dos.pc.audio.lock().sb.set_physical_source(machine, source, level),
@@ -395,7 +395,7 @@ impl<A: crate::Arch> Personality<A> {
         card: Option<crate::kernel::drivers::sb16::Sb16>,
     ) -> Option<crate::kernel::drivers::sb16::Sb16>
     where
-        A2: crate::Arch,
+        A2: crate::Core,
     {
         match (self, card) {
             (Self::Dos(d), Some(card)) => {
@@ -407,7 +407,7 @@ impl<A: crate::Arch> Personality<A> {
     }
 
     /// Take the card back off this thread, if it has it.
-    pub fn release_sb<A2: crate::Arch>(
+    pub fn release_sb<A2: crate::Core>(
         &mut self,
         machine: &mut A2,
     ) -> Option<crate::kernel::drivers::sb16::Sb16> {
@@ -670,7 +670,7 @@ pub type ThreadMode<A> = Personality<A>;
 /// Kernel-side thread state shared across all personalities.
 /// Personality code receives `&mut KernelThread<A>` alongside its own `&mut DosState<A>`
 /// or `&mut LinuxState`, giving clean split borrows with no wrapper hacks.
-pub struct KernelThread<A: crate::Arch> {
+pub struct KernelThread<A: crate::Core> {
     pub tid: i32,
     pub pid: i32,
     pub priority: i32,
@@ -703,12 +703,12 @@ pub struct KernelThread<A: crate::Arch> {
 }
 
 /// Thread control block = kernel state + OS personality
-pub struct Thread<A: crate::Arch> {
+pub struct Thread<A: crate::Core> {
     pub kernel: KernelThread<A>,
     pub personality: Personality<A>,
 }
 
-impl<A: crate::Arch> Thread<A> {
+impl<A: crate::Core> Thread<A> {
     /// Move the live CPU state into this thread, leaving an empty user space.
     pub fn materialize(&mut self, machine: &mut A, regs: Regs) {
         self.personality.on_suspend(machine);
@@ -763,11 +763,11 @@ pub fn hash_regs(r: &Regs) -> u64 {
 }
 
 /// Recompute a thread's cpu_hash after an out-of-band modification to cpu_state.
-pub fn refresh_cpu_hash<A: crate::Arch>(t: &mut Thread<A>) {
+pub fn refresh_cpu_hash<A: crate::Core>(t: &mut Thread<A>) {
     t.kernel.cpu_hash = hash_regs(&t.kernel.vcpu.regs);
 }
 
-impl<A: crate::Arch> KernelThread<A> {
+impl<A: crate::Core> KernelThread<A> {
     pub fn empty() -> Self {
         KernelThread {
             tid: 0,
@@ -848,7 +848,7 @@ impl<A: crate::Arch> KernelThread<A> {
     }
 }
 
-impl<A: crate::Arch> Thread<A> {
+impl<A: crate::Core> Thread<A> {
     pub fn empty() -> Self {
         Thread {
             kernel: KernelThread::empty(),
@@ -877,20 +877,20 @@ impl<A: crate::Arch> Thread<A> {
 
 /// Stable TID slots and their occupied-slot index, owned by the event loop.
 /// Blocked, worker-owned and zombie tasks stay indexed until their slot is freed.
-pub struct ThreadTable<A: crate::Arch> {
+pub struct ThreadTable<A: crate::Core> {
     slots: alloc::vec::Vec<Thread<A>>,
     occupied: [u64; MAX_THREADS.div_ceil(64)],
 }
 
-impl<A: crate::Arch> core::ops::Index<usize> for ThreadTable<A> {
+impl<A: crate::Core> core::ops::Index<usize> for ThreadTable<A> {
     type Output = Thread<A>;
     fn index(&self, tid: usize) -> &Self::Output { &self.slots[tid] }
 }
-impl<A: crate::Arch> core::ops::IndexMut<usize> for ThreadTable<A> {
+impl<A: crate::Core> core::ops::IndexMut<usize> for ThreadTable<A> {
     fn index_mut(&mut self, tid: usize) -> &mut Self::Output { &mut self.slots[tid] }
 }
 
-impl<A: crate::Arch> ThreadTable<A> {
+impl<A: crate::Core> ThreadTable<A> {
     pub fn get(&self, tid: usize) -> Option<&Thread<A>> { self.slots.get(tid) }
 
     /// Snapshot IDs so callers can mutate or reap tasks while traversing them.
@@ -944,7 +944,7 @@ pub fn set_console_pipe(idx: u8) { unsafe { CONSOLE_PIPE = idx; } }
 pub fn console_pipe() -> u8 { unsafe { CONSOLE_PIPE } }
 
 /// Check if threading system is initialized
-pub fn is_initialized<A: crate::Arch>(threads: &ThreadTable<A>) -> bool {
+pub fn is_initialized<A: crate::Core>(threads: &ThreadTable<A>) -> bool {
     !threads.slots.is_empty()
 }
 
@@ -962,7 +962,7 @@ pub fn prng() -> u64 {
 
 
 /// Get thread by TID. Borrow is tied to the task table.
-pub fn get_thread<A: crate::Arch>(threads: &mut ThreadTable<A>, tid: usize) -> Option<&mut Thread<A>> {
+pub fn get_thread<A: crate::Core>(threads: &mut ThreadTable<A>, tid: usize) -> Option<&mut Thread<A>> {
     if tid >= MAX_THREADS {
         return None;
     }
@@ -977,7 +977,7 @@ pub fn get_thread<A: crate::Arch>(threads: &mut ThreadTable<A>, tid: usize) -> O
 
 /// Get mutable references to two different threads (for switch_to). Safe
 /// `split_at_mut` — no aliasing, no `unsafe`.
-pub fn get_two_threads<A: crate::Arch>(threads: &mut ThreadTable<A>, a: usize, b: usize) -> (&mut Thread<A>, &mut Thread<A>) {
+pub fn get_two_threads<A: crate::Core>(threads: &mut ThreadTable<A>, a: usize, b: usize) -> (&mut Thread<A>, &mut Thread<A>) {
     assert!(a != b && a < MAX_THREADS && b < MAX_THREADS);
     assert!(threads[a].kernel.state != ThreadState::OnCpu && threads[b].kernel.state != ThreadState::OnCpu,
         "cross-process access without acquiring worker ownership");
@@ -994,7 +994,7 @@ pub fn get_two_threads<A: crate::Arch>(threads: &mut ThreadTable<A>, a: usize, b
 // Process wrappers reap a leader before issuing group cleanup; immediate reuse
 // can turn that cleanup into a signal against a newly launched unrelated job.
 static NEXT_PROCESS_SLOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(1);
-fn vacant_slot<A: crate::Arch>(threads: &ThreadTable<A>) -> Option<usize> {
+fn vacant_slot<A: crate::Core>(threads: &ThreadTable<A>) -> Option<usize> {
     use core::sync::atomic::Ordering;
     let start = NEXT_PROCESS_SLOT.load(Ordering::Relaxed);
     for offset in 0..MAX_THREADS - 1 {
@@ -1009,7 +1009,7 @@ fn vacant_slot<A: crate::Arch>(threads: &ThreadTable<A>) -> Option<usize> {
 }
 
 /// Create a new thread with the given root page table.
-pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut ThreadTable<A>, machine: &mut A, parent_tid: Option<usize>, root: A::PageTable, is_process: bool) -> Option<&'a mut Thread<A>> {
+pub fn create_thread<'a, A: crate::Core>(threads: &'a mut ThreadTable<A>, machine: &mut A, parent_tid: Option<usize>, root: A::AddressSpace, is_process: bool) -> Option<&'a mut Thread<A>> {
     let (parent_pid, parent_prio, parent_tidv) = match parent_tid {
         Some(tid) => {
             let p = &threads[tid].kernel;
@@ -1047,7 +1047,7 @@ pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut ThreadTable<A>, machin
 /// Reserve the child record while leaving the current address space live.
 /// The caller COW-forks that live space into the parent's now-parked slot;
 /// this fresh child's empty slot then denotes the still-live address space.
-pub fn reserve_live_child<'a, A: crate::Arch>(
+pub fn reserve_live_child<'a, A: crate::Core>(
     threads: &'a mut ThreadTable<A>,
     machine: &mut A,
     parent_tid: usize,
@@ -1084,33 +1084,33 @@ pub fn reserve_live_child<'a, A: crate::Arch>(
 }
 
 /// Initialize a thread as a 32-bit user process
-pub fn init_process_thread<A: crate::Arch>(thread: &mut Thread<A>, entry: u32, stack: u32) {
+pub fn init_process_thread<A: crate::Core>(thread: &mut Thread<A>, entry: u32, stack: u32) {
     thread.kernel.vcpu.regs.init_user_process(entry, stack);
 }
 
 /// Initialize a thread as a 64-bit user process
-pub fn init_process_thread_64<A: crate::Arch>(thread: &mut Thread<A>, entry: u64, stack: u64) {
+pub fn init_process_thread_64<A: crate::Core>(thread: &mut Thread<A>, entry: u64, stack: u64) {
     thread.kernel.vcpu.regs.init_user_process_64(entry, stack);
 }
 
 /// Save CPU state to thread.
-pub fn save_state<A: crate::Arch>(thread: &mut Thread<A>, regs: &Regs) {
+pub fn save_state<A: crate::Core>(thread: &mut Thread<A>, regs: &Regs) {
     thread.kernel.vcpu.regs = *regs;
 }
 
 /// Block a thread (waiting for child exit).
-pub fn block_thread<A: crate::Arch>(threads: &mut ThreadTable<A>, tid: usize) {
+pub fn block_thread<A: crate::Core>(threads: &mut ThreadTable<A>, tid: usize) {
     threads[tid].kernel.state = ThreadState::Blocked;
 }
 
-pub fn unblock_thread<A: crate::Arch>(threads: &mut ThreadTable<A>, tid: usize) {
+pub fn unblock_thread<A: crate::Core>(threads: &mut ThreadTable<A>, tid: usize) {
     if tid < MAX_THREADS && threads[tid].kernel.state == ThreadState::Blocked {
         threads[tid].kernel.state = ThreadState::Ready;
     }
 }
 
 /// Yield a thread: save regs, mark Ready, schedule next.
-pub fn yield_thread<A: crate::Arch>(threads: &mut ThreadTable<A>, tid: usize, regs: &crate::Regs) -> Option<usize> {
+pub fn yield_thread<A: crate::Core>(threads: &mut ThreadTable<A>, tid: usize, regs: &crate::Regs) -> Option<usize> {
     {
         let k = &mut threads[tid].kernel;
         k.vcpu.regs = *regs;
@@ -1126,13 +1126,13 @@ pub fn yield_thread<A: crate::Arch>(threads: &mut ThreadTable<A>, tid: usize, re
 }
 
 /// Set return value in thread's saved state
-pub fn set_return<A: crate::Arch>(thread: &mut Thread<A>, ret: i32) {
+pub fn set_return<A: crate::Core>(thread: &mut Thread<A>, ret: i32) {
     thread.kernel.vcpu.regs.rax = ret as i64 as u64;
 }
 
 /// Schedule next thread (randomly selected from ready threads).
 /// Returns Some(idx) if a switch is needed, None to stay with current.
-pub fn schedule<A: crate::Arch>(threads: &ThreadTable<A>, current_tid: usize) -> Option<usize> {
+pub fn schedule<A: crate::Core>(threads: &ThreadTable<A>, current_tid: usize) -> Option<usize> {
     let mut next_idx: usize = usize::MAX;
     let mut count = 0u64;
 
@@ -1163,7 +1163,7 @@ pub fn schedule<A: crate::Arch>(threads: &ThreadTable<A>, current_tid: usize) ->
 
 /// Borrow another thread's `DosState` for a swap-style operation.
 /// Returns the target's DosState if the target is a DOS thread, else an errno.
-pub fn with_target_dos<F: FnOnce(&mut DosState<A>) -> i32, A: crate::Arch>(threads: &mut ThreadTable<A>, target_tid: i32, f: F) -> i32 {
+pub fn with_target_dos<F: FnOnce(&mut DosState<A>) -> i32, A: crate::Core>(threads: &mut ThreadTable<A>, target_tid: i32, f: F) -> i32 {
     if target_tid < 0 || (target_tid as usize) >= MAX_THREADS { return -22; } // EINVAL
     let target = &mut threads[target_tid as usize];
     if target.kernel.state == ThreadState::Unused { return -3; } // ESRCH
@@ -1199,7 +1199,7 @@ pub fn take_switch_target() -> Option<usize> {
 /// Returns the TID of the next thread to run (falls back to thread 0/idle).
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-pub fn exit_thread<A: crate::Arch>(
+pub fn exit_thread<A: crate::Core>(
     threads: &mut ThreadTable<A>,
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -1210,6 +1210,16 @@ pub fn exit_thread<A: crate::Arch>(
     event_display: &mut Option<crate::kernel::display::Display>,
 ) -> usize {
     crate::kernel::linux::parent_exited(threads, tid, None);
+    // A DOS child may outlive its launcher. Drop that link before the
+    // launcher's slot can be reaped and assigned to another task.
+    for child_tid in threads.active_ids() {
+        let child = &mut threads[child_tid];
+        if child.kernel.parent_tid == tid as i32
+            && matches!(child.personality, Personality::Dos(_))
+        {
+            child.kernel.parent_tid = -1;
+        }
+    }
     let parent_tid = threads[tid].kernel.parent_tid;
     let term_type = ((exit_code >> 8) & 0xFF) as u8;
     // A successful DOS child returns the live adapter to its DOS parent. The
@@ -1218,9 +1228,12 @@ pub fn exit_thread<A: crate::Arch>(
     // fault termination restore it; normal exit and TSR retain live VGA state.
     let return_dos_vga = matches!(term_type, 0x00 | 0x03)
         && matches!(threads[tid].personality, Personality::Dos(_))
-        && parent_tid >= 0
-        && (parent_tid as usize) < MAX_THREADS
-        && matches!(threads[parent_tid as usize].personality, Personality::Dos(_));
+        && parent_tid as usize != tid
+        && threads.get(parent_tid as usize).is_some_and(|parent| {
+            matches!(parent.personality, Personality::Dos(_))
+                && matches!(parent.kernel.state, ThreadState::Ready | ThreadState::Running | ThreadState::Blocked)
+        })
+        && !crate::kernel::sched::vfork_suspended(threads, parent_tid as usize);
 
     // DOS EXEC return transfers the complete child VGA through the event loop;
     // the parked parent's recovery image remains in its own record until the
@@ -1260,7 +1273,10 @@ pub fn exit_thread<A: crate::Arch>(
         match &mut thread.personality {
             Personality::Dos(dos) => dos.on_exit(
                 machine, &mut thread.kernel.vcpu, !return_dos_vga),
-            Personality::Linux(linux) => linux.close_virtual_fds(),
+            Personality::Linux(linux) => {
+                linux.release_console_owner(thread.kernel.tid);
+                linux.close_virtual_fds();
+            }
             Personality::Windows(windows) => windows.on_exit(machine, &mut thread.kernel.vcpu),
             Personality::Os2(_) => {}
         }
@@ -1358,7 +1374,7 @@ pub fn exit_thread<A: crate::Arch>(
 /// -ECHILD if no children at all. The slot stays in `Zombie` state so the
 /// caller can still inspect the child's per-personality state (e.g. DOS pulls
 /// the final VGA snapshot via `with_target_dos`) before calling `reap`.
-pub fn peek_zombie_child<A: crate::Arch>(threads: &ThreadTable<A>, current_tid: usize, pid: i32) -> (i32, i32) {
+pub fn peek_zombie_child<A: crate::Core>(threads: &ThreadTable<A>, current_tid: usize, pid: i32) -> (i32, i32) {
     let current_tid = threads[current_tid].kernel.tid;
     let mut has_children = false;
 
@@ -1378,7 +1394,7 @@ pub fn peek_zombie_child<A: crate::Arch>(threads: &ThreadTable<A>, current_tid: 
 }
 
 /// Recycle a Zombie thread slot. No-op if the tid isn't a zombie.
-pub fn reap<A: crate::Arch>(threads: &mut ThreadTable<A>, machine: &mut A, tid: i32) {
+pub fn reap<A: crate::Core>(threads: &mut ThreadTable<A>, machine: &mut A, tid: i32) {
     if tid < 0 || (tid as usize) >= MAX_THREADS { return; }
     {
         let t = &mut threads[tid as usize];
@@ -1400,7 +1416,7 @@ pub fn reap<A: crate::Arch>(threads: &mut ThreadTable<A>, machine: &mut A, tid: 
 /// Reap every zombie. The event loop calls this before returning: its
 /// contract is "no thread resources survive the loop" — callers (the DN
 /// restart loop, the cmdline sequence) never inherit zombies to clean up.
-pub fn reap_all_zombies<A: crate::Arch>(threads: &mut ThreadTable<A>, machine: &mut A) {
+pub fn reap_all_zombies<A: crate::Core>(threads: &mut ThreadTable<A>, machine: &mut A) {
     for i in threads.active_ids().filter(|&tid| tid != 0) {
         if threads[i].kernel.state == ThreadState::Zombie {
             reap(threads, machine, i as i32);
@@ -1412,7 +1428,7 @@ pub fn reap_all_zombies<A: crate::Arch>(threads: &mut ThreadTable<A>, machine: &
 /// Use when there's no per-personality state to grab from the zombie (the
 /// only current caller is Linux sys_wait4, which has nothing to retrieve
 /// once the parent has the exit code).
-pub fn waitpid<A: crate::Arch>(threads: &mut ThreadTable<A>, machine: &mut A, current_tid: usize, pid: i32) -> (i32, i32) {
+pub fn waitpid<A: crate::Core>(threads: &mut ThreadTable<A>, machine: &mut A, current_tid: usize, pid: i32) -> (i32, i32) {
     let r = peek_zombie_child(threads, current_tid, pid);
     if r.0 >= 0 { reap(threads, machine, r.0); }
     r
@@ -1423,7 +1439,7 @@ pub fn waitpid<A: crate::Arch>(threads: &mut ThreadTable<A>, machine: &mut A, cu
 /// expected to dispatch `KernelAction::Exit(-11)` against the faulting
 /// `tid` so `exit_thread` does the regular cleanup (parent wake,
 /// `last_child_exit_status`, `arch_user_clean`, personality `on_exit`).
-pub fn signal_thread<A: crate::Arch>(thread: &Thread<A>, fault_address: usize) {
+pub fn signal_thread<A: crate::Core>(thread: &Thread<A>, fault_address: usize) {
     if thread.kernel.pid == 0 {
         compact_println!("\x1b[91mSEGV in init at {:#x}\x1b[0m", fault_address);
         loop { core::hint::spin_loop(); }
@@ -1437,7 +1453,7 @@ pub fn signal_thread<A: crate::Arch>(thread: &Thread<A>, fault_address: usize) {
 }
 
 /// Build the task table with stable slots and only init/idle occupied.
-pub fn init_threading<A: crate::Arch>() -> ThreadTable<A> {
+pub fn init_threading<A: crate::Core>() -> ThreadTable<A> {
     let mut slots = alloc::vec::Vec::with_capacity(MAX_THREADS);
     for _ in 0..MAX_THREADS {
         slots.push(Thread::empty());

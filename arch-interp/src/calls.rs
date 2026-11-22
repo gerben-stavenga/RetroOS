@@ -1,9 +1,9 @@
 //! Direct hosted implementations of the shared architecture operations.
 #![allow(unused_variables)]
 
-use crate::space::RootPageTable;
+use crate::space::AddressSpace;
 
-/// Arch call numbers — kept identical to the metal backend (`traps::arch_call`)
+/// Core call numbers — kept identical to the metal backend (`traps::arch_call`)
 /// for surface parity. The interpreter dispatches by calling the functions
 /// below directly, so these are not used as a wire protocol here.
 pub mod arch_call {
@@ -20,7 +20,7 @@ pub mod arch_call {
 }
 
 /// Share the current user page tables into the caller-owned child root.
-pub fn arch_user_fork(child_root: &mut RootPageTable) {
+pub(crate) fn arch_user_fork(child_root: &mut AddressSpace) {
     crate::paging::space_fork(child_root);
 }
 

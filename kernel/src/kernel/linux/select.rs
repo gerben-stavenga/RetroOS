@@ -11,7 +11,7 @@ pub(super) struct Request {
 }
 impl Request {
     pub(super) fn deadline(&self) -> Option<u64> { (self.deadline != u64::MAX).then_some(self.deadline) }
-    pub(super) fn read<A: crate::Arch>(
+    pub(super) fn read<A: crate::Core>(
         machine: &mut A,
         args: &Args,
         wide: bool,
@@ -78,7 +78,7 @@ impl Request {
         let unit = if self.wide { 8 } else { 4 };
         self.nfds.div_ceil(unit * 8) * unit
     }
-    pub(super) fn step<A: crate::Arch>(
+    pub(super) fn step<A: crate::Core>(
         &self,
         machine: &mut A,
         kt: &thread::KernelThread<A>,
@@ -111,7 +111,7 @@ impl Request {
         Some(count)
     }
 }
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     linux: &mut LinuxState,

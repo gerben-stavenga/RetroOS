@@ -165,7 +165,7 @@ impl DpmiState {
 
     /// Release all device mappings owned by this client. Required both for
     /// thread exit and when an EXEC child returns to its suspended parent.
-    pub(in crate::kernel::dos) fn unmap_all_physical<A: crate::Arch>(
+    pub(in crate::kernel::dos) fn unmap_all_physical<A: crate::Core>(
         &mut self,
         machine: &mut A,
     ) {

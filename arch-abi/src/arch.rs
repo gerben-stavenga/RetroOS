@@ -1,6 +1,6 @@
 //! The combined architecture interface and saved CPU context.
 //!
-//! Arch owns execution and lifecycle. X86, Memory and Diagnostics
+//! Core owns execution and lifecycle. X86, Memory and Diagnostics
 //! group its supporting capabilities.
 
 use crate::page_supply::{PageInput, SupplyStatus};
@@ -8,9 +8,9 @@ use crate::{Regs, KernelEvent, ExecutionProfile, ExecutionProfileStage};
 use crate::page_entry::PageEntry;
 use crate::mapping::{MappingError, MappingFailure, UserPage};
 
-/// Execution and lifecycle of one backend/core, with supporting capabilities
-/// grouped into independently usable traits.
-pub trait Arch: Sized + X86 + Memory + Diagnostics + 'static {
+/// Execution and lifecycle of one core. A concrete core handle stays on its
+/// owning CPU or host thread. Parked address spaces can move between cores.
+pub trait Core: Sized + X86 + Memory + Diagnostics + 'static {
     /// Run the active space with `regs` until an interruption (IRQ, syscall,
     /// exception, or monitored instruction), and return that event with the
     /// post-run registers and page-supply status. Replenish the reserve from
@@ -125,12 +125,10 @@ pub trait X86 {
     /// registers); a no-op on backends with no debug-register feature.
     fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>);
 
-    /// Install the active context’s planar handler, or remove it on suspension.
+    /// Install or detach a handler for the active context's user traps.
     /// # Safety
-    /// Binding storage must remain resident and valid until detached on this CPU.
-    /// Only scanout reads may run concurrently with execution. The kernel may
-    /// program registers between execute calls; detach before freeing storage.
-    unsafe fn bind_planar(&mut self, binding: Option<planar::Binding>);
+    /// The handler and its state must remain resident and valid until detached.
+    unsafe fn install_trap_hook(&mut self, hook: Option<crate::entry::TrapHook>);
 
 
 }
@@ -144,14 +142,11 @@ pub trait X86 {
 /// Synchronizing accesses to explicitly shared writable data remains the caller's
 /// responsibility.
 pub trait Memory {
-    /// Backend page-table root type stored in `Vcpu::space` — an OWNED address
-    /// space, so it is **not** `Copy`: a parked `Vcpu` moves rather than
-    /// duplicating the space. It is an OPAQUE owned handle — **not** a memory
-    /// accessor. Guest memory is reached only through the *active* space, so
-    /// `GuestBytes` is a supertrait of `Arch` (the active-space accessor), never
-    /// implemented on `PageTable` or a parked `Vcpu`. `Default` supplies the
-    /// empty placeholder a switch leaves behind in a now-running thread's slot.
-    type PageTable: Default;
+    /// An opaque owned address space. Backends must give it move semantics.
+    /// The scheduler may transfer a parked space between cores. Guest memory
+    /// is accessible through the core where the space is active.
+    /// `Default` constructs an empty space.
+    type AddressSpace: Default + Send;
 
     /// Read consecutive entries without materializing absent page tables or data.
     /// Results are snapshots, not owning references. On failure, `completed`
@@ -197,10 +192,10 @@ pub trait Memory {
 
     /// Install `incoming` as the active address space and return the displaced
     /// one. Registers and FPU state are unchanged.
-    fn activate(&mut self, incoming: Self::PageTable) -> Self::PageTable;
+    fn activate(&mut self, incoming: Self::AddressSpace) -> Self::AddressSpace;
 
     /// COW-fork the current address space into `child` (fills the child root).
-    fn user_fork(&mut self, child: &mut Self::PageTable, pages: PageInput) -> ((), PageInput);
+    fn user_fork(&mut self, child: &mut Self::AddressSpace, pages: PageInput) -> ((), PageInput);
 
     /// Tear down a dead thread's address space entirely. `free_user_pages`
     /// (called at exit, while the space is still active) returns its page
@@ -208,7 +203,7 @@ pub trait Memory {
     /// the host VA reservation + per-page bookkeeping, on metal a no-op
     /// (the saved-entries buffer lives in the Thread and drops with it).
     /// Called at reap, after execution has switched away.
-    fn destroy_space(&mut self, root: &mut Self::PageTable);
+    fn destroy_space(&mut self, root: &mut Self::AddressSpace);
 
     /// Free user pages in the current address space (the CLEAN call).
     fn free_user_pages(&mut self);
@@ -301,41 +296,41 @@ pub trait GuestBytes {
 /// registers live in the event loop (a plain `&mut Regs`) and its address space
 /// is moved *into* the backend as the single active space ([`crate::Memory::activate`]).
 ///
-/// `space` is `A::PageTable` — an OWNED, move-only address-space handle. It is
+/// `space` is `A::AddressSpace` — an OWNED, move-only address-space handle. It is
 /// **not** the guest-memory accessor: guest memory is reached only through the
 /// *active* space, which the backend owns, so [`GuestBytes`] is implemented on
-/// `Arch` (the active-space accessor), never on a parked `Vcpu`. That is the
+/// `Core` (the active-space accessor), never on a parked `Vcpu`. That is the
 /// principle — you can only touch memory that is active, which on metal is a
 /// hardware fact (a `deref` needs the live page tables), so the type system
 /// must not offer a way to read an inactive space.
-pub struct Vcpu<A: Arch> {
+pub struct Vcpu<A: Core> {
     /// Architectural register state (program counter, mode, GPRs).
     pub regs: Regs,
     /// The thread's OWNED address space, dormant while parked. Activated by
     /// moving it into the backend ([`crate::Memory::activate`]); the displaced space
     /// comes back and is re-parked here.
-    pub space: A::PageTable,
+    pub space: A::AddressSpace,
 }
 
 // `Vcpu` is NOT `Copy`/`Clone`: `space` is an owned, move-only resource, so a
 // `Vcpu` names exactly one address space and aliasing is a type error. `Regs`
 // is plain data and is snapshotted on its own; the space moves.
 
-impl<A: Arch> core::ops::Deref for Vcpu<A> {
+impl<A: Core> core::ops::Deref for Vcpu<A> {
     type Target = Regs;
     fn deref(&self) -> &Regs { &self.regs }
 }
-impl<A: Arch> core::ops::DerefMut for Vcpu<A> {
+impl<A: Core> core::ops::DerefMut for Vcpu<A> {
     fn deref_mut(&mut self) -> &mut Regs { &mut self.regs }
 }
 
-impl<A: Arch> Vcpu<A> {
+impl<A: Core> Vcpu<A> {
     /// Bundle registers with an owned address space (re-park after a switch).
-    pub const fn new(regs: Regs, space: A::PageTable) -> Self {
+    pub const fn new(regs: Regs, space: A::AddressSpace) -> Self {
         Vcpu { regs, space }
     }
     /// A cleared context with a default (empty) address space.
     pub fn empty() -> Self {
-        Vcpu { regs: Regs::empty(), space: A::PageTable::default() }
+        Vcpu { regs: Regs::empty(), space: A::AddressSpace::default() }
     }
 }

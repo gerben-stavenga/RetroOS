@@ -155,7 +155,7 @@ pub(super) fn key(state: &mut WindowsState, event: lib::keyboard::Event, control
 }
 
 /// Console primitives; Wine's device structures are translated in RETROOS.DLL.
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     args: [u32; 5],

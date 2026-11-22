@@ -81,7 +81,7 @@ fn mode_name(mode: vga::VgaMode) -> &'static str {
 /// mode, point at LiveVram, and read the display-start / pixel pan /
 /// line-compare that select the visible window. `None` means the current
 /// register state does not describe a renderable mode.
-fn scanout<'a, A: crate::Arch>(
+fn scanout<'a, A: crate::Core>(
     state: &'a VgaState, machine: &'a A, _regs: &Regs,
     svga_start: usize, autonomous: bool,
 ) -> Option<::vga::Frame<'a>>
@@ -195,7 +195,7 @@ fn frame_due(now_ns: u64, hz: u64) -> bool {
 ///
 /// The retrace is the host's clock, handed to the card — it has none of its
 /// own, which is why a deferred `swapbufferCMD` needs this call to complete.
-fn voodoo_display_tick<A: crate::Arch>(
+fn voodoo_display_tick<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     pc: &mut PcMachine,
@@ -259,7 +259,7 @@ fn voodoo_display_tick<A: crate::Arch>(
         } else {
             voodoo.scanout(shadow, w * step, &dac);
         }
-        display.present_packed(machine, bios, w, h, shadow);
+        display.present_dos(machine, bios, w, h, shadow);
     }
     true
 }
@@ -351,7 +351,7 @@ pub(super) fn attach_retained_vga_surface(
 /// Rasterize the detached VGA into an output-independent retained preview.
 /// Native RGB is intentional: PixelBuffer carries its own format and the
 /// compositor converts it to the eventual output format when the OSD opens.
-pub(super) fn snapshot_retained_surface<A: crate::Arch>(
+pub(super) fn snapshot_retained_surface<A: crate::Core>(
     machine: &mut A,
     dos: &mut crate::kernel::thread::DosState<A>,
     regs: &Regs,
@@ -365,7 +365,7 @@ pub(super) fn snapshot_retained_surface<A: crate::Arch>(
     let _ = crate::kernel::display::render_frame(output, format, &frame);
 }
 
-pub fn display_tick<A: crate::Arch>(
+pub fn display_tick<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     pc: &mut PcMachine,
@@ -524,7 +524,7 @@ pub fn display_tick<A: crate::Arch>(
                 // exists only to transfer direct-scanout shadows.
                 if presentation.is_none() {
                     let pixels = crate::kernel::display::take_shadow(&mut pc.scanout);
-                    display.present_packed(
+                    display.present_dos(
                         machine,
                         &mut *bios,
                         ::vga::dimensions(mode).0,
@@ -559,7 +559,7 @@ pub fn display_tick<A: crate::Arch>(
         publish_vga_surface(w, h, desktop, endpoint);
     } else {
         let pixels = crate::kernel::display::take_shadow(&mut pc.scanout);
-        display.present_packed(machine, bios, w, h, &pixels);
+        display.present_dos(machine, bios, w, h, &pixels);
         crate::kernel::display::recycle_shadow(&mut pc.scanout, pixels);
     }
 }

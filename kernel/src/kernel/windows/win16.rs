@@ -270,7 +270,7 @@ fn selector_slots(windows: &mut WindowsState, state: &State, count: usize) -> Op
     }
     None
 }
-fn global_alloc<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, state: &mut State, size: u32, flags: u16) -> u32 {
+fn global_alloc<A: crate::Core>(machine: &mut A, windows: &mut WindowsState, state: &mut State, size: u32, flags: u16) -> u32 {
     let count = size.max(1).div_ceil(65536) as usize;
     let Some(index) = selector_slots(windows,state,count) else { return 0 };
     let address = heap_alloc(machine,windows,if flags & 0x40 != 0 {8} else {0},size);
@@ -289,7 +289,7 @@ fn global_free(windows: &mut WindowsState, state: &mut State, index: usize) {
     for i in 0..block.count { windows.ldt[usize::from(block.selector>>3)+i] = 0; }
     heap_free(windows,block.address);
 }
-fn sync_selectors<A: crate::Arch>(machine: &mut A, windows: &WindowsState, old_len: usize) {
+fn sync_selectors<A: crate::Core>(machine: &mut A, windows: &WindowsState, old_len: usize) {
     const TABLE: usize = 0x7ff8_0000;
     let pages = (windows.ldt.len()*8).div_ceil(4096);
     let old_pages = (old_len*8).div_ceil(4096);
@@ -444,7 +444,7 @@ fn load_module_file(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), 
 
 /// Map the owning PE first so absolute addresses in the NE thunk bytes have
 /// their PE base relocations applied before those segments are copied.
-fn embedded_module<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState,
+fn embedded_module<A: crate::Core>(machine: &mut A, windows: &mut WindowsState,
     path: &[u8], data: Vec<u8>) -> Result<(Vec<u8>, Option<PeOwner>), i32>
 {
     if ne::Image::parse(&data).is_ok() { return Ok((data, None)); }
@@ -484,7 +484,7 @@ fn module_segment_size(image: &ne::Image<'_>, number: u16) -> Result<usize, i32>
     Ok(segment.alloc_size.saturating_add(heap).min(0x10000))
 }
 
-fn patch_chain<A: crate::Arch>(
+fn patch_chain<A: crate::Core>(
     machine: &mut A,
     base: u32,
     alloc_size: usize,
@@ -524,7 +524,7 @@ const LOW_EXPORTS: &[(u16,&[u8],u32)] = &[
     (195,b"__C000H",0xc0000),(179,b"__D000H",0xd0000),
     (190,b"__E000H",0xe0000),(194,b"__F000H",0xf0000),
 ];
-fn imported_target<A: crate::Arch>(
+fn imported_target<A: crate::Core>(
     machine: &A,
     ldt: &[u64],
     modules: &[LoadedModule],
@@ -588,7 +588,7 @@ fn imported_target<A: crate::Arch>(
     Ok((offset, selector))
 }
 
-fn relocate_image<A: crate::Arch>(
+fn relocate_image<A: crate::Core>(
     machine: &mut A,
     image: &ne::Image<'_>,
     selectors: &[u16],
@@ -621,7 +621,7 @@ fn relocate_image<A: crate::Arch>(
 }
 
 #[allow(clippy::too_many_arguments)] // Shared executable launch context.
-pub(super) fn exec<A: crate::Arch>(
+pub(super) fn exec<A: crate::Core>(
     machine: &mut A,
     threads: &mut thread::ThreadTable<A>,
     tid: usize,
@@ -878,7 +878,7 @@ pub(super) fn exec<A: crate::Arch>(
 }
 
 /// Bind guest thunk entry points. There is no per-call kernel continuation.
-fn init_bridge<A: crate::Arch>(
+fn init_bridge<A: crate::Core>(
     machine: &mut A,
     windows: &mut WindowsState,
     modules: &[LoadedModule],
@@ -1006,13 +1006,13 @@ fn stack_at(state: &WindowsState, regs: &Regs, displacement: u16) -> Option<usiz
     linear(state, regs.stack_seg(), (regs.sp32() as u16).wrapping_add(displacement))
 }
 
-fn stack_u16<A: crate::Arch>(
+fn stack_u16<A: crate::Core>(
     machine: &A, state: &WindowsState, regs: &Regs, displacement: u16,
 ) -> Option<u16> {
     Some(machine.read::<u16>((stack_at(state, regs, displacement)?) as u64))
 }
 
-fn stack_u32<A: crate::Arch>(
+fn stack_u32<A: crate::Core>(
     machine: &A, state: &WindowsState, regs: &Regs, displacement: u16,
 ) -> Option<u32> {
     Some(machine.read::<u32>((stack_at(state, regs, displacement)?) as u64))
@@ -1024,7 +1024,7 @@ fn far_linear(state: &WindowsState, pointer: u32) -> Option<usize> {
     if selector == 0 { None } else { linear(state, selector, offset) }
 }
 
-fn far_string<A: crate::Arch>(
+fn far_string<A: crate::Core>(
     machine: &A, state: &WindowsState, pointer: u32,
 ) -> Option<Vec<u8>> {
     if pointer >> 16 == 0 { return None; }
@@ -1048,7 +1048,7 @@ fn dos_path(path: &[u8]) -> Vec<u8> {
     result
 }
 
-fn dib_header<A: crate::Arch>(machine: &A, header: usize) -> Option<(usize, usize, u16, usize)> {
+fn dib_header<A: crate::Core>(machine: &A, header: usize) -> Option<(usize, usize, u16, usize)> {
     match machine.read::<u32>(header as u64) {
         12 => {
             let width = machine.read::<u16>((header + 4) as u64) as usize;
@@ -1067,7 +1067,7 @@ fn dib_header<A: crate::Arch>(machine: &A, header: usize) -> Option<(usize, usiz
     }
 }
 
-fn decode_dib<A: crate::Arch>(
+fn decode_dib<A: crate::Core>(
     machine: &A,
     bits: usize,
     palette: usize,
@@ -1118,7 +1118,7 @@ fn decode_dib<A: crate::Arch>(
     }
 }
 
-fn palette_color<A: crate::Arch>(
+fn palette_color<A: crate::Core>(
     machine: &A, palette: usize, stride: usize, index: usize,
 ) -> u32 {
     let at = palette + index * stride;
@@ -1128,7 +1128,7 @@ fn palette_color<A: crate::Arch>(
     r | (g << 8) | (b << 16)
 }
 
-fn finish<A: crate::Arch>(
+fn finish<A: crate::Core>(
     machine: &A,
     windows: &WindowsState,
     regs: &mut Regs,
@@ -1148,7 +1148,7 @@ fn finish<A: crate::Arch>(
     Ok(())
 }
 
-fn local_alloc<A: crate::Arch>(machine: &mut A, windows: &WindowsState, state: &mut State, size: usize, flags: u16) -> u32 {
+fn local_alloc<A: crate::Core>(machine: &mut A, windows: &WindowsState, state: &mut State, size: usize, flags: u16) -> u32 {
     let aligned = (size.max(1) + 3) & !3;
     let movable = flags & 2 != 0;
     let overhead = if movable { 4 } else { 0 };
@@ -1172,7 +1172,7 @@ fn local_alloc<A: crate::Arch>(machine: &mut A, windows: &WindowsState, state: &
     u32::from(handle)
 }
 
-fn dispatch<A: crate::Arch>(
+fn dispatch<A: crate::Core>(
     machine: &mut A,
     _kt: &mut thread::KernelThread<A>,
     windows: &mut WindowsState,
@@ -1646,7 +1646,7 @@ fn dispatch<A: crate::Arch>(
 }
 
 #[allow(clippy::too_many_arguments)] // Shared personality dispatch context.
-pub(super) fn handle_event<A: crate::Arch>(
+pub(super) fn handle_event<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
@@ -1744,7 +1744,7 @@ pub(super) fn handle_event<A: crate::Arch>(
     }
 }
 
-pub(super) fn dos_call<A: crate::Arch>(
+pub(super) fn dos_call<A: crate::Core>(
     machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>, windows: &mut WindowsState,
     dos: &mut crate::kernel::dos::DosState<A>, regs: &mut Regs,
@@ -1768,7 +1768,7 @@ pub(super) fn dos_call<A: crate::Arch>(
     action
 }
 
-fn load_dynamic<A: crate::Arch>(machine: &mut A, windows: &mut WindowsState, state: &mut State, name: &[u8]) -> Result<u16, i32> {
+fn load_dynamic<A: crate::Core>(machine: &mut A, windows: &mut WindowsState, state: &mut State, name: &[u8]) -> Result<u16, i32> {
     let name = canonical_module_name(name);
     if let Some(m) = state.modules.iter_mut().find(|m| m.name == name) {
         if m.initialized == 3 { return Err(-8); }
@@ -1921,7 +1921,7 @@ pub(super) struct Block {
     used: bool,
 }
 
-pub(super) fn heap_alloc<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, flags: u32, bytes: u32) -> u32 {
+pub(super) fn heap_alloc<A: crate::Core>(machine: &mut A, state: &mut WindowsState, flags: u32, bytes: u32) -> u32 {
     let size = bytes.max(1).next_multiple_of(8);
     if let Some(block) = state.blocks.iter_mut().find(|block| !block.used && block.size >= size) {
         block.used = true;

@@ -116,7 +116,7 @@ impl Hardware for Ahci {
 
 /// Probe every AHCI controller and every directly attached SATA disk.
 /// ATAPI and port multipliers are not exposed as block disks.
-pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<AhciDisk> {
+pub fn probe<A: crate::Core>(machine: &mut A) -> Vec<AhciDisk> {
     let mut disks = Vec::new();
     for (controller, (bus, dev, func)) in pci::find_classes(machine, 1, 6).into_iter().enumerate() {
         probe_controller(machine, bus, dev, func, controller, &mut disks);
@@ -124,7 +124,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<AhciDisk> {
     disks
 }
 
-fn probe_controller<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8,
+fn probe_controller<A: crate::Core>(machine: &mut A, bus: u8, dev: u8, func: u8,
                                     number: usize, disks: &mut Vec<AhciDisk>) {
     if (pci::read32(machine, bus, dev, func, 8) >> 8) as u8 != 1 { return; }
     let bar = pci::read32(machine, bus, dev, func, 0x24);

@@ -1,20 +1,23 @@
 //! Software-MMU tests driven through the public arch surface: demand paging at
 //! a high (sparse) guest address, per-space isolation across an address-space
-//! switch (`Arch::activate`, the same primitive the kernel uses), and unmap →
+//! switch (`Core::activate`, the same primitive the kernel uses), and unmap →
 //! demand-zero.
 
 use retroos_arch_interp as arch;
 use arch_abi::{Memory as _, UserPage};
 use arch_abi::page_entry::{Attributes, Backing, Mapping, PageEntry, PhysicalFrame};
 
+// These tests initialize and exclusively operate the CPU on the test thread.
+fn current_core() -> arch::Interp { arch::Interp::local() }
+
 const HI: usize = 0x4000_0000; // sparse high VA (a flat reservation would never fit)
 
 #[test]
 fn execute_reports_supply_without_running_and_after_retiring_pages() {
-    use arch_abi::{Arch as _, GuestBytes as _, KernelEvent, Regs};
+    use arch_abi::{Core as _, GuestBytes as _, KernelEvent, Regs};
     use arch_abi::page_supply::{PageInput, SUPPLY_CAPACITY};
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let mut regs = Regs::empty();
     regs.set_ip32(0x1234);
     let io = arch_abi::IoPolicy::deny_all();
@@ -46,7 +49,7 @@ fn execute_reports_supply_without_running_and_after_retiring_pages() {
 fn copies_use_explicit_backing_and_reject_inaccessible_memory() {
     use arch_abi::GuestBytes;
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let address = 0x2200ffe;
     let bytes: Vec<u8> = (0..4100).map(|i| (i * 37) as u8).collect();
     let needed = machine.supply_pages(Default::default()).0;
@@ -60,7 +63,7 @@ fn copies_use_explicit_backing_and_reject_inaccessible_memory() {
     assert_eq!(actual, bytes);
 
     let page = UserPage::new(address & !4095).unwrap();
-    let mut child = arch::RootPageTable::default();
+    let mut child = arch::AddressSpace::default();
     machine.user_fork(&mut child, test_memory::input(5));
     let parent = machine.activate(child);
     assert_eq!(machine.copy_to(address, &[91], test_memory::input(5)).0, Some(()));
@@ -89,10 +92,10 @@ fn copies_use_explicit_backing_and_reject_inaccessible_memory() {
     }
 }
 
-/// Make space `id` the active one exactly as the kernel does — `Arch::activate`
+/// Make space `id` the active one exactly as the kernel does — `Core::activate`
 /// moves it into the active slot and returns the displaced (previous) space.
-fn switch(root: arch::RootPageTable) -> arch::RootPageTable {
-    arch::Interp.activate(root)
+fn switch(root: arch::AddressSpace) -> arch::AddressSpace {
+    current_core().activate(root)
 }
 
 #[test]
@@ -105,7 +108,7 @@ fn demand_isolation_and_unmap() {
 
     // A second space is isolated; the first space's contents survive a round
     // trip through it.
-    let other = arch::RootPageTable::default();
+    let other = arch::AddressSpace::default();
     let saved = switch(other);
     assert_eq!(arch::mem().read::<u32>(HI), 0, "new space must be zero-isolated");
     arch::mem().write::<u32>(HI, 0x1234_5678);
@@ -114,7 +117,7 @@ fn demand_isolation_and_unmap() {
     assert_eq!(arch::mem().read::<u32>(HI), 0xCAFE_BABE, "space 0 preserved");
 
     // Unmap drops the page; the next access demand-zeroes it.
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let zero = arch_abi::mapping::read_mapping(&mut machine, UserPage::new(0x7000_0000).unwrap()).unwrap();
     unsafe { arch_abi::mapping::replace_mapping(&mut machine, UserPage::new(HI as u64).unwrap(), zero, test_memory::input(5)).0.unwrap(); }
     assert_eq!(arch::mem().read::<u32>(HI), 0, "unmapped page reads back zero");
@@ -123,7 +126,7 @@ fn demand_isolation_and_unmap() {
 #[test]
 fn kernel_owned_shared_pages_are_coherent_across_guest_fork() {
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let memory = test_memory::alloc_shared_pages(3);
     assert_eq!(memory.as_ptr() as usize % 4096, 0);
     unsafe {
@@ -139,7 +142,7 @@ fn kernel_owned_shared_pages_are_coherent_across_guest_fork() {
         *memory.as_ptr().add(8197) = 0xC3;
     }
     assert_eq!(arch::mem().read::<u8>(HI + 8197), 0xC3);
-    let mut child = arch::RootPageTable::default();
+    let mut child = arch::AddressSpace::default();
     machine.user_fork(&mut child, test_memory::input(5)).0;
     let parent = machine.activate(child);
     arch::mem().write::<u8>(HI + 8197, 0x79);
@@ -156,10 +159,10 @@ fn kernel_owned_shared_pages_are_coherent_across_guest_fork() {
 #[test]
 fn default_space_does_not_alias_a_suspended_vfork_parent() {
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     arch::mem().write::<u32>(HI, 0xCAFE_BABE);
     // vfork parks the shared image while child exit/exec cleans a fresh space.
-    let parent = machine.activate(arch::RootPageTable::default());
+    let parent = machine.activate(arch::AddressSpace::default());
     assert_eq!(arch::mem().read::<u32>(HI), 0);
     arch::mem().write::<u32>(HI, 0x1234_5678);
     machine.free_user_pages();
@@ -171,7 +174,7 @@ fn default_space_does_not_alias_a_suspended_vfork_parent() {
 #[test]
 fn typed_mapping_ownership_and_protection() {
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let page = UserPage::new(HI as u64).unwrap();
     let frame = PhysicalFrame::new(test_memory::alloc_phys_page().unwrap()).unwrap();
     let mapping = Mapping { backing: Backing::Owned(frame), attributes: Attributes::EXECUTABLE };
@@ -195,7 +198,7 @@ fn typed_mapping_ownership_and_protection() {
 #[test]
 fn borrowed_cow_copies_and_batch_failure_reports_progress() {
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let start = UserPage::new(HI as u64).unwrap();
     let memory = test_memory::alloc_shared_pages(1);
     let frame = PhysicalFrame::new(test_memory::direct_frame(memory)).unwrap();
@@ -226,7 +229,7 @@ fn borrowed_cow_copies_and_batch_failure_reports_progress() {
 #[test]
 fn fill_and_range_validation_through_arch() {
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let start = UserPage::new(HI as u64).unwrap();
     unsafe { machine.fill_mappings(start, 3, PageEntry::Intercepted, test_memory::input(5)).0.unwrap(); }
     let mut entries = [PageEntry::Absent; 3];
@@ -269,7 +272,7 @@ fn fill_and_range_validation_through_arch() {
 #[test]
 fn supplied_input_exhaustion_preserves_the_uncompleted_suffix() {
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let mut input = arch_abi::page_supply::PageInput::new();
     for _ in 0..if cfg!(feature = "kvm") { 2 } else { 1 } { input.push(test_memory::alloc_backed_pages(1)); }
     // The two entries require different page tables.
@@ -287,11 +290,11 @@ fn supplied_input_exhaustion_preserves_the_uncompleted_suffix() {
 #[test]
 fn fork_and_detachment_use_only_supplied_input() {
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let at = UserPage::new(HI as u64).unwrap();
     unsafe { arch_abi::mapping::replace_mapping(&mut machine, at, PageEntry::Intercepted, test_memory::input(5)).0.unwrap(); }
     let input = arch_abi::page_supply::PageInput::new();
-    let mut child = arch::RootPageTable::default();
+    let mut child = arch::AddressSpace::default();
     // PAE must detach the parent directory because PDPTEs cannot enforce COW.
     let fork_input = if cfg!(feature = "kvm") { test_memory::input(3) } else { input };
     let ((), mut unused) = machine.user_fork(&mut child, fork_input);
@@ -311,7 +314,7 @@ fn fork_and_detachment_use_only_supplied_input() {
 #[test]
 fn page_batches_return_rejected_and_unused_ownership() {
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let pages = test_memory::input(if cfg!(feature = "kvm") { 3 } else { 2 });
     let numbers = pages.pages[..pages.count].to_vec();
     let (needed, pages) = machine.supply_pages(pages);
@@ -335,7 +338,7 @@ fn page_batches_return_rejected_and_unused_ownership() {
 #[test]
 fn retired_pages_are_drained_in_bounded_batches() {
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let mut expected = std::collections::BTreeSet::new();
     for index in 1..=70 {
         let pages = test_memory::input(3);
@@ -363,7 +366,7 @@ fn retired_pages_are_drained_in_bounded_batches() {
 #[test]
 fn concurrent_forks_detach_replace_and_destroy_shared_tables() {
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     const STRIDE: usize = 4 * 1024 * 1024;
     for index in 0..4 {
         arch::mem().write::<u8>(HI + index * STRIDE, 17);
@@ -371,7 +374,7 @@ fn concurrent_forks_detach_replace_and_destroy_shared_tables() {
     }
     let mut roots = Vec::new();
     for _ in 0..4 {
-        let mut root = arch::RootPageTable::default();
+        let mut root = arch::AddressSpace::default();
         machine.user_fork(&mut root, test_memory::input(5));
         roots.push(root);
     }
@@ -381,11 +384,11 @@ fn concurrent_forks_detach_replace_and_destroy_shared_tables() {
             let barrier = &barrier;
             scope.spawn(move || {
                 init();
-                let mut machine = arch::Interp;
+                let mut machine = current_core();
                 machine.activate(root);
                 for round in 0..16 {
                     test_memory::refill(&machine);
-                    let mut child = arch::RootPageTable::default();
+                    let mut child = arch::AddressSpace::default();
                     machine.user_fork(&mut child, test_memory::input(5));
                     let parent = machine.activate(child);
                     barrier.wait();
@@ -437,11 +440,11 @@ fn init() {
     INIT.call_once(|| { let (base, bytes) = arch::physical_ram();
         unsafe { test_memory::init_direct_ram(base, bytes); }
     });
-    unsafe { arch::init_guest_ram(test_memory::alloc_backed_pages(arch::PAGING_PAGES), test_memory::ownership()); }
-    test_memory::refill(&arch::Interp);
+    unsafe { crate::vcpu::boot_cpu(test_memory::alloc_backed_pages(crate::paging::PAGING_PAGES), test_memory::ownership()); }
+    test_memory::refill(&current_core());
 }
 
-/// A deliberately simple test caller. Arch receives ownership metadata and
+/// A deliberately simple test caller. Core receives ownership metadata and
 /// donated frames; it has no dependency on any kernel allocator.
 pub mod test_memory {
     use arch_abi::page_supply::{FrameOwnership, FrameRegion, PageInput};
@@ -502,13 +505,13 @@ pub mod test_memory {
 #[test]
 fn arch_alias_swap_overlap_cow_and_retry() {
     init();
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let a = UserPage::new(0x2000000).unwrap();
     let b = UserPage::new(0x3000000).unwrap();
     for i in 0..4 { arch::mem().write::<u32>(a.address() as usize + i * 4096, 10 + i as u32); }
     // A fork shares both tables and leaves. Aliasing must detach the source
     // before making it writable, and must not alter the child's snapshot.
-    let mut child = arch::RootPageTable::default();
+    let mut child = arch::AddressSpace::default();
     machine.user_fork(&mut child, test_memory::input(5));
     assert_eq!(machine.alias_mappings(a, b, 4, Default::default()).0, Err(arch_abi::MappingError::NeedPages));
     for i in 0..4 { assert_eq!(arch::mem().read::<u32>(a.address() as usize + i * 4096), 10 + i as u32); }
@@ -551,7 +554,7 @@ fn arch_alias_swap_overlap_cow_and_retry() {
 /// Code fixtures explicitly request executable backing, as real loaders do.
 #[cfg(feature = "kvm")]
 pub(crate) fn executable(address: u64) {
-    let mut machine = arch::Interp;
+    let mut machine = current_core();
     let page = UserPage::new(address & !4095).unwrap();
     let mut entry = arch_abi::mapping::read_mapping(&mut machine, page).unwrap();
     match &mut entry {

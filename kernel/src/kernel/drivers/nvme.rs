@@ -132,7 +132,7 @@ fn set_data_prps(c: &mut [u32; 16], dma: &Region, buffer_phys: u64, sectors: u32
 }
 
 /// Bring up one enumerated NVMe PCI function.
-fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Option<(Nvme, u64)> {
+fn bring_up<A: crate::Core>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Option<(Nvme, u64)> {
 
     // Enable memory space + bus mastering.
     let pcmd = pci::read32(machine, bus, dev, func, 0x04);
@@ -245,7 +245,7 @@ fn wait_csts(regs: Mmio, ready: u32) -> bool {
 
 impl Storage<Nvme> {
     /// Probe every NVMe controller's namespace 1 in PCI scan order.
-    pub fn probe_all<A: crate::Arch>(machine: &mut A) -> Vec<Self> {
+    pub fn probe_all<A: crate::Core>(machine: &mut A) -> Vec<Self> {
         let mut disks = Vec::new();
         for (number, (bus, dev, func)) in pci::find_classes(machine, 0x01, 0x08).into_iter().enumerate() {
             let Some((n, sectors)) = bring_up(machine, bus, dev, func) else { continue };

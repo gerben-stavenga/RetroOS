@@ -1,13 +1,13 @@
 //! Shared architecture contract for native x86 and hosted backends.
 //!
-//! `Arch` owns execution and lifecycle and combines supporting traits. Register
+//! `Core` owns execution and lifecycle and combines supporting traits. Register
 //! frames, events, mappings and other boundary values remain ordinary data.
 //! Backend-specific page-table and FPU representations are associated types.
 
 #![no_std]
 
 mod arch;
-pub use arch::{Arch, X86, Memory, Diagnostics, GuestBytes, Vcpu};
+pub use arch::{Core, X86, Memory, Diagnostics, GuestBytes, Vcpu};
 pub mod page_entry;
 pub mod mapping;
 pub use mapping::{MappingError, MappingFailure, UserPage};
@@ -494,7 +494,7 @@ pub const PVI_POLICY_SHADOW: u64 = 1 << 34;
 /// present=0 with the regular Cache-Disable (PCD) attribute the kernel already
 /// uses for device memory (NVMe BARs, AC'97/SB DMA map present+PCD). The
 /// present=0 + PCD pair is the *trapped* twin: a guest access faults to the
-/// kernel (the planar VGA window, future emulated BARs) instead of
+/// kernel (MMIO apertures) instead of
 /// demand-committing RAM — present distinguishes passthrough device memory
 /// from an emulated one. No invented software bit. The interp must NOT ignore
 /// map flags — that silently diverges from metal the moment a flag carries

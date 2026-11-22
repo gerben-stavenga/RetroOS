@@ -130,7 +130,7 @@ mod tests {
 }
 
 /// NT layout marshalling remains in RETROOS.DLL; reuse the shared atom table.
-pub(super) fn call<A: crate::Arch>(machine: &mut A, args: [u32; 5]) -> u32 {
+pub(super) fn call<A: crate::Core>(machine: &mut A, args: [u32; 5]) -> u32 {
     let [op, atom, name, length, out] = args;
     if length > 510 || length & 1 != 0 {
         return 0xc000000d;

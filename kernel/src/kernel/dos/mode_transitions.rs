@@ -144,7 +144,7 @@ impl RmCallStruct {
 /// Pick the pm-side stack selector for a fresh first-entry. 32-bit
 /// clients get the PM32 alias (D=1), 16-bit clients PM16. Both alias
 /// the same physical buffer at `host_stack_base()`.
-pub(super) fn host_stack_pm_seg<A: crate::Arch>(dos: &thread::DosState<A>) -> u16 {
+pub(super) fn host_stack_pm_seg<A: crate::Core>(dos: &thread::DosState<A>) -> u16 {
     if dos.dpmi.as_ref().is_some_and(|d| d.client_use32) {
         HOST_STACK_PM32_SEL
     } else {
@@ -163,7 +163,7 @@ fn current_side(regs: &Regs) -> Side {
 /// Select live SS:SP for an active side, its suspended cursor otherwise,
 /// or the host's fresh stack when no host entry has activated that side.
 #[inline]
-fn stack_for<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs, side: Side) -> (u16, u32) {
+fn stack_for<A: crate::Core>(dos: &thread::DosState<A>, regs: &Regs, side: Side) -> (u16, u32) {
     let fresh = match side {
         Side::Pm => (host_stack_pm_seg(dos), dos::host_stack_empty_sp()),
         Side::Rm => fresh_rm_stack(),
@@ -172,11 +172,11 @@ fn stack_for<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs, side: Side)
 }
 
 #[inline]
-fn pm_stack<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) -> (u16, u32) {
+fn pm_stack<A: crate::Core>(dos: &thread::DosState<A>, regs: &Regs) -> (u16, u32) {
     stack_for(dos, regs, Side::Pm)
 }
 
-pub(super) fn rm_stack<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) -> (u16, u32) {
+pub(super) fn rm_stack<A: crate::Core>(dos: &thread::DosState<A>, regs: &Regs) -> (u16, u32) {
     stack_for(dos, regs, Side::Rm)
 }
 
@@ -184,28 +184,28 @@ fn fresh_rm_stack() -> (u16, u32) {
     (dos::rm_stack_seg(), rm_stack_top() as u32)
 }
 
-fn push_continuation<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &Regs, rm_call_struct_addr: Option<u32>) {
+fn push_continuation<A: crate::Core>(dos: &mut thread::DosState<A>, regs: &Regs, rm_call_struct_addr: Option<u32>) {
     let save = HostContinuation::capture(
         regs, dos.pc.locked_stack.stacks, rm_call_struct_addr,
     );
     dos.pc.locked_stack.continuations.push(save);
 }
 
-pub(super) fn pop_continuation<A: crate::Arch>(dos: &mut thread::DosState<A>) -> HostContinuation {
+pub(super) fn pop_continuation<A: crate::Core>(dos: &mut thread::DosState<A>) -> HostContinuation {
     dos.pc.locked_stack.continuations.pop()
         .expect("DPMI return without a host continuation")
 }
 
 /// The simulated RM call executes a separate register context. Its known
 /// interrupt entry/return does not need the suspended caller's IF learner.
-pub(super) fn suspend_call_vif<A: crate::Arch>(dos: &mut thread::DosState<A>) {
+pub(super) fn suspend_call_vif<A: crate::Core>(dos: &mut thread::DosState<A>) {
     let saved = dos.dpmi.as_mut().map(|dpmi| dpmi.vif.suspend());
     dos.pc.locked_stack.continuations.last_mut()
         .expect("RM call without a continuation").vif = saved;
     super::refresh_learning_tf(dos);
 }
 
-pub(super) fn resume_continuation<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, save: HostContinuation) {
+pub(super) fn resume_continuation<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, save: HostContinuation) {
     // An attached RMCS on a continuation captured from VM86 identifies an
     // allocated real-mode callback. Unlike 0300/01/02 calls, its handler owns
     // the returned registers and control image; the host retains ownership of
@@ -291,12 +291,12 @@ pub(super) fn resume_continuation<A: crate::Arch>(machine: &mut A, dos: &mut thr
 ///
 /// The caller must then choose PM `CS:EIP` and may add recipe-specific
 /// frames before finalizing `regs.SP`.
-pub(super) fn enter_pm<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Regs, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
+pub(super) fn enter_pm<A: crate::Core>(dos: &mut thread::DosState<A>, regs: &mut Regs, rm_call_struct_addr: Option<u32>) -> (u16, u32) {
     enter_pm_at(dos, regs, rm_call_struct_addr, None)
 }
 
 /// Enter PM using an explicit destination cursor when supplied.
-pub(super) fn enter_pm_at<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Regs, rm_call_struct_addr: Option<u32>, cursor: Option<(u16, u32)>) -> (u16, u32) {
+pub(super) fn enter_pm_at<A: crate::Core>(dos: &mut thread::DosState<A>, regs: &mut Regs, rm_call_struct_addr: Option<u32>, cursor: Option<(u16, u32)>) -> (u16, u32) {
     if_record(IF_SWITCH_PM, regs, vif(regs), vif(regs),
         dos.pc.locked_stack.other_stack(regs));
     let pm_cursor = cursor.unwrap_or_else(|| pm_stack(dos, regs));
@@ -319,7 +319,7 @@ pub(super) fn enter_pm_at<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &
 ///   - The active side's cursor is suspended; the RM stack is marked in use.
 ///
 /// The caller must then choose RM `CS:EIP` and add any guest-visible frame.
-pub(super) fn enter_rm<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Regs,
+pub(super) fn enter_rm<A: crate::Core>(dos: &mut thread::DosState<A>, regs: &mut Regs,
                                       rm_dest: (u16, u32), rm_call_struct_addr: Option<u32>) {
     push_continuation(dos, regs, rm_call_struct_addr);
     dos.pc.locked_stack.suspend_stack(regs);
@@ -433,7 +433,7 @@ fn synthetic_host_iret_target() -> (u16, u32) {
 ///   - Run. The handler's eventual IRET pops the frame and resumes the
 ///     client directly — no kernel involvement, no snapshot, no stack
 ///     switch.
-pub(super) fn deliver_pm_int<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, vector: u8) -> thread::KernelAction {
+pub(super) fn deliver_pm_int<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, vector: u8) -> thread::KernelAction {
     let (sel, off) = dos.pm_vectors[vector as usize];
     let frame_use32 = match dos.dpmi.as_ref() {
         Some(dpmi) => dpmi.client_use32,
@@ -562,7 +562,7 @@ pub(super) fn dump_if_ring() {
     }
 }
 
-pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, vector: u8) {
+pub(super) fn deliver_pm_irq<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, vector: u8) {
     let (sel, off) = dos.pm_vectors[vector as usize];
     unsafe {
         LAST_IRQ = (vector, sel, off, regs.code_seg(), regs.ip32(),
@@ -638,7 +638,7 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::
 /// for a 32-bit client, 6 for a 16-bit client. Handler CS.D can differ (a
 /// 16-bit code segment can return with IRETD). SS.B independently determines
 /// whether stack addressing uses SP or ESP.
-pub(super) fn push_iret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], regs: &mut Regs, frame_use32: bool,
+pub(super) fn push_iret_frame<A: crate::Core>(machine: &mut A, ldt: &[u64], regs: &mut Regs, frame_use32: bool,
                    eip: u32, cs: u16, flags: u32) {
     let ss = regs.frame.ss as u16;
     let base = seg_base(ldt, ss);
@@ -676,7 +676,7 @@ pub(super) fn push_iret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], regs
 /// `RETF` is what pops it. Used for MS-Mouse INT 33h AX=0Ch PM callbacks,
 /// which the driver enters with a FAR CALL and the handler ends with FAR RET
 /// (unlike HW IRQ / DPMI callbacks, which IRET — see `push_iret_frame`).
-pub(super) fn push_farret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], regs: &mut Regs, handler_is_32: bool,
+pub(super) fn push_farret_frame<A: crate::Core>(machine: &mut A, ldt: &[u64], regs: &mut Regs, handler_is_32: bool,
                    eip: u32, cs: u16) {
     let ss = regs.frame.ss as u16;
     let base = seg_base(ldt, ss);
@@ -705,7 +705,7 @@ pub(super) fn push_farret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], re
 /// Pop an IRET frame off `regs.ss:regs.sp`, advancing regs.sp.
 /// `frame_use32` must match the width used at push time. Frame width
 /// follows the DPMI ABI; SP semantics follow SS.B (see `push_iret_frame`).
-pub(super) fn pop_iret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], regs: &mut Regs, frame_use32: bool) -> (u32, u16, u32) {
+pub(super) fn pop_iret_frame<A: crate::Core>(machine: &mut A, ldt: &[u64], regs: &mut Regs, frame_use32: bool) -> (u32, u16, u32) {
     let ss = regs.frame.ss as u16;
     let base = seg_base(ldt, ss);
     let stack_is_32 = seg_is_32(ldt, ss);
@@ -743,7 +743,7 @@ pub(super) fn pop_iret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], regs:
 ///   - `SLOT_RESUME_CONTINUATION` for cross-mode HW-IRQ first-entry.
 ///   - The outer caller's CS:EIP for soft-INT and nested-HW-IRQ.
 #[inline(never)]
-pub(super) fn vector_stub_reflect<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn vector_stub_reflect<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let eip = regs.ip32();
     let vector = ((eip.wrapping_sub(dos::STUB_BASE + 2)) / 2) as u8;
     // INT 31h's host default handler is the DPMI services API — NOT a real-
@@ -791,7 +791,7 @@ pub(super) fn vector_stub_reflect<A: crate::Arch>(machine: &mut A, dos: &mut thr
 /// SLOT_RESUME_CONTINUATION. If the saved continuation target is the synthetic
 /// host IRET marker, `resume_continuation_from_stub` restores the PM state and
 /// immediately pops the frame the caller planted on the user stack.
-pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(machine: &mut A,
+pub(super) fn reflect_int_to_real_mode<A: crate::Core>(machine: &mut A,
                                                        dos: &mut thread::DosState<A>,
                                                        regs: &mut Regs, vector: u8)
                                                        -> thread::KernelAction {
@@ -866,7 +866,7 @@ pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(machine: &mut A,
 /// the continuation; `resume_continuation` exchanges that register block and
 /// restores the suspended side. A synthetic host IRET target asks this function
 /// to consume a planted interrupt frame after restoring the continuation.
-pub(super) fn resume_continuation_from_stub<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+pub(super) fn resume_continuation_from_stub<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     let resume_if_in = vif(regs);
     let resume_other = dos.pc.locked_stack.other_stack(regs);
     let current_status = regs.flags32() & eflags::STATUS_MASK;

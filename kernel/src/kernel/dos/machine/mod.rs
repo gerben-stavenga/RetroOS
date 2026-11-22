@@ -277,7 +277,7 @@ impl AudioDevices {
     pub fn mix(&mut self, now_ns: u64, span: crate::kernel::sound::AudioSpan<'_>) -> usize {
         self.mix_with(now_ns, span, None)
     }
-    pub fn mix_guest<A: crate::Arch>(&mut self, machine: &mut A, now_ns: u64,
+    pub fn mix_guest<A: crate::Core>(&mut self, machine: &mut A, now_ns: u64,
         span: crate::kernel::sound::AudioSpan<'_>) -> usize {
         self.mix_with(now_ns, span, Some(&mut |addr, bytes| machine.copy_from(addr as u64, bytes)))
     }
@@ -398,7 +398,7 @@ impl MouseState {
     ///   0x10 = right button released
     ///   0x20 = middle button pressed
     ///   0x40 = middle button released
-    pub fn apply_packet<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo, regs: &mut Regs, dx: i16, dy: i16, buttons: u8) -> u16 {
+    pub fn apply_packet<A: crate::Core>(&mut self, machine: &mut A, vga: &mut DosVideo, regs: &mut Regs, dx: i16, dy: i16, buttons: u8) -> u16 {
         self.accum_dx = self.accum_dx.saturating_add(dx as i32);
         self.accum_dy = self.accum_dy.saturating_add(dy as i32);
         self.x = (self.x as i32 + dx as i32).clamp(self.min_x as i32, self.max_x as i32) as i16;
@@ -454,7 +454,7 @@ impl MouseState {
     /// already drawn at this cell. Real Microsoft Mouse drivers also do this
     /// in graphics modes via a sprite — we don't (yet); games that go to
     /// mode 13h hide the driver cursor and draw their own anyway.
-    pub fn render_if_visible<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo, _regs: &mut Regs) {
+    pub fn render_if_visible<A: crate::Core>(&mut self, machine: &mut A, vga: &mut DosVideo, _regs: &mut Regs) {
         if self.show_count > 0 { return; }
 
         if !matches!(super::bios::Bda::video_mode(machine), 0..=3 | 7) {
@@ -474,20 +474,20 @@ impl MouseState {
     }
 
     /// Restore the original attribute under the current cursor cell.
-    pub fn erase_cursor<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo) {
+    pub fn erase_cursor<A: crate::Core>(&mut self, machine: &mut A, vga: &mut DosVideo) {
         if let Some(old) = self.drawn_at.take() {
             vga::copy_to_guest(machine, vga, (VGA_TEXT_BASE + old as u32 * 2 + 1) as usize, &[self.saved_attr]);
         }
     }
 
     /// AX=01h — show cursor: decrement counter; if it just reached 0, draw.
-    pub fn show<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo, regs: &mut Regs) {
+    pub fn show<A: crate::Core>(&mut self, machine: &mut A, vga: &mut DosVideo, regs: &mut Regs) {
         self.show_count -= 1;
         self.render_if_visible(machine, vga, regs);
     }
 
     /// AX=02h — hide cursor: increment counter; if it was 0, erase.
-    pub fn hide<A: crate::Arch>(&mut self, machine: &mut A, vga: &mut DosVideo, _regs: &mut Regs) {
+    pub fn hide<A: crate::Core>(&mut self, machine: &mut A, vga: &mut DosVideo, _regs: &mut Regs) {
         if self.show_count <= 0 { self.erase_cursor(machine, vga); }
         self.show_count += 1;
     }
@@ -498,7 +498,7 @@ impl PcMachine {
     /// The DPMI host owns the linear-window allocation and bookkeeping; the
     /// machine owns address decoding and therefore decides whether this is a
     /// real device mapping, a trapped aperture, or aliased emulated RAM.
-    pub fn map_physical<A: crate::Arch>(
+    pub fn map_physical<A: crate::Core>(
         &mut self,
         machine: &mut A,
         physical: u32,
@@ -544,7 +544,7 @@ impl PcMachine {
 
     /// Built straight into its heap slot: the struct is far too large to pass
     /// through a kernel stack frame (see `DosState::pc`).
-    pub fn new_boxed<A: crate::Arch>(
+    pub fn new_boxed<A: crate::Core>(
         machine: &mut A,
         vga: DosVideo,
     ) -> alloc::boxed::Box<Self> {
@@ -638,7 +638,7 @@ pub(super) fn pit_io<R>(
     access(pit)
 }
 
-pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u16) -> u8 {
+pub fn emulate_inb<A: crate::Core>(machine: &mut A, pc: &mut PcMachine, port: u16) -> u8 {
     match port {
         0x3f8..=0x3ff => { let value = pc.uart.read(port - 0x3f8); if pc.uart.poll_irq() { pc.vpic.raise(4); } value },
         // VGA Input Status Register 1: bit 3 (vertical retrace) and bit 0
@@ -767,7 +767,7 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
 }
 
 /// Emulate OUT to a port.
-pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, val: u8) {
+pub fn emulate_outb<A: crate::Core>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, val: u8) {
     match port {
         0x3f8..=0x3ff => { pc.uart.write(port - 0x3f8, val); if pc.uart.poll_irq() { pc.vpic.raise(4); } },
         // VGA ports — pass through to hardware (tracking the AC flip-flop +
@@ -876,7 +876,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
 
 /// Resolve the linear base of segment `sel`. VM86 uses `sel*16`; PM walks
 /// GDT/LDT via the arch descriptor helpers.
-fn seg_base_for<A: crate::Arch>(regs: &Regs, sel: u16) -> u32 {
+fn seg_base_for<A: crate::Core>(regs: &Regs, sel: u16) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         (sel as u32) << 4
     } else {
@@ -948,7 +948,7 @@ fn pci_config_out(pc: &mut PcMachine, port: u16, size: u32, val: u32) -> bool {
 }
 
 /// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up.
-pub fn handle_in_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
+pub fn handle_in_event<A: crate::Core>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
     // PCI configuration space (mechanism #1), served whole rather than through
     // the per-byte path below: 0xCF8 is a latched dword and a config read must
     // answer as a unit, where four ISA byte reads would each fall to the
@@ -969,7 +969,7 @@ pub fn handle_in_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kernel
 }
 
 /// Complete an `OUT port, AL/AX/EAX` the arch monitor bubbled up.
-pub fn handle_out_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
+pub fn handle_out_event<A: crate::Core>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
     let val = regs.rax;
     if pci_config_out(pc, port, size, val as u32) {
         return;
@@ -983,7 +983,7 @@ pub fn handle_out_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kerne
 /// Complete one `INSB/INSW/INSD` element (ES:DI ← port, advance DI). On `rep`
 /// the monitor re-faults per iteration (leaving IP on the instruction), so this
 /// does a single element and decrements the count — `dec_rep_count` — each time.
-pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, size: u32, rep: bool, addr32: bool) {
+pub fn handle_ins_event<A: crate::Core>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let es_base = seg_base_for::<A>(regs, regs.es as u16);
     let di = string_index(regs.rdi, addr32);
@@ -998,7 +998,7 @@ pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kerne
 
 /// Complete one `OUTSB/OUTSW/OUTSD` element (port ← DS:SI, advance SI). Same
 /// per-iteration `rep` contract as `handle_ins_event`.
-pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, size: u32, rep: bool, addr32: bool) {
+pub fn handle_outs_event<A: crate::Core>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let ds_base = seg_base_for::<A>(regs, regs.ds as u16);
     let si = string_index(regs.rsi, addr32);
@@ -1011,7 +1011,7 @@ pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kern
     if rep { dec_rep_count(regs, addr32); }
 }
 
-fn guest_inb<A: crate::Arch>(
+fn guest_inb<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     pc: &mut PcMachine,
@@ -1028,7 +1028,7 @@ fn guest_inb<A: crate::Arch>(
     emulate_inb(machine, pc, port)
 }
 
-fn guest_outb<A: crate::Arch>(
+fn guest_outb<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     pc: &mut PcMachine,
@@ -1122,7 +1122,7 @@ pub fn advance_timers(pc: &mut PcMachine, now_ns: u64) {
 /// clock here once stamped a program's first notes seconds ahead, the GM
 /// start delay). Called on every event-loop slice, including between clock
 /// wakeups when the PCM mixer does not run.
-pub fn audio_service<A: crate::Arch>(
+pub fn audio_service<A: crate::Core>(
     machine: &mut A,
     pc: &mut PcMachine,
     now_ns: u64,
@@ -1149,7 +1149,7 @@ pub fn audio_service<A: crate::Arch>(
     mpu.tick(machine, pushed);
 }
 
-pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, event: crate::Irq) {
+pub fn queue_irq<A: crate::Core>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, event: crate::Irq) {
     use crate::Irq;
     match event {
         Irq::Key(sc) => {
@@ -1260,17 +1260,17 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
 
 /// Read a u16 from a real-mode seg:off address, through the active address
 /// space's memory interface (`arch::mem()`) — works under any arch backend.
-pub fn read_u16<A: crate::Arch>(machine: &mut A, seg: u32, off: u32) -> u16 {
+pub fn read_u16<A: crate::Core>(machine: &mut A, seg: u32, off: u32) -> u16 {
     machine.read::<u16>(((seg << 4) + off) as u64)
 }
 
 /// Write a u16 to a real-mode seg:off address, through `arch::mem()`.
-pub fn write_u16<A: crate::Arch>(machine: &mut A, seg: u32, off: u32, val: u16) {
+pub fn write_u16<A: crate::Core>(machine: &mut A, seg: u32, off: u32, val: u16) {
     machine.write::<u16>(((seg << 4) + off) as u64, val);
 }
 
 /// Push a u16 onto the VM86 stack (SS:SP)
-pub fn vm86_push<A: crate::Arch>(machine: &mut A, regs: &mut Regs, val: u16) {
+pub fn vm86_push<A: crate::Core>(machine: &mut A, regs: &mut Regs, val: u16) {
     let sp = vm86_sp(regs).wrapping_sub(2);
     set_vm86_sp(regs, sp);
     let ss = regs.ss32();
@@ -1278,7 +1278,7 @@ pub fn vm86_push<A: crate::Arch>(machine: &mut A, regs: &mut Regs, val: u16) {
 }
 
 /// Pop a u16 from the VM86 stack (SS:SP)
-pub fn vm86_pop<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> u16 {
+pub fn vm86_pop<A: crate::Core>(machine: &mut A, regs: &mut Regs) -> u16 {
     let sp = vm86_sp(regs);
     let val = read_u16(machine, regs.ss32(), sp as u32);
     set_vm86_sp(regs, sp.wrapping_add(2));
@@ -1287,14 +1287,14 @@ pub fn vm86_pop<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> u16 {
 
 /// Set or clear a flag in the caller's saved VM86 interrupt frame.
 /// IRET restores this FLAGS word; changing live flags would be overwritten.
-pub fn vm86_set_return_flag<A: crate::Arch>(machine: &mut A, regs: &Regs, mask: u16, enabled: bool) {
+pub fn vm86_set_return_flag<A: crate::Core>(machine: &mut A, regs: &Regs, mask: u16, enabled: bool) {
     let address = (usize::from(vm86_ss(regs)) << 4) + usize::from(vm86_sp(regs)) + 4;
     let flags = machine.read::<u16>(address as u64);
     machine.write::<u16>(address as u64, if enabled { flags | mask } else { flags & !mask });
 }
 
 /// Return from a 16-bit VM86 interrupt, restoring IP, CS and virtual FLAGS.
-pub fn vm86_iret<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+pub fn vm86_iret<A: crate::Core>(machine: &mut A, regs: &mut Regs) {
     let ip = vm86_pop(machine, regs);
     let cs = vm86_pop(machine, regs);
     let flags = vm86_pop(machine, regs);

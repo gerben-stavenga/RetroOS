@@ -16,7 +16,7 @@ use super::lowmem::{CTRL_STUB_SEG, SLOT_MOUSE_CB_RET, STUB_BASE, ctrl_slot_off, 
 ///
 /// Mouse hardware state lives on `dos.pc.mouse` and is updated by the IRQ 12
 /// packet stream queued through `machine::queue_irq`.
-pub(super) fn int_33h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn int_33h<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ax = regs.rax as u16;
     // Computed before borrowing `m`: a PM install (AX=0Ch) records the handler
     // as a selector and, for a 32-bit client, keeps the full EDX offset.
@@ -114,7 +114,7 @@ pub(super) fn int_33h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
 /// since `HostContinuation` only covers CS/EIP/SS/ESP/EFLAGS/segs. The user handler
 /// returns via SLOT_MOUSE_CB_RET which restores them and then unwinds through
 /// the standard `resume_continuation_from_stub`.
-pub(in crate::kernel::dos) fn deliver_mouse_callback<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+pub(in crate::kernel::dos) fn deliver_mouse_callback<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     use crate::kernel::dos::machine::vm86_push;
     use crate::kernel::dos::mode_transitions;
 
@@ -199,7 +199,7 @@ pub(in crate::kernel::dos) fn deliver_mouse_callback<A: crate::Arch>(machine: &m
 /// SLOT_MOUSE_CB_RET dispatch: user handler RETFed to this slot.
 /// Restore the GP regs `deliver_mouse_callback` clobbered, then unwind via
 /// the same `resume_continuation_from_stub` that SLOT_RESUME_CONTINUATION uses.
-pub(in crate::kernel::dos) fn mouse_callback_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+pub(in crate::kernel::dos) fn mouse_callback_return<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     use crate::kernel::dos::machine::vm86_pop;
     if !dos.pc.mouse.cb_is_pm {
         // VM86: the stub's `CD 31` (INT 31h, IOPL=3) pushed FLAGS/CS/IP onto

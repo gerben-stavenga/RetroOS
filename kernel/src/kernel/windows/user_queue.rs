@@ -107,7 +107,7 @@ fn refresh(queue: &mut Queue, threads: &mut threads::State, now: u64) {
     }
     session::write_object(queue.offset, &shared);
 }
-pub(super) fn poll<A: crate::Arch>(machine: &mut A, state: &mut WindowsState) {
+pub(super) fn poll<A: crate::Core>(machine: &mut A, state: &mut WindowsState) {
     let now = machine.now();
     let paints = user_objects::pending_paints(state);
     for queue in &mut state.user_queues.queues {
@@ -123,7 +123,7 @@ pub(super) fn set_cursor(state: &mut State, tid: u32, handle: u32, count: i32) {
         session::write_object_part(queue.input_offset, 44, &data);
     }
 }
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     args: [u32; 3],

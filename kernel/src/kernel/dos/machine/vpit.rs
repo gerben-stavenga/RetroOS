@@ -221,7 +221,7 @@ pub struct VirtualPit {
 }
 
 impl VirtualPit {
-    pub(crate) fn new<A: crate::Arch>(machine: &mut A) -> Self {
+    pub(crate) fn new<A: crate::Core>(machine: &mut A) -> Self {
         let now = machine.now();
         Self {
             last_host_ns: now,

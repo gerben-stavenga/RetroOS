@@ -36,7 +36,7 @@ trait Io {
 }
 
 struct Hardware<'a, A>(&'a mut A);
-impl<A: crate::Arch> Io for Hardware<'_, A> {
+impl<A: crate::Core> Io for Hardware<'_, A> {
     fn out(&mut self, port: u16, value: u8) { self.0.outb(port, value); }
     fn input(&mut self, port: u16) -> u8 { self.0.inb(port) }
     fn delay(&mut self, us: u64) {
@@ -372,7 +372,7 @@ fn configure_devices<I: Io>(
 /// Discover PnP first, including cards already enabled by firmware/UNISOUND.
 /// Configure a supported audio device from BLASTER, then let the caller use
 /// the ordinary DSP initialization at that exact base. LPC routing must work.
-pub fn probe_sb<A: crate::Arch>(machine: &mut A, want: Option<SbResources>) -> SbProbe {
+pub fn probe_sb<A: crate::Core>(machine: &mut A, want: Option<SbResources>) -> SbProbe {
     let mut bus = Bus { io: Hardware(machine), rdp: READ_PORTS[0] };
     let cards = bus.isolate();
     let mut devices = Vec::new();

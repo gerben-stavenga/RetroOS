@@ -16,7 +16,7 @@ trait Io {
     fn out32(&mut self, port: u16, value: u32);
 }
 struct Hardware<'a, A>(&'a mut A);
-impl<A: crate::Arch> Io for Hardware<'_, A> {
+impl<A: crate::Core> Io for Hardware<'_, A> {
     fn pci_read(&mut self, offset: u8) -> u32 { pci::read32(self.0, 0, 31, 0, offset) }
     fn pci_write(&mut self, offset: u8, value: u32) { pci::write32(self.0, 0, 31, 0, offset, value); }
     fn input(&mut self, port: u16) -> u8 { self.0.inb(port) }
@@ -162,7 +162,7 @@ fn configure(io: &mut impl Io, ranges: &[(u16, u8, u8); 4]) -> &'static str {
 /// `config_ranges` is RETROOS.INI's `LPC_RANGES` value, if present; an
 /// unparseable override falls back to the sapphisa defaults rather than
 /// aborting setup.
-pub fn setup<A: crate::Arch>(machine: &mut A, config_ranges: Option<&[u8]>) {
+pub fn setup<A: crate::Core>(machine: &mut A, config_ranges: Option<&[u8]>) {
     let ranges = match config_ranges.map(parse_ranges) {
         Some(Some(ranges)) => ranges,
         Some(None) => {

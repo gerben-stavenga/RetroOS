@@ -57,7 +57,11 @@ pub unsafe extern "C" fn isr_handler(stack: &mut StackFrame, from_64: bool) -> b
     };
     if user {
         if let Some(hook) = unsafe { ENTRY_HOOK } {
-            if unsafe { hook(stack, from_64) } {
+            let handled = unsafe { instruction32(stack, from_64) }.is_some_and(|state| {
+                let mut access = NativeTrapAccess(core::cell::OnceCell::new());
+                unsafe { (hook.handler)(state, &mut access, hook.regions.map(|region| region.base)) }
+            });
+            if handled {
                 unsafe { prepare_espfix(stack, from_64); }
                 return from_64;
             }
@@ -337,31 +341,42 @@ fn dispatch(stack: &mut StackFrame, from_64: bool) -> bool {
 }
 
 
-/// An installed hook sees the native frame before canonicalization. On true,
-/// entry restores it directly; on false, normal trap dispatch continues.
-/// Only the saved low halves describe registers in a 32-bit frame; unsaved
-/// fields contain unspecified values. A handler must preserve the layout and
-/// may update live state, including on partial progress.
-pub(crate) type EntryHook = unsafe extern "C" fn(&mut StackFrame, bool) -> bool;
+use arch_abi::entry::{InstructionState, TrapAccess, TrapHook};
 
 #[thread_local]
-static mut ENTRY_HOOK: Option<EntryHook> = None;
+static mut ENTRY_HOOK: Option<TrapHook> = None;
 
-/// Called at ring 0 with interrupts disabled when installing/removing a hook.
-pub(crate) unsafe fn install_hook(hook: Option<EntryHook>) {
+pub(crate) unsafe fn install_hook(hook: Option<TrapHook>) {
     unsafe { ENTRY_HOOK = hook; }
 }
 
-/// Borrowed instruction state for a 16/32-bit handler. This does not normalize
-/// virtual flags or convert the native return frame. Selectors are ES/CS/SS/DS/FS/GS.
-pub(crate) struct InstructionState<'a> {
-    pub gprs: [&'a mut u32; 8], // AX, CX, DX, BX, SP, BP, SI, DI
-    pub high: Option<[&'a mut u32; 8]>,
-    pub ip: &'a mut u32,
-    pub flags: &'a mut u32,
-    pub selectors: [u16; 6],
-    pub vector: u64,
-    pub error: u64,
+struct NativeTrapAccess(core::cell::OnceCell<crate::paging2::PagingGuard>);
+unsafe impl TrapAccess for NativeTrapAccess {
+    fn segment(&self, selector: u16) -> (u32, u32, bool) {
+        let descriptor = crate::descriptors::read_descriptor(selector);
+        let base = ((descriptor >> 16) as u32 & 0xff_ffff) | ((descriptor >> 32) as u32 & 0xff00_0000);
+        let limit = (descriptor as u32 & 0xffff) | ((descriptor >> 32) as u32 & 0xf0000);
+        let limit = if descriptor & (1 << 55) != 0 { (limit << 12) | 4095 } else { limit };
+        (base, limit, selector == 0 || descriptor & (1 << 54) != 0)
+    }
+    fn resident(&self, address: u32, len: u32, write: bool) -> bool {
+        self.0.get_or_init(crate::paging2::PagingGuard::lock);
+        crate::mapping::resident(address, len, write)
+    }
+    fn direct_ram(&self, address: u32, len: u32) -> Option<*const u8> {
+        self.resident(address, len, false).then_some(address as *const u8)
+    }
+    unsafe fn fetched_code(&self, address: u32) -> Option<*const u8> {
+        (address < 0xc000_0000).then_some(address as *const u8)
+    }
+    unsafe fn read(&self, address: u32) -> u8 {
+        unsafe { (address as *const u8).read_volatile() }
+    }
+    unsafe fn write(&mut self, address: u32, byte: u8) {
+        unsafe { (address as *mut u8).write_volatile(byte); }
+    }
+    fn fpu_st0(&self) -> [u8; 10] { crate::x86::fpu_st0() }
+    fn fpu_pop(&mut self) { crate::x86::fpu_pop(); }
 }
 
 /// Borrow only saved fields, leaving unsaved halves and the expansion gap
@@ -393,6 +408,7 @@ pub(crate) unsafe fn instruction32(stack: &mut StackFrame, wide: bool) -> Option
             selectors: [r.es as u16, r.frame.cs as u16, r.frame.ss as u16,
                 r.ds as u16, r.fs as u16, r.gs as u16],
             vector: r.int_num, error: r.err_code,
+            address: if r.int_num == 14 { crate::x86::read_cr2_full() } else { 0 },
         })
     } else {
         let frame = unsafe { &mut stack.raw32 };
@@ -412,6 +428,7 @@ pub(crate) unsafe fn instruction32(stack: &mut StackFrame, wide: bool) -> Option
             high: None,
             ip: &mut r.eip, flags: &mut r.eflags, selectors,
             vector: u64::from(r.int_num), error: u64::from(r.err_code),
+            address: if r.int_num == 14 { u64::from(crate::x86::read_cr2()) } else { 0 },
         })
     }
 }
@@ -424,7 +441,7 @@ fn kernel_call(frame: &mut Regs) {
     // swap_regs parks the kernel continuation and installs the app frame.
     // The operation reads/writes the parked call, never the app's registers.
     crate::traps::swap_regs(frame);
-    if let arch_abi::entry::CallOutcome::Complete = crate::traps::dispatch_parked_call(frame) {
+    if let arch_abi::entry::CallOutcome::Complete = crate::traps::dispatch_parked_call() {
         crate::traps::swap_regs(frame);
     }
     // execute leaves the app frame in place for the assembly IRET epilogue.

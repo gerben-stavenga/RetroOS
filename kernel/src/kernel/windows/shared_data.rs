@@ -13,7 +13,7 @@ static BACKING: spin::Mutex<Backing> = spin::Mutex::new(Backing {
     last_ms: u64::MAX,
 });
 
-pub(super) fn initialize<A: crate::Arch>(machine: &mut A) {
+pub(super) fn initialize<A: crate::Core>(machine: &mut A) {
     let mut backing = BACKING.lock();
     if backing.pointer == 0 {
         let page = crate::kernel::phys_mm::alloc_shared_pages(1);
@@ -52,7 +52,7 @@ unsafe fn system_time(page: *mut u8, offset: usize, value: u64) {
     }
 }
 
-pub(super) fn update<A: crate::Arch>(machine: &A) {
+pub(super) fn update<A: crate::Core>(machine: &A) {
     let now = machine.now();
     let ms = now / 1_000_000;
     let mut backing = BACKING.lock();

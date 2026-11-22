@@ -2,7 +2,7 @@
 //! Rust remains 32-bit: table and data access uses a temporary physical window.
 //! Nonpresent reservation entries describe a uniform subtree without allocating
 //! its lower tables. Fork shares tables; mutations and write faults deshare them.
-use crate::paging2::{self, Entry, Entry64, RootPageTable};
+use crate::paging2::{self, Entry, Entry64, AddressSpace};
 use crate::paging2::flags::*;
 
 pub const START: u64 = 1 << 39;
@@ -45,18 +45,8 @@ fn set_root(index: usize, entry: Entry64) {
 }
 
 // The save area still fits in the union's legacy 768-dword storage.
-const _: () = assert!(core::mem::size_of::<RootPageTable>() == 768 * 4);
-pub fn save(space: &mut RootPageTable) {
-    let _paging = paging2::PagingGuard::lock();
-    if !paging2::is_pae() { return; }
-    for index in 1..256 { unsafe { space.e64[index + 3] = root(index); } }
-}
-pub fn load(space: &RootPageTable) {
-    let _paging = paging2::PagingGuard::lock();
-    if !paging2::is_pae() { return; }
-    for index in 1..256 { set_root(index, unsafe { space.e64[index + 3] }); }
-}
-pub fn swap(space: &mut RootPageTable) {
+const _: () = assert!(core::mem::size_of::<AddressSpace>() == 768 * 4);
+pub fn swap(space: &mut AddressSpace) {
     let _paging = paging2::PagingGuard::lock();
     if !paging2::is_pae() { return; }
     for index in 1..256 {
@@ -65,7 +55,7 @@ pub fn swap(space: &mut RootPageTable) {
         unsafe { space.e64[index + 3] = old; }
     }
 }
-pub fn fork(space: &mut RootPageTable) {
+pub fn fork(space: &mut AddressSpace) {
     let _paging = paging2::PagingGuard::lock();
     if !paging2::is_pae() { return; }
     for index in 1..256 {

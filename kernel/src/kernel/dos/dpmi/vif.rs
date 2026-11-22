@@ -34,7 +34,7 @@
 //! the `#GP`/`#DB` and let us drive `regs` + guest memory.
 
 use arch_abi::eflags;
-use crate::{Arch, Regs, UserMode};
+use crate::{Core, Regs, UserMode};
 
 // EFLAGS bits.
 const CARRIER_FLAGS: u32 = eflags::TF_FLAG | eflags::NT_FLAG;
@@ -134,7 +134,7 @@ impl VifMap {
 
     /// A `CLI` `#GP`'d: virtual IF just went 1→0, a window opens at `cli_ip`.
     /// `arch` gives guest memory + segment bases; `regs` is the fault frame.
-    pub fn on_cli<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs, cli_ip: u32,
+    pub fn on_cli<A: Core>(&mut self, arch: &mut A, regs: &mut Regs, cli_ip: u32,
                            always_step: bool) {
         let cli_linear = A::seg_base(regs.code_seg()).wrapping_add(cli_ip);
         let cli_sp = regs.sp32();
@@ -211,7 +211,7 @@ impl VifMap {
 
     /// A `#DB`: either the post-tag trap (a tagged `POPF`/`IRET` just ran) or a
     /// learning single-step. Returns whether the client should resume.
-    pub fn on_db<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs) -> DbResult {
+    pub fn on_db<A: Core>(&mut self, arch: &mut A, regs: &mut Regs) -> DbResult {
         if self.is_carrier_trap(regs) {
             self.finish_carrier(regs);
             return DbResult::Resume;
@@ -260,7 +260,7 @@ impl VifMap {
 
     /// Single-step the window, emulating each sensitive op; when one re-enables
     /// VIF it is the exit — record its class and stop stepping.
-    fn step_learn<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs) -> DbResult {
+    fn step_learn<A: Core>(&mut self, arch: &mut A, regs: &mut Regs) -> DbResult {
         const BUDGET: usize = 64;
         for _ in 0..BUDGET {
             if regs.flags32() & eflags::VIF_FLAG != 0 {
@@ -329,7 +329,7 @@ impl VifMap {
 /// emulated (so `regs` is post-exit); `ip_before`/`sp_before` are its pre-emulation
 /// IP/SP. Only the ops that set VIF reach here: STI (0xFB), POPF (0x9D), IRET
 /// (0xCF) — STI is emulated inline during learning, so it lands here too.
-fn classify_exit<A: Arch>(
+fn classify_exit<A: Core>(
     arch: &mut A,
     regs: &Regs,
     a: &Active,
@@ -389,7 +389,7 @@ fn classify_exit<A: Arch>(
 /// the body may move the image between registers or through memory; the caller
 /// checks the values line up and a probe pass proves the dataflow before the
 /// site runs free. Returns `(r1, r2)` (never esp).
-fn reg_idiom<A: Arch>(arch: &mut A, cs_base: u32, cli_ip: u32, popf_ip: u32) -> Option<(u8, u8)> {
+fn reg_idiom<A: Core>(arch: &mut A, cs_base: u32, cli_ip: u32, popf_ip: u32) -> Option<(u8, u8)> {
     let at = |ip: u32| -> u8 { arch.read::<u8>(cs_base.wrapping_add(ip) as u64) };
     let pushf = at(cli_ip.wrapping_sub(2)); // 9C
     let pop = at(cli_ip.wrapping_sub(1)); //  58..5F  pop r1
@@ -416,14 +416,14 @@ fn looks_like_flags(w: u32) -> bool {
     w & eflags::IF_FLAG != 0 && w & 2 != 0 && w & CARRIER_FLAGS == 0
 }
 
-fn stack_base<A: Arch>(regs: &Regs) -> u32 {
+fn stack_base<A: Core>(regs: &Regs) -> u32 {
     if regs.mode() == UserMode::VM86 {
         (regs.stack_seg() as u32) << 4
     } else {
         A::seg_base(regs.stack_seg())
     }
 }
-fn code_view<A: Arch>(regs: &Regs) -> (u32, bool) {
+fn code_view<A: Core>(regs: &Regs) -> (u32, bool) {
     let cs = regs.code_seg();
     if regs.mode() == UserMode::VM86 {
         ((cs as u32) << 4, false)

@@ -33,18 +33,18 @@ fn cfg_addr(bus: u8, dev: u8, func: u8, off: u8) -> u32 {
         | ((off as u32) & 0xFC)
 }
 
-pub fn read32<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
+pub fn read32<A: crate::Core>(machine: &mut A, bus: u8, dev: u8, func: u8, off: u8) -> u32 {
     machine.outl(PCI_CFG_ADDR, cfg_addr(bus, dev, func, off));
     machine.inl(PCI_CFG_DATA)
 }
 
-pub fn write32<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8, off: u8, val: u32) {
+pub fn write32<A: crate::Core>(machine: &mut A, bus: u8, dev: u8, func: u8, off: u8, val: u32) {
     machine.outl(PCI_CFG_ADDR, cfg_addr(bus, dev, func, off));
     machine.outl(PCI_CFG_DATA, val);
 }
 
 /// Stop a failed controller from issuing DMA. The injected port-I/O table
-/// also permits this operation from polling paths without an Arch borrow.
+/// also permits this operation from polling paths without an Core borrow.
 pub fn disable_bus_master(address: (u8, u8, u8)) {
     let (bus, dev, func) = address;
     use super::portio;
@@ -68,7 +68,7 @@ const CAP_MSI: u8 = 0x05;
 /// 64-bit-capable bit (7) is set, `c+0x08` = address high and `c+0x0C` = data,
 /// else `c+0x08` = data. All accesses are dword-aligned (caps are 4-byte
 /// aligned), so `read32`/`write32` suffice.
-pub fn msi_enable<A: crate::Arch>(
+pub fn msi_enable<A: crate::Core>(
     machine: &mut A, bus: u8, dev: u8, func: u8, addr: u64, data: u32,
 ) -> bool {
     // Status register (high 16 of dword 0x04), bit 4 = capabilities list present.
@@ -110,7 +110,7 @@ pub fn msi_enable<A: crate::Arch>(
 /// port on a high bus (the dev laptop's xHCI is at 65:00.3 — bus 0x65,
 /// function 3), so a buses-0-3 / function-0-only scan misses it and the device
 /// probes as absent. Empty slots read all-ones (0xFFFF vendor id).
-fn scan_class<A: crate::Arch>(machine: &mut A, class: u8, subclass: u8,
+fn scan_class<A: crate::Core>(machine: &mut A, class: u8, subclass: u8,
                              mut found: impl FnMut((u8, u8, u8)) -> bool) {
     for bus in 0..=255u8 {
         for dev in 0..32u8 {
@@ -136,14 +136,14 @@ fn scan_class<A: crate::Arch>(machine: &mut A, class: u8, subclass: u8,
     }
 }
 
-pub fn find_class<A: crate::Arch>(machine: &mut A, class: u8, subclass: u8) -> Option<(u8, u8, u8)> {
+pub fn find_class<A: crate::Core>(machine: &mut A, class: u8, subclass: u8) -> Option<(u8, u8, u8)> {
     let mut first = None;
     scan_class(machine, class, subclass, |address| { first = Some(address); false });
     first
 }
 
 /// Return every matching PCI function in bus/device/function order.
-pub fn find_classes<A: crate::Arch>(machine: &mut A, class: u8, subclass: u8) -> Vec<(u8, u8, u8)> {
+pub fn find_classes<A: crate::Core>(machine: &mut A, class: u8, subclass: u8) -> Vec<(u8, u8, u8)> {
     let mut matches = Vec::new();
     scan_class(machine, class, subclass, |address| { matches.push(address); true });
     matches

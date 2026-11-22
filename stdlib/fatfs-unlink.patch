@@ -1,0 +1,75 @@
+diff --git a/src/dir.rs b/src/dir.rs
+--- a/src/dir.rs
++++ b/src/dir.rs
+@@ -371,6 +371,26 @@
+         if let Some(n) = e.first_cluster() {
+             self.fs.free_cluster_chain(n)?;
+         }
++        self.remove_entry(&e)
++    }
++
++    /// Unlinks a regular file while retaining its cluster chain in the returned file.
++    ///
++    /// All other handles to this entry must be closed first. The caller must
++    /// seek to zero and truncate the returned file to reclaim its clusters.
++    /// Use on volatile volumes only, since a crash can leave clusters orphaned.
++    pub fn unlink_file(&self, path: &str) -> Result<File<'a, IO, TP, OCC>, Error<IO::Error>> {
++        let (name, rest_opt) = split_path(path);
++        if let Some(rest) = rest_opt {
++            let dir = self.find_entry(name, Some(true), None)?.to_dir();
++            return dir.unlink_file(rest);
++        }
++        let entry = self.find_entry(name, Some(false), None)?;
++        self.remove_entry(&entry)?;
++        Ok(entry.to_unlinked_file())
++    }
++
++    fn remove_entry(&self, e: &DirEntry<IO, TP, OCC>) -> Result<(), Error<IO::Error>> {
+         // free long and short name entries
+         let mut stream = self.stream.clone();
+         stream.seek(SeekFrom::Start(e.offset_range.0))?;
+diff --git a/src/dir_entry.rs b/src/dir_entry.rs
+--- a/src/dir_entry.rs
++++ b/src/dir_entry.rs
+@@ -457,7 +457,7 @@
+ #[derive(Clone, Debug)]
+ pub(crate) struct DirEntryEditor {
+     data: DirFileEntryData,
+-    pos: u64,
++    pos: Option<u64>,
+     dirty: bool,
+ }
+ 
+@@ -465,7 +465,7 @@
+     fn new(data: DirFileEntryData, pos: u64) -> Self {
+         Self {
+             data,
+-            pos,
++            pos: Some(pos),
+             dirty: false,
+         }
+     }
+@@ -521,8 +521,9 @@
+     }
+ 
+     fn write<IO: ReadWriteSeek, TP, OCC>(&self, fs: &FileSystem<IO, TP, OCC>) -> Result<(), IO::Error> {
++        let Some(pos) = self.pos else { return Ok(()); };
+         let mut disk = fs.disk.borrow_mut();
+-        disk.seek(io::SeekFrom::Start(self.pos))?;
++        disk.seek(io::SeekFrom::Start(pos))?;
+         self.data.serialize(&mut *disk)
+     }
+ }
+@@ -627,6 +628,12 @@
+     pub fn to_file(&self) -> File<'a, IO, TP, OCC> {
+         assert!(!self.is_dir(), "Not a file entry");
+         File::new(self.first_cluster(), Some(self.editor()), self.fs)
++    }
++
++    pub(crate) fn to_unlinked_file(&self) -> File<'a, IO, TP, OCC> {
++        let mut editor = self.editor();
++        editor.pos = None;
++        File::new(self.first_cluster(), Some(editor), self.fs)
+     }
+ 
+     /// Returns `Dir` struct for this entry.

@@ -23,7 +23,7 @@ const DISK_ERR_SECTOR_NOT_FOUND: u8 = 0x04;
 const DISK_ERR_CHANGED: u8 = 0x06; // change line active
 const DISK_ERR_NOT_READY: u8 = 0x80;
 
-pub(super) fn int_13h<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn int_13h<A: crate::Core>(machine: &mut A, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     let dl = regs.rdx as u8; // drive number
     if dl < 0x80 {
@@ -62,7 +62,7 @@ pub(super) fn int_13h<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> threa
 /// is per operation: geometry/type questions answer for the DRIVE (which
 /// always exists — the BDA equipment word advertises two), data access
 /// needs a disk in it.
-fn floppy_int13<A: crate::Arch>(machine: &mut A, regs: &mut Regs, ah: u8, dl: u8) {
+fn floppy_int13<A: crate::Core>(machine: &mut A, regs: &mut Regs, ah: u8, dl: u8) {
     use crate::kernel::fs::floppy;
     use core::sync::atomic::Ordering;
 

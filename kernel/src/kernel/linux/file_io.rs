@@ -27,7 +27,7 @@ pub(super) fn write_buffered<T>(
     total as i32
 }
 
-pub(super) fn write_user<A: crate::Arch>(machine: &mut A, handle: i32, pointer: u64, length: usize) -> i32 {
+pub(super) fn write_user<A: crate::Core>(machine: &mut A, handle: i32, pointer: u64, length: usize) -> i32 {
     let length = length.min(MAX_WRITE);
     if !super::high_memory::range(pointer, length as u64) { return -14; }
     super::vfs::with_file_io(handle, length, |file| write_buffered(machine, length,
@@ -37,7 +37,7 @@ pub(super) fn write_user<A: crate::Arch>(machine: &mut A, handle: i32, pointer: 
         |_, bytes| file.write(bytes))).unwrap_or_else(|error| error)
 }
 
-pub(super) fn read_user<A: crate::Arch>(machine: &mut A, handle: i32, pointer: u64, length: usize,
+pub(super) fn read_user<A: crate::Core>(machine: &mut A, handle: i32, pointer: u64, length: usize,
     buffer: &mut alloc::vec::Vec<u8>) -> i32 {
     let length = length.min(MAX_WRITE);
     if !super::high_memory::range(pointer, length as u64) { return -14; }

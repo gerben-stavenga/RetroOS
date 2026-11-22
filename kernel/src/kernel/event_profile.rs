@@ -1,6 +1,6 @@
 //! Opt-in startup/event timings. Run includes guest execution and arch
 //! entry/exit; dispatch covers event handling. No logging in measured paths.
-use crate::{Arch, KernelEvent, Regs};
+use crate::{Core, KernelEvent, Regs};
 use super::thread::Personality;
 
 #[repr(C)]
@@ -232,11 +232,11 @@ pub(super) struct Sample(Option<u64>);
 pub(super) struct Dispatch(Option<(usize, u64, u64)>);
 
 impl Sample {
-    pub(super) fn start<A: Arch>(_machine: &A) -> Self {
+    pub(super) fn start<A: Core>(_machine: &A) -> Self {
         Self(super::startup::profile_enabled().then(|| crate::kernel::event_profile::cycles()))
     }
 
-    pub(super) fn returned<A: Arch>(
+    pub(super) fn returned<A: Core>(
         self, machine: &A, event: &KernelEvent, regs: &Regs, personality: &Personality<A>,
     ) -> Dispatch {
         let Some(start) = self.0 else { return Dispatch(None) };
@@ -296,7 +296,7 @@ impl Sample {
 }
 
 impl Dispatch {
-    pub(super) fn finish<A: Arch>(self, _machine: &A) {
+    pub(super) fn finish<A: Core>(self, _machine: &A) {
         let Some((index, run, start)) = self.0 else { return };
         let elapsed = crate::kernel::event_profile::cycles().wrapping_sub(start);
         unsafe {

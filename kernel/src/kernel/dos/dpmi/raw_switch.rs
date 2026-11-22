@@ -13,7 +13,7 @@ use super::super::mode_transitions;
 ///   BX = new real-mode SP
 ///   SI = new real-mode CS
 ///   DI = new real-mode IP
-fn raw_switch_pm_to_real<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+fn raw_switch_pm_to_real<A: crate::Core>(_machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
@@ -43,7 +43,7 @@ fn raw_switch_pm_to_real<A: crate::Arch>(_machine: &mut A, dos: &mut thread::Dos
 /// short-circuit live here.
 /// Slot = (EIP - STUB_BASE - 2) / 2.
 #[inline(never)]
-pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(
+pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
@@ -134,7 +134,7 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(
 ///   (E)BX = new PM (E)SP
 ///   SI = new PM CS selector
 ///   (E)DI = new PM (E)IP
-pub(in crate::kernel::dos) fn raw_switch_real_to_pm<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+pub(in crate::kernel::dos) fn raw_switch_real_to_pm<A: crate::Core>(_machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;

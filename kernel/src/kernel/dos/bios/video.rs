@@ -25,7 +25,7 @@ pub(super) const TEXT_CURSOR_SHAPE: u16 = 0x0607;
 /// the substitute BIOS's fixed low-memory data area.
 const ROM_FONT_8X8: usize = 0xF_FA6E;
 
-fn set_data_vector<A: crate::Arch>(machine: &mut A, vector: u32, addr: u32) {
+fn set_data_vector<A: crate::Core>(machine: &mut A, vector: u32, addr: u32) {
     write_u16(machine, 0, vector * 4, (addr & 0xF) as u16);
     write_u16(machine, 0, vector * 4 + 2, (addr >> 4) as u16);
 }
@@ -40,11 +40,11 @@ fn rom_font_addr(glyph_h: u8) -> u32 {
 
 /// INT 43h is the active graphics character generator, so it changes along
 /// with the mode's character height rather than permanently naming 8x8.
-fn publish_active_font<A: crate::Arch>(machine: &mut A, glyph_h: u8) {
+fn publish_active_font<A: crate::Core>(machine: &mut A, glyph_h: u8) {
     set_data_vector(machine, 0x43, rom_font_addr(glyph_h));
 }
 
-pub(super) fn install_rom_font<A: crate::Arch>(machine: &mut A) {
+pub(super) fn install_rom_font<A: crate::Core>(machine: &mut A) {
     let font8 = dos::font_8x8_addr();
     let font14 = dos::font_8x14_addr();
     let font16 = dos::font_8x16_addr();
@@ -64,7 +64,7 @@ pub(super) fn install_rom_font<A: crate::Arch>(machine: &mut A) {
 /// Seed the video BIOS static functionality table AH=1Bh points at — the VGA
 /// capability set, matching what we actually emulate (all modes 0-13h, 200/350/
 /// 400-line, DAC palette + colour paging, DCC available).
-pub(super) fn seed_video_static_info<A: crate::Arch>(machine: &mut A) {
+pub(super) fn seed_video_static_info<A: crate::Core>(machine: &mut A) {
     let mut t = [0u8; 16];
     t[0] = 0xFF; // modes 00h-07h supported
     t[1] = 0xE0; // modes 0Dh-0Fh
@@ -143,7 +143,7 @@ mod page_tests {
 /// the 11h/12h/14h variants select 25/50-row text geometry. ST3 uses AX=1112
 /// to enter 80x50; ignoring it leaves its 4,000 character cells interpreted as
 /// 25 rows of 16-line glyphs, which appears as a screen of garbage symbols.
-fn get_font_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+fn get_font_info<A: crate::Core>(machine: &mut A, regs: &mut Regs) {
     let bh = (regs.rbx >> 8) as u8;
     let addr = match bh {
         // Current upper/current active font are the same data pointers exposed
@@ -179,7 +179,7 @@ fn get_font_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     regs.rdx = (regs.rdx & !0xFF) | u64::from(rows_minus1);
 }
 
-fn font_service<A: crate::Arch>(
+fn font_service<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut DosState<A>,
@@ -259,7 +259,7 @@ fn font_service<A: crate::Arch>(
 /// Replace RetroOS's BIOS font tables and the active VGA character map.
 /// Called before publishing a new DOS code page so the byte meanings and
 /// displayed glyphs change together.
-pub(in crate::kernel::dos) fn install_codepage_font<A: crate::Arch>(
+pub(in crate::kernel::dos) fn install_codepage_font<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut DosState<A>,
@@ -313,7 +313,7 @@ pub(in crate::kernel::dos) fn install_codepage_font<A: crate::Arch>(
 /// COMMAND.COM output longer than a screen depends on it. Graphics modes still
 /// clamp: there is no cheap cell-wise scroll there and the C BIOS left it to
 /// direct writers.
-pub(in crate::kernel::dos) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, ch: u8, fg: u8) {
+pub(in crate::kernel::dos) fn teletype<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, ch: u8, fg: u8) {
     let page: u8 = bda_field!(machine, active_page);
     let pos_off = core::mem::offset_of!(Bda, cursor_pos) + (page & 7) as usize * 2;
     let pos: u16 = machine.read((Bda::BASE + pos_off) as u64);
@@ -349,7 +349,7 @@ pub(in crate::kernel::dos) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mu
 
 /// Scroll a text page up one line, blanking the last. A no-op in a graphics
 /// mode, where there are no character cells to move.
-fn scroll_text_page<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, page: u8, cols: u16, max_row: u8) {
+fn scroll_text_page<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, page: u8, cols: u16, max_row: u8) {
     let mode = Bda::video_mode(machine);
     if !is_text_mode(mode) {
         return;
@@ -372,7 +372,7 @@ fn scroll_text_page<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, page
     }
 }
 
-fn text_cell<A: crate::Arch>(machine: &mut A, page: u8, row: u32, col: u32) -> usize {
+fn text_cell<A: crate::Core>(machine: &mut A, page: u8, row: u32, col: u32) -> usize {
     let cols: u16 = bda_field!(machine, columns);
     let page_size: u16 = bda_field!(machine, video_page_size);
     VRAM_TEXT
@@ -380,7 +380,7 @@ fn text_cell<A: crate::Arch>(machine: &mut A, page: u8, row: u32, col: u32) -> u
         + (row as usize * cols as usize + col as usize) * 2
 }
 
-fn sync_cursor_position<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>) {
+fn sync_cursor_position<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>) {
     if !is_text_mode(Bda::video_mode(machine)) { return; }
     let page: u8 = bda_field!(machine, active_page);
     let (row, col) = cursor_of(machine, page);
@@ -406,7 +406,7 @@ fn cursor_scanlines(shape: u16, height: u16) -> (u8, u8) {
     (start, end)
 }
 
-fn sync_cursor_shape<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>) {
+fn sync_cursor_shape<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>) {
     if !is_text_mode(Bda::video_mode(machine)) { return; }
     let shape: u16 = bda_field!(machine, cursor_shape);
     let height: u16 = bda_field!(machine, cell_height);
@@ -416,7 +416,7 @@ fn sync_cursor_shape<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>) {
 }
 
 /// A page's cursor position from the BDA, as (row, column).
-fn cursor_of<A: crate::Arch>(machine: &mut A, page: u8) -> (u32, u32) {
+fn cursor_of<A: crate::Core>(machine: &mut A, page: u8) -> (u32, u32) {
     let pos_off = core::mem::offset_of!(Bda, cursor_pos) + (page as usize & 7) * 2;
     let pos: u16 = machine.read((Bda::BASE + pos_off) as u64);
     ((pos >> 8) as u32, (pos & 0xFF) as u32)
@@ -426,7 +426,7 @@ fn cursor_of<A: crate::Arch>(machine: &mut A, page: u8) -> (u32, u32) {
 /// physical CGA register; EGA/VGA BIOSes emulate it by rewriting Attribute
 /// Controller palette entries. Keeping the 3D9h mirror alone is sufficient
 /// for our CGA renderer but has no visible effect on a native VGA card.
-fn set_cga_compat_palette<A: crate::Arch>(
+fn set_cga_compat_palette<A: crate::Core>(
     machine: &mut A,
     pc: &mut machine::PcMachine,
     regs: &mut Regs,
@@ -471,7 +471,7 @@ fn set_cga_compat_palette<A: crate::Arch>(
 ///
 /// Graphics modes are left alone: scrolling a pixel buffer needs the mode's
 /// plane layout, and no guest we serve asks for it.
-fn scroll_window<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, up: bool) {
+fn scroll_window<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, up: bool) {
     let mode = Bda::video_mode(machine);
     if !is_text_mode(mode) {
         return;
@@ -511,7 +511,7 @@ fn scroll_window<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &
     }
 }
 
-pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
+pub(in crate::kernel::dos) fn int10<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut DosState<A>,
@@ -860,7 +860,7 @@ pub(in crate::kernel::dos) fn int10<A: crate::Arch>(
 /// all-zero block (i.e. an unserviced function) means "no VGA", and it drops to
 /// its EGA path with the worse palette. DOS never chains this service to a
 /// platform ROM, so an unimplemented AH=1Bh is an all-zero block.
-fn state_info<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, regs: &mut Regs) {
+fn state_info<A: crate::Core>(machine: &mut A, dos: &DosState<A>, regs: &mut Regs) {
     if regs.rbx as u16 != 0 {
         return; // BX=0 is the only defined implementation type
     }

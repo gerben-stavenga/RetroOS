@@ -10,11 +10,11 @@ use alloc::{
 };
 use spin::Mutex;
 const FIRST_FD: i32 = 1024;
-fn futex_value<A: crate::Arch>(machine: &mut A, address: u64) -> Option<u32> {
+fn futex_value<A: crate::Core>(machine: &mut A, address: u64) -> Option<u32> {
     let mut bytes = [0; 4];
     high_memory::copy_from(machine, address, &mut bytes).then_some(u32::from_le_bytes(bytes))
 }
-fn timespec_ns<A: crate::Arch>(machine: &mut A, address: u64) -> Result<u64, i32> {
+fn timespec_ns<A: crate::Core>(machine: &mut A, address: u64) -> Result<u64, i32> {
     let mut bytes = [0; 16];
     if !high_memory::copy_from(machine, address, &mut bytes) { return Err(-EFAULT); }
     let seconds = i64::from_le_bytes(bytes[..8].try_into().unwrap());
@@ -104,7 +104,7 @@ pub(super) fn live_task_count(state: &State) -> usize {
 
 pub(super) fn publish_projection(state: &State, snapshot: &mut State) { snapshot.projected_tasks = live_task_count(state); }
 
-pub(super) fn debug_waits<A: crate::Arch>(kt: &thread::KernelThread<A>, state: &State) {
+pub(super) fn debug_waits<A: crate::Core>(kt: &thread::KernelThread<A>, state: &State) {
     let now = crate::kernel::portio::now_ns();
     for context in &state.contexts {
         let (kind, value, deadline) = match context.wait {
@@ -140,7 +140,7 @@ pub(super) fn debug_waits<A: crate::Arch>(kt: &thread::KernelThread<A>, state: &
     }
 }
 
-fn ensure<A: crate::Arch>(
+fn ensure<A: crate::Core>(
     machine: &mut A,
     kt: &thread::KernelThread<A>,
     s: &mut State,
@@ -200,7 +200,7 @@ fn descriptor(s: &State, fd: i32) -> Option<&Descriptor> {
     s.descriptors.get(object(s, fd)?)?.as_ref()
 }
 /// The timerfd behind `fd`: EBADF for no descriptor, EINVAL for another kind.
-fn timer<A: crate::Arch>(kt: &thread::KernelThread<A>, s: &State, fd: i32)
+fn timer<A: crate::Core>(kt: &thread::KernelThread<A>, s: &State, fd: i32)
     -> Result<Arc<Mutex<super::timerfd::Timer>>, i32> {
     match descriptor(s, fd) {
         Some(Descriptor::Timer(timer)) => Ok(timer.clone()),
@@ -210,7 +210,7 @@ fn timer<A: crate::Arch>(kt: &thread::KernelThread<A>, s: &State, fd: i32)
     }
 }
 /// Copy out and consume pending expirations; None while none are pending.
-fn read_timer<A: crate::Arch>(machine: &mut A, timer: &Mutex<super::timerfd::Timer>, out: u64) -> Option<i32> {
+fn read_timer<A: crate::Core>(machine: &mut A, timer: &Mutex<super::timerfd::Timer>, out: u64) -> Option<i32> {
     let now = machine.now();
     let mut timer = timer.lock();
     let n = timer.expirations(now);
@@ -219,14 +219,14 @@ fn read_timer<A: crate::Arch>(machine: &mut A, timer: &Mutex<super::timerfd::Tim
     timer.take(now);
     Some(8)
 }
-fn deadline<A: crate::Arch>(machine: &A, ms: i32) -> u64 {
+fn deadline<A: crate::Core>(machine: &A, ms: i32) -> u64 {
     if ms < 0 {
         u64::MAX
     } else {
         machine.now().saturating_add(ms as u64 * 1_000_000)
     }
 }
-fn ready<A: crate::Arch>(kt: &thread::KernelThread<A>, s: &State, fd: i32, now: u64) -> u32 {
+fn ready<A: crate::Core>(kt: &thread::KernelThread<A>, s: &State, fd: i32, now: u64) -> u32 {
     match descriptor(s, fd) {
         Some(Descriptor::Event { count, .. }) => {
             let count = *count.lock();
@@ -254,7 +254,7 @@ fn ready<A: crate::Arch>(kt: &thread::KernelThread<A>, s: &State, fd: i32, now: 
         _ => 0,
     }
 }
-fn poll<A: crate::Arch>(
+fn poll<A: crate::Core>(
     machine: &mut A,
     kt: &thread::KernelThread<A>,
     s: &State,
@@ -280,7 +280,7 @@ fn poll<A: crate::Arch>(
     }
     n
 }
-fn epoll<A: crate::Arch>(
+fn epoll<A: crate::Core>(
     machine: &mut A,
     kt: &thread::KernelThread<A>,
     s: &mut State,
@@ -348,7 +348,7 @@ fn reset_edge(s: &mut State, fd: i32) {
         }
     }
 }
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     linux: &mut LinuxState,
@@ -882,7 +882,7 @@ pub(super) fn call<A: crate::Arch>(
 /// Observe readiness loss at I/O time. An edge-triggered epoll caller may
 /// drain a socket, receive EAGAIN, and get new data before its next epoll_wait;
 /// sampling only inside epoll_wait would miss that false-to-true transition.
-pub(super) fn after_io<A: crate::Arch>(kt: &thread::KernelThread<A>, linux: &mut LinuxState,
+pub(super) fn after_io<A: crate::Core>(kt: &thread::KernelThread<A>, linux: &mut LinuxState,
     nr: u32, args: &Args, result: i64) {
     let fd = args.a0 as i32;
     if !matches!(kt.fds.get(fd as usize), Some(FdKind::Socket(_))) { return; }
@@ -900,7 +900,7 @@ pub(super) fn after_io<A: crate::Arch>(kt: &thread::KernelThread<A>, linux: &mut
 }
 
 /// Retry blocking socket syscalls per user context so a sibling can supply data.
-pub(super) fn wait_socket<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
+pub(super) fn wait_socket<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>,
     linux: &mut LinuxState, regs: &mut Regs, request: PendingSocket) {
     let s = &mut linux.async_io;
     ensure(machine, kt, s, regs);
@@ -913,7 +913,7 @@ pub(super) fn parked(state: &State) -> bool { state.parked }
 /// wait4 blocks the calling user thread, not the whole shared-address-space
 /// process. Child-table access and status writes happen with the process root
 /// active in the executor, outside the syscall handler's task-table borrow.
-pub(super) fn wait_child<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
+pub(super) fn wait_child<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>,
     linux: &mut LinuxState, regs: &mut Regs, pid: i32, status: u64)
 {
     ensure(machine, kt, &mut linux.async_io, regs);
@@ -943,7 +943,7 @@ pub(super) fn current_id(state: &State, process: i32) -> i32 {
 
 /// Interrupt the active wait before entering a signal handler. The register
 /// frame kept by a parked context is restored before changing its return value.
-pub(super) fn interrupt(kt: &mut thread::KernelThread<impl crate::Arch>, s: &mut State, regs: &mut Regs) {
+pub(super) fn interrupt(kt: &mut thread::KernelThread<impl crate::Core>, s: &mut State, regs: &mut Regs) {
     if let Some(context) = s.contexts.get_mut(s.active)
         && !matches!(context.wait, Wait::Ready | Wait::Exited) {
         if s.parked { *regs = context.regs; }
@@ -957,7 +957,7 @@ pub(super) fn interrupt(kt: &mut thread::KernelThread<impl crate::Arch>, s: &mut
     kt.state = thread::ThreadState::Ready;
 }
 
-pub(super) fn schedule<A: crate::Arch>(
+pub(super) fn schedule<A: crate::Core>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     linux: &mut LinuxState,
@@ -1223,7 +1223,7 @@ pub(super) fn signal_target(state: &State, process: i32, accepts: impl Fn(i32) -
     state.contexts.iter().find(|context| !matches!(context.wait, Wait::Exited) && accepts(context.id)).map(|context| context.id)
 }
 
-pub(super) fn wake_signal<A: crate::Arch>(kt: &mut thread::KernelThread<A>, state: &mut State, target: i32) {
+pub(super) fn wake_signal<A: crate::Core>(kt: &mut thread::KernelThread<A>, state: &mut State, target: i32) {
     if let Some((index, context)) = state.contexts.iter_mut().enumerate().find(|(_, context)| context.id == target)
         && !matches!(context.wait, Wait::Ready | Wait::Exited) {
         context.wait = Wait::Ready;

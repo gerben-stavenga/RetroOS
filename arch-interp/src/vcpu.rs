@@ -4,7 +4,7 @@
 //! physical backing. Kernel copies supply their own demand/COW backing.
 
 use crate::paging;
-use crate::space::RootPageTable;
+use crate::space::AddressSpace;
 use arch_abi::{GuestBytes, Regs};
 
 /// Walk `[addr, addr+len)` one page-bounded chunk at a time, resolving each page
@@ -41,23 +41,10 @@ fn copy_chunks(address: u64, len: usize, write: bool,
     Some(())
 }
 
-/// Register state + address-space handle for one execution context. The shape
-/// is shared across backends, so it is `arch_abi::Vcpu<P>` parameterized over
-/// this backend's page-table type. Guest-memory access comes from the blanket
-/// `GuestBytes for Vcpu<P>` impl in `arch-abi`, which forwards to the
-/// `GuestBytes for RootPageTable` impl below.
+/// Saved CPU state and its parked address space.
 pub type Vcpu = arch_abi::Vcpu<crate::backend::Interp>;
 
-/// The kernel-facing guest-memory primitive on this backend. Each access
-/// commits the spanned pages then indexes the active guest-RAM buffer. Every
-/// access is **volatile** (the guest/devices may observe and mutate the bytes)
-/// and **bytewise** (any address/alignment is fine). No method hands out a
-/// reference into guest memory: bytes are copied to/from a caller-owned buffer,
-/// so kernel/dos code never asserts Rust's non-null / alignment / aliasing
-/// invariants against guest RAM. `self` (the space id) is not consulted —
-/// `host_ptr` resolves the *active* space, matching the prior behaviour. (The
-/// inherent `GuestMem` API below stays for arch-internal callers — BIOS/screen
-/// setup — that legitimately want slice views below the boundary.)
+/// Copy bytes through the currently active guest mappings.
 #[cfg(feature = "tcg")]
 impl GuestBytes for crate::backend::Interp {
     fn read<T: Copy>(&self, addr: u64) -> T {
@@ -133,75 +120,54 @@ impl GuestBytes for crate::backend::Interp {
 /// The live execution context while the kernel runs (the interpreter's analogue
 /// of metal's `traps::REGS`). Single-core: one global Vcpu that `do_arch_execute`
 /// syncs to/from the software CPU before/after each run slice.
-pub static mut REGS: Vcpu = Vcpu::new(Regs::empty(), RootPageTable::empty());
+pub static mut REGS: Vcpu = Vcpu::new(Regs::empty(), AddressSpace::empty());
 
 
-/// Install caller-owned fixed paging storage. No allocation occurs here.
+/// Start the hosted backend and hand control to the supplied kernel entry.
+///
 /// # Safety
-/// The contiguous PAGING_PAGES frames must be zeroed, resident and exclusively
-/// owned for the lifetime of this CPU.
-pub unsafe fn init_guest_ram(storage: u64, ownership: arch_abi::page_supply::FrameOwnership) {
+/// Call once on the thread that will run this backend. The caller must keep
+/// the ownership metadata resident and reserve `boot_paging_frames()` for arch.
+pub unsafe fn boot<S>(
+    ownership: arch_abi::page_supply::FrameOwnership,
+    config: &arch_abi::BootConfig,
+    storage: S,
+    kernel_entry: fn(&mut crate::Interp, &arch_abi::BootConfig, S) -> !,
+) -> ! {
+    unsafe { boot_cpu(crate::phys::boot_paging_frames().start, ownership); }
+    kernel_entry(&mut crate::Interp::local(), config, storage)
+}
+
+/// # Safety
+/// The paging frames must be zeroed, resident and exclusively owned.
+/// The ownership metadata must remain resident for the lifetime of the CPU.
+pub(crate) unsafe fn boot_cpu(storage: u64, ownership: arch_abi::page_supply::FrameOwnership) {
     crate::phys::configure(ownership);
     unsafe { paging::initialize(storage); }
 }
 
-/// Host pointer for a guest address in the active space, demand-committing the
-/// page. Under real paging the backing frames are scattered, so the returned
-/// pointer is valid only within the page containing `addr` — callers that span
-/// more than one page must page-split (`for_chunks` / the `GuestBytes` impl).
-#[inline]
-fn host_ptr(addr: usize, _len: usize) -> *mut u8 {
-    paging::space_resolve(addr as u32)
-}
-
-/// The active address space's memory interface — `arch::mem()`. THE place the
-/// kernel touches guest memory; the backend detail (software MMU vs page
-/// tables) stays behind this identical API.
+/// Local access to the current guest mappings for hosted diagnostics and tests.
 #[derive(Clone, Copy)]
-pub struct GuestMem(());
+pub struct GuestMem(core::marker::PhantomData<*mut ()>);
 
 #[inline]
-pub fn mem() -> GuestMem { GuestMem(()) }
+pub fn mem() -> GuestMem { GuestMem(core::marker::PhantomData) }
 
-// The slice/at views below hand out a contiguous host reference, which under
-// real paging is only sound within one page. They are arch-internal and (per
-// audit) span at most a single small struct/cell, so the page guard holds; the
-// kernel-facing API is the page-splitting `GuestBytes` impl above.
 impl GuestMem {
-    pub fn slice(self, addr: usize, len: usize) -> &'static [u8] {
-        debug_assert!((addr & 0xFFF) + len <= 4096, "GuestMem::slice crosses a page");
-        unsafe { core::slice::from_raw_parts(host_ptr(addr, len), len) }
-    }
-    pub fn slice_mut(self, addr: usize, len: usize) -> &'static mut [u8] {
-        debug_assert!((addr & 0xFFF) + len <= 4096, "GuestMem::slice_mut crosses a page");
-        unsafe { core::slice::from_raw_parts_mut(host_ptr(addr, len), len) }
-    }
-    pub fn c_str(self, addr: usize, max: usize) -> &'static [u8] {
-        unsafe {
-            let p = host_ptr(addr, max);
-            let mut len = 0;
-            while len < max && (addr & 0xFFF) + len < 4096 && *p.add(len) != 0 { len += 1; }
-            core::slice::from_raw_parts(p, len)
-        }
-    }
     pub fn read<T: Copy>(self, addr: usize) -> T {
-        crate::backend::Interp.read::<T>(addr as u64)
+        crate::backend::Interp::local().read::<T>(addr as u64)
     }
     pub fn write<T: Copy>(self, addr: usize, val: T) {
-        crate::backend::Interp.write::<T>(addr as u64, val);
-    }
-    pub fn at<T>(self, addr: usize) -> &'static mut T {
-        debug_assert!((addr & 0xFFF) + core::mem::size_of::<T>() <= 4096, "GuestMem::at crosses a page");
-        unsafe { &mut *(host_ptr(addr, core::mem::size_of::<T>()) as *mut T) }
+        crate::backend::Interp::local().write::<T>(addr as u64, val);
     }
     pub fn zero(self, addr: usize, len: usize) {
-        crate::backend::Interp.zero(addr as u64, len);
+        crate::backend::Interp::local().zero(addr as u64, len);
     }
     pub fn write_bytes(self, addr: usize, src: &[u8]) {
-        for (index, byte) in src.iter().enumerate() { crate::backend::Interp.write(addr as u64 + index as u64, *byte); }
+        for (index, byte) in src.iter().enumerate() { crate::backend::Interp::local().write(addr as u64 + index as u64, *byte); }
     }
     pub fn copy_within(self, src: usize, dst: usize, len: usize) {
-        crate::backend::Interp.copy_within(src as u64, dst as u64, len);
+        crate::backend::Interp::local().copy_within(src as u64, dst as u64, len);
     }
 }
 

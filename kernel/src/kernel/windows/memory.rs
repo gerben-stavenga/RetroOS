@@ -58,7 +58,7 @@ mod statistics_tests {
     }
 }
 
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     api: Api,

@@ -354,7 +354,7 @@ pub fn validate(handle: i32, offset: usize, length: usize, writable: bool) -> Re
     Ok(())
 }
 
-pub fn acquire<A: crate::Arch>(_machine: &mut A, handle: i32, offset: u32, writable: bool) -> Result<(Key, u64), i32> {
+pub fn acquire<A: crate::Core>(_machine: &mut A, handle: i32, offset: u32, writable: bool) -> Result<(Key, u64), i32> {
     let mut vfs = VFS.lock();
     let key = vfs.mapping_key(handle, offset)?;
     let mut bytes = alloc::vec![0; PAGE_SIZE];
@@ -381,7 +381,7 @@ pub fn acquire<A: crate::Arch>(_machine: &mut A, handle: i32, offset: u32, writa
 
 /// Private mappings own counted aliases. They need no retained backend handle
 /// and survive eviction, close and fork through architecture frame ownership.
-pub fn map_private<A: crate::Arch>(machine: &mut A, handle: i32, offset: usize,
+pub fn map_private<A: crate::Core>(machine: &mut A, handle: i32, offset: usize,
     base: usize, length: usize, protection: u64) -> Result<(), i32>
 {
     if offset & 4095 != 0 { return Err(-22); }
@@ -443,7 +443,7 @@ pub fn retain(key: Key) {
 }
 
 /// Caller must remove its guest alias before releasing the last reference.
-pub fn release<A: crate::Arch>(_machine: &mut A, key: Key) {
+pub fn release<A: crate::Core>(_machine: &mut A, key: Key) {
     let mut vfs = VFS.lock();
     let page = vfs.file_pages.get_mut(&key).expect("live mapped file page");
     page.refs -= 1;

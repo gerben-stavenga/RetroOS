@@ -2,7 +2,7 @@
 //! interrupt handling, paging mechanisms, descriptor tables, and the arch
 //! call interface for the ring-1 kernel).
 //!
-//! This is one of the two `arch_abi::Arch` backends (the other is the software
+//! This is one of the two `arch_abi::Core` backends (the other is the software
 //! `arch-interp`). The kernel depends on it only as `crate::arch`; the metal
 //! *entry* (`boot.rs`, which calls `kernel::startup`) lives kernel-side and
 //! drives the bring-up functions this crate exposes.
@@ -126,12 +126,12 @@ pub const MULTIBOOT_INFO_FRAMEBUFFER: u32 = 1 << 12;
 
 // Types
 pub use backend::Metal;
-pub use paging2::{RawPage, RootPageTable, PAGE_SIZE, LOW_MEM_BASE, HEAP_END, heap_base};
+pub use paging2::{RawPage, AddressSpace, PAGE_SIZE, LOW_MEM_BASE, HEAP_END, heap_base};
 pub use vcpu::Vcpu;
 pub use arch_abi::Irq;
 pub use descriptors::{USER_CS, USER_CS64, USER_DS};
 
-// Arch call constants + the ring-1 wrappers that issue them (the kernel-facing
+// Core call constants + the ring-1 wrappers that issue them (the kernel-facing
 // arch API; the HW backend implements them as INT 0x80 stubs in `calls.rs`).
 pub use traps::arch_call;
 pub use calls::*;
@@ -175,5 +175,3 @@ mod mapping;
 
 #[cfg(feature = "kvm")]
 pub mod vm;
-
-mod planar;

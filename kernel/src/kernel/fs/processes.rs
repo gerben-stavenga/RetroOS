@@ -90,7 +90,7 @@ fn stat_text(info: Info) -> Vec<u8> {
     text.into_bytes()
 }
 impl ProcessFs {
-    pub fn publish<A: crate::Arch>(&self, threads: &thread::ThreadTable<A>, current: usize, ticks: u64) {
+    pub fn publish<A: crate::Core>(&self, threads: &thread::ThreadTable<A>, current: usize, ticks: u64) {
         enter_process(current as i32);
         let mut snapshot = self.tasks.lock();
         // Keep the wall-clock boot epoch stable as the RTC advances. Linux

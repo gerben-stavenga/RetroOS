@@ -25,7 +25,7 @@ rust_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//arch-abi", "//lib:planar",
+        "//arch-abi",
         "//lib",
         "@crates//:libc",
         "@crates//:unicorn-engine",
@@ -46,7 +46,7 @@ rust_library(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        "//arch-abi", "//lib:planar",
+        "//arch-abi",
         "//lib",
         "@crates//:kvm-bindings",
         "@crates//:kvm-ioctls",
@@ -71,6 +71,7 @@ rust_test(
     name = "arch-interp-test",
     tags = ["manual"],
     crate = ":arch-interp",
+    deps = ["//lib:planar"],
     crate_features = ["tcg"],
     # abort matches the rlibs; a failing assert aborts the test binary, which
     # Bazel reports as the test failing (same signal, less itemization).
@@ -86,6 +87,8 @@ rust_test(
     tags = ["manual"],
     env = {"RETRO_REQUIRE_KVM": "1"},
     crate = ":arch-interp-kvm",
+    compile_data = [":supervisor_image"],
+    deps = ["//lib:planar"],
     crate_features = ["kvm"],
     rustc_flags = [
         "-Cpanic=abort",
@@ -94,21 +97,10 @@ rust_test(
     ],
 )
 
-# Software-MMU integration test over the public arch surface.
-rust_test(
+# The MMU tests run inside the backend crate so their bootstrap stays private.
+alias(
     name = "mmu-test",
-    tags = ["manual"],
-    srcs = ["tests/mmu.rs"],
-    edition = "2021",
-    rustc_flags = [
-        "-Cpanic=abort",
-        "-Zpanic_abort_tests",
-        "-Crelocation-model=static",
-    ],
-    deps = [
-        ":arch-interp",
-        "//arch-abi", "//lib:planar",
-    ],
+    actual = ":arch-interp-test",
 )
 
 # The self-contained Unicorn proof-of-concept that seeded this backend.
@@ -119,4 +111,10 @@ rust_binary(
     deps = ["@crates//:unicorn-engine"],
 )
 
-metal_artifact(name = "supervisor_image", target = "//arch-metal:vm_supervisor")
+metal_artifact(name = "supervisor_metal", target = "//arch-interp/supervisor:vm_supervisor")
+genrule(
+    name = "supervisor_image",
+    srcs = [":supervisor_metal"],
+    outs = ["supervisor.elf"],
+    cmd = "cp $< $@",
+)

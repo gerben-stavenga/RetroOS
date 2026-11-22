@@ -3,7 +3,7 @@
 #[thread_local]
 static mut INSTALLED: Option<::vga::registers::RegisterFile> = None;
 
-pub fn install<A: crate::Arch>(machine: &mut A, video: &crate::kernel::bios_display::DosVideo) {
+pub fn install<A: crate::Core>(machine: &mut A, video: &crate::kernel::bios_display::DosVideo) {
     let state = video.emulated().map(|vga| &vga.planar);
     // Display handoffs may keep the same device. They do not reinstall it.
     if unsafe { INSTALLED.as_ref() }.zip(state).is_some_and(|(old, new)| old.same_device(new)) { return; }
@@ -15,14 +15,14 @@ pub fn install<A: crate::Arch>(machine: &mut A, video: &crate::kernel::bios_disp
         let owner = state.share();
         // The retained owner and permanent VRAM remain resident until uninstall.
         unsafe {
-            machine.bind_planar(Some(::planar::Binding { registers: &*owner, planes: planes.as_ptr() }));
+            ::planar::bind(machine, Some(::planar::Binding { registers: &*owner, planes: planes.as_ptr() }));
             INSTALLED = Some(owner);
         }
     }
 }
-pub fn uninstall<A: crate::Arch>(machine: &mut A) {
+pub fn uninstall<A: crate::Core>(machine: &mut A) {
     if unsafe { INSTALLED.is_some() } {
-        unsafe { machine.bind_planar(None); INSTALLED = None; }
+        unsafe { ::planar::bind(machine, None); INSTALLED = None; }
     }
 }
 /// Read already-published counters; no arch call and no handler changes.

@@ -1,7 +1,7 @@
 //! Permanent emulated ISA channel RAM, shared by guest aliases and the mixer.
 //! Each channel has one kernel mapping. Reads never consult guest page tables.
 use core::sync::atomic::{AtomicUsize, Ordering};
-use crate::Arch;
+use crate::Core;
 
 static BUFFERS: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 
@@ -44,7 +44,7 @@ impl Binding {
     pub(crate) fn matches(&self, channel: usize, guest: usize, bytes: usize) -> bool {
         self.channel == channel && self.guest == guest && self.bytes == bytes
     }
-    pub(crate) fn new<A: Arch>(machine: &mut A, channel: usize, guest: usize, bytes: usize) -> Option<Self> {
+    pub(crate) fn new<A: Core>(machine: &mut A, channel: usize, guest: usize, bytes: usize) -> Option<Self> {
         let buffer = Buffer::get(channel)?;
         let offset = guest & (buffer.bytes - 1);
         if bytes == 0 || offset.checked_add(bytes)? > buffer.bytes { return None; }
@@ -68,7 +68,7 @@ impl Binding {
         assert!(offset.checked_add(destination.len()).is_some_and(|end| end <= self.bytes));
         self.buffer.read(self.offset + offset, destination);
     }
-    pub(crate) fn unbind<A: Arch>(self, machine: &mut A) {
+    pub(crate) fn unbind<A: Core>(self, machine: &mut A) {
         let mut saved = alloc::vec![0; self.pages * 4096];
         machine.copy_from((self.vpage * 4096) as u64, &mut saved);
         crate::kernel::memory::fresh(machine, self.vpage, self.pages);

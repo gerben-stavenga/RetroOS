@@ -11,7 +11,7 @@ pub(super) struct Request {
 }
 
 impl Request {
-    pub fn new<A: crate::Arch>(machine: &A, kt: &thread::KernelThread<A>, a: &Args, wide: bool) -> Result<Self, i32> {
+    pub fn new<A: crate::Core>(machine: &A, kt: &thread::KernelThread<A>, a: &Args, wide: bool) -> Result<Self, i32> {
         let source = match kt.fds.get(a.a0 as usize) {
             Some(FdKind::Vfs(handle)) => Source::File(*handle),
             Some(FdKind::PipeRead(pipe)) => Source::Pipe(*pipe),
@@ -49,7 +49,7 @@ impl Request {
         Ok(Self { source, regions, length })
     }
 
-    pub fn step<A: crate::Arch>(&self, machine: &mut A) -> Option<i32> {
+    pub fn step<A: crate::Core>(&self, machine: &mut A) -> Option<i32> {
         if self.length == 0 { return Some(0); }
         if let Source::Pipe(pipe) = self.source
             && !crate::kernel::kpipe::has_data(pipe)
@@ -86,7 +86,7 @@ impl Drop for Request {
     }
 }
 
-pub(super) fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args, wide: bool) -> SyscallResult {
+pub(super) fn call<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args, wide: bool) -> SyscallResult {
     let request = match Request::new(machine, kt, a, wide) {
         Ok(request) => request,
         Err(error) => return SyscallResult::val(error),

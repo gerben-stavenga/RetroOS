@@ -5,7 +5,7 @@ const PAGE: usize = 4096;
 
 /// Install only when user RDTSC uses the kernel's stable, calibrated clock.
 /// Other clock sources/backends retain libc's normal syscall fallback.
-pub(super) fn install<A: crate::Arch>(machine: &mut A, floor: usize,
+pub(super) fn install<A: crate::Core>(machine: &mut A, floor: usize,
     occupied: &mut alloc::vec::Vec<(usize, usize)>) -> Option<usize>
 {
     let (epoch, multiplier) = crate::kernel::platform::user_tsc_clock()?;

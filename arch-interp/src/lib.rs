@@ -57,12 +57,11 @@ pub use machine::{
 // Interactive console (hosted `main` drives input): raw terminal mode; key
 // events are delivered by `post_irq` to the entry-installed device sink.
 pub use tty::enter_raw_mode;
-pub use space::RootPageTable;
+pub use space::AddressSpace;
 pub use vcpu::{mem, GuestMem, Vcpu, REGS};
 
 // One-time host setup; runtime memory operations use arch-abi.
-pub use vcpu::init_guest_ram;
-pub use paging::PAGING_PAGES;
+pub use vcpu::boot;
 // Platform device composition (the hosted `main` hooks ports): the PortIo trait
 // + `register` for custom devices, and convenience hooks for the built-ins.
 pub use devices::{
@@ -88,7 +87,7 @@ pub use screendump::{enable_live as enable_live_console, request as request_vga_
 // screenshots peek. Presentation (SDL et al.) lives in the consuming binary.
 pub use vga::{peek_frame, publish as publish_frame, recycle_frame, take_frame};
 
-pub use phys::{frame_layout, ram as physical_ram};
+pub use phys::{boot_paging_frames, frame_layout, ram as physical_ram};
 
 #[cfg(test)]
 extern crate self as retroos_arch_interp;

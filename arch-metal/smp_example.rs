@@ -282,10 +282,11 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
     let physical_end = arch_metal::boot_mem::end() - arch_metal::paging2::KERNEL_BASE
         + arch_metal::paging2::KERNEL_PHYS;
     let image_frames = 0x100..physical_end.div_ceil(4096) as u64;
-    phys_mm::init_phys_mm(layout, [image_frames.clone(), 8..9]);
+    let occupied = [image_frames.clone(), 8..9];
+    let bootstrap = phys_mm::bootstrap(layout, &occupied);
     install_physical_memory();
     back_heap(arch::heap_base(), arch::heap_base() + 2 * 1024 * 1024);
-    phys_mm::complete_initialization();
+    bootstrap.finish();
     let counts = unsafe { alloc::alloc::alloc_zeroed(FrameOwnership::storage_layout(layout.frame_count())) };
     assert!(!counts.is_null());
     let zero_page = paging2::physical_page(&arch::ZERO_PAGE as *const _ as usize);

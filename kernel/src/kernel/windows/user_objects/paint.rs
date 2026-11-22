@@ -132,7 +132,7 @@ fn update_flags(w: &WindowRecord, wanted: u32) -> u32 {
     }
     flags
 }
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     windows: &mut [WindowRecord],
     op: u32,
@@ -392,7 +392,7 @@ fn window_region(windows: &[WindowRecord], i: usize, rect: Rect) -> Vec<Rect> {
     }
     region
 }
-pub(super) fn visible_region<A: crate::Arch>(
+pub(super) fn visible_region<A: crate::Core>(
     machine: &mut A,
     windows: &[WindowRecord],
     p: [u32; 16],

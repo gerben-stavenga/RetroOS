@@ -106,7 +106,7 @@ pub struct IntelEthernet {
     tx_pending: usize,
 }
 impl IntelEthernet {
-    fn bring_up<A: crate::Arch>(
+    fn bring_up<A: crate::Core>(
         machine: &mut A,
         address: (u8, u8, u8),
         controller: &'static Controller,
@@ -271,7 +271,7 @@ impl EthernetDevice for IntelEthernet {
         true
     }
 }
-pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<IntelEthernet> {
+pub fn probe<A: crate::Core>(machine: &mut A) -> Option<IntelEthernet> {
     for address @ (b, d, f) in pci::find_classes(machine, 2, 0) {
         let id = pci::read32(machine, b, d, f, 0);
         let Some(controller) = Controller::identify(id) else {

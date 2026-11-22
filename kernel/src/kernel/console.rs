@@ -25,7 +25,7 @@ pub const F12_PRESS: u8 = 0x58;
 /// device IRQs were consumed earlier by `irq_dispatch`.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)] // The event loop lends disjoint ownership to the input router.
-pub fn dispatch<A: crate::Arch>(
+pub fn dispatch<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     regs: &mut Regs,
@@ -84,7 +84,7 @@ pub fn dispatch<A: crate::Arch>(
 
 /// DOS owner: `blocked` selects the stdin-pipe path (owner is wait4-parked
 /// behind a foreground Linux child).
-fn dispatch_dos<A: crate::Arch>(
+fn dispatch_dos<A: crate::Core>(
     machine: &mut A,
     regs: &mut Regs,
     blocked: bool,
@@ -123,7 +123,7 @@ fn dispatch_dos<A: crate::Arch>(
 ///
 /// One door, not one chord per action: while the monitor is open it eats every
 /// key; when closed, only F12 (opening it) is special.
-fn monitor_key<A: crate::Arch>(
+fn monitor_key<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     _regs: &mut Regs,
@@ -157,7 +157,7 @@ fn monitor_key<A: crate::Arch>(
 
 /// Return the monitor-held display to its focused personality. This is shared
 /// by an ordinary Esc/F12 close and forced dismissal before owner teardown.
-pub fn restore_from_monitor<A: crate::Arch>(
+pub fn restore_from_monitor<A: crate::Core>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     personality: &mut thread::Personality<A>,
@@ -175,7 +175,7 @@ pub fn restore_from_monitor<A: crate::Arch>(
 }
 
 /// Linux owner: keys → cooked fd input.
-fn dispatch_linux<A: crate::Arch>(
+fn dispatch_linux<A: crate::Core>(
     machine: &mut A,
     _regs: &mut Regs,
     kt: &mut thread::KernelThread<A>,
@@ -231,7 +231,7 @@ impl Console {
     /// Publish pending terminal cells immediately. Startup has no event loop
     /// yet, so leaving the console merely dirty can keep every boot message in
     /// shadow RAM until the display is handed to the first DOS program.
-    pub fn present<A: crate::Arch>(
+    pub fn present<A: crate::Core>(
         &mut self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -246,7 +246,7 @@ impl Console {
     /// Give up the display. The console ceases to exist; whoever takes the
     /// token can now drive the screen, and nothing left in the kernel can
     /// print over them.
-    pub fn release<A: crate::Arch>(
+    pub fn release<A: crate::Core>(
         mut self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -257,7 +257,7 @@ impl Console {
 
     /// Take the display back and become a console again, restoring the card to
     /// the state the previous owner found it in.
-    pub fn acquire<A: crate::Arch>(
+    pub fn acquire<A: crate::Core>(
         _machine: &mut A,
         _card: SuspendedCard,
         display: crate::kernel::display::Display,

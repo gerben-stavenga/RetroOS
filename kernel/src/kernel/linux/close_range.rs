@@ -1,7 +1,7 @@
 //! close_range operates on both ordinary and emulated async descriptors.
 use super::{Args, EINVAL, LinuxState, SyscallResult, async_io, thread};
 
-pub(super) fn call<A: crate::Arch>(kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, args: &Args) -> SyscallResult {
+pub(super) fn call<A: crate::Core>(kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, args: &Args) -> SyscallResult {
     let (first, last, flags) = (args.a0 as u32, args.a1 as u32, args.a2 as u32);
     if first > last || flags & !6 != 0 { return SyscallResult::val(-EINVAL); }
     // Fork already owns a private descriptor table. Splitting the table of

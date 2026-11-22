@@ -11,6 +11,7 @@ const ECHOCTL: u32 = 512;
 
 pub(super) struct Console {
     pub termios: [u8; 36],
+    raw_owner: Option<i32>,
     line: Vec<u8>,
     origin: usize,
 }
@@ -24,6 +25,7 @@ impl Console {
         termios[17..24].copy_from_slice(&[3, 28, 127, 21, 4, 0, 1]);
         Self {
             termios,
+            raw_owner: None,
             line: Vec::new(),
             origin: 0,
         }
@@ -37,6 +39,24 @@ impl Console {
 
     fn flags(&self) -> u32 {
         u32::from_le_bytes(self.termios[12..16].try_into().unwrap())
+    }
+
+    pub fn raw_owner(&self) -> Option<i32> {
+        self.raw_owner
+    }
+
+    pub fn record_mode_owner(&mut self, tid: i32) {
+        if self.flags() & ICANON == 0 {
+            self.raw_owner = Some(tid);
+        } else {
+            self.raw_owner = None;
+        }
+    }
+
+    pub fn release_owner(&mut self, tid: i32) {
+        if self.raw_owner == Some(tid) {
+            self.raw_owner = None;
+        }
     }
 
     pub fn configure(&mut self, settings: [u8; 36], flush: bool, mut deliver: impl FnMut(&[u8])) {

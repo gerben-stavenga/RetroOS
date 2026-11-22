@@ -286,9 +286,79 @@ visual_red db 'VBE-VISUAL-RED',13,10,'$'
     jne pm_fail
     cmp byte [hook_calls], 1
     jne pm_fail
+
+    stage '8'
+    ; The protected-mode INT 10h hook is independent of DPMI's real-mode call.
+    mov dword [rmcs+28], 4f07h
+    mov dword [rmcs+16], 0
+    mov dword [rmcs+20], 240
+    mov dword [rmcs+24], 8
+    call rm_int10
+    jc pm_fail
+    cmp word [rmcs+28], 004fh
+    jne pm_fail
+    mov eax, 4f07h
+    mov ebx, 1
+    int 10h
+    cmp ax, 004fh
+    jne pm_fail
+    cmp cx, 8
+    jne pm_fail
+    cmp dx, 240
+    jne pm_fail
+
+    ; A guest hook on the real-mode vector must still run.
+    mov eax, 0200h
+    mov ebx, 10h
+    int 31h
+    jc pm_fail
+    mov [rm_int10_original], dx
+    mov [rm_int10_original+2], cx
+    mov eax, 0201h
+    mov cx, [rm_segment]
+    mov edx, rm_int10_hook
+    int 31h
+    jc pm_fail
+    mov dword [rmcs+28], 4f07h
+    mov dword [rmcs+20], 0
+    mov dword [rmcs+24], 0
+    call rm_int10
+    jc pm_fail
+    cmp word [rmcs+28], 014fh
+    jne pm_fail
+    mov eax, 0201h
+    mov ebx, 10h
+    mov cx, [rm_int10_original+2]
+    mov dx, [rm_int10_original]
+    int 31h
+    jc pm_fail
+    mov eax, 4f07h
+    mov ebx, 1
+    int 10h
+    cmp ax, 004fh
+    jne pm_fail
+    cmp cx, 8
+    jne pm_fail
+    cmp dx, 240
+    jne pm_fail
     mov edx, success
     mov ebx, 0
     jmp finish
+rm_int10:
+    push ds
+    pop es
+    mov dword [rmcs+46], 0
+    mov edi, rmcs
+    xor ecx, ecx
+    mov ebx, 10h
+    mov eax, 0300h
+    int 31h
+    ret
+bits 16
+rm_int10_hook:
+    mov ax, 014fh
+    iret
+bits 32
 pm_fail:
     mov edx, failure
     mov ebx, 1
@@ -313,6 +383,7 @@ int10_hook:
     jmp far [int10_original]
 int10_original dd 0
                dw 0
+rm_int10_original dw 0, 0
 hook_calls db 0
 dpmi_entry dw 0, 0
 pm_entry dd protected

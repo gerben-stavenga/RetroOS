@@ -93,7 +93,7 @@ impl Registers for Soc {
     }
 }
 
-fn prepare_pci<A: crate::Arch>(machine: &mut A, address: (u8, u8, u8)) -> Option<(u64, u32)> {
+fn prepare_pci<A: crate::Core>(machine: &mut A, address: (u8, u8, u8)) -> Option<(u64, u32)> {
     let (bus, dev, func) = address;
     let read = |machine: &mut A, off| pci::read32(machine, bus, dev, func, off);
     let bar = read(machine, 0x10);
@@ -137,7 +137,7 @@ fn prepare_pci<A: crate::Arch>(machine: &mut A, address: (u8, u8, u8)) -> Option
     Some((base, command))
 }
 
-pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Device> {
+pub fn probe<A: crate::Core>(machine: &mut A) -> Option<Device> {
     let (address, chip) =
         pci::find_classes(machine, 2, 0x80)
             .into_iter()

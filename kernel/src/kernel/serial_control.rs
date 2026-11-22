@@ -18,7 +18,7 @@ static mut COMPOSITE_REPLY: bool = false;
 struct LocalReply { bytes: alloc::vec::Vec<u8>, failed: bool }
 static mut LOCAL_REPLY: Option<LocalReply> = None;
 
-fn execute_local(machine: &mut impl crate::Arch, line: &[u8], stats: &mut super::startup::EventStats) -> (bool, alloc::vec::Vec<u8>) {
+fn execute_local(machine: &mut impl crate::Core, line: &[u8], stats: &mut super::startup::EventStats) -> (bool, alloc::vec::Vec<u8>) {
     unsafe { LOCAL_REPLY = Some(LocalReply { bytes: alloc::vec::Vec::new(), failed: false }); }
     let dump = execute(machine, line, stats);
     let reply = unsafe { (*core::ptr::addr_of_mut!(LOCAL_REPLY)).take().unwrap() };
@@ -48,7 +48,7 @@ fn uart() -> Option<Uart16550> {
     }
 }
 
-pub fn init<A: crate::Arch>(machine: &mut A, port: ComPort) -> bool {
+pub fn init<A: crate::Core>(machine: &mut A, port: ComPort) -> bool {
     let endpoint = Uart16550::new(port);
     if !endpoint.is_present() { return false; }
     endpoint.initialize(UartConfig::UART_115200_8N1);
@@ -219,7 +219,7 @@ fn rm_profile() {
     send(b"}}\n");
 }
 
-fn execution_profile<A: crate::Arch>(machine: &A) {
+fn execution_profile<A: crate::Core>(machine: &A) {
     let p = machine.execution_profile();
     send(b"{\"ok\":true");
     for (name, cycles) in [
@@ -335,7 +335,7 @@ fn decode_hex_pair(pair: &[u8]) -> Option<u8> {
     Some((high << 4) | low)
 }
 
-fn execute<A: crate::Arch>(machine: &mut A, line: &[u8], stats: &mut super::startup::EventStats) -> bool {
+fn execute<A: crate::Core>(machine: &mut A, line: &[u8], stats: &mut super::startup::EventStats) -> bool {
     let line = trim(line);
     stats.control_checkpoint(machine);
     if line.eq_ignore_ascii_case(b"profile begin") {
@@ -523,7 +523,7 @@ fn execute<A: crate::Arch>(machine: &mut A, line: &[u8], stats: &mut super::star
 
 /// Drain a bounded amount of RX work before returning to the guest. `true`
 /// asks the event-loop owner to dump its current register/personality state.
-pub(super) fn poll<A: crate::Arch>(machine: &mut A, events: &mut alloc::vec::Vec<crate::Irq>, tick: bool, stats: &mut super::startup::EventStats) -> bool {
+pub(super) fn poll<A: crate::Core>(machine: &mut A, events: &mut alloc::vec::Vec<crate::Irq>, tick: bool, stats: &mut super::startup::EventStats) -> bool {
     let mut dump = local::poll(machine, stats);
     // Local clients can inject keys without a physical diagnostic UART.
     if tick && let Some(scancode) = pop_injected() { events.push(crate::Irq::Key(scancode)); }

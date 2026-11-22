@@ -60,7 +60,7 @@ impl EmulatedVga {
     /// explicitly leave the unobservable latch field invalid. VBE metadata and
     /// palette come from the authoritative RetroOS shadows; only its directly
     /// mapped framebuffer is copied back from hardware.
-    fn snapshot_native<A: crate::Arch>(
+    fn snapshot_native<A: crate::Core>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         native: &mut crate::kernel::platform::NativeVga,
@@ -99,7 +99,7 @@ impl EmulatedVga {
 
     /// Ordinary focus detach: after capturing the VGA, explicitly discard the
     /// hardware-state authority and retain only physical scanout capability.
-    fn detach_native<A: crate::Arch>(
+    fn detach_native<A: crate::Core>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         mut native: crate::kernel::platform::NativeVga,
@@ -108,7 +108,7 @@ impl EmulatedVga {
         (vga, native.into_cap())
     }
 
-    fn attach_native<A: crate::Arch>(
+    fn attach_native<A: crate::Core>(
         mut self,
         machine: &mut A,
         mut native: crate::kernel::platform::VgaCap,
@@ -153,7 +153,7 @@ impl EmulatedVga {
     /// the saved software image. The hardware state wins: normal DOS return
     /// uses this so the parent's screen continues exactly where the child left
     /// it, with no firmware mode set or visible repaint.
-    fn attach_native_replace<A: crate::Arch>(
+    fn attach_native_replace<A: crate::Core>(
         mut self,
         machine: &mut A,
         native: crate::kernel::platform::NativeVga,
@@ -165,7 +165,7 @@ impl EmulatedVga {
         FullscreenVga::Native(native)
     }
 
-    fn attach_capability_replace<A: crate::Arch>(
+    fn attach_capability_replace<A: crate::Core>(
         self,
         machine: &mut A,
         native: crate::kernel::platform::VgaCap,
@@ -174,7 +174,7 @@ impl EmulatedVga {
             machine, crate::kernel::platform::NativeVga::restored(native))
     }
 
-    pub fn present<A: crate::Arch>(
+    pub fn present<A: crate::Core>(
         self,
         machine: &mut A,
         display: crate::kernel::display::Display,
@@ -206,7 +206,7 @@ impl EmulatedVga {
 impl FullscreenVga {
     /// Install a newly constructed emulated VGA into the current address
     /// space. This is construction, not context-switch reconciliation.
-    pub fn initialize_active_address_space<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn initialize_active_address_space<A: crate::Core>(&mut self, machine: &mut A) {
         match self {
             Self::Emulated(vga, _) => {
                 materialize_emulated_aperture(vga, machine);
@@ -245,14 +245,14 @@ impl DosVideo {
         }
     }
 
-    pub fn initialize_active_address_space<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn initialize_active_address_space<A: crate::Core>(&mut self, machine: &mut A) {
         match self {
             Self::Vga(vga) => materialize_emulated_aperture(vga, machine),
             Self::Fullscreen(vga) => vga.initialize_active_address_space(machine),
         }
     }
 
-    pub fn clone_detached_for_child<A: crate::Arch>(&mut self, machine: &mut A) -> Option<Self> {
+    pub fn clone_detached_for_child<A: crate::Core>(&mut self, machine: &mut A) -> Option<Self> {
         let Self::Vga(vga) = self else { return None };
         vga.save_vram(live_vram(machine));
         let child = vga.clone_for_fork();
@@ -263,19 +263,19 @@ impl DosVideo {
         Some(Self::Vga(child))
     }
 
-    pub fn capture_address_space_vram<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn capture_address_space_vram<A: crate::Core>(&mut self, machine: &mut A) {
         if let Some(vga) = self.emulated_mut() {
             vga.save_vram(live_vram(machine));
         }
     }
 
-    pub fn resume_vram<A: crate::Arch>(&mut self, machine: &mut A) {
+    pub fn resume_vram<A: crate::Core>(&mut self, machine: &mut A) {
         if let Some(vga) = self.emulated_mut() {
             materialize_emulated_aperture(vga, machine);
         }
     }
 
-    pub fn release_for_parent_replace<A: crate::Arch>(&mut self, machine: &mut A) -> Self {
+    pub fn release_for_parent_replace<A: crate::Core>(&mut self, machine: &mut A) -> Self {
         self.map(|mut returned| {
             if let Some(vga) = returned.emulated_mut() {
                 vga.save_vram(live_vram(machine));
@@ -284,7 +284,7 @@ impl DosVideo {
         })
     }
 
-    pub(in crate::kernel::dos) fn acquire_parent_replace<A: crate::Arch>(
+    pub(in crate::kernel::dos) fn acquire_parent_replace<A: crate::Core>(
         &mut self, machine: &mut A, returned: Self, bios_video: BdaVideo,
     ) {
         self.map(|parent| {
@@ -310,7 +310,7 @@ impl DosVideo {
 }
 
 /// Suspend the foreground VGA into state-only form and release its output.
-pub fn release_fullscreen<A: crate::Arch>(
+pub fn release_fullscreen<A: crate::Core>(
     video: &mut DosVideo,
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -329,7 +329,7 @@ pub fn release_fullscreen<A: crate::Arch>(
 }
 
 /// Combine stored VGA state with an output handoff into a fullscreen VGA.
-pub fn acquire_fullscreen<A: crate::Arch>(
+pub fn acquire_fullscreen<A: crate::Core>(
     video: &mut DosVideo,
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -345,7 +345,7 @@ pub fn acquire_fullscreen<A: crate::Arch>(
     });
 }
 
-pub fn acquire_fullscreen_replace<A: crate::Arch>(
+pub fn acquire_fullscreen_replace<A: crate::Core>(
     video: &mut DosVideo,
     machine: &mut A,
     display: crate::kernel::display::DisplayHandoff,
@@ -362,7 +362,7 @@ pub fn acquire_fullscreen_replace<A: crate::Arch>(
 
 /// Replace the current output with a headless sink and release the foreground
 /// scanout target: either a render surface or a state-free VGA capability.
-pub fn release_display<A: crate::Arch>(
+pub fn release_display<A: crate::Core>(
     vga: &mut FullscreenVga,
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -381,7 +381,7 @@ pub fn release_display<A: crate::Arch>(
 
 /// Replace an emulated VGA's current output target. A bare VgaCap is upgraded
 /// to NativeVga only after the complete software state is restored.
-pub fn acquire_display<A: crate::Arch>(
+pub fn acquire_display<A: crate::Core>(
     vga: &mut FullscreenVga,
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -398,7 +398,7 @@ pub fn acquire_display<A: crate::Arch>(
 
 /// Acquire a live physical VGA without restoring the receiver's recovery
 /// image. This is the normal child→parent DOS return operation.
-pub fn acquire_display_replace<A: crate::Arch>(
+pub fn acquire_display_replace<A: crate::Core>(
     vga: &mut FullscreenVga,
     machine: &mut A,
     display: crate::kernel::display::DisplayHandoff,
@@ -438,12 +438,16 @@ pub fn is_standard_text(device: &DosVideo) -> bool {
 /// Present the emulated planes to the guest at A0000/B8000 — map the window
 /// and fill it from suspended state, or mark it trapped when writes must
 /// go through the planar ALU. Needs an address space, so it is not the card's.
-fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine: &mut A) {
+fn materialize_emulated_aperture<A: crate::Core>(dev: &mut EmulatedVga, machine: &mut A) {
     rebind_scanout();
     match &mut dev.state {
         VgaState::Legacy(state) => {
             let base = initialize_live_vram(PLANES_LEN >> 12);
-            unsafe { crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, PLANES_LEN >> 12); }
+            unsafe {
+                crate::kernel::memory::map_protected_shared_pages(
+                    machine, VGA_VRAM_BASE >> 12, base, PLANES_LEN >> 12,
+                );
+            }
             // An empty image means this device already resides in LiveVram.
             // `initialize_active_address_space` and the subsequent resume hook
             // may both bind it; rebinding must not erase the resident planes.
@@ -453,12 +457,12 @@ fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine:
                 state.planes.clear();
             }
             install_aperture(machine, state.cpu_aperture());
+            state.registers.refresh_trap_mode();
         }
         VgaState::Vbe(svga) => {
             let pages = (svga.config.framebuffer_bytes as usize).div_ceil(crate::PAGE_SIZE);
             let base = initialize_live_vram(pages);
             unsafe {
-                crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, pages);
                 crate::kernel::memory::map_shared_pages(machine, SVGA_LFB_BASE >> 12, base, pages);
             }
             dev.svga_pages = pages;
@@ -568,18 +572,9 @@ pub(crate) fn live_vram<A>(_machine: &A) -> &[u8] {
     unsafe { core::slice::from_raw_parts(live_vram_ptr(), bytes) }
 }
 
-/// Guest page range whose CPU accesses must pass through the emulated VGA's
-/// planar ALU. The card derives this together with its VRAM layout.
-pub fn trapped_aperture(vga: &LegacyVgaState) -> Option<core::ops::Range<u16>> {
-    match vga.cpu_aperture() {
-        ::vga::CpuAperture::Trapped { range } =>
-            Some(range.start_page..range.end_page),
-        _ => None,
-    }
-}
-/// Guest alias of the shared kernel VRAM. CPU apertures alias these same
-/// pages; address-space teardown/fork must never free or privatize them.
-pub(crate) const VGA_VRAM_BASE: usize = 0x4100_0000;
+/// Protected view of legacy VGA planes in the DOS address space. The CPU
+/// aperture maps or intercepts accesses separately, according to VGA mode.
+const VGA_VRAM_BASE: usize = 0xBFF0_0000;
 
 fn live_planes_mut<A>(_machine: &mut A) -> ::vga::memory::Memory<'static> {
     live_memory().range(0, PLANES_LEN)
@@ -593,7 +588,7 @@ pub(crate) fn live_memory() -> ::vga::memory::Memory<'static> {
 
 fn live_vram_mut<A>(_machine: &mut A) -> ::vga::memory::Memory<'static> { live_memory() }
 
-fn write_live_planes<A: crate::Arch>(machine: &mut A, planes: &[u8]) {
+fn write_live_planes<A: crate::Core>(machine: &mut A, planes: &[u8]) {
     assert_eq!(planes.len(), PLANES_LEN);
     live_planes_mut(machine).copy_from(planes);
 }
@@ -606,14 +601,16 @@ fn aperture_range(aperture: ::vga::CpuAperture) -> Option<::vga::ApertureRange> 
     }
 }
 
-fn install_aperture<A: crate::Arch>(machine: &mut A, aperture: ::vga::CpuAperture) {
+fn install_aperture<A: crate::Core>(machine: &mut A, aperture: ::vga::CpuAperture) {
     match aperture {
         ::vga::CpuAperture::None => {}
-        ::vga::CpuAperture::Direct { range, pages } => crate::kernel::memory::alias(machine,
-            VGA_VRAM_BASE >> 12,
-            usize::from(range.start_page),
-            usize::from(pages.min(range.end_page - range.start_page)),
-        ),
+        ::vga::CpuAperture::Direct { range, pages } => {
+            let base = live_vram_ptr_if_initialized().expect("VGA aperture without plane storage");
+            unsafe {
+                crate::kernel::memory::map_shared_pages(machine, usize::from(range.start_page),
+                    base, usize::from(pages.min(range.end_page - range.start_page)));
+            }
+        }
         ::vga::CpuAperture::Trapped { range } => crate::kernel::memory::map_physical(machine,
             usize::from(range.start_page),
             usize::from(range.end_page - range.start_page),
@@ -623,7 +620,7 @@ fn install_aperture<A: crate::Arch>(machine: &mut A, aperture: ::vga::CpuApertur
     }
 }
 
-fn apply_aperture_write<A: crate::Arch>(machine: &mut A, write: ::vga::PortWrite) {
+fn apply_aperture_write<A: crate::Core>(machine: &mut A, write: ::vga::PortWrite) {
     if write.old_aperture == write.new_aperture {
         return;
     }
@@ -655,7 +652,7 @@ fn apply_aperture_write<A: crate::Arch>(machine: &mut A, write: ::vga::PortWrite
 
 /// One complete VGA port operation: `lib/vga` updates registers and VRAM
 /// representation together; the kernel merely applies its returned mapping.
-pub fn port_write<A: crate::Arch>(
+pub fn port_write<A: crate::Core>(
     machine: &mut A,
     state: &mut LegacyVgaState,
     port: u16,
@@ -668,6 +665,7 @@ pub fn port_write<A: crate::Arch>(
         live_planes_mut(machine).transition(transition);
     }
     apply_aperture_write(machine, write);
+    state.registers.refresh_trap_mode();
 }
 
 pub(in crate::kernel::dos) fn profile_port_write(state: &LegacyVgaState, port: u16, value: u8) {
@@ -687,7 +685,7 @@ pub(in crate::kernel::dos) fn profile_port_write(state: &LegacyVgaState, port: u
 /// BIOS character-generator services operate on plane 2 regardless of the
 /// CPU-visible layout. The font service addresses logical plane 2 directly;
 /// no representation transition is needed for a trapped operation.
-pub fn bios_load_font<A: crate::Arch>(
+pub fn bios_load_font<A: crate::Core>(
     machine: &mut A,
     device: &mut DosVideo,
     map: usize,
@@ -721,7 +719,7 @@ pub fn bios_set_text_height(device: &mut DosVideo, glyph_h: u8) {
 }
 
 /// BIOS text services program the same registers as direct guest port I/O.
-pub fn bios_write_crtc<A: crate::Arch>(
+pub fn bios_write_crtc<A: crate::Core>(
     machine: &mut A, device: &mut DosVideo, index: u8, value: u8,
 ) {
     if let Some(dev) = device.emulated_mut() {
@@ -775,7 +773,7 @@ fn svga_shadow_pages(bytes: usize) -> usize {
 /// Copy between two mappings without allocating another whole VRAM image.
 /// The saved guest framebuffer is already the persistent storage; a full-size
 /// kernel bounce buffer doubles its RAM cost and exhausts 32 MiB machines.
-fn copy_vbe_memory<A: crate::Arch>(
+fn copy_vbe_memory<A: crate::Core>(
     machine: &mut A,
     source: usize,
     destination: usize,
@@ -814,7 +812,7 @@ fn map_linear_vbe(mode: crate::kernel::platform::VbeMode) -> (usize, usize) {
     (arch_abi::FB_WINDOW_BASE + offset, pages)
 }
 
-fn capture_native_vbe<A: crate::Arch>(
+fn capture_native_vbe<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::platform::VgaCap,
@@ -825,7 +823,6 @@ fn capture_native_vbe<A: crate::Arch>(
     let pages = svga_shadow_pages(bytes);
     let base = initialize_live_vram(pages);
     unsafe {
-        crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, pages);
         crate::kernel::memory::map_shared_pages(machine, SVGA_LFB_BASE >> 12, base, pages);
     }
 
@@ -848,7 +845,7 @@ fn capture_native_vbe<A: crate::Arch>(
     pages
 }
 
-fn restore_native_vbe<A: crate::Arch>(
+fn restore_native_vbe<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::platform::VgaCap,
@@ -894,7 +891,7 @@ fn restore_native_vbe<A: crate::Arch>(
     crate::compact_println!("VBE: restored guest mode {:#x} from shadow", mode.number);
 }
 
-fn restore_native_vbe_palette<A: crate::Arch>(
+fn restore_native_vbe_palette<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::platform::VgaCap,
@@ -911,7 +908,7 @@ fn restore_native_vbe_palette<A: crate::Arch>(
     }
 }
 
-fn copy_banked_from_card<A: crate::Arch>(
+fn copy_banked_from_card<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::platform::VgaCap,
@@ -932,7 +929,7 @@ fn copy_banked_from_card<A: crate::Arch>(
     let _ = display.bios_set_bank(machine, bios, current_bank);
 }
 
-fn copy_banked_to_card<A: crate::Arch>(
+fn copy_banked_to_card<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::platform::VgaCap,
@@ -953,7 +950,7 @@ fn copy_banked_to_card<A: crate::Arch>(
     let _ = display.bios_set_bank(machine, bios, current_bank);
 }
 
-fn discard_emulated_svga<A: crate::Arch>(machine: &mut A, dev: &mut EmulatedVga) {
+fn discard_emulated_svga<A: crate::Core>(machine: &mut A, dev: &mut EmulatedVga) {
     crate::kernel::memory::reset(machine,
         SVGA_LFB_BASE >> 12,
         dev.svga_pages,
@@ -961,7 +958,7 @@ fn discard_emulated_svga<A: crate::Arch>(machine: &mut A, dev: &mut EmulatedVga)
     dev.svga_pages = 0;
 }
 
-fn map_native_lfb<A: crate::Arch>(
+fn map_native_lfb<A: crate::Core>(
     machine: &mut A,
     mode: crate::kernel::platform::VbeMode,
     pages: usize,
@@ -976,7 +973,7 @@ fn map_native_lfb<A: crate::Arch>(
     debug_assert_eq!(offset, 0, "VBE LFB aperture must be page aligned");
 }
 
-pub(crate) fn select_native_svga_aperture<A: crate::Arch>(
+pub(crate) fn select_native_svga_aperture<A: crate::Core>(
     machine: &mut A,
     mode: crate::kernel::platform::VbeMode,
     access: ::vga::SvgaAccess,
@@ -1022,7 +1019,7 @@ pub(crate) fn svga_lfb_reserved_contains(addr: u32, size: u32) -> bool {
 /// Enter one curated physical-BIOS mode while the process is detached. The
 /// shadow has the hardware's exact pitch, image count and bank layout; only
 /// the storage is RAM until the process reacquires the adapter.
-pub fn svga_set_curated_mode<A: crate::Arch>(
+pub fn svga_set_curated_mode<A: crate::Core>(
     machine: &mut A,
     pc: &mut PcMachine,
     mode: crate::kernel::platform::VbeMode,
@@ -1034,7 +1031,6 @@ pub fn svga_set_curated_mode<A: crate::Arch>(
     let pages = (mode.framebuffer_bytes as usize).div_ceil(crate::PAGE_SIZE);
     let base = initialize_live_vram(pages);
     unsafe {
-        crate::kernel::memory::map_shared_pages(machine, VGA_VRAM_BASE >> 12, base, pages);
         crate::kernel::memory::map_shared_pages(machine, SVGA_LFB_BASE >> 12, base, pages);
     }
     if request & 0x8000 == 0 {
@@ -1058,7 +1054,7 @@ pub fn svga_set_curated_mode<A: crate::Arch>(
 
 /// VBE 4F05h window control: alias the 0xA0000 window onto `bank` of the
 /// framebuffer. No copy — the window simply shares the bank's frames.
-pub fn svga_set_bank<A: crate::Arch>(
+pub fn svga_set_bank<A: crate::Core>(
     machine: &mut A,
     pc: &mut PcMachine,
     bank: u16,
@@ -1080,7 +1076,7 @@ pub fn svga_set_bank<A: crate::Arch>(
 
 /// Leave SVGA for a standard VGA mode: detach the window alias and free the
 /// framebuffer region.
-fn svga_leave<A: crate::Arch>(machine: &mut A, dev: &mut EmulatedVga) {
+fn svga_leave<A: crate::Core>(machine: &mut A, dev: &mut EmulatedVga) {
     if dev.state.svga().is_none() {
         return;
     }
@@ -1110,7 +1106,7 @@ fn program_bios_mode_registers(vga: &mut ::vga::LegacyVgaState, mode: u8) {
 
 /// Set an emulated VGA mode, replacing its registers, palette, font and CPU
 /// aperture. Clearing mode sets also zero the backing planes.
-pub fn set_emulated_mode<A: crate::Arch>(
+pub fn set_emulated_mode<A: crate::Core>(
     machine: &mut A,
     dev: &mut EmulatedVga,
     mode: u8,
@@ -1205,6 +1201,7 @@ pub fn set_emulated_mode<A: crate::Arch>(
         );
     }
     install_aperture(machine, vga.cpu_aperture());
+    vga.registers.refresh_trap_mode();
 }
 
 /// Trapped planar VRAM write: run the Graphics Controller write-mode logic for a
@@ -1234,11 +1231,8 @@ pub fn vram_write<A: crate::GuestBytes>(machine: &mut A, vga: &mut LegacyVgaStat
     }
 }
 
-/// Apply one planar write through the permanent kernel mapping. The guest
-/// alias is intentionally absent while the VGA ALU is active; walking that
-/// alias through `GuestBytes` here used to perform four translated reads and
-/// up to four translated writes for every already-expensive #PF-emulated CPU
-/// byte.
+/// Apply one planar write through the kernel view of the plane backing.
+/// The VGA aperture enforces the device's addressing and write-mode rules.
 #[inline(always)]
 pub(in crate::kernel::dos) fn vram_write_live(planes: ::vga::memory::Memory<'_>, vga: &mut LegacyVgaState, off: u32, byte: u8) {
     vga.registers.write(planes.planar(), off as usize, byte);
@@ -1480,6 +1474,8 @@ pub fn bios_draw_glyph<A: crate::GuestBytes>(
             let Some(dev) = device.emulated_mut() else { return false };
             let Some(vga) = dev.state.legacy_mut() else { return false };
             let layout = vga.layout();
+            let planes = live_vram_ptr_if_initialized()
+                .map(|base| unsafe { ::vga::memory::Memory::mapped(base.as_ptr(), PLANES_LEN) });
             let width: u32 = if mode == 0x0D { 320 } else { 640 };
             let rb = if vga.crtc.get(0x13) != 0 { vga.crtc.get(0x13) as u32 * 2 } else { width / 8 };
             for gy in 0..cell_h {
@@ -1491,10 +1487,17 @@ pub fn bios_draw_glyph<A: crate::GuestBytes>(
                     let byte_off = (py * rb + px / 8) as usize;
                     let mask = 0x80u8 >> (px & 7);
                     for p in 0..4usize {
-                        let addr = VGA_VRAM_BASE + layout.index(p, byte_off);
-                        let mut byte: u8 = machine.read(addr as u64);
+                        let index = layout.index(p, byte_off);
+                        let mut byte = planes.map_or_else(
+                            || machine.read((VGA_VRAM_BASE + index) as u64),
+                            |planes| planes.get(index).unwrap(),
+                        );
                         if (color >> p) & 1 != 0 { byte |= mask; } else { byte &= !mask; }
-                        machine.write::<u8>(addr as u64, byte);
+                        if let Some(planes) = planes {
+                            planes.put(index, byte);
+                        } else {
+                            machine.write((VGA_VRAM_BASE + index) as u64, byte);
+                        }
                     }
                 }
             }

@@ -55,7 +55,7 @@ impl WindowsState {
     pub(crate) fn take_completed_children(&mut self) -> Vec<i32> {
         core::mem::take(&mut self.processes.completed)
     }
-    pub(crate) fn sync_process_cwd<A: crate::Arch>(&self, machine: &mut A) {
+    pub(crate) fn sync_process_cwd<A: crate::Core>(&self, machine: &mut A) {
         let cwd = process_cwd(self.cwd_str());
         let units = encoding::encode(&cwd, true);
         if units.len() >= 256 {
@@ -81,7 +81,7 @@ pub(super) fn close(state: &mut WindowsState, handle: u32) {
         }
     }
 }
-fn wide<A: crate::Arch>(machine: &A, pointer: u32, length: u32) -> Option<Vec<u8>> {
+fn wide<A: crate::Core>(machine: &A, pointer: u32, length: u32) -> Option<Vec<u8>> {
     if length & 1 != 0 || length > 32766 || pointer == 0 && length != 0 {
         return None;
     }
@@ -92,7 +92,7 @@ fn wide<A: crate::Arch>(machine: &A, pointer: u32, length: u32) -> Option<Vec<u8
         .ok()
         .map(|s| s.into_bytes())
 }
-pub(super) fn spawn<A: crate::Arch>(
+pub(super) fn spawn<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     regs: &mut Regs,
@@ -165,7 +165,7 @@ fn spawn_success(regs: &mut Regs, tid: i32) {
     regs.rax = (tid + 1) as u64;
 }
 
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     regs: &mut Regs,

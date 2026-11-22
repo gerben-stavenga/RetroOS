@@ -1,8 +1,8 @@
 //! BIOS COM1 services over the same UART used by port-based DOS drivers.
 use crate::kernel::dos::DosState;
-use crate::{Arch, Regs};
+use crate::{Core, Regs};
 
-pub(super) fn int14<A: Arch>(dos: &mut DosState<A>, regs: &mut Regs) {
+pub(super) fn int14<A: Core>(dos: &mut DosState<A>, regs: &mut Regs) {
     // COM1 BIOS service. Port-based DOS drivers use the same UART.
     let uart = &mut dos.pc.uart;
     let function = (regs.rax >> 8) as u8;

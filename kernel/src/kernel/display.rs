@@ -156,7 +156,7 @@ pub enum ExitDisplay {
 }
 
 impl ExitDisplay {
-    pub fn into_surface<A: crate::Arch>(
+    pub fn into_surface<A: crate::Core>(
         self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -172,7 +172,7 @@ impl ExitDisplay {
 }
 
 impl DisplayHandoff {
-    pub fn into_surface<A: crate::Arch>(
+    pub fn into_surface<A: crate::Core>(
         self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -189,7 +189,7 @@ impl DisplayHandoff {
 
     /// Materialize the dedicated packed surface chosen for SST-1 scanout.
     /// Non-VGA surfaces (UEFI/hosted) are already in their native format.
-    pub fn into_voodoo_surface<A: crate::Arch>(
+    pub fn into_voodoo_surface<A: crate::Core>(
         self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -239,7 +239,7 @@ enum VgaScanout {
 /// A failed bank switch leaves the adapter scanning graphics memory while the
 /// panic console writes text cells at B8000. Restore text mode while the BIOS
 /// workspace is still available so the subsequent panic is visible.
-fn banked_present_panic<A: crate::Arch>(
+fn banked_present_panic<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     native: &mut crate::kernel::platform::VgaCap,
@@ -314,7 +314,7 @@ impl Display {
     /// Construct the kernel display mode selected once during BIOS discovery.
     /// `Platform::vbe_mode == None` means Mode 13h was the startup selection;
     /// it is not a per-call recovery policy.
-    pub fn new_selected<A: crate::Arch>(
+    pub fn new_selected<A: crate::Core>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         native: crate::kernel::platform::VgaCap,
@@ -324,7 +324,7 @@ impl Display {
         )
     }
 
-    pub fn new_voodoo_selected<A: crate::Arch>(
+    pub fn new_voodoo_selected<A: crate::Core>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         native: crate::kernel::platform::VgaCap,
@@ -337,7 +337,7 @@ impl Display {
         )
     }
 
-    fn new_selected_mode<A: crate::Arch>(
+    fn new_selected_mode<A: crate::Core>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         mut native: crate::kernel::platform::VgaCap,
@@ -419,7 +419,7 @@ impl Display {
     }
 
     /// Select and map a packed linear firmware mode validated by BIOS discovery.
-    fn new_vbe<A: crate::Arch>(
+    fn new_vbe<A: crate::Core>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         mut native: crate::kernel::platform::VgaCap,
@@ -466,7 +466,7 @@ impl Display {
     /// Select a packed VBE mode whose pixels are published through its banked
     /// A000 window. The completed frame remains an ordinary compact Display
     /// shadow; firmware-owned bank selection happens only at [`Self::present`].
-    fn new_banked_vbe<A: crate::Arch>(
+    fn new_banked_vbe<A: crate::Core>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         mut native: crate::kernel::platform::VgaCap,
@@ -515,13 +515,39 @@ impl Display {
 
     pub fn is_headless(&self) -> bool { matches!(self.backend, Backend::Headless) }
     pub fn is_host(&self) -> bool { matches!(self.backend, Backend::Host) }
+
+    pub(crate) fn output(&self) -> (&'static [u8], usize, usize) {
+        let (name, size): (&[u8], _) = match &self.backend {
+            Backend::Host => return EXTERNAL_DISPLAY.get().map_or((b"Display", 0, 0), |sink| (sink.output)()),
+            Backend::Headless => (b"Headless", (0, 0)),
+            Backend::Linear(fb) => (b"Framebuffer", (fb.width, fb.height)),
+            Backend::Vga { scanout: VgaScanout::Mode13 { framebuffer, .. }, .. } =>
+                (b"VGA", (framebuffer.width, framebuffer.height)),
+            Backend::Vga { scanout: VgaScanout::VbeLinear { framebuffer, .. }, .. } =>
+                (b"VBE", (framebuffer.width, framebuffer.height)),
+            Backend::Vga { scanout: VgaScanout::VbeBanked { mode, .. }, .. } =>
+                (b"VBE", (usize::from(mode.width), usize::from(mode.height))),
+        };
+        (name, size.0, size.1)
+    }
+
+    pub fn present_dos<A: crate::Core>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        width: usize,
+        height: usize,
+        pixels: &[u8],
+    ) -> usize {
+        self.present_packed_as(machine, bios, width, height, pixels, FrameLayout::Dos(dos_scaling()))
+    }
     pub fn is_vga(&self) -> bool {
         matches!(self.backend, Backend::Vga { .. })
     }
 
     /// Install the SST-1 gamma table in a programmable direct-colour VBE
     /// mode. A rejected firmware call permanently selects the CPU fallback.
-    pub fn program_voodoo_ramp<A: crate::Arch>(
+    pub fn program_voodoo_ramp<A: crate::Core>(
         &mut self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -551,7 +577,7 @@ impl Display {
 
     /// VGA software rendering expects an identity output ramp after Voodoo
     /// gives the display back.
-    pub fn restore_voodoo_ramp<A: crate::Arch>(
+    pub fn restore_voodoo_ramp<A: crate::Core>(
         &mut self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -664,13 +690,25 @@ impl Display {
     /// Pixels already have this display's encoding and byte layout.
     /// Only scaling, when required, happens here. At most one packed row
     /// is staged; there is no scaled retained frame.
-    pub fn present_packed<A: crate::Arch>(
+    pub fn present_packed<A: crate::Core>(
         &mut self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         width: usize,
         height: usize,
         pixels: &[u8],
+    ) -> usize {
+        self.present_packed_as(machine, bios, width, height, pixels, FrameLayout::Desktop)
+    }
+
+    fn present_packed_as<A: crate::Core>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        width: usize,
+        height: usize,
+        pixels: &[u8],
+        layout: FrameLayout,
     ) -> usize {
         let Some(bytes) = width.checked_mul(height)
             .and_then(|n| n.checked_mul(usize::from(self.rgb.bytes_per_pixel))) else { return 0 };
@@ -684,7 +722,7 @@ impl Display {
         {
             canvas
         } else {
-            native_output_size(canvas.0, canvas.1, width, height)
+            layout.output_size(canvas, (width, height))
         };
         if let Some(copied) = self.queue_presentation(width, height, pixels, output, None) { return copied; }
         let clear_bars = self.last_packed_output != Some(output);
@@ -711,7 +749,7 @@ impl Display {
                 PackedSource { width, height, pixels, row: scratch }, clear_bars,
             ).unwrap_or_else(|error| banked_present_panic(machine, bios, native, error)),
             Backend::Host => {
-                present_host_shadow(width, height, format, pixels)
+                present_host_shadow(layout, width, height, format, pixels)
             }
             Backend::Headless => 0,
         }
@@ -721,7 +759,7 @@ impl Display {
     /// canvas. Unlike [`Self::present_regions`], the input width is explicit:
     /// compositor storage is dense and independent of the legacy VGA shadow
     /// width. A scaled or hosted sink falls back to a whole-frame present.
-    pub fn present_packed_regions<A: crate::Arch>(
+    pub fn present_packed_regions<A: crate::Core>(
         &mut self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -770,7 +808,7 @@ impl Display {
     }
 
     /// Publish one completed packed compositor shadow.
-    pub fn present<A: crate::Arch>(
+    pub fn present<A: crate::Core>(
         &mut self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -799,7 +837,7 @@ impl Display {
             } => native.bios_present(machine, bios, *mode, current_bank, height, shadow)
                     .unwrap_or_else(|error| banked_present_panic(machine, bios, native, error)),
             Backend::Host => present_host_shadow(
-                self.shadow_width, height, format, shadow),
+                FrameLayout::Desktop, self.shadow_width, height, format, shadow),
             Backend::Headless => 0,
             Backend::Linear(_) => unreachable!(),
         }
@@ -808,7 +846,7 @@ impl Display {
     /// Publish only compositor regions whose packed shadow pixels changed.
     /// Hosted and banked sinks currently require whole frames; linear GOP/VBE
     /// and the packed Mode 13h sink receive the exact damaged rectangles.
-    pub fn present_regions<A: crate::Arch>(
+    pub fn present_regions<A: crate::Core>(
         &mut self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -856,7 +894,7 @@ impl Display {
     }
 
     /// Best-effort publication after the kernel has already failed.  A panic
-    /// cannot recover the `Arch` and BIOS workspace values held by the dead
+    /// cannot recover the `Core` and BIOS workspace values held by the dead
     /// stack, but a loader-provided linear framebuffer needs neither: use the
     /// same blit as the normal [`Self::present`] path and publish it directly.
     pub fn panic_present(&mut self, height: usize, shadow: &[u8]) -> usize {
@@ -1213,7 +1251,7 @@ fn blit_regions_cooperative(
 pub(crate) fn native_output_size(
     panel_w: usize, panel_h: usize, source_w: usize, source_h: usize,
 ) -> (usize, usize) {
-    dos_output_size(panel_w, panel_h, source_w, source_h, dos_scaling())
+    FrameLayout::Dos(dos_scaling()).output_size((panel_w, panel_h), (source_w, source_h))
 }
 
 fn dos_output_size(
@@ -1291,32 +1329,46 @@ pub fn fit_vga(width: usize, height: usize) -> (usize, usize) {
 }
 
 
-/// Hosted completed-frame sink. This lives in the allocating kernel rather
-/// than `//lib:vga`, which the allocator-free bootloader does not link.
-static HOST_PRESENT: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-pub fn set_host_present_sink(f: fn(usize, usize, &mut alloc::vec::Vec<u32>)) {
-    HOST_PRESENT.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+/// How a completed frame fills the output viewport.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FrameLayout {
+    Desktop,
+    Dos(DosScaling),
 }
 
-pub fn host_present_sink_installed() -> bool {
-    HOST_PRESENT.load(core::sync::atomic::Ordering::Relaxed) != 0
-}
-
-pub fn present_host(w: usize, h: usize, pixels: &mut alloc::vec::Vec<u32>) {
-    let p = HOST_PRESENT.load(core::sync::atomic::Ordering::Relaxed);
-    if p != 0 {
-        let f: fn(usize, usize, &mut alloc::vec::Vec<u32>) =
-            unsafe { core::mem::transmute(p) };
-        f(w, h, pixels);
+impl FrameLayout {
+    pub fn output_size(self, (width, height): (usize, usize), (w, h): (usize, usize)) -> (usize, usize) {
+        match self {
+            Self::Dos(mode) => dos_output_size(width, height, w, h, mode),
+            Self::Desktop if w == 0 || h == 0 => (0, 0),
+            Self::Desktop if w as u64 * height as u64 > h as u64 * width as u64 =>
+                (width, (h as u64 * width as u64 / w as u64) as usize),
+            Self::Desktop => ((w as u64 * height as u64 / h as u64) as usize, height),
+        }
     }
 }
 
-fn present_host_shadow(w: usize, h: usize, rgb: PixelFormat, shadow: &[u8]) -> usize {
+/// Endpoint supplied by a launcher that owns its display.
+pub struct ExternalDisplay {
+    pub output: fn() -> (&'static [u8], usize, usize),
+    pub present: fn(FrameLayout, usize, usize, alloc::vec::Vec<u32>),
+}
+
+static EXTERNAL_DISPLAY: spin::Once<ExternalDisplay> = spin::Once::new();
+
+pub fn install_external_display(display: ExternalDisplay) {
+    EXTERNAL_DISPLAY.call_once(|| display);
+}
+
+pub fn host_present_sink_installed() -> bool {
+    EXTERNAL_DISPLAY.get().is_some()
+}
+
+fn present_host_shadow(layout: FrameLayout, w: usize, h: usize, rgb: PixelFormat, shadow: &[u8]) -> usize {
+    let Some(sink) = EXTERNAL_DISPLAY.get() else { return 0 };
     let step = rgb.bytes_per_pixel as usize;
     let Some(bytes) = w.checked_mul(h).and_then(|n| n.checked_mul(step)) else { return 0 };
-    if shadow.len() < bytes { return 0; }
+    if bytes == 0 || shadow.len() < bytes { return 0; }
     let mut pixels = alloc::vec::Vec::<u32>::with_capacity(w * h);
     if rgb == PixelFormat::NATIVE {
         // The host sink accepts XRGB8888 words, exactly these packed bytes.
@@ -1325,7 +1377,7 @@ fn present_host_shadow(w: usize, h: usize, rgb: PixelFormat, shadow: &[u8]) -> u
             core::ptr::copy_nonoverlapping(shadow.as_ptr(), pixels.as_mut_ptr().cast::<u8>(), bytes);
             pixels.set_len(w * h);
         }
-        present_host(w, h, &mut pixels);
+        (sink.present)(layout, w, h, pixels);
         return w * h;
     }
     for p in shadow[..bytes].chunks_exact(step) {
@@ -1345,7 +1397,7 @@ fn present_host_shadow(w: usize, h: usize, rgb: PixelFormat, shadow: &[u8]) -> u
             | channel(rgb.green_pos, rgb.green_size) << 8
             | channel(rgb.blue_pos, rgb.blue_size));
     }
-    present_host(w, h, &mut pixels);
+    (sink.present)(layout, w, h, pixels);
     w * h
 }
 

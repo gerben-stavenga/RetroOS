@@ -66,7 +66,7 @@ pub(super) struct State {
     views: Vec<u32>,
 }
 
-pub(super) fn call<A: crate::Arch>(
+pub(super) fn call<A: crate::Core>(
     machine: &mut A,
     state: &mut WindowsState,
     args: [u32; 6],

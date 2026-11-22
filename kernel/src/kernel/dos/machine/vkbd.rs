@@ -265,11 +265,11 @@ pub(super) fn normalize_scancode(pc: &mut PcMachine, scancode: u8) -> Option<(bo
 }
 
 /// Clear the BIOS keyboard buffer at 40:1A..40:3E.
-pub fn clear_bios_keyboard_buffer<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
+pub fn clear_bios_keyboard_buffer<A: crate::Core>(machine: &mut A, _regs: &mut Regs) {
     crate::kernel::dos::Bda::clear_keyboard_buffer(machine);
 }
 
 /// Pop the next word from the BIOS keyboard buffer.
-pub fn pop_bios_keyboard_word<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) -> Option<u16> {
+pub fn pop_bios_keyboard_word<A: crate::Core>(machine: &mut A, _regs: &mut Regs) -> Option<u16> {
     crate::kernel::dos::Bda::pop_keyboard_word(machine)
 }

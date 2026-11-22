@@ -6,7 +6,7 @@ mod setup;
 pub use run::execute;
 pub(crate) use setup::kick;
 use arch_abi::{Memory, X86, GuestBytes, UserPage, MappingError, MappingFailure, page_entry::PageEntry, page_supply::PageInput, vm::{self, Exchange, op}};
-use crate::{backend::Interp, space::RootPageTable};
+use crate::{backend::Interp, space::AddressSpace};
 
 pub(crate) fn supply_status() -> arch_abi::page_supply::SupplyStatus {
     setup::with(|cpu| {
@@ -30,7 +30,7 @@ fn request<R>(operation: u64, args: [u64; 6], prepare: impl FnOnce(&mut Exchange
     })
 }
 fn empty(operation: u64) { request(operation, [0; 6], |_| {}, |_| {}); }
-fn root_operation(operation: u64, root: &mut RootPageTable, pages: PageInput) -> PageInput {
+fn root_operation(operation: u64, root: &mut AddressSpace, pages: PageInput) -> PageInput {
     let incoming = root.0;
     request(operation, [0; 6], |m| { m.root = incoming; m.put_pages(pages); }, |m| { root.0 = m.root; m.take_pages() })
 }
@@ -38,14 +38,14 @@ fn batch_result(m: &Exchange) -> Result<(), MappingFailure> {
     m.mapping_status().map_err(|error| MappingFailure { error, completed: m.result[1] as usize })
 }
 impl Memory for Interp {
-    type PageTable = RootPageTable;
-    fn activate(&mut self, mut root: RootPageTable) -> RootPageTable { root_operation(op::ACTIVATE, &mut root, PageInput::new()); root }
+    type AddressSpace = AddressSpace;
+    fn activate(&mut self, mut root: AddressSpace) -> AddressSpace { root_operation(op::ACTIVATE, &mut root, PageInput::new()); root }
     fn supply_pages(&self, pages: PageInput) -> (usize, PageInput) {
         request(op::SUPPLY, [0; 6], |m| m.put_pages(pages), |m| (m.result[0] as usize, m.take_pages()))
     }
-    fn user_fork(&mut self, root: &mut RootPageTable, pages: PageInput) -> ((), PageInput) { ((), root_operation(op::FORK, root, pages)) }
+    fn user_fork(&mut self, root: &mut AddressSpace, pages: PageInput) -> ((), PageInput) { ((), root_operation(op::FORK, root, pages)) }
     fn free_user_pages(&mut self) { empty(op::CLEAN); }
-    fn destroy_space(&mut self, root: &mut RootPageTable) { root_operation(op::DESTROY, root, PageInput::new()); }
+    fn destroy_space(&mut self, root: &mut AddressSpace) { root_operation(op::DESTROY, root, PageInput::new()); }
     fn alias_mappings(&mut self, a: UserPage, b: UserPage, count: usize, pages: PageInput) -> (Result<(), MappingError>, PageInput) {
         request(op::ALIAS, [a.address(), count as u64, b.address(), 0, 0, 0], |m| m.put_pages(pages), |m| (m.mapping_status(), m.take_pages()))
     }
@@ -329,8 +329,8 @@ fn descriptors_ready() {
     });
 }
 impl X86 for Interp {
-    unsafe fn bind_planar(&mut self, binding: Option<planar::Binding>) {
-        unsafe { setup::bind_planar(binding) }
+    unsafe fn install_trap_hook(&mut self, hook: Option<arch_abi::entry::TrapHook>) {
+        unsafe { setup::install_trap_hook(hook) }
     }
     fn isa_unmask_irq(&mut self, _: u8) { panic!("hosted has no physical ISA interrupt controller"); }
     fn set_debug_watch(&mut self, addresses: Option<(u32, u32)>) {
@@ -367,20 +367,14 @@ pub fn fx_switch(fx: &mut crate::machine::FxState) {
 pub fn fpu_st0() -> [u8; 10] { request(op::FPU_ST0, [0; 6], |_| {}, |m| m.data[..10].try_into().unwrap()) }
 pub fn fpu_pop() { empty(op::FPU_POP); }
 
-// Internal byte views use the same host-side translation as GuestBytes.
 pub(crate) mod paging {
     pub const PAGING_PAGES: usize = 1;
     pub unsafe fn initialize(storage: u64) {
         use arch_abi::Memory;
-        let mut machine = crate::Interp;
-        let mut old = machine.activate(crate::RootPageTable::empty());
+        let mut machine = crate::Interp::local();
+        let mut old = machine.activate(crate::AddressSpace::empty());
         machine.destroy_space(&mut old);
         let mut pages = arch_abi::page_supply::PageInput::new(); pages.push(storage);
         machine.supply_pages(pages);
-    }
-    pub fn space_resolve(address: u32) -> *mut u8 { resolve(address, false) }
-    fn resolve(address: u32, write: bool) -> *mut u8 {
-        super::setup::with(|cpu| super::PhysicalAccess::new(cpu, None)
-            .resolve(address as u64, write).expect("inaccessible guest memory"))
     }
 }

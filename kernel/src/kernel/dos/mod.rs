@@ -143,7 +143,7 @@ impl LaunchPolicy {
 ///   - DOS personality fields (flattened): PSP tracking, DTA, heap/free segment,
 ///     XMS/EMS state, FindFirst/FindNext state, exec-parent chain.
 ///   - `dpmi`: optional DPMI protected-mode state (LDT, memory blocks, callbacks).
-pub struct DosState<A: crate::Arch> {
+pub struct DosState<A: crate::Core> {
     pub(crate) ipx: ipx::IpxState,
     /// Policy-free PC machine state: virtual 8259 PIC, 8253 PIT, PS/2 keyboard,
     /// VGA register set, A20 gate, HMA page tracking.
@@ -266,7 +266,7 @@ type ResumeFn<A> = dyn FnOnce(
 
 /// Block-and-retry closure stored in a [`SuspendedCall`]. Wrapped in a newtype
 /// so the FnOnce can return another `ResumeCallback` (recursive type).
-pub struct ResumeCallback<A: crate::Arch>(pub alloc::boxed::Box<ResumeFn<A>>);
+pub struct ResumeCallback<A: crate::Core>(pub alloc::boxed::Box<ResumeFn<A>>);
 
 /// The guest computation following a suspended interrupt. The original frame
 /// has already returned to the mode-appropriate `SLOT_RESUME`; completion
@@ -279,7 +279,7 @@ pub enum DosReturnFrame {
 
 /// One delimited DOS continuation: delayed work plus the computation to enter
 /// when that work completes. Nested suspensions naturally form a LIFO stack.
-pub struct SuspendedCall<A: crate::Arch> {
+pub struct SuspendedCall<A: crate::Core> {
     pub callback: ResumeCallback<A>,
     pub return_frame: DosReturnFrame,
 }
@@ -302,7 +302,7 @@ pub(crate) fn fresh_ldt() -> alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]> {
         .expect("LDT size mismatch")
 }
 
-impl<A: crate::Arch> DosState<A> {
+impl<A: crate::Core> DosState<A> {
     pub fn new_boxed(machine: &mut A, vga: DosVideo) -> alloc::boxed::Box<Self> {
         let ldt = fresh_ldt();
         // Allocate first and initialize fields at their final addresses. A
@@ -576,7 +576,7 @@ pub struct ExecParent {
 /// base+limit. Downstream the linear is used with the flat `regs.read/write/
 /// slice` memory API.
 #[inline]
-fn seg_offset<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs, seg: u16, off: u32) -> u32 {
+fn seg_offset<A: crate::Core>(dos: &thread::DosState<A>, regs: &Regs, seg: u16, off: u32) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         let lin = ((seg as u32) << 4).wrapping_add(off & 0xFFFF);
         // A20 is permanently wrapped (force line 20 low): the HMA
@@ -682,7 +682,7 @@ fn trace_interrupt(mode: crate::UserMode, cs: u16, regs: &Regs) {
     );
 }
 
-pub fn syscall<A: crate::Arch>(
+pub fn syscall<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
@@ -699,7 +699,7 @@ pub fn syscall<A: crate::Arch>(
         (UserMode::VM86, _)                     => dos::rm_native_syscall(machine, kt, dos, regs),
         (_, mode_transitions::VECTOR_STUB_SEL)  => mode_transitions::vector_stub_reflect(machine, dos, regs),
         (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(machine, bios_display, kt, dos, regs),
-        _ => match dpmi::direct_int21_iret(machine, bios_display, kt, dos, regs) {
+        _ => match dpmi::direct_rm_call(machine, bios_display, kt, dos, regs) {
             Some(action) => action,
             None => dpmi::dpmi_api(machine, dos, regs),
         },
@@ -711,7 +711,7 @@ pub fn syscall<A: crate::Arch>(
 /// handler (for example, a string destination requiring COW). TCG and Voodoo
 /// use the same decoder here for every intercepted memory access.
 /// Returns true if handled (resume), false → real SEGV.
-pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, addr: u32) -> bool {
+pub fn try_vga_fault<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, addr: u32) -> bool {
     // The Voodoo's aperture is trapped the same way, through the same decoder
     // — a different window and a different device behind it, nothing else.
     if let Some(off) = dos.pc.voodoo.as_ref()
@@ -720,36 +720,21 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
         let _sample = super::voodoo_profile::Sample::start(super::voodoo_profile::Stage::Mmio);
         let (segments, def32) = fault_segment_bases(dos, regs);
         let voodoo = dos.pc.voodoo.as_mut().unwrap();
-        let mut target = machine::mmio::MmioTarget::Voodoo(voodoo);
-        return machine::mmio::handle_mmio_fault(
-            machine, regs, &mut target, &segments, def32, off,
-        );
+        return machine::mmio::voodoo_fault(machine, regs, voodoo, &segments, def32, off);
     }
-    // The emulated register file is the sole aperture authority. A native
-    // owner has no software trap: its adapter performs plane routing itself.
-    // Resolved before the device is borrowed, so the decode below needs only
-    // one match: the bases come from the register frame, not from the VGA.
     let (segments, def32) = fault_segment_bases(dos, regs);
-    let Some(dev) = dos.pc.vga.emulated_mut() else {
-        return false;
-    };
+    let cs = regs.code_seg();
+    let limit = if regs.mode() == crate::UserMode::VM86 { 65535 }
+        else if cs & 4 != 0 { mode_transitions::seg_limit(&dos.ldt[..], cs) }
+        else { u32::MAX };
+    let Some(dev) = dos.pc.vga.emulated_mut() else { return false };
     let Some(state) = dev.state.legacy_mut() else { return false };
-    let Some(pages) = machine::vga::trapped_aperture(state) else {
-        return false;
-    };
-    let base = u32::from(pages.start) << 12;
-    let len = u32::from(pages.end - pages.start) << 12;
-    if !(base..base + len).contains(&addr) {
-        return false;
-    }
-    let off = addr - base;
-    let mut target = machine::mmio::MmioTarget::Planar { vga: state, base, len };
-    machine::mmio::handle_mmio_fault(machine, regs, &mut target, &segments, def32, off)
+    machine::mmio::planar_fault(machine, regs, state, &segments, limit, def32, addr)
 }
 
 /// Resolve all instruction operands from DOS's descriptors. Only GDT
 /// selectors need arch's table; LDT descriptors are already owned by DOS.
-fn fault_segment_bases<A: crate::Arch>(
+fn fault_segment_bases<A: crate::Core>(
     dos: &thread::DosState<A>,
     regs: &Regs,
 ) -> ([u32; 6], bool) {
@@ -768,16 +753,16 @@ fn fault_segment_bases<A: crate::Arch>(
     (segments, def32)
 }
 
-fn set_tf_source<A: crate::Arch>(dos: &mut thread::DosState<A>, source: u8, on: bool) {
+fn set_tf_source<A: crate::Core>(dos: &mut thread::DosState<A>, source: u8, on: bool) {
     if on { dos.tf_sources |= source; } else { dos.tf_sources &= !source; }
 }
 
-pub(crate) fn prepare_user_tf<A: crate::Arch>(dos: &thread::DosState<A>, regs: &mut Regs) {
+pub(crate) fn prepare_user_tf<A: crate::Core>(dos: &thread::DosState<A>, regs: &mut Regs) {
     regs.set_forced_tf(effective_tf_sources(dos, regs) != 0);
     regs.project_tf();
 }
 
-fn effective_tf_sources<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) -> u8 {
+fn effective_tf_sources<A: crate::Core>(dos: &thread::DosState<A>, regs: &Regs) -> u8 {
     if regs.mode() == crate::UserMode::VM86
         && !dos.dpmi.as_ref().is_some_and(|d| d.vif.is_carrier_trap(regs))
     {
@@ -787,14 +772,14 @@ fn effective_tf_sources<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) 
     }
 }
 
-fn active_tf_sources<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) -> u8 {
+fn active_tf_sources<A: crate::Core>(dos: &thread::DosState<A>, regs: &Regs) -> u8 {
     effective_tf_sources(dos, regs) | if regs.user_tf() { TF_USER } else { 0 }
 }
 
 /// Split the physical TF observed on entry back into guest and kernel state.
 /// The forced-TF shadow records whether the last user entry projected an
 /// internal source, so that projection can never be mistaken for guest TF.
-fn enter_kernel_tf<A: crate::Arch>(
+fn enter_kernel_tf<A: crate::Core>(
     dos: &mut thread::DosState<A>, regs: &mut Regs, event: &crate::KernelEvent,
 ) {
     // KVM implements single-step through KVM_GUESTDBG and consequently strips
@@ -816,7 +801,7 @@ fn enter_kernel_tf<A: crate::Arch>(
     regs.project_tf();
 }
 
-fn refresh_learning_tf<A: crate::Arch>(dos: &mut thread::DosState<A>) {
+fn refresh_learning_tf<A: crate::Core>(dos: &mut thread::DosState<A>) {
     let learning = dos.dpmi.as_ref().is_some_and(|d| d.vif.is_learning());
     set_tf_source(dos, TF_LEARNING, learning);
 }
@@ -826,7 +811,7 @@ fn refresh_learning_tf<A: crate::Arch>(dos: &mut thread::DosState<A>) {
 /// advances IP but does not retire, so the CPU cannot generate the #DB that TF
 /// would normally produce. Looking at the successor here prevents a following
 /// POPF/IRET from silently clearing TF and stranding VIF off.
-fn continue_vif<A: crate::Arch>(
+fn continue_vif<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
@@ -856,7 +841,7 @@ fn continue_vif<A: crate::Arch>(
 
 /// Dispatch the #DB produced by one retired instruction to every TF source
 /// that was active for that instruction.
-fn handle_debug_trap<A: crate::Arch>(
+fn handle_debug_trap<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
@@ -909,7 +894,7 @@ fn handle_debug_trap<A: crate::Arch>(
 ///
 /// `PageFault` is excluded — the loop handles it inline because it needs
 /// access to the full `Thread` (for `signal_thread`).
-pub fn handle_event<A: crate::Arch>(
+pub fn handle_event<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
@@ -946,7 +931,7 @@ pub fn handle_event<A: crate::Arch>(
     }
 }
 
-fn handle_event_inner<A: crate::Arch>(
+fn handle_event_inner<A: crate::Core>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
@@ -1205,7 +1190,7 @@ fn handle_event_inner<A: crate::Arch>(
 
 /// Give a new DOS VGA its own graphics RAM and the managed text backing.
 /// Focus attachment later materializes the virtual device on hardware.
-fn back_vga_window_if_emulated<A: crate::Arch>(machine: &mut A) {
+fn back_vga_window_if_emulated<A: crate::Core>(machine: &mut A) {
     // Every new DOS VGA starts detached, even on a machine that has a card.
     // Focus attachment later materializes this RAM-backed device on hardware.
     crate::kernel::memory::fresh(machine, 0xA0000 >> 12, 0x18000 >> 12);
@@ -1215,16 +1200,16 @@ fn back_vga_window_if_emulated<A: crate::Arch>(machine: &mut A) {
 /// COW source for top-level DOS worlds. It contains only the Rust substitute
 /// BIOS and DOS-owned low memory; native video firmware has a separate
 /// kernel-only workspace in `bios_display`.
-pub struct DosTemplate<A: crate::Arch> {
+pub struct DosTemplate<A: crate::Core> {
     vcpu: crate::Vcpu<A>,
     fx: A::Fx,
 }
 
-impl<A: crate::Arch> DosTemplate<A> {
+impl<A: crate::Core> DosTemplate<A> {
     pub fn new(machine: &mut A) -> Self {
         let mut regs = crate::Regs::empty();
         initialize_dos_template(machine, &mut regs);
-        let mut space = A::PageTable::default();
+        let mut space = A::AddressSpace::default();
         crate::kernel::memory::fork(machine, &mut space);
         machine.free_user_pages();
         Self {
@@ -1236,7 +1221,7 @@ impl<A: crate::Arch> DosTemplate<A> {
     fn activate_clone(&mut self, machine: &mut A) {
         machine.switch_fx(&mut self.fx);
         let previous = machine.activate(core::mem::take(&mut self.vcpu.space));
-        let mut child = A::PageTable::default();
+        let mut child = A::AddressSpace::default();
         crate::kernel::memory::fork(machine, &mut child);
         machine.switch_fx(&mut self.fx);
         self.vcpu.space = machine.activate(child);
@@ -1247,7 +1232,7 @@ impl<A: crate::Arch> DosTemplate<A> {
 
 /// Construct the kernel's pristine real-mode BIOS/DOS-low-memory template.
 /// This is called exactly once; top-level DOS worlds COW-clone the result.
-pub(crate) fn initialize_dos_template<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+pub(crate) fn initialize_dos_template<A: crate::Core>(machine: &mut A, regs: &mut Regs) {
     crate::kernel::memory::map_dos_memory(machine);
     back_vga_window_if_emulated(machine);
     dos::setup_ivt(machine, regs);
@@ -1258,7 +1243,7 @@ pub(crate) fn initialize_dos_template<A: crate::Arch>(machine: &mut A, regs: &mu
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
 #[allow(clippy::too_many_arguments)]
-pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut thread::ThreadTable<A>, tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, policy: LaunchPolicy, vga: DosVideo) {
+pub fn exec_dos_into<A: crate::Core>(machine: &mut A, threads: &mut thread::ThreadTable<A>, tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, policy: LaunchPolicy, vga: DosVideo) {
     let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
     crate::kernel::memory::map_dos_memory(machine);
@@ -1366,7 +1351,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut thread::Thre
 /// caller's `dos`/`kt` borrow releases. Writes the AX/BX/CF result into the
 /// live frame and stays on the caller (`None`).
 #[inline(never)]
-pub(crate) fn handle_synth_child<A: crate::Arch>(
+pub(crate) fn handle_synth_child<A: crate::Core>(
     machine: &mut A,
     threads: &mut thread::ThreadTable<A>,
     regs: &mut Regs,
@@ -1401,7 +1386,7 @@ pub(crate) fn handle_synth_child<A: crate::Arch>(
 
 /// Helper: write CPU state for a freshly loaded VM86 program. Caller has
 /// already populated `current.personality` and run the loader.
-fn init_process_thread_vm86_state<A: crate::Arch>(_machine: &mut A, thread: &mut thread::Thread<A>, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
+fn init_process_thread_vm86_state<A: crate::Core>(_machine: &mut A, thread: &mut thread::Thread<A>, psp_seg: u16, cs: u16, ip: u16, ss: u16, sp: u16) {
     use machine::IOPL_DEFAULT;
     let state = &mut thread.kernel.vcpu.regs;
     *state = Regs::empty();
@@ -1425,11 +1410,11 @@ fn init_process_thread_vm86_state<A: crate::Arch>(_machine: &mut A, thread: &mut
 /// Used by the boot/init path; fork+exec uses `exec_dos_into` instead.
 /// Returns the new tid; caller drives the event loop.
 #[allow(clippy::too_many_arguments)]
-pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosTemplate<A>, threads: &mut thread::ThreadTable<A>, buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
+pub fn run_init_program<A: crate::Core>(machine: &mut A, dos_template: &mut DosTemplate<A>, threads: &mut thread::ThreadTable<A>, buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
 
     dos_template.activate_clone(machine);
 
-    let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
+    let t = thread::create_thread(threads, machine, None, A::AddressSpace::default(), true)
         .expect("Failed to create DOS thread");
     let tid = t.kernel.tid as usize;
 
@@ -1536,7 +1521,7 @@ pub fn windows_abs_to_vfs(path: &[u8], create: bool) -> Option<alloc::vec::Vec<u
 /// `00 00` terminator) into a heap Vec. Used so the parent's env survives
 /// the COW fork's address-space teardown that happens before `map_psp` runs
 /// in the child.
-fn snapshot_env<A: crate::Arch>(machine: &mut A, env_seg: u16) -> alloc::vec::Vec<u8> {
+fn snapshot_env<A: crate::Core>(machine: &mut A, env_seg: u16) -> alloc::vec::Vec<u8> {
     let base = (env_seg as usize) << 4;
     let mut out = alloc::vec::Vec::new();
     let mut prev_was_nul = false;
@@ -1555,7 +1540,7 @@ fn snapshot_env<A: crate::Arch>(machine: &mut A, env_seg: u16) -> alloc::vec::Ve
 /// `dos.current_psp` is always a segment; PSP[0x2C] may have been
 /// converted to a selector at DPMI entry, so use `saved_rm_env` when the
 /// active PSP matches the one whose env we patched.
-pub fn snapshot_parent_env<A: crate::Arch>(machine: &mut A, _regs: &mut Regs, dos: &thread::DosState<A>) -> alloc::vec::Vec<u8> {
+pub fn snapshot_parent_env<A: crate::Core>(machine: &mut A, _regs: &mut Regs, dos: &thread::DosState<A>) -> alloc::vec::Vec<u8> {
     let psp_seg = dos.current_psp;
     let env_seg = match dos.dpmi.as_ref() {
         Some(dpmi) if dpmi.env_ldt_idx != 0 && dpmi.saved_rm_psp == psp_seg => {
@@ -1575,14 +1560,14 @@ pub fn dump_if_ring() {
 
 /// Virtual-IF activity for the focused DPMI client: windows opened, predicted
 /// exits, post-tag debug traps, and instructions stepped while learning.
-pub(in crate::kernel) fn vif_stats<A: crate::Arch>(dos: &DosState<A>) -> Option<(u32, u32, u32, u32)> {
+pub(in crate::kernel) fn vif_stats<A: crate::Core>(dos: &DosState<A>) -> Option<(u32, u32, u32, u32)> {
     dos.dpmi.as_ref().map(|dpmi| {
         let [windows, predicted, debug_traps, steps] = dpmi.vif.stats;
         (windows, predicted, debug_traps, steps)
     })
 }
 
-pub(in crate::kernel) fn vif_profile_site<A: crate::Arch>(dos: &DosState<A>) -> Option<u32> {
+pub(in crate::kernel) fn vif_profile_site<A: crate::Core>(dos: &DosState<A>) -> Option<u32> {
     dos.dpmi.as_ref().and_then(|dpmi| dpmi.vif.active_site())
 }
 
@@ -1593,7 +1578,7 @@ pub fn dump_gus_ring() {
     machine::vgus::dump_gus_ring();
 }
 
-pub fn dump_dpmi_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
+pub fn dump_dpmi_state<A: crate::Core>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
     let Some(dpmi) = dos.dpmi.as_ref() else { return };
     crate::compact_dbg_println!("[DBG] VIF windows={} predicted={} traps={} steps={} active={:08x}",
         dpmi.vif.stats[0], dpmi.vif.stats[1], dpmi.vif.stats[2], dpmi.vif.stats[3],
@@ -1623,19 +1608,19 @@ pub fn dump_dpmi_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A
 }
 
 /// Queue an arch IRQ into this thread's virtual PIC.
-pub fn queue_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, irq: crate::Irq) {
+pub fn queue_irq<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, irq: crate::Irq) {
     machine::queue_irq(machine, &mut dos.pc, regs, irq);
 }
 
 /// Advance the virtual PIT/RTC to `now_ns` and raise IRQ0/IRQ8 when periods
 /// elapsed. The physical IRQ0 wakeup supplies cadence, not elapsed units.
-pub fn advance_timers<A: crate::Arch>(dos: &mut thread::DosState<A>, now_ns: u64) {
+pub fn advance_timers<A: crate::Core>(dos: &mut thread::DosState<A>, now_ns: u64) {
     machine::advance_timers(&mut dos.pc, now_ns);
 }
 
 /// Pump a fullscreen DOS video device. Native VGA scans itself out; an
 /// emulated fullscreen VGA actively renders into the display it owns.
-pub fn pump_fullscreen<A: crate::Arch>(
+pub fn pump_fullscreen<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut thread::DosState<A>,
@@ -1648,7 +1633,7 @@ pub fn pump_fullscreen<A: crate::Arch>(
 
 /// Render state-only DOS VGA through the event loop's compositor display.
 #[allow(clippy::too_many_arguments)]
-pub fn render<A: crate::Arch>(
+pub fn render<A: crate::Core>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut thread::DosState<A>,
@@ -1670,7 +1655,7 @@ pub fn render<A: crate::Arch>(
     );
 }
 
-pub fn surface_buffer<'a, A: crate::Arch>(
+pub fn surface_buffer<'a, A: crate::Core>(
     dos: &'a thread::DosState<A>,
     output_format: vga::PixelFormat,
 ) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
@@ -1683,7 +1668,7 @@ pub fn surface_buffer<'a, A: crate::Arch>(
 /// address space is still active. DOS fork/exec parks the parent immediately
 /// afterward, so its video mappings cannot be rasterized later without a
 /// context switch.
-pub fn snapshot_retained_surface<A: crate::Arch>(
+pub fn snapshot_retained_surface<A: crate::Core>(
     machine: &mut A,
     dos: &mut thread::DosState<A>,
     regs: &Regs,
@@ -1693,7 +1678,7 @@ pub fn snapshot_retained_surface<A: crate::Arch>(
 
 /// Register a previously captured DOS preview with the retained desktop.
 /// This does not move keyboard focus or raise the suspended parent.
-pub fn attach_retained_surface<A: crate::Arch>(
+pub fn attach_retained_surface<A: crate::Core>(
     dos: &thread::DosState<A>,
     desktop: &mut crate::kernel::gui::Desktop,
     endpoint: crate::kernel::gui::EndpointId,
@@ -1704,7 +1689,7 @@ pub fn attach_retained_surface<A: crate::Arch>(
 
 /// Per-slice audio device service (trigger IRQs, DMA-probe completions, GF1
 /// timers and MPU drain) without running the PCM mixer.
-pub fn audio_service<A: crate::Arch>(
+pub fn audio_service<A: crate::Core>(
     machine: &mut A,
     dos: &mut thread::DosState<A>,
     now_ns: u64,
@@ -1724,7 +1709,7 @@ pub fn audio_service<A: crate::Arch>(
 /// `reflect_int_to_real_mode` first, then returns through the same continuation
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
-pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+pub fn raise_pending<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     // Recompute VIP from the DOS PIC at this delivery boundary. Deferred
     // continuations and callbacks must not inherit a stale pending indication.
     regs.clear_flag32(eflags::VIP_FLAG);
@@ -1815,7 +1800,7 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
 /// Mirror `dos.dos_blocks` out as a real DOS Memory Control Block chain
 /// in VM86 memory. Free MCBs are synthesized in the gaps so the chain
 /// walks contiguously from `heap_base_seg` up to 0xA000.
-fn sync_mcb_chain<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, _regs: &mut Regs) {
+fn sync_mcb_chain<A: crate::Core>(machine: &mut A, dos: &DosState<A>, _regs: &mut Regs) {
     // Update the LOL-1 first-MCB pointer. AH=52h returns ES:BX = LOL, and
     // programs (DOS/4G stubs, MEM utilities) read [LOL - 2] = first MCB
     // segment to walk the chain head.
@@ -1855,7 +1840,7 @@ fn sync_mcb_chain<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, _regs: &mu
     }
 }
 
-fn next_dos_block_limit<A: crate::Arch>(dos: &DosState<A>, seg: u16, skip_seg: Option<u16>) -> u16 {
+fn next_dos_block_limit<A: crate::Core>(dos: &DosState<A>, seg: u16, skip_seg: Option<u16>) -> u16 {
     for block in &dos.dos_blocks {
         if Some(block.seg) == skip_seg || block.seg < seg {
             continue;
@@ -1868,7 +1853,7 @@ fn next_dos_block_limit<A: crate::Arch>(dos: &DosState<A>, seg: u16, skip_seg: O
 /// `heap_seg` = first paragraph past the contiguous run of allocated blocks
 /// starting at `heap_base_seg`. Used for the in-process EXEC fan-out as the
 /// "where does the child's arena start" hint.
-fn sync_heap_seg<A: crate::Arch>(dos: &mut DosState<A>) {
+fn sync_heap_seg<A: crate::Core>(dos: &mut DosState<A>) {
     let mut first_free = dos.heap_base_seg;
     for block in &dos.dos_blocks {
         // Block's MCB sits at first_free; data at first_free+1.
@@ -1885,7 +1870,7 @@ fn sync_heap_seg<A: crate::Arch>(dos: &mut DosState<A>) {
 /// Preserve the address-order invariant shared by allocation, gap discovery,
 /// and guest MCB-chain emission.
 #[inline(never)]
-fn insert_dos_block<A: crate::Arch>(dos: &mut DosState<A>, block: DosMemBlock) {
+fn insert_dos_block<A: crate::Core>(dos: &mut DosState<A>, block: DosMemBlock) {
     let mut lo = 0;
     let mut hi = dos.dos_blocks.len();
     while lo < hi {
@@ -1903,7 +1888,7 @@ fn insert_dos_block<A: crate::Arch>(dos: &mut DosState<A>, block: DosMemBlock) {
 /// Largest free *data* paragraphs across all gaps + trailing region.
 /// Each gap loses 1 paragraph to MCB overhead. Used by `load_exe` to size a
 /// max-alloc child against the live (non-reset) MCB chain.
-fn largest_dos_block<A: crate::Arch>(dos: &DosState<A>) -> u16 {
+fn largest_dos_block<A: crate::Core>(dos: &DosState<A>) -> u16 {
     let mut largest_data = 0u16;
     let mut cur = dos.heap_base_seg;
     for block in &dos.dos_blocks {
@@ -1924,18 +1909,18 @@ fn largest_dos_block<A: crate::Arch>(dos: &DosState<A>) -> u16 {
     largest_data
 }
 
-fn dos_reset_blocks<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, base_seg: u16) {
+fn dos_reset_blocks<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, base_seg: u16) {
     dos.heap_base_seg = base_seg;
     dos.heap_seg = base_seg;
     dos.dos_blocks.clear();
     sync_mcb_chain(machine, dos, regs);
 }
 
-fn current_mcb_owner<A: crate::Arch>(dos: &DosState<A>) -> u16 {
+fn current_mcb_owner<A: crate::Core>(dos: &DosState<A>) -> u16 {
     dos.current_psp
 }
 
-fn dos_alloc_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, need: u16) -> Result<u16, u16> {
+fn dos_alloc_block<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, need: u16) -> Result<u16, u16> {
     // Each alloc consumes 1 MCB paragraph + `need` data paragraphs. Quirk
     // preserved from pre-MCB code: AH=48 BX=0 silently succeeds without
     // recording a block (returns the would-be data segment).
@@ -1980,7 +1965,7 @@ fn dos_alloc_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs:
     Ok(data_seg)
 }
 
-fn dos_free_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16) -> Result<(), u16> {
+fn dos_free_block<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16) -> Result<(), u16> {
     if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
         dos.dos_blocks.remove(idx);
         sync_heap_seg(dos);
@@ -1991,7 +1976,7 @@ fn dos_free_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: 
     }
 }
 
-fn dos_set_program_block_owner<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, env_seg: u16, psp_seg: u16, owner: u16) {
+fn dos_set_program_block_owner<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, env_seg: u16, psp_seg: u16, owner: u16) {
     for block in &mut dos.dos_blocks {
         if block.seg == env_seg || block.seg == psp_seg {
             block.owner = owner;
@@ -2000,7 +1985,7 @@ fn dos_set_program_block_owner<A: crate::Arch>(machine: &mut A, dos: &mut DosSta
     sync_mcb_chain(machine, dos, regs);
 }
 
-fn dos_keep_resident_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16, paras: u16, owner: u16) {
+fn dos_keep_resident_block<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16, paras: u16, owner: u16) {
     let paras = paras.min(0xA000u16.saturating_sub(seg));
     if paras == 0 {
         sync_mcb_chain(machine, dos, regs);
@@ -2012,7 +1997,7 @@ fn dos_keep_resident_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A
     sync_mcb_chain(machine, dos, regs);
 }
 
-fn dos_resize_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16, paras: u16) -> Result<(), (u16, u16)> {
+fn dos_resize_block<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16, paras: u16) -> Result<(), (u16, u16)> {
     // Some DOS programs (including Volkov Commander) relocate themselves by
     // enlarging their PSP block, then split its trailing portion into a new
     // MCB themselves before calling AH=4Ah on that child. Accept only a
@@ -2086,7 +2071,7 @@ fn dos_resize_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs
 /// actually covered, and where the Voodoo aperture sits — enough to say
 /// whether the faulting address was simply past a limit. First few only: a
 /// client that GPs repeatedly must not flood the log.
-fn log_pm_gp<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
+fn log_pm_gp<A: crate::Core>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
     use core::sync::atomic::{AtomicU32, Ordering};
     static SEEN: AtomicU32 = AtomicU32::new(0);
     if SEEN.fetch_add(1, Ordering::Relaxed) >= 8 {
@@ -2170,7 +2155,7 @@ fn log_pm_gp<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
 /// Runtime bytes for a protected-mode #UD.  DOS extenders print the selector
 /// and offset, but that alone cannot distinguish an actually invalid encoding
 /// from damaged code or a bad resume point.
-fn log_pm_ud<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
+fn log_pm_ud<A: crate::Core>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
     use core::sync::atomic::{AtomicU32, Ordering};
     static SEEN: AtomicU32 = AtomicU32::new(0);
     if SEEN.fetch_add(1, Ordering::Relaxed) >= 8 {
@@ -2204,7 +2189,7 @@ pub use dfs::{configure_drive, reset_configured_drives};
 
 // Win16 shares the same PM DOS state, selector decoder, handle table, and
 // interrupt continuations as a 16-bit DOS extender.
-pub(crate) fn new_win16<A: crate::Arch>(machine: &mut A, psp: u16) -> alloc::boxed::Box<DosState<A>> {
+pub(crate) fn new_win16<A: crate::Core>(machine: &mut A, psp: u16) -> alloc::boxed::Box<DosState<A>> {
     initialize_dos_template(machine, &mut Regs::empty());
     let mut dos = DosState::new_boxed(machine, DosVideo::Vga(EmulatedVga::initial_mode3()));
     dpmi::install_kernel_ldt_slots(&mut dos);
@@ -2220,7 +2205,7 @@ pub(crate) fn new_win16<A: crate::Arch>(machine: &mut A, psp: u16) -> alloc::box
     dos_keep_resident_block(machine, &mut dos, &mut regs, psp, 0x200, psp);
     dos
 }
-pub(crate) fn win16_int21<A: crate::Arch>(
+pub(crate) fn win16_int21<A: crate::Core>(
     machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>, dos: &mut DosState<A>, regs: &mut Regs,
 ) -> thread::KernelAction {
@@ -2241,7 +2226,7 @@ pub(crate) fn win16_int21<A: crate::Arch>(
         regs.ip32(), regs.code_seg(), machine::guest_flags(regs));
     dos::pmdos_int21_handler(machine, bios, kt, dos, regs)
 }
-pub(crate) fn win16_resume<A: crate::Arch>(
+pub(crate) fn win16_resume<A: crate::Core>(
     machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut DosState<A>, regs: &mut Regs,
 ) -> Option<thread::KernelAction> {
     if dos.suspended_calls.is_empty() { return None; }
@@ -2249,7 +2234,7 @@ pub(crate) fn win16_resume<A: crate::Arch>(
 }
 
 /// Wine's DOS-memory adapter uses the same allocation ledger as INT 21h.
-pub(crate) fn win16_memory<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>,
+pub(crate) fn win16_memory<A: crate::Core>(machine: &mut A, dos: &mut DosState<A>,
     op: u32, address: u32, bytes: u32, exact: bool) -> u32
 {
     let mut regs = Regs::empty();

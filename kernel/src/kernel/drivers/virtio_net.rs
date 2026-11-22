@@ -89,7 +89,7 @@ struct Cap {
     multiplier: usize,
 }
 
-fn capabilities<A: crate::Arch>(
+fn capabilities<A: crate::Core>(
     machine: &mut A,
     address: (u8, u8, u8),
 ) -> Option<(Mmio, Cap, Mmio)> {
@@ -204,7 +204,7 @@ pub struct VirtioNet {
 }
 
 impl VirtioNet {
-    fn bring_up<A: crate::Arch>(machine: &mut A, address: (u8, u8, u8)) -> Option<Self> {
+    fn bring_up<A: crate::Core>(machine: &mut A, address: (u8, u8, u8)) -> Option<Self> {
         let (b, d, f) = address;
         let (common, notify, config) = capabilities(machine, address)?;
         let command = pci::read32(machine, b, d, f, 4) & 0xFFFF;
@@ -358,7 +358,7 @@ impl EthernetDevice for VirtioNet {
     }
 }
 
-pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<VirtioNet> {
+pub fn probe<A: crate::Core>(machine: &mut A) -> Option<VirtioNet> {
     for address @ (b, d, f) in pci::find_classes(machine, 2, 0) {
         let id = pci::read32(machine, b, d, f, 0);
         if id != 0x1000_1AF4 && id != 0x1041_1AF4 {

@@ -5,7 +5,7 @@ use crate::Regs;
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const BIOS_TICK_DIVISOR: u64 = 65_536;
 
-pub(super) fn bios_time_of_day<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8, u8) {
+pub(super) fn bios_time_of_day<A: crate::Core>(machine: &mut A) -> (u8, u8, u8, u8) {
     // BIOS tick count at 0040:006C advances at PIT_INPUT_HZ / 65536 Hz.
     // DOS AH=2Ch returns hundredths, so convert through centiseconds instead
     // of approximating the tick rate as 18 Hz. (BDA = guest address space.)
@@ -24,7 +24,7 @@ pub(super) fn bios_time_of_day<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8, 
     )
 }
 
-fn cmos_read<A: crate::Arch>(machine: &mut A, index: u8) -> u8 {
+fn cmos_read<A: crate::Core>(machine: &mut A, index: u8) -> u8 {
     machine.outb(0x70, index);
     machine.inb(0x71)
 }
@@ -48,7 +48,7 @@ fn day_of_week(mut year: u16, mut month: u8, day: u8) -> u8 {
     ((y + y / 4 - y / 100 + y / 400 + OFFSETS[month as usize - 1] as u32 + day as u32) % 7) as u8
 }
 
-fn raw_cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
+fn raw_cmos_date<A: crate::Core>(machine: &mut A) -> (u16, u8, u8, u8) {
     for _ in 0..10_000 {
         if cmos_read(machine, 0x0A) & 0x80 == 0 {
             break;
@@ -80,7 +80,7 @@ fn raw_cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
 /// RTC time of day as binary (hour, minute, second), handling BCD/binary and
 /// 12/24-hour CMOS formats. Implausible values collapse to midnight — a
 /// wrong-but-sane clock beats letting firmware garbage through.
-fn raw_rtc_time<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8) {
+fn raw_rtc_time<A: crate::Core>(machine: &mut A) -> (u8, u8, u8) {
     for _ in 0..10_000 {
         if cmos_read(machine, 0x0A) & 0x80 == 0 {
             break;
@@ -106,18 +106,18 @@ fn raw_rtc_time<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8) {
 }
 
 /// Local date and time derived together so UTC offsets carry across midnight.
-fn local_rtc<A: crate::Arch>(machine: &mut A) -> ((u16, u8, u8), (u8, u8, u8)) {
+fn local_rtc<A: crate::Core>(machine: &mut A) -> ((u16, u8, u8), (u8, u8, u8)) {
     let (year, month, day, _) = raw_cmos_date(machine);
     let time = raw_rtc_time(machine);
     crate::kernel::clock::rtc_to_local((year, month, day), time)
 }
 
-pub(in crate::kernel::dos) fn cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
+pub(in crate::kernel::dos) fn cmos_date<A: crate::Core>(machine: &mut A) -> (u16, u8, u8, u8) {
     let ((year, month, day), _) = local_rtc(machine);
     (year, month, day, day_of_week(year, month, day))
 }
 
-pub(in crate::kernel::dos) fn rtc_time<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8) {
+pub(in crate::kernel::dos) fn rtc_time<A: crate::Core>(machine: &mut A) -> (u8, u8, u8) {
     local_rtc(machine).1
 }
 
@@ -125,13 +125,13 @@ pub(in crate::kernel::dos) fn rtc_time<A: crate::Arch>(machine: &mut A) -> (u8, 
 /// POST stores at 40:6C. Guarded time source: DOS/4GW's 16-bit ticks→time
 /// conversion #DEs on a counter whose high word exceeds ~24 hours' worth of
 /// ticks, so this never returns more than a day.
-pub(in crate::kernel::dos) fn rtc_ticks_today<A: crate::Arch>(machine: &mut A) -> u32 {
+pub(in crate::kernel::dos) fn rtc_ticks_today<A: crate::Core>(machine: &mut A) -> u32 {
     let (hour, min, sec) = rtc_time(machine);
     let secs = (hour as u64) * 3600 + (min as u64) * 60 + sec as u64;
     (secs * PIT_INPUT_HZ / BIOS_TICK_DIVISOR) as u32
 }
 
-pub(super) fn current_dos_timestamp<A: crate::Arch>(machine: &mut A, _regs: &Regs) -> (u16, u16) {
+pub(super) fn current_dos_timestamp<A: crate::Core>(machine: &mut A, _regs: &Regs) -> (u16, u16) {
     let (hour, min, sec, _) = bios_time_of_day(machine);
     let (year, month, day, _) = cmos_date(machine);
     let dos_time = ((hour as u16) << 11) | ((min as u16) << 5) | ((sec as u16) / 2);
@@ -236,7 +236,7 @@ mod tests {
 }
 
 /// A Windows PMDOS client has no BIOS IRQ0 handler advancing the BDA clock.
-pub(super) fn host_time<A: crate::Arch>(machine: &A, dos: &crate::kernel::dos::DosState<A>) -> Option<([u16; 8], u8)> {
+pub(super) fn host_time<A: crate::Core>(machine: &A, dos: &crate::kernel::dos::DosState<A>) -> Option<([u16; 8], u8)> {
     let (epoch, start) = dos.host_clock?;
     let centis = epoch * 100 + machine.now().saturating_sub(start) / 10_000_000;
     Some((crate::kernel::clock::calendar_from_unix((centis / 100) as i64), (centis % 100) as u8))
