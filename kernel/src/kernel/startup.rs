@@ -21,25 +21,20 @@ pub enum Storage {
 /// the boot story. Called from enter_ring1 — we are already at ring 1.
 pub fn startup<A: crate::Core>(machine: &mut A, boot: &crate::BootConfig,
     storage: Storage) -> ! {
-    let mut state = core::mem::MaybeUninit::<StartupState<A>>::uninit();
-    prepare_startup(machine, boot, storage, &mut state);
     let StartupState {
-        ref master_env,
-        ref mut bios_workspace,
-        ref mut dos_template,
-        ref mut threads,
+        mut runtime,
         screen,
         sb_card,
         sink,
-    } = unsafe { state.assume_init() };
+    } = prepare_startup(machine, boot, storage);
 
     run(
         machine,
         boot,
-        master_env,
-        bios_workspace,
-        dos_template,
-        threads,
+        &runtime.master_env,
+        &mut runtime.bios_workspace,
+        &mut runtime.dos_template,
+        &mut runtime.threads,
         screen,
         sb_card,
         sink,
@@ -47,25 +42,27 @@ pub fn startup<A: crate::Core>(machine: &mut A, boot: &crate::BootConfig,
 }
 
 struct StartupState<A: crate::Core> {
-    master_env: alloc::vec::Vec<u8>,
-    bios_workspace: crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    dos_template: crate::kernel::dos::DosTemplate<A>,
-    threads: thread::ThreadTable<A>,
+    runtime: alloc::boxed::Box<Runtime<A>>,
     screen: crate::kernel::console::Console,
     sb_card: Option<crate::kernel::drivers::sb16::Sb16>,
     sink: Option<crate::kernel::sound::Sink>,
 }
 
-/// Perform one-shot discovery and construct the runtime objects directly in
-/// the caller's one persistent state slot.  This call boundary lets probe and
-/// formatting temporaries leave the stack before the non-returning flow.
+struct Runtime<A: crate::Core> {
+    master_env: alloc::vec::Vec<u8>,
+    bios_workspace: crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    dos_template: crate::kernel::dos::DosTemplate<A>,
+    threads: thread::ThreadTable<A>,
+}
+
+/// Keep one-shot discovery and the resident runtime allocation out of the
+/// non-returning event loop's stack frame.
 #[inline(never)]
 fn prepare_startup<A: crate::Core>(
     machine: &mut A,
     boot: &crate::BootConfig,
     storage: Storage,
-    out: &mut core::mem::MaybeUninit<StartupState<A>>,
-) {
+) -> StartupState<A> {
     super::platform::init_user_tsc_clock(boot.user_tsc_clock);
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
@@ -114,8 +111,7 @@ fn prepare_startup<A: crate::Core>(
         }
         Storage::Root(root) => {
             vfs::mount(b"", root);
-            crate::kernel::dos::set_c_root(boot.c_root());
-            crate::kernel::dos::configure_drive(b'C', crate::kernel::dos::c_root());
+            crate::kernel::dos::configure_c_root(boot.c_root());
             mount_kernel_log_fs();
             crate::kernel::fs::cdrom::init();
             crate::kernel::fs::floppy::init();
@@ -144,15 +140,11 @@ fn prepare_startup<A: crate::Core>(
     // DOS worlds are cloned from their substitute-BIOS template.
     let dos_template = crate::kernel::dos::DosTemplate::new(machine);
 
-    out.write(StartupState {
-        master_env,
-        bios_workspace,
-        dos_template,
-        threads,
-        screen,
-        sb_card,
-        sink,
-    });
+    let runtime = alloc::boxed::Box::write(
+        alloc::boxed::Box::new_uninit(),
+        Runtime { master_env, bios_workspace, dos_template, threads },
+    );
+    StartupState { runtime, screen, sb_card, sink }
 }
 
 struct PreparedAudio {
@@ -460,7 +452,7 @@ fn load_midi_bank<A: crate::Core>(
             | crate::kernel::platform::Audio::EmulatedSilent)
     {
         crate::screenln!(screen => machine, bios_workspace; "Loading General MIDI bank...");
-        crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root());
+        crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root().as_bytes());
         crate::screenln!(screen => machine, bios_workspace; "General MIDI bank load complete");
     }
 }
@@ -591,7 +583,7 @@ fn mount_filesystems(
 /// The supplied user INI is visible to COMMAND.COM and application launch policy.
 /// A persistent C: file keeps its original backing; USB uses an editable RAM copy.
 fn expose_user_config(bytes: &[u8], disk_settings: bool) {
-    let path = [crate::kernel::dos::c_root(), b"RETROOS/RETROOS.INI"].concat();
+    let path = [crate::kernel::dos::c_root().as_bytes(), b"RETROOS/RETROOS.INI"].concat();
     if disk_settings && let Some(file) = vfs::open_backing(&path) {
         file.close();
         return;
@@ -612,6 +604,7 @@ fn mount_kernel_log_fs() {
     vfs::mount_union_readonly(b"proc/", &crate::kernel::fs::processes::PROCESSES);
 
     let c_root = crate::kernel::dos::c_root();
+    let c_root = c_root.as_bytes();
     if !c_root.is_empty() {
         let dos_proc_prefix: &'static [u8] =
             alloc::boxed::Box::leak([c_root, b"proc/"].concat().into_boxed_slice());
@@ -626,6 +619,7 @@ fn load_master_env() -> alloc::vec::Vec<u8> {
     if let Some(env) = BOOT_ENV.lock().as_ref() { return env.clone(); }
     // Directory-backed and hosted boots use the same INI format.
     let root = crate::kernel::dos::c_root();
+    let root = root.as_bytes();
     let path = [root, b"RETROOS/RETROOS.INI"].concat();
     match crate::kernel::exec::load_file_resolved(&path) {
         Ok(bytes) => {
@@ -950,7 +944,7 @@ fn run<A: crate::Core>(
 
     crate::compact_screenln!(&mut screen, "Welcome to RetroOS! F12 opens the host monitor.");
 
-    let (start_path, start_tail) = startup_command(master_env, crate::kernel::dos::c_root());
+    let (start_path, start_tail) = startup_command(master_env, crate::kernel::dos::c_root().as_bytes());
     crate::compact_screenln!(&mut screen, "Starting {}...",
         core::str::from_utf8(&start_path).unwrap_or("?"));
     match crate::kernel::klog::save_boot_snapshot(machine) {
@@ -1096,7 +1090,7 @@ fn prepare_program<A: crate::Core>(
     if is_batch {
         let mut dos_path = [0u8; dos::DFS_PATH_MAX];
         let dos_len = dos::vfs_to_dos(path, &mut dos_path);
-        launch_path = [dos::c_root(), b"RETROOS/COMMAND.COM"].concat();
+        launch_path = [dos::c_root().as_bytes(), b"RETROOS/COMMAND.COM"].concat();
         launch_tail = b"/C ".to_vec();
         launch_tail.extend_from_slice(&dos_path[..dos_len]);
         if !cmdline_tail.is_empty() {
@@ -1113,7 +1107,7 @@ fn prepare_program<A: crate::Core>(
     let (buf, loaded_path) = match exec::load_executable_resolved(&launch_path) {
         Ok(buf) => (buf, launch_path.clone()),
         Err(_) => {
-            let path = [crate::kernel::dos::c_root(), &launch_path].concat();
+            let path = [crate::kernel::dos::c_root().as_bytes(), &launch_path].concat();
             let buf = exec::load_executable_resolved(&path)
                 .unwrap_or_else(|_| lib::compact_panic!("{} not found", core::str::from_utf8(&launch_path).unwrap_or("?")));
             (buf, path)
@@ -1393,11 +1387,12 @@ fn present_desktop<A: crate::Core>(
     );
     osd_sample.finish(machine, crate::kernel::osd_profile::Stage::Osd, 0);
     let format = display.rgb;
+    let terminal = crate::kernel::term::surface();
     let resolve = |endpoint: crate::kernel::gui::EndpointId,
                    key: crate::kernel::gui::SurfaceKey| {
         if endpoint == crate::kernel::linux::CONSOLE_ENDPOINT {
             return (key == crate::kernel::gui::SurfaceKey(1))
-                .then(crate::kernel::term::surface_buffer).flatten();
+                .then(|| terminal.buffer()).flatten();
         }
         threads
             .get(endpoint.0 as usize)?
@@ -1447,11 +1442,11 @@ fn event_loop<A: crate::Core>(
     let mut last_osd_composite_period = u64::MAX;
     let mut last_world_ns = machine.now();
     let mut exiting_display = None;
-    let audio = unsafe { crate::kernel::media::AudioService::new(
+    let audio = crate::kernel::media::AudioService::new(
         crate::kernel::sound::Engine::new(sink.take(), machine.now()),
         crate::kernel::sound::Engine::due,
         crate::kernel::sound::Engine::poll,
-    ) };
+    );
     let mut audio_source = None;
     let mut cached_sound = crate::kernel::osd::SoundView::KernelSilent;
     let mut sound_view_tick = u64::MAX;
@@ -1776,7 +1771,7 @@ fn event_loop<A: crate::Core>(
         {
             let software = !crate::kernel::osd::midi_hda_enabled();
             if software && crate::kernel::midi_bank::get().is_none() {
-                crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root());
+                crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root().as_bytes());
             }
             if software && crate::kernel::midi_bank::get().is_none() {
                 crate::compact_println!("MIDI: HDA synth unavailable: no General MIDI bank");
@@ -2169,7 +2164,7 @@ fn apply_sound_mode_request<A: crate::Core>(
             };
             if crate::kernel::midi_bank::get().is_none() {
                 crate::compact_println!("Loading General MIDI bank for SB kernel mixing...");
-                crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root());
+                crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root().as_bytes());
             }
             if let Some(hda) = sink.as_mut().filter(|sink| sink.is_hda()) {
                 hda.park_sb(card);
@@ -3399,16 +3394,14 @@ fn dump_virtual_hw<A: crate::Core>(machine: &mut A, dos: &thread::DosState<A>) {
     crate::kernel::dos::dump_gus_ring();
 }
 
-/// Is cycle profiling on? Written by the F12 monitor, read by the
-/// event loop — the same single-threaded volatile-flag shape as
-/// the window picker's atomic target.
+/// The monitor controls cycle profiling for the event loop and workers.
 static PROFILE_DUMP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 pub fn reset_profile() {
     lib::heap::profile_reset();
     PROFILE_RESET.store(true, core::sync::atomic::Ordering::Relaxed);
-    unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, ProfileSnapshot::EMPTY) };
-    unsafe { core::ptr::write_volatile(&raw mut PROFILE_TOTALS, ProfileTotals::EMPTY) };
+    *PROFILE_SNAPSHOT.lock() = ProfileSnapshot::EMPTY;
+    *PROFILE_TOTALS.lock() = ProfileTotals::EMPTY;
     PROFILE_GENERATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     crate::kernel::osd_profile::reset();
     super::event_profile::reset();
@@ -3444,22 +3437,20 @@ pub(crate) fn detail_profile_enabled() -> bool {
 /// 31h synth AH=02/03) so a log captures just that program. Default OFF so
 /// boot/init/DN startup stay silent until something enables it.
 static SYSCALL_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-static mut FILESYSTEM_TRACE: bool = false;
+static FILESYSTEM_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static PROCESS_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Set the trace gate directly (the COMMAND.COM bracket path).
 pub fn set_trace(on: bool) {
     PROCESS_TRACE.store(false, core::sync::atomic::Ordering::Relaxed);
-    unsafe {
-        SYSCALL_TRACE.store(on, core::sync::atomic::Ordering::Relaxed);
-        core::ptr::write_volatile(&raw mut FILESYSTEM_TRACE, false);
-    }
+    SYSCALL_TRACE.store(on, core::sync::atomic::Ordering::Relaxed);
+    FILESYSTEM_TRACE.store(false, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Trace Linux filesystem metadata without clock/futex traffic obscuring I/O.
 pub fn set_filesystem_trace() {
     set_trace(true);
-    unsafe { core::ptr::write_volatile(&raw mut FILESYSTEM_TRACE, true) };
+    FILESYSTEM_TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Trace process lifecycle and signal syscalls without clock/read traffic.
@@ -3474,7 +3465,7 @@ pub fn trace_linux_syscall(nr: u32, wide: bool) -> bool {
         return if wide { matches!(nr, 56..=62 | 200 | 231 | 234 | 435) }
             else { matches!(nr, 1 | 2 | 7 | 11 | 37 | 114 | 120 | 190 | 238 | 252 | 270 | 435) };
     }
-    if !unsafe { core::ptr::read_volatile(&raw const FILESYSTEM_TRACE) } { return true; }
+    if !FILESYSTEM_TRACE.load(core::sync::atomic::Ordering::Relaxed) { return true; }
     if wide {
         matches!(nr, 2..=6 | 8 | 21 | 72..=91 | 217 | 257..=269 | 280 | 316 | 332 | 436)
     } else {
@@ -3485,7 +3476,7 @@ pub fn trace_linux_syscall(nr: u32, wide: bool) -> bool {
 /// Toggle syscall tracing, reporting which way it went (the F12 Trace item).
 pub fn toggle_trace() {
     PROCESS_TRACE.store(false, core::sync::atomic::Ordering::Relaxed);
-    unsafe { core::ptr::write_volatile(&raw mut FILESYSTEM_TRACE, false) };
+    FILESYSTEM_TRACE.store(false, core::sync::atomic::Ordering::Relaxed);
     let on = !SYSCALL_TRACE.fetch_xor(true, core::sync::atomic::Ordering::Relaxed);
     crate::compact_println!("[trace] syscall tracing {}", if on { "ON" } else { "off" });
 }
@@ -3520,7 +3511,7 @@ impl ProfileSnapshot {
     const EMPTY: Self = Self { guest: 0, kernel: 0, parts: [0; PROFILE_BUCKETS], irq_parts: [0; 2], cycles: 0 };
 }
 
-static mut PROFILE_SNAPSHOT: ProfileSnapshot = ProfileSnapshot::EMPTY;
+static PROFILE_SNAPSHOT: spin::Mutex<ProfileSnapshot> = spin::Mutex::new(ProfileSnapshot::EMPTY);
 pub(super) const PROFILE_TOTAL_NAMES: [&str; 11] = [
     "guest_arch", "loop", "irq_drain", "devices", "audio", "display",
     "input", "dispatch", "scheduler", "serial_control", "idle",
@@ -3535,11 +3526,11 @@ pub(super) struct ProfileTotals {
 impl ProfileTotals {
     const EMPTY: Self = Self { elapsed_ns: 0, started_ns: 0, stopped_ns: 0, cycles: [0; 11] };
 }
-static mut PROFILE_TOTALS: ProfileTotals = ProfileTotals::EMPTY;
+static PROFILE_TOTALS: spin::Mutex<ProfileTotals> = spin::Mutex::new(ProfileTotals::EMPTY);
 static PROFILE_GENERATION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub(super) fn profile_generation() -> u32 { PROFILE_GENERATION.load(core::sync::atomic::Ordering::Relaxed) }
 pub(super) fn profile_totals() -> ProfileTotals {
-    unsafe { core::ptr::read_volatile(&raw const PROFILE_TOTALS) }
+    *PROFILE_TOTALS.lock()
 }
 static PROFILE_RESET: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -3547,7 +3538,7 @@ static PROFILE_REBASE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 pub fn profile_snapshot() -> ProfileSnapshot {
-    unsafe { core::ptr::read_volatile(&raw const PROFILE_SNAPSHOT) }
+    *PROFILE_SNAPSHOT.lock()
 }
 
 fn profile_bytes(bytes: &[u8]) {
@@ -3635,7 +3626,7 @@ impl EventStats {
         if !self.active { return; }
         self.mark(machine, PROFILE_SERIAL_CONTROL);
         let totals = self.totals(machine.now().saturating_sub(self.started_ns));
-        unsafe { core::ptr::write_volatile(&raw mut PROFILE_TOTALS, totals); }
+        *PROFILE_TOTALS.lock() = totals;
     }
 
     pub(super) fn control_start(&mut self, machine: &mut impl crate::Core) {
@@ -3683,7 +3674,7 @@ impl EventStats {
         }
         self.last_tsc = now;
         let totals = self.totals(machine.now().saturating_sub(self.started_ns));
-        unsafe { core::ptr::write_volatile(&raw mut PROFILE_TOTALS, totals); }
+        *PROFILE_TOTALS.lock() = totals;
     }
 
     fn totals(&self, elapsed_ns: u64) -> ProfileTotals {
@@ -3749,7 +3740,7 @@ impl EventStats {
         self.kernel_cycles[PROFILE_DISPATCH] = self.kernel_cycles[PROFILE_DISPATCH].wrapping_add(device_cycles);
         self.last_tsc = now;
         if now.wrapping_sub(self.last_publish) >= Self::PUBLISH_CYCLES {
-            unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, self.snapshot()) };
+            *PROFILE_SNAPSHOT.lock() = self.snapshot();
             self.last_publish = now;
         }
     }

@@ -1899,9 +1899,9 @@ fn blit_scaled(
         draw.width as usize * draw.height as usize);
     // Surface pixels and the composition target are resident kernel storage.
     // Join before resolving another surface or mutating the retained scene.
-    unsafe { crate::kernel::media::graphics(|| {
+    crate::kernel::media::graphics(|| {
         blit_scaled_local(source, destination, clip, opacity, target);
-    }); }
+    });
 }
 
 #[optimize(speed)]

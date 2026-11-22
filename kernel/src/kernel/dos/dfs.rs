@@ -21,6 +21,8 @@
 //! Cwd is stored per the CDS convention: uppercase, no drive letter,
 //! no leading or trailing backslash. Root is the empty string. e.g.
 //! `"BORLANDC\BIN"`.
+
+#![forbid(unsafe_code)]
 use crate::kernel::vfs;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -47,9 +49,11 @@ pub const DFS_CWD_MAX: usize = 64;
 
 pub mod ci {
     use super::*;
+    use alloc::sync::Arc;
 
+    #[derive(Clone)]
     pub struct Entry {
-        pub original: Vec<u8>,
+        pub original: Arc<[u8]>,
         pub size: u32,
         pub is_dir: bool,
         pub attributes: u8,
@@ -58,17 +62,19 @@ pub mod ci {
     }
 
     struct DirCi {
-        entries: Vec<(Vec<u8>, Entry)>,
-        aliases: BTreeMap<Vec<u8>, usize>,
+        entries: Vec<(Arc<[u8]>, Entry)>,
+        aliases: BTreeMap<Arc<[u8]>, usize>,
     }
 
-    static mut CI_CACHE: BTreeMap<Vec<u8>, DirCi> = BTreeMap::new();
-    static mut CI_GENERATION: u64 = u64::MAX;
-
-    fn cache() -> &'static mut BTreeMap<Vec<u8>, DirCi> {
-        let p = &raw mut CI_CACHE;
-        unsafe { &mut *p }
+    struct Cache {
+        dirs: BTreeMap<Vec<u8>, Arc<DirCi>>,
+        generation: u64,
     }
+
+    static CACHE: spin::Mutex<Cache> = spin::Mutex::new(Cache {
+        dirs: BTreeMap::new(),
+        generation: u64::MAX,
+    });
 
     /// Trim trailing `/` so cache keys are canonical.
     fn norm(vfs_dir: &[u8]) -> &[u8] {
@@ -94,7 +100,7 @@ pub mod ci {
         }
         let aliases = assign_directory_aliases(&listed);
         for (e, alias) in listed.into_iter().zip(aliases) {
-            let original = e.name[..e.name_len].to_vec();
+            let original = Arc::<[u8]>::from(&e.name[..e.name_len]);
             // DOS has no symbolic-link file type. Present a link to a
             // directory as the directory it resolves to, otherwise file
             // managers such as DN/NC render it as a file and refuse to enter
@@ -113,6 +119,7 @@ pub mod ci {
                 attributes = (attributes & !0x20) | 0x10;
             }
             let entry_index = dir.entries.len();
+            let alias = Arc::<[u8]>::from(alias);
             dir.aliases.insert(alias.clone(), entry_index);
             dir.entries.push((alias, Entry {
                 original,
@@ -125,59 +132,49 @@ pub mod ci {
         dir
     }
 
-    fn ensure_cached(vfs_dir: &[u8]) -> &'static DirCi {
-        let generation = vfs::directory_generation();
-        let generation_ptr = &raw mut CI_GENERATION;
-        if unsafe { *generation_ptr } != generation {
-            reset_cache(generation);
-        }
+    fn ensure_cached(vfs_dir: &[u8]) -> Arc<DirCi> {
         let key = norm(vfs_dir);
-        if let Some(dir) = cache().get(key) { return dir; }
-        cache_miss(key)
+        loop {
+            let generation = vfs::directory_generation();
+            {
+                let mut cache = CACHE.lock();
+                if cache.generation != generation {
+                    cache.dirs.clear();
+                    cache.generation = generation;
+                }
+                if let Some(dir) = cache.dirs.get(key) { return dir.clone(); }
+            }
+            let built = Arc::new(build(key));
+            if vfs::directory_generation() != generation { continue; }
+            let mut cache = CACHE.lock();
+            if cache.generation != generation { continue; }
+            return cache.dirs.entry(key.to_vec()).or_insert(built).clone();
+        }
     }
 
-    #[cold]
-    #[inline(never)]
-    fn reset_cache(generation: u64) {
-        cache().clear();
-        unsafe { CI_GENERATION = generation };
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn cache_miss(key: &[u8]) -> &'static DirCi {
-        let built = build(key);
-        let c = cache();
-        c.insert(key.to_vec(), built);
-        c.get(key).unwrap()
-    }
-
-    /// Look up `alias` (uppercase 8.3) in `vfs_dir`. Returns the original VFS
-    /// name on hit. Populates the cache on miss.
-    pub fn lookup(vfs_dir: &[u8], alias: &[u8]) -> Option<&'static [u8]> {
+    /// Look up an uppercase 8.3 alias and retain the original VFS name.
+    pub fn lookup(vfs_dir: &[u8], alias: &[u8]) -> Option<Arc<[u8]>> {
         let dir = ensure_cached(vfs_dir);
         if let Some(&index) = dir.aliases.get(alias) {
-            return Some(dir.entries[index].1.original.as_slice());
+            return Some(dir.entries[index].1.original.clone());
         }
         let decoded = lfn::decode_oem(alias);
         dir.entries.iter().find(|(_, entry)| lfn::equal(&entry.original, &decoded))
-            .map(|(_, entry)| entry.original.as_slice())
+            .map(|(_, entry)| entry.original.clone())
     }
 
     /// LFN lookup accepts either namespace spelling; matching policy is DOS
     /// policy even when the backing filesystem is case-sensitive.
-    pub fn lookup_lfn(vfs_dir: &[u8], name: &[u8]) -> Option<(&'static [u8], &'static Entry)> {
+    pub fn lookup_lfn(vfs_dir: &[u8], name: &[u8]) -> Option<(Arc<[u8]>, Entry)> {
         let dir = ensure_cached(vfs_dir);
         dir.entries.iter().find(|(alias, _)| lfn::equal(&lfn::decode_oem(alias), name))
             .or_else(|| dir.entries.iter().find(|(_, entry)| lfn::equal(&entry.original, name)))
-            .map(|(alias, entry)| (alias.as_slice(), entry))
+            .cloned()
     }
 
-    /// Get the entry at `idx` in the backing directory's order. Used by
-    /// find_first/find_next, which copies these straight into the DTA.
-    pub fn entry_at(vfs_dir: &[u8], idx: usize) -> Option<(&'static [u8], &'static Entry)> {
-        let dir = ensure_cached(vfs_dir);
-        dir.entries.get(idx).map(|(a, e)| (a.as_slice(), e))
+    /// Get the entry at `idx` in the backing directory's order.
+    pub fn entry_at(vfs_dir: &[u8], idx: usize) -> Option<(Arc<[u8]>, Entry)> {
+        ensure_cached(vfs_dir).entries.get(idx).cloned()
     }
 
 }
@@ -329,9 +326,14 @@ static CONFIG_DRIVES: spin::Mutex<Vec<(u8, &'static [u8])>> = spin::Mutex::new(V
 
 pub fn reset_configured_drives() { CONFIG_DRIVES.lock().clear(); CONFIGURED_LAYOUT.store(false, core::sync::atomic::Ordering::Relaxed); set_c_root(b""); }
 
-pub fn configure_drive(drive: u8, prefix: &'static [u8]) {
+pub(crate) fn configure_c_root(prefix: &[u8]) {
     CONFIGURED_LAYOUT.store(true, core::sync::atomic::Ordering::Relaxed);
-    if drive == b'C' { set_c_root(prefix); return; }
+    set_c_root(prefix);
+}
+
+pub fn configure_drive(drive: u8, prefix: &'static [u8]) {
+    if drive == b'C' { configure_c_root(prefix); return; }
+    CONFIGURED_LAYOUT.store(true, core::sync::atomic::Ordering::Relaxed);
     CONFIG_DRIVES.lock().push((drive, prefix));
 }
 
@@ -460,6 +462,7 @@ impl DfsState {
         // otherwise the DOS cwd is a driveless "HOME\RETROOS\BOOT" and every
         // cwd-relative open fails.
         let cr = c_root();
+        let cr = cr.as_bytes();
         if s.len() >= cr.len() && &s[..cr.len()] == cr {
             s = &s[cr.len()..];
         }
@@ -598,23 +601,26 @@ impl DfsState {
 /// root, or the entire selected FAT volume, unless BootConfig supplies an
 /// explicit override. Linux keeps the real `/`.
 /// DOS startup files live in the ordinary `c_root() + "RETROOS/"` directory.
-static mut C_ROOT_BUF: [u8; 128] = [0; 128];
-static mut C_ROOT_LEN: usize = 0;
+#[derive(Clone, Copy)]
+pub struct DriveRoot {
+    bytes: [u8; 128],
+    len: usize,
+}
+impl DriveRoot {
+    pub fn as_bytes(&self) -> &[u8] { &self.bytes[..self.len] }
+}
+static C_ROOT: spin::Mutex<DriveRoot> = spin::Mutex::new(DriveRoot { bytes: [0; 128], len: 0 });
 
-/// Set the C: → VFS prefix during storage setup, before any DOS resolution.
+/// Set the C: → VFS prefix during storage setup.
 pub fn set_c_root(prefix: &[u8]) {
-    let n = prefix.len().min(128);
-    unsafe {
-        C_ROOT_BUF[..n].copy_from_slice(&prefix[..n]);
-        C_ROOT_LEN = n;
-    }
+    let mut root = C_ROOT.lock();
+    let len = prefix.len().min(root.bytes.len());
+    root.bytes[..len].copy_from_slice(&prefix[..len]);
+    root.len = len;
 }
 
-/// The C: → VFS prefix (e.g. `home/retroos/`, or empty for root).
-#[allow(static_mut_refs)]
-pub fn c_root() -> &'static [u8] {
-    unsafe { &C_ROOT_BUF[..C_ROOT_LEN] }
-}
+/// A snapshot of the C: → VFS prefix (e.g. `home/retroos/`).
+pub fn c_root() -> DriveRoot { *C_ROOT.lock() }
 
 /// Convert a VFS-form path back to drive-qualified DOS form. Used only on
 /// the initial exec path, where we have an already-resolved VFS path and
@@ -627,7 +633,7 @@ pub fn vfs_to_dos(vfs: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> usize {
         s = rest;
         drive
     } else {
-        if let Some(rest) = s.strip_prefix(c_root()) { s = rest; }
+        if let Some(rest) = s.strip_prefix(c_root().as_bytes()) { s = rest; }
         b'C'
     };
     let mut pos = 0;
@@ -653,10 +659,11 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8])
     if abs_dos.len() < 3 || abs_dos[1] != b':' || abs_dos[2] != b'\\' {
         return Err(3);
     }
+    let root;
     let prefix: &[u8] = match abs_dos[0] {
         b'A' => b"floppya/",
         b'B' => b"floppyb/",
-        b'C' => c_root(),
+        b'C' => { root = c_root(); root.as_bytes() },
         b'D' => b"cdrom/",
         drive => extra_drive_prefix(drive).ok_or(15)?,
     };
@@ -706,7 +713,7 @@ fn walk_components(
         // trailing slash) is the cache key.
         let dir_slice = &out[..*pos];
         let original = if lfn {
-            ci::lookup_lfn(dir_slice, comp).map(|(_, entry)| entry.original.as_slice())
+            ci::lookup_lfn(dir_slice, comp).map(|(_, entry)| entry.original)
         } else {
             ci::lookup(dir_slice, comp)
         };
@@ -716,7 +723,7 @@ fn walk_components(
                     if *pos >= out.len() { return Err(3); }
                     out[*pos] = b'/'; *pos += 1;
                 }
-                for &b in original {
+                for &b in original.iter() {
                     if *pos >= out.len() { return Err(3); }
                     out[*pos] = b; *pos += 1;
                 }

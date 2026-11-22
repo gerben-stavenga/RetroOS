@@ -91,54 +91,46 @@ fn two_core_priority_handoff_and_drop_fences() {
     // No AP: identical jobs execute inline.
 
     let mut inline = media::Graphics::new(3usize);
-    unsafe {
-        inline.start(|value| *value *= 2);
-    }
+    inline.start(|value| *value *= 2);
     assert_eq!(*inline.get_mut(), 6);
     let expected_pixels = voodoo_frame();
 
     std::thread::spawn(|| {
         ON_WORKER.with(|flag| flag.set(true));
-        unsafe {
-            media::worker(|| {
-                REFRESHES.fetch_add(1, Ordering::Relaxed);
-            })
-        }
+        media::worker(|| {
+            REFRESHES.fetch_add(1, Ordering::Relaxed);
+        })
     });
     while !media::enabled() {
         std::thread::yield_now();
     }
     let mut drawing = media::Graphics::new(0usize);
-    unsafe {
-        drawing.start(|value| {
-            GRAPHICS_STARTED.store(true, Ordering::Release);
-            while !AUDIO_RAN.load(Ordering::Acquire) {
-                media::checkpoint();
-            }
-            *value = 42;
-        });
-    }
+    drawing.start(|value| {
+        GRAPHICS_STARTED.store(true, Ordering::Release);
+        while !AUDIO_RAN.load(Ordering::Acquire) {
+            media::checkpoint();
+        }
+        *value = 42;
+    });
     while !GRAPHICS_STARTED.load(Ordering::Acquire) {
         std::thread::yield_now();
     }
     // Queue another graphics command while the first is running. Audio must
     // still run INSIDE the first command, not behind either graphics job.
     let mut queued = media::Graphics::new(0usize);
-    unsafe {
-        queued.start(|value| *value = 91);
-    }
+    queued.start(|value| *value = 91);
     static POLLS: AtomicUsize = AtomicUsize::new(0);
     static DUE: AtomicBool = AtomicBool::new(false);
     static HOLD_AUDIO: AtomicBool = AtomicBool::new(false);
     static AUDIO_HELD: AtomicBool = AtomicBool::new(false);
-    let service = unsafe { media::AudioService::new((), || DUE.load(Ordering::Acquire), |_| {
+    let service = media::AudioService::new((), || DUE.load(Ordering::Acquire), |_| {
         POLLS.fetch_add(1, Ordering::Relaxed);
         AUDIO_RAN.store(true, Ordering::Release);
         if HOLD_AUDIO.load(Ordering::Acquire) {
             AUDIO_HELD.store(true, Ordering::Release);
             while HOLD_AUDIO.load(Ordering::Acquire) { core::hint::spin_loop(); }
         }
-    }) };
+    });
     let refreshes = REFRESHES.load(Ordering::Acquire);
     for _ in 0..100 { std::thread::yield_now(); }
     assert_eq!(POLLS.load(Ordering::Acquire), 0);
@@ -151,10 +143,10 @@ fn two_core_priority_handoff_and_drop_fences() {
     static BLOCKED: AtomicBool = AtomicBool::new(false);
     static RELEASE: AtomicBool = AtomicBool::new(false);
     let mut blocker = media::Graphics::new(());
-    unsafe { blocker.start(|_| {
+    blocker.start(|_| {
         BLOCKED.store(true, Ordering::Release);
         while !RELEASE.load(Ordering::Acquire) { core::hint::spin_loop(); }
-    }); }
+    });
     while !BLOCKED.load(Ordering::Acquire) { std::thread::yield_now(); }
     let before = POLLS.load(Ordering::Acquire);
     for _ in 0..100 { media::checkpoint(); }
@@ -175,12 +167,10 @@ fn two_core_priority_handoff_and_drop_fences() {
 
     let mut pixels = vec![0usize; 4096];
     for sequence in 1..128 {
-        let sum = unsafe {
-            media::graphics(|| {
-                pixels.fill(sequence);
-                pixels.iter().sum::<usize>()
-            })
-        };
+        let sum = media::graphics(|| {
+            pixels.fill(sequence);
+            pixels.iter().sum::<usize>()
+        });
         assert_eq!(sum, sequence * pixels.len());
     }
     static DROPPED: AtomicBool = AtomicBool::new(false);
@@ -191,9 +181,7 @@ fn two_core_priority_handoff_and_drop_fences() {
         }
     }
     let mut last = media::Graphics::new(DropCheck);
-    unsafe {
-        last.start(|_| assert!(!DROPPED.load(Ordering::Acquire)));
-    }
+    last.start(|_| assert!(!DROPPED.load(Ordering::Acquire)));
     drop(last);
     assert!(DROPPED.load(Ordering::Acquire));
     assert!(REFRESHES.load(Ordering::Relaxed) >= 131);
@@ -201,11 +189,11 @@ fn two_core_priority_handoff_and_drop_fences() {
     static VIDEO_TICKS: AtomicUsize = AtomicUsize::new(0);
     static HOLD_VIDEO: AtomicBool = AtomicBool::new(true);
     static VIDEO_STARTED: AtomicBool = AtomicBool::new(false);
-    let old_video = unsafe { media::VideoService::new((), || true, |now| now, |_| {
+    let old_video = media::VideoService::new((), || true, |now| now, |_| {
         VIDEO_STARTED.store(true, Ordering::Release);
         while HOLD_VIDEO.load(Ordering::Acquire) { media::checkpoint(); }
         VIDEO_TICKS.fetch_add(1, Ordering::Release);
-    }) };
+    });
     old_video.activate();
     while !VIDEO_STARTED.load(Ordering::Acquire) { std::thread::yield_now(); }
     assert!(old_video.try_lock().is_none(), "publication must skip a running frame, never join it");
@@ -214,15 +202,15 @@ fn two_core_priority_handoff_and_drop_fences() {
     // A completed graphics job proves the worker finished its previous frame
     // and returned through its poll loop. It must leave the next video turn
     // available to the deferred publisher instead of rendering repeatedly.
-    unsafe { media::graphics(|| ()); }
+    media::graphics(|| ());
     assert_eq!(VIDEO_TICKS.load(Ordering::Acquire), 1);
     let publication = old_video.try_publish().expect("deferred publisher gets the next turn");
     assert_eq!(VIDEO_TICKS.load(Ordering::Acquire), 1);
     drop(publication);
     while VIDEO_TICKS.load(Ordering::Acquire) < 10 { std::thread::yield_now(); }
-    let video = unsafe { media::VideoService::new((), || true, |now| now, |_| {
+    let video = media::VideoService::new((), || true, |now| now, |_| {
         VIDEO_TICKS.fetch_add(1, Ordering::Release);
-    }) };
+    });
     video.activate();
     drop(old_video); // Retiring an old display must not unregister its successor.
     let before = VIDEO_TICKS.load(Ordering::Acquire);

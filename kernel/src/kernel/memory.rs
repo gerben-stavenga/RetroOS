@@ -1,9 +1,10 @@
 //! Kernel-owned physical pages supplied to arch as owned batches.
 use crate::Core;
+use bytemuck::Pod;
 use super::phys_mm;
 use arch_abi::page_supply::{PageInput, SupplyStatus, SUPPLY_CAPACITY, FAULT_PAGES};
 #[thread_local]
-static mut SPARES: PageInput = PageInput::new();
+static SPARES: core::cell::RefCell<PageInput> = const { core::cell::RefCell::new(PageInput::new()) };
 
 fn release(mut pages: PageInput) {
     while let Some(page) = pages.take() { phys_mm::free_phys_page(page); }
@@ -56,15 +57,16 @@ fn input_pages(count: usize) -> PageInput {
     assert!(count <= SUPPLY_CAPACITY);
     let mut input = PageInput::new();
     for _ in 0..count {
-        let spare = unsafe { (*(&raw mut SPARES)).take() };
+        let spare = SPARES.borrow_mut().take();
         input.push(spare.or_else(phys_mm::alloc_phys_page)
             .expect("out of physical memory preparing arch input"));
     }
     input
 }
 fn keep_input(mut unused: PageInput) {
+    let mut spares = SPARES.borrow_mut();
     while let Some(page) = unused.take() {
-        unsafe { (*(&raw mut SPARES)).push(page); }
+        spares.push(page);
     }
 }
 pub fn fork<A: Core>(machine: &mut A, child: &mut A::AddressSpace) {
@@ -342,17 +344,13 @@ pub trait GuestBytes {
     fn high_copy(&mut self, address: u64, bytes: &mut [u8], to_user: bool) -> bool;
     fn copy_from(&self, address: u64, bytes: &mut [u8]);
     fn copy_to(&mut self, address: u64, bytes: &[u8]);
-    fn read<T: Copy>(&self, address: u64) -> T {
-        let mut value = core::mem::MaybeUninit::<T>::uninit();
-        unsafe {
-            self.copy_from(address, core::slice::from_raw_parts_mut(
-                value.as_mut_ptr().cast(), core::mem::size_of::<T>()));
-            value.assume_init()
-        }
+    fn read<T: Pod>(&self, address: u64) -> T {
+        let mut value = T::zeroed();
+        self.copy_from(address, bytemuck::bytes_of_mut(&mut value));
+        value
     }
-    fn write<T: Copy>(&mut self, address: u64, value: T) {
-        unsafe { self.copy_to(address, core::slice::from_raw_parts(
-            (&value as *const T).cast(), core::mem::size_of::<T>())); }
+    fn write<T: bytemuck::NoUninit>(&mut self, address: u64, value: T) {
+        self.copy_to(address, bytemuck::bytes_of(&value));
     }
     fn copy_cstr(&self, address: u64, bytes: &mut [u8]) -> usize {
         for (i, byte) in bytes.iter_mut().enumerate() {

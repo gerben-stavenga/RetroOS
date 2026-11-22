@@ -558,6 +558,7 @@ pub fn apply(
         crate::kernel::dos::set_c_root(b"dos-root/");
     }
     let c = crate::kernel::dos::c_root();
+    let c = c.as_bytes();
     let settings_source = config.mounts.iter().position(|m| m.drive == Some(b'C') && m.source != "bundle")
         .map(|index| {
             let mount = &config.mounts[index];

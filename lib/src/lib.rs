@@ -16,3 +16,5 @@ pub mod keyboard;
 mod ansi_tables;
 mod codepage_tables;
 pub mod unicode_lookalike;
+
+pub mod worker_queue;

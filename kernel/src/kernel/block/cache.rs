@@ -5,6 +5,8 @@
 //! composed once above those devices, so filesystem adapters contain no cache
 //! policy and writes remain coherent at the block boundary.
 
+#![forbid(unsafe_code)]
+
 use super::{Disk, FlushError, ReadKind, Volume};
 use alloc::boxed::Box;
 use crate::kernel::cache::{Frame, Lru};
@@ -20,24 +22,22 @@ const PAGE_LIMIT: usize = 512;
 // hits, misses, pages loaded, inner bytes. The block layer is serialized by
 // the VFS on current kernels, so the profiler follows the cache's existing
 // single-owner model.
-static mut PROFILE: [u64; 4] = [0; 4];
+static PROFILE: spin::Mutex<[u64; 4]> = spin::Mutex::new([0; 4]);
 
 fn profile_add(index: usize, value: u64) {
     if !crate::kernel::startup::profile_enabled() {
         return;
     }
-    unsafe {
-        let profile = &mut *core::ptr::addr_of_mut!(PROFILE);
-        profile[index] = profile[index].wrapping_add(value);
-    }
+    let mut profile = PROFILE.lock();
+    profile[index] = profile[index].wrapping_add(value);
 }
 
 pub(crate) fn profile_reset() {
-    unsafe { PROFILE = [0; 4]; }
+    *PROFILE.lock() = [0; 4];
 }
 
 pub(crate) fn profile() -> [u64; 4] {
-    unsafe { *core::ptr::addr_of!(PROFILE) }
+    *PROFILE.lock()
 }
 
 struct Page {

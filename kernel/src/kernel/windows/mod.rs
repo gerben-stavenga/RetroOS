@@ -60,45 +60,31 @@ struct RecentApi {
     name: [u8; 40],
     len: u8,
 }
-static mut RECENT: [RecentApi; RECENT_APIS] = [RecentApi { name: [0; 40], len: 0 }; RECENT_APIS];
-static mut RECENT_AT: usize = 0;
+static RECENT: spin::Mutex<([RecentApi; RECENT_APIS], usize)> =
+    spin::Mutex::new(([RecentApi { name: [0; 40], len: 0 }; RECENT_APIS], 0));
 
 fn note_api(name: &[u8]) {
     let mut slot = RecentApi { name: [0; 40], len: 0 };
     let n = name.len().min(slot.name.len());
     slot.name[..n].copy_from_slice(&name[..n]);
     slot.len = n as u8;
-    unsafe {
-        let at = core::ptr::read_volatile(&raw const RECENT_AT);
-        core::ptr::write_volatile(
-            core::ptr::addr_of_mut!(RECENT).cast::<RecentApi>().add(at % RECENT_APIS),
-            slot,
-        );
-        core::ptr::write_volatile(&raw mut RECENT_AT, at.wrapping_add(1));
-    }
+    let mut recent = RECENT.lock();
+    let index = recent.1 % RECENT_APIS;
+    recent.0[index] = slot;
+    recent.1 = recent.1.wrapping_add(1);
 }
 
 /// The last Win32 gates entered, oldest first. Printed from the page-fault
 /// path so a jump to a null pointer still names the calls that led there.
 pub fn print_recent_apis() {
-    unsafe {
-        let n = core::ptr::read_volatile(&raw const RECENT_AT);
-        if n == 0 {
-            return;
-        }
-        let start = n.saturating_sub(RECENT_APIS);
-        for i in start..n {
-            let slot = core::ptr::read_volatile(
-                core::ptr::addr_of!(RECENT).cast::<RecentApi>().add(i % RECENT_APIS),
-            );
-            if slot.len == 0 {
-                continue;
-            }
-            crate::compact_println!(
-                "  api {}",
-                core::str::from_utf8(&slot.name[..slot.len as usize]).unwrap_or("?")
-            );
-        }
+    let (recent, end) = *RECENT.lock();
+    for index in end.saturating_sub(RECENT_APIS)..end {
+        let slot = recent[index % RECENT_APIS];
+        if slot.len == 0 { continue; }
+        crate::compact_println!(
+            "  api {}",
+            core::str::from_utf8(&slot.name[..slot.len as usize]).unwrap_or("?")
+        );
     }
 }
 
@@ -594,7 +580,7 @@ fn load_windows_file(path: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
 
 fn load_dependency(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
     let file = module_name(name);
-    let system = join(crate::kernel::dos::c_root(), b"RETROOS/WINDOWS/SYSTEM32");
+    let system = join(crate::kernel::dos::c_root().as_bytes(), b"RETROOS/WINDOWS/SYSTEM32");
     for path in [join(dirname(importer), &file), join(&system, &file)] {
         if let Ok(loaded) = load_windows_file(&path) {
             return Ok(loaded);
@@ -1043,6 +1029,7 @@ fn canonical_windows_path(path: &[u8]) -> Vec<u8> {
 
 pub(super) fn guest_windows_path(path: &[u8]) -> Vec<u8> {
     let root = crate::kernel::dos::c_root();
+    let root = root.as_bytes();
     let root_dir = root.strip_suffix(b"/").unwrap_or(root);
     let drives: &[(u8, &[u8])] = &[
         (b'C', root_dir), (b'D', b"cdrom"), (b'H', b"host"),
@@ -1728,7 +1715,7 @@ mod path_tests {
         assert_eq!(full_windows_path(&state, b"\\MC"), b"C:\\MC");
         assert_eq!(full_windows_path(&state, b"MC"), b"C:\\MC");
         assert_eq!(full_windows_path(&state, b"C:\\MC"), b"C:\\MC");
-        let cwd = [crate::kernel::dos::c_root(), b"MC"].concat();
+        let cwd = [crate::kernel::dos::c_root().as_bytes(), b"MC"].concat();
         state.cwd[..cwd.len()].copy_from_slice(&cwd);
         state.cwd_len = cwd.len();
         assert_eq!(full_windows_path(&state, b"C:FILE"), b"C:\\MC\\FILE");

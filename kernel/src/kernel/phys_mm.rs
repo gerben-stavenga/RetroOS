@@ -2,7 +2,7 @@
 #![no_std]
 extern crate alloc;
 use arch_abi::PAGE_SIZE;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use arch_abi::page_supply::FrameLayout;
 
@@ -18,34 +18,20 @@ use pool::Pool;
 // One bootstrap page covers 128 MiB of usable RAM; address holes and boot
 // modules are excluded before allocation. Full metadata is sized to real RAM.
 const BOOTSTRAP_BYTES: usize = PAGE_SIZE;
-static mut BOOTSTRAP_STATES: [u8; BOOTSTRAP_BYTES] = [0; BOOTSTRAP_BYTES];
-static mut POOL: Option<Pool<'static>> = None;
-static POOL_LOCK: AtomicBool = AtomicBool::new(false);
-struct PoolGuard;
-impl Drop for PoolGuard { fn drop(&mut self) { POOL_LOCK.store(false, Ordering::Release); } }
-fn lock_pool() -> PoolGuard {
-    while POOL_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        core::hint::spin_loop();
-    }
-    PoolGuard
-}
-fn with_pool<R>(operation: impl FnOnce(&mut Pool<'static>) -> R) -> R {
-    let _guard = lock_pool();
-    // The critical section only touches resident metadata; never allocate,
-    // reclaim, free heap storage or enter arch while this borrow is live.
-    let pool = unsafe { &mut *(&raw mut POOL) }.as_mut().expect("physical allocator not initialized");
-    let result = operation(pool);
-    result
-}
+static POOL: spin::Mutex<Option<Pool<'static>>> = spin::Mutex::new(None);
 
+fn with_pool<R>(operation: impl FnOnce(&mut Pool<'static>) -> R) -> R {
+    // The critical section touches only resident metadata.
+    let mut pool = POOL.lock();
+    operation(pool.as_mut().expect("physical allocator not initialized"))
+}
 
 /// Install the finalized RAM layout and mark the occupied boot frames.
 pub fn bootstrap<'a>(layout: &'static FrameLayout, occupied: &'a [core::ops::Range<u64>]) -> Bootstrap<'a> {
-    let _guard = lock_pool();
-    let mut pool = Pool::new(layout);
-    unsafe { pool.bootstrap((&raw mut BOOTSTRAP_STATES).cast(), BOOTSTRAP_BYTES); }
+    let mut pool = Pool::new(layout, BOOTSTRAP_BYTES);
     for range in occupied { pool.mark(range.start, range.end); }
-    unsafe { *(&raw mut POOL) = Some(pool); }
+    let previous = POOL.lock().replace(pool);
+    drop(previous);
     Bootstrap { occupied }
 }
 
@@ -60,11 +46,9 @@ impl Bootstrap<'_> {
     pub fn finish(self) {
         let pages = with_pool(|pool| pool.frame_count());
         assert!(pages != 0, "firmware supplied no usable RAM");
-        let layout = Layout::array::<u8>(pages.div_ceil(8)).expect("page state size overflow");
-        let states = unsafe { alloc_zeroed(layout) };
-        assert!(!states.is_null(), "cannot allocate physical page states");
+        let states = alloc::vec![0; pages.div_ceil(8)];
         with_pool(|pool| {
-            unsafe { pool.expand(states); }
+            pool.expand(states);
             // Some boot reservations may lie beyond the bootstrap bitmap.
             for range in self.occupied { pool.mark(range.start, range.end); }
         });
@@ -73,8 +57,8 @@ impl Bootstrap<'_> {
 
 // The kernel may donate an exclusively owned cached frame on exhaustion.
 // No pool borrow survives the callback; it may release cache metadata.
-static RECLAIM: AtomicUsize = AtomicUsize::new(0);
-pub fn set_reclaim(callback: fn() -> Option<u64>) { RECLAIM.store(callback as usize, Ordering::Release); }
+static RECLAIM: spin::Mutex<Option<fn() -> Option<u64>>> = spin::Mutex::new(None);
+pub fn set_reclaim(callback: fn() -> Option<u64>) { *RECLAIM.lock() = Some(callback); }
 /// Heap growth cannot reclaim objects through the heap it is extending.
 pub fn alloc_resident_page() -> Option<u64> {
     with_pool(|pool| pool.allocate())
@@ -82,9 +66,7 @@ pub fn alloc_resident_page() -> Option<u64> {
 
 pub fn alloc_phys_page() -> Option<u64> {
     if let Some(page) = with_pool(|pool| pool.allocate()) { return Some(page); }
-    let callback = RECLAIM.load(Ordering::Acquire);
-    if callback == 0 { return None; }
-    let reclaim: fn() -> Option<u64> = unsafe { core::mem::transmute(callback) };
+    let reclaim = (*RECLAIM.lock())?;
     reclaim()
 }
 

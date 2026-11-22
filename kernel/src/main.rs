@@ -203,6 +203,7 @@ fn install_hosted_backend() {
     arch::install_input_sink(kernel::kernel::irq_dispatch::post);
     kernel::install_portio(kernel::PortIo {
         now_ns: arch::now,
+        cycles: arch::cycles,
         inb: arch::inb,
         inw: arch::inw,
         inl: arch::inl,

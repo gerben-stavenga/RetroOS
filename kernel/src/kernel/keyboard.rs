@@ -1,38 +1,44 @@
 //! Foreground keyboard state and shared Unicode layout translation.
 //! Raw Set-1 scancodes remain available to DOS programs that own IRQ1.
-static mut STATE: lib::keyboard::State = lib::keyboard::State::new();
-static mut EVENT: lib::keyboard::Event = lib::keyboard::Event {
+
+#![forbid(unsafe_code)]
+use lib::keyboard::{Event, State};
+use spin::Mutex;
+
+static KEYBOARD: Mutex<(State, Event)> = Mutex::new((State::new(), Event {
     scan: 0, extended: false, pressed: false, repeat: false,
-    text: ['\0';2], length: 0, dead: false,
-};
+    text: ['\0'; 2], length: 0, dead: false,
+}));
 
 pub(crate) fn key_down(key: u8) -> bool {
-    unsafe { (&*core::ptr::addr_of!(STATE)).down(key,false) || (&*core::ptr::addr_of!(STATE)).down(key,true) }
+    let keyboard = KEYBOARD.lock();
+    keyboard.0.down(key, false) || keyboard.0.down(key, true)
 }
+
 pub fn update_key_state(scancode: u8) -> bool {
-    unsafe {
-        let state = &mut *core::ptr::addr_of_mut!(STATE);
-        EVENT = state.feed(lib::keyboard::current(),scancode);
-        EVENT.pressed
-    }
-}
-/// Keep lock/dead-key state with the console that owns this input stream.
-pub fn update_console(state: &mut lib::keyboard::State, scancode: u8) -> bool {
-    let event = state.feed(lib::keyboard::current(),scancode);
-    unsafe { STATE = *state; EVENT = event; }
+    let mut keyboard = KEYBOARD.lock();
+    let event = keyboard.0.feed(lib::keyboard::current(), scancode);
+    keyboard.1 = event;
     event.pressed
 }
 
-pub fn event() -> lib::keyboard::Event { unsafe { EVENT } }
-pub fn control_state() -> u32 {
-    unsafe {
-        let state = &*core::ptr::addr_of!(STATE);
-        u32::from(state.down(0x38,true)) | (u32::from(state.down(0x38,false)) << 1)
-            | (u32::from(state.down(0x1d,true)) << 2) | (u32::from(state.down(0x1d,false)) << 3)
-            | (u32::from(state.shift()) << 4) | (u32::from(state.num) << 5)
-            | (u32::from(state.scroll) << 6) | (u32::from(state.caps) << 7)
-    }
+/// Keep lock/dead-key state with the console that owns this input stream.
+pub fn update_console(state: &mut State, scancode: u8) -> bool {
+    let event = state.feed(lib::keyboard::current(), scancode);
+    *KEYBOARD.lock() = (*state, event);
+    event.pressed
 }
+
+pub fn event() -> Event { KEYBOARD.lock().1 }
+
+pub fn control_state() -> u32 {
+    let state = KEYBOARD.lock().0;
+    u32::from(state.down(0x38, true)) | (u32::from(state.down(0x38, false)) << 1)
+        | (u32::from(state.down(0x1d, true)) << 2) | (u32::from(state.down(0x1d, false)) << 3)
+        | (u32::from(state.shift()) << 4) | (u32::from(state.num) << 5)
+        | (u32::from(state.scroll) << 6) | (u32::from(state.caps) << 7)
+}
+
 pub fn oem_character(character: char) -> u8 {
     lib::codepage::current_codepage().encode_exact(character).unwrap_or(b'?')
 }

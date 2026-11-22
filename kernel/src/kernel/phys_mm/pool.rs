@@ -1,68 +1,81 @@
 //! Compact metadata for usable RAM only. No allocation inside page operations;
 //! the caller supplies the allocation bitmap.
 
+#![forbid(unsafe_code)]
+
 use arch_abi::page_supply::FrameLayout;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use alloc::vec::Vec;
+
+const BOOTSTRAP_BYTES: usize = arch_abi::PAGE_SIZE;
 
 const FREE: u8 = 0;
 const OWNED: u8 = 1;
 
+enum Bitmap {
+    Bootstrap([u8; BOOTSTRAP_BYTES]),
+    Full(Vec<u8>),
+}
+
 pub(super) struct Pool<'a> {
     layout: &'a FrameLayout,
-    states: *mut u8,
+    states: Bitmap,
     active: usize,
-    free: AtomicUsize,
+    free: usize,
     next: usize,
 }
 
 impl<'a> Pool<'a> {
-    pub(super) const fn new(layout: &'a FrameLayout) -> Self {
+    pub(super) fn new(layout: &'a FrameLayout, bootstrap_bytes: usize) -> Self {
+        assert!(bootstrap_bytes <= BOOTSTRAP_BYTES);
+        let active = layout.frame_count().min(bootstrap_bytes * 8);
         Self {
             layout,
-            states: core::ptr::null_mut(),
-            active: 0,
-            free: AtomicUsize::new(0),
+            states: Bitmap::Bootstrap([0; BOOTSTRAP_BYTES]),
+            active,
+            free: active,
             next: 0,
         }
     }
 
-    pub(super) unsafe fn bootstrap(&mut self, states: *mut u8, bytes: usize) {
-        self.states = states;
-        self.active = self.layout.frame_count().min(bytes * 8);
-        unsafe { core::ptr::write_bytes(states, 0, bytes); }
-        self.free.store(self.active, Ordering::Relaxed);
-        self.next = 0;
-    }
-
     /// Copy the bootstrap state after allocating the new bitmap, since that
     /// allocation itself consumes bootstrap frames.
-    pub(super) unsafe fn expand(&mut self, states: *mut u8) {
-        unsafe { core::ptr::copy_nonoverlapping(self.states, states, self.active.div_ceil(8)); }
+    pub(super) fn expand(&mut self, mut states: Vec<u8>) {
+        assert!(matches!(self.states, Bitmap::Bootstrap(_)));
+        assert_eq!(states.len(), self.layout.frame_count().div_ceil(8));
+        let used_bytes = self.active.div_ceil(8);
+        states[..used_bytes].copy_from_slice(&self.states()[..used_bytes]);
         // Padding bits from the last bootstrap byte must describe free RAM.
         if !self.active.is_multiple_of(8) {
-            unsafe { *states.add(self.active / 8) &= (1 << (self.active % 8)) - 1; }
+            states[self.active / 8] &= (1 << (self.active % 8)) - 1;
         }
-        self.free.fetch_add(self.layout.frame_count() - self.active, Ordering::Relaxed);
+        self.free += self.layout.frame_count() - self.active;
         self.active = self.layout.frame_count();
-        self.states = states;
+        self.states = Bitmap::Full(states);
+    }
+
+    fn states(&self) -> &[u8] {
+        match &self.states {
+            Bitmap::Bootstrap(bytes) => bytes,
+            Bitmap::Full(bytes) => bytes,
+        }
     }
 
     fn state(&self, index: usize) -> u8 {
         if index >= self.active { return OWNED; }
-        unsafe { ((&*self.states.add(index / 8).cast::<AtomicU8>()).load(Ordering::Relaxed) >> (index % 8)) & 1 }
+        (self.states()[index / 8] >> (index % 8)) & 1
     }
 
     fn set(&mut self, index: usize, state: u8) {
-        let old = self.state(index);
         assert!(index < self.active);
-        if old == FREE { self.free.fetch_sub(1, Ordering::Relaxed); }
-        if state == FREE { self.free.fetch_add(1, Ordering::Relaxed); }
-        unsafe {
-            let byte = &*self.states.add(index / 8).cast::<AtomicU8>();
-            let shift = index % 8;
-            let previous = byte.load(Ordering::Relaxed);
-            byte.store((previous & !(1 << shift)) | (state << shift), Ordering::Release);
-        }
+        let bytes: &mut [u8] = match &mut self.states {
+            Bitmap::Bootstrap(bytes) => bytes,
+            Bitmap::Full(bytes) => bytes,
+        };
+        let byte = &mut bytes[index / 8];
+        let shift = index % 8;
+        if (*byte >> shift) & 1 == FREE { self.free -= 1; }
+        if state == FREE { self.free += 1; }
+        *byte = (*byte & !(1 << shift)) | (state << shift);
     }
 
     pub(super) fn mark(&mut self, first: u64, end: u64) {
@@ -81,9 +94,8 @@ impl<'a> Pool<'a> {
     fn find_free(&self, mut start: usize, end: usize) -> Option<usize> {
         while start < end {
             if start.is_multiple_of(32) && end - start >= 32 {
-                let bits = u32::from_le_bytes(core::array::from_fn(|offset| unsafe {
-                    (&*self.states.add(start / 8 + offset).cast::<AtomicU8>()).load(Ordering::Relaxed)
-                }));
+                let byte = start / 8;
+                let bits = u32::from_le_bytes(self.states()[byte..byte + 4].try_into().unwrap());
                 let available = !bits;
                 if available != 0 { return Some(start + available.trailing_zeros() as usize); }
                 start += 32;
@@ -96,7 +108,7 @@ impl<'a> Pool<'a> {
     }
 
     pub(super) fn allocate(&mut self) -> Option<u64> {
-        if self.free.load(Ordering::Relaxed) == 0 { return None; }
+        if self.free == 0 { return None; }
         let next = self.next.min(self.active);
         let index = self.find_free(next, self.active).or_else(|| self.find_free(0, next))?;
         self.set(index, OWNED);
@@ -105,7 +117,7 @@ impl<'a> Pool<'a> {
     }
 
     pub(super) fn allocate_contiguous(&mut self, count: usize, limit: u64) -> Option<u64> {
-        if count == 0 || count > self.free.load(Ordering::Relaxed) { return None; }
+        if count == 0 || count > self.free { return None; }
         for &region in self.layout.regions() {
             let end = region.end.min(limit);
             if end <= region.first { continue; }
@@ -146,7 +158,7 @@ impl<'a> Pool<'a> {
     }
 
     pub(super) fn frame_count(&self) -> usize { self.layout.frame_count() }
-    pub(super) fn free_pages(&self) -> usize { self.free.load(Ordering::Relaxed) }
+    pub(super) fn free_pages(&self) -> usize { self.free }
     pub(super) fn managed_pages(&self) -> usize { self.active }
 }
 
@@ -156,19 +168,10 @@ mod tests {
     use alloc::{vec, vec::Vec};
     use arch_abi::page_supply::MemoryRegion;
 
-    struct Fixture<'a> {
-        pool: Pool<'a>,
-        _bitmap: Vec<u8>,
-    }
-    impl<'a> Fixture<'a> {
-        fn new(layout: &'a FrameLayout) -> Self {
-            let mut pool = Pool::new(layout);
-            let mut bootstrap = vec![0; layout.frame_count().div_ceil(8).min(4096)];
-            unsafe { pool.bootstrap(bootstrap.as_mut_ptr(), bootstrap.len()); }
-            let mut bitmap = vec![0; layout.frame_count().div_ceil(8)];
-            unsafe { pool.expand(bitmap.as_mut_ptr()); }
-            Self { pool, _bitmap: bitmap }
-        }
+    fn full_pool(layout: &FrameLayout) -> Pool<'_> {
+        let mut pool = Pool::new(layout, BOOTSTRAP_BYTES);
+        pool.expand(vec![0; layout.frame_count().div_ceil(8)]);
+        pool
     }
 
     fn layout(ranges: &[(u64, u64)], holes: &[(u64, u64)]) -> FrameLayout {
@@ -184,57 +187,54 @@ mod tests {
     #[test]
     fn bitmap_crosses_words_and_excludes_address_holes() {
         let layout = layout(&[(300, 340), (0x100000, 0x100048)], &[(320, 327)]);
-        let mut f = Fixture::new(&layout);
+        let mut pool = full_pool(&layout);
         let expected: Vec<_> = (300..320).chain(327..340).chain(0x100000..0x100048).collect();
-        assert_eq!(f.pool.free_pages(), expected.len());
-        for page in &expected { assert_eq!(f.pool.allocate(), Some(*page)); }
-        assert_eq!(f.pool.allocate(), None);
-        assert_eq!(f.pool.free_pages(), 0);
-        assert_eq!(f.pool.layout.index(321), None);
-        for page in &expected { f.pool.release(*page); }
-        assert_eq!(f.pool.free_pages(), expected.len());
-        assert_eq!(f.pool.allocate(), Some(300));
+        assert_eq!(pool.free_pages(), expected.len());
+        for page in &expected { assert_eq!(pool.allocate(), Some(*page)); }
+        assert_eq!(pool.allocate(), None);
+        assert_eq!(pool.free_pages(), 0);
+        assert_eq!(pool.layout.index(321), None);
+        for page in &expected { pool.release(*page); }
+        assert_eq!(pool.free_pages(), expected.len());
+        assert_eq!(pool.allocate(), Some(300));
     }
 
     #[test]
     fn contiguous_runs_never_cross_physical_holes_or_dma_limit() {
         let layout = layout(&[(256, 258), (300, 320), (0x100000, 0x100010)], &[]);
-        let mut f = Fixture::new(&layout);
-        f.pool.mark(256, 258);
-        assert_eq!(f.pool.allocate_contiguous(10, 0x100000), Some(300));
-        f.pool.free_contiguous(300, 10);
-        assert_eq!(f.pool.allocate_contiguous(21, u64::MAX), None);
-        f.pool.mark(300, 320);
-        assert_eq!(f.pool.allocate_contiguous(1, 0x100000), None);
-        assert_eq!(f.pool.allocate(), Some(0x100000));
+        let mut pool = full_pool(&layout);
+        pool.mark(256, 258);
+        assert_eq!(pool.allocate_contiguous(10, 0x100000), Some(300));
+        pool.free_contiguous(300, 10);
+        assert_eq!(pool.allocate_contiguous(21, u64::MAX), None);
+        pool.mark(300, 320);
+        assert_eq!(pool.allocate_contiguous(1, 0x100000), None);
+        assert_eq!(pool.allocate(), Some(0x100000));
     }
 
     #[test]
     fn exclusive_release_recycles_high_frames() {
         let layout = layout(&[(0x100000000, 0x100000002)], &[]);
-        let mut f = Fixture::new(&layout);
-        let a = f.pool.allocate().unwrap();
-        let b = f.pool.allocate().unwrap();
+        let mut pool = full_pool(&layout);
+        let a = pool.allocate().unwrap();
+        let b = pool.allocate().unwrap();
         assert!(a > u32::MAX as u64 && b > a);
-        assert_eq!(f.pool.allocate(), None);
-        f.pool.release(a);
-        assert_eq!(f.pool.free_pages(), 1);
-        assert_eq!(f.pool.allocate(), Some(a));
+        assert_eq!(pool.allocate(), None);
+        pool.release(a);
+        assert_eq!(pool.free_pages(), 1);
+        assert_eq!(pool.allocate(), Some(a));
     }
 
     #[test]
     fn bootstrap_can_start_after_large_boot_modules() {
         let mut layout = layout(&[(256, 0x20000)], &[(512, 0x18000)]);
         layout.exclude(512, 512); // empty reservation changes nothing
-        let mut pool = Pool::new(&layout);
-        let mut bits = [0u8; 8];
-        unsafe { pool.bootstrap(bits.as_mut_ptr(), bits.len()); }
+        let mut pool = Pool::new(&layout, 8);
         pool.mark(256, 512);
         assert_eq!(pool.allocate(), None); // bitmap covers kernel pages first
         // Rebuild with a full bootstrap page: it reaches RAM after the module
         // by compact index, instead of stopping at a physical-address ceiling.
-        let mut bits = [0u8; 4096];
-        unsafe { pool.bootstrap(bits.as_mut_ptr(), bits.len()); }
+        let mut pool = Pool::new(&layout, BOOTSTRAP_BYTES);
         pool.mark(256, 512);
         assert_eq!(pool.allocate(), Some(0x18000));
     }

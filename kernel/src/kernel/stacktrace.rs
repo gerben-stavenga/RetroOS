@@ -3,6 +3,8 @@
 //! Walks the EBP/RBP chain to produce a backtrace. Requires frame pointers
 //! to be preserved (-Cforce-frame-pointers=yes).
 
+#![forbid(unsafe_code)]
+
 extern crate alloc;
 
 use alloc::boxed::Box;
@@ -10,8 +12,6 @@ use alloc::vec;
 use crate::compact_println;
 use compact_fmt::Write;
 use crate::kernel::vfs;
-#[cfg(target_arch = "x86")]
-use core::arch::asm;
 
 const SYMBOL_MAGIC: &[u8; 4] = b"RSYM";
 const SYMBOL_VERSION: u32 = 1;
@@ -94,18 +94,14 @@ impl SymbolData {
     }
 }
 
-static mut KERNEL_SYMBOLS: Option<SymbolData> = None;
-
-fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
-    core::ptr::addr_of_mut!(KERNEL_SYMBOLS)
-}
+static KERNEL_SYMBOLS: spin::Once<SymbolData> = spin::Once::new();
 
 /// Load the kernel's symbol table, for naming addresses in a backtrace.
 ///
 /// `C:\RETROOS\KERNEL.SYM` is generated from the unstripped linked kernel. It
 /// contains only fixed-size address records and pre-demangled names.
 pub fn init_from_vfs() {
-    let sym = [crate::kernel::dos::c_root(), b"RETROOS/KERNEL.SYM"].concat();
+    let sym = [crate::kernel::dos::c_root().as_bytes(), b"RETROOS/KERNEL.SYM"].concat();
     let handle = vfs::open_to_handle(&sym);
     if handle < 0 {
         compact_println!("stacktrace: no KERNEL.SYM — backtraces will be addresses only");
@@ -124,9 +120,7 @@ pub fn init_from_vfs() {
     match SymbolData::new(elf_box) {
         Some(data) => {
             compact_println!("Loaded {} function symbols", data.count);
-            unsafe {
-                *kernel_symbols_ptr() = Some(data);
-            }
+            KERNEL_SYMBOLS.call_once(|| data);
         }
         None => {
             compact_println!("stacktrace: invalid KERNEL.SYM");
@@ -140,15 +134,12 @@ pub fn init_from_vfs() {
 /// line is whoever panicked. Only the metal boot path uses this entry; the
 /// hosted backend traces via `stack_trace_regs`.
 #[cfg(target_arch = "x86")]
+#[inline(never)]
 pub fn stack_trace(out: &mut dyn Write) {
-    let bp: usize;
-    unsafe { asm!("mov {}, ebp", out(reg) bp); }
-    // Pre-advance one hop so `walk` starts at our caller's frame (panic's, say).
-    let caller_bp = if bp != 0 {
-        unsafe { *(bp as *const u32) as u64 }
-    } else { 0 };
+    let bp = crate::arch::x86::frame_pointer();
     let _ = compact_fmt::writeln!(out, "Stack trace:");
-    walk(out, caller_bp, 0, false);
+    let frames = crate::arch::smp::stack_return_addresses(bp).skip(1);
+    print_chain(out, 0, frames);
 }
 
 /// Print a stack trace for a saved interrupt context (F12 debug hotkey, etc).
@@ -162,9 +153,9 @@ pub fn stack_trace_regs(regs: &crate::Regs) {
     let mut out = lib::log::DebugCon;
     let _ = compact_fmt::writeln!(&mut out, "Stack trace:");
     print_frame(&mut out, 0, regs.ip());
-    if (regs.frame.cs & 3) == 1 {
-        let user_64 = regs.mode() == crate::UserMode::Mode64;
-        walk(&mut out, regs.rbp, 1, user_64);
+    #[cfg(target_arch = "x86")]
+    if regs.frame.cs & 3 == 1 {
+        print_chain(&mut out, 1, crate::arch::smp::stack_return_addresses(regs.rbp as u32));
     }
 }
 
@@ -178,45 +169,15 @@ fn print_frame(out: &mut dyn Write, depth: usize, ip: u64) {
     let _ = compact_fmt::writeln!(out, "");
 }
 
-/// Walk the ebp/rbp chain starting at `bp`. Each iteration reads the frame's
-/// saved-bp and return-ip pair, prints the return ip (i.e. the caller's
-/// current IP at the time of the call), and advances.
-///
-/// Stops at the trap-entry boundary: when a return IP matches `stacktrace_marker`,
-/// we've crossed from a kernel frame into arch's trap-handling code. Going
-/// further would require interpreting whatever was in ebp at trap time —
-/// junk for ring-0/arch self-reentry, untrusted for ring-3 user. The trap
-/// context itself is shown via `stack_trace_regs`, which prints regs.rip
-/// up front and decides whether to chain into ring-1 from there.
-fn walk(out: &mut dyn Write, mut bp: u64, mut depth: usize, user_64: bool) {
-    // The trap-entry boundary is an `entry.asm` label (metal only). The hosted
-    // process has no such boundary, so the chain just walks to its natural end.
-    #[cfg(target_arch = "x86")]
-    let trap_boundary = {
-        unsafe extern "C" { fn stacktrace_marker(); }
-        stacktrace_marker as *const () as u64
-    };
-    #[cfg(not(target_arch = "x86"))]
-    let trap_boundary = 0u64;
+#[cfg(target_arch = "x86")]
+fn print_chain(out: &mut dyn Write, from: usize, frames: impl Iterator<Item = u32>) {
     const MAX_DEPTH: usize = 20;
-
-    while depth < MAX_DEPTH && bp >= 0x1000 {
-        let (next_bp, ip) = if user_64 {
-            let frame = bp as usize as *const u64;
-            unsafe { (*frame, *frame.add(1)) }
-        } else {
-            let frame = (bp as u32) as *const u32;
-            unsafe { (*frame as u64, *frame.add(1) as u64) }
-        };
-        if ip == 0 || ip < 0x1000 { break; }
-        if ip == trap_boundary { break; }
-        print_frame(out, depth, ip);
-        bp = next_bp;
-        depth += 1;
-    }
-
-    if depth == MAX_DEPTH {
-        let _ = compact_fmt::writeln!(out, "  ... (truncated)");
+    for (depth, pc) in (from..).zip(frames) {
+        if depth == MAX_DEPTH {
+            let _ = compact_fmt::writeln!(out, "  ... (truncated)");
+            break;
+        }
+        print_frame(out, depth, u64::from(pc));
     }
 }
 
@@ -231,12 +192,10 @@ const KERNEL_BASE: u32 = 0xC000_0000;
 /// a panic backtrace needs.
 fn lookup_symbol(addr: u64) -> (&'static str, u64) {
     if addr >= KERNEL_BASE as u64 {
-        let sym_data = unsafe { (*kernel_symbols_ptr()).as_ref() };
-        if let Some(data) = sym_data {
+        if let Some(data) = KERNEL_SYMBOLS.get() {
             let (name, offset) = data.lookup(addr);
             if !name.is_empty() {
-                // SAFETY: kernel symbols are 'static
-                return (unsafe { core::mem::transmute::<&str, &str>(name) }, offset);
+                return (name, offset);
             }
         }
     }

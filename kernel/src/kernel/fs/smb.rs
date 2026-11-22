@@ -715,6 +715,7 @@ impl Filesystem for Offline {
 
 pub fn mount_configured() {
     let root = crate::kernel::dos::c_root();
+    let root = root.as_bytes();
     let path = [root, b"RETROOS/RETROOS.INI"].concat();
     let Ok(bytes) = crate::kernel::exec::load_file_resolved(&path) else {
         return;

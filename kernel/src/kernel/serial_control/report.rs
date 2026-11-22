@@ -3,7 +3,7 @@ use super::{send, send_u64};
 
 pub(super) fn write(machine: &mut impl crate::Core, stats: &mut crate::kernel::startup::EventStats) {
     let totals = crate::kernel::startup::profile_totals();
-    unsafe { super::COMPOSITE_REPLY = true; }
+    super::COMPOSITE_REPLY.store(true, core::sync::atomic::Ordering::Relaxed);
     send(b"{\"ok\":true,\"schema_version\":1,\"window\":{\"id\":");
     send_u64(u64::from(crate::kernel::startup::profile_generation()));
     send(b",\"running\":false,\"scope\":\"event_loop_cpu_all_processes\",\"started_ns\":"); send_u64(totals.started_ns);
@@ -49,7 +49,7 @@ pub(super) fn write(machine: &mut impl crate::Core, stats: &mut crate::kernel::s
     }
     send(b"]},\"event_table_overflow\":"); send_u64(crate::kernel::event_profile::overflow());
     send(b"}");
-    unsafe { super::COMPOSITE_REPLY = false; }
+    super::COMPOSITE_REPLY.store(false, core::sync::atomic::Ordering::Relaxed);
     send(b"\n");
 }
 

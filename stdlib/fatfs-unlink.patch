@@ -73,3 +73,72 @@ diff --git a/src/dir_entry.rs b/src/dir_entry.rs
      }
  
      /// Returns `Dir` struct for this entry.
+diff --git a/src/file.rs b/src/file.rs
+--- a/src/file.rs
++++ b/src/file.rs
+@@ -22,6 +22,29 @@
+     entry: Option<DirEntryEditor>,
+     // file-system reference
+     fs: &'a FileSystem<IO, TP, OCC>,
++    suspended: bool,
++}
++
++/// Cursor and directory-entry state without a borrow of the mounted filesystem.
++pub struct FileState {
++    first_cluster: Option<u32>,
++    current_cluster: Option<u32>,
++    offset: u32,
++    entry: Option<DirEntryEditor>,
++}
++
++impl FileState {
++    /// Resume the cursor on its originating filesystem.
++    pub fn resume<IO: ReadWriteSeek, TP, OCC>(self, fs: &FileSystem<IO, TP, OCC>) -> File<'_, IO, TP, OCC> {
++        File {
++            first_cluster: self.first_cluster,
++            current_cluster: self.current_cluster,
++            offset: self.offset,
++            entry: self.entry,
++            fs,
++            suspended: false,
++        }
++    }
+ }
+ 
+ /// An extent containing a file's data on disk.
+@@ -47,6 +70,19 @@
+             fs,
+             current_cluster: None, // cluster before first one
+             offset: 0,
++            suspended: false,
++        }
++    }
++
++    /// Preserve the cursor and pending directory-entry edits without flushing.
++    /// Drop a resumed file normally to persist its metadata.
++    pub fn suspend(mut self) -> FileState {
++        self.suspended = true;
++        FileState {
++            first_cluster: self.first_cluster,
++            current_cluster: self.current_cluster,
++            offset: self.offset,
++            entry: self.entry.take(),
+         }
+     }
+ 
+@@ -229,6 +265,7 @@
+ 
+ impl<IO: ReadWriteSeek, TP, OCC> Drop for File<'_, IO, TP, OCC> {
+     fn drop(&mut self) {
++        if self.suspended { return; }
+         if let Err(err) = self.flush() {
+             error!("flush failed {:?}", err);
+         }
+@@ -244,6 +281,7 @@
+             offset: self.offset,
+             entry: self.entry.clone(),
+             fs: self.fs,
++            suspended: false,
+         }
+     }
+ }

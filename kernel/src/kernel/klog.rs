@@ -1,5 +1,7 @@
 //! DOS/VFS views of the allocation-free `klog` crate.
 
+#![forbid(unsafe_code)]
+
 extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
@@ -25,13 +27,7 @@ pub struct KLogFs;
 pub static KLOG_FS: KLogFs = KLogFs;
 
 /// Small boot ring before the ordinary allocator exists. Promoted by init().
-pub fn init_early() {
-    static mut EARLY: [u8; 8192] = [0; 8192];
-    static STARTED: AtomicBool = AtomicBool::new(false);
-    if STARTED.swap(true, Ordering::AcqRel) { return; }
-    // One BSP boot call, before any other logger can use this storage.
-    unsafe { klog::init(&mut *core::ptr::addr_of_mut!(EARLY)); }
-}
+pub use klog::init_early;
 
 /// Allocate the log ring once the heap is ready. Its backing storage lives
 /// for the kernel's lifetime; recording individual bytes never allocates.
@@ -98,7 +94,7 @@ pub fn saved_filename() -> Vec<u8> {
 }
 
 fn backing_path(index: usize) -> Vec<u8> {
-    let mut path = crate::kernel::dos::c_root().to_vec();
+    let mut path = crate::kernel::dos::c_root().as_bytes().to_vec();
     if !path.ends_with(b"/") {
         path.push(b'/');
     }

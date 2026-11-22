@@ -204,7 +204,7 @@ impl Display {
         // Retire the earlier one-shot presenter before transferring its sink.
         if let Some(work) = self.presentation.take() { drop(work); }
         if self.video.is_none() {
-            self.video = Some(unsafe { media::VideoService::new(Video::new(fb, self.rgb), due, deadline, Video::render) });
+            self.video = Some(media::VideoService::new(Video::new(fb, self.rgb), due, deadline, Video::render));
         }
         self.video.as_ref()
     }

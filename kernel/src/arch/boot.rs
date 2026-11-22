@@ -376,6 +376,7 @@ unsafe fn prepare_boot(
     // platform probe reads (real 0xE9 debugcon, GOP fbcon detection, metal).
     crate::install_portio(crate::PortIo {
         now_ns: || arch::now(false),
+        cycles: || if x86::cpu_capabilities().tsc() { x86::rdtsc() } else { 0 },
         inb: arch::inb, inw: arch::inw, inl: arch::inl, insw: arch::insw,
         outb: arch::outb, outw: arch::outw, outl: arch::outl, outsw: arch::outsw,
     });

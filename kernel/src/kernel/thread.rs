@@ -3,6 +3,8 @@
 //! Thread states: Unused, Running, Ready, Blocked, Zombie
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
+#![forbid(unsafe_code)]
+
 use crate::compact_println;
 use crate::Regs;
 
@@ -324,9 +326,6 @@ impl<A: crate::Core> Personality<A> {
             }
             Self::Dos(state) if key == crate::kernel::gui::SurfaceKey(2) => {
                 crate::kernel::dos::surface_buffer(state, format)
-            }
-            Self::Linux(_) if key == crate::kernel::gui::SurfaceKey(1) => {
-                crate::kernel::term::surface_buffer()
             }
             _ => None,
         }
@@ -747,16 +746,20 @@ impl<A: crate::Core> Thread<A> {
     }
 }
 
-/// FNV-1a hash of a Regs struct (raw byte view).
+/// FNV-1a hash of the words in the saved register image.
 /// Used to detect whether a saved thread's CPU state is modified while
 /// the thread is not running.
 pub fn hash_regs(r: &Regs) -> u64 {
-    let bytes = unsafe {
-        core::slice::from_raw_parts(r as *const _ as *const u8, core::mem::size_of::<Regs>())
-    };
+    let words = [
+        r.gs, r.fs, r.es, r.ds,
+        r.r15, r.r14, r.r13, r.r12, r.r11, r.r10, r.r9, r.r8,
+        r.rdi, r.rsi, r.rbp, r.rsp_dummy, r.rbx, r.rdx, r.rcx, r.rax,
+        r.int_num, r.err_code,
+        r.frame.rip, r.frame.cs, r.frame.rflags, r.frame.rsp, r.frame.ss,
+    ];
     let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
+    for b in words.into_iter().flat_map(u64::to_ne_bytes) {
+        h ^= u64::from(b);
         h = h.wrapping_mul(0x100000001b3);
     }
     h
@@ -938,10 +941,10 @@ impl Iterator for ActiveIds {
 }
 
 /// Console stdin kpipe index (shared by all Linux processes)
-static mut CONSOLE_PIPE: u8 = 0;
+static CONSOLE_PIPE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-pub fn set_console_pipe(idx: u8) { unsafe { CONSOLE_PIPE = idx; } }
-pub fn console_pipe() -> u8 { unsafe { CONSOLE_PIPE } }
+pub fn set_console_pipe(idx: u8) { CONSOLE_PIPE.store(idx, core::sync::atomic::Ordering::Relaxed); }
+pub fn console_pipe() -> u8 { CONSOLE_PIPE.load(core::sync::atomic::Ordering::Relaxed) }
 
 /// Check if threading system is initialized
 pub fn is_initialized<A: crate::Core>(threads: &ThreadTable<A>) -> bool {
@@ -950,14 +953,12 @@ pub fn is_initialized<A: crate::Core>(threads: &ThreadTable<A>) -> bool {
 
 pub fn prng() -> u64 {
     /// PRNG state for random scheduling
-    static mut SEED: u64 = 0xcafe_babe_dead_beef;
-
-    unsafe {
-        const A: u64 = 0xdead_beed;
-        const C: u64 = 0x1234_5679;
-        SEED = A.wrapping_mul(SEED).wrapping_add(C);
-        SEED
-    }
+    static SEED: spin::Mutex<u64> = spin::Mutex::new(0xcafe_babe_dead_beef);
+    const A: u64 = 0xdead_beed;
+    const C: u64 = 0x1234_5679;
+    let mut seed = SEED.lock();
+    *seed = A.wrapping_mul(*seed).wrapping_add(C);
+    *seed
 }
 
 

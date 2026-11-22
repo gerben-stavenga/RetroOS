@@ -54,6 +54,15 @@ pub use machine::{
     clean_fx_template, install_input_sink, halt_forever, inb, inl, insw, inw, now, outb, outl,
     outsw, outw, post_irq, shutdown, FxState,
 };
+/// Host CPU timestamp for diagnostic timings.
+#[inline]
+pub fn cycles() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    { unsafe { core::arch::x86_64::_rdtsc() } }
+    #[cfg(not(target_arch = "x86_64"))]
+    { 0 }
+}
+
 // Interactive console (hosted `main` drives input): raw terminal mode; key
 // events are delivered by `post_irq` to the entry-installed device sink.
 pub use tty::enter_raw_mode;

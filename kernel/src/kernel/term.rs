@@ -10,13 +10,15 @@
 //! Rendering reads the terminal's Unicode cells, drawn whole. No
 //! personality or content producer sees the physical framebuffer format.
 
+#![forbid(unsafe_code)]
+
 pub use lib::term::{Term, putchar, term};
 
 use crate::kernel::display::Display;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// VGA text palette used to turn terminal attributes into canonical RGB.
-static mut PALETTE: [u8; 768] = [0; 768];
+static PALETTE: spin::Once<[u8; 768]> = spin::Once::new();
 
 /// Packed terminal shadow. Terminal writes only dirty the grid; the event-loop
 /// display tick renders this buffer (the boot console flushes at its handoff),
@@ -44,7 +46,7 @@ impl Scanout {
     }
 }
 
-static mut SCANOUT: Scanout = Scanout::new();
+static SCANOUT: spin::Mutex<Scanout> = spin::Mutex::new(Scanout::new());
 static DIRTY: AtomicBool = AtomicBool::new(true);
 
 /// Request a terminal/OSD frame at the next event-loop display tick.
@@ -62,7 +64,8 @@ pub fn present<A: crate::Core>(
     if !DIRTY.swap(false, Ordering::AcqRel) || display.shadow_width == 0 {
         return;
     }
-    let Some((width, height, shadow)) = render(display, None) else {
+    let mut scanout = SCANOUT.lock();
+    let Some((width, height, shadow)) = render(&mut scanout, display, None, false) else {
         return;
     };
     display.present_packed(machine, bios, width, height, shadow);
@@ -83,48 +86,33 @@ pub fn present_on<A: crate::Core>(
         return;
     }
     DIRTY.store(false, Ordering::Release);
-    let Some((width, height, shadow)) = render(display, Some((desktop, endpoint))) else {
+    let mut scanout = SCANOUT.lock();
+    let Some((width, height, shadow)) = render(&mut scanout, display, Some((desktop, endpoint)), false) else {
         return;
     };
     display.present_packed(machine, bios, width, height, shadow);
 }
 
-/// Best-effort terminal publication for the panic handler.  The system is no
-/// longer live, so deliberately seize the global scanout even if the failed
-/// call chain had borrowed it.
+/// Best-effort terminal publication for the panic handler. A held scanout
+/// or terminal lock leaves the fatal log path available.
 pub fn panic_present(display: &mut Display) {
-    if let Some((width, height, shadow)) = render(display, None) {
+    let Some(mut scanout) = SCANOUT.try_lock() else { return };
+    if let Some((width, height, shadow)) = render(&mut scanout, display, None, true) {
         display.panic_present_packed(width, height, shadow);
     }
 }
 
-fn render(
+fn render<'a>(
+    scanout: &'a mut Scanout,
     display: &mut Display,
     desktop: Option<(
         &mut crate::kernel::gui::Desktop,
         crate::kernel::gui::EndpointId,
     )>,
-) -> Option<(usize, usize, &'static mut [u8])> {
-    if display.shadow_width == 0 {
-        return None;
-    }
-    unsafe {
-        if PALETTE == [0; 768] {
-            PALETTE = vga::fallback_palette();
-        }
-    }
+    panic: bool,
+) -> Option<(usize, usize, &'a [u8])> {
+    if display.shadow_width == 0 { return None; }
     let cell_w = if display.composition_size(720, 400).0 < 720 { 8 } else { 9 };
-    render_grid(display, cell_w, desktop)
-}
-
-fn render_grid(
-    display: &mut Display,
-    cell_w: usize,
-    desktop: Option<(
-        &mut crate::kernel::gui::Desktop,
-        crate::kernel::gui::EndpointId,
-    )>,
-) -> Option<(usize, usize, &'static mut [u8])> {
     let managed = desktop.is_some();
     let (w, h) = (80 * cell_w, 400);
 
@@ -133,24 +121,22 @@ fn render_grid(
     // scene composition performs scaling and output-format conversion.
     let content_format = vga::PixelFormat::NATIVE;
     let content_row_bytes = w * 4;
-    let scanout_p = &raw mut SCANOUT;
-    let s = unsafe { &mut *scanout_p };
     let Scanout {
         pal,
         pal_cache,
         content,
         surface,
         bootstrap_desktop,
-    } = s;
+    } = scanout;
     let need = w * h;
     if content.len() != need {
         content.resize(need, 0);
     }
-    let palette_p = &raw const PALETTE;
-    pal.sync(unsafe { &*palette_p }, 0xff, content_format, pal_cache);
-    let terminal = lib::term::term();
-    let cells = terminal.unicode_cells();
-    lib::unicode_font::render_terminal(cells, 80, cell_w, &pal.lut, content);
+    let palette = PALETTE.call_once(vga::fallback_palette);
+    pal.sync(palette, 0xff, content_format, pal_cache);
+    let terminal = if panic { lib::term::try_term()? } else { lib::term::term() };
+    lib::unicode_font::render_terminal(terminal.unicode_cells(), 80, cell_w, &pal.lut, content);
+    drop(terminal);
 
     const TERMINAL_SURFACE: crate::kernel::gui::SurfaceKey = crate::kernel::gui::SurfaceKey(1);
     const TERMINAL_PRESENTATION: crate::kernel::gui::PresentationKey =
@@ -200,9 +186,7 @@ fn render_grid(
         return None;
     }
 
-    let content_bytes = unsafe {
-        core::slice::from_raw_parts(content.as_ptr().cast::<u8>(), content.len() * 4)
-    };
+    let content_bytes = bytemuck::cast_slice(content);
     let buffer = crate::kernel::gui::PixelBuffer::new(
         w,
         h,
@@ -223,19 +207,21 @@ fn render_grid(
     Some((canvas_width, canvas_height, surface))
 }
 
-pub fn surface_buffer() -> Option<crate::kernel::gui::PixelBuffer<'static>> {
-    let scanout = &raw const SCANOUT;
-    let pixels = unsafe { &(*scanout).content };
-    let width = pixels.len() / 400;
-    if !matches!(width, 640 | 720) || pixels.len() != width * 400 { return None; }
-    let bytes = unsafe {
-        core::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), pixels.len() * 4)
-    };
-    crate::kernel::gui::PixelBuffer::new(
-        width,
-        400,
-        width * 4,
-        vga::PixelFormat::NATIVE,
-        bytes,
-    ).ok()
+pub(crate) struct Surface(spin::MutexGuard<'static, Scanout>);
+
+pub(crate) fn surface() -> Surface { Surface(SCANOUT.lock()) }
+
+impl Surface {
+    pub(crate) fn buffer(&self) -> Option<crate::kernel::gui::PixelBuffer<'_>> {
+        let pixels = &self.0.content;
+        let width = pixels.len() / 400;
+        if !matches!(width, 640 | 720) || pixels.len() != width * 400 { return None; }
+        crate::kernel::gui::PixelBuffer::new(
+            width,
+            400,
+            width * 4,
+            vga::PixelFormat::NATIVE,
+            bytemuck::cast_slice(pixels),
+        ).ok()
+    }
 }

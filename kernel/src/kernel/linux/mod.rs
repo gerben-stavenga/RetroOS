@@ -1064,7 +1064,7 @@ pub(crate) fn setup_user_stack<A: crate::Core>(machine: &mut A, _vcpu: &mut Regs
 
     // 1. Write NUL-terminated string data at top of stack
     // Environment strings first (they end up at higher addresses)
-    let defaults = environment::initial(crate::kernel::dos::c_root(), lib::locale::current().posix);
+    let defaults = environment::initial(crate::kernel::dos::c_root().as_bytes(), lib::locale::current().posix);
     // execve supplies the caller's environment exactly, including an empty
     // one. Boot/cross-personality launches synthesize Linux conventions.
     let inherited: alloc::vec::Vec<&[u8]> = environment.map(|block|
@@ -1970,7 +1970,7 @@ fn sys_execve<A: crate::Core>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     // launch policy. Use the same process-replacing entry as CreateProcess;
     // keep direct DOS loading available on minimal systems without a shell.
     if matches!(format, exec::BinaryFormat::MzExe | exec::BinaryFormat::Com) {
-        let launcher = [crate::kernel::dos::c_root(), b"RETROOS/COMMAND.COM"].concat();
+        let launcher = [crate::kernel::dos::c_root().as_bytes(), b"RETROOS/COMMAND.COM"].concat();
         if !args[0].eq_ignore_ascii_case(&launcher) && let Ok(shell) = exec::load_file_resolved(&launcher) {
             let mut dos_path = [0; crate::kernel::dos::DFS_PATH_MAX];
             let n = crate::kernel::dos::vfs_to_dos(&args[0], &mut dos_path);

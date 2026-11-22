@@ -11,4 +11,5 @@ rust_library(
     rustc_flags = [
         "-Crelocation-model=static",
     ] + panic_strategy(),
+    deps = ["@crates//:spin"],
 )

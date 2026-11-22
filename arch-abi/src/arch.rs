@@ -89,7 +89,7 @@ pub trait X86 {
     // FPU/SSE state
 
     /// Backend FPU/SSE save area (FXSAVE blob on metal; host snapshot on interp).
-    type Fx: Copy + Default + 'static;
+    type Fx: Copy + Default + Send + 'static;
 
     /// Swap the live FPU/SSE image with `fx`, independently of the address space.
     fn switch_fx(&mut self, fx: &mut Self::Fx);

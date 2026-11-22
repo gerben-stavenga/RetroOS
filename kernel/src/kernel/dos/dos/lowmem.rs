@@ -55,7 +55,7 @@ pub(crate) struct JftFull;
 /// for any guest code that walks the structure directly.
 ///
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub(in crate::kernel::dos) struct Psp {
     pub int_20:           [u8; 2],   // 0x00 — CD 20 (terminate)
     pub top_of_mem:       u16,        // 0x02 — segment past program (paragraphs)
@@ -150,12 +150,12 @@ impl Psp {
     }
 }
 impl Default for Psp {
-    fn default() -> Self { unsafe { core::mem::zeroed() } }
+    fn default() -> Self { bytemuck::Zeroable::zeroed() }
 }
 
 /// One System File Table entry (DOS 3+ format, 59 bytes).
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SftEntry {
     refcount: u16,        // 0x00
     open_mode: u16,       // 0x02
@@ -170,12 +170,12 @@ struct SftEntry {
 }
 const _: () = assert!(core::mem::size_of::<SftEntry>() == 59);
 impl Default for SftEntry {
-    fn default() -> Self { unsafe { core::mem::zeroed() } }
+    fn default() -> Self { bytemuck::Zeroable::zeroed() }
 }
 
 /// SFT header followed by the entry array. Total 1186 bytes.
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Sft {
     next: u32,                       // 0x00 — far ptr to next SFT block (FFFF:FFFF = end)
     count: u16,                      // 0x04
@@ -185,7 +185,7 @@ struct Sft {
 /// List-of-Lists (DOS internal). Only the fields we actually fill are named;
 /// the rest is reserved padding.
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub(super) struct Lol {
     _reserved_00: [u8; 4],
     sft_off: u16,                    // 0x04 — far ptr to SFT (off, seg)
@@ -200,12 +200,12 @@ pub(super) struct Lol {
 }
 const _: () = assert!(core::mem::size_of::<Lol>() == 0x40);
 impl Default for Lol {
-    fn default() -> Self { unsafe { core::mem::zeroed() } }
+    fn default() -> Self { bytemuck::Zeroable::zeroed() }
 }
 
 /// Current Directory Structure (one per drive letter, DOS 3.3 format).
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CdsEntry {
     path: [u8; 67],                  // 0x00 — ASCIIZ (e.g. "C:\")
     flags: u16,                      // 0x43 — 0x4000 = valid physical drive
@@ -214,7 +214,7 @@ struct CdsEntry {
 }
 const _: () = assert!(core::mem::size_of::<CdsEntry>() == 81);
 impl Default for CdsEntry {
-    fn default() -> Self { unsafe { core::mem::zeroed() } }
+    fn default() -> Self { bytemuck::Zeroable::zeroed() }
 }
 
 /// DOS block-device header published through MSCDEX AX=1501h.
@@ -224,7 +224,7 @@ impl Default for CdsEntry {
 /// entry points valid prevents software which inspects the driver chain from
 /// finding a dangling header meanwhile.
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub(super) struct CdromDeviceHeader {
     next: u32,
     attributes: u16,

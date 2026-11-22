@@ -335,7 +335,7 @@ fn drive_relative(path: &[u8], root: &[u8]) -> Vec<u8> {
 }
 
 pub(super) fn current_dos(s: &Os2State) -> Vec<u8> {
-    drive_relative(s.cwd_str(), crate::kernel::dos::c_root())
+    drive_relative(s.cwd_str(), crate::kernel::dos::c_root().as_bytes())
 }
 
 #[cfg(test)]
@@ -949,6 +949,7 @@ pub(super) fn dispatch<A: crate::Core>(
             };
             let mut p = b"C:\\".to_vec();
             let root = crate::kernel::dos::c_root();
+            let root = root.as_bytes();
             let relative = module.path.strip_prefix(root).unwrap_or(&module.path);
             p.extend(
                 relative
@@ -1027,7 +1028,7 @@ pub(super) fn dispatch<A: crate::Core>(
             let cap = a(3) as usize;
             if level == 5 {
                 let mut p = b"C:\\".to_vec();
-                p.extend(drive_relative(&path, crate::kernel::dos::c_root()));
+                p.extend(drive_relative(&path, crate::kernel::dos::c_root().as_bytes()));
                 return copy_string(m, out, cap, &p);
             }
             let Some(stat) = vfs::stat(&path, true) else {

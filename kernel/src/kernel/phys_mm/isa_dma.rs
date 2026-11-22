@@ -1,4 +1,6 @@
 //! ISA DMA channel buffers: kernel-owned lifetime and low-memory constraints.
+
+#![forbid(unsafe_code)]
 use arch_abi::PAGE_SIZE;
 use core::alloc::Layout;
 
@@ -9,17 +11,17 @@ pub struct LowDmaMemory {
     /// Remove the ordinary cached alias before the driver maps it uncached.
     pub unmap: fn(usize),
 }
-static MEMORY: AtomicPtr<LowDmaMemory> = AtomicPtr::new(core::ptr::null_mut());
+static MEMORY: spin::Once<&'static LowDmaMemory> = spin::Once::new();
 pub fn install_low_dma_memory(memory: &'static LowDmaMemory) {
-    assert!(MEMORY.compare_exchange(core::ptr::null_mut(),
-        core::ptr::from_ref(memory).cast_mut(), Ordering::Release, Ordering::Relaxed).is_ok(),
-        "ISA DMA memory already installed");
+    let mut installed = false;
+    MEMORY.call_once(|| {
+        installed = true;
+        memory
+    });
+    assert!(installed, "ISA DMA memory already installed");
 }
 fn memory() -> &'static LowDmaMemory {
-    let pointer = MEMORY.load(Ordering::Acquire);
-    assert!(!pointer.is_null(), "ISA DMA memory not installed");
-    // Installation accepts only immutable, permanent callback tables.
-    unsafe { &*pointer }
+    MEMORY.get().expect("ISA DMA memory not installed")
 }
 
 /// Largest physical page usable for ISA DMA (addresses are 24-bit, < 16 MB).
@@ -27,7 +29,7 @@ const DMA_MAX_PAGE: usize = 0x100_0000 / PAGE_SIZE;
 // Physical pages of lazily allocated channel buffers. usize::MAX serializes
 // first allocation; trap entry has IRQs disabled, so a same-CPU interrupt
 // cannot reenter while its slot is being initialized.
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 static DMA_CHANNELS: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 
 /// Physical page of a channel's permanent low-memory buffer (0 if unavailable).

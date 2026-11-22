@@ -283,11 +283,7 @@ mod banked_tests {
             assert_eq!(inside, 0);
             assert_eq!(bytes.len(), (source.len() - copies * 65536).min(65536));
             let offset = usize::from(bank) * 4096 + inside;
-            unsafe {
-                crate::kernel::display::copy_bytes(
-                    output.as_mut_ptr().add(offset), bytes.as_ptr(), bytes.len(), false,
-                );
-            }
+            output[offset..offset + bytes.len()].copy_from_slice(bytes);
             copies += 1;
             Ok(())
         }).unwrap();
@@ -305,11 +301,7 @@ mod banked_tests {
             banked_span(offset, &source, 65536, 4096, |bank, inside, bytes| {
                 assert!(inside + bytes.len() <= 65536);
                 let address = usize::from(bank) * 4096 + inside;
-                unsafe {
-                    crate::kernel::display::copy_bytes(
-                        output.as_mut_ptr().add(address), bytes.as_ptr(), bytes.len(), false,
-                    );
-                }
+                output[address..address + bytes.len()].copy_from_slice(bytes);
                 Ok(())
             }).unwrap();
         }
@@ -339,6 +331,7 @@ enum BiosTransfer<'a> {
 }
 
 #[repr(C, packed)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct VbeControllerInfo {
     signature: [u8; 4],
     version: u16,
@@ -350,6 +343,7 @@ struct VbeControllerInfo {
 }
 
 #[repr(C, packed)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct VbeModeInfo {
     attributes: u16,
     window_a_attributes: u8,
@@ -403,31 +397,21 @@ const _: [(); 256] = [(); core::mem::size_of::<VbeModeInfo>()];
 
 impl VbeControllerInfo {
     fn request() -> Self {
-        let mut info: Self = unsafe { core::mem::zeroed() };
+        let mut info: Self = bytemuck::Zeroable::zeroed();
         info.signature = *b"VBE2";
         info
     }
 
     fn bytes_mut(&mut self) -> &mut [u8] {
-        unsafe {
-            core::slice::from_raw_parts_mut(
-                core::ptr::from_mut(self).cast(),
-                core::mem::size_of::<Self>(),
-            )
-        }
+        bytemuck::bytes_of_mut(self)
     }
 }
 
 impl VbeModeInfo {
-    fn empty() -> Self { unsafe { core::mem::zeroed() } }
+    fn empty() -> Self { bytemuck::Zeroable::zeroed() }
 
     fn bytes_mut(&mut self) -> &mut [u8] {
-        unsafe {
-            core::slice::from_raw_parts_mut(
-                core::ptr::from_mut(self).cast(),
-                core::mem::size_of::<Self>(),
-            )
-        }
+        bytemuck::bytes_of_mut(self)
     }
 }
 

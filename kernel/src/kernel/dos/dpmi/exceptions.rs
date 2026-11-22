@@ -57,19 +57,19 @@ fn dump_dpmi_fault_context<A: crate::Core>(dos: &thread::DosState<A>, regs: &Reg
 /// frame. Handler pops it via RETF, landing at our `SLOT_EXCEPTION_RET`
 /// stub which traps to `exception_return` via INT 31h.
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RetF32 { ret_eip: u32, ret_cs: u32 }
 
 /// 16-bit RETF return frame (4 bytes).
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RetF16 { ret_ip: u16, ret_cs: u16 }
 
 /// 32-bit DPMI 0.9 exception spec frame body (24 bytes). Sits above
 /// `RetF32` on the host stack. Per DPMI 0.9 §6.1.4, handler entry SS:ESP
 /// points at RetF32, the 0.9 body lives at +08H..+1FH.
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ExcFrame32 {
     err_code: u32,    // +08H
     eip:      u32,    // +0CH
@@ -85,7 +85,7 @@ struct ExcFrame32 {
 /// frame. It is written on every dispatch; 0.9 handlers read only the
 /// +0..+1FH portion and ignore the expanded bytes above it.
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ExcFrameV10 {
     ret_eip:   u32,   // +20H  Return EIP (or CS:IP for 16-bit handler)
     ret_cs:    u32,   // +24H  Return CS (low 16) + Reserved (high 16)
@@ -114,7 +114,7 @@ struct ExcFrameV10 {
 /// oblivious to the padding above; but the constant 0x20 footprint
 /// leaves a stable +20H offset for the DPMI 1.0 expanded frame.
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ExcFrame16 {
     err_code: u16,    // +04H from SS:SP
     ip:       u16,    // +06H

@@ -15,6 +15,8 @@
 //! - Linux owners get keys cooked into their fds; they have no virtual
 //!   device bus for other IRQs.
 
+#![forbid(unsafe_code)]
+
 use crate::Regs;
 use crate::kernel::thread;
 
@@ -49,7 +51,7 @@ pub fn dispatch<A: crate::Core>(
             dispatch_dos(machine, regs, blocked, dos, guest_events);
         }
         thread::Personality::Linux(linux) => {
-            dispatch_linux(machine, regs, kt, linux, guest_events)
+            dispatch_linux(machine, &kt.fds, linux, guest_events)
         }
         thread::Personality::Os2(os2) => {
             let mut wake = false;
@@ -91,9 +93,7 @@ fn dispatch_dos<A: crate::Core>(
     dos: &mut thread::DosState<A>,
     events: impl Iterator<Item = crate::Irq>,
 ) {
-    let dp = dos as *mut thread::DosState<A>;
-    {
-        for evt in events {
+    for evt in events {
         if let crate::Irq::Key(sc) = evt {
             if blocked {
                 if crate::kernel::keyboard::update_key_state(sc) {
@@ -107,14 +107,11 @@ fn dispatch_dos<A: crate::Core>(
                     }
                 }
             } else {
-                unsafe { (*dp).process_key(machine, regs, sc) };
+                dos.process_key(machine, regs, sc);
             }
-        } else {
-            if !blocked {
-                crate::kernel::dos::queue_irq(machine, unsafe { &mut *dp }, regs, evt);
-            }
+        } else if !blocked {
+            crate::kernel::dos::queue_irq(machine, dos, regs, evt);
         }
-    }
     }
 }
 
@@ -177,20 +174,14 @@ pub fn restore_from_monitor<A: crate::Core>(
 /// Linux owner: keys → cooked fd input.
 fn dispatch_linux<A: crate::Core>(
     machine: &mut A,
-    _regs: &mut Regs,
-    kt: &mut thread::KernelThread<A>,
+    fds: &[thread::FdKind; thread::MAX_FDS],
     linux: &mut thread::LinuxState,
     events: impl Iterator<Item = crate::Irq>,
 ) {
-    let ktp = kt as *mut thread::KernelThread<A>;
-    let lp = linux as *mut thread::LinuxState;
-    {
-        for evt in events {
-        if let crate::Irq::Key(sc) = evt
-        {
-            unsafe { (*lp).process_key(machine, &(*ktp).fds, sc) };
+    for evt in events {
+        if let crate::Irq::Key(sc) = evt {
+            linux.process_key(machine, fds, sc);
         }
-    }
     }
 }
 

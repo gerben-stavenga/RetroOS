@@ -30,7 +30,7 @@ pub fn request(name: &str, maximum: usize) -> Result<Vec<u8>, Error> {
     }
     let paths = [
         [b"lib/firmware/".as_slice(), name.as_bytes()].concat(),
-        [super::dos::c_root(), b"RETROOS/FIRMWARE/", name.as_bytes()].concat(),
+        [super::dos::c_root().as_bytes(), b"RETROOS/FIRMWARE/", name.as_bytes()].concat(),
     ];
     for path in paths {
         let fd = vfs::open_to_handle(&path);

@@ -444,7 +444,7 @@ pub(super) fn find_matching_file<A: crate::Core>(machine: &mut A, dos: &mut thre
                 // Ordinary files always participate; directories require the
                 // directory bit in the FindFirst attribute mask.
                 if find_attributes_match(attributes, entry.is_dir)
-                    && dos_wildcard_match(pat, alias)
+                    && dos_wildcard_match(pat, &alias)
                 {
                     let found_attributes = entry.attributes;
                     if !dfs::lfn::attributes_match(u16::from(attributes), found_attributes) { continue; }

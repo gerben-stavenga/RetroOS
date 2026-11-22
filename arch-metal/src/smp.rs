@@ -87,6 +87,53 @@ pub unsafe fn init_core(core_id: u32) {
     descriptors::setup_syscall();
 }
 
+/// Walk frame records in this CPU's resident kernel and trap stacks.
+#[cfg(not(feature = "kvm"))]
+pub fn stack_return_addresses(mut frame: u32) -> impl Iterator<Item = u32> {
+    unsafe extern "C" {
+        static KERNEL_STACK: u8;
+        static KERNEL_STACK_TOP: u8;
+        static ARCH_STACK: u8;
+        fn stacktrace_marker();
+    }
+    let stacks = if current_core_id() == 0 {
+        [
+            (&raw const KERNEL_STACK as u32)..(&raw const KERNEL_STACK_TOP as u32),
+            (&raw const ARCH_STACK as u32)..(&raw const ARCH_STACK_TOP as u32),
+        ]
+    } else {
+        let start = unsafe { START.expect("AP missing startup context") };
+        [
+            start.stack_top - 65536..start.stack_top,
+            start.trap_stack_top - 16368..start.trap_stack_top + 16,
+        ]
+    };
+    let boundary = stacktrace_marker as *const () as u32;
+    core::iter::from_fn(move || {
+        let end = frame.checked_add(8)?;
+        if !frame.is_multiple_of(4) || !stacks.iter().any(|stack| frame >= stack.start && end <= stack.end) {
+            return None;
+        }
+        let next: u32;
+        let pc: u32;
+        // Inspect machine words within the current CPU's stack. The frame
+        // pointer may be corrupt, so load the words as data and range-check
+        // the successor before using it as an address.
+        unsafe {
+            core::arch::asm!(
+                "mov {next}, [{frame}]",
+                "mov {pc}, [{frame} + 4]",
+                frame = in(reg) frame,
+                next = out(reg) next,
+                pc = lateout(reg) pc,
+                options(readonly, nostack, preserves_flags),
+            );
+        }
+        frame = if next > frame { next } else { 0 };
+        (pc >= 0x1000 && pc != boundary).then_some(pc)
+    })
+}
+
 /// Complete the AP branch of the common Rust entry. No shared allocator,
 /// device initialization, timer setup, or scheduler is entered implicitly.
 ///

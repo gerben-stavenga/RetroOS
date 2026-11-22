@@ -53,7 +53,7 @@ enum Wait {
 }
 struct Context {
     regs: Regs,
-    fx: Box<dyn core::any::Any>,
+    fx: Box<dyn core::any::Any + Send>,
     id: i32,
     comm: [u8; 16],
     clear_tid: u64,

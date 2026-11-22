@@ -193,7 +193,7 @@ pub fn init() {
 }
 
 fn catalog_dir() -> Vec<u8> {
-    let mut path = crate::kernel::dos::c_root().to_vec();
+    let mut path = crate::kernel::dos::c_root().as_bytes().to_vec();
     path.extend_from_slice(b"CD");
     path
 }

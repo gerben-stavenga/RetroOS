@@ -1,7 +1,9 @@
 //! Parallel Linux execution and ordinary syscall dispatch on worker CPUs.
 //! Lifecycle actions acquire affected process loans while unrelated CPUs run.
+
+#![forbid(unsafe_code)]
 use alloc::{boxed::Box, vec::Vec};
-use core::{any::TypeId, cell::UnsafeCell, sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering}};
+use core::{any::Any, sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering}};
 use crate::{Core, KernelEvent, Regs};
 use super::{exec_ctx::ExecutionContext, thread::{self, ThreadTable, ThreadState}};
 
@@ -12,9 +14,7 @@ const DONE: u32 = 3;
 const DISABLED: u32 = 4;
 const MAX_CPUS: usize = 64;
 static START: AtomicBool = AtomicBool::new(false);
-static SLOTS: AtomicUsize = AtomicUsize::new(0);
-static COUNT: AtomicUsize = AtomicUsize::new(0);
-static BACKEND: spin::Once<TypeId> = spin::Once::new();
+static SLOTS: spin::Once<Box<dyn Any + Send + Sync>> = spin::Once::new();
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_HANDLERS: AtomicUsize = AtomicUsize::new(0);
@@ -33,8 +33,8 @@ pub(crate) fn bsp_events_with_workers() -> usize { BSP_EVENTS_WITH_WORKERS.load(
 pub(crate) fn parallel_lifecycles() -> usize { PARALLEL_LIFECYCLES.load(Ordering::Relaxed) }
 pub(crate) fn peak_handlers() -> usize { PEAK_HANDLERS.load(Ordering::Relaxed) }
 #[thread_local]
-static mut ON_WORKER: bool = false;
-pub fn on_worker() -> bool { unsafe { ON_WORKER } }
+static ON_WORKER: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+pub fn on_worker() -> bool { ON_WORKER.get() }
 #[thread_local]
 static PROFILE_CPU: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 pub(crate) fn profile_cpu() -> usize { PROFILE_CPU.get() }
@@ -61,53 +61,52 @@ pub struct Slot<A: Core> {
     cancel: AtomicBool,
     pub processor: AtomicU32,
     tid: AtomicUsize,
-    loan: UnsafeCell<Loan<A>>,
+    loan: spin::Mutex<Loan<A>>,
 }
 // One BSP producer and one CPU consumer. RUN transfers the whole loan; DONE
 // transfers it back after the worker removes all user entries from its root.
 // Only cancel/state/processor atomics are accessed by the BSP during
 // execution. Shared Linux descriptors have their own Arc/Mutex protection;
 // each process owns its remaining mutable Linux state.
-unsafe impl<A: Core> Sync for Slot<A> where A::Fx: Send {}
 impl<A: Core> Slot<A> {
     fn new() -> Self { Self {
         state: AtomicU32::new(PARKED), cancel: AtomicBool::new(false),
         processor: AtomicU32::new(0), tid: AtomicUsize::new(0),
-        loan: UnsafeCell::new(Loan { space: Default::default(), fx: Default::default(),
+        loan: spin::Mutex::new(Loan { space: Default::default(), fx: Default::default(),
             regs: Regs::empty(), event: KernelEvent::Irq, deadline: 0, tls: (-1, 0, 0, false),
             kernel: thread::KernelThread::empty(), linux: super::linux::LinuxState::new(), stats: WorkerStats::default() }),
     } }
 }
 /// BSP boot only, before any worker starts. Storage remains resident forever.
 pub fn provision<A: Core>(count: usize) -> &'static [Slot<A>] {
-    assert!(count <= MAX_CPUS && SLOTS.load(Ordering::Relaxed) == 0);
-    let mut slots = Vec::with_capacity(count);
-    for _ in 0..count { slots.push(Slot::<A>::new()); }
-    let slots = Box::leak(slots.into_boxed_slice());
-    BACKEND.call_once(TypeId::of::<A>);
-    SLOTS.store(slots.as_ptr() as usize, Ordering::Relaxed);
-    COUNT.store(count, Ordering::Release);
-    slots
+    assert!(count <= MAX_CPUS && SLOTS.get().is_none());
+    let mut workers = Vec::with_capacity(count);
+    for _ in 0..count { workers.push(Slot::<A>::new()); }
+    SLOTS.call_once(|| Box::new(workers.into_boxed_slice()));
+    slots::<A>()
 }
+
 fn slots<A: Core>() -> &'static [Slot<A>] {
-    if BACKEND.get() != Some(&TypeId::of::<A>()) { return &[]; }
-    let count = COUNT.load(Ordering::Acquire);
-    // The TypeId check proves this is exactly the A used to allocate the array.
-    unsafe { core::slice::from_raw_parts(SLOTS.load(Ordering::Relaxed) as *const Slot<A>, count) }
+    SLOTS.get().and_then(|workers| workers.downcast_ref::<Box<[Slot<A>]>>())
+        .map_or(&[], Box::as_ref)
 }
+
+#[cfg(target_arch = "x86")]
+pub(crate) fn slot_for_core<A: Core>(logical_id: usize) -> &'static Slot<A> {
+    &slots::<A>()[logical_id]
+}
+
 pub fn enable() { START.store(true, Ordering::Release); }
 pub fn started() -> bool { START.load(Ordering::Acquire) }
 pub fn disable<A: Core>(slot: &Slot<A>) { slot.state.store(DISABLED, Ordering::Release); }
 
 /// AP ring-1 loop. Owns the process state while running the normal Linux
 /// handlers. Shared task-table actions and device polling remain outside it.
-/// # Safety
-/// This CPU exclusively consumes slot. Stacks/TLS/slot storage are resident.
-pub unsafe fn worker<A: Core>(mut machine: A, slot: &'static Slot<A>) -> !
-where A::Fx: Send {
-    unsafe { ON_WORKER = true; }
+pub fn worker<A: Core>(mut machine: A, slot: &'static Slot<A>) -> ! {
+    ON_WORKER.set(true);
     PROFILE_CPU.set(slots::<A>().iter().position(|s| core::ptr::eq(s, slot)).expect("unknown worker slot"));
-    slot.state.store(IDLE, Ordering::Release);
+    assert!(slot.state.compare_exchange(PARKED, IDLE, Ordering::AcqRel, Ordering::Acquire).is_ok(),
+        "worker slot already claimed");
     loop {
         if slot.state.load(Ordering::Acquire) != RUN {
             machine.idle(core::time::Duration::from_millis(1));
@@ -115,7 +114,8 @@ where A::Fx: Send {
         }
         super::platform::refresh_kernel_mappings();
         super::memory::service(&machine);
-        let loan = unsafe { &mut *slot.loan.get() };
+        let mut guard = slot.loan.lock();
+        let loan = &mut *guard;
         let (entry, base, limit, pages) = loan.tls;
         if entry >= 0 { machine.set_tls_entry(entry, base, limit, pages); }
         machine.switch_fx(&mut loan.fx);
@@ -126,6 +126,7 @@ where A::Fx: Send {
         ACTIVE.fetch_sub(1, Ordering::AcqRel);
         machine.switch_fx(&mut loan.fx);
         loan.space = machine.activate(old);
+        drop(guard);
         slot.state.store(DONE, Ordering::Release);
     }
 }
@@ -263,7 +264,8 @@ impl Parallel {
             let slot = &all[cpu];
             let task = &mut threads[tid];
             let thread::Personality::Linux(linux) = &task.personality else { unreachable!() };
-            let loan = unsafe { &mut *slot.loan.get() };
+            let mut guard = slot.loan.lock();
+            let loan = &mut *guard;
             loan.space = core::mem::take(&mut task.kernel.vcpu.space);
             loan.fx = task.kernel.fx_state;
             loan.regs = task.kernel.vcpu.regs;
@@ -284,6 +286,7 @@ impl Parallel {
             task.kernel.state = ThreadState::OnCpu;
             slot.tid.store(tid, Ordering::Relaxed);
             slot.cancel.store(false, Ordering::Relaxed);
+            drop(guard);
             slot.state.store(RUN, Ordering::Release);
             machine.interrupt_processor(slot.processor.load(Ordering::Relaxed));
         }
@@ -334,7 +337,8 @@ pub(crate) fn collect_finished<A: Core>(threads: &mut ThreadTable<A>) {
         let tid = slot.tid.load(Ordering::Relaxed);
         let task = &mut threads[tid];
         assert!(task.kernel.state == ThreadState::OnCpu);
-        let loan = unsafe { &mut *slot.loan.get() };
+        let mut guard = slot.loan.lock();
+        let loan = &mut *guard;
         core::mem::swap(&mut loan.kernel, &mut task.kernel);
         let thread::Personality::Linux(linux) = &mut task.personality else { unreachable!() };
         core::mem::swap(&mut loan.linux, linux);
@@ -345,6 +349,7 @@ pub(crate) fn collect_finished<A: Core>(threads: &mut ThreadTable<A>) {
         task.kernel.cpu_hash = thread::hash_regs(&loan.regs);
         // Do not retain a phantom live task in the reusable loan.
         loan.kernel.state = ThreadState::Unused;
+        drop(guard);
         slot.state.store(IDLE, Ordering::Release);
     }
 }
@@ -401,7 +406,7 @@ pub fn peak_workers() -> usize { PEAK.load(Ordering::Relaxed) }
 pub(crate) fn worker_stats<A: Core>() -> Vec<(usize, WorkerStats)> {
     slots::<A>().iter().enumerate().filter_map(|(cpu, slot)| {
         if !matches!(slot.state.load(Ordering::Acquire), DONE | IDLE) { return None; }
-        let stats = unsafe { (*slot.loan.get()).stats };
+        let stats = slot.loan.try_lock()?.stats;
         (stats.syscalls != 0).then_some((cpu, stats))
     }).collect()
 }

@@ -103,7 +103,7 @@ impl HostContinuation {
 
 /// DPMI real-mode call structure used by INT 31h/0300-0302 and callbacks.
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub(super) struct RmCallStruct {
     pub edi: u32, pub esi: u32, pub ebp: u32, pub _reserved: u32,
     pub ebx: u32, pub edx: u32, pub ecx: u32, pub eax: u32,
@@ -486,13 +486,14 @@ pub(super) fn deliver_pm_int<A: crate::Core>(machine: &mut A, dos: &mut thread::
 /// dispatcher when a non-DPMI VM86 thread faults — lets us see whether
 /// a HW IRQ was just delivered (and where) right before the crash.
 /// Layout: (vec, target_sel, target_off, src_cs, src_ip, src_ss, src_sp).
-pub(super) static mut LAST_IRQ: (u8, u16, u32, u16, u32, u16, u32) = (0xFF, 0, 0, 0, 0, 0, 0);
+type IrqDelivery = (u8, u16, u32, u16, u32, u16, u32);
+static LAST_IRQ: spin::Mutex<IrqDelivery> = spin::Mutex::new((0xFF, 0, 0, 0, 0, 0, 0));
 
-// ── Zero-perturbation virtual-IF trace ring ──────────────────────────────
-// One entry per PM-IRQ-chain event, written inline (pure stores, no I/O,
-// no formatting) so it doesn't change instruction timing — the Sokoban
-// stuck-IF=0 hang is a Heisenbug that print-tracing hides. Dumped only on
-// the F12 state key via `dump_if_ring()`.
+pub(super) fn last_irq() -> IrqDelivery { *LAST_IRQ.lock() }
+
+// ── Virtual-IF trace ring ──────────────────────────────
+// Record PM-IRQ-chain events without I/O or formatting. The F12 state key
+// dumps the ring; printing at each transition can hide timing-sensitive hangs.
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub(super) struct IfEvt {
@@ -512,27 +513,25 @@ pub(super) const IF_PM_IRQ_NESTED: u8 = 5;     // deliver_pm_irq nested, hooked 
 pub(super) const IF_PM_IRQ_FIRST: u8 = 6;      // deliver_pm_irq first-entry/toggle
 
 const IF_RING_LEN: usize = 128;
-pub(super) static mut IF_RING: [IfEvt; IF_RING_LEN] = [IfEvt {
+static IF_RING: spin::Mutex<([IfEvt; IF_RING_LEN], usize)> = spin::Mutex::new(([IfEvt {
     tag: 0, vm86: false, cs: 0, ip: 0, if_in: false, if_out: false, other: (0, 0),
-}; IF_RING_LEN];
-pub(super) static mut IF_RING_POS: usize = 0;
+}; IF_RING_LEN], 0));
 
 #[inline]
 pub(super) fn if_record(tag: u8, regs: &Regs, if_in: bool, if_out: bool,
                         other: Option<(u16, u32)>) {
-    unsafe {
-        let i = IF_RING_POS % IF_RING_LEN;
-        IF_RING[i] = IfEvt {
-            tag,
-            vm86: regs.mode() == crate::UserMode::VM86,
-            cs: regs.code_seg(),
-            ip: regs.ip32(),
-            if_in,
-            if_out,
-            other: other.unwrap_or((0, 0)),
-        };
-        IF_RING_POS = IF_RING_POS.wrapping_add(1);
-    }
+    let mut ring = IF_RING.lock();
+    let i = ring.1 % IF_RING_LEN;
+    ring.0[i] = IfEvt {
+        tag,
+        vm86: regs.mode() == crate::UserMode::VM86,
+        cs: regs.code_seg(),
+        ip: regs.ip32(),
+        if_in,
+        if_out,
+        other: other.unwrap_or((0, 0)),
+    };
+    ring.1 = ring.1.wrapping_add(1);
 }
 
 /// The guest's virtual interrupt flag (VIF/bit 19) — the kernel's single store.
@@ -545,29 +544,25 @@ fn vif(regs: &Regs) -> bool {
 /// (oldest first): tag, guest mode, CS:IP at record time, virtual-IF
 /// before→after, and the suspended opposite-side cursor.
 pub(super) fn dump_if_ring() {
-    unsafe {
-        let pos = IF_RING_POS;
-        let n = pos.min(IF_RING_LEN);
-        crate::compact_dbg_println!("[IFRING] {} events total, showing last {} in_hw_irq={}",
-            pos, n,
-            super::IN_HW_IRQ_CONTEXT.load(core::sync::atomic::Ordering::Relaxed));
-        for k in 0..n {
-            let i = (pos - n + k) % IF_RING_LEN;
-            let e = IF_RING[i];
-            crate::compact_dbg_println!(
-                "[IFRING] #{:03} tag={} vm86={} {:04X}:{:08X} if {}→{} other={:04X}:{:08X}",
-                pos - n + k, e.tag, e.vm86 as u8, e.cs, e.ip,
-                e.if_in as u8, e.if_out as u8, e.other.0, e.other.1);
-        }
+    let (events, pos) = *IF_RING.lock();
+    let n = pos.min(IF_RING_LEN);
+    crate::compact_dbg_println!("[IFRING] {} events total, showing last {} in_hw_irq={}",
+        pos, n,
+        super::IN_HW_IRQ_CONTEXT.load(core::sync::atomic::Ordering::Relaxed));
+    for k in 0..n {
+        let i = (pos - n + k) % IF_RING_LEN;
+        let e = events[i];
+        crate::compact_dbg_println!(
+            "[IFRING] #{:03} tag={} vm86={} {:04X}:{:08X} if {}→{} other={:04X}:{:08X}",
+            pos - n + k, e.tag, e.vm86 as u8, e.cs, e.ip,
+            e.if_in as u8, e.if_out as u8, e.other.0, e.other.1);
     }
 }
 
 pub(super) fn deliver_pm_irq<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, vector: u8) {
     let (sel, off) = dos.pm_vectors[vector as usize];
-    unsafe {
-        LAST_IRQ = (vector, sel, off, regs.code_seg(), regs.ip32(),
-                    regs.stack_seg(), regs.sp32());
-    }
+    *LAST_IRQ.lock() = (vector, sel, off, regs.code_seg(), regs.ip32(),
+                        regs.stack_seg(), regs.sp32());
     let default_vector = sel == VECTOR_STUB_SEL && off == dos::STUB_BASE + (vector as u32) * 2;
     let handler_use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
 

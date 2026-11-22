@@ -1,5 +1,7 @@
 //! Opt-in startup/event timings. Run includes guest execution and arch
 //! entry/exit; dispatch covers event handling. No logging in measured paths.
+#![forbid(unsafe_code)]
+
 use crate::{Core, KernelEvent, Regs};
 use super::thread::Personality;
 
@@ -16,14 +18,14 @@ const SLOTS: usize = 256;
 // The cooperative event loop owns this optional diagnostic storage. Allocate
 // on first use, outside the measured dispatch interval, rather than reserving
 // 12 KiB in every kernel's bootstrap footprint.
-static mut COUNTERS: alloc::vec::Vec<Counter> = alloc::vec::Vec::new();
-static mut OVERFLOW: u64 = 0;
+static COUNTERS: spin::Mutex<alloc::vec::Vec<Counter>> = spin::Mutex::new(alloc::vec::Vec::new());
+static OVERFLOW: spin::Mutex<u64> = spin::Mutex::new(0);
 const RM_TARGET_SLOTS: usize = 32;
-static mut RM_TARGETS: [(u8, u16, u16, u64); RM_TARGET_SLOTS] = [(0, 0, 0, 0); RM_TARGET_SLOTS];
+static RM_TARGETS: spin::Mutex<[(u8, u16, u16, u64); RM_TARGET_SLOTS]> = spin::Mutex::new([(0, 0, 0, 0); RM_TARGET_SLOTS]);
 const READ_DETAIL_SLOTS: usize = 64;
-static mut READ_DETAILS: [(u16, u64, u64); READ_DETAIL_SLOTS] = [(0, 0, 0); READ_DETAIL_SLOTS];
+static READ_DETAILS: spin::Mutex<[(u16, u64, u64); READ_DETAIL_SLOTS]> = spin::Mutex::new([(0, 0, 0); READ_DETAIL_SLOTS]);
 // calls, RM-call setup, DOS vector dispatch, continuation unwind.
-static mut DIRECT_RM_PHASES: [u64; 4] = [0; 4];
+static DIRECT_RM_PHASES: spin::Mutex<[u64; 4]> = spin::Mutex::new([0; 4]);
 pub(super) const FILE_IO_NAMES: [&str; 49] = ["read_allocate", "read_fetch", "read_copy", "mmap_zero", "mmap_read", "mmap_copy", "elf_allocate", "elf_read", "elf_copy", "ext4_read", "volume_read", "vfs_lock", "vfs_read", "cache_check", "cache_miss", "elf_seek", "cache_insert", "pipe_wait", "pipe_allocate", "disk_read", "disk_write", "disk_flush", "volume_flush", "smb_send", "smb_receive", "smb_sign", "smb_verify", "smb_response_allocate", "smb_read_decode", "smb_encode", "ext4_create", "ext4_set_meta", "ext4_mkdir", "ext4_commit_write", "ext4_unlink", "ext4_rmdir", "ext4_fsync", "ext4_resize", "directory_scan", "path_resolve", "write_permission", "loop_writeback", "loop_klog_sync", "loop_deadlines", "task_snapshot", "loop_network", "write_refresh", "rtc_read", "loop_prelude"];
 pub(super) const LOOP_WRITEBACK: usize = 41;
 pub(super) const LOOP_KLOG_SYNC: usize = 42;
@@ -33,13 +35,13 @@ pub(super) const LOOP_NETWORK: usize = 45;
 pub(super) const WRITE_REFRESH: usize = 46;
 pub(super) const RTC_READ: usize = 47;
 pub(super) const LOOP_PRELUDE: usize = 48;
-static mut FILE_IO: [[u64; 3]; FILE_IO_NAMES.len()] = [[0; 3]; FILE_IO_NAMES.len()];
-static mut FILE_IO_MAX: [u64; FILE_IO_NAMES.len()] = [0; FILE_IO_NAMES.len()];
-pub(super) fn file_io_max() -> [u64; FILE_IO_NAMES.len()] { unsafe { *core::ptr::addr_of!(FILE_IO_MAX) } }
+static FILE_IO: spin::Mutex<([[u64; 3]; FILE_IO_NAMES.len()], [u64; FILE_IO_NAMES.len()])> =
+    spin::Mutex::new(([[0; 3]; FILE_IO_NAMES.len()], [0; FILE_IO_NAMES.len()]));
+pub(super) fn file_io_max() -> [u64; FILE_IO_NAMES.len()] { FILE_IO.lock().1 }
 
 pub(super) const DIRECTORY_FIELDS: [&str; 10] = ["hits", "misses", "builds", "entries_loaded", "build_ns",
     "namespace_invalidations", "metadata_invalidations", "write_invalidations", "dynamic_invalidations", "global_invalidations"];
-static mut DIRECTORIES: alloc::collections::BTreeMap<alloc::vec::Vec<u8>, [u64; 10]> = alloc::collections::BTreeMap::new();
+static DIRECTORIES: spin::Mutex<alloc::collections::BTreeMap<alloc::vec::Vec<u8>, [u64; 10]>> = spin::Mutex::new(alloc::collections::BTreeMap::new());
 pub(super) fn directory_event(path: &[u8], field: usize, count: u64) {
     if super::parallel::on_worker() {
         if super::startup::detail_profile_enabled() {
@@ -51,26 +53,26 @@ pub(super) fn directory_event(path: &[u8], field: usize, count: u64) {
         return;
     }
     if !super::startup::profile_enabled() { return; }
-    let counters = unsafe { &mut *core::ptr::addr_of_mut!(DIRECTORIES) };
+    let mut counters = DIRECTORIES.lock();
     if let Some(row) = counters.get_mut(path) { row[field] = row[field].wrapping_add(count); }
     else { let mut row = [0; 10]; row[field] = count; counters.insert(path.to_vec(), row); }
 }
-pub(super) fn directory_count() -> usize { unsafe { (&*core::ptr::addr_of!(DIRECTORIES)).len() } }
+pub(super) fn directory_count() -> usize { DIRECTORIES.lock().len() }
 pub(super) fn directory_totals() -> [u64; 10] {
     let mut totals = [0u64; 10];
-    for row in unsafe { &*core::ptr::addr_of!(DIRECTORIES) }.values() {
+    for row in DIRECTORIES.lock().values() {
         for (total, value) in totals.iter_mut().zip(row) { *total = total.wrapping_add(*value); }
     }
     totals
 }
-pub(super) fn directories_top(limit: usize) -> alloc::vec::Vec<(&'static [u8], [u64; 10])> {
-    let mut rows: alloc::vec::Vec<_> = unsafe { &*core::ptr::addr_of!(DIRECTORIES) }.iter()
-        .map(|(path, counters)| (path.as_slice(), *counters)).collect();
+pub(super) fn directories_top(limit: usize) -> alloc::vec::Vec<(alloc::vec::Vec<u8>, [u64; 10])> {
+    let mut rows: alloc::vec::Vec<_> = DIRECTORIES.lock().iter()
+        .map(|(path, counters)| (path.clone(), *counters)).collect();
     rows.sort_unstable_by_key(|(_, values)| core::cmp::Reverse(values[4]));
     rows.truncate(limit);
     rows
 }
-pub(super) fn overflow() -> u64 { unsafe { OVERFLOW } }
+pub(super) fn overflow() -> u64 { *OVERFLOW.lock() }
 
 /// Worker measurements are CPU time and may overlap. They never contribute
 /// to the disjoint BSP wall-time ledger or its nested I/O tables.
@@ -127,60 +129,51 @@ pub(crate) fn file_io_finish(stage: usize, bytes: usize, start: Option<u64>) {
             profile.io_max[stage] = profile.io_max[stage].max(elapsed);
             return;
         }
-        let counters = unsafe { &mut (*core::ptr::addr_of_mut!(FILE_IO))[stage] };
+        let mut profile = FILE_IO.lock();
+        let counters = &mut profile.0[stage];
         counters[0] = counters[0].wrapping_add(1);
         counters[1] = counters[1].wrapping_add(bytes as u64);
         counters[2] = counters[2].wrapping_add(elapsed);
-        unsafe {
-            let maximum = &mut (*core::ptr::addr_of_mut!(FILE_IO_MAX))[stage];
-            *maximum = (*maximum).max(elapsed);
-        }
+        profile.1[stage] = profile.1[stage].max(elapsed);
     }
 }
-pub(super) fn file_io() -> [[u64; 3]; FILE_IO_NAMES.len()] { unsafe { *core::ptr::addr_of!(FILE_IO) } }
+pub(super) fn file_io() -> [[u64; 3]; FILE_IO_NAMES.len()] { FILE_IO.lock().0 }
 // Native device shortcuts do not create event-loop events. Keep their cost
 // separate, including failed attempts that subsequently take the normal path.
 pub(super) const DEVICE_NAMES: [&str; 7] = ["vga_mov", "vga_generic", "vga_status", "vga_mask", "dma_poll", "vga_palette", "opl_status"];
-static mut DEVICE_ENTRIES: [[u64; 2]; 7] = [[0; 2]; 7];
+static DEVICE_ENTRIES: spin::Mutex<[[u64; 2]; 7]> = spin::Mutex::new([[0; 2]; 7]);
 #[derive(Clone, Copy)]
 struct TimedEvent { ns: u64, kind: u32, value: u32 }
-const EMPTY_TIMED: TimedEvent = TimedEvent { ns: 0, kind: 0, value: 0 };
-static mut TIMELINE: alloc::vec::Vec<TimedEvent> = alloc::vec::Vec::new();
-static mut TIMELINE_USED: usize = 0;
-static mut OPL_INDEX: u8 = 0;
+static TIMELINE: spin::Mutex<alloc::vec::Vec<TimedEvent>> = spin::Mutex::new(alloc::vec::Vec::new());
+static OPL_INDEX: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 /// BSP-only, preallocated diagnostic events: frame address, palette begin/end,
 /// and OPL key transitions. Recording never allocates or logs in the hot path.
 pub(super) fn timed_event(now: u64, kind: u32, value: u32) {
     if !super::startup::profile_enabled() { return; }
-    unsafe {
-        let events = &mut *core::ptr::addr_of_mut!(TIMELINE);
-        if TIMELINE_USED < events.len() {
-            events[TIMELINE_USED] = TimedEvent { ns: now, kind, value };
-            TIMELINE_USED += 1;
-        }
+    let mut events = TIMELINE.lock();
+    if events.len() < events.capacity() {
+        events.push(TimedEvent { ns: now, kind, value });
     }
 }
 
 pub(super) fn record_device_entries(details: [[u32; 4]; 7]) {
+    let mut entries = DEVICE_ENTRIES.lock();
     for (kind, [calls_lo, calls_hi, cycles_lo, cycles_hi]) in details.into_iter().enumerate() {
-        unsafe {
-            let counters = &mut (&mut *core::ptr::addr_of_mut!(DEVICE_ENTRIES))[kind];
-            counters[0] = counters[0].wrapping_add(u64::from(calls_lo) | (u64::from(calls_hi) << 32));
-            counters[1] = counters[1].wrapping_add(u64::from(cycles_lo) | (u64::from(cycles_hi) << 32));
-        }
+        let counters = &mut entries[kind];
+        counters[0] = counters[0].wrapping_add(u64::from(calls_lo) | (u64::from(calls_hi) << 32));
+        counters[1] = counters[1].wrapping_add(u64::from(cycles_lo) | (u64::from(cycles_hi) << 32));
     }
 }
 
 pub(super) fn device_entries() -> [[u64; 2]; 7] {
-    unsafe { *core::ptr::addr_of!(DEVICE_ENTRIES) }
+    *DEVICE_ENTRIES.lock()
 }
 
 /// Syscalls have their own unbounded table: faults and port traffic must not
 /// evict them from the bounded guest-event profile. ABI distinguishes equal
 /// syscall numbers with different meanings. Only the event loop accesses it.
-static mut SYSCALLS: alloc::collections::BTreeMap<(u32, u32), [u64; 3]> =
-    alloc::collections::BTreeMap::new();
+static SYSCALLS: spin::Mutex<alloc::collections::BTreeMap<(u32, u32), [u64; 3]>> = spin::Mutex::new(alloc::collections::BTreeMap::new());
 
 pub(crate) struct SyscallScope { key: (u32, u32), start: Option<u64> }
 impl SyscallScope {
@@ -193,7 +186,7 @@ impl SyscallScope {
                 if !super::startup::detail_profile_enabled() { return Self { key, start: None }; }
                 profile.syscalls.entry(key).or_default();
             }
-            else { unsafe { (&mut *core::ptr::addr_of_mut!(SYSCALLS)).entry(key).or_default(); } }
+            else { SYSCALLS.lock().entry(key).or_default(); }
             Some(super::portio::now_ns())
         } else { None };
         Self { key, start }
@@ -212,18 +205,18 @@ impl Drop for SyscallScope {
             row[2] = row[2].max(elapsed);
             return;
         }
-        unsafe {
-            let counters = (&mut *core::ptr::addr_of_mut!(SYSCALLS)).get_mut(&self.key)
-                .expect("profiled syscall has a counter");
-            counters[0] = counters[0].wrapping_add(1);
-            counters[1] = counters[1].wrapping_add(elapsed);
-            counters[2] = counters[2].max(elapsed);
-        }
+        let mut syscalls = SYSCALLS.lock();
+        let counters = syscalls.get_mut(&self.key)
+            .expect("profiled syscall has a counter");
+        counters[0] = counters[0].wrapping_add(1);
+        counters[1] = counters[1].wrapping_add(elapsed);
+        counters[2] = counters[2].max(elapsed);
     }
 }
 
 pub(super) fn visit_syscalls(mut visit: impl FnMut(u32, u32, u64, u64, u64)) {
-    for (&(abi, number), &[calls, ns, max]) in unsafe { &*core::ptr::addr_of!(SYSCALLS) } {
+    let syscalls = SYSCALLS.lock().clone();
+    for ((abi, number), [calls, ns, max]) in syscalls {
         visit(abi, number, calls, ns, max);
     }
 }
@@ -264,9 +257,9 @@ impl Sample {
             KernelEvent::Outs { .. } => (14, regs.rdx as u32 & 0xFFFF),
         };
         if let KernelEvent::Out { port, .. } = *event {
-            if port == 0x388 { unsafe { OPL_INDEX = regs.rax as u8; } }
+            if port == 0x388 { OPL_INDEX.store(regs.rax as u8, core::sync::atomic::Ordering::Relaxed); }
             if port == 0x389 {
-                let index = unsafe { OPL_INDEX };
+                let index = OPL_INDEX.load(core::sync::atomic::Ordering::Relaxed);
                 if (0xb0..=0xb8).contains(&index) {
                     timed_event(machine.now(), 4, u32::from(index) << 8 | regs.rax as u32 & 255);
                 }
@@ -274,23 +267,21 @@ impl Sample {
         }
         // Single cooperative event loop owns this storage. No IRQ accesses.
         // Keep table lookup outside the measured dispatch interval.
-        unsafe {
-            let counters = &mut *core::ptr::addr_of_mut!(COUNTERS);
-            if counters.is_empty() { counters.resize(SLOTS, EMPTY); }
-            let first = (key.wrapping_mul(2654435761) ^ kind) as usize % SLOTS;
-            for probe in 0..SLOTS {
-                let index = (first + probe) % SLOTS;
-                let counter = &mut counters[index];
-                if counter.kind == 0 || (counter.kind == kind && counter.key == key) {
-                    counter.kind = kind;
-                    counter.key = key;
-                    counter.cs = u32::from(regs.code_seg());
-                    counter.ip = regs.ip32();
-                    return Dispatch(Some((index, run, crate::kernel::event_profile::cycles())));
-                }
+        let mut counters = COUNTERS.lock();
+        if counters.is_empty() { counters.resize(SLOTS, EMPTY); }
+        let first = (key.wrapping_mul(2654435761) ^ kind) as usize % SLOTS;
+        for probe in 0..SLOTS {
+            let index = (first + probe) % SLOTS;
+            let counter = &mut counters[index];
+            if counter.kind == 0 || (counter.kind == kind && counter.key == key) {
+                counter.kind = kind;
+                counter.key = key;
+                counter.cs = u32::from(regs.code_seg());
+                counter.ip = regs.ip32();
+                return Dispatch(Some((index, run, crate::kernel::event_profile::cycles())));
             }
-            OVERFLOW += 1;
         }
+        *OVERFLOW.lock() += 1;
         Dispatch(None)
     }
 }
@@ -299,13 +290,12 @@ impl Dispatch {
     pub(super) fn finish<A: Core>(self, _machine: &A) {
         let Some((index, run, start)) = self.0 else { return };
         let elapsed = crate::kernel::event_profile::cycles().wrapping_sub(start);
-        unsafe {
-            let counter = &mut (&mut *core::ptr::addr_of_mut!(COUNTERS))[index];
-            counter.calls += 1;
-            counter.run += run;
-            counter.dispatch += elapsed;
-            counter.max_dispatch = counter.max_dispatch.max(elapsed);
-        }
+        let mut counters = COUNTERS.lock();
+        let counter = &mut counters[index];
+        counter.calls += 1;
+        counter.run += run;
+        counter.dispatch += elapsed;
+        counter.max_dispatch = counter.max_dispatch.max(elapsed);
     }
 }
 
@@ -315,47 +305,43 @@ pub(super) fn reset() {
         let mut profile = profile.lock();
         *profile = WorkerProfile { reset_ns, ..WorkerProfile::new() };
     }
-    unsafe {
-        (&mut *core::ptr::addr_of_mut!(COUNTERS)).fill(EMPTY);
-        OVERFLOW = 0;
-        (&mut *core::ptr::addr_of_mut!(SYSCALLS)).clear();
-        RM_TARGETS = [(0, 0, 0, 0); RM_TARGET_SLOTS];
-        READ_DETAILS = [(0, 0, 0); READ_DETAIL_SLOTS];
-        DIRECT_RM_PHASES = [0; 4];
-        FILE_IO = [[0; 3]; FILE_IO_NAMES.len()];
-        FILE_IO_MAX = [0; FILE_IO_NAMES.len()];
-        (&mut *core::ptr::addr_of_mut!(DIRECTORIES)).clear();
-        DEVICE_ENTRIES = [[0; 2]; 7];
-        (&mut *core::ptr::addr_of_mut!(TIMELINE)).resize(2048, EMPTY_TIMED);
-        TIMELINE_USED = 0;
-        OPL_INDEX = 0;
+    COUNTERS.lock().fill(EMPTY);
+    *OVERFLOW.lock() = 0;
+    SYSCALLS.lock().clear();
+    *RM_TARGETS.lock() = [(0, 0, 0, 0); RM_TARGET_SLOTS];
+    *READ_DETAILS.lock() = [(0, 0, 0); READ_DETAIL_SLOTS];
+    *DIRECT_RM_PHASES.lock() = [0; 4];
+    *FILE_IO.lock() = ([[0; 3]; FILE_IO_NAMES.len()], [0; FILE_IO_NAMES.len()]);
+    DIRECTORIES.lock().clear();
+    *DEVICE_ENTRIES.lock() = [[0; 2]; 7];
+    {
+        let mut timeline = TIMELINE.lock();
+        timeline.clear();
+        timeline.reserve_exact(2048);
     }
+    OPL_INDEX.store(0, core::sync::atomic::Ordering::Relaxed);
     super::block::cache::profile_reset();
 }
 
 pub(super) fn record_direct_rm_phases(setup: u64, dispatch: u64, unwind: u64) {
-    unsafe {
-        let phases = &mut *core::ptr::addr_of_mut!(DIRECT_RM_PHASES);
-        phases[0] = phases[0].wrapping_add(1);
-        phases[1] = phases[1].wrapping_add(setup);
-        phases[2] = phases[2].wrapping_add(dispatch);
-        phases[3] = phases[3].wrapping_add(unwind);
-    }
+    let mut phases = DIRECT_RM_PHASES.lock();
+    phases[0] = phases[0].wrapping_add(1);
+    phases[1] = phases[1].wrapping_add(setup);
+    phases[2] = phases[2].wrapping_add(dispatch);
+    phases[3] = phases[3].wrapping_add(unwind);
 }
 
 pub(super) fn direct_rm_phases() -> [u64; 4] {
-    unsafe { *core::ptr::addr_of!(DIRECT_RM_PHASES) }
+    *DIRECT_RM_PHASES.lock()
 }
 
 fn record_dos_read_detail(size: u16, fetch: u64, copy: u64) {
     if !super::startup::profile_enabled() { return; }
-    unsafe {
-        let details = &mut *core::ptr::addr_of_mut!(READ_DETAILS);
-        if let Some(entry) = details.iter_mut().find(|entry| entry.0 == size || entry.0 == 0) {
-            entry.0 = size;
-            entry.1 = entry.1.wrapping_add(fetch);
-            entry.2 = entry.2.wrapping_add(copy);
-        }
+    let mut details = READ_DETAILS.lock();
+    if let Some(entry) = details.iter_mut().find(|entry| entry.0 == size || entry.0 == 0) {
+        entry.0 = size;
+        entry.1 = entry.1.wrapping_add(fetch);
+        entry.2 = entry.2.wrapping_add(copy);
     }
 }
 
@@ -370,22 +356,21 @@ pub(super) fn record_dos_read_copy(size: u16, cycles: u64) {
 /// Record a DPMI 0300/0301/0302 destination.
 pub(super) fn record_rm_target(kind: u8, cs: u16, ip: u16) {
     if !super::startup::profile_enabled() { return; }
-    unsafe {
-        let targets = &mut *core::ptr::addr_of_mut!(RM_TARGETS);
-        if let Some(entry) = targets
-            .iter_mut()
-            .find(|entry| (entry.0 == kind && entry.1 == cs && entry.2 == ip) || entry.3 == 0)
-        {
-            entry.0 = kind;
-            entry.1 = cs;
-            entry.2 = ip;
-            entry.3 = entry.3.wrapping_add(1);
-        }
+    let mut targets = RM_TARGETS.lock();
+    if let Some(entry) = targets
+        .iter_mut()
+        .find(|entry| (entry.0 == kind && entry.1 == cs && entry.2 == ip) || entry.3 == 0)
+    {
+        entry.0 = kind;
+        entry.1 = cs;
+        entry.2 = ip;
+        entry.3 = entry.3.wrapping_add(1);
     }
 }
 
 pub(super) fn visit_rm_targets(mut visit: impl FnMut(u8, u16, u16, u64)) {
-    for &(kind, cs, ip, calls) in unsafe { &*core::ptr::addr_of!(RM_TARGETS) } {
+    let targets = *RM_TARGETS.lock();
+    for (kind, cs, ip, calls) in targets {
         if calls != 0 {
             visit(kind, cs, ip, calls);
         }
@@ -407,13 +392,15 @@ pub(super) fn print() {
             crate::compact_println!("[io-prof] {} calls={} bytes={} ns={}", name, calls, bytes, ns);
         }
     }
-    for event in unsafe { &(&*core::ptr::addr_of!(TIMELINE))[..TIMELINE_USED] } {
+    let timeline = TIMELINE.lock().clone();
+    for event in timeline {
         crate::compact_println!("[frame-timeline] ns={} kind={} value={}", event.ns, event.kind, event.value);
     }
     for (name, [calls, cycles]) in DEVICE_NAMES.into_iter().zip(device_entries()) {
         crate::compact_println!("[device-prof] {} calls={} cycles={}", name, calls, cycles);
     }
-    for c in unsafe { &*core::ptr::addr_of!(COUNTERS) } {
+    let counters = COUNTERS.lock().clone();
+    for c in counters {
         if c.calls != 0 {
             crate::compact_println!(
                 "[event-prof] kind={} key={:08x} calls={} run={} dispatch={} max={} at={:04x}:{:08x}",
@@ -421,16 +408,18 @@ pub(super) fn print() {
             );
         }
     }
-    crate::compact_println!("[event-prof] overflow={}", unsafe { OVERFLOW });
+    crate::compact_println!("[event-prof] overflow={}", overflow());
 }
 
 /// Visit profiled DOS file reads without routing the data through the ambient
 /// log UART. Large COM1 dumps can outrun an emulator's serial sink; the
 /// diagnostic control channel emits these counters as one structured reply.
 pub(super) fn visit_dos_file_reads(mut visit: impl FnMut(u16, u64, u64, u64, u64, u64)) {
-    for counter in unsafe { &*core::ptr::addr_of!(COUNTERS) } {
+    let counters = COUNTERS.lock().clone();
+    let details = *READ_DETAILS.lock();
+    for counter in counters {
         if counter.kind == 4 && counter.key >> 16 == 0x213F && counter.calls != 0 {
-            let detail = unsafe { &*core::ptr::addr_of!(READ_DETAILS) }
+            let detail = details
                 .iter()
                 .find(|detail| detail.0 == counter.key as u16)
                 .copied()
@@ -454,8 +443,7 @@ pub(super) type EventSummary = (u32, u32, u32, u32, u64, u64, u64, u64);
 /// the serial-control profiler. A bounded list keeps the reply well below the
 /// UART timeout while retaining every material kernel-side cost.
 pub(super) fn top(limit: usize) -> alloc::vec::Vec<EventSummary> {
-    let mut counters: alloc::vec::Vec<_> = unsafe { &*core::ptr::addr_of!(COUNTERS) }
-        .iter()
+    let mut counters: alloc::vec::Vec<_> = COUNTERS.lock().iter()
         .filter(|counter| counter.calls != 0)
         .map(|counter| (
             counter.kind,
@@ -473,12 +461,6 @@ pub(super) fn top(limit: usize) -> alloc::vec::Vec<EventSummary> {
     counters
 }
 
-/// RDTSC is unprivileged; profiling reads it directly, in the same cycle units
-/// as the native execution counters. This is not the scheduler clock.
+/// Diagnostic cycle count in the units of the native execution counters.
 #[inline]
-pub fn cycles() -> u64 {
-    #[cfg(target_arch = "x86")]
-    unsafe { core::arch::x86::_rdtsc() }
-    #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::x86_64::_rdtsc() }
-}
+pub fn cycles() -> u64 { super::portio::cycles() }

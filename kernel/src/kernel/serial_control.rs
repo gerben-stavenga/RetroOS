@@ -4,6 +4,8 @@
 //! own UART. The host sends one ASCII command per line and receives exactly
 //! one JSON reply per line. No keyboard or OSD navigation is involved.
 
+#![forbid(unsafe_code)]
+
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use arch_abi::ComPort;
@@ -11,17 +13,17 @@ use crate::kernel::drivers::uart16550::{Uart16550, UartConfig};
 
 pub(crate) mod local;
 mod report;
-static mut COMPOSITE_REPLY: bool = false;
+static COMPOSITE_REPLY: AtomicBool = AtomicBool::new(false);
 
 // Only the cooperative event-loop owner serializes replies. A local command
 // captures the same serializer's output instead of transmitting it on a UART.
 struct LocalReply { bytes: alloc::vec::Vec<u8>, failed: bool }
-static mut LOCAL_REPLY: Option<LocalReply> = None;
+static LOCAL_REPLY: spin::Mutex<Option<LocalReply>> = spin::Mutex::new(None);
 
 fn execute_local(machine: &mut impl crate::Core, line: &[u8], stats: &mut super::startup::EventStats) -> (bool, alloc::vec::Vec<u8>) {
-    unsafe { LOCAL_REPLY = Some(LocalReply { bytes: alloc::vec::Vec::new(), failed: false }); }
+    *LOCAL_REPLY.lock() = Some(LocalReply { bytes: alloc::vec::Vec::new(), failed: false });
     let dump = execute(machine, line, stats);
-    let reply = unsafe { (*core::ptr::addr_of_mut!(LOCAL_REPLY)).take().unwrap() };
+    let reply = LOCAL_REPLY.lock().take().expect("missing local reply");
     (dump, if reply.failed { b"{\"ok\":false,\"error\":\"reply too large or out of memory\"}\n".to_vec() } else { reply.bytes })
 }
 
@@ -33,12 +35,50 @@ const TX_READY_POLLS: u32 = 100_000;
 static LIVE: AtomicBool = AtomicBool::new(false);
 static PORT: AtomicU8 = AtomicU8::new(0);
 static RX_PENDING: AtomicBool = AtomicBool::new(false);
-static mut RX: [u8; RX_CAPACITY] = [0; RX_CAPACITY];
-static mut RX_LEN: usize = 0;
-static mut DISCARDING: bool = false;
-static mut INJECT: [u8; INJECT_CAPACITY] = [0; INJECT_CAPACITY];
-static mut INJECT_HEAD: usize = 0;
-static mut INJECT_TAIL: usize = 0;
+struct Receiver {
+    bytes: [u8; RX_CAPACITY],
+    len: usize,
+    discarding: bool,
+}
+enum Received {
+    Incomplete,
+    TooLong,
+    Command(usize),
+}
+impl Receiver {
+    fn receive(&mut self, byte: u8, line: &mut [u8; RX_CAPACITY]) -> Received {
+        if matches!(byte, b'\n' | b'\r') {
+            let len = core::mem::take(&mut self.len);
+            if core::mem::take(&mut self.discarding) {
+                return Received::TooLong;
+            }
+            if len != 0 {
+                line[..len].copy_from_slice(&self.bytes[..len]);
+                return Received::Command(len);
+            }
+        } else if !self.discarding {
+            if self.len == RX_CAPACITY {
+                self.discarding = true;
+                self.len = 0;
+            } else {
+                self.bytes[self.len] = byte;
+                self.len += 1;
+            }
+        }
+        Received::Incomplete
+    }
+}
+static RX: spin::Mutex<Receiver> = spin::Mutex::new(Receiver {
+    bytes: [0; RX_CAPACITY], len: 0, discarding: false,
+});
+struct Injection {
+    bytes: [u8; INJECT_CAPACITY],
+    head: usize,
+    tail: usize,
+}
+static INJECT: spin::Mutex<Injection> = spin::Mutex::new(Injection {
+    bytes: [0; INJECT_CAPACITY], head: 0, tail: 0,
+});
 
 fn uart() -> Option<Uart16550> {
     match PORT.load(Ordering::Relaxed) {
@@ -61,8 +101,8 @@ pub fn init<A: crate::Core>(machine: &mut A, port: ComPort) -> bool {
 }
 
 fn send(bytes: &[u8]) {
-    let bytes = if unsafe { COMPOSITE_REPLY } { bytes.strip_suffix(b"\n").unwrap_or(bytes) } else { bytes };
-    if let Some(reply) = unsafe { (*core::ptr::addr_of_mut!(LOCAL_REPLY)).as_mut() } {
+    let bytes = if COMPOSITE_REPLY.load(Ordering::Relaxed) { bytes.strip_suffix(b"\n").unwrap_or(bytes) } else { bytes };
+    if let Some(reply) = LOCAL_REPLY.lock().as_mut() {
         if !reply.failed {
             if bytes.len() > local::MAX_REPLY.saturating_sub(reply.bytes.len())
                 || reply.bytes.try_reserve(bytes.len()).is_err() { reply.failed = true; }
@@ -265,29 +305,23 @@ fn trim(mut bytes: &[u8]) -> &[u8] {
 }
 
 fn injection_free() -> usize {
-    unsafe {
-        if INJECT_TAIL >= INJECT_HEAD {
-            INJECT_CAPACITY - 1 - (INJECT_TAIL - INJECT_HEAD)
-        } else {
-            INJECT_HEAD - INJECT_TAIL - 1
-        }
-    }
+    let queue = INJECT.lock();
+    (queue.head + INJECT_CAPACITY - queue.tail - 1) % INJECT_CAPACITY
 }
 
 fn inject(scancode: u8) {
-    unsafe {
-        INJECT[INJECT_TAIL] = scancode;
-        INJECT_TAIL = (INJECT_TAIL + 1) % INJECT_CAPACITY;
-    }
+    let mut queue = INJECT.lock();
+    let tail = queue.tail;
+    queue.bytes[tail] = scancode;
+    queue.tail = (tail + 1) % INJECT_CAPACITY;
 }
 
 fn pop_injected() -> Option<u8> {
-    unsafe {
-        if INJECT_HEAD == INJECT_TAIL { return None; }
-        let scancode = INJECT[INJECT_HEAD];
-        INJECT_HEAD = (INJECT_HEAD + 1) % INJECT_CAPACITY;
-        Some(scancode)
-    }
+    let mut queue = INJECT.lock();
+    if queue.head == queue.tail { return None; }
+    let scancode = queue.bytes[queue.head];
+    queue.head = (queue.head + 1) % INJECT_CAPACITY;
+    Some(scancode)
 }
 
 fn queue_tap(scancode: u8, extended: bool) -> usize {
@@ -534,28 +568,14 @@ pub(super) fn poll<A: crate::Core>(machine: &mut A, events: &mut alloc::vec::Vec
     let irq = take_irq(events, endpoint.irq());
     let receive = irq || RX_PENDING.load(Ordering::Relaxed);
     let mut pending = receive;
+    let mut line = [0; RX_CAPACITY];
     for _ in 0..if receive { RX_PER_POLL } else { 0 } {
         let Ok(byte) = endpoint.read_byte(1) else { pending = false; break };
-        unsafe {
-            if byte == b'\n' || byte == b'\r' {
-                if DISCARDING {
-                    DISCARDING = false;
-                    RX_LEN = 0;
-                    send(b"{\"ok\":false,\"error\":\"command too long\"}\n");
-                } else if RX_LEN != 0 {
-                    let len = RX_LEN;
-                    RX_LEN = 0;
-                    dump |= execute(machine, &RX[..len], stats);
-                }
-            } else if !DISCARDING {
-                if RX_LEN == RX_CAPACITY {
-                    DISCARDING = true;
-                    RX_LEN = 0;
-                } else {
-                    RX[RX_LEN] = byte;
-                    RX_LEN += 1;
-                }
-            }
+        let received = RX.lock().receive(byte, &mut line);
+        match received {
+            Received::Incomplete => {}
+            Received::TooLong => send(b"{\"ok\":false,\"error\":\"command too long\"}\n"),
+            Received::Command(len) => dump |= execute(machine, &line[..len], stats),
         }
     }
     RX_PENDING.store(pending, Ordering::Relaxed);
@@ -598,5 +618,6 @@ mod tests {
 pub(crate) fn next_deadline(now: u64) -> Option<u64> {
     if local::pending() { return Some(now); }
     if RX_PENDING.load(Ordering::Relaxed) { return Some(now); }
-    unsafe { (INJECT_HEAD != INJECT_TAIL).then(|| now.saturating_add(1_000_000)) }
+    let queue = INJECT.lock();
+    (queue.head != queue.tail).then(|| now.saturating_add(1_000_000))
 }

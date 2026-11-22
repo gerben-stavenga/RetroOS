@@ -113,6 +113,7 @@ impl VbeDisplayMode {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Platform {
     pub host: Host,
     /// Guest VGA port programming reaches a real adapter rather than an
@@ -122,7 +123,7 @@ pub struct Platform {
     ///
     /// A *fact*, not a capability: that a Sound Blaster answered is frozen
     /// here, but the card itself is a move-only value with one owner
-    /// (`sb16::Sb16`), and `Platform` hands out `&'static`. It used to be
+    /// (`sb16::Sb16`), and `Platform` is a snapshot. It used to be
     /// mirrored here as `sb_card` + `sb_wiring`, which is how every DOS
     /// thread came to mint its own copy of the machine's one card.
     pub audio_hw: AudioHw,
@@ -203,7 +204,7 @@ impl NativeVga {
 }
 
 pub struct ProbedPlatform {
-    pub facts: &'static Platform,
+    pub facts: Platform,
     pub display: crate::kernel::display::Display,
     pub audio: AudioToken,
 }
@@ -364,27 +365,29 @@ impl HostEnv {
     }
 }
 
-static mut HOST_ENV: HostEnv = HostEnv {
+static HOST_ENV: spin::Mutex<HostEnv> = spin::Mutex::new(HostEnv {
     framebuffer: || None,
     debug: DebugSink::HostStdout,
     is_metal: false,
-};
+});
 
 /// Install the entry's environment facts. Boot-time single-threaded; call
 /// before `probe`.
 pub fn set_host_env(env: HostEnv) {
-    unsafe { HOST_ENV = env };
+    *HOST_ENV.lock() = env;
 }
 
 fn host_env() -> HostEnv {
-    unsafe { HOST_ENV }
+    *HOST_ENV.lock()
 }
 
-static mut PLATFORM: Option<Platform> = None;
+static PLATFORM: spin::Mutex<Option<Platform>> = spin::Mutex::new(None);
 
-/// Probe the machine and freeze the result. Called exactly once, early in
-/// `startup` — after the heap, before threading (still single-threaded, so
-/// the write-once static needs no lock).
+fn update_platform<R>(update: impl FnOnce(&mut Platform) -> R) -> R {
+    update(PLATFORM.lock().as_mut().expect("platform not probed"))
+}
+
+/// Record the machine's capabilities before startup configures its devices.
 pub fn probe<A: crate::Core>(
     machine: &mut A,
     boot: &crate::BootConfig,
@@ -476,10 +479,7 @@ pub fn probe<A: crate::Core>(
     };
 
     let (p, display) = p;
-    unsafe {
-        PLATFORM = Some(p);
-    }
-    let p = get();
+    *PLATFORM.lock() = Some(p);
     let display = display.unwrap_or_else(|| {
         crate::kernel::display::Display::new_vga(NativeVga::new().into_cap())
     });
@@ -518,8 +518,6 @@ pub fn apply_audio_mode<A: crate::Core>(
     declared: Option<crate::kernel::drivers::sb16::SbWiring>,
     pnp: Option<crate::kernel::drivers::isapnp::SbResources>,
 ) -> Option<crate::kernel::drivers::sb16::Sb16> {
-    let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
-        .expect("platform::apply_audio_mode before probe");
     // PnP owns discovery and configuration first. Only genuine absence
     // permits a legacy base sweep; failure on a PnP card is not absence.
     use crate::kernel::drivers::{isapnp, sb16};
@@ -528,12 +526,12 @@ pub fn apply_audio_mode<A: crate::Core>(
         isapnp::SbProbe::Absent => sb16::scan(machine, declared),
         isapnp::SbProbe::Failed => None,
     };
-    let kernel_audio = p.audio_hw;
-    if card.is_some() { p.audio_hw = AudioHw::Sb; }
+    let kernel_audio = get().audio_hw;
+    let detected = if card.is_some() { AudioHw::Sb } else { kernel_audio };
     // When HDA is present it is the kernel mixer's output, leaving the real
     // SB available for native DOS ownership. Without HDA, mixed mode uses the
     // SB itself and therefore requires its 16-bit DMA channel.
-    p.audio = match (&card, mixed) {
+    let audio = match (&card, mixed) {
         (Some(_), true) if kernel_audio == AudioHw::Hda => Audio::EmulatedHda,
         (Some(c), true) if c.dma16 == Some(5) => Audio::SbSink,
         (Some(_), true) => {
@@ -545,12 +543,16 @@ pub fn apply_audio_mode<A: crate::Core>(
         }
         (Some(_), false) => Audio::NativeSb,
         // No card: whatever else the machine has (or silence).
-        (None, _) => match p.audio_hw {
+        (None, _) => match detected {
             AudioHw::Sb => Audio::EmulatedSilent,
             hw => hw.default_verdict(),
         },
     };
-    crate::compact_println!("Audio: {} ({})", p.audio.name(),
+    update_platform(|platform| {
+        platform.audio_hw = detected;
+        platform.audio = audio;
+    });
+    crate::compact_println!("Audio: {} ({})", audio.name(),
         if mixed { "SB_AUDIO=mixed" } else { "SB_AUDIO=native" });
     card
 }
@@ -559,9 +561,10 @@ pub fn apply_audio_mode<A: crate::Core>(
 /// exists. This records a descriptor only; it neither sets the mode nor maps
 /// the framebuffer.
 pub fn set_vbe_mode(mode: Option<VbeDisplayMode>) {
-    let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
-        .expect("platform::set_vbe_mode before probe");
-    p.vbe_mode = mode;
+    let passthrough = update_platform(|platform| {
+        platform.vbe_mode = mode;
+        platform.vga_passthrough
+    });
     match mode {
         Some(selected) => {
             let m = selected.mode();
@@ -571,7 +574,7 @@ pub fn set_vbe_mode(mode: Option<VbeDisplayMode>) {
             m.window_segment, m.window_granularity_kb, m.window_size_kb,
             )
         },
-        None if p.vga_passthrough => {
+        None if passthrough => {
             crate::compact_println!("VBE: no usable packed mode; selected display is Mode 13h")
         }
         None => {}
@@ -605,14 +608,11 @@ pub fn set_voodoo_vbe_mode(modes: Option<&[VbeMode]>, surface_available: bool) {
             .min_by_key(|&(_, key)| key)
             .map(|(mode, _)| mode)
     });
-    let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
-        .expect("platform::set_voodoo_vbe_mode before probe");
-    p.voodoo_vbe_mode = selected;
-    p.voodoo_emulation = if p.vga_passthrough {
-        selected.is_some()
-    } else {
-        surface_available
-    };
+    let passthrough = update_platform(|platform| {
+        platform.voodoo_vbe_mode = selected;
+        platform.voodoo_emulation = if platform.vga_passthrough { selected.is_some() } else { surface_available };
+        platform.vga_passthrough
+    });
     match selected {
         Some(selected) => {
             let m = selected.mode();
@@ -626,7 +626,7 @@ pub fn set_voodoo_vbe_mode(modes: Option<&[VbeMode]>, surface_available: bool) {
                 if m.programmable_ramp { "programmable" } else { "fixed" },
             );
         }
-        None if p.vga_passthrough =>
+        None if passthrough =>
             crate::compact_println!("VBE: no supported display mode; Voodoo disabled"),
         None => {}
     }
@@ -635,17 +635,11 @@ pub fn set_voodoo_vbe_mode(modes: Option<&[VbeMode]>, surface_available: bool) {
 /// Whether boot discovery found a physical SB. No guest may own one before
 /// discovery. HDA/AC'97-only systems need no shared mixer state to answer this.
 pub(crate) fn sound_blaster_present() -> bool {
-    unsafe { (&raw const PLATFORM).as_ref().and_then(Option::as_ref).is_some_and(|p| p.audio_hw == AudioHw::Sb) }
+    PLATFORM.lock().is_some_and(|platform| platform.audio_hw == AudioHw::Sb)
 }
 
-pub fn get() -> &'static Platform {
-    unsafe {
-        (&raw const PLATFORM)
-            .as_ref()
-            .unwrap()
-            .as_ref()
-            .expect("platform::get before platform::probe")
-    }
+pub fn get() -> Platform {
+    PLATFORM.lock().expect("platform::get before probe")
 }
 
 /// Probe audio once. PCI drivers return their initialized capability together

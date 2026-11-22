@@ -916,7 +916,7 @@ pub(super) fn int_21h<A: crate::Core>(
                     // `ent`, not `e` — the extension slice below owns that name.
                     Some((alias, ent)) => {
                         idx += 1;
-                        if !dos_wildcard_match(pat, alias) { continue; }
+                        if !dos_wildcard_match(pat, &alias) { continue; }
                         dos.find_idx = idx as u16;
                         let (is_dir, size) = (ent.is_dir, ent.size);
                         // Write search FCB into DTA. Layout above.
@@ -939,7 +939,7 @@ pub(super) fn int_21h<A: crate::Core>(
                         let dot = alias.iter().position(|&c| c == b'.');
                         let (n, e) = match dot {
                             Some(d) => (&alias[..d], &alias[d + 1..]),
-                            None => (alias, &[][..]),
+                            None => (alias.as_ref(), &[][..]),
                         };
                         for (i, &c) in n.iter().take(8).enumerate() {
                             name_buf[i] = c.to_ascii_uppercase();

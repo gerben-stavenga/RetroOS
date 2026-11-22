@@ -889,10 +889,10 @@ fn seg_base_for<A: crate::Core>(regs: &Regs, sel: u16) -> u32 {
 const VOODOO_BDF: u32 = 0x0000_0800; // bus 0, device 1, function 0
 
 /// The latched `CONFIG_ADDRESS` value (port 0xCF8).
-static mut PCI_CONFIG_ADDRESS: u32 = 0;
+static PCI_CONFIG_ADDRESS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn pci_addressed_device() -> Option<u8> {
-    let addr = unsafe { core::ptr::read_volatile(&raw const PCI_CONFIG_ADDRESS) };
+    let addr = PCI_CONFIG_ADDRESS.load(core::sync::atomic::Ordering::Relaxed);
     // Bit 31 enables the decode; bits 30:24 are reserved.
     if addr & 0x8000_0000 == 0 {
         return None;
@@ -904,7 +904,7 @@ fn pci_addressed_device() -> Option<u8> {
 fn pci_config_in(pc: &mut PcMachine, port: u16, size: u32) -> Option<u32> {
     match port {
         0xCF8 if size == 4 => {
-            Some(unsafe { core::ptr::read_volatile(&raw const PCI_CONFIG_ADDRESS) })
+            Some(PCI_CONFIG_ADDRESS.load(core::sync::atomic::Ordering::Relaxed))
         }
         // Reads narrower than a dword address within the data port.
         0xCFC..=0xCFF => {
@@ -925,7 +925,7 @@ fn pci_config_in(pc: &mut PcMachine, port: u16, size: u32) -> Option<u32> {
 fn pci_config_out(pc: &mut PcMachine, port: u16, size: u32, val: u32) -> bool {
     match port {
         0xCF8 if size == 4 => {
-            unsafe { core::ptr::write_volatile(&raw mut PCI_CONFIG_ADDRESS, val) };
+            PCI_CONFIG_ADDRESS.store(val, core::sync::atomic::Ordering::Relaxed);
             true
         }
         0xCFC..=0xCFF => {

@@ -1,17 +1,69 @@
 //! Device-owned input storage. CPU interruption and queued data are independent.
 
-use core::{cell::UnsafeCell, mem::MaybeUninit, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
+#![forbid(unsafe_code)]
+
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 const CAPACITY: usize = 256;
 struct Slot {
     ready: AtomicBool,
-    value: UnsafeCell<MaybeUninit<(crate::Irq, u64)>>,
+    header: AtomicU32,
+    motion: AtomicU32,
+    timestamp_low: AtomicU32,
+    timestamp_high: AtomicU32,
 }
-// A producer exclusively reserves each slot; ready publishes it to the consumer.
-unsafe impl Sync for Slot {}
-static INPUT: [Slot; CAPACITY] = [const { Slot {
-    ready: AtomicBool::new(false), value: UnsafeCell::new(MaybeUninit::uninit()),
-} }; CAPACITY];
+
+impl Slot {
+    const fn new() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            header: AtomicU32::new(0),
+            motion: AtomicU32::new(0),
+            timestamp_low: AtomicU32::new(0),
+            timestamp_high: AtomicU32::new(0),
+        }
+    }
+
+    fn publish(&self, event: crate::Irq, timestamp: u64) {
+        use crate::Irq;
+        let (tag, value, motion) = match event {
+            Irq::Key(key) => (0, key, 0),
+            Irq::Hw(line) => (1, line, 0),
+            Irq::Msi(source) => (2, source, 0),
+            Irq::Mouse { dx, dy, buttons } => {
+                (3, buttons, u32::from(dx as u16) | (u32::from(dy as u16) << 16))
+            }
+        };
+        self.header.store((tag << 8) | u32::from(value), Ordering::Relaxed);
+        self.motion.store(motion, Ordering::Relaxed);
+        self.timestamp_low.store(timestamp as u32, Ordering::Relaxed);
+        self.timestamp_high.store((timestamp >> 32) as u32, Ordering::Relaxed);
+        self.ready.store(true, Ordering::Release);
+    }
+
+    fn read(&self) -> (crate::Irq, u64) {
+        use crate::Irq;
+        let header = self.header.load(Ordering::Relaxed);
+        let value = header as u8;
+        let event = match header >> 8 {
+            0 => Irq::Key(value),
+            1 => Irq::Hw(value),
+            2 => Irq::Msi(value),
+            3 => {
+                let motion = self.motion.load(Ordering::Relaxed);
+                Irq::Mouse { dx: motion as i16, dy: (motion >> 16) as i16, buttons: value }
+            }
+            _ => unreachable!("invalid device event"),
+        };
+        let timestamp = u64::from(self.timestamp_low.load(Ordering::Relaxed))
+            | (u64::from(self.timestamp_high.load(Ordering::Relaxed)) << 32);
+        (event, timestamp)
+    }
+}
+
+// Exclusive reservation and ready publication keep each event and timestamp
+// together. The payload uses 32-bit atomics so producers never take a lock.
+static INPUT: [Slot; CAPACITY] = [const { Slot::new() }; CAPACITY];
 static READ: AtomicUsize = AtomicUsize::new(0);
 static WRITE: AtomicUsize = AtomicUsize::new(0);
 static DRAINING: AtomicBool = AtomicBool::new(false);
@@ -24,8 +76,7 @@ pub fn post(event: crate::Irq, timestamp_ns: u64) {
             .then_some(write.wrapping_add(1))
     }) else { return; };
     let slot = &INPUT[position % CAPACITY];
-    unsafe { (*slot.value.get()).write((event, timestamp_ns)); }
-    slot.ready.store(true, Ordering::Release);
+    slot.publish(event, timestamp_ns);
 }
 
 fn drain(mut consume: impl FnMut(crate::Irq, u64)) {
@@ -37,7 +88,7 @@ fn drain(mut consume: impl FnMut(crate::Irq, u64)) {
     while position != end {
         let slot = &INPUT[position % CAPACITY];
         if !slot.ready.load(Ordering::Acquire) { break; }
-        let (event, timestamp) = unsafe { (*slot.value.get()).assume_init_read() };
+        let (event, timestamp) = slot.read();
         slot.ready.store(false, Ordering::Relaxed);
         position = position.wrapping_add(1);
         READ.store(position, Ordering::Release);
@@ -108,6 +159,16 @@ mod tests {
             });
             assert_eq!(received, 1);
         }
+    }
+
+    #[test]
+    fn slot_preserves_signed_motion_and_full_timestamp() {
+        let slot = Slot::new();
+        let time = 0xabcd_1234_9876_ffff;
+        slot.publish(crate::Irq::Mouse { dx: i16::MIN, dy: i16::MAX, buttons: u8::MAX }, time);
+        let (event, timestamp) = slot.read();
+        assert!(matches!(event, crate::Irq::Mouse { dx: i16::MIN, dy: i16::MAX, buttons: u8::MAX }));
+        assert_eq!(timestamp, time);
     }
 
     #[test]

@@ -180,6 +180,7 @@ pub fn init<A: crate::Core>(machine: &mut A) {
     vfs::hide_mount(b"wificonfig/");
     vfs::bind(b"proc/wifi", b"wificonfig/status");
     let c_root = crate::kernel::dos::c_root();
+    let c_root = c_root.as_bytes();
     if !c_root.is_empty() {
         let path = [c_root, b"proc/wifi"].concat();
         vfs::bind(
@@ -278,6 +279,7 @@ impl crate::kernel::net::EthernetDevice for Adapter {
 pub fn save_dump<A: crate::Core>(machine: &mut A, bytes: &[u8]) -> Result<Vec<u8>, i32> {
     use crate::kernel::thread::{FdKind, MAX_FDS};
     let root = crate::kernel::dos::c_root();
+    let root = root.as_bytes();
     if root.is_empty() {
         return Err(-2);
     }

@@ -472,7 +472,7 @@ fn dll_filename(name: &[u8]) -> Vec<u8> {
 
 fn load_dependency(name: &[u8], importer_path: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
     let file = dll_filename(name);
-    let system_dll_dir = join(crate::kernel::dos::c_root(), b"RETROOS/OS2/DLL");
+    let system_dll_dir = join(crate::kernel::dos::c_root().as_bytes(), b"RETROOS/OS2/DLL");
     let candidates = [
         join(dirname(importer_path), &file),
         join(&system_dll_dir, &file),
@@ -661,7 +661,8 @@ pub fn exec_lx_into<A: crate::Core>(
     if main_image.is_dll() { return Err(8); }
     let main_path = vfs_image_path(path, launcher);
     if crate::kernel::startup::trace_enabled() {
-        crate::compact_println!("[os2-path] image={} root={}", core::str::from_utf8(&main_path).unwrap_or("?"), core::str::from_utf8(crate::kernel::dos::c_root()).unwrap_or("?"));
+        let root = crate::kernel::dos::c_root();
+        crate::compact_println!("[os2-path] image={} root={}", core::str::from_utf8(&main_path).unwrap_or("?"), core::str::from_utf8(root.as_bytes()).unwrap_or("?"));
     }
     let mut modules = vec![Module {
         name: module_name(main_path.rsplit(|&b| b == b'/').next().unwrap_or(&main_path)),
@@ -766,6 +767,7 @@ pub fn exec_lx_into<A: crate::Core>(
     let mut os2_name = Vec::with_capacity(main_path.len() + 4);
     os2_name.extend_from_slice(b"C:\\");
     let croot = crate::kernel::dos::c_root();
+    let croot = croot.as_bytes();
     let relative = main_path.strip_prefix(croot).unwrap_or(&main_path);
     os2_name.extend(relative.iter().copied().skip_while(|&b| b == b'/').map(|b| if b == b'/' { b'\\' } else { b }));
     if crate::kernel::startup::trace_enabled() {

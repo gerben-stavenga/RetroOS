@@ -307,7 +307,7 @@ impl Display {
         frame.pixels.copy_from_slice(&pixels[..bytes]);
         frame.row.resize(output.0 * usize::from(self.rgb.bytes_per_pixel), 0);
         // Storage is fully resident; Display fences before mode/mapping changes.
-        unsafe { work.start(Presentation::render); }
+        work.start(Presentation::render);
         Some(output.0 * output.1)
     }
 
@@ -921,17 +921,18 @@ impl Display {
 
 /// Backend hook: the frame is finished, show it. Installed by the entry crate
 /// like the portio/socket hooks.
-static mut PRESENT_HOOK: fn() = || {};
+static PRESENT_HOOK: spin::Mutex<fn()> = spin::Mutex::new(|| {});
 
 pub fn set_present_hook(f: fn()) {
-    unsafe { PRESENT_HOOK = f };
+    *PRESENT_HOOK.lock() = f;
 }
 
 /// Complete writes to the platform display. VGA text and the timed VGA raster
 /// both end here; the backend decides whether that means an `sfence`, a window
 /// publication, or nothing.
 pub fn finish_present() {
-    (unsafe { PRESENT_HOOK })();
+    let hook = *PRESENT_HOOK.lock();
+    hook();
 }
 
 /// Copy a packed framebuffer span. Bulk traffic moves in dwords; a
@@ -1034,10 +1035,7 @@ fn scale_packed_row<const STEP: usize>(source: &[u8], destination: &mut [u8]) {
         let from = sx * STEP;
         let to = dx * STEP;
         if STEP == 3 && from + 4 <= source.len() && to + 4 <= destination.len() {
-            unsafe {
-                let pixel = source.as_ptr().add(from).cast::<u32>().read_unaligned();
-                destination.as_mut_ptr().add(to).cast::<u32>().write_unaligned(pixel);
-            }
+            destination[to..to + 4].copy_from_slice(&source[from..from + 4]);
         } else {
             destination[to..to + STEP].copy_from_slice(&source[from..from + STEP]);
         }
@@ -1369,17 +1367,14 @@ fn present_host_shadow(layout: FrameLayout, w: usize, h: usize, rgb: PixelFormat
     let step = rgb.bytes_per_pixel as usize;
     let Some(bytes) = w.checked_mul(h).and_then(|n| n.checked_mul(step)) else { return 0 };
     if bytes == 0 || shadow.len() < bytes { return 0; }
-    let mut pixels = alloc::vec::Vec::<u32>::with_capacity(w * h);
     if rgb == PixelFormat::NATIVE {
-        // The host sink accepts XRGB8888 words, exactly these packed bytes.
-        // Copy into aligned storage without decoding/re-encoding channels.
-        unsafe {
-            core::ptr::copy_nonoverlapping(shadow.as_ptr(), pixels.as_mut_ptr().cast::<u8>(), bytes);
-            pixels.set_len(w * h);
-        }
+        let pixels = shadow[..bytes].chunks_exact(4)
+            .map(|packed| u32::from_ne_bytes(packed.try_into().unwrap()))
+            .collect();
         (sink.present)(layout, w, h, pixels);
         return w * h;
     }
+    let mut pixels = alloc::vec::Vec::<u32>::with_capacity(w * h);
     for p in shadow[..bytes].chunks_exact(step) {
         let raw = match step {
             1 => u32::from(p[0]),
@@ -1743,7 +1738,7 @@ fn raster_shadow(
             );
         }
     };
-    if local { render(); } else { unsafe { crate::kernel::media::graphics(render); } }
+    if local { render(); } else { crate::kernel::media::graphics(render); }
     true
 }
 

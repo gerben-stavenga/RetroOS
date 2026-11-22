@@ -841,6 +841,6 @@ mod tests {
         let network = NETWORK.lock().take().unwrap();
         assert!(network.address.is_none());
         // This is the only unit test which installs the native socket backend.
-        unsafe { super::super::SOCKET_BACKEND = None; }
+        *super::super::SOCKET_BACKEND.write() = None;
     }
 }

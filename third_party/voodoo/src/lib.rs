@@ -54,7 +54,6 @@ pub mod regs;
 pub mod rgba;
 pub mod texture;
 
-#[cfg(test)]
 extern crate alloc;
 #[cfg(test)]
 mod tests;
@@ -194,8 +193,9 @@ impl Voodoo {
     /// complete value and then moving it into a `Box` needlessly materializes
     /// roughly 20 KiB on a kernel stack, so heap-owning hosts use this entry
     /// point to construct the same value in place.
-    pub fn init(dst: &mut core::mem::MaybeUninit<Self>, kind: Kind, fb_bytes: usize, tex_bytes: usize) {
+    pub fn new_boxed(kind: Kind, fb_bytes: usize, tex_bytes: usize) -> alloc::boxed::Box<Self> {
         debug_assert!(fb_bytes.is_power_of_two());
+        let mut dst = alloc::boxed::Box::<Self>::new_uninit();
         let p = dst.as_mut_ptr();
         unsafe {
             core::ptr::addr_of_mut!((*p).cooperate).write(|| {});
@@ -222,6 +222,7 @@ impl Voodoo {
             core::ptr::addr_of_mut!((*p).tex[1]).write(Texture::new(tex_bytes));
             core::ptr::addr_of_mut!((*p).fog).write(FogTable::default());
             core::ptr::addr_of_mut!((*p).clut).write(Clut::new());
+            dst.assume_init()
         }
     }
 

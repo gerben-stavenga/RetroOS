@@ -4,52 +4,19 @@
 //! Publishing storage refreshes the worker's kernel mappings and TLB.
 //! Audio runs as an independent service, including at graphics checkpoints.
 
-use alloc::boxed::Box;
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+#![forbid(unsafe_code)]
 
-#[derive(Clone, Copy)]
-struct Command {
-    run: unsafe fn(usize),
-    argument: usize,
-}
-struct Mailbox {
-    ready: AtomicBool,
-    command: UnsafeCell<Option<Command>>,
-}
-// Single BSP producer, single worker consumer; Release/Acquire transfers the
-// command. The consumer copies it before allowing the producer to reuse it.
-unsafe impl Sync for Mailbox {}
-impl Mailbox {
-    const fn new() -> Self {
-        Self {
-            ready: AtomicBool::new(false),
-            command: UnsafeCell::new(None),
-        }
-    }
-    fn send(&self, command: Command) {
-        while self.ready.load(Ordering::Acquire) {
-            core::hint::spin_loop();
-        }
-        unsafe {
-            *self.command.get() = Some(command);
-        }
-        self.ready.store(true, Ordering::Release);
-    }
-    fn take(&self) -> Option<Command> {
-        if !self.ready.load(Ordering::Acquire) {
-            return None;
-        }
-        let command = unsafe { (*self.command.get()).take() };
-        self.ready.store(false, Ordering::Release);
-        command
-    }
-}
-static GRAPHICS: Mailbox = Mailbox::new();
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc};
+use core::sync::atomic::{AtomicBool, Ordering};
+use lib::worker_queue::WorkerQueue;
+
+static GRAPHICS: WorkerQueue<Arc<dyn GraphicsJob>> = WorkerQueue::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
 #[thread_local]
-static mut ON_WORKER: bool = false;
-static REFRESH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static ON_WORKER: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+static REFRESH: spin::Once<fn()> = spin::Once::new();
+
+fn refresh_mappings() { (REFRESH.get().expect("media worker not initialized"))(); }
 
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
@@ -57,255 +24,172 @@ pub fn enabled() -> bool {
 
 /// Start exactly one consumer, after platform initialization. Never returns.
 ///
-/// # Safety
-/// Only this thread may consume mailboxes. `refresh` must synchronize kernel
+/// `refresh` synchronizes kernel
 /// mappings and invalidate translations before accessing handed-off storage;
 /// it may be empty when the host OS maintains shared process mappings.
-pub unsafe fn worker(refresh: fn()) -> ! {
-    unsafe { ON_WORKER = true; }
-    REFRESH.store(refresh as usize, Ordering::Relaxed);
+pub fn worker(refresh: fn()) -> ! {
+    ON_WORKER.set(true);
+    let mut started = false;
+    REFRESH.call_once(|| { started = true; refresh });
+    assert!(started, "media worker already initialized");
     ENABLED.store(true, Ordering::Release);
     loop {
         audio_checkpoint();
         video_checkpoint();
         device_checkpoint();
-        if let Some(command) = GRAPHICS.take() {
-            unsafe {
-                execute(command);
-            }
-        } else {
+        if !GRAPHICS.poll(refresh_mappings, |job| job.run()) {
             core::hint::spin_loop();
         }
-    }
-}
-
-unsafe fn execute(command: Command) {
-    let refresh: fn() = unsafe { core::mem::transmute(REFRESH.load(Ordering::Relaxed)) };
-    refresh();
-    unsafe {
-        (command.run)(command.argument);
     }
 }
 
 /// Graphics callbacks invoke this between bounded row batches. Worker only.
 /// Inline fallback never consumes the worker mailbox.
 fn audio_checkpoint() {
-    if let Some(service) = AUDIO_SERVICE.try_lock()
-        && let Some(command) = *service
+    if let Some(slot) = AUDIO_SERVICE.try_lock()
+        && let Some(service) = slot.as_ref()
+        && (service.due)()
     {
-        let due: fn() -> bool = unsafe { core::mem::transmute(AUDIO_DUE.load(Ordering::Relaxed)) };
-        if due() {
-            unsafe { execute(command); }
-        }
+        refresh_mappings();
+        (service.poll)();
     }
-}
-
-struct Scoped<F, R> {
-    function: Option<F>,
-    result: Option<R>,
-    done: AtomicBool,
 }
 
 /// Join a graphics calculation borrowing resident source/destination buffers.
-/// # Safety
-/// BSP only. No allocation/free, guest mappings, shared mutable globals, or
-/// recursive submissions. Referenced storage must remain resident and mapped.
-pub unsafe fn graphics<F: FnOnce() -> R + Send, R: Send>(function: F) -> R {
-    unsafe { scoped(&GRAPHICS, function) }
+/// The callback works on resident kernel storage without allocating.
+pub fn graphics<F: FnOnce() -> R + Send, R: Send>(function: F) -> R {
+    if !enabled() || ON_WORKER.get() { function() }
+    else { GRAPHICS.join(function) }
 }
 
-unsafe fn scoped<F: FnOnce() -> R + Send, R: Send>(mailbox: &Mailbox, function: F) -> R {
-    if !enabled() {
-        return function();
-    }
-    unsafe fn invoke<F: FnOnce() -> R, R>(argument: usize) {
-        let work = argument as *mut Scoped<F, R>;
-        let function = unsafe { (*work).function.take().unwrap() };
-        unsafe {
-            (*work).result = Some(function());
-        }
-        unsafe {
-            (*work).done.store(true, Ordering::Release);
-        }
-    }
-    let work = UnsafeCell::new(Scoped {
-        function: Some(function),
-        result: None,
-        done: AtomicBool::new(false),
-    });
-    mailbox.send(Command {
-        run: invoke::<F, R>,
-        argument: work.get() as usize,
-    });
-    while !unsafe { (*work.get()).done.load(Ordering::Acquire) } {
-        core::hint::spin_loop();
-    }
-    unsafe { (*work.get()).result.take().unwrap() }
+trait GraphicsJob: Send + Sync {
+    fn run(&self);
 }
 
 struct State<T> {
-    busy: AtomicBool,
-    value: UnsafeCell<T>,
-    run: UnsafeCell<Option<fn(&mut T)>>,
+    work: spin::Mutex<(T, Option<fn(&mut T)>)>,
+}
+
+impl<T: Send> GraphicsJob for State<T> {
+    fn run(&self) {
+        let mut work = self.work.lock();
+        let run = work.1.take().expect("graphics job missing callback");
+        run(&mut work.0);
+    }
 }
 
 /// Stable, exclusively owned graphics state. Access and destruction join any
-/// outstanding work; forgetting a job only leaks storage, never dangling it.
+/// outstanding work; the mailbox owns a reference until the job completes.
 pub struct Graphics<T: Send + 'static> {
-    state: Box<State<T>>,
+    state: Arc<State<T>>,
 }
+
 impl<T: Send + 'static> Graphics<T> {
     pub fn new(value: T) -> Self {
-        Self {
-            state: Box::new(State {
-                busy: AtomicBool::new(false),
-                value: UnsafeCell::new(value),
-                run: UnsafeCell::new(None),
-            }),
-        }
+        Self { state: Arc::new(State { work: spin::Mutex::new((value, None)) }) }
     }
+
     pub fn wait(&self) {
-        while self.state.busy.load(Ordering::Acquire) {
+        while Arc::strong_count(&self.state) != 1 {
             core::hint::spin_loop();
         }
     }
-    pub fn get_mut(&mut self) -> &mut T {
+
+    fn owned_state(&mut self) -> &mut (T, Option<fn(&mut T)>) {
         self.wait();
-        unsafe { &mut *self.state.value.get() }
+        Arc::get_mut(&mut self.state).expect("graphics state still shared").work.get_mut()
     }
 
-    /// Hand the entire state to the graphics worker. A subsequent get/drop
-    /// waits; unrelated guest execution may continue while the worker runs.
-    ///
-    /// # Safety
-    /// BSP only; callback must satisfy the resident, allocation-free contract
-    /// of `graphics`. It should service `audio_checkpoint` between bounded batches
-    /// when `enabled()`, and must not retain pointers after returning.
-    pub unsafe fn start(&mut self, run: fn(&mut T)) {
-        self.wait();
+    pub fn get_mut(&mut self) -> &mut T { &mut self.owned_state().0 }
+
+    /// Hand the entire state to the graphics worker. Access and drop join it.
+    /// The callback uses resident storage, runs without allocating, and can
+    /// checkpoint audio between bounded batches.
+    pub fn start(&mut self, run: fn(&mut T)) {
         if !enabled() {
             run(self.get_mut());
             return;
         }
-        unsafe fn invoke<T>(argument: usize) {
-            let state = unsafe { &*(argument as *const State<T>) };
-            unsafe {
-                ((*state.run.get()).unwrap())(&mut *state.value.get());
-            }
-            state.busy.store(false, Ordering::Release);
-        }
-        unsafe {
-            *self.state.run.get() = Some(run);
-        }
-        self.state.busy.store(true, Ordering::Relaxed);
-        GRAPHICS.send(Command {
-            run: invoke::<T>,
-            argument: &*self.state as *const State<T> as usize,
-        });
+        assert!(!ON_WORKER.get(), "the media worker cannot submit graphics to itself");
+        self.owned_state().1 = Some(run);
+        GRAPHICS.send(self.state.clone());
     }
 }
+
 impl<T: Send + 'static> Drop for Graphics<T> {
-    fn drop(&mut self) {
-        self.wait();
-    }
+    fn drop(&mut self) { self.wait(); }
 }
 
 /// A checkpoint installed in graphics libraries. Inline execution has no
 /// competing worker and therefore nothing to service.
 pub fn checkpoint() {
-    if unsafe { ON_WORKER } {
+    if ON_WORKER.get() {
         audio_checkpoint();
     }
 }
 
 /// Kernel-context ownership lock. Interrupt handlers must not acquire it.
 /// The media core never allocates while holding this lock.
-pub struct Shared<T> {
-    held: AtomicBool,
-    value: UnsafeCell<T>,
-}
-unsafe impl<T: Send> Sync for Shared<T> {}
+pub struct Shared<T>(spin::Mutex<T>);
+pub type Guard<'a, T> = spin::MutexGuard<'a, T>;
+
 impl<T> Shared<T> {
-    pub const fn new(value: T) -> Self {
-        Self { held: AtomicBool::new(false), value: UnsafeCell::new(value) }
-    }
+    pub const fn new(value: T) -> Self { Self(spin::Mutex::new(value)) }
     pub fn with<R>(&self, read: impl FnOnce(&T) -> R) -> R { read(&self.lock()) }
-    pub fn lock(&self) -> Guard<'_, T> {
-        loop {
-            if let Some(guard) = self.try_lock() { return guard; }
-            core::hint::spin_loop();
-        }
-    }
-    pub fn try_lock(&self) -> Option<Guard<'_, T>> {
-        self.held.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok().map(|_| Guard { owner: self })
-    }
-}
-pub struct Guard<'a, T> { owner: &'a Shared<T> }
-impl<T> core::ops::Deref for Guard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T { unsafe { &*self.owner.value.get() } }
-}
-impl<T> core::ops::DerefMut for Guard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.owner.value.get() } }
-}
-impl<T> Drop for Guard<'_, T> {
-    fn drop(&mut self) { self.owner.held.store(false, Ordering::Release); }
+    pub fn lock(&self) -> Guard<'_, T> { self.0.lock() }
+    pub fn try_lock(&self) -> Option<Guard<'_, T>> { self.0.try_lock() }
 }
 
 // Registration is held while polling. Unregistering therefore also joins the
 // last poll, before the owning core can release the service's storage.
-static AUDIO_SERVICE: Shared<Option<Command>> = Shared::new(None);
+struct AudioPoll {
+    due: fn() -> bool,
+    poll: Box<dyn Fn() + Send + Sync>,
+}
+static AUDIO_SERVICE: Shared<Option<AudioPoll>> = Shared::new(None);
 
-/// One independently polled audio service. Register/drop on the BSP only.
+/// One independently polled audio service. Register and retire it on the BSP.
+/// The callback runs on the media core without allocating. The deadline check
+/// reads permanent storage before the worker refreshes its mappings.
 pub struct AudioService<T: Send + 'static> {
-    state: Box<Shared<T>>,
+    state: Arc<Shared<T>>,
     registered: bool,
 }
+
 impl<T: Send + 'static> AudioService<T> {
-    /// # Safety
-    /// `poll` runs on the media core and must obey the resident/no-allocation
-    /// contract. It must not recursively access this service or submit jobs.
-    /// `due` runs before refreshing mappings: it may only read permanent boot
-    /// storage and must not access allocations published by the BSP.
-    pub unsafe fn new(value: T, due: fn() -> bool, poll: fn(&mut T)) -> Self {
-        // Stable resident storage; the registration owns the callback until
-        // Drop fences the final poll before freeing the state.
-        let state = Box::new(Shared::new(value));
+    pub fn new(value: T, due: fn() -> bool, poll: fn(&mut T)) -> Self {
+        let state = Arc::new(Shared::new(value));
         let registered = enabled();
-        let service = Self { state, registered };
         if registered {
-            unsafe fn invoke<T>(arg: usize) {
-                let state = unsafe { &*(arg as *const Shared<T>) };
-                if let Some(mut state) = state.try_lock() {
-                    let poll: fn(&mut T) = unsafe {
-                        core::mem::transmute(AUDIO_POLL.load(Ordering::Relaxed))
-                    };
-                    poll(&mut state);
-                }
-            }
             let mut slot = AUDIO_SERVICE.lock();
             assert!(slot.is_none(), "only one audio service may own the sink");
-            AUDIO_POLL.store(poll as usize, Ordering::Relaxed);
-            AUDIO_DUE.store(due as usize, Ordering::Relaxed);
-            *slot = Some(Command { run: invoke::<T>, argument: &*service.state as *const _ as usize });
+            let shared = state.clone();
+            *slot = Some(AudioPoll {
+                due,
+                poll: Box::new(move || {
+                    if let Some(mut state) = shared.try_lock() { poll(&mut state); }
+                }),
+            });
         }
-        service
+        Self { state, registered }
     }
+
     pub fn lock(&self) -> Guard<'_, T> { self.state.lock() }
     pub fn try_lock(&self) -> Option<Guard<'_, T>> { self.state.try_lock() }
 }
-static AUDIO_DUE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static AUDIO_POLL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 impl<T: Send + 'static> Drop for AudioService<T> {
     fn drop(&mut self) {
-        if self.registered { *AUDIO_SERVICE.lock() = None; }
+        if self.registered {
+            let old = AUDIO_SERVICE.lock().take();
+            drop(old);
+        }
     }
 }
 
-#[derive(Clone, Copy)]
 struct VideoPoll {
-    command: Command,
+    state: Arc<dyn VideoJob>,
+    owner: usize,
     due: fn() -> bool,
     deadline: fn(u64) -> u64,
 }
@@ -315,25 +199,39 @@ static VIDEO_OWNER: core::sync::atomic::AtomicUsize = core::sync::atomic::Atomic
 /// Resident display state. The active display is polled independently of the
 /// guest loop. Inactive displays retain their storage until their owner drops.
 pub struct VideoService<T: Send + 'static> {
-    state: Box<VideoState<T>>,
+    state: Arc<VideoState<T>>,
     due: fn() -> bool,
     deadline: fn(u64) -> u64,
-    poll: fn(&mut T),
 }
+
+trait VideoJob: Send + Sync {
+    fn render(&self);
+}
+
 struct VideoState<T> {
     value: Shared<T>,
     publication_pending: AtomicBool,
+    poll: fn(&mut T),
 }
-impl<T: Send + 'static> VideoService<T> {
-    /// # Safety
-    /// Same resident/no-allocation contract as AudioService. `due` only reads
-    /// permanent storage. Registration, updates and destruction are BSP-only.
-    pub unsafe fn new(value: T, due: fn() -> bool, deadline: fn(u64) -> u64, poll: fn(&mut T)) -> Self {
-        Self { state: Box::new(VideoState {
-            value: Shared::new(value), publication_pending: AtomicBool::new(false),
-        }), due, deadline, poll }
+
+impl<T: Send> VideoJob for VideoState<T> {
+    fn render(&self) {
+        if self.publication_pending.load(Ordering::Acquire) { return; }
+        if let Some(mut state) = self.value.try_lock() { (self.poll)(&mut state); }
     }
+}
+
+impl<T: Send + 'static> VideoService<T> {
+    /// The callback uses resident storage and runs without allocating.
+    /// The deadline check reads permanent boot storage.
+    pub fn new(value: T, due: fn() -> bool, deadline: fn(u64) -> u64, poll: fn(&mut T)) -> Self {
+        Self { state: Arc::new(VideoState {
+            value: Shared::new(value), publication_pending: AtomicBool::new(false), poll,
+        }), due, deadline }
+    }
+
     pub fn try_lock(&self) -> Option<Guard<'_, T>> { self.state.value.try_lock() }
+
     /// Defer the next frame until the BSP retries a busy scene publication.
     /// The current frame may finish; the producer never waits for it.
     /// A failed attempt must be retried, or cancelled with `pause`.
@@ -343,42 +241,39 @@ impl<T: Send + 'static> VideoService<T> {
         self.state.publication_pending.store(false, Ordering::Release);
         Some(guard)
     }
+
     pub fn activate(&self) {
-        let argument = &*self.state as *const VideoState<T> as usize;
-        if VIDEO_OWNER.load(Ordering::Acquire) == argument {
+        let owner = Arc::as_ptr(&self.state) as usize;
+        if VIDEO_OWNER.load(Ordering::Acquire) == owner {
             kernel_entry();
             return;
         }
-        unsafe fn invoke<T>(argument: usize) {
-            let state = unsafe { &*(argument as *const VideoState<T>) };
-            if state.publication_pending.load(Ordering::Acquire) { return; }
-            if let Some(mut state) = state.value.try_lock() {
-                let poll: fn(&mut T) = unsafe { core::mem::transmute(VIDEO_POLL.load(Ordering::Relaxed)) };
-                poll(&mut state);
-            }
-        }
         let mut slot = VIDEO_SERVICE.lock();
-        VIDEO_POLL.store(self.poll as usize, Ordering::Relaxed);
-        *slot = Some(VideoPoll { command: Command { run: invoke::<T>, argument }, due: self.due, deadline: self.deadline });
-        VIDEO_OWNER.store(argument, Ordering::Release);
+        let old = slot.replace(VideoPoll { state: self.state.clone(), owner, due: self.due, deadline: self.deadline });
+        VIDEO_OWNER.store(owner, Ordering::Release);
         drop(slot);
+        drop(old);
         kernel_entry();
     }
+
     /// Fence scanout before changing the physical mode or releasing mappings.
     pub fn pause(&self) {
-        let argument = &*self.state as *const VideoState<T> as usize;
+        let owner = Arc::as_ptr(&self.state) as usize;
         let mut slot = VIDEO_SERVICE.lock();
-        if slot.as_ref().is_some_and(|slot| slot.command.argument == argument) {
-            *slot = None;
+        let old = if slot.as_ref().is_some_and(|slot| slot.owner == owner) {
             VIDEO_OWNER.store(0, Ordering::Release);
-        }
+            slot.take()
+        } else { None };
         self.state.publication_pending.store(false, Ordering::Release);
+        drop(slot);
+        drop(old);
     }
 }
-static VIDEO_POLL: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 impl<T: Send + 'static> Drop for VideoService<T> {
     fn drop(&mut self) { self.pause(); }
 }
+
 /// The synchronous driver consumes precisely the same device phases as the
 /// media worker. Call before dispatching a guest event that can change VGA.
 pub(crate) fn kernel_entry() {
@@ -392,117 +287,118 @@ pub(crate) fn inline_video_deadline(now: u64) -> Option<u64> {
     VIDEO_SERVICE.lock().as_ref().map(|service| (service.deadline)(now))
 }
 fn video_checkpoint() {
-    if let Some(service) = VIDEO_SERVICE.try_lock()
-        && let Some(service) = *service
+    if let Some(slot) = VIDEO_SERVICE.try_lock()
+        && let Some(service) = slot.as_ref()
         && (service.due)()
     {
-        unsafe {
-            if enabled() { execute(service.command); }
-            else { (service.command.run)(service.command.argument); }
-        }
+        if enabled() { refresh_mappings(); }
+        service.state.render();
     }
 }
 
-
 /// Persistent devices are polled independently of guest exits and display
 /// refresh. Registration changes fence callbacks; only the BSP allocates.
-struct DevicePoll { command: Command, ready: unsafe fn(usize) -> bool }
+trait DeviceJob: Send + Sync {
+    fn ready(&self) -> bool;
+    fn poll(&self);
+}
+
+struct DevicePoll {
+    state: Arc<dyn DeviceJob>,
+    owner: usize,
+}
 static DEVICES: Shared<alloc::vec::Vec<DevicePoll>> = Shared::new(alloc::vec::Vec::new());
 static DEVICE_REVISION: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
 struct DeviceState<T> { value: T, ready: fn(&T) -> bool, poll: fn(&T) }
+
+impl<T: Send + Sync> DeviceJob for DeviceState<T> {
+    fn ready(&self) -> bool { (self.ready)(&self.value) }
+    fn poll(&self) { (self.poll)(&self.value); }
+}
+
 pub struct DeviceService<T: Send + Sync + 'static> {
-    state: Box<DeviceState<T>>,
+    state: Arc<DeviceState<T>>,
     registered: bool,
 }
+
 impl<T: Send + Sync + 'static> DeviceService<T> {
-    /// # Safety
-    /// `ready` only reads storage resident at registration. `poll` obeys the
-    /// same allocation-free callback contract as AudioService, runs a bounded
-    /// batch and must not register/drop services or recursively poll devices.
-    pub unsafe fn new(value: T, ready: fn(&T) -> bool, poll: fn(&T)) -> Self {
-        let state = Box::new(DeviceState { value, ready, poll });
+    /// Readiness uses resident storage. Polling is bounded, allocation-free
+    /// work and does not register or recursively poll other services.
+    pub fn new(value: T, ready: fn(&T) -> bool, poll: fn(&T)) -> Self {
+        let state = Arc::new(DeviceState { value, ready, poll });
         let registered = enabled();
         if registered {
-            unsafe fn ready<T>(arg: usize) -> bool {
-                let state = unsafe { &*(arg as *const DeviceState<T>) };
-                (state.ready)(&state.value)
-            }
-            unsafe fn invoke<T>(arg: usize) {
-                let state = unsafe { &*(arg as *const DeviceState<T>) };
-                (state.poll)(&state.value);
-            }
             let mut devices = DEVICES.lock();
-            devices.push(DevicePoll { command: Command { run: invoke::<T>,
-                argument: &*state as *const _ as usize }, ready: ready::<T> });
+            devices.push(DevicePoll { state: state.clone(), owner: Arc::as_ptr(&state) as usize });
             DEVICE_REVISION.fetch_add(1, Ordering::Release);
         }
         Self { state, registered }
     }
+
     pub fn poll_inline(&self) {
-        if !self.registered && (self.state.ready)(&self.state.value) {
-            (self.state.poll)(&self.state.value);
-        }
+        if !self.registered && self.state.ready() { self.state.poll(); }
     }
 }
+
 impl<T: Send + Sync + 'static> Drop for DeviceService<T> {
     fn drop(&mut self) {
         if self.registered {
-            let argument = &*self.state as *const _ as usize;
-            DEVICES.lock().retain(|device| device.command.argument != argument);
+            let owner = Arc::as_ptr(&self.state) as usize;
+            DEVICES.lock().retain(|device| device.owner != owner);
             DEVICE_REVISION.fetch_add(1, Ordering::Release);
         }
     }
 }
+
 fn device_checkpoint() {
-    // Worker only. Refresh before dereferencing newly registered heap storage.
+    // Refresh before dereferencing newly registered heap storage.
     static SEEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
     let Some(devices) = DEVICES.try_lock() else { return };
     let revision = DEVICE_REVISION.load(Ordering::Acquire);
     if SEEN.load(Ordering::Relaxed) != revision {
-        let refresh: fn() = unsafe { core::mem::transmute(REFRESH.load(Ordering::Relaxed)) };
-        refresh();
+        refresh_mappings();
         SEEN.store(revision, Ordering::Relaxed);
     }
     for device in devices.iter() {
-        if unsafe { (device.ready)(device.command.argument) } {
-            unsafe { execute(device.command); }
+        if device.state.ready() {
+            refresh_mappings();
+            device.state.poll();
         }
     }
 }
 
-/// Fixed-capacity SPSC command ring. One guest core publishes, one media core
-/// consumes. Storage is committed on construction; neither end allocates.
-pub struct Commands<T: Copy, const N: usize> {
-    head: core::sync::atomic::AtomicUsize,
-    tail: core::sync::atomic::AtomicUsize,
-    entries: UnsafeCell<[core::mem::MaybeUninit<T>; N]>,
+/// Fixed-capacity command ring. Storage is committed on construction.
+/// The lock only protects queue metadata and a single command transfer.
+pub struct Commands<T, const N: usize> {
+    queue: spin::Mutex<VecDeque<T>>,
+    pending: AtomicBool,
 }
-unsafe impl<T: Copy + Send, const N: usize> Sync for Commands<T, N> {}
-impl<T: Copy, const N: usize> Commands<T, N> {
+
+impl<T, const N: usize> Commands<T, N> {
     pub fn new() -> Self {
-        assert!(N.is_power_of_two());
-        Self { head: core::sync::atomic::AtomicUsize::new(0),
-            tail: core::sync::atomic::AtomicUsize::new(0),
-            entries: UnsafeCell::new([core::mem::MaybeUninit::uninit(); N]) }
+        assert!(N != 0);
+        Self {
+            queue: spin::Mutex::new(VecDeque::with_capacity(N)),
+            pending: AtomicBool::new(false),
+        }
     }
-    pub fn pending(&self) -> bool { self.head.load(Ordering::Acquire) != self.tail.load(Ordering::Acquire) }
-    /// # Safety
-    /// Only the single producer may call this method.
-    pub unsafe fn push(&self, command: T) -> bool {
-        let head = self.head.load(Ordering::Relaxed);
-        if head.wrapping_sub(self.tail.load(Ordering::Acquire)) == N { return false; }
-        unsafe { (*self.entries.get())[head % N].write(command); }
-        self.head.store(head.wrapping_add(1), Ordering::Release);
+
+    pub fn pending(&self) -> bool { self.pending.load(Ordering::Acquire) }
+
+    pub fn push(&self, command: T) -> bool {
+        let mut queue = self.queue.lock();
+        if queue.len() == N { return false; }
+        queue.push_back(command);
+        self.pending.store(true, Ordering::Release);
         true
     }
-    /// # Safety
-    /// Only the single consumer may call this method.
-    pub unsafe fn pop(&self) -> Option<T> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        if tail == self.head.load(Ordering::Acquire) { return None; }
-        let command = unsafe { (*self.entries.get())[tail % N].assume_init_read() };
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
-        Some(command)
+
+    pub fn pop(&self) -> Option<T> {
+        let mut queue = self.queue.lock();
+        let next = queue.pop_front();
+        if queue.is_empty() { self.pending.store(false, Ordering::Release); }
+        next
     }
 }
 
@@ -510,9 +406,9 @@ impl<T: Copy, const N: usize> Commands<T, N> {
 #[test]
 fn inline_video_entries_do_not_require_a_worker_refresh_callback() {
     assert!(!enabled());
-    assert_eq!(REFRESH.load(Ordering::Relaxed), 0);
+    assert!(REFRESH.get().is_none());
     assert_eq!(inline_video_deadline(100), None);
-    let service = unsafe { VideoService::new(0usize, || true, |now| now + 123, |calls| *calls += 1) };
+    let service = VideoService::new(0usize, || true, |now| now + 123, |calls| *calls += 1);
     service.activate();
     assert_eq!(inline_video_deadline(100), Some(223));
     kernel_entry();

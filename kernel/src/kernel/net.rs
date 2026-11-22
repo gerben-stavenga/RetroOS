@@ -2,18 +2,17 @@
 //! Linux, OS/2 and Windows adapters translate their ABIs into this typed API.
 //! No guest sockaddr layout, errno value or poll mask belongs in this layer.
 
+#![forbid(unsafe_code)]
+
 pub use arch_abi::net::{
     Endpoint, Error, Readiness, Result, Shutdown, SocketHooks, SocketKind, SocketOption,
 };
 
-static mut SOCKET_BACKEND: Option<SocketHooks> = None;
+static SOCKET_BACKEND: spin::RwLock<Option<SocketHooks>> = spin::RwLock::new(None);
 
-/// Install the native socket hooks. Single-threaded boot context (the entry
-/// calls this before `startup`), safe by the same argument as `install_portio`.
+/// Install the native socket hooks before starting networking.
 pub fn install_socket_backend(hooks: SocketHooks) {
-    unsafe {
-        SOCKET_BACKEND = Some(hooks);
-    }
+    *SOCKET_BACKEND.write() = Some(hooks);
 }
 
 pub(crate) mod local;
@@ -113,14 +112,12 @@ pub fn read_sequence(h: i32) -> u64 {
 
 /// Whether a socket backend is installed.
 pub fn socket_backend_installed() -> bool {
-    // Copy the Option out (Copy) so we never reference the mutable static —
-    // an error under edition 2024.
-    unsafe { SOCKET_BACKEND }.is_some()
+    backend().is_some()
 }
 
 #[inline]
 fn backend() -> Option<SocketHooks> {
-    unsafe { SOCKET_BACKEND }
+    *SOCKET_BACKEND.read()
 }
 
 pub fn socket(kind: SocketKind, nonblocking: bool) -> Result<i32> {

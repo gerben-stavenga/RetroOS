@@ -68,7 +68,7 @@ pub(crate) use dos::dos_to_unix_datetime;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.
 pub use dfs::{c_root, set_c_root};
-pub(crate) use dfs::{DFS_PATH_MAX, vfs_to_dos, extra_drive_prefix, drive_available};
+pub(crate) use dfs::{configure_c_root, DFS_PATH_MAX, vfs_to_dos, extra_drive_prefix, drive_available};
 pub(crate) use dos::win16_multiplex;
 pub(crate) use bios::win16_int1a;
 
@@ -1142,7 +1142,7 @@ fn handle_event_inner<A: crate::Core>(
                 let s3 = machine.read::<u16>((ss_lin.wrapping_add(6)) as u64);
                 let s4 = machine.read::<u16>((ss_lin.wrapping_add(8)) as u64);
                 let s5 = machine.read::<u16>((ss_lin.wrapping_add(10)) as u64);
-                let liq = unsafe { mode_transitions::LAST_IRQ };
+                let liq = mode_transitions::last_irq();
                 crate::compact_println!("DOS: CPU exception {} at CS:EIP={:04x}:{:#x} ss:sp={:04x}:{:08x} psp={:04x} (vm86={}) bytes={:02x?} stack={:04x} {:04x} {:04x} {:04x} {:04x} {:04x} last_irq=vec{:02x} target={:04x}:{:08x} from cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
                     n, regs.code_seg(), regs.ip32(),
                     regs.stack_seg(), regs.sp32(),
@@ -1164,7 +1164,7 @@ fn handle_event_inner<A: crate::Core>(
                 // A plain `push ds` etc. cannot #GP in genuine VM86, so
                 // SS:SP/flags and the last reflected IRQ help explain the
                 // fault. Terminate this DOS process, not the whole kernel.
-                let liq = unsafe { mode_transitions::LAST_IRQ };
+                let liq = mode_transitions::last_irq();
                 crate::compact_println!("VM86 #GP state: ss:sp={:04x}:{:08x} flags={:#x} vm={} last_irq=vec{:02x} handler={:04x}:{:04x} delivered_at cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
                     regs.stack_seg(), regs.sp32(), regs.flags32(),
                     regs.mode() == crate::UserMode::VM86,
@@ -2104,7 +2104,7 @@ fn log_pm_gp<A: crate::Core>(machine: &mut A, dos: &thread::DosState<A>, regs: &
     };
     let mut stack = [0u8; 24];
     machine.copy_from(ss_b.wrapping_add(sp) as u64, &mut stack);
-    let last_irq = unsafe { mode_transitions::LAST_IRQ };
+    let last_irq = mode_transitions::last_irq();
     crate::compact_println!(
         "[#GP] cs={:04x}:{:#x} err={:#x} bytes={:02x?} eax={:#x} ebx={:#x} esi={:#x}",
         regs.code_seg(), regs.ip32(), regs.err_code, &bytes[..], regs.rax as u32,

@@ -79,6 +79,7 @@ rust_library(
         "//third_party/smb2-core",
         "@crates//:hadris-iso",
         "@crates//:spin",
+        "@crates__bytemuck-1.25.2//:bytemuck",
         "@crates//:smoltcp",
         "@crates//:hmac",
         "@crates//:sha2",
@@ -109,7 +110,7 @@ rust_test(
     crate_root = "tests/media.rs",
     edition = "2024",
     rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
-    deps = ["//third_party/voodoo"],
+    deps = ["//lib", "//third_party/voodoo", "@crates//:spin"],
     args = ["--test-threads=1"],
 )
 
@@ -316,7 +317,7 @@ rust_library(
     crate_name = "physical_memory",
     edition = "2024",
     rustc_flags = panic_strategy(),
-    deps = ["//arch-abi"],
+    deps = ["//arch-abi", "@crates//:spin"],
 )
 
 rust_test(

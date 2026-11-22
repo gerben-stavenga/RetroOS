@@ -30,28 +30,23 @@ struct Geom {
     /// Bare metal (no hypervisor): wide NT stores for device-row copies.
     wide: bool,
 }
-static mut GEOM: Option<Geom> = None;
+static GEOM: spin::Once<Geom> = spin::Once::new();
 
 // Eight-pixel text cells fit all 80 columns in a 640-pixel framebuffer.
 const TEXT_W: usize = 640;
 const TEXT_H: usize = 400;
 
-fn geom() -> &'static Option<Geom> {
-    // Published once during BSP boot, before the media worker is released.
-    unsafe { &*core::ptr::addr_of!(GEOM) }
-}
-
 /// Whether the framebuffer console owns the display (a linear framebuffer
 /// was handed over and mapped). Probed by `kernel::platform`.
 pub fn active() -> bool {
-    geom().is_some()
+    GEOM.get().is_some()
 }
 
 /// The boot framebuffer, as a sink the kernel can blit into directly.
 /// Installed into `HostEnv` by the metal entry; the platform probe freezes it
 /// into a linear `Display`.
 pub fn framebuffer() -> Option<crate::kernel::display::Display> {
-    let g = (*geom()).as_ref()?;
+    let g = GEOM.get()?;
     let framebuffer = crate::kernel::display::Framebuffer {
         va: g.va,
         pitch: g.pitch,
@@ -235,7 +230,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
     }
 
     lib::compact_screenln!(screen, "fbcon: format accepted, native_blit={}", format.is_native());
-    unsafe { core::ptr::addr_of_mut!(GEOM).write(Some(Geom {
+    GEOM.call_once(|| Geom {
         va: paging2::FB_WINDOW_BASE + page_off,
         pitch,
         width,
@@ -243,7 +238,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
         format,
         slow: policy.slow,
         wide: policy.wide,
-    })); }
+    });
 
     // Wipe the boot splash (the pre-paging life-sign strip boot_kernel
     // paints) now that the console owns the pixels.

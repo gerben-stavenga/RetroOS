@@ -320,6 +320,14 @@ pub unsafe fn write_cr4(value: u32) {
     unsafe { asm!("mov cr4, {}", in(reg) value, options(nostack)); }
 }
 
+/// The caller's frame pointer, for diagnostics in frame-pointer builds.
+#[inline(always)]
+pub fn frame_pointer() -> u32 {
+    let value: u32;
+    unsafe { asm!("mov {}, ebp", out(reg) value, options(nomem, nostack, preserves_flags)); }
+    value
+}
+
 /// Read the time-stamp counter (RDTSC). Wall-clock-ish in cycles, advances
 /// at CPU base frequency. Useful for cheap user/kernel-time accounting.
 #[inline(always)]

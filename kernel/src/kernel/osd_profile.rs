@@ -10,6 +10,8 @@
 //! Pixel counts describe work, not changed pixels; capture counts visible
 //! pixels even when planar VRAM capture reads more backing storage.
 
+#![forbid(unsafe_code)]
+
 #[derive(Clone, Copy)]
 pub(crate) enum Stage { Capture, Raster, Compose, Present, Pack, Bank, Copy, Osd, Scene, Snapshot, Register }
 
@@ -17,7 +19,7 @@ pub(crate) enum Stage { Capture, Raster, Compose, Present, Pack, Bank, Copy, Osd
 struct Counter { calls: u64, cycles: u64, max: u64, pixels: u64 }
 
 const EMPTY: Counter = Counter { calls: 0, cycles: 0, max: 0, pixels: 0 };
-static mut COUNTERS: [Counter; 11] = [EMPTY; 11];
+static COUNTERS: spin::Mutex<[Counter; 11]> = spin::Mutex::new([EMPTY; 11]);
 
 #[derive(Clone, Copy)]
 pub(crate) enum Blit { Packed, Convert, Scale }
@@ -25,22 +27,20 @@ pub(crate) enum Blit { Packed, Convert, Scale }
 #[derive(Clone, Copy)]
 struct BlitCounter { path: usize, width: usize, height: usize, calls: u64, pixels: u64 }
 const EMPTY_BLIT: BlitCounter = BlitCounter { path: 0, width: 0, height: 0, calls: 0, pixels: 0 };
-static mut BLITS: [BlitCounter; 16] = [EMPTY_BLIT; 16];
+static BLITS: spin::Mutex<[BlitCounter; 16]> = spin::Mutex::new([EMPTY_BLIT; 16]);
 
 pub(crate) fn blit(path: Blit, width: usize, height: usize, pixels: usize) {
     if !super::startup::profile_enabled() || !super::osd::is_open() { return; }
-    unsafe {
-        for counter in &mut *core::ptr::addr_of_mut!(BLITS) {
-            if counter.calls == 0 || (counter.path == path as usize
-                && counter.width == width && counter.height == height)
-            {
-                counter.path = path as usize;
-                counter.width = width;
-                counter.height = height;
-                counter.calls += 1;
-                counter.pixels += pixels as u64;
-                return;
-            }
+    for counter in &mut *BLITS.lock() {
+        if counter.calls == 0 || (counter.path == path as usize
+            && counter.width == width && counter.height == height)
+        {
+            counter.path = path as usize;
+            counter.width = width;
+            counter.height = height;
+            counter.calls += 1;
+            counter.pixels += pixels as u64;
+            return;
         }
     }
 }
@@ -57,23 +57,22 @@ impl Sample {
         let Some(start) = self.0 else { return };
         let cycles = crate::kernel::event_profile::cycles().wrapping_sub(start);
         // Kernel execution is cooperative: no ISR touches this storage.
-        unsafe {
-            let counter = &mut (*core::ptr::addr_of_mut!(COUNTERS))[stage as usize];
-            counter.calls += 1;
-            counter.cycles += cycles;
-            counter.max = counter.max.max(cycles);
-            counter.pixels += pixels as u64;
-        }
+        let mut counters = COUNTERS.lock();
+        let counter = &mut counters[stage as usize];
+        counter.calls += 1;
+        counter.cycles += cycles;
+        counter.max = counter.max.max(cycles);
+        counter.pixels += pixels as u64;
     }
 }
 
 pub(crate) fn reset() {
-    unsafe { core::ptr::write(core::ptr::addr_of_mut!(COUNTERS), [EMPTY; 11]); }
-    unsafe { core::ptr::write(core::ptr::addr_of_mut!(BLITS), [EMPTY_BLIT; 16]); }
+    *COUNTERS.lock() = [EMPTY; 11];
+    *BLITS.lock() = [EMPTY_BLIT; 16];
 }
 
 pub(crate) fn print() {
-    let counters = unsafe { core::ptr::read(core::ptr::addr_of!(COUNTERS)) };
+    let counters = *COUNTERS.lock();
     for (name, counter) in ["capture", "raster", "compose", "present", "pack", "bank", "copy", "osd", "scene", "snapshot", "register"]
         .into_iter().zip(counters)
     {
@@ -82,7 +81,7 @@ pub(crate) fn print() {
             name, counter.calls, counter.cycles, counter.max, counter.pixels,
         );
     }
-    let blits = unsafe { core::ptr::read(core::ptr::addr_of!(BLITS)) };
+    let blits = *BLITS.lock();
     for counter in blits.into_iter().filter(|counter| counter.calls != 0) {
         crate::compact_println!("[osd-blit] {} source={}x{} calls={} pixels={}",
             ["packed", "convert", "scale"][counter.path],

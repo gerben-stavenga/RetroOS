@@ -7,11 +7,15 @@
 //! `startup` (composition-root dependency injection, no `cfg`). Reads
 //! before installation return the ISA "no device" pattern; writes drop.
 
+#![forbid(unsafe_code)]
+
 /// The installed hook table.
 #[derive(Clone, Copy)]
 pub struct PortIo {
     /// Monotonic nanoseconds, advancing even while a driver polls in the kernel.
     pub now_ns: fn() -> u64,
+    /// Optional hardware cycle counter for diagnostic measurements.
+    pub cycles: fn() -> u64,
     pub inb: fn(u16) -> u8,
     pub inw: fn(u16) -> u16,
     pub inl: fn(u16) -> u32,
@@ -30,6 +34,7 @@ pub struct PortIo {
 
 const NONE: PortIo = PortIo {
     now_ns: || 0,
+    cycles: || 0,
     inb: |_| 0xFF,
     inw: |_| 0xFFFF,
     inl: |_| 0xFFFF_FFFF,
@@ -40,18 +45,16 @@ const NONE: PortIo = PortIo {
     outsw: |_, _| {},
 };
 
-static mut HOOKS: PortIo = NONE;
+static HOOKS: spin::Once<PortIo> = spin::Once::new();
 
-/// Install the backend's port accessors. Single-threaded boot context (the
-/// entry calls this before `startup`), so the plain static is safe by the
-/// same argument as the rest of the boot statics.
+/// Install the backend's port accessors before starting device discovery.
 pub fn install_portio(hooks: PortIo) {
-    unsafe { HOOKS = hooks };
+    HOOKS.call_once(|| hooks);
 }
 
 #[inline]
 fn hooks() -> PortIo {
-    unsafe { HOOKS }
+    *HOOKS.get().unwrap_or(&NONE)
 }
 
 #[inline]
@@ -91,6 +94,9 @@ pub fn outsw(port: u16, buf: &[u16]) {
 #[inline]
 pub fn now_ns() -> u64 { (hooks().now_ns)() }
 
+#[inline]
+pub(crate) fn cycles() -> u64 { (hooks().cycles)() }
+
 /// Sparse wall-clock diagnostics for operations which can block interaction.
 /// No allocation or per-poll output; nested scopes report the innermost slow
 /// operation first. Rate limiting also prevents live log flushes feeding back
@@ -100,7 +106,7 @@ pub(crate) struct StallWatch {
     start: u64,
 }
 #[thread_local]
-static mut LAST_STALL_REPORT: Option<u64> = None;
+static LAST_STALL_REPORT: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
 impl StallWatch {
     pub(crate) fn new(operation: &'static str) -> Self {
         Self { operation, start: now_ns() }
@@ -111,12 +117,10 @@ impl Drop for StallWatch {
         let now = now_ns();
         let elapsed = now.saturating_sub(self.start);
         if elapsed < 50_000_000 { return; }
-        unsafe {
-            if LAST_STALL_REPORT.is_some_and(|last| now.saturating_sub(last) < 1_000_000_000) {
-                return;
-            }
-            LAST_STALL_REPORT = Some(now);
+        if LAST_STALL_REPORT.get().is_some_and(|last| now.saturating_sub(last) < 1_000_000_000) {
+            return;
         }
+        LAST_STALL_REPORT.set(Some(now));
         crate::compact_println!("[stall] {} took {} ms at {} ms",
             self.operation, elapsed / 1_000_000, now / 1_000_000);
     }

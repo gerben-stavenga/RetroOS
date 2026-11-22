@@ -250,17 +250,8 @@ impl Gus {
     }
 }
 
-// ── Zero-perturbation GUS-access trace ring ──────────────────────────────
-// One entry per decoded GUS port IN/OUT, written inline (pure stores, no I/O,
-// no formatting) so it doesn't change instruction timing — the same idiom the
-// virtual-IF ring (`mode_transitions::IF_RING`) uses, and for the same reason:
-// the Duke3D "wedged in the GUS music ISR" hang is timing-sensitive and
-// print-tracing (PORT_TRACE) hides it. Dumped only on the F12 state key via
-// `dump_gus_ring()`, alongside the IF ring.
-//
-// This is also why the ring stayed behind when the chip moved to `//lib:sound`:
-// it is a pile of mutable statics, which a card meant to be instantiated by
-// anyone must not own.
+// Record decoded GUS port accesses without I/O or formatting. The F12 state
+// dump includes the guest IRQ context, which the chip model does not own.
 #[derive(Clone, Copy)]
 struct GusEvt {
     write: bool,     // true = OUT, false = IN
@@ -272,20 +263,18 @@ struct GusEvt {
 }
 
 const GUS_RING_LEN: usize = 128;
-static mut GUS_RING: [GusEvt; GUS_RING_LEN] = [GusEvt {
+static GUS_RING: spin::Mutex<([GusEvt; GUS_RING_LEN], usize)> = spin::Mutex::new(([GusEvt {
     write: false, in_irq: false, port: 0, val: 0, reg_sel: 0, voice_sel: 0,
-}; GUS_RING_LEN];
-static mut GUS_RING_POS: usize = 0;
+}; GUS_RING_LEN], 0));
 
 #[inline]
 fn gus_ring_record(write: bool, port: u16, val: u8, reg_sel: u8, voice_sel: u8) {
     let in_irq = super::super::IN_HW_IRQ_CONTEXT
         .load(core::sync::atomic::Ordering::Relaxed);
-    unsafe {
-        let i = GUS_RING_POS % GUS_RING_LEN;
-        GUS_RING[i] = GusEvt { write, in_irq, port, val, reg_sel, voice_sel };
-        GUS_RING_POS = GUS_RING_POS.wrapping_add(1);
-    }
+    let mut ring = GUS_RING.lock();
+    let i = ring.1 % GUS_RING_LEN;
+    ring.0[i] = GusEvt { write, in_irq, port, val, reg_sel, voice_sel };
+    ring.1 = ring.1.wrapping_add(1);
 }
 
 /// F12 hook: dump the most recent GUS port accesses (oldest first). A stuck
@@ -293,18 +282,16 @@ fn gus_ring_record(write: bool, port: u16, val: u8, reg_sel: u8, voice_sel: u8) 
 /// `irq=1`; an IRQ storm shows the same ISR-drain prologue re-appearing over
 /// and over. `total` is the lifetime access count.
 pub fn dump_gus_ring() {
-    unsafe {
-        let pos = GUS_RING_POS;
-        let n = pos.min(GUS_RING_LEN);
-        crate::compact_dbg_println!("[GUSRING] {} accesses total, showing last {}", pos, n);
-        for k in 0..n {
-            let i = (pos - n + k) % GUS_RING_LEN;
-            let e = GUS_RING[i];
-            crate::compact_dbg_println!(
-                "[GUSRING] #{:03} {} {:03X} {}={:02X} reg={:02X} v={:02X} irq={}",
-                pos - n + k, if e.write { "OUT" } else { "IN " }, e.port,
-                if e.write { "val" } else { "->" }, e.val, e.reg_sel, e.voice_sel,
-                e.in_irq as u8);
-        }
+    let (events, pos) = *GUS_RING.lock();
+    let n = pos.min(GUS_RING_LEN);
+    crate::compact_dbg_println!("[GUSRING] {} accesses total, showing last {}", pos, n);
+    for k in 0..n {
+        let i = (pos - n + k) % GUS_RING_LEN;
+        let e = events[i];
+        crate::compact_dbg_println!(
+            "[GUSRING] #{:03} {} {:03X} {}={:02X} reg={:02X} v={:02X} irq={}",
+            pos - n + k, if e.write { "OUT" } else { "IN " }, e.port,
+            if e.write { "val" } else { "->" }, e.val, e.reg_sel, e.voice_sel,
+            e.in_irq as u8);
     }
 }

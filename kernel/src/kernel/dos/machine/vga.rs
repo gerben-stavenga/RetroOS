@@ -1637,18 +1637,6 @@ mod bios_memory_tests {
 
     impl GuestBytes for Memory {
         fn high_copy(&mut self, _address: u64, _bytes: &mut [u8], _to_user: bool) -> bool { false }
-        fn read<T: Copy>(&self, addr: u64) -> T {
-            let mut value = core::mem::MaybeUninit::<T>::uninit();
-            unsafe {
-                let bytes = core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), core::mem::size_of::<T>());
-                self.copy_from(addr, bytes);
-                value.assume_init()
-            }
-        }
-        fn write<T: Copy>(&mut self, addr: u64, value: T) {
-            let bytes = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(value).cast::<u8>(), core::mem::size_of::<T>()) };
-            self.copy_to(addr, bytes);
-        }
         fn copy_from(&self, addr: u64, dst: &mut [u8]) {
             for (i, byte) in dst.iter_mut().enumerate() {
                 let (plane, off) = self.offset(usize::try_from(addr).unwrap() + i);

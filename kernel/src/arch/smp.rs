@@ -14,7 +14,7 @@ static MEDIA_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn park(id: u32, _argument: usize) -> ! {
     if id != 1 {
-        let slot = unsafe { &*(_argument as *const crate::kernel::parallel::Slot<arch::Metal>) };
+        let slot = crate::kernel::parallel::slot_for_core::<arch::Metal>(id as usize);
         while !crate::kernel::parallel::started() { core::hint::spin_loop(); }
         arch::paging2::refresh_kernel_mappings();
         let Some(timer) = WORKER_TIMER.get().copied() else {
@@ -24,7 +24,7 @@ extern "C" fn park(id: u32, _argument: usize) -> ! {
         arch::irq::init_worker_timer(timer);
         if arch::paging2::is_pae() { arch::paging2::setup_long_mode_tables(); arch::paging2::flush_tlb(); }
         arch::descriptors::enter_ring1();
-        unsafe { crate::kernel::parallel::worker(arch::Metal::bind_current(), slot) }
+        crate::kernel::parallel::worker(unsafe { arch::Metal::bind_current() }, slot)
     }
     while !MEDIA_START.load(Ordering::Acquire) { core::hint::spin_loop(); }
     fn refresh() {
@@ -37,7 +37,7 @@ extern "C" fn park(id: u32, _argument: usize) -> ! {
     }
     refresh();
     lib::compact_println!("Media worker: audio and graphics ready");
-    unsafe { crate::kernel::media::worker(refresh) }
+    crate::kernel::media::worker(refresh)
 }
 
 pub(super) fn enable_parallel() {
@@ -178,7 +178,7 @@ pub(super) unsafe fn start(
                     trap_stack_top: trap as u32 + 16384 - 16,
                     tls,
                     entry: park,
-                    argument: &slots[logical] as *const _ as usize,
+                    argument: 0,
                     memory: crate::kernel::platform::bootstrap_supply(),
                     ready: &READY[logical],
                 },

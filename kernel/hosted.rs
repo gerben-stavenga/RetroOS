@@ -15,7 +15,7 @@ pub fn start_media_worker() {
     START.call_once(|| {
         std::thread::Builder::new().name("retroos-media".into()).spawn(|| {
             // This is the sole consumer; Linux needs no mapping refresh.
-            unsafe { kernel::kernel::media::worker(|| {}) }
+            kernel::kernel::media::worker(|| {})
         }).expect("start media worker");
         while !kernel::kernel::media::enabled() {
             std::thread::yield_now();
@@ -233,10 +233,10 @@ mod tests {
         start_media_worker();
         let caller = std::thread::current().id();
         // Sole producer; the job reads thread-local std state without allocation.
-        let worker = unsafe { kernel::kernel::media::graphics(|| {
+        let worker = kernel::kernel::media::graphics(|| {
             let thread = std::thread::current();
             (thread.id(), thread.name() == Some("retroos-media"))
-        }) };
+        });
         assert_ne!(worker.0, caller);
         assert!(worker.1);
     }

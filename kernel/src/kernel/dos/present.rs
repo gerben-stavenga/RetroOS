@@ -11,6 +11,8 @@
 //! sink the kernel owns; the machine below produces a picture and has no
 //! opinion about where it goes.
 
+#![forbid(unsafe_code)]
+
 use crate::Regs;
 use crate::kernel::bios_display::{DosVideo, FullscreenVga};
 use core::sync::atomic::Ordering;
@@ -18,8 +20,7 @@ use core::sync::atomic::Ordering;
 use super::machine::PcMachine;
 use ::vga::VgaState;
 
-static mut LAST_DIAG_MODE: Option<::vga::VgaMode> = None;
-static mut LAST_DIAG_BLACK: Option<bool> = None;
+static LAST_DIAG: spin::Mutex<Option<(::vga::VgaMode, bool)>> = spin::Mutex::new(None);
 static DIAG_LINES: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 static DIAG_RENDERS: core::sync::atomic::AtomicU32 =
@@ -30,16 +31,14 @@ fn diagnose_shadow(state: &VgaState, mode: ::vga::VgaMode, nonzero: usize, hash:
         return;
     }
     let black = nonzero == 0;
-    let old_mode = unsafe { core::ptr::read_volatile(&raw const LAST_DIAG_MODE) };
-    let old_black = unsafe { core::ptr::read_volatile(&raw const LAST_DIAG_BLACK) };
-    let changed = old_mode != Some(mode) || old_black != Some(black);
     let render = DIAG_RENDERS.fetch_add(1, Ordering::Relaxed) + 1;
-    if !changed && !render.is_multiple_of(32) {
-        return;
-    }
-    unsafe {
-        core::ptr::write_volatile(&raw mut LAST_DIAG_MODE, Some(mode));
-        core::ptr::write_volatile(&raw mut LAST_DIAG_BLACK, Some(black));
+    {
+        let mut last = LAST_DIAG.lock();
+        let current = Some((mode, black));
+        if *last == current && !render.is_multiple_of(32) {
+            return;
+        }
+        *last = current;
     }
     if DIAG_LINES.fetch_add(1, Ordering::Relaxed) >= 512 {
         return;

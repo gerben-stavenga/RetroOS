@@ -82,6 +82,7 @@ fn main() {
         // Storage is supplied directly as host directories below.
         kernel::install_portio(kernel::PortIo {
             now_ns: arch::now,
+            cycles: arch::cycles,
             inb: arch::inb,
             inw: arch::inw,
             inl: arch::inl,

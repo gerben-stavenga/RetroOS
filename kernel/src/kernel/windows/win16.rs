@@ -414,7 +414,7 @@ fn canonical_module_name(name: &[u8]) -> Vec<u8> {
 
 fn load_module_file(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
     let file = module_file(name);
-    let system = join(crate::kernel::dos::c_root(), b"RETROOS/WINDOWS/SYSTEM");
+    let system = join(crate::kernel::dos::c_root().as_bytes(), b"RETROOS/WINDOWS/SYSTEM");
     // Core facades form a private ABI with the kernel and shared PE DLLs.
     // Load them exclusively from the matched runtime, never from an app.
     // Ordinary application dependencies (e.g. COMMDLG) keep local precedence.
@@ -426,7 +426,7 @@ fn load_module_file(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), 
         if let Ok(loaded) = super::load_windows_file(path) {
             return Ok(loaded);
         }
-        let rooted = [crate::kernel::dos::c_root(), path.as_slice()].concat();
+        let rooted = [crate::kernel::dos::c_root().as_bytes(), path.as_slice()].concat();
         if let Ok(data) = crate::kernel::exec::load_file_resolved(&rooted) {
             return Ok((rooted, data));
         }
@@ -1040,6 +1040,7 @@ fn far_string<A: crate::Core>(
 
 fn dos_path(path: &[u8]) -> Vec<u8> {
     let root = crate::kernel::dos::c_root();
+    let root = root.as_bytes();
     let relative = path.strip_prefix(root).unwrap_or(path);
     let relative = relative.strip_prefix(b"/").unwrap_or(relative);
     let mut result = Vec::with_capacity(relative.len() + 3);

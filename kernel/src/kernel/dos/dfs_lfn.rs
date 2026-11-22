@@ -81,9 +81,9 @@ impl DfsState {
             let (name, alias) = match ci::lookup_lfn(&result.vfs, &decoded) {
                 Some((alias, entry)) => {
                     if !last && !entry.is_dir { return Err(3); }
-                    (entry.original.clone(), alias.to_vec())
+                    (entry.original, alias.to_vec())
                 }
-                None if last && allow_new => (decoded, part.to_vec()),
+                None if last && allow_new => (decoded.into(), part.to_vec()),
                 None => return Err(if last { 2 } else { 3 }),
             };
             if !result.vfs.is_empty() { result.vfs.push(b'/'); }
@@ -142,7 +142,7 @@ impl Search {
     pub fn next(&mut self) -> Option<Found> {
         while let Some((alias, entry)) = ci::entry_at(&self.directory, self.cursor) {
             self.cursor += 1;
-            if !wildcard(&self.pattern, &entry.original) && !wildcard(&self.pattern, &decode_oem(alias)) { continue; }
+            if !wildcard(&self.pattern, &entry.original) && !wildcard(&self.pattern, &decode_oem(&alias)) { continue; }
             let mut path = self.directory.clone();
             if !path.is_empty() { path.push(b'/'); }
             path.extend_from_slice(&entry.original);

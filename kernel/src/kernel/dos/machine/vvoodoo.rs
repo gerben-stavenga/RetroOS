@@ -165,7 +165,7 @@ impl VoodooOutput {
     fn drain(&self, render: &mut Render) {
         // Bound each batch so a producer cannot starve timed scanout.
         for _ in 0..256 {
-            let Some(command) = (unsafe { self.commands.pop() }) else { break };
+            let Some(command) = self.commands.pop() else { break };
             match command {
                 Command::Write(off, data, mask) => { render.command = (off, data, mask); render.execute(); }
                 Command::Init(value) => render.card.set_init_enable(value),
@@ -199,9 +199,7 @@ impl VoodooOutput {
 
 impl VVoodoo {
     pub fn new() -> Self {
-        let mut card = Box::<Voodoo>::new_uninit();
-        Voodoo::init(&mut card, Kind::Voodoo1, FB_BYTES, TEX_BYTES);
-        let mut card = unsafe { card.assume_init() };
+        let mut card = Voodoo::new_boxed(Kind::Voodoo1, FB_BYTES, TEX_BYTES);
         card.set_checkpoint(crate::kernel::media::checkpoint);
         let output = alloc::sync::Arc::new(VoodooOutput {
             render: crate::kernel::media::Shared::new(Render {
@@ -214,8 +212,9 @@ impl VVoodoo {
             ready: core::sync::atomic::AtomicBool::new(false),
         });
         Self {
-            work: unsafe { crate::kernel::media::DeviceService::new(output.clone(),
-                |output| output.commands.pending(), VoodooOutput::run) }, output, allocated: false,
+            work: crate::kernel::media::DeviceService::new(output.clone(),
+                |output| output.commands.pending(), VoodooOutput::run),
+            output, allocated: false,
             cfg: Config {
                 command: 0,
                 bar0: BAR_PHYS,
@@ -244,12 +243,12 @@ impl VVoodoo {
     }
     fn kick(&mut self) { self.work.poll_inline(); }
     fn submit(&mut self, command: Command) {
-        if !unsafe { self.output.commands.push(command) } {
+        if !self.output.commands.push(command) {
             let _sample = Sample::start(Stage::QueueFull);
             loop {
                 self.kick();
                 core::hint::spin_loop();
-                if unsafe { self.output.commands.push(command) } { break; }
+                if self.output.commands.push(command) { break; }
             }
         }
         self.kick();
@@ -365,9 +364,7 @@ impl VVoodoo {
         self.flush();
         self.fence();
         let render = self.output.render.lock();
-        unsafe {
-            crate::kernel::media::graphics(|| render.card.render(&render.fb, dac, out, pitch));
-        }
+        crate::kernel::media::graphics(|| render.card.render(&render.fb, dac, out, pitch));
         drop(render);
         self.output.render.lock().swapped = false;
         self.output.ready.store(false, Ordering::Release);
@@ -379,9 +376,7 @@ impl VVoodoo {
         self.flush();
         self.fence();
         let render = self.output.render.lock();
-        unsafe {
-            crate::kernel::media::graphics(|| render.card.render_raw(&render.fb, dac, out, pitch));
-        }
+        crate::kernel::media::graphics(|| render.card.render_raw(&render.fb, dac, out, pitch));
         drop(render);
         self.output.render.lock().swapped = false;
         self.output.ready.store(false, Ordering::Release);

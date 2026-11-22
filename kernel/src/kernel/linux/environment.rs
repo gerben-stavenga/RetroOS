@@ -22,7 +22,9 @@ pub(crate) fn configure_home(home: Option<&str>) {
 pub(super) fn identity() -> (u32, u32) {
     if let Some(identity) = *IDENTITY.lock() { return identity; }
     let home = HOME.lock().clone();
-    let path = home.as_deref().unwrap_or_else(|| crate::kernel::dos::c_root());
+    let root = crate::kernel::dos::c_root();
+    let root = root.as_bytes();
+    let path = home.as_deref().unwrap_or(root);
     let path = path.strip_prefix(b"/").unwrap_or(path);
     let path = path.strip_suffix(b"/").unwrap_or(path);
     let identity = crate::kernel::vfs::ownership(path, true).unwrap_or((0, 0));
