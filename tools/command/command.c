@@ -572,11 +572,9 @@ static unsigned int get_child_exit_status(void) {
     return (unsigned int)r.x.ax;
 }
 
-/* Re-seed the BIOS tick-of-day counter (40:6C) from the RTC. A fork-exec'd
- * child runs in its own address space with its own BDA; while we sit in the
- * waitpid loop our timer IRQs coalesce, so our copy of the counter falls
- * behind by however long the child ran. INT 1A AH=02 reads the RTC (BCD),
- * AH=01 stores the recomputed count. */
+/* After a forked child exits, resync this world's BIOS clock from the RTC.
+ * Its private BDA misses timer ticks while COMMAND.COM is parked. The same
+ * refresh repairs the shared counter after an in-process EXEC. */
 static void refresh_bda_clock(void) {
     unsigned long secs, ticks;
     r.h.ah = 0x02;
@@ -585,9 +583,9 @@ static void refresh_bda_clock(void) {
     secs = 3600UL * (unsigned char)((r.h.ch >> 4) * 10 + (r.h.ch & 0x0F))
          +   60UL * (unsigned char)((r.h.cl >> 4) * 10 + (r.h.cl & 0x0F))
          +          (unsigned char)((r.h.dh >> 4) * 10 + (r.h.dh & 0x0F));
-    /* ticks = secs * 1193182 / 65536 = secs * 18.20651 Hz, kept in 32 bits:
-     * secs*2065 <= 86399*2065 < 2^32. */
-    ticks = secs * 18UL + (secs * 2065UL) / 10000UL;
+    /* Split 1193182 / 65536 into 18 + 13534 / 65536 to keep products
+     * within 32 bits and match the BIOS boot-time conversion. */
+    ticks = secs * 18UL + (secs * 13534UL) / 65536UL;
     r.h.ah = 0x01;
     r.x.cx = (unsigned)(ticks >> 16);
     r.x.dx = (unsigned)(ticks & 0xFFFF);

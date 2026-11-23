@@ -8,7 +8,7 @@
 # features compile a static SDL2 in its build script — no system libSDL2 at
 # build or run time). Build for the host: --platforms=@platforms//host.
 #
-load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
 rust_binary(
     name = "retroos-play",
@@ -50,4 +50,12 @@ rust_binary(
         "//lib",
         "@crates//:sdl2",
     ],
+)
+
+rust_test(
+    name = "keyboard_test_host",
+    crate = ":retroos-play",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests", "-Crelocation-model=static"],
+    tags = ["manual"],
+    visibility = ["//tests:__pkg__"],
 )

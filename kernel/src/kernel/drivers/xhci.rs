@@ -4,6 +4,8 @@
 //! input queue as i8042 input. Boot supplies the platform operations; controller
 //! protocols and HID handling live entirely in this kernel driver.
 
+use lib::keyboard::KeyRepeat;
+
 /// Boot-supplied mechanisms. Allocations and mappings remain resident until reboot.
 /// Callbacks run on the boot CPU with interrupts masked, including during polling.
 pub struct Platform {
@@ -187,43 +189,16 @@ const HID_SC: [u8; 0x68] = [
 // dropped for now.
 const MOD_SC: [u8; 8] = [0x1D, 0x2A, 0x38, 0, 0x1D, 0x36, 0x38, 0];
 
-const REPEAT_DELAY_NS: u64 = 500_000_000;
-const REPEAT_INTERVAL_NS: u64 = 33_333_333;
-
-/// USB reports describe held keys; unlike PS/2, they do not supply typematic
-/// make codes. Repeat the most recently pressed ordinary key from timer polls.
-#[derive(Clone, Copy)]
-struct KeyRepeat {
-    usage: u8,
-    deadline: u64,
-}
-
-impl KeyRepeat {
-    const fn empty() -> Self { Self { usage: 0, deadline: 0 } }
-
-    fn report(&mut self, previous: &[u8], current: &[u8], now: u64) {
-        if !current.contains(&self.usage) { self.usage = 0; }
-        for &usage in current {
-            // Lock keys toggle state, so they must never repeat. Modifiers
-            // live outside this key array and likewise do not arm a repeat.
-            if !previous.contains(&usage) && !matches!(usage, 0x39 | 0x47 | 0x53)
-                && hid_to_scancode(usage).is_some()
-            {
-                self.usage = usage;
-                self.deadline = now.wrapping_add(REPEAT_DELAY_NS);
-            }
+fn update_key_repeat(repeat: &mut KeyRepeat, previous: &[u8], current: &[u8], now: u64) {
+    for &usage in previous {
+        if !current.contains(&usage) && let Some(key) = hid_to_scancode(usage) {
+            repeat.release(key);
         }
     }
-
-    fn poll(&mut self, now: u64) {
-        if self.usage == 0 || now.wrapping_sub(self.deadline) >= (1u64 << 63) {
-            return;
+    for &usage in current {
+        if !previous.contains(&usage) && let Some(key) = hid_to_scancode(usage) {
+            repeat.press(key, now);
         }
-        if let Some((sc, extended)) = hid_to_scancode(self.usage) {
-            emit_key(sc, extended, false);
-        }
-        // A delayed timer delivers one repeat, without a catch-up burst.
-        self.deadline = now.wrapping_add(REPEAT_INTERVAL_NS);
     }
 }
 
@@ -993,7 +968,7 @@ impl Controller {
                             id_prefixed,
                         );
                         let end = if id_prefixed { 16 } else { 8 };
-                        pipe.repeat.report(&previous[2..end], &pipe.prev[2..end], now);
+                        update_key_repeat(&mut pipe.repeat, &previous[2..end], &pipe.prev[2..end], now);
                     } else if let Some((dx, dy, buttons)) = decode_mouse_report(&report, len) {
                         self.pipes[index].prev[0] = buttons;
                         (platform().push_mouse)(dx, dy, self.mouse_buttons() | other_buttons);
@@ -1008,7 +983,9 @@ impl Controller {
         // Releases above take effect before the repeat deadline is checked,
         // and an idle endpoint must still repeat without another USB report.
         for pipe in &mut self.pipes[..KEYBOARD_PIPES] {
-            if pipe.ready { pipe.repeat.poll(now); }
+            if pipe.ready && let Some((scan, extended)) = pipe.repeat.poll(now) {
+                emit_key(scan, extended, false);
+            }
         }
     }
 

@@ -1,3 +1,4 @@
+use lib::keyboard::{REPEAT_DELAY_NS, REPEAT_INTERVAL_NS};
 mod input {
     extern crate std;
     std::thread_local! {
@@ -260,19 +261,15 @@ fn unchanged_keyboard_reports_do_not_restart_repeat_delay() {
 #[test]
 fn newest_key_repeats_while_modifier_and_lock_keys_do_not_arm_repeat() {
     let mut repeat = KeyRepeat::empty();
-    repeat.report(&[], &[4], 0); // A
-    repeat.report(&[4], &[4, 5], 100); // B takes over
-    repeat.report(&[4, 5], &[4, 5, 0x39, 0x47, 0x53], 200);
-    repeat.poll(REPEAT_DELAY_NS);
-    input::KEYS.with(|keys| assert!(keys.borrow().is_empty()));
-    repeat.poll(REPEAT_DELAY_NS + 100);
-    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
-    repeat.report(&[4, 5], &[4], REPEAT_DELAY_NS + 200); // releasing B stops
-    repeat.poll(REPEAT_DELAY_NS * 10);
-    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
-    repeat.report(&[], &[0x39, 0x47, 0x53], 0);
-    repeat.poll(REPEAT_DELAY_NS);
-    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x30]));
+    update_key_repeat(&mut repeat, &[], &[4], 0); // A
+    update_key_repeat(&mut repeat, &[4], &[4, 5], 100); // B takes over
+    update_key_repeat(&mut repeat, &[4, 5], &[4, 5, 0x39, 0x47, 0x53], 200);
+    assert_eq!(repeat.poll(REPEAT_DELAY_NS), None);
+    assert_eq!(repeat.poll(REPEAT_DELAY_NS + 100), Some((0x30, false)));
+    update_key_repeat(&mut repeat, &[4, 5], &[4], REPEAT_DELAY_NS + 200);
+    assert_eq!(repeat.poll(REPEAT_DELAY_NS * 10), None);
+    update_key_repeat(&mut repeat, &[], &[0x39, 0x47, 0x53], 0);
+    assert_eq!(repeat.poll(REPEAT_DELAY_NS), None);
 }
 
 #[test]
@@ -306,14 +303,12 @@ fn failed_keyboard_transfer_stops_repeat() {
 fn repeat_deadline_wraps_and_late_poll_does_not_flood_input() {
     let mut repeat = KeyRepeat::empty();
     let start = u64::MAX - REPEAT_DELAY_NS / 2;
-    repeat.report(&[], &[4], start);
-    repeat.poll(start);
-    repeat.poll(start.wrapping_add(REPEAT_DELAY_NS - 1));
-    input::KEYS.with(|keys| assert!(keys.borrow().is_empty()));
-    repeat.poll(start.wrapping_add(REPEAT_DELAY_NS));
-    repeat.poll(REPEAT_DELAY_NS * 10);
-    repeat.poll(REPEAT_DELAY_NS * 10);
-    input::KEYS.with(|keys| assert_eq!(*keys.borrow(), [0x1e, 0x1e]));
+    update_key_repeat(&mut repeat, &[], &[4], start);
+    assert_eq!(repeat.poll(start), None);
+    assert_eq!(repeat.poll(start.wrapping_add(REPEAT_DELAY_NS - 1)), None);
+    assert_eq!(repeat.poll(start.wrapping_add(REPEAT_DELAY_NS)), Some((0x1e, false)));
+    assert_eq!(repeat.poll(REPEAT_DELAY_NS * 10), Some((0x1e, false)));
+    assert_eq!(repeat.poll(REPEAT_DELAY_NS * 10), None);
 }
 
 #[test]

@@ -3,6 +3,9 @@
 //! ru/winkeys and Polish programmer layouts. No allocation is needed here.
 use core::sync::atomic::{AtomicU8, Ordering};
 
+mod repeat;
+pub use repeat::{KeyRepeat, REPEAT_DELAY_NS, REPEAT_INTERVAL_NS};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Layout { Us, De, It, Ru, Pl }

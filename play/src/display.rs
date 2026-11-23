@@ -9,6 +9,7 @@ use retroos_arch_interp as arch;
 
 use arch::Irq;
 use kernel::kernel::display::{ExternalDisplay, FrameLayout};
+use lib::keyboard::KeyRepeat;
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::{Mod, Scancode};
 use sdl2::mouse::MouseButton;
@@ -16,7 +17,7 @@ use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::Rect;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Main-loop period: pump input + present at ~60 Hz.
 const TICK: Duration = Duration::from_millis(16);
@@ -67,6 +68,9 @@ pub fn run(sdl: &sdl2::Sdl) -> ! {
     canvas.window_mut().maximize();
     let texture_creator = canvas.texture_creator();
     let mut event_pump = sdl.event_pump().expect("SDL event pump");
+    let start = Instant::now();
+    let mut keyboard = WindowKeyboard::new();
+    let post_key = |byte| arch::post_irq(Irq::Key(byte));
 
     // INT 33h button mask (bit 0 left, 1 right, 2 middle) — the kernel's mouse
     // packet wants the current mask, not edge events.
@@ -99,16 +103,6 @@ pub fn run(sdl: &sdl2::Sdl) -> ! {
                     captured = false; // Ctrl+F10: release the pointer
                     sdl.mouse().set_relative_mouse_mode(false);
                     let _ = canvas.window_mut().set_title("RetroOS — DOS");
-                }
-                Event::KeyDown { scancode: Some(sc), repeat: false, .. } => {
-                    if let Some(pc) = pc_scancode(sc) {
-                        arch::post_irq(Irq::Key(pc));
-                    }
-                }
-                Event::KeyUp { scancode: Some(sc), .. } => {
-                    if let Some(pc) = pc_scancode(sc) {
-                        arch::post_irq(Irq::Key(pc | 0x80));
-                    }
                 }
                 Event::MouseMotion { xrel, yrel, .. } => {
                     // Convert window coordinates through the rendered picture,
@@ -144,9 +138,11 @@ pub fn run(sdl: &sdl2::Sdl) -> ! {
                         arch::post_irq(Irq::Mouse { dx: 0, dy: 0, buttons });
                     }
                 }
-                _ => {}
+                _ => keyboard.event(event, start.elapsed().as_nanos() as u64, post_key),
             }
         }
+        // Deliver releases first if one arrived during the same event pump.
+        keyboard.poll(start.elapsed().as_nanos() as u64, post_key);
 
         let viewport = canvas.output_size().unwrap_or_else(|_| canvas.window().size());
         if viewport.0 == 0 || viewport.1 == 0 {
@@ -206,12 +202,61 @@ fn button_bit(btn: MouseButton) -> Option<u8> {
     })
 }
 
-/// SDL (USB-HID) scancode → PC Set-1 make code. Covers the keys a DOS program
-/// reads through the BIOS; arrows/navigation use their bare (un-prefixed) codes,
-/// matching the stdin pump's escape-sequence mapping. `None` for unmapped keys.
-fn pc_scancode(sc: Scancode) -> Option<u8> {
+struct WindowKeyboard {
+    held: [bool; 256],
+    repeat: KeyRepeat,
+}
+
+impl WindowKeyboard {
+    fn new() -> Self {
+        Self { held: [false; 256], repeat: KeyRepeat::empty() }
+    }
+
+    fn event(&mut self, event: Event, now: u64, mut emit: impl FnMut(u8)) {
+        let (scancode, pressed) = match event {
+            // SDL's desktop repeat is ignored so the same schedule used by
+            // USB HID drives the window, even when host repeat is disabled.
+            Event::KeyDown { scancode: Some(scancode), repeat: false, .. } => (scancode, true),
+            Event::KeyUp { scancode: Some(scancode), .. } => (scancode, false),
+            Event::Window { win_event: WindowEvent::FocusLost, .. } => {
+                self.repeat = KeyRepeat::empty();
+                for (index, held) in self.held.iter_mut().enumerate() {
+                    if core::mem::take(held) {
+                        emit_key((index as u8 & 0x7f, index >= 128), false, &mut emit);
+                    }
+                }
+                return;
+            }
+            _ => return,
+        };
+        let Some(key) = pc_scancode(scancode) else { return; };
+        let index = usize::from(key.0) + if key.1 { 128 } else { 0 };
+        if self.held[index] == pressed { return; }
+        self.held[index] = pressed;
+        if pressed {
+            self.repeat.press(key, now);
+        } else {
+            self.repeat.release(key);
+        }
+        emit_key(key, pressed, &mut emit);
+    }
+
+    fn poll(&mut self, now: u64, mut emit: impl FnMut(u8)) {
+        if let Some(key) = self.repeat.poll(now) {
+            emit_key(key, true, &mut emit);
+        }
+    }
+}
+
+fn emit_key((scan, extended): (u8, bool), pressed: bool, emit: &mut impl FnMut(u8)) {
+    if extended { emit(0xe0); }
+    emit(if pressed { scan } else { scan | 0x80 });
+}
+
+/// SDL scancode to PC Set-1 make code and E0 prefix flag.
+fn pc_scancode(sc: Scancode) -> Option<(u8, bool)> {
     use Scancode::*;
-    Some(match sc {
+    let scan = match sc {
         Escape => 0x01,
         Num1 => 0x02, Num2 => 0x03, Num3 => 0x04, Num4 => 0x05, Num5 => 0x06,
         Num6 => 0x07, Num7 => 0x08, Num8 => 0x09, Num9 => 0x0A, Num0 => 0x0B,
@@ -229,10 +274,60 @@ fn pc_scancode(sc: Scancode) -> Option<u8> {
         CapsLock => 0x3A,
         F1 => 0x3B, F2 => 0x3C, F3 => 0x3D, F4 => 0x3E, F5 => 0x3F, F6 => 0x40,
         F7 => 0x41, F8 => 0x42, F9 => 0x43, F10 => 0x44, F11 => 0x57, F12 => 0x58,
-        // Bare extended-key codes (no 0xE0 prefix), as the stdin pump posts them.
         Up => 0x48, Down => 0x50, Left => 0x4B, Right => 0x4D,
         Home => 0x47, End => 0x4F, PageUp => 0x49, PageDown => 0x51,
         Insert => 0x52, Delete => 0x53,
         _ => return None,
-    })
+    };
+    let extended = matches!(sc, Up | Down | Left | Right | Home | End | PageUp | PageDown
+        | Insert | Delete | RCtrl | RAlt);
+    Some((scan, extended))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lib::keyboard::{REPEAT_DELAY_NS, REPEAT_INTERVAL_NS};
+
+    fn key_down(scancode: Scancode, repeat: bool) -> Event {
+        Event::KeyDown {
+            timestamp: 0, window_id: 1, keycode: None, scancode: Some(scancode),
+            keymod: Mod::NOMOD, repeat,
+        }
+    }
+
+    #[test]
+    fn one_sdl_arrow_press_repeats_with_extended_scancodes_until_release() {
+        let mut keyboard = WindowKeyboard::new();
+        let mut bytes = Vec::new();
+        keyboard.event(key_down(Scancode::Right, false), 0, |byte| bytes.push(byte));
+        keyboard.event(key_down(Scancode::Right, true), 1, |byte| bytes.push(byte));
+        keyboard.poll(REPEAT_DELAY_NS - 1, |byte| bytes.push(byte));
+        assert_eq!(bytes, [0xe0, 0x4d]);
+
+        keyboard.poll(REPEAT_DELAY_NS + 1, |byte| bytes.push(byte));
+        keyboard.poll(REPEAT_DELAY_NS + REPEAT_INTERVAL_NS, |byte| bytes.push(byte));
+        assert_eq!(bytes, [0xe0, 0x4d, 0xe0, 0x4d, 0xe0, 0x4d]);
+
+        let release = Event::KeyUp {
+            timestamp: 0, window_id: 1, keycode: None, scancode: Some(Scancode::Right),
+            keymod: Mod::NOMOD, repeat: false,
+        };
+        let next = REPEAT_DELAY_NS + 2 * REPEAT_INTERVAL_NS;
+        keyboard.event(release, next, |byte| bytes.push(byte));
+        keyboard.poll(next, |byte| bytes.push(byte));
+        assert_eq!(bytes, [0xe0, 0x4d, 0xe0, 0x4d, 0xe0, 0x4d, 0xe0, 0xcd]);
+    }
+
+    #[test]
+    fn losing_sdl_focus_releases_all_held_keys_and_cancels_repeat() {
+        let mut keyboard = WindowKeyboard::new();
+        let mut bytes = Vec::new();
+        keyboard.event(key_down(Scancode::LShift, false), 0, |byte| bytes.push(byte));
+        keyboard.event(key_down(Scancode::Up, false), 0, |byte| bytes.push(byte));
+        let lost = Event::Window { timestamp: 0, window_id: 1, win_event: WindowEvent::FocusLost };
+        keyboard.event(lost, REPEAT_DELAY_NS, |byte| bytes.push(byte));
+        keyboard.poll(REPEAT_DELAY_NS, |byte| bytes.push(byte));
+        assert_eq!(bytes, [0x2a, 0xe0, 0x48, 0xaa, 0xe0, 0xc8]);
+    }
 }

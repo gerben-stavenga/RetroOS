@@ -97,6 +97,7 @@ fn main() {
             debug: kernel::DebugSink::HostStdout,
             is_metal: false,
         });
+        arch::register_rtc();
         // Native socket backend (hosted "punch-through" → host std::net); the
         // socket table is thread-local, so install it on this CPU/kernel thread.
         arch::install_native_sockets();

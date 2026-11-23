@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise xHCI enumeration and real input with no PS/2 fallback."""
+"""Exercise xHCI input with no PS/2 fallback, or check the QEMU PS/2 path."""
 import argparse
 import json
 from pathlib import Path
@@ -41,13 +41,15 @@ org 100h
     mov ah, 9
     int 21h
 .loop:
-    mov ah, 1
+    mov ah, 11h
     int 16h
     jz .mouse
-    xor ah, ah
+    mov ah, 10h
     int 16h
     cmp ah, 4dh
     jne .ordinary_key
+    cmp al, 0e0h
+    jne failure
     inc word [right_count]
     cmp word [right_count], 3
     jne .mouse
@@ -139,23 +141,24 @@ failure:
     int 21h
 seen db 0
 right_count dw 0
-repeated db 'USB REPEAT PASS',13,10,'$'
-key_a db 'USB KEY a',13,10,'$'
-key_b db 'USB KEY b',13,10,'$'
-key_c db 'USB KEY c',13,10,'$'
-key_d db 'USB KEY d',13,10,'$'
-first_mouse db 'USB MOUSE 1',13,10,'$'
-ready db 'USB INPUT READY',13,10,'$'
-passed db 'USB INPUT PASS',13,10,'$'
+repeated db 'REPEAT PASS',13,10,'$'
+key_a db 'KEY a',13,10,'$'
+key_b db 'KEY b',13,10,'$'
+key_c db 'KEY c',13,10,'$'
+key_d db 'KEY d',13,10,'$'
+first_mouse db 'MOUSE 1',13,10,'$'
+ready db 'INPUT READY',13,10,'$'
+passed db 'INPUT PASS',13,10,'$'
 '''
 
 
 def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, second_keyboard=None, four_keyboards=False, second_mouse=None):
+    ps2 = controllers == 0
     log = work / (name + '.log')
     qmp = work / (name + '.sock')
     boot = prepare_boot(work, disk)
     args = [
-        'qemu-system-i386', '-machine', 'pc,i8042=off', '-m', '256',
+        'qemu-system-i386', '-machine', 'pc' if ps2 else 'pc,i8042=off', '-m', '256',
         '-display', 'none', '-serial', 'none', '-no-reboot',
         '-debugcon', 'file:' + str(log),
         '-drive', f'file={boot},format=raw,snapshot=on',
@@ -190,8 +193,9 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
                      '-device', f'usb-kbd,id=kbd{index + 1},display=video{index},bus=usb{keyboard}.0{port}']
     key_port = ',port=' + chain[:-1] + '2' if hubs else ''
     mouse_port = ',port=' + chain[:-1] + '4' if hubs and mouse == keyboard else ''
-    args += ['-device', f'usb-kbd,id=kbd,bus=usb{keyboard}.0{key_port}' + (',display=video0' if second_keyboard is not None else ''),
-             '-device', f'usb-mouse,id=mouse,bus=usb{mouse}.0{mouse_port}']
+    if not ps2:
+        args += ['-device', f'usb-kbd,id=kbd,bus=usb{keyboard}.0{key_port}' + (',display=video0' if second_keyboard is not None else ''),
+                 '-device', f'usb-mouse,id=mouse,bus=usb{mouse}.0{mouse_port}']
     if second_mouse is not None:
         port = ',port=' + chain[:-1] + '5' if hubs and second_mouse == keyboard else ''
         args += ['-device', f'usb-mouse,id=mouse2,bus=usb{second_mouse}.0{port}']
@@ -209,7 +213,7 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
                     time.sleep(.1)
                 raise AssertionError(name + ': ' + text)
 
-            wait_for('USB INPUT READY')
+            wait_for('INPUT READY')
             with socket.socket(socket.AF_UNIX) as connection:
                 connection.settimeout(15)
                 connection.connect(str(qmp))
@@ -233,7 +237,13 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
                 if second_keyboard is not None:
                     arguments['device'] = 'video0'
                 call('input-send-event', arguments)
-                wait_for('USB REPEAT PASS')
+                if ps2:
+                    # Reproduce the extra makes supplied by QEMU's desktop
+                    # frontend, with the same held key and a single break.
+                    for _ in range(2):
+                        time.sleep(.06)
+                        call('input-send-event', arguments)
+                wait_for('REPEAT PASS')
                 arguments['events'][0]['data']['down'] = False
                 call('input-send-event', arguments)
                 keyboards = [('a', 'video0'), ('b', 'video1')] if second_keyboard is not None else [('a', None)]
@@ -250,7 +260,7 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
                                 arguments['device'] = display
                             call('input-send-event', arguments)
                             if down and sent == key:
-                                wait_for('USB KEY ' + key)
+                                wait_for('KEY ' + key)
                             time.sleep(.03 if four_keyboards and not uefi else .2)
                 arguments = {'events': [
                     {'type': 'rel', 'data': {'axis': 'x', 'value': 20}},
@@ -263,7 +273,7 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
                     call('human-monitor-command', {'command-line': 'mouse_set ' + str(mice[0]['index'])})
                 call('input-send-event', arguments)
                 if second_mouse is not None:
-                    wait_for('USB MOUSE 1')
+                    wait_for('MOUSE 1')
                     call('input-send-event', {'events': [
                         {'type': 'btn', 'data': {'down': False, 'button': 'left'}}]})
                     call('human-monitor-command', {'command-line': 'mouse_set ' + str(mice[1]['index'])})
@@ -271,7 +281,11 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
                         {'type': 'rel', 'data': {'axis': 'x', 'value': -20}},
                         {'type': 'btn', 'data': {'down': True, 'button': 'right'}}]})
                 text = wait_for('All commands done')
-            assert 'USB INPUT PASS' in text, text
+            assert 'INPUT PASS' in text, text
+            if ps2:
+                assert 'IRQ: no i8042' not in text and 'xHCI: running' not in text, text
+                print(f'PASS: {name}: repeated PS/2 arrow makes and mouse input reached DOS', flush=True)
+                return
             assert text.count('xHCI: running') == min(controllers, 4), text
             assert text.count('xHCI: hub ready') == hubs, text
             assert text.count('xHCI: keyboard ready') == (4 if four_keyboards else 2 if second_keyboard is not None else 1), text
@@ -291,7 +305,9 @@ def session(work, disk, name, controllers, keyboard, mouse, uefi=False, hubs=0, 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--full', action='store_true', help='run all 21 USB topologies')
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--full', action='store_true', help='run all 21 USB topologies')
+    modes.add_argument('--ps2', action='store_true', help='run with QEMU PS/2 keyboard and mouse')
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='retroos-xhci-') as temp:
         work = Path(temp)
@@ -312,6 +328,9 @@ def main():
         subprocess.run(['mcopy', '-i', str(disk), str(probe), '::MICE.COM'], check=True)
         subprocess.run(['mmd', '-i', str(disk), '::RETROOS'], check=True)
         subprocess.run(['mcopy', '-i', str(disk), str(ROOT / 'etc/RETROOS.INI'), '::RETROOS/RETROOS.INI'], check=True)
+        if args.ps2:
+            session(work, disk, 'qemu-ps2', 0, 0, 0)
+            return
         if not args.full:
             session(work, disk, 'shared', 1, 0, 0)
             session(work, disk, 'four-keyboards-deep-hub', 1, 0, 0, hubs=4, second_keyboard=0, four_keyboards=True)

@@ -147,11 +147,12 @@ pub(super) fn int_21h<A: crate::Core>(
             return thread::KernelAction::Done;
         }
         // AH=0x0B: Check Standard Input Status — AL=0 no char, 0xFF char ready.
-        // Reflect the BIOS keyboard buffer state (head != tail = char ready).
-        // Some Borland C builds back kbhit() with this rather than INT 16h
-        // AH=01h, so a hardcoded "no char" silently breaks polling.
+        // A DOS read splits an extended BIOS keystroke into a zero byte
+        // followed by its scan code. Both bytes must be visible to kbhit().
         0x0B => {
-            let al = if crate::kernel::dos::Bda::keyboard_buffer_nonempty(machine) { 0xFFu8 } else { 0u8 };
+            let ready = dos.dos_pending_char.is_some()
+                || crate::kernel::dos::Bda::keyboard_buffer_nonempty(machine);
+            let al = if ready { 0xFF } else { 0 };
             regs.rax = (regs.rax & !0xFF) | al as u64;
             return thread::KernelAction::Done;
         }
