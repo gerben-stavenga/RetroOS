@@ -2,7 +2,9 @@
 
 extern crate alloc;
 
+use alloc::{alloc::{Layout, handle_alloc_error}, boxed::Box};
 use arch_abi::eflags;
+use pinned_init::{InPlaceInit, init};
 use crate::Regs;
 use crate::kernel::thread;
 use crate::kernel::{
@@ -140,10 +142,8 @@ fn prepare_startup<A: crate::Core>(
     // DOS worlds are cloned from their substitute-BIOS template.
     let dos_template = crate::kernel::dos::DosTemplate::new(machine);
 
-    let runtime = alloc::boxed::Box::write(
-        alloc::boxed::Box::new_uninit(),
-        Runtime { master_env, bios_workspace, dos_template, threads },
-    );
+    let runtime = Box::init(init!(Runtime::<A> { master_env, bios_workspace, dos_template, threads }))
+        .unwrap_or_else(|_| handle_alloc_error(Layout::new::<Runtime<A>>()));
     StartupState { runtime, screen, sb_card, sink }
 }
 
@@ -2815,7 +2815,7 @@ pub(crate) fn handle_fork_exec<A: crate::Core>(
             let vga = parent
                 .pc
                 .vga
-                .clone_detached_for_child(machine)
+                .clone_detached_for_child()
                 .unwrap_or_else(|| {
                     crate::kernel::bios_display::DosVideo::Vga(
                         crate::kernel::bios_display::EmulatedVga::initial_mode3(),

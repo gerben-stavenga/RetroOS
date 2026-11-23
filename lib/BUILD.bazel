@@ -90,7 +90,7 @@ rust_library(
     rustc_flags = [
         "-Crelocation-model=static",
     ] + panic_strategy(),
-    deps = [":lib", ":planar"],
+    deps = [":lib", ":planar", "//arch-abi"],
 )
 
 # Emulated sound cards as passive, host-agnostic state machines, plus the

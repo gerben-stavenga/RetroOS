@@ -7,7 +7,7 @@
 //! phys memfd, so everything runs inside ONE #[test] (Rust runs tests on
 //! separate threads; a second REGS user would race).
 
-use arch_abi::eflags;
+use arch_abi::{eflags, mapping::InspectMappings as _, page_entry::PageEntry};
 #[cfg(test)]
 use crate::test_memory;
 
@@ -238,8 +238,8 @@ fn kvm_engine_proofs() {
     let arch_abi::page_entry::Backing::Owned(frame) = first_mapping.backing else { panic!("expected owned RAM") };
     assert!(unsafe { test_memory::ownership().retain(frame.number()) });
     unsafe {
-        arch_abi::mapping::replace_mapping(&mut mem, first_page, second, test_memory::input(5)).0.unwrap();
-        arch_abi::mapping::replace_mapping(&mut mem, second_page, first, test_memory::input(5)).0.unwrap();
+        test_memory::replace_mapping(&mut mem, first_page, second, test_memory::input(5)).0.unwrap();
+        test_memory::replace_mapping(&mut mem, second_page, first, test_memory::input(5)).0.unwrap();
     }
     test_memory::free_phys_page(frame.number());
     let mut remapped = r;
@@ -465,7 +465,7 @@ fn kvm_engine_proofs() {
     // including mappings above 512 GiB and COW after a fork.
     let high = (1u64 << 39) + 0x1234_0000;
     let zero = arch_abi::mapping::read_mapping(&mut mem, UserPage::new(0x7000_0000).unwrap()).unwrap();
-    unsafe { mem.fill_mappings(UserPage::new(high).unwrap(), 2, zero, test_memory::input(8)).0.unwrap(); }
+    unsafe { mem.fill_mappings(UserPage::new(high).unwrap(), 2, arch_abi::mapping::Install::from_entry(zero), test_memory::input(8)).0.unwrap(); }
     let before = run::vm_entries();
     mem.copy_to(high, &[0x48, 0xff, 0x07, 0x48, 0x8b, 0x07, 0x0f, 0x05], crate::test_memory::input(5)); // inc [rdi]; mov rax,[rdi]; syscall
     mem.write::<u64>(high + 4096, 41);
@@ -547,7 +547,7 @@ fn planar_device_proof(mem: &mut crate::Interp, code: u32, stack: u32) {
     let aperture = UserPage::new(0xa0000).unwrap();
     let mut previous = [PageEntry::Absent; 16];
     mem.read_mappings(aperture, &mut previous).unwrap();
-    unsafe { mem.fill_mappings(aperture, 16, PageEntry::Intercepted, test_memory::input(8)).0.unwrap(); }
+    mem.fill_mappings(aperture, 16, arch_abi::mapping::Install::INTERCEPTED, test_memory::input(8)).0.unwrap();
     let binding = planar::Binding { registers: state, planes };
     // Two MOV stores separated by a sequencer mask change; then a VGA read.
     let program = [0xb0, 0x11, 0xa2, 0, 0, 0x0a, 0,
@@ -665,6 +665,7 @@ fn planar_device_proof(mem: &mut crate::Interp, code: u32, stack: u32) {
 
     unsafe {
         planar::bind(mem, None);
+        let previous = previous.map(|entry| arch_abi::mapping::Install::from_entry(entry));
         mem.replace_mappings(aperture, &previous, test_memory::input(8)).0.unwrap();
         assert_eq!(libc::munmap(storage, 65 * 4096), 0);
     }
@@ -801,7 +802,6 @@ fn espfix_resume(r: Regs, offset: u64, long: bool) {
 
 #[test]
 fn host_byte_access_never_enters_the_vm() {
-    use arch_abi::page_entry::PageEntry;
     crate::phys::init_test_ram();
     let mut mem = crate::Interp::local();
     let address = 0x0450_0ffe;
@@ -844,7 +844,7 @@ fn host_byte_access_never_enters_the_vm() {
         other => panic!("expected RAM: {other:?}"),
     };
     for entry in [PageEntry::ReadOnly(mapping), PageEntry::NoAccess(mapping), PageEntry::Intercepted, PageEntry::Absent] {
-        unsafe { arch_abi::mapping::replace_mapping(&mut mem, page, entry, test_memory::input(5)).0.unwrap(); }
+        unsafe { test_memory::replace_mapping(&mut mem, page, entry, test_memory::input(5)).0.unwrap(); }
         let before = run::vm_entries();
         assert_eq!(mem.copy_to(address, &[1], test_memory::input(5)).0, None);
         let mut byte = [0];

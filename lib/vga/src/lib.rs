@@ -1622,11 +1622,11 @@ pub fn render(frame: &Frame, out: &mut [u32]) -> (usize, usize) {
 /// we report to the guest), so they assemble directly — a no-op recolour, i.e.
 /// the zero-copy-shaped path.
 fn render_svga(frame: &Frame, out: &mut [u32], w: usize, h: usize, bpp: u8, pitch: usize) {
-    let vram = frame.vram;
+    let vram = frame.linear();
     let bpp8 = (bpp as usize).div_ceil(8);
     let pitch = if pitch == 0 { w * bpp8 } else { pitch };
-    let rd16 = |p: usize| (vram.get(p).copied().unwrap_or(0) as u16)
-        | ((vram.get(p + 1).copied().unwrap_or(0) as u16) << 8);
+    let rd16 = |p: usize| (vram.get(p).unwrap_or(0) as u16)
+        | ((vram.get(p + 1).unwrap_or(0) as u16) << 8);
     for y in 0..h {
         let (start, _, row_index) = row_origin(frame, y);
         let base = start + row_index * pitch;
@@ -1636,7 +1636,7 @@ fn render_svga(frame: &Frame, out: &mut [u32], w: usize, h: usize, bpp: u8, pitc
             *px = match bpp {
                 8 => pal_rgb_width(
                     &frame.palette,
-                    vram.get(p).copied().unwrap_or(0) & frame.dac_mask,
+                    vram.get(p).unwrap_or(0) & frame.dac_mask,
                     true,
                 ),
                 15 => {
@@ -1654,9 +1654,9 @@ fn render_svga(frame: &Frame, out: &mut [u32], w: usize, h: usize, bpp: u8, pitc
                     ((r * 255 / 31) << 16) | ((g * 255 / 63) << 8) | (b * 255 / 31)
                 }
                 _ => {
-                    let b = vram.get(p).copied().unwrap_or(0) as u32;
-                    let g = vram.get(p + 1).copied().unwrap_or(0) as u32;
-                    let r = vram.get(p + 2).copied().unwrap_or(0) as u32;
+                    let b = vram.get(p).unwrap_or(0) as u32;
+                    let g = vram.get(p + 1).unwrap_or(0) as u32;
+                    let r = vram.get(p + 2).unwrap_or(0) as u32;
                     (r << 16) | (g << 8) | b
                 }
             };
@@ -1673,7 +1673,7 @@ fn render_svga(frame: &Frame, out: &mut [u32], w: usize, h: usize, bpp: u8, pitc
 /// visible width (320); a uniform horizontal shift,
 /// not a per-row shear, is what the offset produces.
 fn render_mode13(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
-    let vram = frame.vram;
+    let vram = frame.linear();
     for y in 0..h {
         let split = y >= frame.line_compare;
         let (start, pan, ry) = if split {
@@ -1686,7 +1686,7 @@ fn render_mode13(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
         for (x, px) in row.iter_mut().enumerate() {
             *px = pal_rgb(
                 &frame.palette,
-                vram.get((base + x) & (VGA_PLANE_BYTES - 1)).copied().unwrap_or(0) & frame.dac_mask,
+                vram.get((base + x) & (VGA_PLANE_BYTES - 1)).unwrap_or(0) & frame.dac_mask,
             );
         }
     }
@@ -1731,11 +1731,11 @@ fn render_cga4(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
         for x in 0..w {
             let address = bank + x / 4;
             let byte = if frame.vram.is_empty() {
-                frame.planes.get(frame.plane_layout.index(address & 1, address >> 1))
+                frame.planar().get(frame.plane_layout.index(address & 1, address >> 1))
             } else {
-                frame.vram.get(address)
+                frame.linear().get(address)
             };
-            let Some(&byte) = byte else { continue };
+            let Some(byte) = byte else { continue };
             let shift = 6 - (x & 3) * 2;
             let idx = (byte >> shift) & 0x03;
             out[y * w + x] = pal[idx as usize];
@@ -1753,11 +1753,11 @@ fn render_cga2(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
         for x in 0..w {
             let address = bank + x / 8;
             let byte = if frame.vram.is_empty() {
-                frame.planes.get(frame.plane_layout.index(0, address))
+                frame.planar().get(frame.plane_layout.index(0, address))
             } else {
-                frame.vram.get(address)
+                frame.linear().get(address)
             };
-            let Some(&byte) = byte else { continue };
+            let Some(byte) = byte else { continue };
             let on = byte & (0x80 >> (x & 7)) != 0;
             out[y * w + x] = if on { fg } else { bg };
         }
@@ -1809,7 +1809,7 @@ static SPREAD: [u32; 256] = {
 /// Planar 16-colour: assemble one bit from each of the 4 planes into a 4-bit
 /// pixel value. Pixel (x,y) → byte `y*row_bytes + x/8`, bit `7-(x&7)`.
 fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: usize) {
-    let planes = frame.planes;
+    let planes = frame.planar();
     let rb = if row_bytes == 0 { w / 8 } else { row_bytes };
     let colours: [u32; 16] =
         core::array::from_fn(|i| {
@@ -1841,10 +1841,10 @@ fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes
         let mut sbyte = pan / 8;
         while x < w {
             let off = (base + sbyte) & (VGA_PLANE_BYTES - 1);
-            let p0 = planes.get(frame.plane_layout.index(0, off)).copied().unwrap_or(0) as usize;
-            let p1 = planes.get(frame.plane_layout.index(1, off)).copied().unwrap_or(0) as usize;
-            let p2 = planes.get(frame.plane_layout.index(2, off)).copied().unwrap_or(0) as usize;
-            let p3 = planes.get(frame.plane_layout.index(3, off)).copied().unwrap_or(0) as usize;
+            let p0 = planes.get(frame.plane_layout.index(0, off)).unwrap_or(0) as usize;
+            let p1 = planes.get(frame.plane_layout.index(1, off)).unwrap_or(0) as usize;
+            let p2 = planes.get(frame.plane_layout.index(2, off)).unwrap_or(0) as usize;
+            let p3 = planes.get(frame.plane_layout.index(3, off)).unwrap_or(0) as usize;
             let pix = SPREAD[p0] | (SPREAD[p1] << 1) | (SPREAD[p2] << 2) | (SPREAD[p3] << 3);
             while bit < 8 && x < w {
                 row[x] = colours[((pix >> (4 * bit)) & 0xF) as usize];
@@ -1860,7 +1860,7 @@ fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes
 /// Unchained 256-colour (Mode X): pixel (x,y) is plane `x & 3`, byte
 /// `y*row_bytes + x/4`, value indexes the DAC directly.
 fn render_modex(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: usize) {
-    let planes = frame.planes;
+    let planes = frame.planar();
     let rb = if row_bytes == 0 { w / 4 } else { row_bytes };
     for y in 0..h {
         // Line Compare split: the lower region fetches from address 0.
@@ -1877,7 +1877,6 @@ fn render_modex(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: u
             let off = (start + ry * rb + sx / 4) & (VGA_PLANE_BYTES - 1);
             let idx = planes
                 .get(frame.plane_layout.index(plane, off))
-                .copied()
                 .unwrap_or(0);
             out[y * w + x] = pal_rgb(&frame.palette, idx & frame.dac_mask);
         }
@@ -1913,8 +1912,8 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
         return;
     }
     let (ch, attr) = if frame.vram.is_empty() {
-        let Some(&ch) = frame.planes.get(frame.plane_layout.index(0, cell / 2)) else { return };
-        let Some(&attr) = frame.planes.get(frame.plane_layout.index(1, cell / 2)) else { return };
+        let Some(ch) = frame.planar().get(frame.plane_layout.index(0, cell / 2)) else { return };
+        let Some(attr) = frame.planar().get(frame.plane_layout.index(1, cell / 2)) else { return };
         (ch as usize, attr)
     } else {
         let Some((&ch, &attr)) = frame.vram.get(cell).zip(frame.vram.get(cell + 1)) else { return };
@@ -1937,9 +1936,9 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
     let line_gfx = (0xC0..=0xDF).contains(&ch);
     for gy in 0..cell_h {
         let bits = if let Some(map) = font_map {
-            frame.planes.get(frame.plane_layout.index(
+            frame.planar().get(frame.plane_layout.index(
                 2, usize::from(map) * 0x2000 + ch * 32 + gy,
-            )).copied().unwrap_or(0)
+            )).unwrap_or(0)
         } else {
             compact_font.get(ch * cell_h + gy).copied().unwrap_or(0)
         };

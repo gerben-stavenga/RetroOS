@@ -40,7 +40,6 @@ pub fn current_core_id() -> u32 {
 }
 
 /// Caller-owned stacks and TLS; all addresses are linked virtual addresses.
-#[derive(Clone, Copy)]
 pub struct CoreStart {
     pub core_id: u32,
     pub stack_top: u32,
@@ -78,10 +77,13 @@ pub unsafe fn init_core(core_id: u32) {
         paging2::enable_paging(&raw mut crate::SCRATCH, paging2::KERNEL_PHYS, pages);
         (&raw const ARCH_STACK_TOP) as u32 - 16
     } else {
-        let start = unsafe { START.expect("AP missing startup context") };
-        crate::memory::bootstrap(start.memory);
+        let stack = unsafe {
+            let start = (&mut *(&raw mut START)).as_mut().expect("AP missing startup context");
+            crate::memory::bootstrap(&mut start.memory);
+            start.trap_stack_top
+        };
         paging2::init_secondary();
-        unsafe { START.expect("AP missing startup context").trap_stack_top }
+        stack
     };
     descriptors::setup_descriptor_tables(stack);
     descriptors::setup_syscall();
@@ -102,7 +104,7 @@ pub fn stack_return_addresses(mut frame: u32) -> impl Iterator<Item = u32> {
             (&raw const ARCH_STACK as u32)..(&raw const ARCH_STACK_TOP as u32),
         ]
     } else {
-        let start = unsafe { START.expect("AP missing startup context") };
+        let start = unsafe { (&*(&raw const START)).as_ref().expect("AP missing startup context") };
         [
             start.stack_top - 65536..start.stack_top,
             start.trap_stack_top - 16368..start.trap_stack_top + 16,
@@ -141,7 +143,7 @@ pub fn stack_return_addresses(mut frame: u32) -> impl Iterator<Item = u32> {
 /// `init_core` must have completed on this AP, with interrupts still disabled.
 pub unsafe fn run_secondary() -> ! {
     paging2::refresh_kernel_mappings();
-    let start = unsafe { START.expect("not a secondary core") };
+    let start = unsafe { (&*(&raw const START)).as_ref().expect("not a secondary core") };
     // The active GDT is now private TLS storage; the trampoline can be reused.
     start.ready.store(start.core_id, Ordering::Release);
     (start.entry)(start.core_id, start.argument)
@@ -160,6 +162,7 @@ pub enum StartError {
 /// Start a known, stopped processor using one reserved SIPI page below 1 MiB.
 /// `delay_us` must provide a calibrated, bounded delay without enabling IRQs.
 /// Returns after the AP has completed `init_core` and acknowledged its handoff.
+/// Validation failures leave the caller's page donation intact.
 ///
 /// # Safety
 /// Call after `init_core(0)` on the BSP at ring 0 with IRQs off, and serialize
@@ -180,7 +183,7 @@ pub enum StartError {
 pub unsafe fn start_core(
     apic_id: u32,
     page_phys: u32,
-    start: CoreStart,
+    start: &mut CoreStart,
     delay_us: fn(u32),
 ) -> Result<(), StartError> {
     if start.core_id == 0
@@ -237,9 +240,12 @@ pub unsafe fn start_core(
         let tp = start.tls.add((&raw const TLS_SIZE) as usize);
         tp.cast::<u32>().write(tp as u32);
         let offset = ((&raw const START) as usize).wrapping_sub(x86::thread_pointer() as usize);
+        let memory = arch_abi::page_supply::PageBootstrap::new(
+            start.memory.ownership, start.memory.take_pages(),
+        );
         tp.wrapping_add(offset)
             .cast::<Option<CoreStart>>()
-            .write(Some(start));
+            .write(Some(CoreStart { memory, ..*start }));
         let page = (paging2::LOW_MEM_BASE + page_phys as usize) as *mut u8;
         let len = (&raw const ap_trampoline_end) as usize - (&raw const ap_trampoline) as usize;
         assert!(len <= 0x800);

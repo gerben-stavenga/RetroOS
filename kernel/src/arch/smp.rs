@@ -123,7 +123,7 @@ pub(super) unsafe fn start(
     let own = x86::current_apic_id();
     let count = arch::acpi::processor_ids(rsdp, &mut ids)
         .filter(|&n| own.is_some_and(|id| ids[..n].contains(&id)));
-    let mut starts = [None; MAX_CPUS];
+    let mut starts = [const { None }; MAX_CPUS];
     let mut selected = 0;
     let can_start = if count.is_none() {
         lib::compact_screenln!(
@@ -190,7 +190,8 @@ pub(super) unsafe fn start(
         lib::compact_screenln!(screen, "SMP: AP TLS uses low BSS pool; stacks use resident heap");
     }
     let mut online = 1;
-    for &(id, start) in starts.iter().flatten() {
+    for (id, start) in starts.iter_mut().flatten() {
+        let id = *id;
         match unsafe { smp::start_core(id, page.unwrap(), start, delay) } {
             Ok(()) => {
                 online += 1;

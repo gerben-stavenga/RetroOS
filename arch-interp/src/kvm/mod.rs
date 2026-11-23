@@ -5,7 +5,7 @@ mod setup;
 #[cfg(test)] mod tests;
 pub use run::execute;
 pub(crate) use setup::kick;
-use arch_abi::{Memory, X86, GuestBytes, UserPage, MappingError, MappingFailure, page_entry::PageEntry, page_supply::PageInput, vm::{self, Exchange, op}};
+use arch_abi::{Memory, X86, GuestBytes, UserPage, MappingError, MappingFailure, page_supply::{OwnedPage, PageInput}, vm::{self, Exchange, op}};
 use crate::{backend::Interp, space::AddressSpace};
 
 pub(crate) fn supply_status() -> arch_abi::page_supply::SupplyStatus {
@@ -23,7 +23,7 @@ fn request<R>(operation: u64, args: [u64; 6], prepare: impl FnOnce(&mut Exchange
         let message = unsafe { &mut *cpu.message };
         message.operation = operation;
         message.args = args;
-        message.page_count = 0;
+        assert_eq!(message.page_count, 0, "unclaimed pages in exchange");
         prepare(message);
         run::until_return(cpu, false);
         finish(unsafe { &mut *cpu.message })
@@ -32,27 +32,62 @@ fn request<R>(operation: u64, args: [u64; 6], prepare: impl FnOnce(&mut Exchange
 fn empty(operation: u64) { request(operation, [0; 6], |_| {}, |_| {}); }
 fn root_operation(operation: u64, root: &mut AddressSpace, pages: PageInput) -> PageInput {
     let incoming = root.0;
-    request(operation, [0; 6], |m| { m.root = incoming; m.put_pages(pages); }, |m| { root.0 = m.root; m.take_pages() })
+    request(operation, [0; 6], |m| { m.root = incoming; m.put_pages(pages); }, |m| { root.0 = m.root; unsafe { m.take_pages() } })
 }
 fn batch_result(m: &Exchange) -> Result<(), MappingFailure> {
     m.mapping_status().map_err(|error| MappingFailure { error, completed: m.result[1] as usize })
 }
 impl Memory for Interp {
+
     type AddressSpace = AddressSpace;
-    fn activate(&mut self, mut root: AddressSpace) -> AddressSpace { root_operation(op::ACTIVATE, &mut root, PageInput::new()); root }
+    fn activate(&mut self, mut root: AddressSpace) -> AddressSpace {
+        assert!(root_operation(op::ACTIVATE, &mut root, PageInput::new()).is_empty());
+        root
+    }
     fn supply_pages(&self, pages: PageInput) -> (usize, PageInput) {
-        request(op::SUPPLY, [0; 6], |m| m.put_pages(pages), |m| (m.result[0] as usize, m.take_pages()))
+        request(op::SUPPLY, [0; 6], |m| m.put_pages(pages), |m| (m.result[0] as usize, unsafe { m.take_pages() }))
     }
     fn user_fork(&mut self, root: &mut AddressSpace, pages: PageInput) -> ((), PageInput) { ((), root_operation(op::FORK, root, pages)) }
     fn free_user_pages(&mut self) { empty(op::CLEAN); }
-    fn destroy_space(&mut self, root: &mut AddressSpace) { root_operation(op::DESTROY, root, PageInput::new()); }
+    fn destroy_space(&mut self, root: &mut AddressSpace) {
+        assert!(root_operation(op::DESTROY, root, PageInput::new()).is_empty());
+    }
     fn alias_mappings(&mut self, a: UserPage, b: UserPage, count: usize, pages: PageInput) -> (Result<(), MappingError>, PageInput) {
-        request(op::ALIAS, [a.address(), count as u64, b.address(), 0, 0, 0], |m| m.put_pages(pages), |m| (m.mapping_status(), m.take_pages()))
+        request(op::ALIAS, [a.address(), count as u64, b.address(), 0, 0, 0], |m| m.put_pages(pages), |m| (m.mapping_status(), unsafe { m.take_pages() }))
     }
     fn swap_mappings(&mut self, a: UserPage, b: UserPage, count: usize, pages: PageInput) -> (Result<(), MappingError>, PageInput) {
-        request(op::SWAP, [a.address(), count as u64, b.address(), 0, 0, 0], |m| m.put_pages(pages), |m| (m.mapping_status(), m.take_pages()))
+        request(op::SWAP, [a.address(), count as u64, b.address(), 0, 0, 0], |m| m.put_pages(pages), |m| (m.mapping_status(), unsafe { m.take_pages() }))
     }
-    fn read_mappings(&mut self, start: UserPage, entries: &mut [PageEntry]) -> Result<(), MappingFailure> {
+    fn edit_mappings(&mut self, start: UserPage, count: usize, operation: arch_abi::mapping::Edit,
+        pages: PageInput) -> (Result<(), MappingFailure>, PageInput) {
+        request(op::EDIT_MAPPINGS, [start.address(), count as u64, 0, 0, 0, 0],
+            |message| { message.put_edit(operation); message.put_pages(pages); },
+            |message| (batch_result(message), unsafe { message.take_pages() }))
+    }
+
+    fn replace_mappings(&mut self, start: UserPage, entries: &[arch_abi::mapping::Install<'_>], mut pages: PageInput) -> (Result<(), MappingFailure>, PageInput) {
+        if !entries.is_empty() {
+            if let Err(error) = start.offset(entries.len() - 1) { return (Err(MappingFailure { error, completed: 0 }), pages); }
+        }
+        for (chunk, entries) in entries.chunks(vm::MAPPINGS).enumerate() {
+            let base = chunk * vm::MAPPINGS;
+            let page = match start.offset(base) { Ok(page) => page, Err(error) => return (Err(MappingFailure { error, completed: base }), pages) };
+            let (result, unused) = request(op::REPLACE_MAPPINGS, [page.address(), entries.len() as u64, 0, 0, 0, 0],
+                |m| { m.entries[..entries.len()].copy_from_slice(arch_abi::mapping::Install::entries(entries)); m.put_pages(pages); },
+                |m| (batch_result(m), unsafe { m.take_pages() }));
+            pages = unused;
+            if let Err(mut error) = result { error.completed += base; return (Err(error), pages); }
+        }
+        (Ok(()), pages)
+    }
+    fn fill_mappings(&mut self, start: UserPage, count: usize, entry: arch_abi::mapping::Install<'_>, pages: PageInput) -> (Result<(), MappingFailure>, PageInput) {
+        request(op::FILL_MAPPINGS, [start.address(), count as u64, 0, 0, 0, 0], |m| { m.entries[0] = entry.entry(); m.put_pages(pages); }, |m| (batch_result(m), unsafe { m.take_pages() }))
+    }
+}
+
+#[cfg(test)]
+impl arch_abi::mapping::InspectMappings for Interp {
+    fn read_mappings(&mut self, start: UserPage, entries: &mut [arch_abi::page_entry::PageEntry]) -> Result<(), MappingFailure> {
         if !entries.is_empty() { start.offset(entries.len() - 1).map_err(|error| MappingFailure { error, completed: 0 })?; }
         for (chunk, entries) in entries.chunks_mut(vm::MAPPINGS).enumerate() {
             let base = chunk * vm::MAPPINGS;
@@ -66,26 +101,8 @@ impl Memory for Interp {
         }
         Ok(())
     }
-    fn read_mapping_run(&mut self, start: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError> {
+    fn read_mapping_run(&mut self, start: UserPage, maximum: usize) -> Result<(arch_abi::page_entry::PageEntry, usize), MappingError> {
         request(op::READ_RUN, [start.address(), maximum as u64, 0, 0, 0, 0], |_| {}, |m| m.mapping_status().map(|()| (m.entries[0], m.result[1] as usize)))
-    }
-    unsafe fn replace_mappings(&mut self, start: UserPage, entries: &[PageEntry], mut pages: PageInput) -> (Result<(), MappingFailure>, PageInput) {
-        if !entries.is_empty() {
-            if let Err(error) = start.offset(entries.len() - 1) { return (Err(MappingFailure { error, completed: 0 }), pages); }
-        }
-        for (chunk, entries) in entries.chunks(vm::MAPPINGS).enumerate() {
-            let base = chunk * vm::MAPPINGS;
-            let page = match start.offset(base) { Ok(page) => page, Err(error) => return (Err(MappingFailure { error, completed: base }), pages) };
-            let (result, unused) = request(op::REPLACE_MAPPINGS, [page.address(), entries.len() as u64, 0, 0, 0, 0],
-                |m| { m.entries[..entries.len()].copy_from_slice(entries); m.put_pages(pages); },
-                |m| (batch_result(m), m.take_pages()));
-            pages = unused;
-            if let Err(mut error) = result { error.completed += base; return (Err(error), pages); }
-        }
-        (Ok(()), pages)
-    }
-    unsafe fn fill_mappings(&mut self, start: UserPage, count: usize, entry: PageEntry, pages: PageInput) -> (Result<(), MappingFailure>, PageInput) {
-        request(op::FILL_MAPPINGS, [start.address(), count as u64, 0, 0, 0, 0], |m| { m.entries[0] = entry; m.put_pages(pages); }, |m| (batch_result(m), m.take_pages()))
     }
 }
 
@@ -213,6 +230,7 @@ impl<'a> PhysicalAccess<'a> {
     }
     fn take_page(&mut self) -> Option<u64> {
         match &mut self.pages { Some(pages) => pages.take(), None => self.cpu.reserve().take() }
+            .map(OwnedPage::into_number)
     }
     fn copy_page(&mut self, from: u64, to: u64) {
         unsafe { core::ptr::copy_nonoverlapping(self.cpu.frame(from), self.cpu.frame(to), 4096); }
@@ -329,8 +347,8 @@ fn descriptors_ready() {
     });
 }
 impl X86 for Interp {
-    unsafe fn install_trap_hook(&mut self, hook: Option<arch_abi::entry::TrapHook>) {
-        unsafe { setup::install_trap_hook(hook) }
+    fn install_trap_hook(&mut self, hook: Option<arch_abi::entry::RetainedTrapHook>) {
+        setup::install_trap_hook(hook);
     }
     fn isa_unmask_irq(&mut self, _: u8) { panic!("hosted has no physical ISA interrupt controller"); }
     fn set_debug_watch(&mut self, addresses: Option<(u32, u32)>) {
@@ -374,7 +392,8 @@ pub(crate) mod paging {
         let mut machine = crate::Interp::local();
         let mut old = machine.activate(crate::AddressSpace::empty());
         machine.destroy_space(&mut old);
-        let mut pages = arch_abi::page_supply::PageInput::new(); pages.push(storage);
-        machine.supply_pages(pages);
+        let mut pages = arch_abi::page_supply::PageInput::new();
+        pages.push(unsafe { arch_abi::page_supply::OwnedPage::from_number(storage) });
+        assert!(machine.supply_pages(pages).1.is_empty());
     }
 }

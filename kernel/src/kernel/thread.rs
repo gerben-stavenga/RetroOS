@@ -474,7 +474,7 @@ impl<A: crate::Core> Personality<A> {
         crate::kernel::dos::planar::uninstall(machine);
         if let Self::Dos(d) = self {
             d.pc.audio.lock().sb.sb_suspend(machine);
-            d.pc.vga.capture_address_space_vram(machine);
+            d.pc.vga.capture_address_space_vram();
         }
     }
 
@@ -1244,7 +1244,7 @@ pub fn exit_thread<A: crate::Core>(
         let child = &mut threads[tid];
         let Personality::Dos(child_dos) = &mut child.personality else { unreachable!() };
         let bios_video = crate::kernel::dos::BdaVideo::capture(machine);
-        let video = child_dos.pc.vga.release_for_parent_replace(machine);
+        let video = child_dos.pc.vga.release_for_parent_replace();
         assert!(exiting_display.is_none(), "unconsumed exiting display");
         *exiting_display = Some(crate::kernel::display::ExitDisplay::DosReplace { video, bios_video });
         if child_was_focused {

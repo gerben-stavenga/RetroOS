@@ -59,7 +59,7 @@ impl Binding {
         // sound-buffer setup and neighbouring guest accesses into UC traffic.
         crate::kernel::memory::reset(machine, vpage, pages);
         unsafe {
-            crate::kernel::memory::map_shared_pages(machine, vpage, base, pages);
+            crate::kernel::platform::map_shared_pages(machine, vpage, base, pages);
         }
         machine.copy_to((vpage * 4096) as u64, &saved);
         Some(Self { buffer, channel, guest, bytes, offset, vpage, pages })

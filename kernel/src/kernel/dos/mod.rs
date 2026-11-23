@@ -15,7 +15,8 @@
 
 extern crate alloc;
 use arch_abi::eflags;
-use alloc::vec::Vec;
+use alloc::{alloc::{Layout, handle_alloc_error}, boxed::Box, vec::Vec};
+use pinned_init::{InPlaceInit, init, init_array_from_fn, init_zeroed};
 
 /// Track whether we're currently running in a hardware IRQ context.
 pub(crate) static IN_HW_IRQ_CONTEXT: core::sync::atomic::AtomicBool =
@@ -303,58 +304,51 @@ pub(crate) fn fresh_ldt() -> alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]> {
 }
 
 impl<A: crate::Core> DosState<A> {
-    pub fn new_boxed(machine: &mut A, vga: DosVideo) -> alloc::boxed::Box<Self> {
+    pub fn new_boxed(machine: &mut A, vga: DosVideo) -> Box<Self> {
         let ldt = fresh_ldt();
-        // Allocate first and initialize fields at their final addresses. A
-        // conventional `Box::new(DosState { .. })` makes rustc materialize
-        // the complete 10 KiB value on the 64 KiB kernel stack before copying
-        // it to the heap. EXEC reaches this constructor through an already
-        // deep call chain, so that hidden temporary can hit the guard page.
-        let mut state = alloc::boxed::Box::<Self>::new_uninit();
-        let p = state.as_mut_ptr();
-        unsafe {
-            core::ptr::addr_of_mut!((*p).ipx).write(ipx::IpxState::new());
-            core::ptr::addr_of_mut!((*p).pc).write(machine::PcMachine::new_boxed(machine, vga));
-            core::ptr::addr_of_mut!((*p).dta).write(0);
-            core::ptr::addr_of_mut!((*p).heap_seg).write(0xA000);
-            core::ptr::addr_of_mut!((*p).heap_base_seg).write(0xA000);
-            core::ptr::addr_of_mut!((*p).alloc_strategy).write(0);
-            core::ptr::addr_of_mut!((*p).umb_link_state).write(0);
-            core::ptr::addr_of_mut!((*p).current_psp).write(dos::heap_start() + 0x10);
-            core::ptr::addr_of_mut!((*p).dos_pending_char).write(None);
-            core::ptr::addr_of_mut!((*p).int09_registers).write([0; 11]);
-            core::ptr::addr_of_mut!((*p).bios_keyboard).write(lib::keyboard::State::new());
-            core::ptr::addr_of_mut!((*p).last_child_exit_status).write(0);
-            core::ptr::addr_of_mut!((*p).last_dos_error).write(0);
-            core::ptr::addr_of_mut!((*p).exec_parent).write(None);
-            core::ptr::addr_of_mut!((*p).tsr_session).write(false);
-            core::ptr::addr_of_mut!((*p).cpu_pacer).write(cpu_pacing::CpuPacer::default());
-            core::ptr::addr_of_mut!((*p).cpu_limit_override).write(0);
-            core::ptr::addr_of_mut!((*p).xms).write(None);
-            core::ptr::addr_of_mut!((*p).ems).write(None);
-            core::ptr::addr_of_mut!((*p).memory).write(memory::DosMemory::new());
-            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).find_path), 0, 1);
-            core::ptr::addr_of_mut!((*p).find_path_len).write(0);
-            core::ptr::addr_of_mut!((*p).find_idx).write(0);
-            core::ptr::addr_of_mut!((*p).searches).write(core::array::from_fn(|_| DosSearch::new()));
-            core::ptr::addr_of_mut!((*p).search_next).write(0);
-            core::ptr::addr_of_mut!((*p).fcb_search_drive).write(0);
-            core::ptr::addr_of_mut!((*p).fcb_search_ext).write(false);
-            core::ptr::addr_of_mut!((*p).dfs).write(dfs::DfsState::new());
-            core::ptr::addr_of_mut!((*p).dos_blocks).write(alloc::vec::Vec::new());
-            core::ptr::addr_of_mut!((*p).ldt).write(ldt);
-            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).ldt_alloc), 0, 1);
-            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).pm_vectors), 0, 1);
-            core::ptr::addr_of_mut!((*p).dpmi_phys_next).write(dpmi::PHYS_MAP_TOP);
-            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).pm_rm_vector_shadow), 0, 1);
-            core::ptr::addr_of_mut!((*p).dpmi).write(None);
-            core::ptr::addr_of_mut!((*p).tf_sources).write(0);
-            core::ptr::addr_of_mut!((*p).pm_dos).write(false);
-            core::ptr::addr_of_mut!((*p).host_clock).write(None);
-            core::ptr::addr_of_mut!((*p).bios_clock).write(None);
-            core::ptr::addr_of_mut!((*p).suspended_calls).write(alloc::vec::Vec::new());
-            state.assume_init()
-        }
+        Box::init(init!(Self {
+            ipx: ipx::IpxState::new(),
+            pc: machine::PcMachine::new_boxed(machine, vga),
+            dta: 0,
+            heap_seg: 0xA000,
+            heap_base_seg: 0xA000,
+            alloc_strategy: 0,
+            umb_link_state: 0,
+            current_psp: dos::heap_start() + 0x10,
+            dos_pending_char: None,
+            int09_registers: [0; 11],
+            bios_keyboard: lib::keyboard::State::new(),
+            last_child_exit_status: 0,
+            last_dos_error: 0,
+            exec_parent: None,
+            tsr_session: false,
+            cpu_pacer: cpu_pacing::CpuPacer::default(),
+            cpu_limit_override: 0,
+            xms: None,
+            ems: None,
+            memory: memory::DosMemory::new(),
+            find_path <- init_zeroed(),
+            find_path_len: 0,
+            find_idx: 0,
+            searches <- init_array_from_fn(|_| DosSearch::new()),
+            search_next: 0,
+            fcb_search_drive: 0,
+            fcb_search_ext: false,
+            dfs: dfs::DfsState::new(),
+            dos_blocks: alloc::vec::Vec::new(),
+            ldt,
+            ldt_alloc <- init_zeroed(),
+            pm_vectors <- init_zeroed(),
+            dpmi_phys_next: dpmi::PHYS_MAP_TOP,
+            pm_rm_vector_shadow <- init_zeroed(),
+            dpmi: None,
+            tf_sources: 0,
+            pm_dos: false,
+            host_clock: None,
+            bios_clock: None,
+            suspended_calls: alloc::vec::Vec::new(),
+        }))
+        .unwrap_or_else(|_| handle_alloc_error(Layout::new::<Self>()))
     }
 
     /// Process a raw PS/2 scancode — queue as virtual keyboard IRQ.
@@ -374,7 +368,7 @@ impl<A: crate::Core> DosState<A> {
             // detached snapshot before the address space disappears. Normal
             // DOS return has already moved NativeVga directly and deliberately
             // skips this readback path.
-            self.pc.vga.capture_address_space_vram(machine);
+            self.pc.vga.capture_address_space_vram();
         }
         // Hand the single global ISA-DMA pool back; a dying thread that
         // armed SB DMA must not poison it for the next program.

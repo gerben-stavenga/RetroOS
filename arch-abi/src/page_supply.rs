@@ -233,6 +233,27 @@ impl FrameOwnership {
 
 }
 
+/// One transferable reference to a physical page. The frame number is
+/// public information; creating another owner requires proving ownership.
+#[must_use = "transfer or release the owned page"]
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct OwnedPage(core::num::NonZeroU64);
+
+impl OwnedPage {
+    /// # Safety
+    /// The caller transfers ownership of one live page reference. No other
+    /// token may represent that same reference.
+    pub unsafe fn from_number(number: u64) -> Self {
+        Self(core::num::NonZeroU64::new(number).expect("owned page zero"))
+    }
+
+    pub const fn number(&self) -> u64 { self.0.get() }
+
+    /// Transfer the reference through a frame-number interface.
+    pub const fn into_number(self) -> u64 { self.number() }
+}
+
 /// Fixed-width donated-page stack shared by the hosted arch and its supervisor.
 /// Access is exclusive to the owning CPU while it is stopped in the host.
 #[repr(C, align(8))]
@@ -243,14 +264,15 @@ pub struct PageReserve {
 impl PageReserve {
     pub const fn new() -> Self { Self { pages: [0; SUPPLY_CAPACITY], count: 0 } }
     pub fn len(&self) -> usize { self.count as usize }
-    pub fn take(&mut self) -> Option<u64> {
+    pub fn take(&mut self) -> Option<OwnedPage> {
         if self.count == 0 { return None; }
         self.count -= 1;
-        Some(self.pages[self.count as usize])
+        // Only donate() puts an owned reference in a live slot.
+        Some(unsafe { OwnedPage::from_number(self.pages[self.count as usize]) })
     }
-    pub fn donate(&mut self, page: u64) {
-        assert!(page != 0 && self.len() < SUPPLY_CAPACITY, "invalid frame donation");
-        self.pages[self.count as usize] = page;
+    pub fn donate(&mut self, page: OwnedPage) {
+        assert!(self.len() < SUPPLY_CAPACITY, "page reserve is full");
+        self.pages[self.count as usize] = page.into_number();
         self.count += 1;
     }
 }
@@ -275,29 +297,55 @@ impl PageSupply {
         returned_head: 0, returned_count: 0,
         fault_depth: 0, fault_pages_used: 0, fault_pages_current: 0,
         fault_pages_peak: 0, ownership: FrameOwnership::EMPTY } }
-    pub fn take(&mut self) -> Option<u64> { self.reserve.take() }
-    pub fn donate(&mut self, page: u64) { self.reserve.donate(page); }
+    pub fn take(&mut self) -> Option<OwnedPage> { self.reserve.take() }
+    pub fn donate(&mut self, page: OwnedPage) { self.reserve.donate(page); }
 }
 impl Default for PageSupply { fn default() -> Self { Self::new() } }
 
 /// Initial AP donation, prepared by the BSP before the AP can fault.
-#[derive(Clone, Copy)]
 pub struct PageBootstrap {
     pub ownership: FrameOwnership,
-    pub pages: [u64; FAULT_PAGES],
+    pages: Option<[OwnedPage; FAULT_PAGES]>,
+}
+
+impl PageBootstrap {
+    pub fn new(ownership: FrameOwnership, pages: [OwnedPage; FAULT_PAGES]) -> Self {
+        Self { ownership, pages: Some(pages) }
+    }
+
+    pub fn take_pages(&mut self) -> [OwnedPage; FAULT_PAGES] {
+        self.pages.take().expect("AP reserve already donated")
+    }
 }
 
 /// Explicitly owned backing pages for one kernel-to-arch mapping operation.
-pub struct PageInput { pub pages: [u64; SUPPLY_CAPACITY], pub count: usize }
+pub struct PageInput { pages: [u64; SUPPLY_CAPACITY], count: usize }
 impl PageInput {
-    pub fn push(&mut self, page: u64) {
-        assert!(page != 0 && self.count < SUPPLY_CAPACITY);
-        self.pages[self.count] = page;
+    pub fn push(&mut self, page: OwnedPage) {
+        assert!(self.count < SUPPLY_CAPACITY, "page batch is full");
+        self.pages[self.count] = page.into_number();
         self.count += 1;
     }
     pub const fn new() -> Self { Self { pages: [0; SUPPLY_CAPACITY], count: 0 } }
-    pub fn take(&mut self) -> Option<u64> {
-        if self.count == 0 { None } else { self.count -= 1; Some(self.pages[self.count]) }
+    pub fn take(&mut self) -> Option<OwnedPage> {
+        if self.count == 0 { return None; }
+        self.count -= 1;
+        // push() or the wire handoff transferred this reference into the batch.
+        Some(unsafe { OwnedPage::from_number(self.pages[self.count]) })
+    }
+    pub const fn len(&self) -> usize { self.count }
+    pub const fn is_empty(&self) -> bool { self.count == 0 }
+    pub fn numbers(&self) -> &[u64] { &self.pages[..self.count] }
+
+    pub(crate) fn into_raw_parts(self) -> ([u64; SUPPLY_CAPACITY], usize) {
+        (self.pages, self.count)
+    }
+
+    /// # Safety
+    /// The first `count` entries must each transfer one owned reference.
+    pub(crate) unsafe fn from_raw_parts(pages: [u64; SUPPLY_CAPACITY], count: usize) -> Self {
+        assert!(count <= SUPPLY_CAPACITY);
+        Self { pages, count }
     }
 }
 impl Default for PageInput { fn default() -> Self { Self::new() } }

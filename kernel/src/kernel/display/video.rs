@@ -63,9 +63,10 @@ pub(super) struct Video {
 }
 impl Video {
     fn new(fb: Framebuffer, format: PixelFormat) -> Self {
+        let canvas = (fb.width, fb.height);
         Self { fb, format, device: None, device_epoch: 0, device_ready: None, presented: Vec::new(), owner: None, voodoo: None, scanout: Scanout::new_boxed(),
-            scene: None, composed: Vec::new(), row: alloc::vec![0; fb.width * usize::from(format.bytes_per_pixel)],
-            canvas: (fb.width, fb.height), last_output: None, announced: false, next_present_ns: 0 }
+            scene: None, composed: Vec::new(), row: alloc::vec![0; canvas.0 * usize::from(format.bytes_per_pixel)],
+            canvas, last_output: None, announced: false, next_present_ns: 0 }
     }
     pub(super) fn invalidate(&mut self) {
         self.last_output = None;
@@ -200,7 +201,7 @@ impl Display {
         if let Some(service) = &self.video { service.pause(); }
     }
     fn video_service(&mut self) -> Option<&media::VideoService<Video>> {
-        let fb = *self.framebuffer()?;
+        let fb = self.framebuffer()?.clone();
         // Retire the earlier one-shot presenter before transferring its sink.
         if let Some(work) = self.presentation.take() { drop(work); }
         if self.video.is_none() {
@@ -306,14 +307,14 @@ mod tests {
 
     #[test]
     fn terminal_handoff_renders_after_outgoing_vga_epoch_stops() {
-        let mut pixels = alloc::vec![0u32; 8];
-        let mut video = Video::new(Framebuffer {
-            va: pixels.as_mut_ptr() as usize, pitch: 16, width: 4, height: 2,
-            slow: false, wide: false,
-        }, PixelFormat::NATIVE);
+        let (framebuffer, pixels) = super::super::tests::test_framebuffer(4, 2, 16, 0, 0);
+        let mut video = Video::new(framebuffer, PixelFormat::NATIVE);
+        let displayed = || pixels.iter().map(|byte| byte.load(core::sync::atomic::Ordering::Relaxed))
+            .collect::<alloc::vec::Vec<_>>();
         let dos = crate::kernel::bios_display::EmulatedVga::initial_mode3();
-        let mut planes = alloc::vec![0u8; 4 * 65536];
-        let memory = unsafe { vga::memory::Memory::mapped(planes.as_mut_ptr(), planes.len()) };
+        static PLANES: [core::sync::atomic::AtomicU8; 4 * 65536] =
+            [const { core::sync::atomic::AtomicU8::new(0) }; 4 * 65536];
+        let memory = vga::memory::Memory::from_bytes(&PLANES);
         video.device = Some(vga::scanout::Scanout::new(&dos.state, memory, video.format, 0));
         video.device_epoch = crate::kernel::dos::scanout_epoch().wrapping_sub(1);
         video.owner = Some(gui::EndpointId(1));
@@ -331,14 +332,14 @@ mod tests {
             video.owner, video.format);
         video.composed.resize(32, 0);
         video.render();
-        assert!(pixels.iter().all(|&pixel| pixel == 0));
+        assert_eq!(displayed(), [0; 32]);
         // A completed VGA frame has swapped its back buffer into presented.
         // Its geometry may survive even when the replacement buffer is empty.
         video.scanout.geo = (4, 2, 4, 2, 4, 2);
         assert!(video.scanout.surface().is_none());
         video.retire_dos_scanout();
         video.render();
-        assert!(pixels.iter().all(|&pixel| pixel == 0x0000ff00));
+        assert_eq!(displayed(), green);
 
         // A later terminal frame uses only the compositor's retained pixels.
         let blue = [0x000000ffu32.to_le_bytes(); 8].concat();
@@ -347,6 +348,6 @@ mod tests {
             |_, _| gui::PixelBuffer::new(4, 2, 16, video.format, &blue).ok(),
             video.owner, video.format);
         video.render();
-        assert!(pixels.iter().all(|&pixel| pixel == 0x000000ff));
+        assert_eq!(displayed(), blue);
     }
 }

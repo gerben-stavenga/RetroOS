@@ -9,7 +9,11 @@
 //! Pixels may occupy 2, 3, or 4 bytes. Channel layout and width are consumed
 //! when the 256-entry palette is built, not in the per-pixel VGA decoder.
 
+#![forbid(unsafe_code)]
+
 mod video;
+use alloc::{alloc::{Layout, handle_alloc_error}, boxed::Box};
+use pinned_init::{InPlaceInit, init, init_zeroed};
 pub use vga::PixelFormat;
 
 /// Runtime policy for standalone DOS framebuffer images. Native desktop
@@ -66,10 +70,10 @@ impl compact_fmt::Format for FormatSpec {
 
 /// Kernel mapping of physical framebuffer storage. The VGA library never sees
 /// this address or the mapping/publication policy attached to it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 pub struct Framebuffer {
-    /// Kernel-virtual address of pixel (0,0).
-    pub va: usize,
+    /// Bounded storage beginning at pixel (0,0).
+    pub(crate) storage: crate::kernel::drivers::vga_hw::FramebufferMemory,
     /// Bytes per device row (the pitch, which may exceed width × pixel size).
     pub pitch: usize,
     pub width: usize,
@@ -77,8 +81,6 @@ pub struct Framebuffer {
     /// Full-frame writes are unusually expensive (QEMU-TCG's strong-UC GOP
     /// mapping), so emulated VGA should use a conservative refresh cadence.
     pub slow: bool,
-    /// Select the measured wide-store path for real WC apertures.
-    pub wide: bool,
 }
 
 /// Dense packed pixels plus the reusable row for optional horizontal scaling.
@@ -284,13 +286,13 @@ impl Display {
     fn queue_presentation(&mut self, width: usize, height: usize, pixels: &[u8], output: (usize, usize), regions: Option<&[crate::kernel::gui::Rect]>) -> Option<usize> {
         if !crate::kernel::media::enabled() { return None; }
         if let Some(video) = &self.video { video.pause(); }
-        let fb = *self.framebuffer()?;
+        let fb = self.framebuffer()?.clone();
         let bytes = width.checked_mul(height)?.checked_mul(usize::from(self.rgb.bytes_per_pixel))?;
         if width == 0 || height == 0 || pixels.len() < bytes { return Some(0); }
         let clear = self.last_packed_output != Some(output);
         self.last_packed_output = Some(output);
         let work = self.presentation.get_or_insert_with(|| crate::kernel::media::Graphics::new(Presentation {
-            fb, format: self.rgb, width, height, output, pixels: alloc::vec::Vec::new(),
+            fb: fb.clone(), format: self.rgb, width, height, output, pixels: alloc::vec::Vec::new(),
             row: alloc::vec::Vec::new(), clear, regions: alloc::vec::Vec::new(), partial: false,
         }));
         let frame = work.get_mut();
@@ -392,6 +394,7 @@ impl Display {
         state.dac.write(vga::palette_rgb332());
         state.planes.resize(4 * 0x10000, 0);
         crate::kernel::drivers::vga_hw::restore(&native, &state);
+        let storage = crate::kernel::drivers::vga_hw::mode13_framebuffer(&native);
         Self {
             shadow_width: 320,
             rgb: PixelFormat::RGB332,
@@ -405,12 +408,11 @@ impl Display {
                 native,
                 scanout: VgaScanout::Mode13 {
                     framebuffer: Framebuffer {
-                    va: crate::LOW_MEM_BASE + 0xA0000,
+                    storage,
                     pitch: 320,
                     width: 320,
                     height: 200,
                     slow: false,
-                    wide: false,
                 },
                     saved,
                 },
@@ -430,19 +432,16 @@ impl Display {
     ) -> Self {
         native.bios_set_mode(machine, bios, mode.number);
         let policy = crate::kernel::platform::framebuffer_map_policy();
-        crate::kernel::platform::map_kernel_physical(
-            arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE,
-            pages,
-            u64::from(mode.physical_base) / crate::PAGE_SIZE as u64,
-            policy.flags,
+        let storage = crate::kernel::drivers::vga_hw::map_linear_framebuffer(
+            &native, mode.physical_base, offset, pages,
+            usize::from(mode.pitch) * usize::from(mode.height), policy,
         );
         let framebuffer = Framebuffer {
-            va: arch_abi::FB_WINDOW_BASE + offset,
+            storage,
             pitch: usize::from(mode.pitch),
             width: usize::from(mode.width),
             height: usize::from(mode.height),
             slow: policy.slow,
-            wide: policy.wide,
         };
         let (shadow_width, _) = fit_vga(framebuffer.width, framebuffer.height);
         crate::compact_println!("Display: VBE {}x{}x{} mode={:#x}",
@@ -657,7 +656,7 @@ impl Display {
         let Some(fb) = self.framebuffer() else { return };
         let row_bytes = fb.width * usize::from(self.rgb.bytes_per_pixel);
         for y in 0..fb.height {
-            unsafe { core::ptr::write_bytes((fb.va + y * fb.pitch) as *mut u8, 0, row_bytes); }
+            fb.storage.clear(y * fb.pitch, row_bytes);
         }
     }
     fn fit(&self) -> (usize, usize) {
@@ -945,58 +944,6 @@ pub fn finish_present() {
 /// caller keeps `wide` off there. This deliberately does not fence each row:
 /// the caller's single end-of-frame [`present`] drains the whole blit.
 ///
-/// # Safety
-/// Both pointers must be valid for `len` bytes and must not overlap. The
-/// destination must support dword stores (and SSE stores when `wide` is set).
-#[inline]
-#[optimize(speed)]
-pub(crate) unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
-    let mut d = dst;
-    let mut s = src;
-    let mut left = len;
-
-    // The wide assembly advances in dwords while aligning to 16, so feed it an
-    // already-aligned destination: packed 16/24-bit pitches need byte heads.
-    if wide {
-        while left != 0 && d as usize & 15 != 0 {
-            unsafe { *d = *s };
-            d = unsafe { d.add(1) };
-            s = unsafe { s.add(1) };
-            left -= 1;
-        }
-    }
-    let dwords = left / 4;
-    #[cfg(target_arch = "x86")]
-    unsafe {
-        if wide && dwords != 0 {
-            retroos_fb_copy32_wide(d as *mut u32, s as *const u32, dwords);
-        } else {
-            retroos_fb_copy32(d as *mut u32, s as *const u32, dwords);
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let _ = wide; // 64-bit metal: measure before adding the SSE path
-        core::arch::asm!(
-            "rep movsd",
-            inout("rcx") dwords => _,
-            inout("rsi") s => _,
-            inout("rdi") d => _,
-            options(nostack)
-        );
-    }
-    let done = dwords * 4;
-    d = unsafe { d.add(done) };
-    s = unsafe { s.add(done) };
-    left -= done;
-    while left != 0 {
-        unsafe { *d = *s };
-        d = unsafe { d.add(1) };
-        s = unsafe { s.add(1) };
-        left -= 1;
-    }
-}
-
 /// Scale already-encoded packed pixels, without colour conversion. Equal
 /// widths are a row copy. RGB888 uses overlapping dwords only where both
 /// slices have room; the last pixel is always bounded to three bytes.
@@ -1069,7 +1016,7 @@ fn blit(
     let bx = (fb.width - out_w) / 2;
     let by = (fb.height - out_h) / 2;
     let (ybase, yrem) = (out_h / vga_height, out_h % vga_height);
-    let origin = fb.va + by * fb.pitch + bx * step;
+    let origin = by * fb.pitch + bx * step;
 
     let mut oy = 0usize;
     let mut yerr = 0usize;
@@ -1078,11 +1025,9 @@ fn blit(
         let carry = (yerr >= vga_height) as usize;
         let rows = ybase + carry;
         yerr -= carry * vga_height;
-        let src = shadow[sy * row_bytes..(sy + 1) * row_bytes].as_ptr();
+        let src = &shadow[sy * row_bytes..(sy + 1) * row_bytes];
         for _ in 0..rows {
-            unsafe {
-                copy_bytes((origin + oy * fb.pitch) as *mut u8, src, row_bytes, fb.wide);
-            }
+            fb.storage.write(origin + oy * fb.pitch, src);
             oy += 1;
         }
     }
@@ -1103,15 +1048,12 @@ fn clear_packed_bars_cooperative(fb: &Framebuffer, format: PixelFormat, output: 
     let by = (fb.height - out_h) / 2;
     for y in 0..fb.height {
         cooperate();
-        let row = fb.va + y * fb.pitch;
-        unsafe {
-            if y < by || y >= by + out_h {
-                core::ptr::write_bytes(row as *mut u8, 0, fb.width * step);
-            } else {
-                core::ptr::write_bytes(row as *mut u8, 0, bx * step);
-                core::ptr::write_bytes((row + (bx + out_w) * step) as *mut u8, 0,
-                    (fb.width - bx - out_w) * step);
-            }
+        let row = y * fb.pitch;
+        if y < by || y >= by + out_h {
+            fb.storage.clear(row, fb.width * step);
+        } else {
+            fb.storage.clear(row, bx * step);
+            fb.storage.clear(row + (bx + out_w) * step, (fb.width - bx - out_w) * step);
         }
     }
 }
@@ -1142,12 +1084,12 @@ fn blit_packed_cooperative(
     let bx = (fb.width - out_w) / 2;
     let by = (fb.height - out_h) / 2;
     let (ybase, yrem) = (out_h / source_h, out_h % source_h);
-    let origin = fb.va + by * fb.pitch + bx * step;
+    let origin = by * fb.pitch + bx * step;
     if source_w == out_w && source_h == out_h && row_bytes == fb.pitch {
         // A dense mode-sized canvas is already the framebuffer's byte layout.
         for (i, chunk) in source[..row_bytes * out_h].chunks(16384).enumerate() {
             cooperate();
-            unsafe { copy_bytes((origin + i * 16384) as *mut u8, chunk.as_ptr(), chunk.len(), fb.wide); }
+            fb.storage.write(origin + i * 16384, chunk);
         }
         return out_w * out_h;
     }
@@ -1167,14 +1109,7 @@ fn blit_packed_cooperative(
         let rows = ybase + carry;
         yerr -= carry * source_h;
         for _ in 0..rows {
-            unsafe {
-                copy_bytes(
-                    (origin + oy * fb.pitch) as *mut u8,
-                    src.as_ptr(),
-                    row_bytes,
-                    fb.wide,
-                );
-            }
+            fb.storage.write(origin + oy * fb.pitch, src);
             oy += 1;
         }
     }
@@ -1207,7 +1142,7 @@ fn blit_regions_cooperative(
     let bx = (fb.width - out_w) / 2;
     let by = (fb.height - out_h) / 2;
     let (ybase, yrem) = (out_h / vga_height, out_h % vga_height);
-    let origin = fb.va + by * fb.pitch + bx * step;
+    let origin = by * fb.pitch + bx * step;
     let mut copied = 0usize;
     let mut oy = 0usize;
     let mut yerr = 0usize;
@@ -1227,16 +1162,10 @@ fn blit_regions_cooperative(
                 .clamp(0, out_w as i64) as usize;
             if left >= right { continue; }
             let bytes = (right - left) * step;
-            let src = shadow[sy * row_bytes + left * step..].as_ptr();
+            let start = sy * row_bytes + left * step;
+            let src = &shadow[start..start + bytes];
             for row in 0..rows {
-                unsafe {
-                    copy_bytes(
-                        (origin + (oy + row) * fb.pitch + left * step) as *mut u8,
-                        src,
-                        bytes,
-                        fb.wide,
-                    );
-                }
+                fb.storage.write(origin + (oy + row) * fb.pitch + left * step, src);
                 copied += right - left;
             }
         }
@@ -1449,25 +1378,21 @@ impl Scanout {
         }
     }
 
-    /// Allocate the scanout scratch without ever materializing its large
-    /// palette arrays as a return-value temporary on the kernel stack.
-    pub fn new_boxed() -> alloc::boxed::Box<Scanout> {
-        let mut boxed = alloc::boxed::Box::<Scanout>::new_uninit();
-        let p = boxed.as_mut_ptr();
-        unsafe {
-            core::ptr::addr_of_mut!((*p).pal).write(vga::Pal::new());
-            core::ptr::addr_of_mut!((*p).pal_cache).write([0; 768]);
-            core::ptr::addr_of_mut!((*p).surface).write(alloc::vec::Vec::new());
-            core::ptr::addr_of_mut!((*p).geo).write((0, 0, 0, 0, 0, 0));
-            core::ptr::addr_of_mut!((*p).mode).write(None);
-            core::ptr::addr_of_mut!((*p).phase).write(0);
-            core::ptr::addr_of_mut!((*p).refresh_hz).write(0);
-            core::ptr::addr_of_mut!((*p).raster_hz).write(0);
-            core::ptr::addr_of_mut!((*p).frame).write(0);
-            core::ptr::addr_of_mut!((*p).ready).write(false);
-            core::ptr::addr_of_mut!((*p).last_tick).write(0);
-            boxed.assume_init()
-        }
+    pub fn new_boxed() -> Box<Self> {
+        Box::init(init!(Self {
+            pal: vga::Pal::new(),
+            pal_cache <- init_zeroed(),
+            surface: alloc::vec::Vec::new(),
+            geo: (0, 0, 0, 0, 0, 0),
+            mode: None,
+            phase: 0,
+            refresh_hz: 0,
+            raster_hz: 0,
+            frame: 0,
+            ready: false,
+            last_tick: 0,
+        }))
+        .unwrap_or_else(|_| handle_alloc_error(Layout::new::<Self>()))
     }
 
     /// Immutable view of tightly packed display-format VGA pixels.
@@ -1505,76 +1430,6 @@ impl Scanout {
         self.surface.get_mut(..storage)
     }
 }
-
-#[cfg(target_arch = "x86")]
-core::arch::global_asm!(
-    r#"
-    .global retroos_fb_copy32
-    .type retroos_fb_copy32, @function
-retroos_fb_copy32:
-    push esi
-    push edi
-    mov edi, dword ptr [esp + 12]
-    mov esi, dword ptr [esp + 16]
-    mov ecx, dword ptr [esp + 20]
-    cld
-    rep movsd
-    pop edi
-    pop esi
-    ret
-    .size retroos_fb_copy32, .-retroos_fb_copy32
-
-    .global retroos_fb_copy32_wide
-    .type retroos_fb_copy32_wide, @function
-    /* Wide device-row copy: 16-byte non-temporal stores to the WC
-     * framebuffer — four times fewer store instructions than rep movsd.
-     * The kernel swaps FPU/SSE state only at thread switch, so the guest's
-     * live XMM registers are resident here: xmm0 is spilled around the
-     * copy. Head loop aligns the destination to 16 (movntdq requires it);
-     * the one end-of-frame present sfence drains all row copies together. */
-retroos_fb_copy32_wide:
-    push esi
-    push edi
-    mov edi, dword ptr [esp + 12]
-    mov esi, dword ptr [esp + 16]
-    mov ecx, dword ptr [esp + 20]
-    cld
-    sub esp, 16
-    movdqu [esp], xmm0
-1:  test edi, 15
-    jz 2f
-    test ecx, ecx
-    jz 4f
-    movsd
-    dec ecx
-    jmp 1b
-2:  mov eax, ecx
-    shr eax, 2
-    jz 4f
-    and ecx, 3
-3:  movdqu xmm0, [esi]
-    movntdq [edi], xmm0
-    add esi, 16
-    add edi, 16
-    dec eax
-    jnz 3b
-4:  rep movsd
-    movdqu xmm0, [esp]
-    add esp, 16
-    pop edi
-    pop esi
-    ret
-    .size retroos_fb_copy32_wide, .-retroos_fb_copy32_wide
-"#
-);
-
-#[cfg(target_arch = "x86")]
-unsafe extern "C" {
-    fn retroos_fb_copy32(dst: *mut u32, src: *const u32, len: usize);
-    fn retroos_fb_copy32_wide(dst: *mut u32, src: *const u32, len: usize);
-}
-
-
 
 const BEAM_STEPS: u64 = 449;
 const VRETRACE_STEPS: usize = 49;
@@ -1870,15 +1725,25 @@ mod tests {
         }
     }
 
+    pub(super) fn test_framebuffer(
+        width: usize, height: usize, pitch: usize, guard: usize, fill: u8,
+    ) -> (Framebuffer, alloc::sync::Arc<[core::sync::atomic::AtomicU8]>) {
+        let len = pitch * height;
+        let output: alloc::sync::Arc<[_]> = (0..len + 2 * guard)
+            .map(|_| core::sync::atomic::AtomicU8::new(fill)).collect();
+        let storage = crate::kernel::drivers::vga_hw::FramebufferMemory::test(output.clone(), guard, len);
+        (Framebuffer { storage, pitch, width, height, slow: false }, output)
+    }
+
+    fn snapshot(output: &[core::sync::atomic::AtomicU8]) -> alloc::vec::Vec<u8> {
+        output.iter().map(|byte| byte.load(core::sync::atomic::Ordering::Relaxed)).collect()
+    }
+
     #[test]
     fn switching_scaling_clears_borders_and_keeps_uniform_pixel_blocks() {
         let format = PixelFormat::RGB332;
         let (width, height, pitch) = (19, 12, 23);
-        let mut output = alloc::vec![0xEE; pitch * height + 2];
-        let framebuffer = Framebuffer {
-            va: output.as_mut_ptr() as usize + 1, pitch, width, height,
-            slow: false, wide: false,
-        };
+        let (framebuffer, output) = test_framebuffer(width, height, pitch, 1, 0xEE);
         let source: alloc::vec::Vec<u8> = (1..=16).collect();
         let mut row = alloc::vec::Vec::new();
         for mode in [DosScaling::FillScreen, DosScaling::SharpPixels,
@@ -1887,6 +1752,9 @@ mod tests {
             clear_packed_bars(&framebuffer, format, size);
             assert_eq!(blit_packed(&framebuffer, format, size,
                 PackedSource { width: 4, height: 4, pixels: &source, row: &mut row }), size.0 * size.1);
+            let output = snapshot(&output);
+            assert_eq!(output[0], 0xEE);
+            assert_eq!(*output.last().unwrap(), 0xEE);
             let (bx, by) = ((width - size.0) / 2, (height - size.1) / 2);
             for y in 0..height {
                 for x in 0..width {
@@ -1898,16 +1766,13 @@ mod tests {
                 assert!(output[1 + y * pitch + width..1 + (y + 1) * pitch].iter().all(|&v| v == 0xEE));
             }
         }
-        assert_eq!(output[0], 0xEE);
-        assert_eq!(*output.last().unwrap(), 0xEE);
     }
 
     #[test]
     fn desktop_canvas_uses_mode_dimensions_not_window_extents() {
         for (width, height) in [(800, 600), (1280, 720), (320, 200)] {
-            let display = Display::from_framebuffer(Framebuffer {
-                va: 0, pitch: width * 2, width, height, slow: false, wide: false,
-            }, PixelFormat::RGB565);
+            let (framebuffer, _) = test_framebuffer(width, height, width * 2, 0, 0);
+            let display = Display::from_framebuffer(framebuffer, PixelFormat::RGB565);
             for extent in [(0, 0), (320, 200), (720, 400), (1920, 1080)] {
                 assert_eq!(display.composition_size(extent.0, extent.1), (width, height));
             }
@@ -1929,11 +1794,7 @@ mod tests {
                 let height = 3;
                 for padding in [0, 4] {
                     let pitch = width * step + padding;
-                    let mut output = alloc::vec![0xAAu8; pitch * height + 2];
-                    let framebuffer = Framebuffer {
-                        va: output.as_mut_ptr() as usize + 1, pitch, width, height,
-                        slow: false, wide: false,
-                    };
+                    let (framebuffer, output) = test_framebuffer(width, height, pitch, 1, 0xAA);
                     let pixels: alloc::vec::Vec<u8> = (0..width * height * step)
                         .map(|i| (i * 19 + 7) as u8).collect();
                     let mut row = alloc::vec::Vec::new();
@@ -1941,6 +1802,7 @@ mod tests {
                         native_output_size(width, height, width, height),
                         PackedSource { width, height, pixels: &pixels, row: &mut row }), width * height);
                     assert!(row.is_empty(), "unscaled presentation must not allocate a staging row");
+                    let output = snapshot(&output);
                     for y in 0..height {
                         assert_eq!(&output[1 + y * pitch..1 + y * pitch + width * step],
                             &pixels[y * width * step..(y + 1) * width * step]);
@@ -2020,15 +1882,7 @@ mod tests {
 
     #[test]
     fn regional_blit_leaves_clean_pixels_untouched() {
-        let mut output = alloc::vec![0xAAu8; 4 * 2 * 2];
-        let framebuffer = Framebuffer {
-            va: output.as_mut_ptr() as usize,
-            pitch: 4 * 2,
-            width: 4,
-            height: 2,
-            slow: false,
-            wide: false,
-        };
+        let (framebuffer, output) = test_framebuffer(4, 2, 8, 0, 0xAA);
         let shadow: alloc::vec::Vec<u8> = (0..16u8).collect();
         assert_eq!(
             blit_regions(
@@ -2042,6 +1896,7 @@ mod tests {
             ),
             2,
         );
+        let output = snapshot(&output);
         assert_eq!(&output[..2], &[0xAA, 0xAA]);
         assert_eq!(&output[2..6], &shadow[2..6]);
         assert!(output[6..].iter().all(|&byte| byte == 0xAA));

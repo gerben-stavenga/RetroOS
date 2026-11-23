@@ -52,6 +52,7 @@ pub(crate) fn set_execute_regs(regs: *mut Regs) {
 /// Core call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
 pub mod arch_call {
     pub const INSTALL_TRAP_HOOK: u64 = 0x134;
+    pub const EDIT_MAPPINGS: u64 = 0x135;
     pub const REARRANGE_MAPPINGS: u64 = 0x133;
     pub const READ_MAPPINGS: u64 = 0x12E;
     pub const REPLACE_MAPPINGS: u64 = 0x12F;
@@ -175,6 +176,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
 pub(crate) fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
     match regs.rax {
         arch_call::REARRANGE_MAPPINGS => crate::mapping::rearrange_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Rearrange) }),
+        arch_call::EDIT_MAPPINGS => crate::mapping::edit_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Edit) }),
         arch_call::READ_MAPPINGS => crate::mapping::read_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Read) }),
         arch_call::REPLACE_MAPPINGS => crate::mapping::replace_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Replace) }),
         arch_call::FILL_MAPPINGS => crate::mapping::fill_mappings(unsafe { &mut *(regs.rdx as *mut crate::mapping::Fill) }),

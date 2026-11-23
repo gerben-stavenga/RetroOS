@@ -85,98 +85,20 @@ fn scanout<'a, A: crate::Core>(
     svga_start: usize, autonomous: bool,
 ) -> Option<::vga::Frame<'a>>
 {
-    use ::vga::{Frame, VgaMode};
-    // Both VGA programming models scan out of the one kernel-owned live store.
-    // Guest LFB and bank windows are aliases of these pages, so no capture copy
-    // is needed before rendering.
+    let live = super::machine::vga::live_memory();
     if let Some(svga) = state.svga() {
-        let size = svga.visible_frame_bytes();
-        let live = super::machine::vga::live_vram(machine);
-        let end = svga_start.checked_add(size)?;
-        // The status-bar split restarts at VRAM zero, independently of the
-        // scrolled viewport. Keep both origins available to the row decoder.
-        let vram = live.get(..end)?;
-        return Some(Frame {
-            memory: None,
-            plane_layout: ::vga::VramLayout::PlaneMinor,
-            mode: VgaMode::LinearSvga {
-                w: svga.config.width,
-                h: svga.config.height,
-                bpp: svga.config.bits_per_pixel,
-                pitch: svga.logical_pitch.get(),
-            },
-            vram,
-            planes: &[],
-            ac: [0; 21],
-            palette: svga.palette.rgb.read(),
-            dac_mask: svga.palette.mask(),
-            font: &lib::vga_fonts::FONT_8X16,
-            font_b: &lib::vga_fonts::FONT_8X16,
-            font_maps: None,
-            blink: false, text_cursor: None,
-            cga_palette: [0; 4],
-            start_offset: svga_start,
-            pixel_pan: 0,
-            split_pixel_pan: 0,
-            line_compare: svga.line_compare(),
-            blank_start: usize::MAX,
-        });
+        let end = svga_start.checked_add(svga.visible_frame_bytes())?;
+        if end > live.len() { return None; }
+        let mut frame = svga.frame(live.range(0, end));
+        frame.start_offset = svga_start;
+        return Some(frame);
     }
-    let state = state.legacy()?;
-    let mode = state.classify_mode()?;
-    let (_, h) = ::vga::dimensions(mode);
-    // The shared borrow prevents guest execution/owner switches until the
-    // returned frame is consumed. No IRQ handler accesses this store.
-    let live = super::machine::vga::live_planes(machine);
-    let vram = if matches!(mode, VgaMode::Mode13h) { &live[..0x10000] } else { &[] };
-    let map_b = (state.seq.get(3) & 0x03) << 1 | (state.seq.get(3) >> 4) & 1;
-    let map_a = ((state.seq.get(3) >> 2) & 0x03) << 1 | (state.seq.get(3) >> 5) & 1;
-    // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
-    // line-compare (split-screen) apply to the planar families and to linear
-    // Mode 13h. The display-start latch is in word units for the planar
-    // modes (per-plane byte offset) but the address counter runs in
-    // doubleword mode under 13h, so each latch step is 4 linear pixels.
-    let planar = matches!(mode, VgaMode::Planar16 { .. } | VgaMode::ModeX { .. });
-    let mode13 = matches!(mode, VgaMode::Mode13h);
-    // The 256-colour shift mode uses half-dot clocks: two AC pan counts
-    // advance one logical colour pixel. Planar 16-colour scanout uses the
-    // full three-bit pixel count.
-    let pixel_pan = if matches!(mode, VgaMode::ModeX { .. } | VgaMode::Mode13h) {
-        ((state.pixel_pan() >> 1) & 0x03) as usize
-    } else if planar {
-        (state.pixel_pan() & 0x07) as usize
-    } else { 0 };
-    let start_latch = usize::from(state.display_start());
-    // CGA palettes come from the Mode-Control/Colour-Select registers. The
-    // 640×200 2-colour mode's foreground is the Colour-Select low nibble
-    // (background black); the 320×200 4-colour set is the register-resolved
-    // palette. Other modes ignore this field.
-    let cga_palette = match mode {
-        VgaMode::Cga4 => ::vga::cga4_palette(state.cga_mode_ctl.get(), state.cga_color_select.get()),
-        VgaMode::Cga2 => [0x000000, ::vga::CGA16[(state.cga_color_select.get() & 0x0F) as usize], 0, 0],
-        _ => [0; 4],
-    };
-    Some(Frame {
-            memory: None,
-        plane_layout: state.layout(),
-        mode,
-        vram,
-        planes: live,
-        ac: state.ac.read(),
-        palette: state.dac.read(),
-        dac_mask: state.dac_mask.get(),
-        font: &[],
-        font_b: &[],
-        font_maps: Some((map_a, map_b)),
-        blink: state.ac.get(0x10) & 0x08 != 0,
-        text_cursor: ::vga::TextCursor::from_crtc(&state.crtc.read(), autonomous || (machine.now() / 250_000_000).is_multiple_of(2)),
-        cga_palette,
-        start_offset: if planar || matches!(mode, VgaMode::Text { .. }) { start_latch } else if mode13 { start_latch * 4 } else { 0 },
-        pixel_pan,
-        split_pixel_pan: if state.ac.get(0x10) & 0x20 != 0 { 0 } else { pixel_pan },
-        line_compare: if planar || mode13 { state.line_compare(h) } else { usize::MAX },
-        blank_start: if planar || mode13 { state.vertical_blank_start(h) } else { usize::MAX },
-    })
+    let legacy = state.legacy()?;
+    let mode = legacy.classify_mode()?;
+    let cursor_phase = autonomous || (machine.now() / 250_000_000).is_multiple_of(2);
+    Some(::vga::scanout::legacy_frame(
+        legacy, live.range(0, super::machine::vga::PLANES_LEN), mode, cursor_phase,
+    ))
 }
 
 /// Whole-frame throttle for the hosted window sink, off the same tick clock

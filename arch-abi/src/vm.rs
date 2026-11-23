@@ -19,6 +19,7 @@ pub const MAPPINGS: usize = 128;
 
 pub mod op {
     pub const INSTALL_TRAP_HOOK: u64 = 28;
+    pub const EDIT_MAPPINGS: u64 = 29;
     pub const CONFIGURE: u64 = 0;
     pub const EXECUTE: u64 = 1;
     pub const SUPPLY: u64 = 2;
@@ -78,20 +79,53 @@ impl Exchange {
             pages: [0; SUPPLY_CAPACITY], page_count: 0, root: [0; 768],
             entries: [PageEntry::Absent; MAPPINGS], data: [0; DATA_SIZE] }
     }
-    pub fn take_pages(&mut self) -> PageInput {
-        let count = usize::try_from(self.page_count).unwrap();
-        assert!(count <= SUPPLY_CAPACITY);
-        self.page_count = 0;
-        PageInput { pages: self.pages, count }
+    /// # Safety
+    /// The other side of the exchange must have transferred ownership of
+    /// every frame named by the active slots, and be stopped while we take it.
+    pub unsafe fn take_pages(&mut self) -> PageInput {
+        let count = usize::try_from(core::mem::take(&mut self.page_count)).unwrap();
+        unsafe { PageInput::from_raw_parts(self.pages, count) }
     }
     pub fn put_pages(&mut self, pages: PageInput) {
-        self.pages = pages.pages;
-        self.page_count = pages.count as u64;
+        assert_eq!(self.page_count, 0, "unclaimed pages in exchange");
+        let (frames, count) = pages.into_raw_parts();
+        self.pages = frames;
+        self.page_count = count as u64;
     }
+    pub fn put_edit(&mut self, edit: crate::mapping::Edit) {
+        use crate::mapping::{Edit, Missing};
+        let (kind, access, executable, policy) = match edit {
+            Edit::ReserveZero { access, executable, only_if_vacant } => (0, access as u64, executable, only_if_vacant),
+            Edit::CommitZero => (1, 0, false, false),
+            Edit::Protect { access, executable, missing } => (2, access as u64, executable, missing == Missing::Reject),
+            Edit::Discard => (3, 0, false, false),
+            Edit::MakePrivate => (4, 0, false, false),
+        };
+        self.args[2..].copy_from_slice(&[kind, access, executable as u64, policy as u64]);
+    }
+
+    pub fn edit(&self) -> crate::mapping::Edit {
+        use crate::mapping::{Edit, Missing, Protection};
+        let access = match self.args[3] {
+            0 => Protection::None, 1 => Protection::ReadOnly, 2 => Protection::ReadWrite,
+            _ => panic!("invalid mapping protection"),
+        };
+        let executable = self.args[4] != 0;
+        let policy = self.args[5] != 0;
+        match self.args[2] {
+            0 => Edit::ReserveZero { access, executable, only_if_vacant: policy },
+            1 => Edit::CommitZero,
+            2 => Edit::Protect { access, executable, missing: if policy { Missing::Reject } else { Missing::Skip } },
+            3 => Edit::Discard,
+            4 => Edit::MakePrivate,
+            _ => panic!("invalid mapping edit"),
+        }
+    }
+
     pub fn mapping_result(&mut self, result: Result<(), crate::MappingError>) {
         use crate::MappingError::*;
         self.result[0] = match result { Ok(()) => 0, Err(NeedPages) => 1,
-            Err(InvalidAddress) => 2, Err(InvalidFrame) => 3, Err(Unsupported) => 4,
+            Err(InvalidAddress) => 2, Err(InvalidFrame) => 3, Err(Unsupported) => 4, Err(AlreadyMapped) => 9,
             Err(Encoding(error)) => 5 + match error {
                 crate::page_entry::EncodingError::InvalidEncoding => 0,
                 crate::page_entry::EncodingError::InvalidPhysicalWidth => 1,
@@ -106,6 +140,7 @@ impl Exchange {
             6 => Err(Encoding(crate::page_entry::EncodingError::InvalidPhysicalWidth)),
             7 => Err(Encoding(crate::page_entry::EncodingError::FrameOutOfRange)),
             8 => Err(Encoding(crate::page_entry::EncodingError::InvalidVirtualAddress)),
+            9 => Err(AlreadyMapped),
             _ => panic!("invalid supervisor response") }
     }
 }

@@ -155,11 +155,11 @@ fn build() -> Unicorn<'static, Ctx> {
         if !is_int && uc.get_data().trap_hook_enabled
             && uc.get_data().pending.is_none() && uc.get_data().pending_intr.is_none()
         {
-            if let Some(hook) = TRAP_HOOK.get() {
-                // Unicorn has restored the faulting instruction. Updating
-                // live operands here keeps execution inside this emu_start.
-                if offer_trap(uc, hook, vector, error, address) { return; }
-            }
+            // Unicorn has restored the faulting instruction. Updating
+            // live operands here keeps execution inside this emu_start.
+            if TRAP_HOOK.with_borrow(|hook| hook.as_ref().is_some_and(|hook|
+                offer_trap(uc, hook.descriptor(), vector, error, address)))
+            { return; }
         }
         // Debug single-steps are reflected as `KernelEvent::DebugTrap`; DOS
         // attributes the trap to its active TF sources.
@@ -1055,7 +1055,7 @@ mod execution_tests {
 
     #[test]
     fn planar_hook_handles_raw_page_fault_and_resumes() {
-        use arch_abi::{Memory, UserPage, page_entry::PageEntry};
+        use arch_abi::{Memory, UserPage};
         crate::phys::init_test_ram();
         let mut machine = crate::backend::Interp::local();
         let layout = std::alloc::Layout::from_size_align(65 * 4096, 4096).unwrap();
@@ -1069,7 +1069,7 @@ mod execution_tests {
         registers.gc.set(8, 255);
         registers.gc.set(6, 4);
         let page = UserPage::new(0xa0000).unwrap();
-        unsafe { machine.fill_mappings(page, 16, PageEntry::Intercepted, crate::test_memory::input(5)).0.unwrap(); }
+        machine.fill_mappings(page, 16, arch_abi::mapping::Install::INTERCEPTED, crate::test_memory::input(5)).0.unwrap();
         // 300 VGA stores exceed the old stop-and-restart loop's limit.
         // mov al,5a; mov ecx,300; loop over mov [a0000],al; mov al,[a0000]; int 80h
         let code = [0xb0, 0x5a, 0xb9, 0x2c, 1, 0, 0,
@@ -1093,11 +1093,11 @@ mod execution_tests {
 }
 
 thread_local! {
-    static TRAP_HOOK: core::cell::Cell<Option<arch_abi::entry::TrapHook>> = const { core::cell::Cell::new(None) };
+    static TRAP_HOOK: core::cell::RefCell<Option<arch_abi::entry::RetainedTrapHook>> = const { core::cell::RefCell::new(None) };
 }
 
-pub(crate) fn install_trap_hook(hook: Option<arch_abi::entry::TrapHook>) {
-    TRAP_HOOK.set(hook);
+pub(crate) fn install_trap_hook(hook: Option<arch_abi::entry::RetainedTrapHook>) {
+    TRAP_HOOK.with_borrow_mut(|installed| *installed = hook);
 }
 
 struct TrapMemory<'a, 'uc> {

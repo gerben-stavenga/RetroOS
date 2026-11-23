@@ -88,6 +88,7 @@ rust_library(
         "@crates//:aes-kw",
         "@crates//:zeroize",
         "@crates//:subtle",
+        "@crates//:pinned-init",
         # no_std-patched http_archive (not @crates): one flavour serves both
         # platforms — the synth core is pure integer math with zero deps.
         "@nuked_opl3//:nuked_opl3",

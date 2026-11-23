@@ -65,7 +65,8 @@ pub(crate) fn requests(frame: &mut Regs) {
             crate::descriptors::install_io_policy(&arch_abi::IoPolicy::deny_all());
             break;
         }
-        let pages = message.take_pages();
+        // The stopped host transferred the frames in this request.
+        let pages = unsafe { message.take_pages() };
         if message.operation == op::SUPPLY {
             let (needed, unused) = crate::memory::supply_pages(pages);
             message.result[0] = needed as u64;
@@ -131,9 +132,14 @@ fn operation(message: &mut Exchange) {
             });
             unsafe { crate::entry::install_hook(hook); }
         }
-        op::READ_MAPPINGS | op::REPLACE_MAPPINGS | op::FILL_MAPPINGS | op::READ_RUN | op::ALIAS | op::SWAP => {
+        op::READ_MAPPINGS | op::REPLACE_MAPPINGS | op::FILL_MAPPINGS | op::READ_RUN | op::ALIAS | op::SWAP | op::EDIT_MAPPINGS => {
             let page = match UserPage::new(a[0]) { Ok(page) => page, Err(error) => { message.mapping_result(Err(error)); return; } };
             match message.operation {
+                op::EDIT_MAPPINGS => {
+                    let mut request = mapping::Edit { page, count, operation: message.edit(), result: Ok(()) };
+                    call(arch_call::EDIT_MAPPINGS, &mut request);
+                    batch(message, request.result);
+                }
                 op::READ_MAPPINGS => {
                     let mut request = mapping::Read { page, entries: &mut message.entries[..count], result: Ok(()) };
                     call(arch_call::READ_MAPPINGS, &mut request);

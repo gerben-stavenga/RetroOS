@@ -651,3 +651,252 @@ pub fn restore_dac(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaStat
         outb(0x3C8, state.dac_index);
     }
 }
+
+/// A bounded hardware aperture. The driver establishes its mapping before
+/// publication and retires its scanout workers before changing the mapping.
+#[derive(Clone, Debug)]
+pub(crate) struct FramebufferMemory {
+    base: usize,
+    len: usize,
+    wide: bool,
+    #[cfg(test)]
+    test: Option<(alloc::sync::Arc<[core::sync::atomic::AtomicU8]>, usize)>,
+}
+
+impl FramebufferMemory {
+    /// # Safety
+    /// The entire range is a writable device mapping, kept live while in use.
+    pub(crate) unsafe fn mapped(base: usize, len: usize, wide: bool) -> Self {
+        assert_ne!(base, 0);
+        assert!(base.checked_add(len).is_some());
+        Self { base, len, wide, #[cfg(test)] test: None }
+    }
+
+    pub(crate) fn write(&self, offset: usize, bytes: &[u8]) {
+        assert!(offset <= self.len && bytes.len() <= self.len - offset);
+        if bytes.is_empty() { return; }
+        #[cfg(test)]
+        if let Some((memory, start)) = &self.test {
+            for (cell, &byte) in memory[start + offset..].iter().zip(bytes) {
+                cell.store(byte, core::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+        unsafe { copy_bytes(self.base + offset, bytes, self.wide); }
+    }
+
+    pub(crate) fn read(&self, offset: usize, bytes: &mut [u8]) {
+        assert!(offset <= self.len && bytes.len() <= self.len - offset);
+        #[cfg(test)]
+        if let Some((memory, start)) = &self.test {
+            for (byte, cell) in bytes.iter_mut().zip(&memory[start + offset..]) {
+                *byte = cell.load(core::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = unsafe { ((self.base + offset + i) as *const u8).read_volatile() };
+        }
+    }
+
+    pub(crate) fn clear(&self, offset: usize, len: usize) {
+        assert!(offset <= self.len && len <= self.len - offset);
+        #[cfg(test)]
+        if let Some((memory, start)) = &self.test {
+            for cell in &memory[start + offset..start + offset + len] {
+                cell.store(0, core::sync::atomic::Ordering::Relaxed);
+            }
+            return;
+        }
+        if len == 0 { return; }
+        #[cfg(target_arch = "x86")]
+        unsafe { retroos_fb_clear(self.base + offset, len); }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("rep stosb",
+                in("al") 0u8, inout("rcx") len => _, inout("rdi") self.base + offset => _,
+                options(nostack, preserves_flags));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test(memory: alloc::sync::Arc<[core::sync::atomic::AtomicU8]>, start: usize, len: usize) -> Self {
+        assert!(start <= memory.len() && len <= memory.len() - start);
+        Self { base: 0, len, wide: false, test: Some((memory, start)) }
+    }
+}
+
+pub(crate) fn mode13_framebuffer(_: &crate::kernel::platform::VgaCap) -> FramebufferMemory {
+    unsafe { FramebufferMemory::mapped(crate::LOW_MEM_BASE + 0xA0000, 320 * 200, false) }
+}
+
+pub(crate) fn map_linear_framebuffer(
+    _: &crate::kernel::platform::VgaCap, physical: u32, offset: usize, pages: usize,
+    len: usize, policy: crate::kernel::platform::FramebufferMapPolicy,
+) -> FramebufferMemory {
+    assert!(offset.checked_add(len).is_some_and(|end| end <= pages * crate::PAGE_SIZE));
+    crate::kernel::platform::map_kernel_physical(
+        arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages,
+        u64::from(physical) / crate::PAGE_SIZE as u64, policy.flags,
+    );
+    unsafe { FramebufferMemory::mapped(arch_abi::FB_WINDOW_BASE + offset, len, policy.wide) }
+}
+
+/// Transfer between the card's linear aperture and the VGA model's RAM.
+pub(crate) fn transfer_linear_vbe(
+    cap: &crate::kernel::platform::VgaCap, mode: crate::kernel::platform::VbeMode,
+    live: vga::memory::Memory<'_>, scratch: &mut [u8], to_card: bool,
+) {
+    let offset = mode.physical_base as usize % crate::PAGE_SIZE;
+    let bytes = mode.framebuffer_bytes as usize;
+    assert!(bytes <= live.len() && !scratch.is_empty());
+    let pages = (offset + bytes).div_ceil(crate::PAGE_SIZE);
+    let storage = map_linear_framebuffer(cap, mode.physical_base, offset, pages, bytes,
+        crate::kernel::platform::FramebufferMapPolicy {
+            flags: arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
+            wide: false,
+            slow: false,
+        });
+    for offset in (0..bytes).step_by(scratch.len()) {
+        let count = scratch.len().min(bytes - offset);
+        let chunk = &mut scratch[..count];
+        let span = live.range(offset, count);
+        if to_card {
+            span.copy_to(chunk);
+            storage.write(offset, chunk);
+        } else {
+            storage.read(offset, chunk);
+            span.copy_from(chunk);
+        }
+    }
+    crate::kernel::platform::unmap_kernel_pages(arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
+}
+
+pub(crate) fn banked_framebuffer(
+    _: &crate::kernel::platform::VgaCap, segment: u16, window: usize,
+) -> Option<FramebufferMemory> {
+    let base = usize::from(segment) * 16;
+    if base < 0xA0000 || base.checked_add(window)? > 0xC0000 { return None; }
+    // The kernel's permanent, uncached VGA mapping is independent of the
+    // address space used to make the BIOS bank-switch call.
+    Some(unsafe { FramebufferMemory::mapped(crate::LOW_MEM_BASE + base, window, false) })
+}
+
+/// # Safety
+/// The destination must be a device range of at least `source.len()` bytes.
+/// It must support dword stores and, when `wide` is set, SSE stores.
+#[inline]
+#[optimize(speed)]
+unsafe fn copy_bytes(mut destination: usize, source: &[u8], wide: bool) {
+    let head_len = if wide { destination.wrapping_neg() & 15 } else { 0 };
+    let (head, source) = source.split_at(head_len.min(source.len()));
+    for &byte in head {
+        unsafe { (destination as *mut u8).write_volatile(byte); }
+        destination += 1;
+    }
+    let dwords = source.len() / 4;
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        if wide && dwords != 0 {
+            retroos_fb_copy32_wide(destination, source.as_ptr(), dwords);
+        } else {
+            retroos_fb_copy32(destination, source.as_ptr(), dwords);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "rep movsd",
+            inout("rcx") dwords => _,
+            inout("rsi") source.as_ptr() => _,
+            inout("rdi") destination => _,
+            options(nostack, preserves_flags)
+        );
+    }
+    let done = dwords * 4;
+    for (i, &byte) in source[done..].iter().enumerate() {
+        unsafe { ((destination + done + i) as *mut u8).write_volatile(byte); }
+    }
+}
+
+#[cfg(target_arch = "x86")]
+core::arch::global_asm!(
+    r#"
+    .global retroos_fb_clear
+    .type retroos_fb_clear, @function
+retroos_fb_clear:
+    push edi
+    mov edi, dword ptr [esp + 8]
+    mov ecx, dword ptr [esp + 12]
+    xor eax, eax
+    cld
+    rep stosb
+    pop edi
+    ret
+    .size retroos_fb_clear, .-retroos_fb_clear
+
+    .global retroos_fb_copy32
+    .type retroos_fb_copy32, @function
+retroos_fb_copy32:
+    push esi
+    push edi
+    mov edi, dword ptr [esp + 12]
+    mov esi, dword ptr [esp + 16]
+    mov ecx, dword ptr [esp + 20]
+    cld
+    rep movsd
+    pop edi
+    pop esi
+    ret
+    .size retroos_fb_copy32, .-retroos_fb_copy32
+
+    .global retroos_fb_copy32_wide
+    .type retroos_fb_copy32_wide, @function
+    /* Wide device-row copy: 16-byte non-temporal stores to the WC
+     * framebuffer — four times fewer store instructions than rep movsd.
+     * The kernel swaps FPU/SSE state only at thread switch, so the guest's
+     * live XMM registers are resident here: xmm0 is spilled around the
+     * copy. Head loop aligns the destination to 16 (movntdq requires it);
+     * the one end-of-frame present sfence drains all row copies together. */
+retroos_fb_copy32_wide:
+    push esi
+    push edi
+    mov edi, dword ptr [esp + 12]
+    mov esi, dword ptr [esp + 16]
+    mov ecx, dword ptr [esp + 20]
+    cld
+    sub esp, 16
+    movdqu [esp], xmm0
+1:  test edi, 15
+    jz 2f
+    test ecx, ecx
+    jz 4f
+    movsd
+    dec ecx
+    jmp 1b
+2:  mov eax, ecx
+    shr eax, 2
+    jz 4f
+    and ecx, 3
+3:  movdqu xmm0, [esi]
+    movntdq [edi], xmm0
+    add esi, 16
+    add edi, 16
+    dec eax
+    jnz 3b
+4:  rep movsd
+    movdqu xmm0, [esp]
+    add esp, 16
+    pop edi
+    pop esi
+    ret
+    .size retroos_fb_copy32_wide, .-retroos_fb_copy32_wide
+"#
+);
+
+#[cfg(target_arch = "x86")]
+unsafe extern "C" {
+    fn retroos_fb_clear(dst: usize, bytes: usize);
+    fn retroos_fb_copy32(dst: usize, src: *const u8, dwords: usize);
+    fn retroos_fb_copy32_wide(dst: usize, src: *const u8, dwords: usize);
+}

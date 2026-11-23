@@ -15,7 +15,9 @@
 
 extern crate alloc;
 
+use alloc::{alloc::{Layout, handle_alloc_error}, boxed::Box};
 use arch_abi::eflags;
+use pinned_init::{InPlaceInit, init};
 use crate::Regs;
 use crate::kernel::bios_display::DosVideo;
 
@@ -506,10 +508,13 @@ impl PcMachine {
         virtual_base: u32,
         page_count: u32,
         returned_linear: u32,
-    ) {
-        let voodoo_bar = vvoodoo::BAR_PHYS;
+    ) -> bool {
+        if page_count == 0 { return false; }
+        let first = u64::from(physical & !0xFFF);
+        let end = first + u64::from(page_count) * 4096;
+        let voodoo_bar = u64::from(vvoodoo::BAR_PHYS);
         if let Some(voodoo) = self.voodoo.as_mut()
-            && (voodoo_bar..voodoo_bar + vvoodoo::BAR_SIZE).contains(&physical)
+            && first >= voodoo_bar && end <= voodoo_bar + u64::from(vvoodoo::BAR_SIZE)
         {
             crate::kernel::memory::map_physical(machine,
                 (virtual_base >> 12) as usize,
@@ -518,7 +523,7 @@ impl PcMachine {
                 arch_abi::MAP_MMIO,
             );
             voodoo.linear_base = Some(returned_linear & !0xFFF);
-            return;
+            return true;
         }
 
         if vga::svga_lfb_reserved_contains(physical, size) {
@@ -531,15 +536,29 @@ impl PcMachine {
                 (virtual_base >> 12) as usize,
                 page_count as usize,
             );
-            return;
+            return true;
         }
 
+        // Physical requests from DPMI may expose the card apertures we
+        // know about. They cannot select arbitrary host RAM or devices.
+        let platform = crate::kernel::platform::get();
+        let legacy = platform.vga_passthrough && first >= 0xA0000 && end <= 0xC0000;
+        let linear = platform.vbe_mode.is_some_and(|mode| {
+            let mode = mode.mode();
+            let base = u64::from(mode.physical_base);
+            let limit = (base + u64::from(mode.framebuffer_bytes)).next_multiple_of(4096);
+            base != 0 && first >= (base & !0xFFF) && end <= limit
+        });
+        if (!legacy && !linear) || !crate::kernel::platform::physical_view_allowed(first >> 12, page_count as usize) {
+            return false;
+        }
         crate::kernel::memory::map_physical(machine,
             (virtual_base >> 12) as usize,
             page_count as usize,
-            u64::from(physical & !0xFFF) >> 12,
+            first >> 12,
             arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
         );
+        true
     }
 
     /// Built straight into its heap slot: the struct is far too large to pass
@@ -547,7 +566,7 @@ impl PcMachine {
     pub fn new_boxed<A: crate::Core>(
         machine: &mut A,
         vga: DosVideo,
-    ) -> alloc::boxed::Box<Self> {
+    ) -> Box<Self> {
         // A20 is permanently wrapped: HMA_PAGE aliases the user's private low
         // memory by copying entries[0..16], the faithful A20-off default every
         // real machine boots with. We never un-wrap it — a VM86 guest can use
@@ -555,37 +574,25 @@ impl PcMachine {
         // nothing to toggle. Dropping it removes the shadow region, the page
         // swap, and the local/global ref-counting that used to track it.
         crate::kernel::memory::alias(machine, 0, HMA_PAGE, HMA_PAGE_COUNT);
-        // `Box::new(Self { .. })` is not an in-place construction guarantee:
-        // rustc may assemble the complete aggregate on the kernel stack before
-        // copying it to the allocation. PcMachine is large enough that a tiny
-        // field-size increase then makes fork/exec cross the guard page. Write
-        // each initialized field directly into uninitialized heap storage.
-        let mut boxed = alloc::boxed::Box::<Self>::new_uninit();
-        let p = boxed.as_mut_ptr();
-        unsafe {
-            core::ptr::addr_of_mut!((*p).vpit).write(VirtualPit::new(machine));
-            core::ptr::addr_of_mut!((*p).vpic).write(VirtualPic::new());
-            core::ptr::addr_of_mut!((*p).vrtc).write(VirtualRtc::new(machine));
-            core::ptr::addr_of_mut!((*p).vkbd).write(VirtualKeyboard::new());
-            core::ptr::addr_of_mut!((*p).uart).write(vuart::Uart::new());
-            core::ptr::addr_of_mut!((*p).mouse).write(MouseState::new());
-            core::ptr::addr_of_mut!((*p).skip_irq).write(false);
-            core::ptr::addr_of_mut!((*p).e0_pending).write(false);
-            core::ptr::addr_of_mut!((*p).vga).write(vga);
-            let voodoo = crate::kernel::platform::get().voodoo_emulation
-                .then(vvoodoo::VVoodoo::new);
-            core::ptr::addr_of_mut!((*p).voodoo).write(voodoo);
-            core::ptr::addr_of_mut!((*p).scanout)
-                .write(crate::kernel::display::Scanout::new_boxed());
-            core::ptr::addr_of_mut!((*p).dma).write(Dma8237::new());
-            core::ptr::addr_of_mut!((*p).audio).write(alloc::sync::Arc::new(
-                crate::kernel::media::Shared::new(AudioDevices::new())));
-            core::ptr::addr_of_mut!((*p).sb_probe_delay).write(None);
-            core::ptr::addr_of_mut!((*p).cmos_index).write(0);
-            core::ptr::addr_of_mut!((*p).locked_stack)
-                .write(super::mode_transitions::LockedStackState::new());
-            boxed.assume_init()
-        }
+        Box::init(init!(Self {
+            vpit: VirtualPit::new(machine),
+            vpic: VirtualPic::new(),
+            vrtc: VirtualRtc::new(machine),
+            vkbd: VirtualKeyboard::new(),
+            uart: vuart::Uart::new(),
+            mouse: MouseState::new(),
+            skip_irq: false,
+            e0_pending: false,
+            vga,
+            voodoo: crate::kernel::platform::get().voodoo_emulation.then(vvoodoo::VVoodoo::new),
+            scanout: crate::kernel::display::Scanout::new_boxed(),
+            dma: Dma8237::new(),
+            audio: alloc::sync::Arc::new(crate::kernel::media::Shared::new(AudioDevices::new())),
+            sb_probe_delay: None,
+            cmos_index: 0,
+            locked_stack: super::mode_transitions::LockedStackState::new(),
+        }))
+        .unwrap_or_else(|_| handle_alloc_error(Layout::new::<Self>()))
     }
 }
 

@@ -1295,15 +1295,39 @@ impl FaultBus for PlanarBus<'_> {
     fn fpu_pop(&mut self) { self.access.fpu_pop(); }
 }
 
-/// Emulate a data access. Both the installed hook and the kernel use this
-/// function. The caller controls whether guest RAM access may need paging.
+/// Guest memory operations for callers outside a hardware trap. These
+/// operations may service paging before returning.
+pub trait GuestMemory {
+    fn resident(&self, address: u32, len: u32, write: bool) -> bool;
+    fn read(&self, address: u32) -> u8;
+    fn read_bytes(&self, address: u32, bytes: &mut [u8]);
+    fn write(&mut self, address: u32, byte: u8);
+    fn fpu_st0(&self) -> [u8; 10];
+    fn fpu_pop(&mut self);
+}
+
+struct GuestTrapAccess<'a>(&'a mut dyn GuestMemory);
+
+// The fallback delegates read/write to safe memory operations. It exposes
+// neither a direct memory view nor a fetched-instruction pointer.
+unsafe impl TrapAccess for GuestTrapAccess<'_> {
+    fn segment(&self, _: u16) -> (u32, u32, bool) { unreachable!("fallback supplies segments") }
+    fn resident(&self, address: u32, len: u32, write: bool) -> bool { self.0.resident(address, len, write) }
+    unsafe fn read(&self, address: u32) -> u8 { self.0.read(address) }
+    unsafe fn read_bytes(&self, address: u32, bytes: &mut [u8]) { self.0.read_bytes(address, bytes); }
+    unsafe fn write(&mut self, address: u32, byte: u8) { self.0.write(address, byte); }
+    fn fpu_st0(&self) -> [u8; 10] { self.0.fpu_st0() }
+    fn fpu_pop(&mut self) { self.0.fpu_pop(); }
+}
+
+/// Emulate a data access using the caller's ordinary guest memory API.
 pub fn planar_fault(
-    registers: &crate::Registers, planes: crate::Memory<'_>, access: &mut dyn TrapAccess,
+    registers: &crate::Registers, planes: crate::Memory<'_>, access: &mut dyn GuestMemory,
     regs: &mut Operands<'_>, segments: &[u32; 6], code_limit: u32, default32: bool, address: u32,
 ) -> bool {
     let Some((aperture, sequential)) = registers.trap_mode()
         .filter(|(range, _)| range.contains(&address)) else { return false };
-    planar_access(registers, planes, access, regs, (segments[1], code_limit, default32),
+    planar_access(registers, planes, &mut GuestTrapAccess(access), regs, (segments[1], code_limit, default32),
         aperture, sequential, address, false, |_| *segments).is_some()
 }
 

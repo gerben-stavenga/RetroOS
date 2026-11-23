@@ -48,12 +48,13 @@ pub fn active() -> bool {
 pub fn framebuffer() -> Option<crate::kernel::display::Display> {
     let g = GEOM.get()?;
     let framebuffer = crate::kernel::display::Framebuffer {
-        va: g.va,
+        storage: unsafe {
+            crate::kernel::drivers::vga_hw::FramebufferMemory::mapped(g.va, g.pitch * g.height, g.wide)
+        },
         pitch: g.pitch,
         width: g.width,
         height: g.height,
         slow: g.slow,
-        wide: g.wide,
     };
     // A loader-provided framebuffer is already established, whether the
     // loader used GOP or VBE. Only a sink RetroOS creates by consuming a
@@ -257,7 +258,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
     // instead — RAM the console can read/write. This is the singleton VGA text
     // memory; DOS processes map the SAME pages at their guest 0xB8000, so the
     // kernel console and every DOS program share one screen, like VGA hardware.
-    let aperture = crate::kernel::memory::text_frame();
+    let aperture = crate::kernel::platform::text_frame().expect("text screen backing");
     for i in 0..8 {
         // Cacheable, FOREIGN: RAM we allocated (not a card's MMIO), shared with
         // every DOS process, so no address space may free or COW it. It was

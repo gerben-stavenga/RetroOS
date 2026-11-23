@@ -6,6 +6,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 mod arch;
 pub use arch::{Core, X86, Memory, Diagnostics, GuestBytes, Vcpu};
 pub mod page_entry;

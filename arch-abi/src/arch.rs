@@ -5,7 +5,6 @@
 
 use crate::page_supply::{PageInput, SupplyStatus};
 use crate::{Regs, KernelEvent, ExecutionProfile, ExecutionProfileStage};
-use crate::page_entry::PageEntry;
 use crate::mapping::{MappingError, MappingFailure, UserPage};
 
 /// Execution and lifecycle of one core. A concrete core handle stays on its
@@ -126,9 +125,8 @@ pub trait X86 {
     fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>);
 
     /// Install or detach a handler for the active context's user traps.
-    /// # Safety
-    /// The handler and its state must remain resident and valid until detached.
-    unsafe fn install_trap_hook(&mut self, hook: Option<crate::entry::TrapHook>);
+    /// The backend retains its storage until the handler has been detached.
+    fn install_trap_hook(&mut self, hook: Option<crate::entry::RetainedTrapHook>);
 
 
 }
@@ -148,16 +146,11 @@ pub trait Memory {
     /// `Default` constructs an empty space.
     type AddressSpace: Default + Send;
 
-    /// Read consecutive entries without materializing absent page tables or data.
-    /// Results are snapshots, not owning references. On failure, `completed`
-    /// identifies the valid prefix of the output slice.
-    fn read_mappings(&mut self, start: UserPage, entries: &mut [PageEntry]) -> Result<(), MappingFailure>;
-
-    /// Read a uniform prefix of a range. Returns an entry and a count in
-    /// `1..=maximum`; every page in that prefix has exactly that entry,
-    /// including its backing frame. The prefix need not be maximal.
-    /// Does not materialize absent tables or data. Zero maximum is invalid.
-    fn read_mapping_run(&mut self, start: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError>;
+    /// Edit a virtual range using only supplied pages. On NeedPages, resume
+    /// at the returned prefix with more frames. Strict modes validate the
+    /// entire range before the first mutation.
+    fn edit_mappings(&mut self, start: UserPage, count: usize, edit: crate::mapping::Edit, pages: PageInput)
+        -> (Result<(), MappingFailure>, PageInput);
 
     /// Alias a source range with memmove overlap semantics. COW sources first
     /// become private writable RAM. Uses only supplied pages. NeedPages leaves
@@ -172,23 +165,15 @@ pub trait Memory {
     fn swap_mappings(&mut self, a: UserPage, b: UserPage, count: usize,
         pages: crate::page_supply::PageInput) -> (Result<(), MappingError>, crate::page_supply::PageInput);
 
-    /// Replace consecutive entries, retaining Owned backing before releasing
-    /// displaced references. Borrowed backing is neither retained nor released.
-    /// Returns unused table backing and reports any completed prefix on failure.
-    /// Invalid address ranges fail before changing any mapping. Empty ranges
-    /// succeed without consuming supplied pages.
-    /// # Safety
-    /// Supplied frames must be valid; Borrowed backing must outlive every alias.
-    /// Writable aliases must obey the caller's synchronization/ownership rules.
-    /// The caller must exclusively own the active address space.
-    unsafe fn replace_mappings(&mut self, start: UserPage, entries: &[PageEntry], pages: PageInput) -> (Result<(), MappingFailure>, PageInput);
+    /// Replace consecutive entries with authorized backing. Returns unused
+    /// table storage and reports the committed prefix on a partial failure.
+    fn replace_mappings(&mut self, start: UserPage, entries: &[crate::mapping::Install<'_>], pages: PageInput)
+        -> (Result<(), MappingFailure>, PageInput);
 
-    /// Repeat exactly one entry across a range, including its backing frame.
-    /// Each Owned occurrence retains a reference. Failure and empty-range
-    /// behavior match replace_mappings.
-    /// # Safety
-    /// Same backing lifetime and ownership requirements as replace_mappings.
-    unsafe fn fill_mappings(&mut self, start: UserPage, count: usize, entry: PageEntry, pages: PageInput) -> (Result<(), MappingFailure>, PageInput);
+    /// Repeat the authorized entry across a range, retaining a reference for
+    /// each owned occurrence.
+    fn fill_mappings(&mut self, start: UserPage, count: usize, entry: crate::mapping::Install<'_>, pages: PageInput)
+        -> (Result<(), MappingFailure>, PageInput);
 
     /// Install `incoming` as the active address space and return the displaced
     /// one. Registers and FPU state are unchanged.

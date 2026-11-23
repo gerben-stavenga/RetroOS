@@ -1,16 +1,16 @@
 //! Per-address-space aliases of VFS-owned file pages.
 use super::*;
 
-#[derive(Clone, Copy)]
-struct Alias { address: usize, key: vfs::mapping::Key, may_write: bool }
+struct Alias { address: usize, backing: vfs::mapping::SharedPage, may_write: bool }
 
 #[derive(Default)]
 pub(super) struct State { aliases: alloc::vec::Vec<Alias> }
 
 impl State {
     pub fn fork(&self) -> Self {
-        for alias in &self.aliases { vfs::mapping::retain(alias.key); }
-        Self { aliases: self.aliases.clone() }
+        Self { aliases: self.aliases.iter().map(|alias| Alias {
+            address: alias.address, backing: alias.backing.retain(), may_write: alias.may_write,
+        }).collect() }
     }
 
     pub fn intersects(&self, start: usize, end: usize) -> bool {
@@ -18,13 +18,10 @@ impl State {
     }
 
     /// Guest aliases must already be unmapped (or the whole space freed).
-    pub fn release<A: crate::Core>(&mut self, machine: &mut A, start: usize, end: usize) {
-        self.aliases.retain(|alias| {
-            if alias.address >= start && alias.address < end {
-                vfs::mapping::release(machine, alias.key);
-                false
-            } else { true }
-        });
+    pub fn release<A: crate::Core>(&mut self, _machine: &mut A, start: usize, end: usize) {
+        for alias in self.aliases.extract_if(.., |alias| alias.address >= start && alias.address < end) {
+            alias.backing.release();
+        }
     }
 
     pub fn map<A: crate::Core>(&mut self, machine: &mut A, handle: i32, offset: usize,
@@ -33,10 +30,10 @@ impl State {
         let may_write = vfs::mapping::validate(handle, offset, size, true).is_ok();
         let mut pending = alloc::vec::Vec::new();
         for page in 0..size / 4096 {
-            match vfs::mapping::acquire(machine, handle, (offset + page * 4096) as u32, may_write) {
-                Ok((key, pointer)) => pending.push((key, pointer)),
+            match vfs::mapping::acquire(handle, (offset + page * 4096) as u32, may_write) {
+                Ok(backing) => pending.push(backing),
                 Err(error) => {
-                    for (key, _) in pending { vfs::mapping::release(machine, key); }
+                    for backing in pending { backing.release(); }
                     return Err(error);
                 }
             }
@@ -44,16 +41,18 @@ impl State {
         // All backing pages are ready before MAP_FIXED replaces anything.
         crate::kernel::memory::reset(machine, base / 4096, size / 4096);
         self.release(machine, base, base + size);
-        for (index, &(_, frame)) in pending.iter().enumerate() {
+        for (index, backing) in pending.iter().enumerate() {
             let address = base + index * 4096;
-            if !crate::kernel::memory::map_cached_frame(machine, address / 4096, frame, true, protection & 2 != 0, protection & 4 != 0) {
+            // On success State retains these pins through unmap and fork.
+            // On failure remove the completed prefix before releasing any pin.
+            if unsafe { backing.map(machine, address, protection & 2 != 0, protection & 4 != 0) }.is_err() {
                 crate::kernel::memory::reset(machine, base / 4096, index);
-                for (key, _) in pending { vfs::mapping::release(machine, key); }
+                for backing in pending { backing.release(); }
                 return Err(-12);
             }
         }
-        self.aliases.extend(pending.into_iter().enumerate().map(|(index, (key, _))|
-            Alias { address: base + index * 4096, key, may_write }));
+        self.aliases.extend(pending.into_iter().enumerate().map(|(index, backing)|
+            Alias { address: base + index * 4096, backing, may_write }));
         Ok(())
     }
 
@@ -66,8 +65,9 @@ impl State {
     pub fn sync(&self, start: usize, end: usize) -> i32 {
         let mut files = alloc::collections::BTreeSet::new();
         for alias in &self.aliases {
-            if alias.address >= start && alias.address < end && files.insert((alias.key.0, alias.key.1)) {
-                let status = vfs::mapping::sync(alias.key);
+            let key = alias.backing.key();
+            if alias.address >= start && alias.address < end && files.insert((key.0, key.1)) {
+                let status = vfs::mapping::sync(key);
                 if status < 0 { return status; }
             }
         }

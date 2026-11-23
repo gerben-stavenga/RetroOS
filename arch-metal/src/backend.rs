@@ -6,9 +6,8 @@
 //! CPU execution state lives in arch-owned Rust TLS. The handle addresses the
 //! current CPU; it does not own or synchronize the remaining shared devices.
 
-use crate::mapping::{Read, Replace, Fill, ReadRun, invoke};
-use arch_abi::{MappingError, MappingFailure, UserPage};
-use arch_abi::page_entry::PageEntry;
+use crate::mapping::{Edit, Replace, Fill, invoke};
+use arch_abi::{MappingFailure, UserPage};
 use super::paging2::AddressSpace;
 use super::x86::FxState;
 use arch_abi::{X86, Memory, Diagnostics, ExecutionProfile, ExecutionProfileStage};
@@ -35,8 +34,15 @@ impl Metal {
 }
 
 impl X86 for Metal {
-    unsafe fn install_trap_hook(&mut self, mut hook: Option<arch_abi::entry::TrapHook>) {
-        unsafe { invoke(crate::arch_call::INSTALL_TRAP_HOOK, &mut hook); }
+    fn install_trap_hook(&mut self, hook: Option<arch_abi::entry::RetainedTrapHook>) {
+        #[thread_local]
+        static INSTALLED: core::cell::RefCell<Option<arch_abi::entry::RetainedTrapHook>> =
+            const { core::cell::RefCell::new(None) };
+        let mut installed = INSTALLED.borrow_mut();
+        let mut descriptor = hook.as_ref().map(|hook| hook.descriptor());
+        // Both the old and new region owners survive the hardware handoff.
+        unsafe { invoke(crate::arch_call::INSTALL_TRAP_HOOK, &mut descriptor); }
+        *installed = hook;
     }
     fn isa_unmask_irq(&mut self, line: u8) {
         #[cfg(not(feature = "kvm"))]
@@ -120,29 +126,26 @@ impl Memory for Metal {
         })
     }
 
-    fn read_mappings(&mut self, page: UserPage, entries: &mut [PageEntry]) -> Result<(), MappingFailure> {
-        let mut arguments = Read { page, entries, result: Ok(()) };
-        unsafe { invoke(crate::arch_call::READ_MAPPINGS, &mut arguments); }
-        arguments.result
+    fn edit_mappings(&mut self, page: UserPage, count: usize, operation: arch_abi::mapping::Edit,
+        pages: arch_abi::page_supply::PageInput) -> (Result<(), MappingFailure>, arch_abi::page_supply::PageInput) {
+        crate::memory::with_input(pages, || {
+            let mut arguments = Edit { page, count, operation, result: Ok(()) };
+            unsafe { invoke(crate::arch_call::EDIT_MAPPINGS, &mut arguments); }
+            arguments.result
+        })
     }
 
-    unsafe fn replace_mappings(&mut self, page: UserPage, entries: &[PageEntry], pages: arch_abi::page_supply::PageInput) -> (Result<(), MappingFailure>, arch_abi::page_supply::PageInput) {
+    fn replace_mappings(&mut self, page: UserPage, entries: &[arch_abi::mapping::Install<'_>], pages: arch_abi::page_supply::PageInput) -> (Result<(), MappingFailure>, arch_abi::page_supply::PageInput) {
         crate::memory::with_input(pages, || {
-            let mut arguments = Replace { page, entries, result: Ok(()) };
+            let mut arguments = Replace { page, entries: arch_abi::mapping::Install::entries(entries), result: Ok(()) };
             unsafe { invoke(crate::arch_call::REPLACE_MAPPINGS, &mut arguments); }
             arguments.result
         })
     }
 
-    fn read_mapping_run(&mut self, page: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError> {
-        let mut arguments = ReadRun { page, maximum, result: Err(MappingError::InvalidAddress) };
-        unsafe { invoke(crate::arch_call::READ_MAPPING_RUN, &mut arguments); }
-        arguments.result
-    }
-
-    unsafe fn fill_mappings(&mut self, page: UserPage, count: usize, entry: PageEntry, pages: arch_abi::page_supply::PageInput) -> (Result<(), MappingFailure>, arch_abi::page_supply::PageInput) {
+    fn fill_mappings(&mut self, page: UserPage, count: usize, entry: arch_abi::mapping::Install<'_>, pages: arch_abi::page_supply::PageInput) -> (Result<(), MappingFailure>, arch_abi::page_supply::PageInput) {
         crate::memory::with_input(pages, || {
-            let mut arguments = Fill { page, count, entry, result: Ok(()) };
+            let mut arguments = Fill { page, count, entry: entry.entry(), result: Ok(()) };
             unsafe { invoke(crate::arch_call::FILL_MAPPINGS, &mut arguments); }
             arguments.result
         })

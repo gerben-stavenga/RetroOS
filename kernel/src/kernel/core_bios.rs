@@ -4,6 +4,8 @@
 //! only in this kernel-owned persistent workspace, synchronously servicing
 //! operations on a move-only `NativeVga`.
 
+#![forbid(unsafe_code)]
+
 use arch_abi::eflags;
 use crate::{Core, Regs, Vcpu};
 use arch_abi::IoSize;
@@ -1170,6 +1172,9 @@ impl<A: Core> NativeBiosWorkspace<A> {
             return Err(BiosError::InvalidFrame);
         }
 
+        let aperture = crate::kernel::drivers::vga_hw::banked_framebuffer(
+            display, mode.window_segment, window_size,
+        ).ok_or(BiosError::InvalidFrame)?;
         machine.switch_fx(&mut self.fx);
         let caller_space = machine.activate(core::mem::take(&mut self.bios_vcpu.space));
         let io = crate::kernel::io_policy::bios_display(display);
@@ -1178,7 +1183,6 @@ impl<A: Core> NativeBiosWorkspace<A> {
             let bx = (panel_w - out_w) / 2;
             let by = (panel_h - out_h) / 2;
             let (ybase, yrem) = (out_h / shadow_height, out_h % shadow_height);
-            let aperture = usize::from(mode.window_segment) * 16;
             let mut current_bank = None;
             let mut write_span = |machine: &mut A, offset, bytes: &[u8]| {
                 banked_span(offset, bytes, window_size, granularity, |bank, inside, chunk| {
@@ -1191,14 +1195,7 @@ impl<A: Core> NativeBiosWorkspace<A> {
                         current_bank = Some(bank);
                     }
                     let copy_sample = crate::kernel::osd_profile::Sample::start(machine);
-                    // Only native firmware creates this workspace. Its active
-                    // address space maps the hardware aperture directly; this
-                    // is framebuffer memory, not a generic guest/MMIO copy.
-                    unsafe {
-                        crate::kernel::display::copy_bytes(
-                            (aperture + inside) as *mut u8, chunk.as_ptr(), chunk.len(), false,
-                        );
-                    }
+                    aperture.write(inside, chunk);
                     copy_sample.finish(machine, crate::kernel::osd_profile::Stage::Copy, chunk.len() / step);
                     Ok(())
                 })

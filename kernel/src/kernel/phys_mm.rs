@@ -4,11 +4,14 @@ extern crate alloc;
 use arch_abi::PAGE_SIZE;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use arch_abi::page_supply::FrameLayout;
+use arch_abi::page_supply::{FrameLayout, OwnedPage, PageInput, SUPPLY_CAPACITY};
 
 #[path = "phys_mm/isa_dma.rs"]
 mod isa_dma;
 pub use isa_dma::{LowDmaMemory, install_low_dma_memory, dma_channel_buf};
+pub fn contains_dma_channel_pages(first: u64, end: u64) -> bool {
+    isa_dma::contains_channel_pages(first, end)
+}
 use alloc::alloc::{alloc_zeroed, dealloc};
 use core::alloc::Layout;
 #[path = "phys_mm/pool.rs"]
@@ -30,8 +33,9 @@ fn with_pool<R>(operation: impl FnOnce(&mut Pool<'static>) -> R) -> R {
 pub fn bootstrap<'a>(layout: &'static FrameLayout, occupied: &'a [core::ops::Range<u64>]) -> Bootstrap<'a> {
     let mut pool = Pool::new(layout, BOOTSTRAP_BYTES);
     for range in occupied { pool.mark(range.start, range.end); }
-    let previous = POOL.lock().replace(pool);
-    drop(previous);
+    let mut slot = POOL.lock();
+    assert!(slot.is_none(), "physical allocator already initialized");
+    *slot = Some(pool);
     Bootstrap { occupied }
 }
 
@@ -57,22 +61,23 @@ impl Bootstrap<'_> {
 
 // The kernel may donate an exclusively owned cached frame on exhaustion.
 // No pool borrow survives the callback; it may release cache metadata.
-static RECLAIM: spin::Mutex<Option<fn() -> Option<u64>>> = spin::Mutex::new(None);
-pub fn set_reclaim(callback: fn() -> Option<u64>) { *RECLAIM.lock() = Some(callback); }
+static RECLAIM: spin::Mutex<Option<fn() -> Option<OwnedPage>>> = spin::Mutex::new(None);
+pub fn set_reclaim(callback: fn() -> Option<OwnedPage>) { *RECLAIM.lock() = Some(callback); }
 /// Heap growth cannot reclaim objects through the heap it is extending.
-pub fn alloc_resident_page() -> Option<u64> {
-    with_pool(|pool| pool.allocate())
+pub fn alloc_resident_page() -> Option<OwnedPage> {
+    // The allocator just removed the frame from the free pool.
+    with_pool(|pool| pool.allocate()).map(|page| unsafe { OwnedPage::from_number(page) })
 }
 
-pub fn alloc_phys_page() -> Option<u64> {
-    if let Some(page) = with_pool(|pool| pool.allocate()) { return Some(page); }
+pub fn alloc_phys_page() -> Option<OwnedPage> {
+    if let Some(page) = alloc_resident_page() { return Some(page); }
     let reclaim = (*RECLAIM.lock())?;
     reclaim()
 }
 
 /// Return an exclusively owned frame to the allocator.
-pub fn free_phys_page(page: u64) {
-    with_pool(|pool| pool.release(page));
+pub fn free_phys_page(page: OwnedPage) {
+    with_pool(|pool| pool.release(page.into_number()));
 }
 
 /// Allocate physically contiguous DMA memory from the general pool.
@@ -83,7 +88,10 @@ pub fn alloc_phys_contig(num_pages: usize) -> Option<u64> {
 }
 
 /// Return a contiguous allocation to RAM.
-pub fn free_phys_contig(start_page: u64, num_pages: usize) {
+///
+/// # Safety
+/// Every frame in the range must belong exclusively to the caller.
+pub unsafe fn free_phys_contig(start_page: u64, num_pages: usize) {
     with_pool(|pool| pool.free_contiguous(start_page, num_pages));
 }
 
@@ -100,9 +108,9 @@ pub fn total_page_count() -> usize { with_pool(|pool| pool.managed_pages()) }
 mod tests;
 
 /// Allocate a bounded batch. A short batch means the RAM pool is exhausted.
-pub fn page_batch(count: usize) -> arch_abi::page_supply::PageInput {
-    assert!(count <= arch_abi::page_supply::SUPPLY_CAPACITY);
-    let mut pages = arch_abi::page_supply::PageInput::new();
+pub fn page_batch(count: usize) -> PageInput {
+    assert!(count <= SUPPLY_CAPACITY);
+    let mut pages = PageInput::new();
     for _ in 0..count {
         let Some(page) = alloc_phys_page() else { break; };
         pages.push(page);
@@ -127,7 +135,7 @@ pub unsafe fn install_direct_ram(base: *mut u8, bytes: usize) {
 /// Allocate and zero frames from directly mapped RAM.
 fn alloc_direct_pages(count: usize) -> u64 {
     assert!(DIRECT_BASE.load(Ordering::Acquire) != 0 && count != 0, "direct RAM not initialized");
-    let page = if count == 1 { alloc_phys_page() } else { alloc_contig(count) }
+    let page = if count == 1 { alloc_phys_page().map(OwnedPage::into_number) } else { alloc_contig(count) }
         .expect("physical RAM exhausted");
     unsafe { core::ptr::write_bytes(direct_pointer(page), 0, count.checked_mul(PAGE_SIZE).unwrap()); }
     page
@@ -167,7 +175,7 @@ pub unsafe fn free_shared_pages(base: core::ptr::NonNull<u8>, count: usize) {
         let offset = (base.as_ptr() as usize).checked_sub(direct).unwrap();
         assert!(offset.is_multiple_of(PAGE_SIZE));
         assert!(offset.checked_add(count.checked_mul(PAGE_SIZE).unwrap()).unwrap() <= DIRECT_BYTES.load(Ordering::Acquire));
-        for i in 0..count { free_phys_page((offset / PAGE_SIZE + i) as u64); }
+        unsafe { free_phys_contig((offset / PAGE_SIZE) as u64, count); }
     } else {
         unsafe { dealloc(base.as_ptr(), Layout::from_size_align(count.checked_mul(PAGE_SIZE).unwrap(), PAGE_SIZE).unwrap()); }
     }

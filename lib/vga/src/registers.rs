@@ -54,6 +54,19 @@ impl RegisterFile {
             Self(allocation.assume_init())
         }
     }
+    /// Keep the register allocation and the boot-resident planes valid
+    /// while the execution backend has their trap hook installed.
+    pub fn trap_hook(&self, planes: crate::memory::Memory<'static>) -> arch_abi::entry::RetainedTrapHook {
+        assert_eq!(planes.len(), 4 * 65536);
+        let binding = planar::Binding {
+            registers: &*self.0,
+            planes: planes.bytes().as_ptr().cast_mut().cast(),
+        };
+        // The static plane slice is permanent and the hook retains the Arc
+        // containing the complete aligned register region.
+        unsafe { arch_abi::entry::RetainedTrapHook::new(binding.descriptor(), self.0.clone()) }
+    }
+
     pub fn share(&self) -> Self { Self(self.0.clone()) }
     pub fn same_device(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
 }

@@ -18,7 +18,7 @@ fn back_heap(start: usize, end: usize) {
     for address in (start..end).step_by(4096) {
         let table = phys_mm::alloc_resident_page().unwrap();
         let frame = phys_mm::alloc_resident_page().unwrap();
-        if !arch::map_heap_page(address, frame, table) { phys_mm::free_phys_page(table); }
+        if !arch::map_heap_page(address, frame.into_number(), table.number()) { phys_mm::free_phys_page(table); }
     }
     unsafe { ALLOC.add_region(start, end); }
 }
@@ -183,10 +183,10 @@ fn allocate_core(
         trap_stack_top: trap as u32 + 16384 - 16,
         entry: secondary,
         argument: 0xabcdef,
-        memory: PageBootstrap {
+        memory: PageBootstrap::new(
             ownership,
-            pages: core::array::from_fn(|_| phys_mm::alloc_phys_page().expect("out of AP fault reserve pages")),
-        },
+            core::array::from_fn(|_| phys_mm::alloc_phys_page().expect("out of AP fault reserve pages")),
+        ),
         ready,
     }
 }
@@ -231,7 +231,7 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
         typ: 0,
     }; 128];
     let mut count = 0;
-    let mut starts = [None; 3];
+    let mut starts = [const { None }; 3];
     if core_id == 0 {
         assert_eq!(_magic, 0x2badb002);
         let delta = arch_metal::paging2::KERNEL_BASE - arch_metal::paging2::KERNEL_PHYS;
@@ -311,8 +311,8 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
     print("SMP BSP initialized\n");
     check_local(0);
     calibrate();
-    if let Some(missing) = missing {
-        let failure = unsafe { smp::start_core(254, 0x8000, missing, delay) };
+    if let Some(mut missing) = missing {
+        let failure = unsafe { smp::start_core(254, 0x8000, &mut missing, delay) };
         assert!(matches!(
             failure,
             Err(smp::StartError::StartupTimeout | smp::StartError::DeliveryTimeout)
@@ -322,7 +322,7 @@ pub unsafe extern "C" fn boot_kernel(core_id: u32, _magic: u32, _info: *const u8
         stop(0);
     }
     for id in 1..4u32 {
-        let start = starts[id as usize - 1].unwrap();
+        let start = starts[id as usize - 1].as_mut().unwrap();
         STACKS[id as usize].store(start.stack_top, Ordering::Release);
         assert_eq!(
             unsafe { smp::start_core(0, 0x8000, start, delay) },
@@ -423,7 +423,7 @@ fn install_physical_memory() {
     };
     phys_mm::install_low_dma_memory(&DMA);
     let (needed, returned) = arch::memory::supply_pages(Default::default());
-    assert_eq!(returned.count, 0);
+    assert_eq!(returned.len(), 0);
     let (_, unused) = arch::memory::supply_pages(phys_mm::page_batch(needed));
-    assert_eq!(unused.count, 0);
+    assert_eq!(unused.len(), 0);
 }

@@ -143,7 +143,7 @@ pub(super) fn call<A: crate::Core>(
     // The boot session owns the allocation permanently. Read-only guest aliases
     // are removed with the view/address space; they never free the allocation.
     unsafe {
-        crate::kernel::memory::map_shared_pages(machine, base as usize / 4096, pointer, length as usize / 4096);
+        crate::kernel::platform::map_shared_pages(machine, base as usize / 4096, pointer, length as usize / 4096);
     }
     crate::kernel::memory::protect(machine, base as usize / 4096, length as usize / 4096, false, false);
     memory::adopt_shared(state, base, 0);

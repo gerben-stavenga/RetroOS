@@ -154,7 +154,7 @@ impl Scanout {
                     let row = line / repeat;
                     if row >= h || row != self.rows { continue; }
                     let mut frame = match &self.device {
-                        Device::Legacy(v) => device_frame(v, self.memory, mode, now),
+                        Device::Legacy(v) => legacy_frame(v, self.memory, mode, (now / 250_000_000).is_multiple_of(2)),
                         Device::Vbe(v) => v.frame(self.memory),
                     };
                     frame.line_compare = self.split;
@@ -181,7 +181,10 @@ impl Scanout {
     }
 }
 
-fn device_frame<'a>(state: &LegacyVgaState, memory: Memory<'a>, mode: VgaMode, now: u64) -> Frame<'a> {
+/// Decode display registers for the supplied live plane storage.
+pub fn legacy_frame<'a>(
+    state: &LegacyVgaState, memory: Memory<'a>, mode: VgaMode, cursor_phase: bool,
+) -> Frame<'a> {
     let (_, h) = dimensions(mode);
     let planar = matches!(mode, VgaMode::Planar16 { .. } | VgaMode::ModeX { .. });
     let mode13 = matches!(mode, VgaMode::Mode13h);
@@ -197,7 +200,7 @@ fn device_frame<'a>(state: &LegacyVgaState, memory: Memory<'a>, mode: VgaMode, n
         memory: Some(memory), mode, vram: &[], planes: &[], plane_layout: state.layout(),
         ac, palette: state.dac.read(), dac_mask: state.dac_mask.get(),
         font: &[], font_b: &[], font_maps: Some((map_a, map_b)), blink: ac[16] & 8 != 0,
-        text_cursor: crate::TextCursor::from_crtc(&state.crtc.read(), (now / 250_000_000).is_multiple_of(2)),
+        text_cursor: crate::TextCursor::from_crtc(&state.crtc.read(), cursor_phase),
         cga_palette: match mode {
             VgaMode::Cga4 => crate::cga4_palette(state.cga_mode_ctl.get(), state.cga_color_select.get()),
             VgaMode::Cga2 => [0, crate::CGA16[usize::from(state.cga_color_select.get() & 15)], 0, 0],
@@ -205,7 +208,7 @@ fn device_frame<'a>(state: &LegacyVgaState, memory: Memory<'a>, mode: VgaMode, n
         },
         start_offset: if planar || matches!(mode, VgaMode::Text { .. }) { start } else if mode13 { start * 4 } else { 0 },
         pixel_pan: pan, split_pixel_pan: if ac[16] & 0x20 != 0 { 0 } else { pan },
-        line_compare: usize::MAX,
+        line_compare: if planar || mode13 { state.line_compare(h) } else { usize::MAX },
         blank_start: if planar || mode13 { state.vertical_blank_start(h) } else { usize::MAX },
     }
 }

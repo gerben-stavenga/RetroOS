@@ -21,6 +21,13 @@ pub(crate) struct Fill {
     pub(crate) count: usize,
     pub(crate) result: Result<(), MappingFailure>,
 }
+pub(crate) struct Edit {
+    pub(crate) page: UserPage,
+    pub(crate) count: usize,
+    pub(crate) operation: arch_abi::mapping::Edit,
+    pub(crate) result: Result<(), MappingFailure>,
+}
+
 pub(crate) struct ReadRun {
     pub(crate) page: UserPage,
     pub(crate) maximum: usize,
@@ -94,17 +101,29 @@ pub(crate) fn replace_mappings(arguments: &mut Replace<'_>) {
     // Invalidate successful prefixes even when a later replacement failed.
     paging2::flush_tlb();
 }
+fn fill(page: UserPage, count: usize, entry: PageEntry) -> Result<(), MappingFailure> {
+    validate_range(page, count)?;
+    if count == 0 { return Ok(()); }
+    if page.address() >= crate::high_paging::START {
+        crate::high_paging::fill(page, count, entry)
+    } else {
+        batch(page, count, |page, _| replace_page(page, entry))
+    }
+}
+
 pub(crate) fn fill_mappings(arguments: &mut Fill) {
     let _paging = paging2::PagingGuard::lock();
-    let Fill { page, count, entry, result } = arguments;
-    *result = validate_range(*page, *count).and_then(|()| {
-        if *count == 0 { return Ok(()); }
-        if page.address() >= crate::high_paging::START {
-            crate::high_paging::fill(*page, *count, *entry)
-        } else { batch(*page, *count, |page, _| replace_page(page, *entry)) }
-    });
+    arguments.result = fill(arguments.page, arguments.count, arguments.entry);
     paging2::flush_tlb();
 }
+
+pub(crate) fn edit_mappings(arguments: &mut Edit) {
+    let _paging = paging2::PagingGuard::lock();
+    arguments.result = arch_abi::mapping::edit_range(&mut Mappings,
+        arguments.page, arguments.count, arguments.operation, zero_mapping().backing.frame());
+    paging2::flush_tlb();
+}
+
 pub(crate) fn read_mapping_run(arguments: &mut ReadRun) {
     let _paging = paging2::PagingGuard::lock();
     arguments.result = if arguments.maximum == 0 { Err(MappingError::InvalidAddress) }
@@ -288,8 +307,33 @@ fn replace<E: Entry>(entries: &mut [E], page: UserPage, entry: PageEntry) -> Res
     Ok(())
 }
 
-struct Rearrangement;
-impl arch_abi::mapping::Rearrange for Rearrangement {
+#[inline(never)]
+fn copy_frame(source: PhysicalFrame) -> Result<PhysicalFrame, MappingError> {
+    let frame = PhysicalFrame::new(crate::memory::take_page().ok_or(MappingError::NeedPages)?).unwrap();
+    let mut bytes = [0; 4096];
+    // The paging lock protects the temporary window; this runs at ring 0.
+    let saved = paging2::temp_swap(source.number());
+    unsafe { core::ptr::copy_nonoverlapping((&raw const paging2::TEMP_PAGE).cast::<u8>(), bytes.as_mut_ptr(), 4096); }
+    let _ = paging2::temp_swap(frame.number());
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (&raw mut paging2::TEMP_PAGE).cast::<u8>(), 4096); }
+    let _ = paging2::temp_swap(saved);
+    Ok(frame)
+}
+
+struct Mappings;
+impl arch_abi::mapping::EditMappings for Mappings {
+    fn read_run(&mut self, start: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError> {
+        read_run(start, maximum)
+    }
+    fn fill(&mut self, start: UserPage, count: usize, entry: PageEntry) -> Result<(), MappingFailure> {
+        fill(start, count, entry)
+    }
+    fn copy(&mut self, source: PhysicalFrame) -> Result<PhysicalFrame, MappingError> {
+        copy_frame(source)
+    }
+    fn release(&mut self, frame: PhysicalFrame) { crate::memory::release_page(frame.number()); }
+}
+impl arch_abi::mapping::Rearrange for Mappings {
     fn read(&mut self, page: UserPage) -> Result<PageEntry, MappingError> { read_run(page, 1).map(|(entry, _)| entry) }
     fn prepare(&mut self, page: UserPage) -> Result<(), MappingError> {
         let entry = self.read(page)?;
@@ -298,14 +342,7 @@ impl arch_abi::mapping::Rearrange for Rearrangement {
     #[inline(never)]
     fn private_alias(&mut self, page: UserPage) -> Result<(), MappingError> {
         let PageEntry::CopyOnWrite(mut mapping) = self.read(page)? else { return Ok(()); };
-        let frame = PhysicalFrame::new(crate::memory::take_page().ok_or(MappingError::NeedPages)?).unwrap();
-        let mut bytes = [0; 4096];
-        // The paging lock protects the temporary window; this runs at ring 0.
-        let saved = paging2::temp_swap(mapping.backing.frame().number());
-        unsafe { core::ptr::copy_nonoverlapping((&raw const paging2::TEMP_PAGE).cast::<u8>(), bytes.as_mut_ptr(), 4096); }
-        let _ = paging2::temp_swap(frame.number());
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), (&raw mut paging2::TEMP_PAGE).cast::<u8>(), 4096); }
-        let _ = paging2::temp_swap(saved);
+        let frame = copy_frame(mapping.backing.frame())?;
         mapping.backing = Backing::Owned(frame);
         let entry = PageEntry::Writable(mapping);
         let result = self.replace(page, entry);
@@ -339,6 +376,6 @@ pub(crate) struct Rearrange {
 }
 pub(crate) fn rearrange_mappings(args: &mut Rearrange) {
     let _paging = paging2::PagingGuard::lock();
-    args.result = arch_abi::mapping::rearrange(&mut Rearrangement, args.a, args.b, args.count, args.swap);
+    args.result = arch_abi::mapping::rearrange(&mut Mappings, args.a, args.b, args.count, args.swap);
     paging2::flush_tlb();
 }

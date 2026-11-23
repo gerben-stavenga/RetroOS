@@ -50,18 +50,20 @@ fn reserve_transition_preserves_frame_order() {
     let saved = reserve.pages[index];
     let donate: bool = kani::any();
 
+    // A populated reserve only contains nonzero frame numbers.
+    if before != 0 { kani::assume(reserve.pages[before - 1] != 0); }
     if donate {
         kani::assume(before < SUPPLY_CAPACITY);
         let frame: u64 = kani::any();
         kani::assume(frame != 0);
-        reserve.donate(frame);
+        reserve.donate(unsafe { OwnedPage::from_number(frame) });
         assert_eq!(reserve.len(), before + 1);
         assert_eq!(reserve.pages[index], if index == before { frame } else { saved });
-        assert_eq!(reserve.take(), Some(frame));
+        assert_eq!(reserve.take().map(OwnedPage::into_number), Some(frame));
         assert_eq!(reserve.len(), before);
     } else {
         let expected = if before == 0 { None } else { Some(reserve.pages[before - 1]) };
-        assert_eq!(reserve.take(), expected);
+        assert_eq!(reserve.take().map(OwnedPage::into_number), expected);
         assert_eq!(reserve.len(), before.saturating_sub(1));
         assert_eq!(reserve.pages[index], saved);
     }

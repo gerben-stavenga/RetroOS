@@ -1,4 +1,6 @@
 //! Long-mode reservations above the compatibility kernel's PML4 slot.
+#![forbid(unsafe_code)]
+
 use super::*;
 pub(super) const START: u64 = 1 << 39;
 const END: u64 = 1 << 47;
@@ -131,57 +133,29 @@ pub fn unmap<A: crate::Core>(machine: &mut A, linux: &mut LinuxState, a: &Args) 
     result
 }
 
-/// Linux reservation/protection/discard policy over architecture mapping data.
+/// Translate Linux's range operations to architecture paging requests.
 fn apply<A: crate::Core>(machine: &mut A, address: u64, length: u64, operation: u32, protection: u32) -> i32 {
-    use arch_abi::{UserPage, page_entry::{Backing, PageEntry}};
+    use arch_abi::{MappingError, UserPage, mapping::{Edit, Missing, Protection}};
     use crate::kernel::memory;
     let Ok(start) = UserPage::new(address) else { return -EINVAL; };
     let Ok(count) = usize::try_from(length / 4096) else { return -ENOMEM; };
     if count == 0 { return 0; }
     if start.offset(count - 1).is_err() { return -EINVAL; }
-    // MAP_FIXED_NOREPLACE and mprotect validate the whole range before mutation.
-    if matches!(operation, 1 | 3 | 4) {
-        let mut offset = 0;
-        while offset < count {
-            let Ok((entry, run)) = machine.read_mapping_run(start.offset(offset).unwrap(), count - offset) else { return -ENOMEM; };
-            if operation == 4 && entry != PageEntry::Absent { return -17; }
-            if operation != 4 && entry == PageEntry::Absent { return -ENOMEM; }
-            offset += run;
-        }
+    if operation == 2 {
+        return if memory::unmap(machine, start, count).is_ok() { 0 } else { -ENOMEM };
     }
-    if matches!(operation, 0 | 2 | 4) {
-        let mapping = memory::zero_mapping(machine, protection & 4 != 0);
-        let entry = if operation == 2 { PageEntry::Absent }
-            else if protection == 0 { PageEntry::NoAccess(mapping) }
-            else if protection & 2 != 0 { PageEntry::CopyOnWrite(mapping) }
-            else { PageEntry::ReadOnly(mapping) };
-        return if unsafe { memory::fill(machine, start, count, entry) }.is_ok() { 0 } else { -ENOMEM };
+    let access = if protection == 0 { Protection::None }
+        else if protection & 2 != 0 { Protection::ReadWrite } else { Protection::ReadOnly };
+    let executable = protection & 4 != 0;
+    let edit = match operation {
+        0 | 4 => Edit::ReserveZero { access, executable, only_if_vacant: operation == 4 },
+        1 => Edit::Protect { access, executable, missing: Missing::Reject },
+        3 => Edit::Discard,
+        _ => return -EINVAL,
+    };
+    match memory::edit(machine, start, count, edit) {
+        Ok(()) => 0,
+        Err(MappingError::AlreadyMapped) => -17,
+        Err(_) => -ENOMEM,
     }
-    let mut offset = 0;
-    while offset < count {
-        let page = start.offset(offset).unwrap();
-        let Ok((entry, run)) = machine.read_mapping_run(page, count - offset) else { return -ENOMEM; };
-        let (mut mapping, no_access, writable) = match entry {
-            PageEntry::NoAccess(m) => (m, true, false),
-            PageEntry::ReadOnly(m) => (m, false, false),
-            PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) => (m, false, true),
-            _ => return -ENOMEM,
-        };
-        let next = if operation == 3 {
-            let zero = memory::zero_mapping(machine, true);
-            mapping.backing = zero.backing;
-            if no_access { PageEntry::NoAccess(mapping) }
-            else if writable { PageEntry::CopyOnWrite(mapping) } else { PageEntry::ReadOnly(mapping) }
-        } else {
-            mapping.attributes = mapping.attributes.with_executable(protection & 4 != 0);
-            if protection == 0 { PageEntry::NoAccess(mapping) }
-            else if protection & 2 == 0 { PageEntry::ReadOnly(mapping) }
-            else if matches!(mapping.backing, Backing::Owned(_)) || mapping.backing == memory::zero_mapping(machine, true).backing {
-                PageEntry::CopyOnWrite(mapping)
-            } else { PageEntry::Writable(mapping) }
-        };
-        if unsafe { memory::fill(machine, page, run, next) }.is_err() { return -ENOMEM; }
-        offset += run;
-    }
-    0
 }

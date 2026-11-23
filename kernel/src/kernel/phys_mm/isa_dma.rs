@@ -57,3 +57,14 @@ pub fn dma_channel_buf(ch: usize) -> u64 {
     slot.store(page as usize, Ordering::Release);
     page
 }
+
+/// Whether an entire span belongs to one published permanent DMA buffer.
+pub(super) fn contains_channel_pages(first: u64, end: u64) -> bool {
+    DMA_CHANNELS.iter().enumerate().any(|(channel, slot)| {
+        let page = slot.load(Ordering::Acquire);
+        if page == 0 || page == usize::MAX { return false; }
+        let page = page as u64;
+        let pages = if channel < 4 { 16 } else { 32 };
+        first >= page && end <= page + pages
+    })
+}

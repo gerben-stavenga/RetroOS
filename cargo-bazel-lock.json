@@ -1,5 +1,5 @@
 {
-  "checksum": "c05f20baf35e1d563dd7fecdcc335e2695477e553b64acd5880182b027767afa",
+  "checksum": "4e0176edd1908692c97ce86d06fdc5e525cd48af1272e36bb246fee5c59c9273",
   "crates": {
     "aes 0.9.3": {
       "name": "aes",
@@ -1615,6 +1615,10 @@
             {
               "id": "pbkdf2 0.13.0",
               "target": "pbkdf2"
+            },
+            {
+              "id": "pinned-init 0.0.10",
+              "target": "pinned_init"
             },
             {
               "id": "rustc-demangle 0.1.27",
@@ -3524,6 +3528,77 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "paste 1.0.15": {
+      "name": "paste",
+      "version": "1.0.15",
+      "package_url": "https://github.com/dtolnay/paste",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/paste/1.0.15/download",
+          "sha256": "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+        }
+      },
+      "targets": [
+        {
+          "ProcMacro": {
+            "crate_name": "paste",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "paste",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "paste 1.0.15",
+              "target": "build_script_build"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "1.0.15"
+      },
+      "build_script_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "compile_data_glob_excludes": [
+          "**/*.rs"
+        ],
+        "data_glob": [
+          "**"
+        ]
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "pbkdf2 0.13.0": {
       "name": "pbkdf2",
       "version": "0.13.0",
@@ -3581,6 +3656,159 @@
         "MIT"
       ],
       "license_file": "LICENSE-APACHE"
+    },
+    "pinned-init 0.0.10": {
+      "name": "pinned-init",
+      "version": "0.0.10",
+      "package_url": "https://github.com/Rust-for-Linux/pin-init",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/pinned-init/0.0.10/download",
+          "sha256": "e82ef52a6d0cd8fb1282340a1c6fb773f64cd28332b03f58d5428e821798153d"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "pinned_init",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "pinned_init",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "alloc"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "proc_macro_deps": {
+          "common": [
+            {
+              "id": "paste 1.0.15",
+              "target": "paste"
+            },
+            {
+              "id": "pinned-init-macro 0.0.6",
+              "target": "pinned_init_macro"
+            }
+          ],
+          "selects": {}
+        },
+        "rustc_flags": {
+          "common": [
+            "--cfg=RUSTC_LINT_REASONS_IS_STABLE",
+            "--cfg=RUSTC_NEW_UNINIT_IS_STABLE"
+          ],
+          "selects": {}
+        },
+        "version": "0.0.10"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
+    "pinned-init-macro 0.0.6": {
+      "name": "pinned-init-macro",
+      "version": "0.0.6",
+      "package_url": "https://github.com/Rust-for-Linux/pin-init",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/pinned-init-macro/0.0.6/download",
+          "sha256": "3d449b713caa03c1db93b217633063bb185412bd24e11564db0f326a890d8dad"
+        }
+      },
+      "targets": [
+        {
+          "ProcMacro": {
+            "crate_name": "pinned_init_macro",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        },
+        {
+          "BuildScript": {
+            "crate_name": "build_script_build",
+            "crate_root": "build.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "pinned_init_macro",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "pinned-init-macro 0.0.6",
+              "target": "build_script_build"
+            },
+            {
+              "id": "proc-macro2 1.0.106",
+              "target": "proc_macro2"
+            },
+            {
+              "id": "quote 1.0.46",
+              "target": "quote"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "0.0.6"
+      },
+      "build_script_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "compile_data_glob_excludes": [
+          "**/*.rs"
+        ],
+        "data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "rustc_version 0.4.1",
+              "target": "rustc_version"
+            }
+          ],
+          "selects": {}
+        }
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": null
     },
     "pkg-config 0.3.33": {
       "name": "pkg-config",
@@ -4122,6 +4350,54 @@
       ],
       "license_file": "LICENSE-APACHE"
     },
+    "rustc_version 0.4.1": {
+      "name": "rustc_version",
+      "version": "0.4.1",
+      "package_url": "https://github.com/djc/rustc-version-rs",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/rustc_version/0.4.1/download",
+          "sha256": "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "rustc_version",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "rustc_version",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "deps": {
+          "common": [
+            {
+              "id": "semver 1.0.28",
+              "target": "semver"
+            }
+          ],
+          "selects": {}
+        },
+        "edition": "2018",
+        "version": "0.4.1"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
+    },
     "rustversion 1.0.23": {
       "name": "rustversion",
       "version": "1.0.23",
@@ -4435,6 +4711,52 @@
         "Zlib"
       ],
       "license_file": null
+    },
+    "semver 1.0.28": {
+      "name": "semver",
+      "version": "1.0.28",
+      "package_url": "https://github.com/dtolnay/semver",
+      "repository": {
+        "Http": {
+          "url": "https://static.crates.io/crates/semver/1.0.28/download",
+          "sha256": "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+        }
+      },
+      "targets": [
+        {
+          "Library": {
+            "crate_name": "semver",
+            "crate_root": "src/lib.rs",
+            "srcs": {
+              "allow_empty": true,
+              "include": [
+                "**/*.rs"
+              ]
+            }
+          }
+        }
+      ],
+      "library_target_name": "semver",
+      "common_attrs": {
+        "compile_data_glob": [
+          "**"
+        ],
+        "crate_features": {
+          "common": [
+            "default",
+            "std"
+          ],
+          "selects": {}
+        },
+        "edition": "2021",
+        "version": "1.0.28"
+      },
+      "license": "MIT OR Apache-2.0",
+      "license_ids": [
+        "Apache-2.0",
+        "MIT"
+      ],
+      "license_file": "LICENSE-APACHE"
     },
     "sha1 0.11.0": {
       "name": "sha1",
@@ -5732,6 +6054,7 @@
     "md4 0.11.0",
     "num_enum 0.7.6",
     "pbkdf2 0.13.0",
+    "pinned-init 0.0.10",
     "rustc-demangle 0.1.27",
     "sdl2 0.37.0",
     "sha1 0.11.0",

@@ -902,14 +902,18 @@ fn dpmi_api_inner<A: crate::Core>(machine: &mut A, dos: &mut thread::DosState<A>
                 return thread::KernelAction::Done;
             };
 
-            dos.pc.map_physical(
+            if !dos.pc.map_physical(
                 machine,
                 physical,
                 size,
                 virtual_base,
                 page_count,
                 returned_linear,
-            );
+            ) {
+                regs.set_flag32(eflags::CF_FLAG);
+                regs.rax = (regs.rax & !0xFFFF) | 0x8021;
+                return thread::KernelAction::Done;
+            }
             dpmi.phys_mappings[slot] = Some(PhysicalMapping {
                 physical_page_base: physical & !0xFFF,
                 returned_linear,

@@ -199,6 +199,13 @@ impl<'a> Memory<'a> {
         assert_eq!(source.len(), self.len());
         for (i, value) in source.iter().enumerate() { self.put(i, *value); }
     }
+    pub fn bytes(self) -> &'a [AtomicU8] { self.bytes }
+    pub fn copy_to(self, destination: &mut [u8]) {
+        assert_eq!(destination.len(), self.len());
+        for (byte, cell) in destination.iter_mut().zip(self.bytes) {
+            *byte = cell.load(Ordering::Relaxed);
+        }
+    }
     pub fn fill(self, value: u8) {
         for byte in self.bytes { byte.store(value, Ordering::Relaxed); }
     }
@@ -498,21 +505,28 @@ impl Profile {
 
 pub const TRAP_NAME: &str = "vga-planar";
 
-/// Lend the active VGA to the execution context until it is suspended.
-/// # Safety
-/// Both regions must remain resident and valid until detached.
-pub unsafe fn bind(arch: &mut impl arch_abi::X86, binding: Option<Binding>) {
-    use arch_abi::entry::{HookRegion, TrapHook};
-    let hook = binding.map(|binding| {
-        unsafe { (&*binding.registers).refresh_trap_mode(); }
+impl Binding {
+    /// # Safety
+    /// Both regions must remain resident and valid for the descriptor's use.
+    pub unsafe fn descriptor(self) -> arch_abi::entry::TrapHook {
+        use arch_abi::entry::{HookRegion, TrapHook};
+        unsafe { (&*self.registers).refresh_trap_mode(); }
         TrapHook {
             name: TRAP_NAME,
             handler: instruction::trap_handler,
             regions: [
-                HookRegion { base: binding.registers.cast_mut().cast(), bytes: 4096 },
-                HookRegion { base: binding.planes, bytes: 4 * 65536 },
+                HookRegion { base: self.registers.cast_mut().cast(), bytes: 4096 },
+                HookRegion { base: self.planes, bytes: 4 * 65536 },
             ],
         }
-    });
-    unsafe { arch.install_trap_hook(hook); }
+    }
+}
+
+/// Lend the active VGA to the execution context until it is suspended.
+/// # Safety
+/// Both regions must remain resident and valid until detached.
+pub unsafe fn bind(arch: &mut impl arch_abi::X86, binding: Option<Binding>) {
+    arch.install_trap_hook(binding.map(|binding| unsafe {
+        arch_abi::entry::RetainedTrapHook::borrowed(binding.descriptor())
+    }));
 }

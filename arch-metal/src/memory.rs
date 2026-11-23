@@ -1,5 +1,5 @@
 //! CPU-local donated pages, with no allocator dependency or allocation callbacks.
-use arch_abi::page_supply::{FrameOwnership, PageBootstrap, PageInput, PageSupply, FAULT_PAGES};
+use arch_abi::page_supply::{FrameOwnership, OwnedPage, PageBootstrap, PageInput, PageSupply, FAULT_PAGES};
 use crate::paging2;
 #[thread_local]
 static mut SUPPLY: PageSupply = PageSupply::new();
@@ -16,9 +16,9 @@ pub(crate) fn reserve_address() -> usize { unsafe { &raw mut (*supply()).reserve
 pub fn configure(ownership: FrameOwnership) {
     unsafe { (*supply()).ownership = ownership; }
 }
-pub fn bootstrap(boot: PageBootstrap) {
+pub fn bootstrap(boot: &mut PageBootstrap) {
     configure(boot.ownership);
-    for page in boot.pages { unsafe { (*supply()).donate(page); } }
+    for page in boot.take_pages() { unsafe { (*supply()).donate(page); } }
 }
 /// Only owned page numbers enter the operation; no caller storage is retained.
 pub(crate) fn with_input<R>(pages: PageInput, operation: impl FnOnce() -> R) -> (R, PageInput) {
@@ -38,7 +38,7 @@ pub fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
         let Some(page) = pages.take() else { break; };
         state.donate(page);
     }
-    while pages.count < pages.pages.len() && state.returned_head != 0 {
+    while pages.len() < arch_abi::page_supply::SUPPLY_CAPACITY && state.returned_head != 0 {
         let page = state.returned_head;
         let mut next = [0; 8];
         #[cfg(not(feature = "kvm"))]
@@ -51,7 +51,7 @@ pub fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
         }
         state.returned_head = u64::from_ne_bytes(next);
         state.returned_count -= 1;
-        pages.push(page);
+        pages.push(unsafe { OwnedPage::from_number(page) });
     }
     (arch_abi::page_supply::SUPPLY_CAPACITY - state.reserve.len(), pages)
 }
@@ -85,7 +85,7 @@ impl Drop for FaultGuard {
 pub(crate) fn page_available() -> bool {
     unsafe {
         if (*supply()).fault_depth != 0 { (*supply()).reserve.len() != 0 }
-        else { (*(&raw const INPUT)).count != 0 }
+        else { !(*(&raw const INPUT)).is_empty() }
     }
 }
 /// Consume a donated page. Faults use their guaranteed per-core reserve;
@@ -95,9 +95,9 @@ pub fn take_page() -> Option<u64> {
         if (*supply()).fault_depth != 0 {
             let page = (*supply()).take();
             if page.is_some() { (*supply()).fault_pages_current += 1; (*supply()).fault_pages_used += 1; }
-            page
+            page.map(OwnedPage::into_number)
         }
-        else { (*(&raw mut INPUT)).take() }
+        else { (*(&raw mut INPUT)).take().map(OwnedPage::into_number) }
     }
 }
 pub fn get_ref_count(page: u64) -> u8 {
@@ -110,7 +110,7 @@ pub fn release_page(page: u64) {
     if !unsafe { (*supply()).ownership.release_shared(page) } { return; }
     unsafe {
         let state = &mut *supply();
-        if state.reserve.len() < arch_abi::page_supply::SUPPLY_CAPACITY { state.donate(page); return; }
+        if state.reserve.len() < arch_abi::page_supply::SUPPLY_CAPACITY { state.donate(OwnedPage::from_number(page)); return; }
         // The last reference becomes a returned-page list link. Preserve the
         // temporary window even when a COW operation already owns its mapping.
         let saved = paging2::temp_swap(page);

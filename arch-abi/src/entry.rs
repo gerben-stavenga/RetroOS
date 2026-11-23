@@ -372,3 +372,26 @@ pub struct TrapHook {
     pub handler: TrapHandler,
     pub regions: [HookRegion; 2],
 }
+
+/// A hook with storage retained on the calling side of the architecture
+/// boundary. The execution image receives only the raw descriptor.
+pub struct RetainedTrapHook {
+    descriptor: TrapHook,
+    _owner: Option<alloc::sync::Arc<dyn Send + Sync>>,
+}
+
+impl RetainedTrapHook {
+    /// # Safety
+    /// The regions must be valid for the handler while `owner` is retained.
+    pub unsafe fn new(descriptor: TrapHook, owner: alloc::sync::Arc<dyn Send + Sync>) -> Self {
+        Self { descriptor, _owner: Some(owner) }
+    }
+
+    /// # Safety
+    /// Both regions and their handler must stay valid until the hook is detached.
+    pub unsafe fn borrowed(descriptor: TrapHook) -> Self {
+        Self { descriptor, _owner: None }
+    }
+
+    pub fn descriptor(&self) -> TrapHook { self.descriptor }
+}

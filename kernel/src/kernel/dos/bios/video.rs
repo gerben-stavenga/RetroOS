@@ -236,7 +236,7 @@ fn font_service<A: crate::Core>(
         }
     } else {
         machine::vga::bios_load_font(
-            machine, &mut dos.pc.vga, map, first, font, glyph_h,
+            &mut dos.pc.vga, map, first, font, glyph_h,
         );
         if set_geometry {
             machine::vga::bios_set_text_height(&mut dos.pc.vga, glyph_h as u8);
@@ -280,8 +280,8 @@ pub(in crate::kernel::dos) fn install_codepage_font<A: crate::Core>(
         call.rcx = 256;
         display.cap_mut().bios_font_call(machine, bios_display, &mut call, Some(font)).is_ok()
     } else {
-        machine::vga::bios_load_font(machine, &mut dos.pc.vga, 0, 0, font, height);
-        machine::vga::bios_load_font(machine, &mut dos.pc.vga, 1, 0, font, height);
+        machine::vga::bios_load_font(&mut dos.pc.vga, 0, 0, font, height);
+        machine::vga::bios_load_font(&mut dos.pc.vga, 1, 0, font, height);
         true
     };
     if installed {

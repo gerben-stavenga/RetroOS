@@ -158,7 +158,7 @@ pub fn init_test_ram() {
         #[cfg(feature = "tcg")]
         {
             let mut input = PageInput::new();
-            for _ in 0..64 { input.push(test_memory::alloc_backed_pages(1)); }
+            for _ in 0..64 { input.push(test_memory::alloc_owned_page()); }
             INPUT.with(|p| p.replace(input));
         }
     });
@@ -170,7 +170,7 @@ use crate::test_memory;
 #[cfg(any(feature = "tcg", test))]
 use arch_abi::page_supply::PageInput;
 #[cfg(feature = "tcg")]
-use arch_abi::page_supply::PageSupply;
+use arch_abi::page_supply::{OwnedPage, PageSupply};
 #[cfg(feature = "tcg")]
 use arch_abi::page_supply::FAULT_PAGES;
 #[cfg(feature = "tcg")]
@@ -215,11 +215,11 @@ pub(crate) fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
         let Some(page) = pages.take() else { break; };
         state.donate(page);
     }
-    while pages.count < pages.pages.len() && state.returned_head != 0 {
+    while pages.len() < arch_abi::page_supply::SUPPLY_CAPACITY && state.returned_head != 0 {
         let page = state.returned_head;
         state.returned_head = unsafe { frame_ptr(page).cast::<u64>().read() };
         state.returned_count -= 1;
-        pages.push(page);
+        pages.push(unsafe { OwnedPage::from_number(page) });
     }
     (arch_abi::page_supply::SUPPLY_CAPACITY - state.reserve.len(), pages)
 }
@@ -227,7 +227,7 @@ pub(crate) fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
 pub(crate) fn can_fault() -> bool { unsafe { (*supply()).reserve.len() >= FAULT_PAGES } }
 #[cfg(feature = "tcg")]
 pub(crate) fn take_input() -> Option<u64> {
-    INPUT.with(|p| p.borrow_mut().take()).map(zero)
+    INPUT.with(|p| p.borrow_mut().take()).map(|page| zero(page.into_number()))
 }
 #[cfg(feature = "tcg")]
 pub(crate) fn take_fault() -> Option<u64> {
@@ -235,7 +235,7 @@ pub(crate) fn take_fault() -> Option<u64> {
         let state = &mut *supply();
         let page = state.take()?;
         state.fault_pages_used += 1;
-        Some(zero(page))
+        Some(zero(page.into_number()))
     }
 }
 #[cfg(feature = "tcg")]
@@ -256,7 +256,7 @@ pub(crate) fn release(page: u64) {
     unsafe {
         let state = &mut *supply();
         if !state.ownership.release_shared(page) { return; }
-        if state.reserve.len() < arch_abi::page_supply::SUPPLY_CAPACITY { state.donate(page); }
+        if state.reserve.len() < arch_abi::page_supply::SUPPLY_CAPACITY { state.donate(OwnedPage::from_number(page)); }
         else {
             frame_ptr(page).cast::<u64>().write(state.returned_head);
             state.returned_head = page;
@@ -269,10 +269,10 @@ pub(crate) fn release(page: u64) {
 #[cfg(test)]
 pub(crate) fn refill_test_reserve() {
     let (needed, mut returned) = supply_pages(PageInput::new());
-    while let Some(page) = returned.take() { test_memory::free_phys_page(page); }
+    while let Some(page) = returned.take() { test_memory::free_phys_page(page.into_number()); }
     let mut pages = PageInput::new();
-    for _ in 0..needed { pages.push(test_memory::alloc_backed_pages(1)); }
-    assert_eq!(supply_pages(pages).1.count, 0);
+    for _ in 0..needed { pages.push(test_memory::alloc_owned_page()); }
+    assert_eq!(supply_pages(pages).1.len(), 0);
 }
 
 #[cfg(feature = "kvm")]

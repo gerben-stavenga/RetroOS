@@ -6,6 +6,12 @@ use std::sync::Mutex;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+// The tests hold TEST_LOCK and release their test frames before changing the pool.
+fn reset_test_pool() {
+    *POOL.lock() = None;
+    *RECLAIM.lock() = None;
+}
+
 fn layout(entries: impl Iterator<Item = MemoryRegion> + Clone, limit: u64) -> &'static FrameLayout {
     let mut layout = FrameLayout::from_memory_map(entries, limit);
     layout.exclude(0, 0x100000 / PAGE_SIZE as u64);
@@ -15,6 +21,7 @@ fn layout(entries: impl Iterator<Item = MemoryRegion> + Clone, limit: u64) -> &'
 #[test]
 fn firmware_holes_high_ram_and_exhaustion() {
     let _guard = TEST_LOCK.lock().unwrap();
+    reset_test_pool();
     let map = [
         MemoryRegion { base: 0, length: 0x100000, usable: true },
         // Integrated graphics/firmware has reserved the first 256 MiB.
@@ -25,47 +32,62 @@ fn firmware_holes_high_ram_and_exhaustion() {
     let occupied = [256..258];
     bootstrap(layout(map.into_iter(), 1 << 24), &occupied).finish();
     assert_eq!(free_page_count(), 4);
-    assert_eq!(alloc_phys_page(), Some(0x10000));
-    assert_eq!(alloc_phys_page(), Some(0x10001));
-    assert_eq!(alloc_phys_page(), Some(0x10002));
-    assert_eq!(alloc_phys_page(), Some(0x100000));
-    assert_eq!(alloc_phys_page(), None);
-    free_phys_page(0x10001);
-    assert_eq!(alloc_phys_page(), Some(0x10001));
-    free_phys_page(0x10001);
+    let first = alloc_phys_page().unwrap();
+    let second = alloc_phys_page().unwrap();
+    let third = alloc_phys_page().unwrap();
+    let high = alloc_phys_page().unwrap();
+    assert_eq!([first.number(), second.number(), third.number(), high.number()],
+        [0x10000, 0x10001, 0x10002, 0x100000]);
+    assert!(alloc_phys_page().is_none());
+    free_phys_page(second);
+    let reused = alloc_phys_page().unwrap();
+    assert_eq!(reused.number(), 0x10001);
+    free_phys_page(reused);
     assert_eq!(alloc_phys_contig(1), Some(0x10001));
-    free_phys_contig(0x10001, 1);
+    unsafe { free_phys_contig(0x10001, 1); }
     assert_eq!(free_page_count(), 1);
     assert_eq!(alloc_phys_contig(usize::MAX), None);
+    for page in [first, third, high] { free_phys_page(page); }
+    assert_eq!(free_page_count(), 4);
+}
 
+#[test]
+fn reclaimed_page_can_be_donated_once() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    reset_test_pool();
     // A small, fully allocated machine must terminate after wrapping even
     // when the last successful allocation ended at the tracked RAM limit.
     let small = [MemoryRegion { base: 0, length: 259 * 4096, usable: true }];
-    bootstrap(layout(small.into_iter(), 1 << 24), &occupied).finish();
-    assert_eq!(alloc_phys_page(), Some(258));
-    assert_eq!(alloc_phys_page(), None);
+    bootstrap(layout(small.into_iter(), 1 << 24), &[256..258]).finish();
+    let page = alloc_phys_page().unwrap();
+    assert_eq!(page.number(), 258);
+    assert!(alloc_phys_page().is_none());
     assert_eq!(free_page_count(), 0);
-    static DONATION: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(258);
-    fn donate() -> Option<u64> {
-        match DONATION.swap(0, core::sync::atomic::Ordering::Relaxed) { 0 => None, page => Some(page) }
-    }
-    set_reclaim(donate);
-    assert_eq!(alloc_phys_page(), Some(258), "reclaim transfers existing ownership");
-    assert_eq!(alloc_phys_page(), None);
-    free_phys_page(258);
-    assert_eq!(free_page_count(), 1);
-    // Owned batches stop at exhaustion and leave transfer/rejection to arch.
-    let mut pages = page_batch(64);
-    assert_eq!(pages.count, 1);
-    assert_eq!(pages.take(), Some(258));
-    assert_eq!(page_batch(1).count, 0);
-    free_phys_page(258);
 
+    static DONATION: Mutex<Option<OwnedPage>> = Mutex::new(None);
+    fn donate() -> Option<OwnedPage> { DONATION.lock().unwrap().take() }
+    *DONATION.lock().unwrap() = Some(page);
+    set_reclaim(donate);
+    let page = alloc_phys_page().unwrap();
+    assert_eq!(page.number(), 258);
+    assert!(alloc_phys_page().is_none());
+    free_phys_page(page);
+    assert_eq!(free_page_count(), 1);
+
+    let mut pages = page_batch(64);
+    assert_eq!(pages.numbers(), &[258]);
+    let page = pages.take().unwrap();
+    assert_eq!(page.number(), 258);
+    assert!(pages.is_empty());
+    assert!(page_batch(1).is_empty());
+    free_phys_page(page);
+    assert_eq!(free_page_count(), 1);
 }
 
 #[test]
 fn enabling_all_frames_preserves_reservations_beyond_the_bootstrap_bitmap() {
     let _guard = TEST_LOCK.lock().unwrap();
+    reset_test_pool();
     let first = 0x100;
     let bootstrap_pages = (BOOTSTRAP_BYTES * 8) as u64;
     let reserved = first + bootstrap_pages;
@@ -78,13 +100,17 @@ fn enabling_all_frames_preserves_reservations_beyond_the_bootstrap_bitmap() {
     allocator.finish();
     assert_eq!(free_page_count(), bootstrap_pages as usize + 1);
     assert_eq!(alloc_contig(bootstrap_pages as usize), Some(first));
-    assert_eq!(alloc_phys_page(), Some(reserved + 1));
-    assert_eq!(alloc_phys_page(), None);
+    let frame = alloc_phys_page().unwrap();
+    assert_eq!(frame.number(), reserved + 1);
+    assert!(alloc_phys_page().is_none());
+    free_phys_page(frame);
+    unsafe { free_phys_contig(first, bootstrap_pages as usize); }
 }
 
 #[test]
 fn direct_ram_reuses_contiguous_pages() {
     let _guard = TEST_LOCK.lock().unwrap();
+    reset_test_pool();
     let bytes = 0x100000 + 16 * PAGE_SIZE;
     let storage = Layout::from_size_align(bytes, PAGE_SIZE).unwrap();
     let ram = unsafe { alloc_zeroed(storage) };
@@ -104,6 +130,9 @@ fn direct_ram_reuses_contiguous_pages() {
     let reused = alloc_direct_pages(16);
     assert_eq!(reused, first);
     assert!(unsafe { core::slice::from_raw_parts(direct_pointer(reused), 16 * PAGE_SIZE) }.iter().all(|&b| b == 0));
-    free_phys_contig(reused, 16);
+    unsafe { free_phys_contig(reused, 16); }
     assert_eq!(free_page_count(), 16);
+    DIRECT_BASE.store(0, Ordering::Release);
+    DIRECT_BYTES.store(0, Ordering::Release);
+    unsafe { dealloc(ram, storage); }
 }

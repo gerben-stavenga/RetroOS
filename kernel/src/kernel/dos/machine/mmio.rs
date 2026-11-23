@@ -1,22 +1,20 @@
 //! Kernel guest-memory access for device instructions.
+#![forbid(unsafe_code)]
+
 use crate::Regs;
-use arch_abi::entry::TrapAccess;
-use planar::instruction::{FaultBus, Operands};
+use planar::instruction::{FaultBus, GuestMemory, Operands};
 
 struct GuestAccess<'a, A>(&'a mut A);
 
-unsafe impl<A: crate::Core> TrapAccess for GuestAccess<'_, A> {
-    fn segment(&self, selector: u16) -> (u32, u32, bool) {
-        (A::seg_base(selector), u32::MAX, A::seg_is_32(selector))
-    }
+impl<A: crate::Core> GuestMemory for GuestAccess<'_, A> {
     fn resident(&self, address: u32, len: u32, _: bool) -> bool {
         address.checked_add(len).is_some_and(|end| end <= 0xc000_0000)
     }
-    unsafe fn read(&self, address: u32) -> u8 { self.0.read(u64::from(address)) }
-    unsafe fn read_bytes(&self, address: u32, bytes: &mut [u8]) {
+    fn read(&self, address: u32) -> u8 { self.0.read(u64::from(address)) }
+    fn read_bytes(&self, address: u32, bytes: &mut [u8]) {
         self.0.copy_from(u64::from(address), bytes);
     }
-    unsafe fn write(&mut self, address: u32, byte: u8) { self.0.write(u64::from(address), byte); }
+    fn write(&mut self, address: u32, byte: u8) { self.0.write(u64::from(address), byte); }
     fn fpu_st0(&self) -> [u8; 10] { self.0.fpu_st0() }
     fn fpu_pop(&mut self) { self.0.fpu_pop(); }
 }
@@ -58,8 +56,7 @@ pub fn voodoo_fault<A: crate::Core>(machine: &mut A, regs: &mut Regs, device: &m
 
 pub fn planar_fault<A: crate::Core>(machine: &mut A, regs: &mut Regs, state: &super::vga::LegacyVgaState,
     segments: &[u32; 6], limit: u32, default32: bool, address: u32) -> bool {
-    let Some(planes) = super::vga::live_vram_ptr_if_initialized() else { return false };
-    let planes = unsafe { planar::Memory::mapped(planes.as_ptr(), 4 * 65536) };
-    operands(regs, |regs| planar::instruction::planar_fault(&state.registers, planes,
+    let Some(planes) = super::vga::live_planes() else { return false };
+    operands(regs, |regs| planar::instruction::planar_fault(&state.registers, planes.planar(),
         &mut GuestAccess(machine), regs, segments, limit, default32, address))
 }

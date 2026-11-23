@@ -354,7 +354,41 @@ pub fn validate(handle: i32, offset: usize, length: usize, writable: bool) -> Re
     Ok(())
 }
 
-pub fn acquire<A: crate::Core>(_machine: &mut A, handle: i32, offset: u32, writable: bool) -> Result<(Key, u64), i32> {
+#[must_use]
+pub struct SharedPage {
+    key: Key,
+    frame: arch_abi::page_entry::PhysicalFrame,
+}
+
+impl SharedPage {
+    pub fn key(&self) -> Key { self.key }
+
+    pub fn retain(&self) -> Self {
+        VFS.lock().file_pages.get_mut(&self.key).expect("live mapped file page").refs += 1;
+        Self { key: self.key, frame: self.frame }
+    }
+
+    /// # Safety
+    /// Retain this pin until removing the mapping and retain a pin for each
+    /// fork that can keep the mapping alive.
+    pub unsafe fn map<A: crate::Core>(&self, machine: &mut A, address: usize,
+        writable: bool, executable: bool,
+    ) -> Result<(), arch_abi::MappingError> {
+        use arch_abi::{UserPage, mapping::{Access, Install}, page_entry::Attributes};
+        let page = UserPage::new(address as u64)?;
+        let access = if writable { Access::ReadWrite } else { Access::ReadOnly };
+        // The address-space alias retains this pin until unmap. Fork retains
+        // another pin before it can release either address space.
+        let entry = unsafe { Install::borrowed(self.frame, access,
+            Attributes::default().with_executable(executable)) };
+        crate::kernel::memory::install(machine, page, &[entry])
+    }
+
+    /// Release this pin after its guest view is gone.
+    pub fn release(self) { release(self.key); }
+}
+
+pub fn acquire(handle: i32, offset: u32, writable: bool) -> Result<SharedPage, i32> {
     let mut vfs = VFS.lock();
     let key = vfs.mapping_key(handle, offset)?;
     let mut bytes = alloc::vec![0; PAGE_SIZE];
@@ -364,6 +398,7 @@ pub fn acquire<A: crate::Core>(_machine: &mut A, handle: i32, offset: u32, writa
     if n as u32 != expected { return Err(-5); }
     if !vfs.file_pages.contains_key(&key) { return Err(-12); }
     let physical = vfs.file_pages[&key].data.physical().ok_or(-12)?;
+    let frame = arch_abi::page_entry::PhysicalFrame::new(physical).map_err(|_| -12)?;
     if !vfs.file_pages[&key].pinned() {
         vfs.file_pages.get_mut(&key).unwrap().handle = handle;
         vfs.pin_mapping_handle(handle);
@@ -376,7 +411,7 @@ pub fn acquire<A: crate::Core>(_machine: &mut A, handle: i32, offset: u32, writa
     let page = vfs.file_pages.get_mut(&key).unwrap();
     page.refs += 1;
     page.writable |= writable;
-    Ok((key, physical))
+    Ok(SharedPage { key, frame })
 }
 
 /// Private mappings own counted aliases. They need no retained backend handle
@@ -414,8 +449,8 @@ pub fn map_private<A: crate::Core>(machine: &mut A, handle: i32, offset: usize,
                 continue;
             }
             let key = vfs.mapping_key(handle, (at + index * 4096) as u32)?;
-            let frame = vfs.file_pages.get(&key).and_then(|p| p.data.physical()).ok_or(-12)?;
-            if !crate::kernel::memory::map_cached_frame(machine, address / 4096, frame, false, protection & 2 != 0, protection & 4 != 0) {
+            let frame = vfs.file_pages.get(&key).and_then(|p| p.data.owned_page()).ok_or(-12)?;
+            if crate::kernel::memory::map_cached_private(machine, address / 4096, frame, protection & 2 != 0, protection & 4 != 0).is_err() {
                 return Err(-12);
             }
         }
@@ -426,7 +461,7 @@ pub fn map_private<A: crate::Core>(machine: &mut A, handle: i32, offset: usize,
 
 /// Called by the physical allocator on exhaustion, including ring 0. Never
 /// reenter VFS or privileged frame operations: only transfer exclusive frames.
-pub(crate) fn reclaim_frame() -> Option<u64> {
+pub(crate) fn reclaim_frame() -> Option<arch_abi::page_supply::OwnedPage> {
     let mut vfs = VFS.try_lock()?;
     while let Some(frame) = vfs.evict_clean_page() {
         if let Some(frame) = frame.into_reclaimed() { return Some(frame); }
@@ -438,12 +473,7 @@ pub(crate) fn reclaim_pressure() {
     if let Some(mut vfs) = VFS.try_lock() { vfs.make_page_room(); }
 }
 
-pub fn retain(key: Key) {
-    VFS.lock().file_pages.get_mut(&key).expect("live mapped file page").refs += 1;
-}
-
-/// Caller must remove its guest alias before releasing the last reference.
-pub fn release<A: crate::Core>(_machine: &mut A, key: Key) {
+fn release(key: Key) {
     let mut vfs = VFS.lock();
     let page = vfs.file_pages.get_mut(&key).expect("live mapped file page");
     page.refs -= 1;

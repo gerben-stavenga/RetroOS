@@ -13,6 +13,7 @@
 //! entries through plain function hooks — no `cfg` anywhere in this crate.
 
 #![no_std]
+#![recursion_limit = "512"] // pinned-init expands each field of DosState recursively.
 #![feature(optimize_attribute)]
 #![feature(thread_local)]
 

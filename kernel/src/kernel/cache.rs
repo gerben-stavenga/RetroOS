@@ -1,10 +1,11 @@
 //! Kernel cache storage. Contents are physical frames; only ownership and
 //! indexes occupy permanent kernel address space. Core supplies mechanisms.
 use alloc::boxed::Box;
+use arch_abi::page_supply::OwnedPage;
 use spin::Once;
 
 static INSTALLED: Once<()> = Once::new();
-pub(crate) fn install(reclaim: fn() -> Option<u64>) {
+pub(crate) fn install(reclaim: fn() -> Option<OwnedPage>) {
     INSTALLED.call_once(|| ());
     super::phys_mm::set_reclaim(reclaim);
 }
@@ -15,7 +16,7 @@ pub(crate) fn reserve() -> usize {
 }
 
 pub(crate) struct Frame {
-    physical: Option<u64>,
+    physical: Option<OwnedPage>,
     // Pure kernel tests without a machine use the same storage API.
     bytes: Option<Box<[u8]>>,
 }
@@ -24,33 +25,32 @@ impl Frame {
         assert_eq!(bytes.len(), 4096);
         if installed() {
             let physical = super::phys_mm::alloc_phys_page().ok_or(-12)?;
-            super::platform::write_physical_frame(physical, 0, bytes);
+            super::platform::write_physical_frame(physical.number(), 0, bytes);
             Ok(Self { physical: Some(physical), bytes: None })
         } else {
             Ok(Self { physical: None, bytes: Some(bytes.into()) })
         }
     }
-    pub fn physical(&self) -> Option<u64> { self.physical }
+    pub fn owned_page(&self) -> Option<&OwnedPage> { self.physical.as_ref() }
+    pub fn physical(&self) -> Option<u64> { self.physical.as_ref().map(OwnedPage::number) }
     pub fn read(&self, offset: usize, bytes: &mut [u8]) {
         assert!(offset <= 4096 && bytes.len() <= 4096 - offset);
-        if let Some(page) = self.physical { super::platform::read_physical_frame(page, offset, bytes); }
+        if let Some(page) = self.physical() { super::platform::read_physical_frame(page, offset, bytes); }
         else { bytes.copy_from_slice(&self.bytes.as_ref().unwrap()[offset..offset + bytes.len()]); }
     }
     pub fn write(&mut self, offset: usize, bytes: &[u8]) {
         assert!(offset <= 4096 && bytes.len() <= 4096 - offset);
-        if let Some(page) = self.physical { super::platform::write_physical_frame(page, offset, bytes); }
+        if let Some(page) = self.physical() { super::platform::write_physical_frame(page, offset, bytes); }
         else { self.bytes.as_mut().unwrap()[offset..offset + bytes.len()].copy_from_slice(bytes); }
     }
-    pub fn into_reclaimed(mut self) -> Option<u64> {
+    pub fn into_reclaimed(mut self) -> Option<OwnedPage> {
         let page = self.physical.take()?;
-        super::platform::release_frame_reference(page).then_some(page)
+        super::platform::release_frame_reference(page)
     }
 }
 impl Drop for Frame {
     fn drop(&mut self) {
-        if let Some(page) = self.physical
-            && super::platform::release_frame_reference(page)
-        {
+        if let Some(page) = self.physical.take().and_then(super::platform::release_frame_reference) {
             super::phys_mm::free_phys_page(page);
         }
     }

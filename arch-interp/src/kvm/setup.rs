@@ -8,10 +8,10 @@ use arch_abi::vm::{self, Exchange};
 pub(super) struct KvmCpu {
     pub _vm: VmFd,
     pub tid: libc::pid_t,
-    pub hook_installed: bool,
     pub vcpu: VcpuFd,
     pub image: *mut u8,
     pub message: *mut Exchange,
+    hook: Option<arch_abi::entry::RetainedTrapHook>,
 }
 impl KvmCpu {
     pub(super) fn frame(&self, page: u64) -> *mut u8 {
@@ -67,7 +67,7 @@ fn init() -> KvmCpu {
     super::entry::boot(&vcpu, entry);
     let tid = unsafe { libc::gettid() };
     install_alarm(&mut vcpu, tid);
-    let mut cpu = KvmCpu { hook_installed: false, _vm: vmfd, tid, vcpu, image: image.cast(), message: core::ptr::null_mut() };
+    let mut cpu = KvmCpu { hook: None, _vm: vmfd, tid, vcpu, image: image.cast(), message: core::ptr::null_mut() };
     super::run::until_return(&mut cpu, false);
     let message = unsafe { &mut *cpu.message };
     message.operation = vm::op::CONFIGURE;
@@ -159,13 +159,13 @@ impl Drop for KvmCpu {
 
 /// Map the owner's resident pages into the supervisor for the duration of a
 /// loan. No host pointer appears in a VM request or in supervisor storage.
-pub(super) unsafe fn install_trap_hook(hook: Option<arch_abi::entry::TrapHook>) {
+pub(super) fn install_trap_hook(hook: Option<arch_abi::entry::RetainedTrapHook>) {
     with(|cpu| {
-        if hook.is_none() && !cpu.hook_installed { return; }
+        if hook.is_none() && cpu.hook.is_none() { return; }
         let message = unsafe { &mut *cpu.message };
         let mut args = [0; 6];
-        if let Some(hook) = hook {
-            assert!(!cpu.hook_installed, "detach trap hook before replacing it");
+        if let Some(hook) = hook.as_ref().map(|hook| hook.descriptor()) {
+            assert!(cpu.hook.is_none(), "detach trap hook before replacing it");
             assert!(hook.regions.iter().map(|region| region.bytes).sum::<usize>() <= vm::HOOK_PAGES * 4096);
             let mut physical = vm::HOOK_PHYSICAL;
             for (index, region) in hook.regions.into_iter().enumerate() {
@@ -195,6 +195,6 @@ pub(super) unsafe fn install_trap_hook(hook: Option<arch_abi::entry::TrapHook>) 
                 }) }.expect("unmap trap hook storage");
             }
         }
-        cpu.hook_installed = hook.is_some();
+        cpu.hook = hook;
     })
 }

@@ -48,9 +48,9 @@ unsafe impl core::alloc::GlobalAlloc for KernelHeap {
             let mut table = None;
             while start != 0 && end < limit {
                 if table.is_none() { table = phys_mm::alloc_resident_page(); }
-                let Some(spare) = table else { break; };
+                let Some(spare) = table.as_ref() else { break; };
                 let Some(frame) = phys_mm::alloc_resident_page() else { break; };
-                if arch::map_heap_page(end, frame, spare) { table = None; }
+                if arch::map_heap_page(end, frame.into_number(), spare.number()) { table = None; }
                 end += 4096;
             }
             // The spare is exclusive and never had reference metadata.
@@ -432,10 +432,10 @@ unsafe fn prepare_boot(
     let ownership = crate::kernel::platform::init_memory(layout, &occupied, zero_page);
     arch::memory::configure(ownership);
     install_isa_dma_memory();
-    crate::kernel::memory::set_text_frame(phys_mm::alloc_contig(8).expect("no VGA backing pages"));
+    crate::kernel::platform::allocate_text_frame();
     crate::kernel::klog::init();
     let table = phys_mm::alloc_phys_page().expect("physical aperture table");
-    if !arch::aperture::init(table) { phys_mm::free_phys_page(table); }
+    if !arch::aperture::init(table.number()) { phys_mm::free_phys_page(table); }
 
     // Every core shares these resident kernel tables. Install all parents
     // before AP startup, so heap growth and device mappings only change leaves;
@@ -443,7 +443,7 @@ unsafe fn prepare_boot(
     // A 2 MiB chunk needs at most one table in either paging format.
     let mut table = phys_mm::alloc_resident_page().expect("kernel page table");
     for page in (LOW_MEM_BASE / PAGE_SIZE..1 << 20).step_by(512) {
-        if paging2::prepare_kernel_mapping(page, 512, table) {
+        if paging2::prepare_kernel_mapping(page, 512, table.number()) {
             table = phys_mm::alloc_resident_page().expect("kernel page table");
         }
     }
@@ -453,7 +453,10 @@ unsafe fn prepare_boot(
     // Retain the existing identity mapping until every startup has completed.
     unsafe { smp::start(screen, &acpi_rsdp[..acpi_rsdp_len], trampoline); }
     paging2::finish_setup_paging();
-    if let Some(page) = trampoline_frame { phys_mm::free_phys_page(page); }
+    if let Some(page) = trampoline_frame {
+        // Boot reserved this frame in the physical allocator until all APs started.
+        phys_mm::free_phys_page(unsafe { arch_abi::page_supply::OwnedPage::from_number(page) });
+    }
 
     let boot_modules = crate::multiboot::handoff_modules(boot_modules_raw);
 

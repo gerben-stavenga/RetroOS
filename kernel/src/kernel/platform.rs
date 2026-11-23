@@ -9,6 +9,8 @@
 //! private `static` verdict. Adding an enum variant breaks every policy
 //! site at compile time — deliberately.
 
+use crate::Core;
+use arch_abi::{mapping::{Access, Install}, page_entry::{Attributes, PhysicalFrame}};
 use arch_abi::page_supply::{FrameLayout, FrameOwnership};
 
 /// A mode advertised by the machine's physical video BIOS. Its physical base,
@@ -726,11 +728,11 @@ pub(crate) fn dma_buffer(
         Some((page, prefix, suffix, phys, va))
     })();
     let Some((page, prefix, suffix, phys, va)) = span else {
-        phys_mm::free_phys_contig(raw, raw_pages);
+        unsafe { phys_mm::free_phys_contig(raw, raw_pages); }
         return None;
     };
-    if prefix != 0 { phys_mm::free_phys_contig(raw, prefix); }
-    if suffix != 0 { phys_mm::free_phys_contig(page + pages as u64, suffix); }
+    if prefix != 0 { unsafe { phys_mm::free_phys_contig(raw, prefix); } }
+    if suffix != 0 { unsafe { phys_mm::free_phys_contig(page + pages as u64, suffix); } }
     map_kernel_physical(va >> 12, pages, page, 0);
     unsafe { core::ptr::write_bytes(va as *mut u8, 0, bytes) };
     Some(Region { va, phys, bytes })
@@ -761,6 +763,122 @@ pub(crate) fn map_kernel_physical(vpage: usize, pages: usize, physical: u64, fla
 
 pub(crate) fn unmap_kernel_pages(vpage: usize, pages: usize) {
     map_kernel_physical(vpage, pages, 0, arch_abi::MAP_MMIO);
+}
+
+const TEXT_PAGES: usize = 8;
+static TEXT_FRAME: spin::Once<u64> = spin::Once::new();
+
+#[cfg(target_arch = "x86")]
+pub(crate) fn allocate_text_frame() {
+    TEXT_FRAME.call_once(|| super::phys_mm::alloc_contig(TEXT_PAGES).expect("no VGA backing pages"));
+}
+
+pub(crate) fn text_frame() -> Option<u64> { TEXT_FRAME.get().copied() }
+
+pub(crate) fn physical_view_allowed(first: u64, count: usize) -> bool {
+    let Some(end) = first.checked_add(count as u64) else { return false; };
+    let layout = FRAME_LAYOUT.get().expect("physical memory not initialized");
+    if !layout.regions().iter().any(|region| first < region.end && region.first < end) {
+        return true;
+    }
+    // These allocations are permanently reserved and intentionally guest-visible.
+    text_frame().is_some_and(|text| first >= text && end <= text + TEXT_PAGES as u64)
+        || super::phys_mm::contains_dma_channel_pages(first, end)
+}
+
+/// A platform-owned firmware/device view with boot-lifetime backing.
+pub(super) struct PhysicalView {
+    first: u64,
+    count: usize,
+}
+
+impl PhysicalView {
+    pub(super) fn new(first: u64, count: usize) -> Option<Self> {
+        if !physical_view_allowed(first, count) { return None; }
+        if count != 0 {
+            PhysicalFrame::new(first.checked_add((count - 1) as u64)?).ok()?;
+        }
+        Some(Self { first, count })
+    }
+
+    pub(super) fn mapping(&self, offset: usize, attributes: Attributes) -> Install<'static> {
+        assert!(offset < self.count);
+        let frame = PhysicalFrame::new(self.first + offset as u64).unwrap();
+        // This range excludes allocator RAM apart from permanent device buffers.
+        unsafe { Install::borrowed(frame, Access::ReadWrite, attributes) }
+    }
+}
+
+/// Resident RAM shared with guest mappings. The backing stays allocated for
+/// the boot session, so views and guest mappings can outlive a VGA mode change.
+pub(crate) struct ResidentSharedPages(&'static [core::sync::atomic::AtomicU8]);
+
+impl ResidentSharedPages {
+    pub(crate) fn allocate(pages: usize) -> Self {
+        let base = super::phys_mm::alloc_shared_pages(pages);
+        let bytes = pages.checked_mul(crate::PAGE_SIZE).unwrap();
+        // This allocation is never freed. Kernel accesses use byte atomics
+        // because the active guest and scanout worker can share the backing.
+        Self(unsafe { core::slice::from_raw_parts(base.as_ptr().cast(), bytes) })
+    }
+
+    pub(crate) fn bytes(&self) -> &'static [core::sync::atomic::AtomicU8] { self.0 }
+
+    pub(crate) fn map(
+        &self, machine: &mut impl Core, page: usize, pages: usize, accessible: bool,
+    ) {
+        assert!(pages <= self.0.len() / crate::PAGE_SIZE);
+        let base = core::ptr::NonNull::from(&self.0[0]).cast();
+        // The allocation outlives all guest aliases.
+        unsafe {
+            if accessible {
+                map_shared_pages(machine, page, base, pages);
+            } else {
+                map_protected_shared_pages(machine, page, base, pages);
+            }
+        }
+    }
+}
+
+/// Borrow shared allocation pages into a user view. Ownership remains with the
+/// allocation; allocation and mapping are separate architecture mechanisms.
+/// # Safety
+/// The allocation must outlive all aliases; synchronize access with user code.
+pub(crate) unsafe fn map_shared_pages<A: Core>(machine: &mut A, vpage: usize,
+    base: core::ptr::NonNull<u8>, count: usize)
+{
+    unsafe { map_shared_backing(machine, vpage, base, count, Attributes::EXECUTABLE, Access::ReadWrite); }
+}
+
+/// Reserve a user's virtual range with borrowed device backing. Native user
+/// execution cannot access the backing through this range.
+/// # Safety
+/// The allocation must outlive the mappings.
+unsafe fn map_protected_shared_pages<A: Core>(machine: &mut A, vpage: usize,
+    base: core::ptr::NonNull<u8>, count: usize)
+{
+    unsafe { map_shared_backing(machine, vpage, base, count, Attributes::default(), Access::None); }
+}
+
+unsafe fn map_shared_backing<A: Core>(machine: &mut A, vpage: usize,
+    base: core::ptr::NonNull<u8>, count: usize, attributes: Attributes,
+    access: Access,
+)
+{
+    let start = arch_abi::UserPage::new((vpage as u64).checked_mul(4096).expect("mapping address overflow")).unwrap();
+    if count != 0 { start.offset(count - 1).unwrap(); }
+    let mut entries = [Install::ABSENT; 64];
+    for first in (0..count).step_by(entries.len()) {
+        let length = (count - first).min(entries.len());
+        let batch = &mut entries[..length];
+        for (offset, entry) in batch.iter_mut().enumerate() {
+            let index = first + offset;
+            let pointer = unsafe { core::ptr::NonNull::new_unchecked(base.as_ptr().add(index * 4096)) };
+            let frame = unsafe { physical_frame(pointer) };
+            *entry = unsafe { Install::borrowed(frame, access, attributes) };
+        }
+        super::memory::install(machine, start.offset(first).unwrap(), batch).expect("cannot map shared backing");
+    }
 }
 
 /// # Safety
@@ -837,6 +955,7 @@ pub(crate) fn write_physical_frame(page: u64, offset: usize, bytes: &[u8]) {
     }
 }
 
+static FRAME_LAYOUT: spin::Once<&'static FrameLayout> = spin::Once::new();
 static FRAME_OWNERSHIP: spin::Once<FrameOwnership> = spin::Once::new();
 
 /// Start the frame pool, graduate to its full bitmap, then provision arch's
@@ -846,6 +965,7 @@ pub fn init_memory(
     occupied: &[core::ops::Range<u64>],
     zero_page: u64,
 ) -> FrameOwnership {
+    FRAME_LAYOUT.call_once(|| layout);
     super::phys_mm::bootstrap(layout, occupied).finish();
     *FRAME_OWNERSHIP.call_once(|| {
         let storage = FrameOwnership::storage_layout(layout.frame_count());
@@ -857,9 +977,11 @@ pub fn init_memory(
 
 /// Drop one reference through arch. True transfers the exclusive frame back
 /// to the caller, which may immediately recycle it or return it to the pool.
-pub(crate) fn release_frame_reference(page: u64) -> bool {
+pub(crate) fn release_frame_reference(
+    page: arch_abi::page_supply::OwnedPage,
+) -> Option<arch_abi::page_supply::OwnedPage> {
     let ownership = FRAME_OWNERSHIP.get().expect("frame ownership not initialized");
-    unsafe { ownership.release_shared(page) }
+    unsafe { ownership.release_shared(page.number()) }.then_some(page)
 }
 
 #[cfg(target_arch = "x86")]
@@ -869,5 +991,5 @@ pub(crate) fn bootstrap_supply() -> arch_abi::page_supply::PageBootstrap {
     let pages = core::array::from_fn::<_, FAULT_PAGES, _>(|_| {
         super::phys_mm::alloc_phys_page().expect("out of AP fault reserve pages")
     });
-    PageBootstrap { ownership, pages }
+    PageBootstrap::new(ownership, pages)
 }

@@ -238,6 +238,8 @@ crate.spec(package = "aes-kw", version = "0.3", default_features = False, featur
 crate.spec(package = "zeroize", version = "1", default_features = False, features = ["alloc"])
 crate.spec(package = "subtle", version = "2", default_features = False)
 crate.spec(package = "rustc-demangle", version = "0.1.24")
+# Rust-for-Linux pin-init is published under the name pinned-init.
+crate.spec(package = "pinned-init", version = "=0.0.10", default_features = False, features = ["alloc"])
 crate.spec(
     package = "spin",
     # Match Hadris so the kernel has one spin implementation/version.
@@ -298,6 +300,12 @@ crate.annotation(
     # it makes rules_rust probe our custom bare-metal target with stable rustc,
     # which rejects custom target JSON before the actual nightly compile.
     gen_build_script = "off",
+)
+crate.annotation(
+    crate = "pinned-init",
+    # Our nightly supports these APIs. Avoid probing the custom target with stable rustc.
+    gen_build_script = "off",
+    rustc_flags = ["--cfg=RUSTC_LINT_REASONS_IS_STABLE", "--cfg=RUSTC_NEW_UNINIT_IS_STABLE"],
 )
 use_repo(crate, "crates", "crates__bytemuck-1.25.2")
 crate.annotation(

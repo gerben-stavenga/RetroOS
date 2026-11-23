@@ -396,6 +396,8 @@ use crate::space::AddressSpace;
 thread_local! {
     static STORAGE: Cell<u64> = const { Cell::new(u64::MAX) };
 }
+// The first core's reserved zero page stays resident across address-space migration.
+static ZERO_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// Fixed supervisor storage: directory, SYS table, zero, SYS pages and long twin.
 pub const PAGING_PAGES: usize = 28 + 2054;
 
@@ -403,6 +405,7 @@ pub const PAGING_PAGES: usize = 28 + 2054;
 pub unsafe fn initialize(storage: u64) {
     assert!(storage + PAGING_PAGES as u64 <= (phys::PHYS_SIZE / 4096) as u64);
     STORAGE.with(|s| { assert_eq!(s.replace(storage), u64::MAX); });
+    ZERO_FRAME.get_or_init(|| storage + 2);
     let pd = storage;
     write_entry(pd, 1023, (((storage + 1) as u32) << 12) | PRESENT | WRITABLE);
     for i in 0..crate::sysdesc::SYS_SIZE / 4096 {
@@ -1097,7 +1100,7 @@ fn owns_mapping(entry: u32) -> bool {
 fn release_mapping(entry: u32) {
     if owns_mapping(entry) { phys::release(u64::from(entry >> 12)); }
 }
-fn zero_frame() -> u64 { active_pd() + 2 }
+fn zero_frame() -> u64 { *ZERO_FRAME.get().expect("paging not initialized") }
 
 /// Keep validation and the whole completed prefix within one paging transition.
 pub(crate) fn mapping_batch(start: arch_abi::UserPage, count: usize,
@@ -1229,8 +1232,37 @@ fn test_alias(source: usize, destination: usize, count: usize) {
 
 use arch_abi::{UserPage, MappingError, page_entry::{PageEntry, Backing, PhysicalFrame}};
 
-struct Rearrangement;
-impl arch_abi::mapping::Rearrange for Rearrangement {
+pub(crate) fn edit_mappings(start: UserPage, count: usize, operation: arch_abi::mapping::Edit)
+    -> Result<(), arch_abi::MappingFailure>
+{
+    let _paging = PagingGuard::lock();
+    arch_abi::mapping::edit_range(&mut Mappings, start, count, operation,
+        PhysicalFrame::new(zero_frame()).unwrap())
+}
+
+fn copy_frame(source: PhysicalFrame) -> Result<PhysicalFrame, MappingError> {
+    let frame = PhysicalFrame::new(phys::take_input().ok_or(MappingError::NeedPages)?).unwrap();
+    // take_input already zeroed this frame before returning it.
+    if source.number() != zero_frame() {
+        unsafe { core::ptr::copy_nonoverlapping(phys::frame_ptr(source.number()), phys::frame_ptr(frame.number()), 4096); }
+    }
+    Ok(frame)
+}
+
+struct Mappings;
+impl arch_abi::mapping::EditMappings for Mappings {
+    fn read_run(&mut self, start: UserPage, maximum: usize) -> Result<(PageEntry, usize), MappingError> {
+        read_mapping_run(start, maximum)
+    }
+    fn fill(&mut self, start: UserPage, count: usize, entry: PageEntry) -> Result<(), arch_abi::MappingFailure> {
+        mapping_batch(start, count, |page, _| replace_user_mapping(page, entry))
+    }
+    fn copy(&mut self, source: PhysicalFrame) -> Result<PhysicalFrame, MappingError> {
+        copy_frame(source)
+    }
+    fn release(&mut self, frame: PhysicalFrame) { phys::release(frame.number()); }
+}
+impl arch_abi::mapping::Rearrange for Mappings {
     fn read(&mut self, page: UserPage) -> Result<PageEntry, MappingError> { read_mapping(page) }
     fn prepare(&mut self, page: UserPage) -> Result<(), MappingError> {
         let entry = self.read(page)?;
@@ -1239,8 +1271,7 @@ impl arch_abi::mapping::Rearrange for Rearrangement {
     #[inline(never)]
     fn private_alias(&mut self, page: UserPage) -> Result<(), MappingError> {
         let PageEntry::CopyOnWrite(mut mapping) = self.read(page)? else { return Ok(()); };
-        let frame = PhysicalFrame::new(phys::take_input().ok_or(MappingError::NeedPages)?).unwrap();
-        unsafe { core::ptr::copy_nonoverlapping(phys::frame_ptr(mapping.backing.frame().number()), phys::frame_ptr(frame.number()), 4096); }
+        let frame = copy_frame(mapping.backing.frame())?;
         mapping.backing = Backing::Owned(frame);
         let entry = PageEntry::Writable(mapping);
         let result = self.replace(page, entry);
@@ -1269,5 +1300,5 @@ pub(crate) fn rearrange_mappings(a: UserPage, b: UserPage, count: usize, swap: b
     let _paging = PagingGuard::lock();
     // Reject unsupported high ranges before any preparation on the low range.
     if count != 0 && (a.address() >= 0xc0000000 || b.address() >= 0xc0000000) { return Err(MappingError::Unsupported); }
-    arch_abi::mapping::rearrange(&mut Rearrangement, a, b, count, swap)
+    arch_abi::mapping::rearrange(&mut Mappings, a, b, count, swap)
 }
