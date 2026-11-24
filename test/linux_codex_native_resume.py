@@ -194,6 +194,7 @@ print('RESIDENT_BUILD_COMPLETE',flush=True)
             profile = work / 'profile.json'
             profile.write_text(json.dumps({'root': '/' if args.live_tools else str(work / 'native-root'), 'c_root': str(home)}))
             env['RETROOS_QEMU_LIVE_PROFILE'] = str(profile)
+            launch += ['--live-root']
         launch += ['--cmd', '/home/retroos/RETROOS/SHELL.ELF /home/retroos/run.sh', '--', '-m', str(args.memory), '-smp', str(args.cpus)]
         comparison_socket = None
         if args.kernel:

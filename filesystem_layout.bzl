@@ -17,7 +17,7 @@ CORE_FILES = {
     "etc/RETROOS.INI": "RETROOS/RETROOS.INI",
     "etc/BOOT.INI": "RETROOS/BOOT.INI",
     # boot-bundle/** is not listed here. BUILD.bazel globs it onto the boot
-    # disk: DN/ is the default shell; system files live under RETROOS/.
+    # disk. The bundled file manager lives under RETROOS/DN/.
 
     "//tools/command:command_com": "RETROOS/COMMAND.COM",
     # Kernel symbols for the stack tracer. kernel.elf itself is stripped, so

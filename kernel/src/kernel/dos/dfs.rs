@@ -98,6 +98,25 @@ pub mod ci {
             listed.push(e);
             idx += 1;
         }
+        let host_paths = crate::kernel::linux::environment::uses_host_paths();
+        if host_paths {
+            // DOS has no link entry type. Match Samba's view of Unix links,
+            // including metadata from the target and no entry for a dangling link.
+            listed.retain_mut(|entry| {
+                if !entry.is_symlink { return true; }
+                let child = [readdir_key.as_slice(), &entry.name[..entry.name_len]].concat();
+                let Some(target) = vfs::stat(&child, true) else { return false; };
+                entry.is_dir = target.is_dir;
+                entry.is_symlink = false;
+                entry.size = target.size;
+                entry.mtime = target.mtime.unwrap_or(0);
+                entry.dos_attributes = entry.dos_attributes.map(|attr| attr | u8::from(target.mode & 0o222 == 0));
+                true
+            });
+            // Native and SMB directory enumeration can return different orders.
+            // Assign colliding DOS aliases in the same order on both backends.
+            listed.sort_unstable_by(|a, b| a.name[..a.name_len].cmp(&b.name[..b.name_len]));
+        }
         let aliases = assign_directory_aliases(&listed);
         for (e, alias) in listed.into_iter().zip(aliases) {
             let original = Arc::<[u8]>::from(&e.name[..e.name_len]);
@@ -115,6 +134,10 @@ pub mod ci {
                 false
             };
             let mut attributes = e.dos_attributes.unwrap_or(if is_dir { 0x10 } else { 0x20 });
+            if host_paths && attributes == 0x80 {
+                // SMB's NORMAL attribute has no DOS equivalent.
+                attributes = 0x20;
+            }
             if is_dir {
                 attributes = (attributes & !0x20) | 0x10;
             }
@@ -123,7 +146,7 @@ pub mod ci {
             dir.aliases.insert(alias.clone(), entry_index);
             dir.entries.push((alias, Entry {
                 original,
-                size: e.size,
+                size: if host_paths && is_dir { 0 } else { e.size },
                 is_dir,
                 attributes,
                 mtime: e.mtime,

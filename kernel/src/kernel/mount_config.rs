@@ -36,11 +36,14 @@ pub struct Mount {
 pub struct Bundle {
     pub source: String,
     pub subdir: String,
+    pub runtime_only: bool,
 }
 
 #[derive(Clone, Default, Debug)]
 pub struct Config {
     pub home: Option<String>,
+    pub identity: Option<(u32, u32)>,
+    pub host_paths: bool,
     pub bundle: Option<Bundle>,
     pub mounts: Vec<Mount>,
 }
@@ -81,11 +84,13 @@ pub fn uuid(value: &str) -> Result<arch_abi::VolumeUuid, &'static str> {
 impl Config {
     pub fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
         let mut config = Self::default();
+        let mut uid = None;
+        let mut gid = None;
         for group in ini::parse(bytes)? {
             let section = group.name;
             if section == "bundle" {
                 if config.bundle.is_some() { return Err("duplicate bundle section"); }
-                config.bundle = Some(Bundle { source: String::new(), subdir: "/".into() });
+                config.bundle = Some(Bundle { source: String::new(), subdir: "/".into(), runtime_only: false });
             } else if let Some(name) = section.strip_prefix("mount ") {
                 let name = name
                     .strip_prefix('"')
@@ -112,15 +117,19 @@ impl Config {
             for entry in group.entries {
                 let (key, value) = (entry.key, entry.value);
                 if section == "session" {
-                    if key != "home" || config.home.is_some() || !canonical(value) {
-                        return Err("session home must be one canonical absolute path");
+                    match key {
+                        "home" if config.home.is_none() && canonical(value) => config.home = Some(value.into()),
+                        "uid" if uid.is_none() => uid = Some(value.parse().map_err(|_| "invalid session uid")?),
+                        "gid" if gid.is_none() => gid = Some(value.parse().map_err(|_| "invalid session gid")?),
+                        "host_paths" if !config.host_paths && value == "true" => config.host_paths = true,
+                        _ => return Err("invalid or duplicate session setting"),
                     }
-                    config.home = Some(value.into());
                 } else if section == "bundle" {
                     let bundle = config.bundle.as_mut().ok_or("missing bundle section")?;
                     match key {
                         "source" => bundle.source = value.into(),
                         "subdir" => bundle.subdir = value.into(),
+                        "runtime_only" if !bundle.runtime_only && value == "true" => bundle.runtime_only = true,
                         _ => return Err("unknown bundle key"),
                     }
                 } else if section.starts_with("mount ") {
@@ -215,6 +224,11 @@ impl Config {
             }
         }
         // A file depends on the most specific configured mount containing it.
+        config.identity = match (uid, gid) {
+            (Some(uid), Some(gid)) => Some((uid, gid)),
+            (None, None) => None,
+            _ => return Err("session uid and gid must be set together"),
+        };
         // Reject cycles before any filesystem is opened writable.
         config.order()?;
         Ok(config)
@@ -286,6 +300,20 @@ pub fn prefix(path: &str) -> &'static [u8] {
         bytes.push(b'/');
     }
     Box::leak(bytes.into_boxed_slice())
+}
+
+/// Overlay the paired runtime on the persistent DOS directory. Keep the
+/// shipped DLL and DN trees intact even if C: contains stale copies.
+pub(crate) fn bind_host_runtime(c: &[u8], runtime: &[u8]) {
+    let target = [c, b"RETROOS/"].concat();
+    vfs::bind_union(Box::leak(target.clone().into_boxed_slice()), Box::leak(runtime.to_vec().into_boxed_slice()));
+    for directory in [b"DN/".as_slice(), b"OS2/".as_slice(), b"WINDOWS/".as_slice()] {
+        let source = [runtime, directory].concat();
+        if vfs::dir_exists(&source[..source.len() - 1]) {
+            vfs::bind(Box::leak([target.as_slice(), directory].concat().into_boxed_slice()),
+                Box::leak(source.into_boxed_slice()));
+        }
+    }
 }
 
 /// Read before namespace composition, directly on the supplied boot filesystem.
@@ -372,7 +400,8 @@ pub fn apply(
     protected: bool,
     extras: Vec<(arch_abi::BootModule, FilesystemVolume)>,
 ) -> Result<(), &'static str> {
-    crate::kernel::linux::environment::configure_home(config.home.as_deref());
+    crate::kernel::linux::environment::configure_session(
+        config.home.as_deref().map(str::as_bytes), config.identity, config.host_paths);
     for mount in &config.mounts {
         if let Some(id) = mount.source.strip_prefix("UUID=") {
             let id = uuid(id)?;
@@ -401,10 +430,25 @@ pub fn apply(
     // sector overlay protects the source; for GRUB this also preserves the
     // original module bytes for multiple views of the same filesystem.
     let bootfs: &'static dyn vfs::Filesystem = Box::leak(open(bundle, Access::Ram, true)?);
-    vfs::mount(b"bootbundle/", bootfs);
+    let runtime_only = config.bundle.as_ref().is_some_and(|bundle| bundle.runtime_only);
+    let host_runtime = runtime_only && config.host_paths;
+    if host_runtime && config.mounts.iter().any(|mount| mount.drive == Some(b'C') && mount.source == "bundle") {
+        // The live disk's BOOT.INI has already supplied its policy. Remove the
+        // bootstrap copy from the RAM view so the host's file can show through.
+        let bootstrap = [bundle_home, b"RETROOS/BOOT.INI"].concat();
+        if bootfs.stat(&bootstrap, false).is_some() && bootfs.remove(&bootstrap) != 0 {
+            return Err("cannot hide live bootstrap BOOT.INI");
+        }
+    }
+    if host_runtime {
+        vfs::mount_readonly(b"bootbundle/", bootfs);
+    } else {
+        vfs::mount(b"bootbundle/", bootfs);
+    }
     vfs::hide_mount(b"bootbundle/");
+    let session: &'static dyn vfs::Filesystem = Box::leak(crate::kernel::fs::session::new());
     // A self-contained root remains if configuration only names data mounts.
-    vfs::mount(b"", bootfs);
+    vfs::mount(b"", if runtime_only { session } else { bootfs });
     crate::kernel::dos::configure_drive(b'C', b"");
     let mut c_mounted = false;
     let mut opened: Vec<(usize, &'static dyn vfs::Filesystem)> = Vec::new();
@@ -570,13 +614,19 @@ pub fn apply(
         });
     // An external C: owns its applications and data. Only the matched runtime
     // and default shell come from the boot bundle; edits stay in RAM.
-    let external_c = config.mounts.iter().any(|m| m.drive == Some(b'C') && m.source != "bundle");
+    let external_c = config.host_paths
+        || config.mounts.iter().any(|m| m.drive == Some(b'C') && m.source != "bundle");
     let mut entries = Vec::new();
-    bootfs.readdir(bundle_home.strip_suffix(b"/").unwrap_or(bundle_home), 0, &mut entries, usize::MAX);
+    if host_runtime {
+        let runtime = [b"bootbundle/".as_slice(), bundle_home, b"RETROOS/"].concat();
+        bind_host_runtime(c, &runtime);
+    } else {
+        bootfs.readdir(bundle_home.strip_suffix(b"/").unwrap_or(bundle_home), 0, &mut entries, usize::MAX);
+    }
     for entry in entries {
         let name = &entry.name[..entry.name_len];
         if !entry.is_dir || entry.is_symlink || matches!(name, b"." | b".." | b"bin" | b"TEMP" | b"lost+found") { continue; }
-        if external_c && !matches!(name, b"RETROOS" | b"DN") { continue; }
+        if (external_c || runtime_only) && name != b"RETROOS" { continue; }
         let directory: &'static [u8] = Box::leak([name, b"/"].concat().into_boxed_slice());
         let source = [b"bootbundle/".as_slice(), bundle_home, directory].concat();
         let exposed = [c, directory].concat();
@@ -587,31 +637,42 @@ pub fn apply(
         {
             // Unix command aliases must follow an explicitly mounted app
             // directory as well as the default boot copy.
-            if !c.is_empty() && !config.mounts.iter().any(|m| prefix_bytes(&m.path) == directory) {
+            if !runtime_only && !config.host_paths && !c.is_empty() && !config.mounts.iter().any(|m| prefix_bytes(&m.path) == directory) {
                 vfs::bind(directory, Box::leak(exposed.into_boxed_slice()));
             }
             continue;
         }
         if bootfs.dir_exists(&[bundle_home, directory.strip_suffix(b"/").unwrap()].concat()) {
-            if !c.is_empty() && !config.mounts.iter().any(|m| prefix_bytes(&m.path) == directory) {
+            if !runtime_only && !config.host_paths && !c.is_empty() && !config.mounts.iter().any(|m| prefix_bytes(&m.path) == directory) {
                 vfs::bind(directory, Box::leak(source.clone().into_boxed_slice()));
             }
             vfs::bind(
-                Box::leak([c, directory].concat().into_boxed_slice()),
+                Box::leak(exposed.into_boxed_slice()),
                 Box::leak(source.into_boxed_slice()),
             );
         }
+    }
+    let windows = [bundle_home, b"RETROOS/WINDOWS"].concat();
+    if config.host_paths && !host_runtime && bootfs.dir_exists(&windows) {
+        // The live RETROOS directory is merged later. Pin the Windows runtime
+        // to the boot bundle at its more specific path.
+        let prefix = [c, b"RETROOS/WINDOWS/"].concat();
+        let source = [b"bootbundle/".as_slice(), windows.as_slice(), b"/"].concat();
+        vfs::bind(Box::leak(prefix.into_boxed_slice()), Box::leak(source.into_boxed_slice()));
     }
     if let Some(source) = settings_source {
         // Keep BusyBox's standalone home on the physical C: filesystem,
         // alongside settings, even though runtime files use a bundle view.
         let home = [source.as_slice(), b"HOME/"].concat();
-        if config.home.as_deref() == Some("/RETROOS/HOME") {
+        let c_home = [c, b"RETROOS/HOME"].concat();
+        if config.home.as_deref().is_some_and(|path| {
+            path == "/RETROOS/HOME" || path.trim_start_matches('/').as_bytes() == c_home
+        }) {
             if !vfs::dir_exists(&home) && vfs::mkdir(home.strip_suffix(b"/").unwrap()) < 0 {
                 return Err("cannot create persistent session home");
             }
             let home = Box::leak(home.into_boxed_slice());
-            vfs::bind(b"RETROOS/HOME/", home);
+            if !runtime_only || c.is_empty() { vfs::bind(b"RETROOS/HOME/", home); }
             if !c.is_empty() {
                 vfs::bind(Box::leak([c, b"RETROOS/HOME/"].concat().into_boxed_slice()), home);
             }
@@ -626,6 +687,7 @@ pub fn apply(
             );
         }
         for name in [b"RETROOS.INI".as_slice(), b"BOOT.INI".as_slice()] {
+            if runtime_only && name == b"BOOT.INI" { continue; }
             let target = [b"RETROOS/".as_slice(), name].concat();
             let backing = Box::leak([source.as_slice(), name].concat().into_boxed_slice());
             if name == b"BOOT.INI" {
@@ -633,13 +695,13 @@ pub fn apply(
                 file.close();
             }
             vfs::bind(Box::leak([c, target.as_slice()].concat().into_boxed_slice()), backing);
-            if !c.is_empty() { vfs::bind(Box::leak(target.into_boxed_slice()), backing); }
+            if !runtime_only && !config.host_paths && !c.is_empty() { vfs::bind(Box::leak(target.into_boxed_slice()), backing); }
         }
     }
     // /bin/rc points at /COMMANDER/RC/RC.EXE. A persistent C: owns that
     // application tree; expose its Unix spelling only when it exists.
     let commanders = [c, b"COMMANDER/"].concat();
-    if external_c && !c.is_empty()
+    if external_c && !config.host_paths && !c.is_empty()
         && (vfs::dir_exists(&commanders)
             || config.mounts.iter().any(|m| prefix_bytes(&m.path).starts_with(&commanders)))
         && !config.mounts.iter().any(|m| m.path == "/COMMANDER")
@@ -674,19 +736,20 @@ pub fn apply(
             vfs::mount_union_readonly(b"bin/", Box::leak(Box::new(links)));
         }
     }
-    let session = Box::leak(crate::kernel::fs::session::new());
     session.mkdir(b"TEMP");
     session.mkdir(b"run");
     vfs::mount(b"sessionfs/", session);
     vfs::hide_mount(b"sessionfs/");
-    vfs::bind(
-        Box::leak([c, b"TEMP/"].concat().into_boxed_slice()),
-        b"sessionfs/TEMP/",
-    );
-    if !config.mounts.iter().any(|m| m.path == "/tmp") {
+    if !config.host_paths {
+        vfs::bind(
+            Box::leak([c, b"TEMP/"].concat().into_boxed_slice()),
+            b"sessionfs/TEMP/",
+        );
+    }
+    if !config.host_paths && !config.mounts.iter().any(|m| m.path == "/tmp") {
         vfs::bind(b"tmp/", b"sessionfs/TEMP/");
     }
-    if !config.mounts.iter().any(|m| m.path == "/run") {
+    if !config.host_paths && !config.mounts.iter().any(|m| m.path == "/run") {
         vfs::bind(b"run/", b"sessionfs/run/");
     }
     if let Some(home) = &config.home {
@@ -695,7 +758,7 @@ pub fn apply(
             return Err("session home does not exist and cannot be created");
         }
         let temporary = [prefix_bytes(home), b"TEMP/".to_vec()].concat();
-        if temporary != b"tmp/" {
+        if !config.host_paths && temporary != b"tmp/" {
             vfs::bind(Box::leak(temporary.into_boxed_slice()), b"sessionfs/TEMP/");
         }
     }

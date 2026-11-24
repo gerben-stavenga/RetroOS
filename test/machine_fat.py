@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot the FAT machine-install layout and persist edits to both INIs."""
+"""Boot with release-specific GRUB configuration and writable DOS settings."""
 from pathlib import Path
 import shutil
 import tarfile
@@ -11,7 +11,6 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
-from grub_module_install import seed_c_files
 from machine_install import grub_entries, boot_configuration, normalize_runtime, runtime_filter
 
 
@@ -61,15 +60,17 @@ def exercise(kind):
         ident = 'ABCD-1234' if kind == 'fat' else 'ea8c19a0-a2e3-4d14-9fd2-6955c176122c'
         plan = {'boot_uuid': '0000-0000', 'release': '/boot/retroos/releases/test',
                 'grub_release': '/boot/retroos/releases/test', 'uuid': ident, 'c_uuid': ident,
-                'c_dir': '/', 'c_root': '/', 'linux_root': None, 'runtime_subdir': '/RETROOS/releases/test'}
+                'c_dir': '/', 'c_root': '/', 'linux_root': None, 'runtime_subdir': '/RETROOS/releases/test',
+                'boot_ini_source': None}
         (stage / 'BOOT.INI').write_text(boot_configuration(plan))
         (stage / 'RETROOS.INI').write_text((ROOT / 'etc/RETROOS.INI').read_text().replace('language=en-US', 'language=it-IT'))
         home = work / 'C'
-        home.mkdir()
-        seed_c_files(home, stage)
+        (home / 'RETROOS').mkdir(parents=True)
+        shutil.copyfile(stage / 'RETROOS.INI', home / 'RETROOS/RETROOS.INI')
         runtime = home / 'RETROOS/releases/test'
         with tarfile.open(ROOT / 'bazel-bin/machine_boot_tar.tar') as archive:
-            archive.extractall(runtime, filter=runtime_filter)
+            archive.extractall(runtime, members=(member for member in archive
+                if member.name.removeprefix('./') != 'kernel.elf'), filter=runtime_filter)
         normalize_runtime(runtime)
         source = work / 'probe.c'
         source.write_text(r'''
@@ -91,17 +92,20 @@ void _start(void) {
  error=12;
  int state=call(5,(int)"/dos/STATE.DAT",0,0), again=state>=0;
  if(again) call(6,state,0,0);
- char *paths[]={"/dos/RETROOS/RETROOS.INI","/dos/RETROOS/BOOT.INI"};
+ int dn=call(5,(int)"/dos/RETROOS/DN/DN.COM",0,0);
+ if(dn<0) goto fail;
+ call(6,dn,0,0);
+ if(call(5,(int)"/dos/DN/DN.COM",0,0)>=0 ||
+    call(5,(int)"/DN/DN.COM",0,0)>=0 ||
+    call(5,(int)"/dos/RETROOS/BOOT.INI",0,0)>=0) goto fail;
  char marker[]="\n# MACHINE_CONFIG_EDIT\n", b[8192];
- for(int i=0;i<2;i++) {
-  error=20+i*10;
-  int f=call(5,(int)paths[i],2,0); if(f<0) goto fail;
-  error++; int n=call(3,f,(int)b,sizeof(b)); if(n<=0) goto fail;
-  error++; if(again && !contains(b,n,"MACHINE_CONFIG_EDIT")) goto fail;
-  error++; if(call(19,f,0,2)<0) goto fail;
-  error++; if(call(4,f,(int)marker,sizeof(marker)-1)!=sizeof(marker)-1) goto fail;
-  call(6,f,0,0);
- }
+ error=20;
+ int f=call(5,(int)"/dos/RETROOS/RETROOS.INI",2,0); if(f<0) goto fail;
+ error++; int n=call(3,f,(int)b,sizeof(b)); if(n<=0) goto fail;
+ error++; if(again && !contains(b,n,"MACHINE_CONFIG_EDIT")) goto fail;
+ error++; if(call(19,f,0,2)<0) goto fail;
+ error++; if(call(4,f,(int)marker,sizeof(marker)-1)!=sizeof(marker)-1) goto fail;
+ call(6,f,0,0);
  error=16;
  state=call(5,(int)"/dos/STATE.DAT",0x241,0644);
  if(state<0 || call(4,state,(int)"YES",3)!=3) goto fail;
@@ -127,6 +131,7 @@ fail: call(1,error,0,0); for(;;) {}
         release.mkdir(parents=True)
         (tree / 'boot/grub').mkdir()
         shutil.copyfile(ROOT / 'bazel-bin/kernel/kernel.elf', release / 'kernel.elf')
+        shutil.copyfile(stage / 'BOOT.INI', release / 'BOOT.INI')
         entries = grub_entries(plan).replace(
             'search --no-floppy --fs-uuid --set=root 0000-0000', 'set root=$bootiso')
         config = tree / 'boot/grub/grub.cfg'
@@ -135,20 +140,18 @@ fail: call(1,error,0,0); for(;;) {}
         iso = work / 'persistent.iso'
         run('grub-mkrescue', '-o', iso, tree)
         boot(work, iso, disk, 0)
-        for name in ('BOOT.INI', 'RETROOS.INI'):
-            assert b'MACHINE_CONFIG_EDIT' in contents(disk, name, kind), name
+        assert b'MACHINE_CONFIG_EDIT' in contents(disk, 'RETROOS.INI', kind)
         boot(work, iso, disk, 2)
-        before = {name: contents(disk, name, kind) for name in ('BOOT.INI', 'RETROOS.INI')}
+        before = contents(disk, 'RETROOS.INI', kind)
         config.write_text('set timeout=0\nset default=1\nset bootiso=$root\n' + entries)
         protected = work / 'protected.iso'
         run('grub-mkrescue', '-o', protected, tree)
         boot(work, protected, disk, 2)
-        for name, data in before.items():
-            assert contents(disk, name, kind) == data, name
+        assert contents(disk, 'RETROOS.INI', kind) == before
         # Load the Windows app and its Wine DLLs from disk in the same 128 MiB
         # guest. No filesystem images are supplied as Multiboot modules.
         boot(work, iso, disk, 0, '/dos/WINHELLO.EXE')
-        print(f'PASS: {kind} disk runtime supplies BusyBox root, persists both INIs across reboot, protects disk edits, and executes Win32 from disk with 128 MiB RAM')
+        print(f'PASS: {kind} uses release BOOT.INI, mounts the runtime under C:/RETROOS, persists user settings, and executes Win32 with 128 MiB RAM')
 
 
 def main():

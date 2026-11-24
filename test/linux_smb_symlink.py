@@ -19,7 +19,7 @@ def launch(work, program, label, timeout=120, memory=None, qemu_args=()):
     env.pop('RETROOS_DATA_IMAGE', None)
     env['RETROOS_QEMU_LIVE_PROFILE'] = str(work / 'profile.json')
     log = ARTIFACTS / (label + '.log')
-    command = [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--headless',
+    command = [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--live-root', '--headless',
         '--sound', 'none', '--cmd', '/home/retroos/' + program]
     extra = (['-m', str(memory)] if memory is not None else []) + list(qemu_args)
     if extra:

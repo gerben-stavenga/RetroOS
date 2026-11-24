@@ -19,6 +19,7 @@ STAGE = ROOT / "build" / "machine-install"
 MANAGED = Path("/etc/grub.d/41_retroos")
 CUSTOM = Path("/etc/grub.d/40_custom")
 OTHER_MANAGED = Path("/etc/grub.d/42_retroos_module")
+BOOT_INI_MARKER = "# RetroOS BOOT.INI: "
 
 
 def default_c_dir(volume):
@@ -153,10 +154,21 @@ def boot_configuration(plan, previous=None):
     if "session" not in config:
         config["session"] = {"home": home}
     home = config["session"].get("home", home)
+    if plan.get("linux_root") == plan["c_uuid"] and home != "/RETROOS/HOME":
+        config["session"]["host_paths"] = "true"
     config["bundle"] = {"source": "UUID=" + plan["c_uuid"], "subdir": plan["runtime_subdir"]}
+    if "boot_ini_source" in plan:
+        config["bundle"]["runtime_only"] = "true"
+        if home == "/RETROOS/HOME":
+            home = c_path.rstrip("/") + home
+            config["session"]["home"] = home
     for section in list(config.sections()):
         if config[section].get("drive", "").upper() == "C":
             config.remove_section(section)
+    legacy_dn = 'mount "legacy-dn-runtime"'
+    if (plan.get("dn_in_retroos") and legacy_dn in config
+            and config[legacy_dn].get("source") == "bundle" and config[legacy_dn].get("subdir") == "/DN"):
+        config.remove_section(legacy_dn)
     if plan.get("linux_root"):
         same = plan["linux_root"] == plan["c_uuid"]
         config['mount "linux"'] = {"source": "UUID=" + plan["linux_root"], "path": "/",
@@ -171,17 +183,41 @@ def boot_configuration(plan, previous=None):
     return text.getvalue()
 
 
+def previous_boot_ini(destination, c_root):
+    if MANAGED.is_file():
+        releases = (destination / "releases").resolve()
+        for line in MANAGED.read_text().splitlines():
+            if line.startswith(BOOT_INI_MARKER):
+                path = Path(line[len(BOOT_INI_MARKER):]).resolve()
+                if path.is_relative_to(releases) and path.is_file():
+                    return path
+                break
+    legacy = c_root / "RETROOS/BOOT.INI" if c_root else None
+    if legacy is not None and legacy.is_file():
+        return legacy
+    legacy = destination / "BOOT.INI"
+    return legacy if legacy.is_file() else None
+
+
+def write_boot_ini(path, content):
+    with tempfile.TemporaryDirectory(prefix=".boot-ini-", dir=path.parent) as temp:
+        pending = Path(temp) / path.name
+        pending.write_bytes(content)
+        pending.chmod(0o644)
+        pending.replace(path)
+
+
 def grub_entries(plan):
     release = plan.get("grub_release", plan["release"])
     uuid = plan.get("boot_uuid") or plan["uuid"]
-    boot_ini = plan.get("boot_ini", f"{plan.get('destination', release)}/BOOT.INI")
-    user_ini = f"{plan['c_root']}/RETROOS/RETROOS.INI"
+    boot_ini = plan.get("boot_ini", f"{release}/BOOT.INI")
     config_search = ""
     if "c_uuid" in plan:
         config_search = f"    search --no-floppy --fs-uuid --set=retroos_config {plan['c_uuid']}\n"
         home = plan["c_dir"].rstrip("/") + "/RETROOS"
-        boot_ini = f"($retroos_config){home}/BOOT.INI"
         user_ini = f"($retroos_config){home}/RETROOS.INI"
+    else:
+        user_ini = f"{plan['c_root']}/RETROOS/RETROOS.INI"
     entries = []
     for name, extra in (("current, persistent", ""), ("current, protected disk", " ram-overlay")):
         entries.append(f'''menuentry "RetroOS ({name})" {{
@@ -291,17 +327,18 @@ def prepare(c_root, destination, archive=None, copy_showcase=False, showcase_arc
     settings_path.touch(mode=0o600, exist_ok=True)
     settings_path.chmod(0o600)
     settings_path.write_text(settings)
-    existing_boot = c_root / "RETROOS/BOOT.INI" if c_root else None
-    policy = existing_boot if existing_boot and existing_boot.exists() else destination / "BOOT.INI"
+    policy = previous_boot_ini(destination, c_root)
     owner = c_root.stat() if c_root and c_root.exists() else None
     plan = dict(layout, uuid=uuid, destination=str(destination),
                 c_owner=[owner.st_uid, owner.st_gid] if owner else [os.getuid(), os.getgid()],
                 copy_showcase=copy_showcase, release=str(release), runtime_subdir=runtime_subdir,
+                dn_in_retroos=(stage / "runtime/RETROOS/DN/DN.COM").is_file(),
                 grub_release=grub.grub_path(release, layout["boot_fs"]), archive_sha256=digest,
                 settings_observed=c_root is not None,
                 user_ini_sha256=checksum(user_ini) if user_ini and user_ini.exists() else None,
-                boot_ini_sha256=checksum(existing_boot) if existing_boot and existing_boot.exists() else None)
-    (stage / "BOOT.INI").write_text(boot_configuration(plan, policy.read_text() if policy.exists() else None))
+                boot_ini_source=str(policy) if policy else None,
+                boot_ini_sha256=checksum(policy) if policy else None)
+    (stage / "BOOT.INI").write_text(boot_configuration(plan, policy.read_text() if policy else None))
     # Retire only the two old RetroOS entries that load the obsolete location.
     # Preserve every other custom entry, and verify the original before install.
     custom = CUSTOM
@@ -320,7 +357,8 @@ def prepare(c_root, destination, archive=None, copy_showcase=False, showcase_arc
     entries = grub_entries(plan)
     (stage / "grub.cfg").write_text(entries)
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
-    (stage / "41_retroos").write_text('#!/bin/sh\nexec tail -n +3 "$0"\n' + entries)
+    (stage / "41_retroos").write_text(
+        '#!/bin/sh\nexec tail -n +3 "$0"\n' + BOOT_INI_MARKER + str(release / "BOOT.INI") + "\n" + entries)
     # Record the exact staged files; install checks them before changing anything.
     files = [p for p in stage.rglob("*") if (p.is_file() or p.is_symlink()) and p.name != "checksums.json"]
     (stage / "checksums.json").write_text(json.dumps({str(p.relative_to(stage)):
@@ -371,6 +409,10 @@ def install_into(stage, plan, c_root):
         if path.is_symlink() or (path.exists() and not path.is_file()):
             raise ValueError(f"configuration must be an ordinary file: {path}")
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
+    runtime = stage / "runtime"
+    staged_kernel = runtime / "kernel.elf"
+    if not staged_kernel.is_file():
+        raise ValueError(f"staged kernel is missing: {staged_kernel}")
     release = c_root / "RETROOS/releases" / plan["archive_sha256"][:12]
     if release.is_symlink():
         raise ValueError(f"runtime release must be an ordinary directory: {release}")
@@ -378,16 +420,18 @@ def install_into(stage, plan, c_root):
         release.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".install-", dir=release.parent) as temp:
             pending = Path(temp) / "runtime"
-            shutil.copytree(stage / "runtime", pending, symlinks=True)
+            shutil.copytree(runtime, pending, symlinks=True,
+                            ignore=lambda path, _: ("kernel.elf",) if Path(path) == runtime else ())
             pending.rename(release)
     else:
-        for source in (stage / "runtime").rglob("*"):
+        for source in runtime.rglob("*"):
+            if source == staged_kernel:
+                continue
+            target = release / source.relative_to(runtime)
             if source.is_symlink():
-                target = release / source.relative_to(stage / "runtime")
                 if not target.is_symlink() or os.readlink(target) != os.readlink(source):
                     raise ValueError(f"existing release link changed: {target}")
             elif source.is_file():
-                target = release / source.relative_to(stage / "runtime")
                 if not target.is_file() or target.read_bytes() != source.read_bytes():
                     raise ValueError(f"existing release is incomplete or changed: {target}")
     for path in [release, *release.rglob("*")]:
@@ -398,10 +442,10 @@ def install_into(stage, plan, c_root):
     kernel_release = Path(plan["release"])
     kernel_release.mkdir(parents=True, exist_ok=True)
     kernel = kernel_release / "kernel.elf"
-    if kernel.exists() and kernel.read_bytes() != (release / "kernel.elf").read_bytes():
+    if kernel.exists() and kernel.read_bytes() != staged_kernel.read_bytes():
         raise ValueError(f"existing kernel changed: {kernel}")
     if not kernel.exists():
-        shutil.copyfile(release / "kernel.elf", kernel)
+        shutil.copyfile(staged_kernel, kernel)
     kernel.chmod(0o644)
     user_ini = c_root / "RETROOS" / "RETROOS.INI"
     if user_ini.exists() and plan["settings_observed"]:
@@ -432,20 +476,29 @@ def install_into(stage, plan, c_root):
             previous = Path(str(path) + ".previous")
             previous.write_bytes(data)
             previous.chmod(0o644)
-    boot_ini = c_root / "RETROOS/BOOT.INI"
-    old_boot = boot_ini.read_bytes() if boot_ini.exists() else None
-    actual_boot_hash = hashlib.sha256(old_boot).hexdigest() if old_boot is not None else None
-    if plan["settings_observed"] and actual_boot_hash != plan["boot_ini_sha256"]:
+    per_release_ini = "boot_ini_source" in plan
+    legacy_ini = c_root / "RETROOS/BOOT.INI"
+    boot_ini = kernel_release / "BOOT.INI" if per_release_ini else legacy_ini
+    source_ini = legacy_ini
+    if per_release_ini and plan["boot_ini_source"]:
+        source_ini = Path(plan["boot_ini_source"])
+    previous_boot = source_ini.read_bytes() if source_ini.is_file() else None
+    actual_boot_hash = hashlib.sha256(previous_boot).hexdigest() if previous_boot is not None else None
+    if (plan["settings_observed"] or plan.get("boot_ini_source")) and actual_boot_hash != plan["boot_ini_sha256"]:
         raise ValueError("BOOT.INI changed since preparation; prepare again")
-    if old_boot is not None:
+    if boot_ini.is_symlink() or (boot_ini.exists() and not boot_ini.is_file()):
+        raise ValueError(f"configuration must be an ordinary file: {boot_ini}")
+    old_boot = boot_ini.read_bytes() if boot_ini.exists() else None
+    if not per_release_ini and old_boot is not None:
         Path(str(boot_ini) + ".previous").write_bytes(old_boot)
     other_mode = None
     try:
         other_mode = retire_managed(OTHER_MANAGED)
         boot_ini.parent.mkdir(parents=True, exist_ok=True)
-        boot_ini.write_text(boot_configuration(plan, old_boot.decode() if old_boot is not None else (stage / "BOOT.INI").read_text()))
-        boot_ini.chmod(0o644)
-        os.chown(boot_ini, owner.st_uid, owner.st_gid)
+        policy = previous_boot.decode() if previous_boot is not None else (stage / "BOOT.INI").read_text()
+        write_boot_ini(boot_ini, boot_configuration(plan, policy).encode())
+        if not per_release_ini:
+            os.chown(boot_ini, owner.st_uid, owner.st_gid)
         shutil.copyfile(stage / "41_retroos", managed)
         managed.chmod(0o755)
         if old_custom is not None:
@@ -454,8 +507,12 @@ def install_into(stage, plan, c_root):
     except Exception:
         if other_mode is not None:
             OTHER_MANAGED.chmod(other_mode)
-        if old_boot is None: boot_ini.unlink(missing_ok=True)
-        else: boot_ini.write_bytes(old_boot)
+        if old_boot is None:
+            boot_ini.unlink(missing_ok=True)
+        else:
+            write_boot_ini(boot_ini, old_boot)
+            if not per_release_ini:
+                os.chown(boot_ini, owner.st_uid, owner.st_gid)
         if old_custom is not None:
             custom.write_bytes(old_custom)
         if old_managed is None:

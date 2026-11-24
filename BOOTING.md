@@ -105,12 +105,13 @@ formatted. The installer remembers the prepared layout, so the installation
 command needs no storage flags. The release bundle uses the same commands
 with `./install.sh`.
 
-FAT and ext4 use the same disk-backed C: layout. Both INIs live under
-`C:\RETROOS`, and the matched runtime is versioned beneath
-`C:\RETROOS\releases\<version>`. GRUB loads only the kernel and INIs;
-RetroOS reads the runtime directly from the selected disk. Kernel files live
-under `/boot/retroos/releases/<version>/` (or `--destination`). `/boot` may
-be separate or Btrfs because only GRUB needs to read those kernel files.
+FAT and ext4 use the same disk-backed C: layout. GRUB loads `kernel.elf` and
+its matching `BOOT.INI` from `/boot/retroos/releases/<version>/` (or the
+selected `--destination`). RetroOS reads the paired runtime directly from
+`C:\RETROOS\releases\<version>` and mounts it at `C:\RETROOS`, including
+Dos Navigator under `C:\RETROOS\DN`. GRUB reads the shared user settings from
+`C:\RETROOS\RETROOS.INI`. The boot volume can be Btrfs because GRUB reads
+the kernel and boot configuration there.
 
 On the default ext4 Linux-root installation, C: is `$HOME/DOS` and the
 Linux filesystem supplies `/`, `/bin` and `/usr/bin`. A separate FAT or
@@ -126,7 +127,8 @@ home=/home/alice
 ```
 
 For a Linux-root installation, the installer uses the installing user's home
-and mounts their `DOS` directory as C:. Settings physically live at
+and mounts their `DOS` directory as C:. The UID and GID default to that
+home directory's Unix owner and group. Settings physically live at
 `/home/alice/DOS/RETROOS/RETROOS.INI`, visible as
 `C:\RETROOS\RETROOS.INI`. Use `--c-root` to select another DOS directory.
 On FAT, C: is the volume root, mounted at `/dos` in the bundled Linux namespace.
@@ -167,12 +169,14 @@ Settings take effect after reboot and do not alter the hardware clock.
 Configure the local live-files profile once, as your normal user:
 
 ```sh
-python3 tools/qemu_live.py setup --root / --c-root /home/retroos
-./run.sh qemu --kvm
+python3 tools/qemu_live.py setup --root / --c-root "$HOME/DOS"
+./run.sh qemu --live-root --kvm
 ```
 
-With that profile present, QEMU KVM uses the host's live `/` read-only and
-`/home/retroos` as writable C:, through authenticated, signed SMB2 over VirtIO.
+With that profile, `--live-root` mounts the host's live `/` read-only and
+mounts `/tmp`, the user's home and the DOS directory read/write at their host paths,
+through authenticated, signed SMB2 over VirtIO. The Linux session uses the
+launching user's home, UID and GID. The DOS directory supplies `C:`.
 It reads the same GNU programs, shared libraries, CA certificates and user
 `RETROOS/RETROOS.INI` as the metal installation. C: writes and user-settings
 edits are visible immediately on the host. Existing C: application symlinks
@@ -180,16 +184,15 @@ retain access to their targets with your Unix user's permissions.
 
 Live-files QEMU defaults to 2 GiB RAM for native Linux applications, including
 Codex's client and background server. Override this with emulator arguments,
-for example `./run.sh qemu --kvm -- -m 4096`.
+for example `./run.sh qemu --live-root --kvm -- -m 4096`.
 
 The launcher starts a private Samba process on loopback, with a random port
 and fresh per-launch credentials. It reuses installed Samba tools or the
 existing user-local RetroOS Samba tools. On Debian/Ubuntu, setup can extract
 missing server utilities locally; their runtime libraries must be available.
-The writable SMB session uses a subdirectory view of the host namespace so
-normal server symlink handling can resolve C: links. The guest's `/` mount is
-read-only. This shares live files; storage access is SMB rather than the ext4
-backend used on metal, and QEMU still supplies virtual hardware.
+The writable SMB mounts use subdirectory views of the host namespace so
+normal server symlink handling can resolve C: links. QEMU supplies virtual
+hardware and accesses the live files over SMB.
 
 No mounted host block device is attached. The only VM disk is a disposable
 boot image containing the matched runtime and bootstrap INIs. It carries a
@@ -198,17 +201,33 @@ persistent user INI is exposed again once C: is mounted. The QEMU RTC base
 follows the selected user's clock setting. The server and bootstrap copy are
 removed when the VM exits; an unavailable root/C: share stops boot.
 
-`--live-root` explicitly selects this profile. To use a separate persistent
-disk instead, supply `--data-image build/data.bin`; this overrides the KVM
-live-files default. `RETROOS_QEMU_LIVE_PROFILE` selects another profile JSON
-with `root` and `c_root` directory paths. Run `python3 test/live_root.py` for
-GNU userspace from the live root, DOS/Linux C: writes, application symlinks,
-persistent settings, and rejection of writes through the root view.
+`--live-root` works with QEMU's default TCG accelerator and with `--kvm`.
+Ordinary QEMU boots use the persistent `build/data.bin` disk with either accelerator.
+Use `--data-image PATH` to select another disk.
+`RETROOS_QEMU_LIVE_PROFILE` selects another profile JSON with `root` and
+`c_root` directory paths. Include `session_home` in a custom profile with
+`root` set to `/` to use the real home and C: paths. `./run.sh hosted` uses
+the host's `/` directly with the launching user's permissions. Its Linux
+session inherits their `$HOME`, UID and GID. Hosted takes its default
+`C:` directory from the profile's `c_root` or `~/DOS`. Use `--c-root PATH`
+or `RETROOS_HOST_DIRECTORY` to point hosted `C:` at another directory.
+Hosted Linux uses the actual host path. The launcher stages a temporary
+runtime built alongside the hosted kernel and mounts it at `C:\RETROOS`.
+It includes Dos Navigator in `C:\RETROOS\DN` and the paired Windows and OS/2
+libraries. QEMU live SMB and disk-installed metal use the same runtime paths.
+Each uses the runtime paired with its own kernel. The DOS directory supplies
+user settings and application files.
+
+Run `python3 test/live_root.py` for
+GNU userspace from the live root, DOS/Linux writes, application symlinks,
+persistent settings and priority for the paired runtime.
 
 `C:\RETROOS\SHELL.ELF` starts a Linux shell session. Linux entry supplies `PATH` with
 `HOME/bin`, `/usr/local/bin`, `/usr/bin`, `/bin` and the sbin directories,
-`TMPDIR=HOME/TEMP`, `SHELL=/bin/sh` and `TERM=linux`. HOME defaults to the C:
-mount's Unix path; LANG follows the selected locale. Arguments such as `-i`,
+`SHELL=/bin/sh` and `TERM=linux`. TMPDIR defaults to `/tmp` in hosted and
+workstation SMB sessions and to `HOME/TEMP` in other configurations. HOME
+follows the session home when configured and uses the C: mount's Unix path otherwise.
+LANG follows the selected locale. Arguments such as `-i`,
 `-c` or a script filename are forwarded to the selected shell. GNU `/bin/sh`
 is used when available, with a BusyBox fallback for a missing or unsupported
 default shell. Linux children inherit exactly the environment their parent
@@ -2493,11 +2512,10 @@ it never flashes a USB device. Boot its default RAM session and inspect
 Firmware contents and the generated image remain local build artifacts.
 
 
-QEMU live-root Codex state is separate from the Linux session: with the normal
-live profile it lives in $HOME/DOS/.codex and appears as /home/retroos/.codex.
-setup_codex.py preserves an existing guest login by default. If that copy has
-expired while the Linux login still works, refresh only the guest cache from
-Linux with:
+With the workstation live profile, Codex uses the Linux session's
+`$HOME/.codex` unless `CODEX_HOME` points elsewhere. The private SMB tests
+below used a separate guest login in `$HOME/DOS/.codex`. To refresh an isolated
+guest cache whose login has expired, run:
 
     python3 tools/setup_codex.py --home "$HOME/DOS" --refresh-auth
 

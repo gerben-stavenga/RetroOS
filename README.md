@@ -105,6 +105,7 @@ firmware, sound card, and image:
 ./run.sh qemu --hd ahci               # data disk on AHCI (also: ata, nvme)
 ./run.sh qemu --sound ac97            # AC'97 instead of the default HDA
 ./run.sh qemu --kvm                   # run on the host CPU (near-metal semantics)
+./run.sh qemu --live-root             # use the configured live SMB profile
 ./run.sh hosted --cmd GAMES/SKYROADS  # interp backend: DOSBox-style hosted run
 ./run.sh bochs | ./run.sh 86box       # other emulators, same flags
 ./run.sh unipcemu                    # Pentium/i430fx; uses local UniPCemu build and ROM when present
@@ -112,10 +113,13 @@ firmware, sound card, and image:
 ./run.sh rust-dos-games              # Rust-DOS shell with a disposable FAT16 C:
 ```
 
-`run.sh` defaults to the shared layout on QEMU, Bochs, 86Box and hosted:
+`run.sh` defaults to the shared disk layout on QEMU, Bochs and 86Box:
 
 - `bazel-bin/boot_disk.bin`: GRUB, kernel and `C:\RETROOS` system files, rebuilt from current sources.
 - `build/data.bin`: one writable disk, shared across backends. FAT32 holds `C:` and ext4 holds the Linux root. Guest writes persist.
+
+QEMU uses the same disk by default with TCG and KVM. Use `--live-root` with either
+accelerator to share host files over SMB. See [QEMU live-files setup](BOOTING.md#qemu-with-the-live-machine-files).
 
 Install the pinned [Rust-DOS](https://github.com/dividebysandwich/rust-dos)
 build with `bash tools/install_rust_dos.sh`. It installs a standalone executable
@@ -170,7 +174,7 @@ Set `[display]` `scaling=fill_screen` to stretch DOS output to the whole framebu
 on each boot. Other modes are `original_aspect` (default), `sharp_pixels`, and
 `square_pixels`. The OSD display setting still changes the mode for the current
 session; it does not rewrite the INI file.
-`[system] start=C:\DN\DN.COM` selects the startup program; `[locale]
+`[system] start=C:\RETROOS\DN\DN.COM` selects the startup program; `[locale]
 language=it-IT` selects shared regional settings. `keyboard=us` and
 `codepage=850` override the locale defaults. Regional policy is shared by DOS,
 Windows, OS/2 and Linux.
@@ -368,10 +372,13 @@ regeneration instructions are in [lib/fonts/uni-vga](lib/fonts/uni-vga/README.md
 Host-directory sharing uses authenticated SMB mounts configured in
 `RETROOS/RETROOS.INI`; see [SMB network mounts](BOOTING.md#smb-network-mounts).
 The deprecated `--host DIR` launcher shortcut and serial file-sharing backend
-setup have been removed. Hosted mounts a host directory directly through VFS:
-`./run.sh hosted --directory /path/to/root`. With no directory specified, the
-launcher seeds `build/hosted-root` once from the packaged files. Changes persist
-immediately in that directory. QEMU uses disks or configured SMB mounts.
+setup have been removed. `./run.sh hosted` uses the host filesystem directly
+with the launching user's home, UID, GID, and file permissions.
+`--c-root /path/to/dos` selects the host directory for DOS `C:`.
+Linux sees it at its real host path. The default is
+the configured live profile's `c_root`, or `~/DOS` when no profile exists.
+The directory must exist and should contain the programs you want to run.
+`--directory` is an alias for `--c-root`. See [live profile setup](BOOTING.md#qemu-with-the-live-machine-files).
 `--cmd` is supported on QEMU and hosted; the launcher does not inject
 temporary commands or serial settings into the persistent disk.
 The old `-i` image modes, installer flow, and `--gpt` assembly are removed.
@@ -393,6 +400,30 @@ BOOT.INI. `access=rw` persists permitted writes; `access=ro` rejects them;
 `access=ram` keeps changes in memory. The GRUB `ram-overlay` option protects
 all physical writes for that boot. Unlisted physical partitions stay unmounted. See
 [BOOTING.md](BOOTING.md#disk-writes-and-ram-overlay).
+
+### Reuse a DOSBox C: directory
+
+Use the directory you mount as `C:` in DOSBox as `C:` in RetroOS. Your
+programs, game data, and saves stay in place.
+
+For hosted RetroOS, pass the directory to the launcher.
+
+```sh
+./run.sh hosted --c-root /path/to/dos
+```
+
+On metal, prepare the installation with an ext4 directory or a FAT volume
+mountpoint, then install the prepared release.
+
+```sh
+tools/install_kernel.sh --prepare --c-root /path/to/dos
+sudo tools/install_kernel.sh
+```
+
+Set `start=` in the `[system]` section of `C:\RETROOS\RETROOS.INI` to choose
+the startup program. Use the sample INI as a template when creating that file.
+RetroOS uses its own hardware settings, so some games may need their sound
+or memory options adjusted. [Sample RETROOS.INI](etc/RETROOS.INI)
 
 ## Game regression tests
 

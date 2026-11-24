@@ -111,7 +111,9 @@ print('PYTHON_BUILD_PASS',flush=True,file=sys.stderr)
     command = [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--headless', '--sound', 'hda' if metal_devices else 'none']
     if backend == 'ext4':
         command += ['--net', 'virtio' if metal_devices else 'none', '--hd', 'nvme', '--data-image', str(image)]
-    startup = '/home/retroos/DN/DN.COM' if from_dn else '/home/retroos/RETROOS/SHELL.ELF /home/retroos/run.sh'
+    else:
+        command += ['--live-root']
+    startup = '/home/retroos/RETROOS/DN/DN.COM' if from_dn else '/home/retroos/RETROOS/SHELL.ELF /home/retroos/run.sh'
     command += ['--cmd', startup, '--', '-m', '32768', '-smp', '6']
     command += ['-qmp', f'unix:{work}/qmp.sock,server=on,wait=off']
     if metal_devices:

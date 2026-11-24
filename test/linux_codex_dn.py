@@ -59,7 +59,7 @@ def main():
         log = artifacts / 'klog.txt'
         control = screen = None
         with log.open('w') as output:
-            process = subprocess.Popen([str(ROOT / 'run.sh'), 'qemu', '--kvm', '--headless',
+            process = subprocess.Popen([str(ROOT / 'run.sh'), 'qemu', '--kvm', '--live-root', '--headless',
                 '--sound', 'hda', '--', '-m', '2048', '-smp', '2',
                 '-qmp', f'unix:{work}/qmp.sock,server=on,wait=off'],
                 cwd=ROOT, env=env, stdout=output, stderr=subprocess.STDOUT)

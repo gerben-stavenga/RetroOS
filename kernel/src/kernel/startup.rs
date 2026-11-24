@@ -1,4 +1,4 @@
-//! Kernel startup - filesystem mount and DN.COM loader
+//! Kernel startup, filesystem mounts and configured program launch.
 
 extern crate alloc;
 
@@ -15,7 +15,24 @@ use crate::kernel::{
 /// Storage supplied by platform setup: native devices or an already-open root.
 pub enum Storage {
     Disks(alloc::vec::Vec<&'static dyn crate::kernel::block::Disk>),
-    Root(&'static dyn vfs::Filesystem),
+    Root {
+        root: &'static dyn vfs::Filesystem,
+        runtime: alloc::vec::Vec<HostedRuntimeDirectory>,
+        boot_runtime: Option<&'static dyn vfs::Filesystem>,
+        session: Option<HostedSession>,
+    },
+}
+
+pub struct HostedRuntimeDirectory {
+    pub name: &'static [u8],
+    pub shipped: &'static dyn vfs::Filesystem,
+    pub user: Option<&'static dyn vfs::Filesystem>,
+}
+
+pub struct HostedSession {
+    pub home: Option<alloc::vec::Vec<u8>>,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
@@ -111,9 +128,25 @@ fn prepare_startup<A: crate::Core>(
             prepare_storage(machine, boot, disks, BootMounts { modules, config: early_config },
                 &mut screen, &mut bios_workspace);
         }
-        Storage::Root(root) => {
+        Storage::Root { root, runtime, boot_runtime, session } => {
             vfs::mount(b"", root);
+            if let Some(session) = session {
+                crate::kernel::linux::environment::configure_session(
+                    session.home.as_deref(), Some((session.uid, session.gid)), true);
+            }
             crate::kernel::dos::configure_c_root(boot.c_root());
+            for directory in runtime {
+                let prefix = Box::leak([boot.c_root(), directory.name, b"/"].concat().into_boxed_slice());
+                vfs::mount_union_readonly(prefix, directory.shipped);
+                if let Some(user) = directory.user {
+                    vfs::mount_union(prefix, user);
+                }
+            }
+            if let Some(bundle) = boot_runtime {
+                vfs::mount_readonly(b"bootbundle/", bundle);
+                vfs::hide_mount(b"bootbundle/");
+                crate::kernel::mount_config::bind_host_runtime(boot.c_root(), b"bootbundle/");
+            }
             mount_kernel_log_fs();
             crate::kernel::fs::cdrom::init();
             crate::kernel::fs::floppy::init();
@@ -664,10 +697,9 @@ fn configure_locale(env: &[u8]) {
 
 /// START is one executable plus its command tail, with paths relative to C:.
 /// DOS C:\ paths and absolute VFS paths are also accepted.
-fn startup_command(env: &[u8], root: &[u8]) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
+fn startup_command(env: &[u8], root: &[u8]) -> Option<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>)> {
     let raw = crate::kernel::dos::config_var(env, b"START")
-        .map(trim_ascii).filter(|v| !v.is_empty())
-        .unwrap_or(b"C:\\DN\\DN.COM");
+        .map(trim_ascii).filter(|v| !v.is_empty())?;
     let end = raw.iter().position(u8::is_ascii_whitespace).unwrap_or(raw.len());
     let program = &raw[..end];
     let tail = trim_ascii(&raw[end..]).to_vec();
@@ -681,7 +713,7 @@ fn startup_command(env: &[u8], root: &[u8]) -> (alloc::vec::Vec<u8>, alloc::vec:
     } else {
         [root, normalized.strip_prefix(b"/").unwrap_or(&normalized)].concat()
     };
-    (path, tail)
+    Some((path, tail))
 }
 
 /// `SB_AUDIO=native <irq> <dma8>` — the wiring an owner declares for a card
@@ -792,20 +824,19 @@ mod launch_directive_tests {
     fn startup_command_uses_configured_path_and_arguments() {
         let root = b"/home/retroos/";
         let env = b"START=C:\\RETROOS\\COMMAND.COM /C echo hello\0\0";
-        let (path, tail) = super::startup_command(env, root);
+        let (path, tail) = super::startup_command(env, root).unwrap();
         assert_eq!(path, b"/home/retroos/RETROOS/COMMAND.COM");
         assert_eq!(tail, b"/C echo hello");
         assert_eq!(super::startup_command(b"START=TOOLS\\APP.COM arg\0", root),
-            (b"/home/retroos/TOOLS/APP.COM".to_vec(), b"arg".to_vec()));
+            Some((b"/home/retroos/TOOLS/APP.COM".to_vec(), b"arg".to_vec())));
         assert_eq!(super::startup_command(b"START=/usr/bin/dash -i\0", root),
-            (b"/usr/bin/dash".to_vec(), b"-i".to_vec()));
+            Some((b"/usr/bin/dash".to_vec(), b"-i".to_vec())));
     }
 
     #[test]
-    fn startup_command_defaults_to_dn_when_absent_or_empty() {
+    fn startup_command_requires_an_explicit_program() {
         for env in [b"".as_slice(), b"START=   \0".as_slice()] {
-            assert_eq!(super::startup_command(env, b"/home/retroos/"),
-                (b"/home/retroos/DN/DN.COM".to_vec(), alloc::vec::Vec::new()));
+            assert_eq!(super::startup_command(env, b"/home/retroos/"), None);
         }
     }
 
@@ -944,7 +975,13 @@ fn run<A: crate::Core>(
 
     crate::compact_screenln!(&mut screen, "Welcome to RetroOS! F12 opens the host monitor.");
 
-    let (start_path, start_tail) = startup_command(master_env, crate::kernel::dos::c_root().as_bytes());
+    let c_root = crate::kernel::dos::c_root();
+    let Some((start_path, start_tail)) = startup_command(master_env, c_root.as_bytes()) else {
+        crate::compact_screenln!(&mut screen, "Set [system] start= in C:\\RETROOS\\RETROOS.INI to choose a startup program.");
+        let _ = crate::kernel::klog::save_boot_snapshot(machine);
+        screen.present(machine, bios_workspace);
+        machine.halt_forever();
+    };
     crate::compact_screenln!(&mut screen, "Starting {}...",
         core::str::from_utf8(&start_path).unwrap_or("?"));
     match crate::kernel::klog::save_boot_snapshot(machine) {

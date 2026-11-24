@@ -18,6 +18,7 @@ def run(*args):
 
 def session(work, disk, save_config):
     ini = (ROOT / "etc/RETROOS.INI").read_text().split('[mount "session"]', 1)[0]
+    ini = ini.replace('start=C:\\RETROOS\\DN\\DN.COM', 'start=C:\\DN\\DN.COM')
     # A persistent DN directory is an explicit mount, including its runtime.
     from vm_mount_config import volumes
     ident = volumes(disk)[0][1]

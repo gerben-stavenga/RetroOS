@@ -11,7 +11,7 @@ launch() {
     local binary="${RUST_DOS_BIN:-${RUST_DOS_PREFIX:-$HOME/.local}/bin/rust-dos}"
     [ -x "$binary" ] || fail "Rust-DOS binary missing: $binary (install it with bash tools/install_rust_dos.sh)"
     binary=$(realpath "$binary")
-    local cpu=486 sbtype=sb16 startup='C:\DN\DN.COM'
+    local cpu=486 sbtype=sb16 startup=
     [ "$ARCH" != 686 ] || cpu=pentium
     [ "$SOUND" != none ] || sbtype=none
 

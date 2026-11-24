@@ -67,7 +67,7 @@ def main():
         log_path = artifacts / f'codex-{mode}.log'
         with log_path.open('w') as log:
             process = subprocess.Popen(
-                [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--headless', '--sound', 'none',
+                [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--live-root', '--headless', '--sound', 'none',
                  '--cmd', ('/bin/sh' if args.direct else '/home/retroos/RETROOS/SHELL.ELF') + ' /home/retroos/run.sh', '--', '-m', '2048'],
                 cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
             try:

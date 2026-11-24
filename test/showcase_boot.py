@@ -59,14 +59,14 @@ def main():
     with tarfile.open(ROOT / 'bazel-bin/root_module_base_tar.tar') as archive:
         members = archive.getmembers()
         names = {m.name.removeprefix('./') for m in members}
-    assert 'DN/DN.COM' in names and 'bin/busybox' in names
+    assert 'RETROOS/DN/DN.COM' in names and 'bin/busybox' in names
     assert not any(n.startswith(('TC/', 'COMMANDER/', 'GAMES/', 'ULTRASND/')) for n in names)
     # Boot itself has no dependency on the Windows runtime.
     assert not any(n.startswith('RETROOS/WINDOWS/') for n in names)
     assert (ROOT / 'bazel-bin/retroos-base.img').stat().st_size == 16 * 1024 * 1024
     with tarfile.open(ROOT / 'bazel-bin/machine_boot_tar.tar') as archive:
         names = {m.name.removeprefix('./') for m in archive.getmembers()}
-    assert 'DN/DN.COM' in names and 'RETROOS/COMMAND.COM' in names
+    assert 'RETROOS/DN/DN.COM' in names and 'RETROOS/COMMAND.COM' in names
     assert 'RETROOS/BOOT.INI' not in names
     assert not any(n.startswith(('OS2/APPS/', 'WINDOWS/APPS/', 'SRC/', 'TESTS/')) for n in names)
     assert not any(n.startswith(('COMMANDER/', 'GAMES/', 'TC/', 'ULTRASND/')) for n in names)

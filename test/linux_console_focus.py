@@ -40,7 +40,7 @@ def main():
         qmp = work / 'qmp.sock'
         log_path = artifacts / 'klog.txt'
         with log_path.open('w') as log:
-            process = subprocess.Popen([str(ROOT / 'run.sh'), 'qemu', '--kvm',
+            process = subprocess.Popen([str(ROOT / 'run.sh'), 'qemu', '--kvm', '--live-root',
                 '--headless', '--sound', 'none', '--cmd', '/home/retroos/LAUNCH.COM',
                 '--', '-m', '512', '-qmp', f'unix:{qmp},server=on,wait=off'],
                 cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)

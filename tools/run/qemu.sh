@@ -48,7 +48,6 @@ launch() {
         virtio) args+=(-netdev user,id=net0 -device virtio-net-pci,netdev=net0) ;;
         e1000|e1000e) args+=(-netdev user,id=net0 -device "$NETWORK,netdev=net0") ;;
     esac
-    [ "$LIVE" != 1 ] || cpu=(-cpu max)
     [ "$KVM" = 0 ] || cpu=(-accel kvm -cpu host)
     if [ "$FIRMWARE" = bios ]; then
         local rom="${VGABIOS_ROM:-$SCRIPT_DIR/third_party/vgabios/vgabios-stdvga.bin}"

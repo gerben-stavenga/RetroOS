@@ -221,7 +221,7 @@ def main():
         if compiler_image:
             qemu_args += ['-drive', f'file={compiler_image},format=raw,readonly=on,if=none,id=selfbuildtools',
                           '-device', 'nvme,drive=selfbuildtools,serial=COMPILER']
-        process = subprocess.Popen([str(ROOT / 'run.sh'), 'qemu', '--kvm',
+        process = subprocess.Popen([str(ROOT / 'run.sh'), 'qemu', '--kvm', '--live-root',
             '--headless', '--sound', 'none', '--cmd',
             '/home/retroos/RETROOS/SHELL.ELF /home/retroos/run.sh', '--', *qemu_args],
             cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)

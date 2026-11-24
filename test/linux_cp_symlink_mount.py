@@ -76,7 +76,7 @@ def main():
         env=os.environ.copy(); env.pop('RETROOS_DATA_IMAGE',None); env['RETROOS_QEMU_LIVE_PROFILE']=str(profile)
         log=artifacts/'linux-cp-symlink-mount.log'
         with log.open('w') as output:
-            result=subprocess.run([str(ROOT/'run.sh'),'qemu','--kvm','--headless','--sound','none','--cmd','/home/retroos/probe','--',
+            result=subprocess.run([str(ROOT/'run.sh'),'qemu','--kvm','--live-root','--headless','--sound','none','--cmd','/home/retroos/probe','--',
                 '-smp','5','-m','1024','-drive',f'file={image},format=raw,if=none,id=copyhome','-device','nvme,drive=copyhome,serial=SMBCOPY'],
                 cwd=ROOT,env=env,stdout=output,stderr=subprocess.STDOUT,timeout=60)
         text=log.read_text()

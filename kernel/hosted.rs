@@ -28,6 +28,74 @@ pub struct HostFs {
     files: Mutex<(u64, BTreeMap<u64, HostFile>)>,
 }
 
+pub fn boot_storage(
+    config: &mut kernel::BootConfig,
+    directory: &str,
+    c_root: Option<&str>,
+    host_c_root: Option<&str>,
+    boot_runtime: Option<&str>,
+) -> io::Result<kernel::kernel::startup::Storage> {
+    let root = HostFs::new(directory)?;
+    let host_home = std::env::var_os("HOME");
+    let home = match host_c_root {
+        Some(path) => Some(HostFs::new(path)?),
+        None if c_root.is_none() && root.root == Path::new("/") => {
+            let dos = host_home.as_deref().map(Path::new).filter(|home| home.is_absolute())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput,
+                    "set HOME to an absolute path or supply --host-c-root"))?
+                .join("DOS");
+            Some(HostFs::new(&dos).map_err(|error| io::Error::new(error.kind(),
+                format!("cannot use {} for C: {error}", dos.display())))?)
+        }
+        None => None,
+    };
+    if let Some(home) = &home {
+        let prefix = home.root.strip_prefix(&root.root)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "C: must be inside the host filesystem root"))?;
+        let prefix = prefix.as_os_str().as_bytes();
+        config.set_c_root(prefix);
+        if config.c_root().strip_suffix(b"/").unwrap_or(config.c_root()) != prefix {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "C: directory path is too long"));
+        }
+    } else {
+        config.set_c_root(c_root.unwrap_or("/").as_bytes());
+    }
+    let runtime = home.as_ref().filter(|_| boot_runtime.is_none()).and_then(|home| {
+        let boot = fs::read(home.root.join("RETROOS/BOOT.INI")).ok()?;
+        let policy = kernel::kernel::mount_config::Config::parse_boot(&boot).ok()?;
+        let bundle = policy.bundle?;
+        if bundle.source == "module" { return None; }
+        let bundle_path = Path::new(&bundle.subdir);
+        let dir = policy.mounts.iter().find(|mount| mount.drive == Some(b'C') && mount.source == bundle.source)
+            .and_then(|mount| bundle_path.strip_prefix(&mount.subdir).ok())
+            .map_or_else(|| bundle_path.to_path_buf(), |path| home.root.join(path));
+        let directories = ["DN", "RETROOS"].into_iter().filter_map(|name| {
+            let shipped = HostFs::new(dir.join(name)).ok()?;
+            let user = HostFs::new(home.root.join(name)).ok()
+                .map(|fs| Box::leak(Box::new(fs)) as &'static dyn Filesystem);
+            Some(kernel::kernel::startup::HostedRuntimeDirectory {
+                name: name.as_bytes(),
+                shipped: Box::leak(Box::new(shipped)),
+                user,
+            })
+        }).collect();
+        Some(directories)
+    }).unwrap_or_default();
+    let session = (root.root == Path::new("/")).then(|| kernel::kernel::startup::HostedSession {
+        home: host_home.map(|home| home.into_encoded_bytes()),
+        uid: unsafe { libc::getuid() },
+        gid: unsafe { libc::getgid() },
+    });
+    let boot_runtime = boot_runtime.map(HostFs::new).transpose()?
+        .map(|fs| Box::leak(Box::new(fs)) as &'static dyn Filesystem);
+    Ok(kernel::kernel::startup::Storage::Root {
+        root: Box::leak(Box::new(root)),
+        runtime,
+        boot_runtime,
+        session,
+    })
+}
+
 struct HostFile { file: File, identity: u64 }
 
 fn identity(meta: &fs::Metadata) -> u64 { (meta.dev().rotate_left(32) ^ meta.ino()).max(1) }

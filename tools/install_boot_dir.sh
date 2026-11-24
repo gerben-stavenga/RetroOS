@@ -7,4 +7,4 @@ C_ROOT="${1:-$HOME/DOS}"
 [ -d "$C_ROOT" ] || { echo "C: root does not exist: $C_ROOT" >&2; exit 1; }
 bazelisk build //:boot_dir_tar
 tar xf bazel-bin/boot_dir_tar.tar -C "$C_ROOT"
-echo "Runtime refreshed at $C_ROOT/RETROOS; shell is at $C_ROOT/DN"
+echo "Runtime refreshed at $C_ROOT/RETROOS; shell is at $C_ROOT/RETROOS/DN"

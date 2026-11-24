@@ -1063,7 +1063,7 @@ integration_test(
     name = "hosted_elf",
     command = ["python3", "test/hosted_elf_smoke.py"],
     sources = ["//:integration_sources"],
-    metal = [":hosted_hello", ":hosted_outlive_composite"],
+    metal = [":hosted_hello", ":hosted_outlive_composite", "//tools/command:command_com"],
     host = ["//kernel:retroos-host"],
     tags = ["dos"],
 )
@@ -1072,7 +1072,7 @@ integration_test(
     name = "hosted_elf_kvm",
     command = ["python3", "test/hosted_elf_smoke.py"],
     sources = ["//:integration_sources"],
-    metal = [":hosted_hello", ":hosted_outlive_composite"],
+    metal = [":hosted_hello", ":hosted_outlive_composite", "//tools/command:command_com"],
     host = ["//kernel:retroos-host-kvm"],
     env = {"ENGINE": "kvm"},
     tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],

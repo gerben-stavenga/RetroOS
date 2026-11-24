@@ -10,7 +10,6 @@
 
 use retroos_arch_interp as arch;
 use std::io::Read;
-use kernel::kernel::vfs::Filesystem;
 
 /// Optional log file for the kernel debug sink (`--console` mode routes logs
 /// here to keep them off the terminal showing the live VGA render). When unset,
@@ -51,6 +50,8 @@ fn main() {
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut c_root: Option<String> = None;
+    let mut host_c_root = None;
+    let mut boot_runtime = None;
     let mut shot: Option<String> = None;
     let mut wav: Option<String> = None;
     let mut live_console = false;
@@ -69,6 +70,14 @@ fn main() {
             "--cmd" | "-c" => cmd = args.next(),
             "--cwd" => cwd = args.next(),
             "--c-root" => c_root = args.next(),
+            "--host-c-root" => host_c_root = Some(args.next().unwrap_or_else(|| {
+                eprintln!("--host-c-root requires a directory");
+                std::process::exit(2);
+            })),
+            "--boot-runtime" => boot_runtime = Some(args.next().unwrap_or_else(|| {
+                eprintln!("--boot-runtime requires a directory");
+                std::process::exit(2);
+            })),
             // Periodically snapshot the guest's VGA text screen (0xB8000) to a
             // file — lets a headless run of an interactive TUI (DN) be inspected.
             "--screenshot" => shot = args.next(),
@@ -98,7 +107,7 @@ fn main() {
             }
             _ if input.is_none() => input = Some(a),
             _ => {
-                eprintln!("usage: retroos-host [--cmd COMMAND] DIRECTORY");
+                eprintln!("usage: retroos-host [--host-c-root DIR] [--cmd COMMAND] [DIRECTORY]");
                 std::process::exit(2);
             }
         }
@@ -166,14 +175,20 @@ fn main() {
     unsafe { kernel::kernel::phys_mm::install_direct_ram(ram, bytes); }
     let ownership = kernel::kernel::platform::init_memory(arch::frame_layout(), &[paging], u64::MAX);
 
-    let root = hosted::HostFs::new(input.as_deref().unwrap_or(".")).unwrap_or_else(|e| {
-        eprintln!("cannot open host directory: {e}");
+    // Build the boot config from our CLI args directly — the interpreter is
+    // QEMU-like (it must fabricate 0x3DA etc.), and we already know the headless
+    // cmdline/cwd, so there's no fw_cfg port round-trip.
+    let mut config = kernel::BootConfig::empty();
+    config.is_qemu = true;
+    if let Some(c) = &cmd { config.set_cmdline(c.as_bytes()); }
+    if let Some(c) = &cwd { config.set_cwd(c.as_bytes()); }
+    let storage = hosted::boot_storage(&mut config, input.as_deref().unwrap_or("/"),
+        c_root.as_deref(), host_c_root.as_deref(), boot_runtime.as_deref()).unwrap_or_else(|e| {
+        eprintln!("cannot open host filesystem: {e}");
         std::process::exit(1);
     });
 
-    // Drive the booted OS (DOS shell, DN) from the terminal: raw mode + the
-    // stdin→keyboard pump. Keys reach the guest via the kernel's IRQ1 path and
-    // the C BIOS INT 9/16h. Harmless headless (raw mode skips a non-TTY).
+    // Keys reach the guest via IRQ1 and the C BIOS INT 9/16h.
     arch::enter_raw_mode();
     if suite_control || input_control {
         if suite_control { arch::suite_control::enable(); }
@@ -182,17 +197,7 @@ fn main() {
         spawn_keyboard();
     }
 
-    // Build the boot config from our CLI args directly — the interpreter is
-    // QEMU-like (it must fabricate 0x3DA etc.), and we already know the headless
-    // cmdline/cwd, so there's no fw_cfg port round-trip.
-    let mut config = kernel::BootConfig::empty();
-    config.is_qemu = true;
-    if let Some(c) = &cmd { config.set_cmdline(c.as_bytes()); }
-    if let Some(c) = &cwd { config.set_cwd(c.as_bytes()); }
-    config.set_c_root(c_root.as_deref().unwrap_or(if root.dir_exists(b"home/retroos") { "/home/retroos" } else { "/" }).as_bytes());
-
     hosted::start_media_worker();
-    let storage = kernel::kernel::startup::Storage::Root(Box::leak(Box::new(root)));
     unsafe { arch::boot(ownership, &config, storage, kernel::startup) }
 }
 

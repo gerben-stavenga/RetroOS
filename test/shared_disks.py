@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,6 +48,8 @@ if os.environ.get("HOLD_VM"):
                    RETROOS_QEMU_BIN=str(emulator), BOX86=str(emulator),
                    BOCHS_BIN=str(emulator), BOCHS_BIOS=str(mock), BOCHS_VGA_ROM=str(mock))
         env.pop("RETROOS_DATA_IMAGE", None)
+        env.pop("RETROOS_HOST_DIRECTORY", None)
+        env.pop("RETROOS_QEMU_LIVE_PROFILE", None)
         env.pop("RETROOS_86BOX_KERNEL_LOG", None)
         command = [str(root / "run.sh"), "qemu", "--firmware", "bios", "--sound", "none"]
         def run(args=command, extra=None):
@@ -104,29 +107,68 @@ if os.environ.get("HOLD_VM"):
                 assert config["Hard disks"]["hdd_01_parameters"] == "63, 16, 1, 0, ide"
                 assert "hdd_02_fn" not in config["Hard disks"]
         assert run(command + ["-i", "image"]).returncode != 0
-        # A configured KVM live view uses only the disposable boot disk;
-        # explicit --data-image still selects the old persistent-disk path.
+        # A configured profile is available to either accelerator on request.
         (root / "build/qemu-live.json").write_text('{}')
         (root / "tools/qemu_live.py").write_text("""import argparse, pathlib, time
 p=argparse.ArgumentParser(); p.add_argument('action'); p.add_argument('--work'); p.add_argument('--boot-image'); p.add_argument('--command'); p.add_argument('--profile'); a=p.parse_args()
-pathlib.Path(a.work, 'smb-ready').write_text('ready')
 pathlib.Path(__file__).resolve().parents[1].joinpath('live-work').write_text(a.work)
+pathlib.Path(a.work, 'smb-ready').write_text('ready')
 while True: time.sleep(1)
 """)
-        good(run(command + ['--kvm']))
-        args = json.loads((root / 'arguments').read_text())
-        assert args[args.index('-accel') + 1] == 'kvm'
-        assert not any('id=data' in arg or 'drive=data' in arg for arg in args)
-        assert not Path((root / 'live-work').read_text()).exists(), 'live share state was not cleaned up'
-        good(run(command + ['--kvm', '--data-image', str(data)]))
-        args = json.loads((root / 'arguments').read_text())
-        assert f'file={data},if=none,id=data,format=raw' in args
-        good(run(command))
-        assert 'id=data' in ' '.join(json.loads((root / 'arguments').read_text()))
-        rejected = run(command + ['--kvm', '--net', 'none'])
-        assert rejected.returncode != 0 and 'live SMB files require' in rejected.stderr
+        live_work = root / 'live-work'
+        for accelerator, cpu_args in [([], ['-cpu', '486']), (['--kvm'], ['-accel', 'kvm', '-cpu', 'host'])]:
+            launch = command + accelerator
+            good(run(launch + ['--net', 'none']))
+            args = json.loads((root / 'arguments').read_text())
+            assert args[:len(cpu_args)] == cpu_args
+            assert f'file={data},if=none,id=data,format=raw' in args
+            assert not live_work.exists()
+
+            rejected = run(launch + ['--live-root', '--net', 'none'])
+            assert rejected.returncode != 0 and 'live SMB files require' in rejected.stderr
+            rejected = run(launch + ['--live-root', '--data-image', str(data)])
+            assert rejected.returncode != 0 and 'choose live files or --data-image' in rejected.stderr
+
+            good(run(launch + ['--live-root']))
+            args = json.loads((root / 'arguments').read_text())
+            assert args[:len(cpu_args)] == cpu_args
+            assert not any('id=data' in arg or 'drive=data' in arg for arg in args)
+            assert not Path(live_work.read_text()).exists(), 'live share state was not cleaned up'
+            live_work.unlink()
         assert data.read_bytes().startswith(b"guest changes")
-    print("PASS: seed once, rebuild boot, preserve writes, lock, failed seed, backend attachments, KVM live files and explicit disk override")
+
+        hosted_binary = root / 'bazel-bin/kernel/retroos-host'
+        hosted_binary.parent.mkdir()
+        shutil.copy(emulator, hosted_binary)
+        runtime_archive = root / 'bazel-bin/hosted_runtime_tar.tar'
+        with tarfile.open(runtime_archive, 'w') as archive:
+            runtime = tarfile.TarInfo('RETROOS')
+            runtime.type = tarfile.DIRTYPE
+            archive.addfile(runtime)
+        hosted = [str(root / 'run.sh'), 'hosted', '--headless']
+        host_root, home = root / 'live root', root / 'DOS files'
+        host_root.mkdir()
+        home.mkdir()
+        profile = root / 'build/qemu-live.json'
+        profile.write_text(json.dumps({'root': str(host_root), 'c_root': str(home)}))
+        def check_hosted_c_root(path):
+            args = json.loads((root / 'arguments').read_text())
+            assert args[:3] == ['--host-c-root', str(path), '--boot-runtime']
+            assert Path(args[3]).name == 'RETROOS'
+            assert args[4:] == ['/']
+        good(run(hosted, {'RETROOS_PREBUILT': '1'}))
+        check_hosted_c_root(home)
+
+        override = root / 'other DOS files'
+        override.mkdir()
+        for option in ('--c-root', '--directory'):
+            good(run(hosted + [option, str(override)], {'RETROOS_PREBUILT': '1'}))
+            check_hosted_c_root(override)
+        good(run(hosted, {'RETROOS_PREBUILT': '1', 'RETROOS_HOST_DIRECTORY': str(override)}))
+        check_hosted_c_root(override)
+        assert not (root / 'build/hosted-root').exists()
+    print("PASS: seed once, rebuild boot, preserve writes, lock, failed seed, backend attachments, independent QEMU acceleration and storage")
+    print("PASS: hosted uses the host root and a separately configurable C: directory")
 
 
 if __name__ == "__main__":

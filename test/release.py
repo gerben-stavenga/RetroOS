@@ -51,7 +51,7 @@ def check_usb(work):
                                     '::/boot/grub/grub.cfg']).decode()
     assert 'GOP 1024x768' in menu and 'GOP 800x600' in menu
     ini = subprocess.check_output(['mtype', '-i', f'{image}@@1048576', '::/boot/retroos/RETROOS.INI']).decode()
-    assert '[mount ' not in ini and 'start=C:\\DN\\DN.COM' in ini
+    assert '[mount ' not in ini and 'start=C:\\RETROOS\\DN\\DN.COM' in ini
     boot_ini = subprocess.check_output(['mtype', '-i', f'{image}@@1048576', '::/boot/retroos/BOOT.INI']).decode()
     assert 'source=module' in boot_ini and 'source=bundle' in boot_ini
     assert 'boot_choices base' in menu and 'Core only (less RAM)' in menu

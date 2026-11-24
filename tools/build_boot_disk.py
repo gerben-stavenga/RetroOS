@@ -13,7 +13,7 @@ Layout:
                         /EFI/BOOT/BOOTX64.EFI                 UEFI GRUB
                         /kernel.elf                           Multiboot2 target
                         /RETROOS/...                          mounted at C:\\RETROOS
-                        /DN/...                               bundled shell
+                        /RETROOS/DN/...                       bundled shell
                         /bin/...                              BusyBox userland
 
 One FAT partition does three jobs: it is GRUB's prefix volume on BIOS, the EFI

@@ -99,7 +99,7 @@ def main():
         env.pop('RETROOS_DATA_IMAGE', None)
         env['RETROOS_QEMU_LIVE_PROFILE'] = str(work / 'profile.json')
         with (artifacts / 'klog.txt').open('w') as log:
-            process = subprocess.Popen(native_command or [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--headless', '--sound', options.sound,
+            process = subprocess.Popen(native_command or [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--live-root', '--headless', '--sound', options.sound,
                 '--', '-m', '2048', '-smp', str(options.cpus),
                 '-qmp', f'unix:{work}/qmp,server=on,wait=off',
                 '-drive', f'file={data},format=raw,if=none,id=home',

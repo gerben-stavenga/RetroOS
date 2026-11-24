@@ -1187,8 +1187,7 @@ impl Vfs {
                     if let Some(&mtime) = self.mtimes.get(&child) { e.mtime = mtime; }
                     e.dos_attributes = Some(self.dos_attributes.get(&child).copied()
                         .or(e.dos_attributes)
-                        .unwrap_or(if e.is_dir { 0x10 } else { 0x20 }
-                            | if e.mode & 0o222 == 0 { 1 } else { 0 }));
+                        .unwrap_or_else(|| default_dos_attributes(&e.name[..e.name_len], u32::from(e.mode), e.is_dir)));
                     if claim_visible_name(
                         &mut visible_names,
                         &e.name[..e.name_len],
@@ -2569,13 +2568,19 @@ pub fn set_handle_mode(handle: i32, mode: u32) -> i32 {
 /// never rewrite Unix owner/mode permissions (the independent write grant).
 pub fn dos_attributes(path: &[u8]) -> Option<u8> {
     let mut v = VFS.lock();
+    let name = path.rsplit(|&byte| byte == b'/').next().unwrap_or_default();
     let path = v.resolve_symlinks(path, true)?;
     if let Some(&attributes) = v.dos_attributes.get(&path) { return Some(attributes); }
     let (mode, is_dir) = v.path_mode(&path)?;
     let object = v.resolve_object(&path, ALIAS_DEPTH)?;
     let (fs, subpath) = (object.fs, object.subpath());
-    fs.dos_attributes(subpath).or(Some(if is_dir { 0x10 } else { 0x20 }
-        | if mode & 0o222 == 0 { 1 } else { 0 }))
+    Some(fs.dos_attributes(subpath).unwrap_or_else(|| default_dos_attributes(name, mode, is_dir)))
+}
+
+fn default_dos_attributes(name: &[u8], mode: u32, is_dir: bool) -> u8 {
+    let hidden = crate::kernel::linux::environment::uses_host_paths()
+        && name.starts_with(b".") && !matches!(name, b"." | b"..");
+    (if is_dir { 0x10 } else { 0x20 }) | u8::from(mode & 0o222 == 0) | (u8::from(hidden) << 1)
 }
 
 pub fn set_dos_attributes(path: &[u8], attributes: u8) -> i32 {

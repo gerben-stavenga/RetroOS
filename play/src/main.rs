@@ -16,12 +16,11 @@ mod audio;
 mod display;
 
 use retroos_arch_interp as arch;
-use kernel::kernel::vfs::Filesystem;
 use std::io::Write;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: retroos-play DIRECTORY [--cmd \"PROG ARGS\"] [--cwd DIR] [--wav FILE] [--no-audio]"
+        "usage: retroos-play [DIRECTORY] [--host-c-root DIR] [--cmd \"PROG ARGS\"] [--cwd DIR] [--wav FILE] [--no-audio]"
     );
     std::process::exit(2);
 }
@@ -36,6 +35,8 @@ fn main() {
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut c_root: Option<String> = None;
+    let mut host_c_root = None;
+    let mut boot_runtime = None;
     let mut wav: Option<String> = None;
     let mut no_audio = false;
     let mut directory: Option<String> = None;
@@ -45,16 +46,14 @@ fn main() {
             "--cmd" => cmd = args.next(),
             "--cwd" => cwd = args.next(),
             "--c-root" => c_root = args.next(),
+            "--host-c-root" => host_c_root = Some(args.next().unwrap_or_else(|| usage())),
+            "--boot-runtime" => boot_runtime = Some(args.next().unwrap_or_else(|| usage())),
             "--wav" => wav = args.next(),
             "--no-audio" => no_audio = true,
             _ if directory.is_none() && !a.starts_with('-') => directory = Some(a),
             _ => usage(),
         }
     }
-    if directory.is_none() {
-        usage();
-    }
-
     kernel::kernel::klog::init();
     lib::log::set_debug_sink(log_byte);
 
@@ -128,11 +127,6 @@ fn main() {
         unsafe { kernel::kernel::phys_mm::install_direct_ram(ram, bytes); }
         let ownership = kernel::kernel::platform::init_memory(arch::frame_layout(), &[paging], u64::MAX);
 
-        let root = hosted::HostFs::new(directory.as_deref().unwrap_or(".")).unwrap_or_else(|e| {
-            eprintln!("cannot open host directory: {e}");
-            std::process::exit(1);
-        });
-
         let mut config = kernel::BootConfig::empty();
         config.is_qemu = true; // no real VGA raster: fabricate 0x3DA, like QEMU
         if let Some(c) = &cmd {
@@ -141,9 +135,12 @@ fn main() {
         if let Some(c) = &cwd {
             config.set_cwd(c.as_bytes());
         }
-        config.set_c_root(c_root.as_deref().unwrap_or(if root.dir_exists(b"home/retroos") { "/home/retroos" } else { "/" }).as_bytes());
+        let storage = hosted::boot_storage(&mut config, directory.as_deref().unwrap_or("/"),
+            c_root.as_deref(), host_c_root.as_deref(), boot_runtime.as_deref()).unwrap_or_else(|e| {
+            eprintln!("cannot open host filesystem: {e}");
+            std::process::exit(1);
+        });
         hosted::start_media_worker();
-        let storage = kernel::kernel::startup::Storage::Root(Box::leak(Box::new(root)));
         unsafe { arch::boot(ownership, &config, storage, kernel::startup) }
     });
 

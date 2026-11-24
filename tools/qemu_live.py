@@ -65,15 +65,18 @@ def setup(root, c_root):
     command([smbd, '--version'])
     command([pdbedit, '--version'])
     PROFILE.parent.mkdir(parents=True, exist_ok=True)
-    PROFILE.write_text(json.dumps({'root': str(root), 'c_root': str(c_root)}, indent=2) + '\n')
+    profile = {'root': str(root), 'c_root': str(c_root)}
+    if root == Path('/'):
+        profile['session_home'] = str(Path.home().resolve())
+    PROFILE.write_text(json.dumps(profile, indent=2) + '\n')
     PROFILE.chmod(0o600)
-    print(f'Configured QEMU KVM live files: / = {root} (read-only), C: = {c_root} (writable)')
-    print('Launch with ./run.sh qemu --kvm; --data-image selects an isolated disk instead.')
+    print(f'Configured QEMU live files: / = {root} (read-only), C: = {c_root} (writable)')
+    print('Launch with ./run.sh qemu --live-root. Add --kvm to use hardware acceleration.')
 
 
 def configuration(root, c_root, work, port, username):
-    # The writable connection is exposed only through its C: subdirectory
-    # view in RetroOS. Serving the host namespace lets ordinary Samba symlink
+    # Writable connections are exposed through subdirectory views.
+    # Serving the host namespace lets ordinary Samba symlink
     # handling resolve existing C: application links without wide-links mode.
     return f'''[global]
 server role = standalone server
@@ -115,7 +118,8 @@ follow symlinks = yes
 '''
 
 
-def prepare(work, boot, root, c_root, port, password, startup, native_home=None, native_tools=None, native_tool_paths=()):
+def prepare(work, boot, root, c_root, port, password, startup, native_home=None,
+            native_tools=None, native_tool_paths=(), session_home=None):
     username = pwd.getpwuid(os.getuid()).pw_name
     for directory in ('private', 'lock', 'cache', 'state', 'run'):
         (work / directory).mkdir(mode=0o700)
@@ -141,14 +145,30 @@ def prepare(work, boot, root, c_root, port, password, startup, native_home=None,
         if any(c in startup for c in '\n\r\0'):
             raise ValueError('Startup command must be one line')
         settings += '\n[environment]\nTEST=' + startup + '\n'
-    shares = [('root', '/', 'ro')] + ([] if native_home else [('data', '/home/retroos', 'rw')])
-    for share, path, access in shares:
+    guest_c_root = str(c_root) if session_home else '/home/retroos'
+    shares = [('root', '/', 'ro', None)]
+    if session_home and Path('/tmp') not in (session_home, c_root):
+        shares.append(('data', '/tmp', 'rw', '/tmp'))
+    if session_home and session_home != c_root:
+        shares.append(('data', str(session_home), 'rw', session_home))
+    if not native_home:
+        shares.append(('data', guest_c_root, 'rw', c_root))
+    for share, path, access, subdir in shares:
         settings += (f'\n[smb]\nserver=10.0.2.2\nport={port}\nshare={share}\n'
                      f'username={username}\npassword={password}\npath={path}\naccess={access}\n')
-        if share == 'data':
-            settings += f'subdir={c_root}\n'
-    boot_config = ('[bundle]\nsource=UUID=5E77-0002\nsubdir=/\n\n'
-                   '[mount "data"]\nsource=bundle\npath=/home/retroos\ndrive=C\naccess=ram\nsubdir=/\n')
+        if subdir is not None:
+            settings += f'subdir={subdir}\n'
+    boot_config = '[bundle]\nsource=UUID=5E77-0002\nsubdir=/\n'
+    if session_home:
+        boot_config += (f'runtime_only=true\n\n[session]\nhome={session_home}\nuid={os.getuid()}\ngid={os.getgid()}\n'
+                        'host_paths=true\n\n')
+        if session_home != c_root:
+            boot_config += (f'[mount "home"]\nsource=bundle\npath={session_home}\n'
+                            'access=ram\nsubdir=/\n\n')
+    else:
+        boot_config += '\n'
+    boot_config += (f'[mount "data"]\nsource=bundle\npath={guest_c_root}\n'
+                    'drive=C\naccess=ram\nsubdir=/\n')
     if native_home:
         ident = next(ident for kind, ident in volumes(native_home) if kind == 'ext4')
         boot_config = ('[bundle]\nsource=UUID=5E77-0002\nsubdir=/\n\n'
@@ -178,12 +198,22 @@ def serve(work, boot, startup, profile_path):
         raise ValueError('Run QEMU live sharing as your normal user, not root')
     profile = json.loads(profile_path.read_text())
     root, c_root = Path(profile['root']), Path(profile['c_root'])
+    session_home = profile.get('session_home')
+    if session_home is None and root == Path('/') and profile_path.resolve() == PROFILE.resolve():
+        session_home = Path.home()
+    if session_home is not None:
+        if root != Path('/') or profile.get('native_home_image'):
+            raise ValueError('session_home requires the live host root and DOS directory')
+        session_home, c_root = Path(session_home).resolve(), c_root.resolve()
+        for path in (session_home, c_root):
+            if path == Path('/') or not path.is_dir() or any(c in str(path) for c in '\n\r\0%'):
+                raise ValueError(f'Invalid live session directory: {path}')
     with socket.socket() as listener:
         listener.bind(('127.0.0.1', 0))
         port = listener.getsockname()[1]
     password = secrets.token_hex(32)
     prepare(work, boot, root, c_root, port, password, startup, profile.get("native_home_image"),
-            profile.get("native_tool_image"), profile.get("native_tool_paths", ()))
+            profile.get("native_tool_image"), profile.get("native_tool_paths", ()), session_home)
     smbd, _ = binaries()
     def interrupted(number, _frame):
         raise SystemExit(128 + number)
@@ -226,7 +256,7 @@ def main():
     commands = parser.add_subparsers(dest='action', required=True)
     install = commands.add_parser('setup')
     install.add_argument('--root', type=Path, default=Path('/'))
-    install.add_argument('--c-root', type=Path, default=Path('/home/retroos'))
+    install.add_argument('--c-root', type=Path, default=Path.home() / 'DOS')
     start = commands.add_parser('serve')
     start.add_argument('--work', type=Path, required=True)
     start.add_argument('--boot-image', type=Path, required=True)

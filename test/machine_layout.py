@@ -82,6 +82,9 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False, st
         while process.poll() is None and time.monotonic() < deadline:
             text = log.read_text(errors="replace") if log.exists() else ""
             if success in text or "[mem] exit tid=1 code=1" in text:
+                if success in text and expected != "bundle UUID not found":
+                    # The exit marker precedes the final disk sync and poweroff.
+                    process.wait(timeout=10)
                 break
             time.sleep(.1)
     finally:

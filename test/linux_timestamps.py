@@ -37,7 +37,7 @@ def run(work, bits, smb=False):
         profile = work / 'profile.json'
         profile.write_text(json.dumps({'root': '/', 'c_root': str(home)}))
         env['RETROOS_QEMU_LIVE_PROFILE'] = str(profile)
-        command = [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--headless', '--sound',
+        command = [str(ROOT / 'run.sh'), 'qemu', '--kvm', '--live-root', '--headless', '--sound',
                    'none', '--cmd', '/home/retroos/probe']
     else:
         data = work / 'data.img'

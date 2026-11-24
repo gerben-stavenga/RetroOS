@@ -130,7 +130,7 @@ def main():
         env['RETROOS_QEMU_LIVE_PROFILE'] = str(profile)
         control_path, qmp_path = work / 'control', work / 'qmp'
         with (artifacts / 'klog.txt').open('w') as log:
-            process = subprocess.Popen([str(ROOT / 'run.sh'), 'qemu', '--kvm',
+            process = subprocess.Popen([str(ROOT / 'run.sh'), 'qemu', '--kvm', '--live-root',
                 '--headless', '--sound', 'none', '--cmd',
                 '/home/retroos/RETROOS/SHELL.ELF /home/retroos/run.sh', '--',
                 '-m', str(options.memory),

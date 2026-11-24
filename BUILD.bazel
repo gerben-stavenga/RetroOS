@@ -80,6 +80,16 @@ _APPS_BOOT_SRCS = glob(
     exclude = ["boot-bundle/bin/**"],
     allow_empty = True,
 )
+_DN_BOOT_FILES = {
+    ":" + src: "RETROOS/" + src[len("boot-bundle/"):].upper()
+    for src in _APPS_BOOT_SRCS
+    if src.startswith("boot-bundle/dn/")
+}
+_APPS_BOOT_FILES = {
+    ":" + src: src[len("boot-bundle/"):].upper()
+    for src in _APPS_BOOT_SRCS
+    if not src.startswith("boot-bundle/dn/")
+} | _DN_BOOT_FILES
 _TC_SRCS = glob(["showcase-bundle/TC/**/*"], allow_empty = True)
 _TP70_SRCS = glob(["showcase-bundle/TP70/**/*"], allow_empty = True)
 
@@ -90,10 +100,7 @@ pkg_tar(
         "RC/LICENSE": "0644",
         "RC/README.MD": "0644",
     },
-    files = {
-        ":" + src: src[len("boot-bundle/"):].upper()
-        for src in _APPS_BOOT_SRCS
-    },
+    files = _APPS_BOOT_FILES,
 )
 
 pkg_tar(
@@ -118,6 +125,16 @@ genrule(
 # Built runtime (COMMAND.COM, symbols, shell). boot-bundle/ is :apps_boot_tar,
 # not this map: keep bundled applications separate from generated runtime files.
 _BOOT_DIR_FILES = dict(BOOT_FILES)
+
+# The hosted kernel stages its matched DOS runtime as a single C:\RETROOS tree.
+pkg_tar(
+    name = "hosted_runtime_tar",
+    files = {
+        src: dest
+        for src, dest in _BOOT_DIR_FILES.items()
+        if dest not in ("RETROOS/BOOT.INI", "RETROOS/RETROOS.INI", "RETROOS/KERNEL.SYM")
+    } | _DN_BOOT_FILES,
+)
 
 # Boot bundle (small TAR, partition 1): the LEGACY BOOTLOADER's kernel
 # source only — the MBR stage reads kernel.elf (+ md5) from it. The kernel
@@ -566,10 +583,7 @@ genrule(
 # DOS runtime, without games, compilers, Linux userland, or instrument samples.
 pkg_tar(
     name = "diagnostic_apps_boot_tar",
-    files = {
-        ":" + src: src[len("boot-bundle/"):].upper()
-        for src in _APPS_BOOT_SRCS
-    },
+    files = _APPS_BOOT_FILES,
 )
 
 pkg_tar(

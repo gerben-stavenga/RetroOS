@@ -15,6 +15,14 @@ import install_machine as unified
 
 
 class ShowcaseTests(unittest.TestCase):
+    def test_new_runtime_replaces_legacy_dn_mount(self):
+        plan = dict(c_uuid='data', c_dir='/home/alice/DOS', linux_root='data', runtime_subdir='/runtime')
+        previous = ('[mount "legacy-dn-runtime"]\nsource=bundle\nsubdir=/DN\n'
+                    'path=/home/alice/DOS/RETROOS/DN\naccess=ro\n')
+        self.assertIn('[mount "legacy-dn-runtime"]', installer.boot_configuration(plan, previous))
+        plan['dn_in_retroos'] = True
+        self.assertNotIn('[mount "legacy-dn-runtime"]', installer.boot_configuration(plan, previous))
+
     def test_session_home_and_dos_root_for_linux_and_fat(self):
         for backend, root_key in [(installer.boot_configuration, 'linux_root'),
                                   (unified.module.mount_configuration, 'root_uuid')]:
@@ -34,6 +42,8 @@ class ShowcaseTests(unittest.TestCase):
                     self.assertEqual(config['session']['home'], expected_home)
                     if root:
                         self.assertEqual(config['mount "linux"']['grant'], '/home/alice')
+                        if backend is installer.boot_configuration:
+                            self.assertTrue(config['session'].getboolean('host_paths'))
 
     def test_default_c_directory_uses_installing_users_home(self):
         with patch.object(installer.Path, 'home', return_value=Path('/home/alice')):
@@ -146,10 +156,16 @@ class ShowcaseTests(unittest.TestCase):
                 (stage / '41_retroos').write_text('#!/bin/sh\n')
                 home = root / 'C'
                 home.mkdir()
-                plan = dict(c_uuid='AAAA-BBBB', c_fstype=kind, c_dir='/', linux_root=None,
+                plan = dict(boot_uuid='CCCC-DDDD', c_uuid='AAAA-BBBB', c_fstype=kind, c_dir='/', linux_root=None,
                             archive_sha256='a'*64, release=str(root / 'boot/releases/version'),
                             runtime_subdir='/RETROOS/releases/'+'a'*12, settings_observed=True,
-                            user_ini_sha256=None, boot_ini_sha256=None, copy_showcase=False)
+                            user_ini_sha256=None, boot_ini_source=None, boot_ini_sha256=None,
+                            copy_showcase=False)
+                release_boot = Path(plan['release']) / 'BOOT.INI'
+                (stage / '41_retroos').write_text(installer.BOOT_INI_MARKER + str(release_boot) + '\n')
+                entries = installer.grub_entries(plan)
+                self.assertIn(f'module2 {release_boot} retroos.config=boot', entries)
+                self.assertIn('module2 ($retroos_config)/RETROOS/RETROOS.INI retroos.config=ini', entries)
                 (stage / 'BOOT.INI').write_text(installer.boot_configuration(plan))
                 (root / 'inactive').write_text('menuentry "RetroOS (old module)" {}\n')
                 (root / 'inactive').chmod(0o755)
@@ -167,15 +183,31 @@ class ShowcaseTests(unittest.TestCase):
                     self.assertTrue((root / 'inactive.previous').is_file())
                     self.assertEqual((release / 'RETROOS/DOSRT.EXE').read_bytes(), b'runtime')
                     self.assertEqual((release / 'RETROOS/UNIXLINK.LST').read_text(), 'sh\tbusybox\n')
+                    self.assertFalse((release / 'kernel.elf').exists())
                     self.assertEqual((root / 'boot/releases/version/kernel.elf').read_bytes(), b'kernel')
-                    boot = (home / 'RETROOS/BOOT.INI').read_text()
+                    self.assertFalse((home / 'RETROOS/BOOT.INI').exists())
+                    boot = release_boot.read_text()
                     self.assertIn('source=UUID=AAAA-BBBB', boot)
                     self.assertNotIn('source=module', boot)
                     (home / 'RETROOS/RETROOS.INI').write_text('[system]\n# user edit\n')
                     plan['user_ini_sha256'] = installer.checksum(home / 'RETROOS/RETROOS.INI')
-                    plan['boot_ini_sha256'] = installer.checksum(home / 'RETROOS/BOOT.INI')
+                    source = installer.previous_boot_ini(root / 'boot', home)
+                    self.assertEqual(source, release_boot)
+                    plan['boot_ini_source'] = str(source)
+                    plan['boot_ini_sha256'] = installer.checksum(source)
                     installer.install_into(stage, plan, home)
                     self.assertIn('# user edit', (home / 'RETROOS/RETROOS.INI').read_text())
+                    self.assertFalse((release / 'kernel.elf').exists())
+                    old_boot = release_boot.read_bytes()
+                    next_boot = root / 'boot/releases/next-version/BOOT.INI'
+                    next_plan = dict(plan, release=str(next_boot.parent), archive_sha256='b'*64,
+                                     runtime_subdir='/RETROOS/releases/'+'b'*12)
+                    self.assertIn(f'module2 {next_boot} retroos.config=boot', installer.grub_entries(next_plan))
+                    (stage / '41_retroos').write_text(installer.BOOT_INI_MARKER + str(next_boot) + '\n')
+                    installer.install_into(stage, next_plan, home)
+                    self.assertEqual(release_boot.read_bytes(), old_boot)
+                    self.assertIn(next_plan['runtime_subdir'], next_boot.read_text())
+                    self.assertEqual(installer.previous_boot_ini(root / 'boot', home), next_boot)
 
     def test_prepare_choice_and_noninteractive_default(self):
         for flags, exists, terminal, answer, expected in [
