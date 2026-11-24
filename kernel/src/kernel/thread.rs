@@ -398,7 +398,7 @@ impl<A: crate::Core> Personality<A> {
     {
         match (self, card) {
             (Self::Dos(d), Some(card)) => {
-                d.pc.audio.lock().sb.adopt_card(machine, &mut d.pc.dma, card);
+                d.pc.audio.lock().sb.adopt_card(machine, &mut d.pc.dma, &mut d.pc.vpic, card);
                 None
             }
             (_, card) => card,
@@ -411,7 +411,7 @@ impl<A: crate::Core> Personality<A> {
         machine: &mut A2,
     ) -> Option<crate::kernel::drivers::sb16::Sb16> {
         match self {
-            Self::Dos(d) => d.pc.audio.lock().sb.release_card(machine),
+            Self::Dos(d) => d.pc.audio.lock().sb.release_card(machine, &mut d.pc.vpic),
             Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => None,
         }
     }

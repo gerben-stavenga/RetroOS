@@ -1186,17 +1186,22 @@ pub fn queue_irq<A: crate::Core>(machine: &mut A, pc: &mut PcMachine, regs: &mut
         }
         Irq::Hw(line) => {
             // Only the card this guest actually holds has a line to relay.
-            let audio = pc.audio.lock();
-            let SbDevice::Native { pt, .. } = &audio.sb.device else { return };
+            let mut audio = pc.audio.lock();
+            let irq = audio.sb.blaster.irq;
+            let SbDevice::Native { pt, .. } = &mut audio.sb.device else { return };
             if line != pt.card.irq {
+                return;
+            }
+            if !pt.relay_irq(machine) {
+                machine.isa_unmask_irq(line);
                 return;
             }
             // The physical card's completion line (read from its mixer, or
             // declared for a card that cannot report it). Relay it to the
             // guest's BLASTER IRQ, leaving the host line masked until the
             // guest completes the virtual interrupt with a PIC EOI.
-            if !pc.vpic.is_requested(audio.sb.blaster.irq) {
-                pc.vpic.raise(audio.sb.blaster.irq);
+            if !pc.vpic.is_requested(irq) {
+                pc.vpic.raise(irq);
             }
         }
         // MSI identities are kernel-owned and never map onto the guest's ISA

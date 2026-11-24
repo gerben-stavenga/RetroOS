@@ -13,10 +13,8 @@
 //!     not an emulation request (the personality dispatcher exits the
 //!     process on `KE::In`/`KE::Out`).
 //!
-//! Everything is derived — there is no runtime grant table. The OPL window
-//! rides with `platform::Audio::SbPassthrough` for every DOS thread:
-//! background FM music keeps playing; the display does not follow focus,
-//! audio does not follow it either.
+//! Everything is derived — there is no runtime grant table. OPL ports trap
+//! even in native mode so the write-only FM state can follow the DOS thread.
 
 use crate::kernel::thread::Personality;
 
@@ -89,7 +87,6 @@ pub(super) fn for_key(key: PolicyKey) -> arch_abi::IoPolicy {
     // an emulated card's window must keep trapping, or the model never sees
     // the traffic it exists to answer.
     if key.native_sb {
-        policy.allow(0x388, 2);
         for off in 0..16u16 {
             if key.sb_trap_mask & (1 << off) == 0 {
                 policy.allow(key.sb_base + off, 1);

@@ -181,12 +181,27 @@ impl SbDevice {
         self,
         machine: &mut A,
         b: &Blaster,
+        vpic: &mut VirtualPic,
     ) -> (Self, Option<Sb16>) {
         match self {
             Self::Emulated(emu) => (Self::Emulated(emu), None),
             Self::Native { mut pt, mut shadow } => {
-                let count = pt.bound_dma_count(machine, shadow.dma_channel);
-                pt.release(machine, b);
+                pt.park_fm(machine, shadow.core.fm_registers());
+                shadow.core.set_native_fm(false);
+                let (count, irq) = pt.relinquish(machine, b, shadow.dma_channel);
+                let pending = match irq {
+                    Some((0, _)) => {
+                        vpic.clear_request(b.irq);
+                        0
+                    }
+                    Some((status, unrelayed)) => {
+                        if unrelayed != 0 { vpic.raise(b.irq); }
+                        status
+                    }
+                    None => u8::from(vpic.is_requested(b.irq)),
+                };
+                shadow.core.restore_pcm_irq(pending);
+                shadow.probe_steps = 0;
                 if let Some(count) = count
                     && let Some(position) = shadow.core.sync_auto_init_dma_count(count)
                 {
@@ -206,16 +221,26 @@ impl SbDevice {
     /// because on a real DSP the start command is what latches the format and
     /// begins the transfer. The caller then re-arms the real controller from
     /// the programming retained by the virtual 8237.
-    fn present<A: crate::Core>(self, machine: &mut A, card: Sb16) -> Self {
+    fn present<A: crate::Core>(
+        self, machine: &mut A, card: Sb16, vpic: &mut VirtualPic, irq: u8,
+    ) -> Self {
         let Self::Emulated(mut shadow) = self else {
             panic!("SB already owns the card");
         };
         shadow.unbind_dma(machine);
+        let trigger = shadow.core.take_trigger();
+        let timed = shadow.core.poll_timed_irq(machine.now());
+        if trigger || timed { vpic.raise(irq); }
+        let pending = shadow.core.pending_pcm_irq();
+        shadow.core.restore_pcm_irq(0);
         // The model is the only record of what this guest thinks it programmed
         // (a DSP is write-only), so hand that state to the driver and let it
         // put the silicon there.
         let st = shadow.core.dsp_state();
-        Self::Native { pt: NativeSb::adopt(machine, card, st), shadow }
+        let mut pt = NativeSb::adopt(machine, card, st, shadow.core.mixer_index(), pending);
+        pt.restore_fm(machine, shadow.core.fm_registers());
+        shadow.core.set_native_fm(true);
+        Self::Native { pt, shadow }
     }
 }
 
@@ -390,6 +415,7 @@ impl SoundBlaster {
                 emu.core.reset_for_exit();
             }
             SbDevice::Native { pt, shadow } => {
+                pt.park_fm(machine, shadow.core.fm_registers());
                 pt.release(machine, blaster);
                 shadow.core.reset_for_exit();
             }
@@ -401,19 +427,21 @@ impl SoundBlaster {
     ///
     /// The mirror of `VgaAdapter::present`, and for the same reason — the guest
     /// must not be able to tell that its card changed identity underneath it.
-    pub fn adopt_card<A: crate::Core>(&mut self, machine: &mut A, dma: &mut Dma8237, card: Sb16) {
+    pub fn adopt_card<A: crate::Core>(
+        &mut self, machine: &mut A, dma: &mut Dma8237, vpic: &mut VirtualPic, card: Sb16,
+    ) {
         let dev = core::mem::replace(&mut self.device, SbDevice::Emulated(EmulatedSb::new()));
-        self.device = dev.present(machine, card);
+        self.device = dev.present(machine, card, vpic, self.blaster.irq);
         self.maybe_remap(machine, dma);
     }
 
     /// Give the card up: snapshot it into the model and hand the silicon on.
     /// The mirror of `VgaAdapter::drop_to_facade`. `None` if this thread never had
     /// it, which is every thread on a machine without a card.
-    pub fn release_card<A: crate::Core>(&mut self, machine: &mut A) -> Option<Sb16> {
+    pub fn release_card<A: crate::Core>(&mut self, machine: &mut A, vpic: &mut VirtualPic) -> Option<Sb16> {
         let Self { blaster, device } = self;
         let dev = core::mem::replace(device, SbDevice::Emulated(EmulatedSb::new()));
-        let (dev, card) = dev.drop_to_facade(machine, blaster);
+        let (dev, card) = dev.drop_to_facade(machine, blaster, vpic);
         *device = dev;
         card
     }
@@ -481,7 +509,7 @@ impl SoundBlaster {
                 // Only the native driver owns the guest DMA mapping here.
                 // Mapping the software ring would detach the physical 8237
                 // from the pages the guest is refilling.
-                shadow.program(dma, blaster, p, val, machine.now());
+                shadow.program(dma, blaster, pt.fm_shadow_port(blaster, p), val, machine.now());
                 pt.write(machine, blaster, p, val)
             }
         }

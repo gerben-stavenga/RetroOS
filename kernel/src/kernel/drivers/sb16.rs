@@ -74,6 +74,7 @@ pub struct Sb16 {
     pub dma16: Option<u8>,
     dma8_page: u64,
     dma16_page: u64,
+    pub(super) fm_parked: bool,
 }
 
 /// Physical-SB state that exists only while the kernel mixer owns the card.
@@ -258,6 +259,7 @@ fn identify<A: crate::Core>(machine: &mut A, base: u16, declared: Option<SbWirin
     }
     Some(Sb16 {
         dma8_page: 0, dma16_page: 0,
+        fm_parked: false,
         pnp,
         is_sb16,
         base,

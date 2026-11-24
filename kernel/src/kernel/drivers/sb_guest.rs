@@ -25,6 +25,7 @@
 //! reached only while holding an [`Sb16`], which is the possession proof.
 
 use super::sb16::Sb16;
+use sound::opl::{OPERATOR_OFFSETS, Registers};
 use sound::sb::Wiring as Blaster;
 
 /// Cache-disable attribute for the native ISA DMA alias. The platform
@@ -60,9 +61,14 @@ pub struct NativeSb {
     /// is no "maybe a card" state to guard, because possession is the
     /// guarantee: this value cannot be copied or conjured, only moved in.
     pub card: Sb16,
+    opl2: bool,
     /// Last mixer index the guest selected (`base+0x04`), so `base+0x05`
     /// can answer the wiring registers from the guest's own numbers.
     mixer_idx: u8,
+    /// Software completions still awaiting the guest's DSP acknowledge.
+    carried_irq: u8,
+    /// Hardware PCM latches for which an edge already reached the virtual PIC.
+    notified_irq: u8,
     /// Current alias binding. `bound_chan == 0xFF` ⇒ none. While bound,
     /// the guest's `bound_vpage..+bound_pages` linear pages alias DMA
     /// channel `bound_host`'s permanent buffer; `bound_gpa`/`bound_len`
@@ -100,11 +106,91 @@ impl NativeSb {
     fn new(card: Sb16) -> Self {
         Self {
             card,
+            // QEMU's YM3812 aliases its upper ports onto the lower bank.
+            opl2: crate::kernel::platform::get().host == crate::kernel::platform::Host::Qemu,
             mixer_idx: 0,
+            carried_irq: 0,
+            notified_irq: 0,
             bound_chan: 0xFF, bound_host: 0xFF,
             bound_gpa: 0, bound_len: 0, bound_vpage: 0, bound_pages: 0,
             suspended: false, last_gen: [0; 8],
         }
+    }
+
+    pub fn fm_shadow_port(&self, b: &Blaster, port: u16) -> u16 {
+        if self.opl2
+            && (matches!(port, 0x38a | 0x38b)
+                || matches!(port.wrapping_sub(b.io_base), 2 | 3))
+        {
+            return port - 2;
+        }
+        port
+    }
+
+    fn opl_write<A: crate::Core>(&self, machine: &mut A, index: u16, val: u8) {
+        if self.opl2 && index >= 0x100 { return; }
+        let port = 0x388 + (index >> 8) * 2;
+        machine.outb(port, index as u8);
+        self.opl_delay(machine, 3_300);
+        machine.outb(port + 1, val);
+        self.opl_delay(machine, 23_000);
+    }
+
+    fn opl_delay<A: crate::Core>(&self, machine: &A, ns: u64) {
+        if self.opl2 { return; }
+        let start = machine.now();
+        while machine.now().saturating_sub(start) < ns {
+            core::hint::spin_loop();
+        }
+    }
+
+    pub fn restore_fm<A: crate::Core>(&mut self, machine: &mut A, registers: Option<&Registers>) {
+        if core::mem::take(&mut self.card.fm_parked) {
+            for bank in [0, 0x100] {
+                for offset in OPERATOR_OFFSETS {
+                    self.opl_write(machine, bank + 0x80 + offset, 0);
+                }
+            }
+        }
+        if let Some(registers) = registers {
+            registers.replay(|index, val| self.opl_write(machine, index, val));
+            let index = registers.index();
+            let port = if self.opl2 { 0x388 } else { 0x388 + (index >> 8) * 2 };
+            machine.outb(port, index as u8);
+            self.opl_delay(machine, 3_300);
+        }
+    }
+
+    pub fn park_fm<A: crate::Core>(&mut self, machine: &mut A, registers: Option<&Registers>) {
+        let Some(registers) = registers else { return; };
+        // DSP reset leaves OPL running. Force a fast release even for
+        // instruments with a zero release rate, then clear their programming.
+        for bank in [0, 0x100] {
+            for offset in OPERATOR_OFFSETS {
+                self.opl_write(machine, bank + 0x80 + offset, 0x0f);
+            }
+            for voice in 0..9 {
+                self.opl_write(machine, bank + 0xb0 + voice, 0);
+            }
+        }
+        // Release the percussion keys while rhythm mode is still enabled.
+        self.opl_write(machine, 0xbd, 0x20);
+        self.opl_write(machine, 0xbd, 0);
+        self.opl_write(machine, 0x04, 0x60);
+        self.opl_write(machine, 0x04, 0x80);
+        registers.replay(|index, _| {
+            if !Registers::is_key_register(index)
+                && !matches!(index, 0x04 | 0x80..=0x95 | 0x104 | 0x105 | 0x180..=0x195)
+            {
+                self.opl_write(machine, index, 0);
+            }
+        });
+        if !self.opl2 {
+            self.opl_write(machine, 0x104, 0);
+            self.opl_write(machine, 0x105, 0);
+        }
+        machine.outb(0x388, 0);
+        self.card.fm_parked = true;
     }
 
     /// Take possession of `card` and program it into the stream `st`
@@ -117,7 +203,9 @@ impl NativeSb {
     /// begins the transfer. The DMA side needs nothing here — the virtual
     /// 8237 still holds the guest's programming, and the next `arm` re-arms
     /// the real controller from it.
-    pub fn adopt<A: crate::Core>(machine: &mut A, card: Sb16, st: sound::sb::DspState) -> Self {
+    pub fn adopt<A: crate::Core>(
+        machine: &mut A, card: Sb16, st: sound::sb::DspState, mixer_idx: u8, pending: u8,
+    ) -> Self {
         let base = card.base;
         let mixer = |machine: &mut A, index: u8| {
             machine.outb(base + 0x04, index);
@@ -167,7 +255,11 @@ impl NativeSb {
             st.rate, st.bits, if st.stereo { "stereo" } else { "mono" },
             if st.single { "single" } else { "auto" }, st.block, st.speaker, st.playing
         );
-        Self::new(card)
+        let mut native = Self::new(card);
+        native.mixer_idx = mixer_idx;
+        machine.outb(base + 0x04, mixer_idx);
+        native.carried_irq = pending;
+        native
     }
 
     /// Give the card back. The caller must have `release`d it first.
@@ -187,9 +279,45 @@ impl NativeSb {
     }
 
     /// Read the hardware cursor while the guest's playback ring is still bound.
-    pub fn bound_dma_count<A: crate::Core>(&self, machine: &mut A, channel: usize) -> Option<u16> {
+    fn bound_dma_count<A: crate::Core>(&self, machine: &mut A, channel: usize) -> Option<u16> {
         (self.bound_chan != 0xff && usize::from(self.bound_chan) == channel)
             .then(|| real_8237_count(machine, self.bound_host))
+    }
+
+    fn irq_status<A: crate::Core>(&self, machine: &mut A) -> Option<u8> {
+        if !self.card.has_ct1745() {
+            return None;
+        }
+        let index = self.card.base + 0x04;
+        machine.outb(index, 0x82);
+        let status = machine.inb(index + 1);
+        machine.outb(index, self.mixer_idx);
+        Some(status)
+    }
+
+    /// Filter stale host edges and remember completions already posted to DOS.
+    pub fn relay_irq<A: crate::Core>(&mut self, machine: &mut A) -> bool {
+        let Some(status) = self.irq_status(machine) else { return true; };
+        // A completion of the same width coalesces with a latch the guest
+        // still owes an acknowledgement for, including one from the mixer.
+        let fresh = status & !(self.notified_irq | self.carried_irq);
+        self.notified_irq = status & 0x03;
+        fresh & 0x07 != 0
+    }
+
+    /// Freeze the DMA controller before sampling the cursor and interrupt latches.
+    /// The second status value contains PCM edges the kernel has yet to relay.
+    pub fn relinquish<A: crate::Core>(
+        &mut self, machine: &mut A, b: &Blaster, channel: usize,
+    ) -> (Option<u16>, Option<(u8, u8)>) {
+        self.mask_dma(machine);
+        let count = self.bound_dma_count(machine, channel);
+        let interrupts = self.irq_status(machine).map(|status| {
+            let pcm = status & 0x03;
+            (pcm | self.carried_irq, pcm & !(self.notified_irq | self.carried_irq))
+        });
+        self.reset_and_unbind(machine, b);
+        (count, interrupts)
     }
 
     /// Clear the suspended mark once the caller has replayed the programming.
@@ -209,46 +337,15 @@ impl NativeSb {
 // ── The real card's machine side ────────────────────────────────────────────
 
 impl NativeSb {
-    /// Ports inside the DSP window that MUST trap, as a mask of offsets from
-    /// `io_base`. Everything else is granted to the guest outright (the IOPB
-    /// is per-port), so DSP traffic on a correctly-declared card costs no
-    /// exits at all.
-    ///
-    /// Exactly two things trap, and only one of them is about this card:
-    ///
-    ///  * the whole window when the card is strapped somewhere other than
-    ///    BLASTER's base — every access needs `host_port` translation.
-    ///  * mixer index+data (0x04/0x05): ALWAYS. Registers 0x80/0x81 are the
-    ///    SB16's soft-straps, and here the card tells the TRUTH while the
-    ///    truth is wrong for this guest — it was told other numbers by
-    ///    BLASTER, and the machine translates (the vPIC relays the card's
-    ///    line onto the guest's, the virtual 8237 remaps its channels). A
-    ///    guest that believed the straps would hook a line we never raise, so
-    ///    a write there must not reach silicon (`write` drops it) and a read
-    ///    reports the guest's own labels (`read`). Mixer traffic is volume
-    ///    knobs — cold path, the trap costs nothing.
-    ///
-    /// Nothing else is synthesized. Compensating for a *host emulator's*
-    /// imperfect card (QEMU's sb16 never pulses the write-status busy bit and
-    /// does not surface the E4h/E8h test register) used to live here too;
-    /// that is 86Box's job now, and QEMU runs the emulated SB over HDA/AC97,
-    /// which exercises the software path instead of a second-rate real one.
+    /// Trap accesses needed to translate the guest's wiring, track DSP
+    /// commands, and preserve completion latches across mode changes.
+    /// A mismatched I/O base requires translation for the entire window.
     pub fn trap_mask(&self, b: &Blaster) -> u16 {
         if self.card.base != b.io_base {
             return 0xFFFF;
         }
-        // Mixer index+data, and the two DSP write ports.
-        //
-        // The DSP window used to be granted outright, which cost no exits and
-        // lost every byte that went through it. That was affordable while the
-        // card never changed hands; it is not now. `0x0C` carries every
-        // command and parameter and `0x06` is the reset that voids them, so
-        // these two are exactly what the shadow needs to stay in lockstep —
-        // and no more: the DSP READ ports (0x0A/0x0E) stay granted, so status
-        // polls and data reads, which are the hot ones in a playback loop,
-        // still cost nothing. A driver programs the DSP per block, not per
-        // sample.
-        (1 << 0x04) | (1 << 0x05) | (1 << 0x06) | (1 << 0x0C)
+        // OPL aliases, mixer, DSP writes, and completion acknowledgements.
+        0x030F | (1 << 0x04) | (1 << 0x05) | (1 << 0x06) | (1 << 0x0C) | (1 << 0x0E) | (1 << 0x0F)
     }
 
     /// The physical port for a guest port in the DSP window. BLASTER is the
@@ -276,6 +373,16 @@ impl NativeSb {
     /// timeout branch (526 `INT 21 AH=2C` calls in the hang trace).
     /// Idempotent.
     pub fn release<A: crate::Core>(&mut self, machine: &mut A, b: &Blaster) {
+        self.mask_dma(machine);
+        self.reset_and_unbind(machine, b);
+    }
+
+    fn mask_dma<A: crate::Core>(&self, machine: &mut A) {
+        mask_real_8237(machine, self.card.dma8);
+        if let Some(d16) = self.card.dma16 { mask_real_8237(machine, d16); }
+    }
+
+    fn reset_and_unbind<A: crate::Core>(&mut self, machine: &mut A, b: &Blaster) {
         self.unbind(machine);
         // SB DSP reset: write 1 then 0 to io_base+6. QEMU's sb16 processes
         // this atomically; the hardware ~3 µs hold is irrelevant under
@@ -284,10 +391,6 @@ impl NativeSb {
         let reset = self.host_port(b, b.io_base + 0x06);
         machine.outb(reset, 1);
         machine.outb(reset, 0);
-        // Stop any in-flight host DMA cold; the next bind reprograms and
-        // unmasks. These are the card's own 8-bit/16-bit lines.
-        mask_real_8237(machine, self.card.dma8);
-        if let Some(d16) = self.card.dma16 { mask_real_8237(machine, d16); }
         // Silence what the channels would transfer if anything unmasked them.
         // The buffer still holds this program's last lap — `unbind` copied it
         // back to the guest, it did not clear it — and an auto-init transfer
@@ -298,11 +401,12 @@ impl NativeSb {
         }
         self.suspended = false;
         self.last_gen = [0; 8];
+        self.carried_irq = 0;
+        self.notified_irq = 0;
     }
 
-    /// Read a DSP/mixer/OPL port off the real card. Only the mixer's strap
-    /// registers are answered locally — see `trap_mask`; everything else the
-    /// card reports is the card's own truth and passes straight through.
+    /// Read the card, translating its wiring and exposing PCM completions
+    /// carried across from the software DSP until the guest acknowledges them.
     pub fn read<A: crate::Core>(&mut self, machine: &mut A, b: &Blaster, p: u16) -> u8 {
         if p == b.io_base + 0x05 {
             // Mixer data. Registers 0x80/0x81 report the IRQ and DMA the card
@@ -318,9 +422,17 @@ impl NativeSb {
                     let hi = match b.dma16 { 5 => 0x20, 6 => 0x40, 7 => 0x80, _ => 0 };
                     return lo | hi;
                 }
+                0x82 => return machine.inb(self.host_port(b, p)) | self.carried_irq,
                 _ => {}
             }
         }
+        let ack = match p.wrapping_sub(b.io_base) {
+            0x0E => 0x01,
+            0x0F => 0x02,
+            _ => 0,
+        };
+        self.carried_irq &= !ack;
+        self.notified_irq &= !ack;
         machine.inb(self.host_port(b, p))
     }
 
@@ -328,6 +440,10 @@ impl NativeSb {
     /// strap pair is filtered (see `trap_mask`); every other byte reaches the
     /// silicon verbatim, because the silicon is the card.
     pub fn write<A: crate::Core>(&mut self, machine: &mut A, b: &Blaster, p: u16, val: u8) {
+        if p == b.io_base + 0x06 && val == 0 {
+            self.carried_irq = 0;
+            self.notified_irq = 0;
+        }
         if p == b.io_base + 0x04 {
             self.mixer_idx = val;
         } else if p == b.io_base + 0x05 && matches!(self.mixer_idx, 0x80 | 0x81) {

@@ -351,7 +351,8 @@ pub struct Sb {
 
     /// FM synthesis (OPL2/OPL3). Lazily created on the first FM register write
     /// — the chip is ~20 KB and most programs never touch FM.
-    opl: Option<opl::Fm>,
+    opl: Option<Box<opl::Fm>>,
+    native_fm: bool,
 }
 
 impl Sb {
@@ -374,7 +375,7 @@ impl Sb {
             blocks_done: 0, blocks_acked: 0,
             write_busy: 0, dma_tc: false, tc_status: 0,
             stream_hold: false, done_ns: 0,
-            opl: None,
+            opl: None, native_fm: false,
         }
     }
 
@@ -470,7 +471,7 @@ impl Sb {
         // on first touch.
         if let Some(port) = opl::decode_port(self.io_base, p) {
             self.opl
-                .get_or_insert_with(|| opl::Fm::new(now))
+                .get_or_insert_with(|| Box::new(opl::Fm::new(now, self.native_fm)))
                 .write(now, port, val);
             return None;
         }
@@ -914,6 +915,17 @@ impl Sb {
         self.opl.as_ref().is_some_and(|o| o.audible(now))
     }
 
+    pub fn fm_registers(&self) -> Option<&opl::Registers> {
+        self.opl.as_ref().map(|fm| fm.registers())
+    }
+
+    pub fn set_native_fm(&mut self, native: bool) {
+        self.native_fm = native;
+        if let Some(fm) = &mut self.opl {
+            if native { fm.suspend(); } else { fm.resume(); }
+        }
+    }
+
     /// Program-exit cleanup: stop the DSP and drop the FM chip so the next
     /// program sees a power-on card. Parking the host's sink is separate —
     /// it is shared with every other card.
@@ -940,6 +952,21 @@ impl Sb {
         self.silence_until_ns = 0;
         self.cmd = None;
         self.opl = None; // next program gets a power-on-fresh FM chip
+    }
+
+    pub fn pending_pcm_irq(&self) -> u8 {
+        self.irq_status & 0x03
+    }
+
+    pub fn mixer_index(&self) -> u8 {
+        self.mixer_index
+    }
+
+    /// Restore the completion latches with the state sampled at handoff.
+    pub fn restore_pcm_irq(&mut self, status: u8) {
+        self.irq_status = status & 0x03;
+        self.trigger_irq = 0;
+        self.silence_until_ns = 0;
     }
 
     // ── PCM ──────────────────────────────────────────────────────────────
@@ -1190,6 +1217,18 @@ pub fn new_boxed() -> Box<Sb> {
 #[cfg(test)]
 mod tests {
     use super::{Sb, Start, Step};
+
+    #[test]
+    fn restored_completion_latches_clear_on_matching_dsp_reads() {
+        let mut sb = Sb::new();
+        sb.port_write(0x224, 0x82, 0);
+        sb.restore_pcm_irq(0x03);
+        assert_eq!(sb.port_read(0x225), 0x03);
+        sb.port_read(0x22e);
+        assert_eq!(sb.port_read(0x225), 0x02);
+        sb.port_read(0x22f);
+        assert_eq!(sb.port_read(0x225), 0);
+    }
 
     #[test]
     fn native_handoff_continues_the_dma_ring_and_dsp_block() {
