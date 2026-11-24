@@ -315,7 +315,7 @@ if os.environ.get('EXPECTED_ISO_IMAGE'):
             if cpu == '386':
                 assert 'VME not supported, using software VM86 monitor' in text, text
             device = {'ata': 'ata1', 'ahci': 'ahci0p0', 'nvme': 'nvme0n1'}[controller]
-            assert f'Storage: {device} ' in text, text
+            assert f'Mount candidate: {device} FAT ' in text, text
             print(f'PASS: packaged launcher + persistent write {firmware}/{cpu}/{controller}')
             assert not any(marker in text for marker in ('FATAL', 'PANIC', 'panicked')), text
     print('PASS: release checksums, public data, matched runtime, packaged installer, and prebuilt QEMU launcher')

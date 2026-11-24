@@ -60,7 +60,7 @@ qemu_run "$serial_log" "serial=com1" "$debug_log"
 for expected in \
     'serial: Com1 logging enabled' \
     'RetroOS Rust Kernel' \
-    'Block devices initialized'; do
+    'Filesystems: scanning partition tables'; do
     grep -aFq "$expected" "$serial_log"
     grep -aFq "$expected" "$debug_log"
 done

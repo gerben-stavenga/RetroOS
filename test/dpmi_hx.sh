@@ -18,8 +18,12 @@ set -e -o pipefail
 cd "$(dirname "$0")/.."
 source test/lib/hosted_common.sh
 
+root=$(mktemp -d)
+trap 'rm -rf -- "$root"' EXIT
+mkdir "$root/TESTS"
+cp test/dpmi/DPMI.EXE "$root/TESTS/DPMI.EXE"
 
-LOG=/tmp/dpmi-hx.log
+LOG="$root/probe.log"
 fail() { echo "FAIL: $1"; echo "----- last 30 log lines -----"; tail -30 "$LOG"; exit 1; }
 
 # The probe also benchmarks 100,000 reflected INTs, 100,000 simulated INTs,
@@ -28,7 +32,7 @@ fail() { echo "FAIL: $1"; echo "----- last 30 log lines -----"; tail -30 "$LOG";
 # Keep a bounded deadline, allowing the complete workload on slower hosts.
 # Hosted INT 21h console output lands in the log for content assertions.
 status=0
-timeout --kill-after=5 180 "$HOST_BIN" --cmd "TESTS/DPMI.EXE -r" bazel-bin/image.bin \
+timeout --kill-after=5 180 "$HOST_BIN" --cmd "TESTS/DPMI.EXE -r" "$root" \
     </dev/null > "$LOG" 2>&1 || status=$?
 if [ "$status" -eq 124 ]; then
     fail "HX DPMI probe timed out after 180 seconds"

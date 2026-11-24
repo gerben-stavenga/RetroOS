@@ -73,6 +73,10 @@ pub struct Exchange {
     pub entries: [PageEntry; MAPPINGS],
     pub data: [u8; DATA_SIZE],
 }
+impl Default for Exchange {
+    fn default() -> Self { Self::new() }
+}
+
 impl Exchange {
     pub const fn new() -> Self {
         Self { operation: 0, args: [0; 6], result: [0; 3], supply_returned: 0, memory: UserMemory::EMPTY, reserve_address: 0, tables_changed: 0, regs: Regs::empty(),

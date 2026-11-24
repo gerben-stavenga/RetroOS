@@ -30,9 +30,9 @@ impl Request {
         for index in 0..count {
             let entry = a.a1 + (index * stride) as u64;
             let (pointer, size) = if wide {
-                (machine.read::<u64>(entry as u64), machine.read::<u64>((entry + 8) as u64))
+                (machine.read::<u64>(entry), machine.read::<u64>(entry + 8))
             } else {
-                (u64::from(machine.read::<u32>(entry as u64)), u64::from(machine.read::<u32>((entry + 4) as u64)))
+                (u64::from(machine.read::<u32>(entry)), u64::from(machine.read::<u32>(entry + 4)))
             };
             if size == 0 { continue; }
             if !high_memory::range(pointer, size) { return Err(-EFAULT); }
@@ -68,7 +68,7 @@ impl Request {
             let mut offset = 0;
             for &(pointer, size) in &self.regions {
                 let count = size.min(result as usize - offset);
-                machine.copy_to(pointer as u64, &bytes[offset..offset + count]);
+                machine.copy_to(pointer, &bytes[offset..offset + count]);
                 offset += count;
                 if offset == result as usize { break; }
             }

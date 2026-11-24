@@ -169,7 +169,7 @@ pub(super) fn install_trap_hook(hook: Option<arch_abi::entry::RetainedTrapHook>)
             assert!(hook.regions.iter().map(|region| region.bytes).sum::<usize>() <= vm::HOOK_PAGES * 4096);
             let mut physical = vm::HOOK_PHYSICAL;
             for (index, region) in hook.regions.into_iter().enumerate() {
-                assert!(region.base as usize % 4096 == 0 && region.bytes % 4096 == 0);
+                assert!((region.base as usize).is_multiple_of(4096) && region.bytes.is_multiple_of(4096));
                 assert!(region.bytes == 0 || !region.base.is_null());
                 if region.bytes != 0 {
                     unsafe { cpu._vm.set_user_memory_region(kvm_userspace_memory_region {

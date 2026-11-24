@@ -4,9 +4,13 @@ set -e -o pipefail
 cd "$(dirname "$0")/.."
 source test/lib/hosted_common.sh
 
+root=$(mktemp -d)
+trap 'rm -rf -- "$root"' EXIT
+mkdir "$root/TESTS"
+cp bazel-bin/test/dos/xmsprobe/XMSPROBE.COM "$root/TESTS/XMSPROBE.COM"
 
-LOG=/tmp/retroos-xms.log
-timeout 30 "$HOST_BIN" --cmd "TESTS/XMSPROBE.COM" bazel-bin/image.bin \
+LOG="$root/probe.log"
+timeout 30 "$HOST_BIN" --cmd "TESTS/XMSPROBE.COM" "$root" \
     </dev/null > "$LOG" 2>&1 || true
 
 if ! grep -q "XMSPROBE PASS" "$LOG"; then

@@ -261,9 +261,14 @@ pub struct PageReserve {
     pages: [u64; SUPPLY_CAPACITY],
     count: u64,
 }
+impl Default for PageReserve {
+    fn default() -> Self { Self::new() }
+}
+
 impl PageReserve {
     pub const fn new() -> Self { Self { pages: [0; SUPPLY_CAPACITY], count: 0 } }
     pub fn len(&self) -> usize { self.count as usize }
+    pub fn is_empty(&self) -> bool { self.count == 0 }
     pub fn take(&mut self) -> Option<OwnedPage> {
         if self.count == 0 { return None; }
         self.count -= 1;

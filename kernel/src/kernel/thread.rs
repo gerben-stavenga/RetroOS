@@ -1154,9 +1154,9 @@ pub fn schedule<A: crate::Core>(threads: &ThreadTable<A>, current_tid: usize) ->
     if next_idx == usize::MAX {
         // A worker-owned process is live even when no local row is Ready.
         // Switching acquires just this loan; never report AllDead while APs run.
-        threads.active_ids().filter(|&tid| tid != 0).find_map(|tid|
-            (tid != current_tid && threads[tid].kernel.state == ThreadState::OnCpu
-                && !crate::kernel::sched::vfork_suspended(threads, tid)).then_some(tid))
+        threads.active_ids().find(|&tid| tid != 0 && tid != current_tid
+            && threads[tid].kernel.state == ThreadState::OnCpu
+            && !crate::kernel::sched::vfork_suspended(threads, tid))
     } else {
         Some(next_idx)
     }

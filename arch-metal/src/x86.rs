@@ -58,7 +58,8 @@ static mut APIC_ID: Option<u32> = None;
 pub fn cpu_capabilities() -> &'static CpuCapabilities {
     assert!(CAPABILITIES_READY.load(Ordering::Acquire), "CPU capabilities not initialized");
     // The BSP publishes once, before AP startup; no writes follow publication.
-    unsafe { (&*(&raw const CPU_CAPABILITIES)).as_ref().unwrap() }
+    let capabilities = &raw const CPU_CAPABILITIES;
+    unsafe { (*capabilities).as_ref().unwrap() }
 }
 
 /// Probe only during core initialization. APs must support the BSP's choices.

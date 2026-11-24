@@ -18,6 +18,10 @@ struct ScopedJob {
     context: usize,
 }
 
+impl<T: Send> Default for WorkerQueue<T> {
+    fn default() -> Self { Self::new() }
+}
+
 impl<T: Send> WorkerQueue<T> {
     pub const fn new() -> Self {
         Self { ready: AtomicBool::new(false), entry: Mutex::new(None) }

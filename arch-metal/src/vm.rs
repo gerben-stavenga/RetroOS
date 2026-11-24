@@ -17,6 +17,13 @@ pub unsafe fn boot(hooks: &'static [(&'static str, arch_abi::entry::TrapHandler)
     unsafe { HOOKS = hooks; }
     unsafe { crate::smp::init_core(0); }
     paging2::finish_setup_paging();
+    // The resident supervisor has its own terminal state and no VGA aperture.
+    lib::term::term().set_aperture(None);
+    lib::log::set_debug_sink(|byte| crate::x86::outb(0xe9, byte));
+    lib::log::set_fatal_handler(|| {
+        crate::x86::outl(vm::PANIC_PORT, 1);
+        loop { crate::x86::hlt(); }
+    });
     unsafe { crate::boot_mem::BootMemory::new().finish(); }
     unsafe {
         (*exchange()).memory = paging2::user_memory();

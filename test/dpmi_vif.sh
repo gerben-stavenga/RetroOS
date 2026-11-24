@@ -4,9 +4,13 @@ set -e -o pipefail
 cd "$(dirname "$0")/.."
 source test/lib/hosted_common.sh
 
+root=$(mktemp -d)
+trap 'rm -rf -- "$root"' EXIT
+mkdir "$root/TESTS"
+cp bazel-bin/test/dos/vifiret/VIFIRET.COM "$root/TESTS/VIFIRET.COM"
 
-LOG=/tmp/retroos-vifiret.log
-timeout 30 "$HOST_BIN" --cmd "TESTS/VIFIRET.COM" bazel-bin/image.bin \
+LOG="$root/probe.log"
+timeout 30 "$HOST_BIN" --cmd "TESTS/VIFIRET.COM" "$root" \
     </dev/null > "$LOG" 2>&1 || true
 
 if ! grep -q "VIFIRET PASS" "$LOG"; then

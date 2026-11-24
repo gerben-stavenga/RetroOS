@@ -571,7 +571,7 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
 /// don't push ESP/SS.
 pub(crate) fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
     match int_num {
-        14 => panic!("Page fault in resident arch: addr={:#x} err={:#x}", x86::read_cr2_full(), error),
+        14 => panic!("Page fault in resident arch: addr={:#x} err={:#x} at {cs:#x}:{eip:#x}", x86::read_cr2_full(), error),
         #[cfg(not(feature = "kvm"))]
         32..=47 | 0xF8..=0xFE => {
             let mut regs = Regs::empty();

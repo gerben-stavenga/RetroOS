@@ -264,8 +264,8 @@ fn poll<A: crate::Core>(
     let now = machine.now();
     let mut n = 0;
     for i in 0..count {
-        let fd = machine.read::<i32>((ptr + (i * 8) as u64) as u64);
-        let requested = machine.read::<u16>((ptr + (i * 8) as u64 + 4) as u64) as u32;
+        let fd = machine.read::<i32>(ptr + (i * 8) as u64);
+        let requested = machine.read::<u16>(ptr + (i * 8) as u64 + 4) as u32;
         let bits = if fd < 0 {
             0
         } else if descriptor(s, fd).is_none()
@@ -275,7 +275,7 @@ fn poll<A: crate::Core>(
         } else {
             ready(kt, s, fd, now) & (requested | 0x18)
         };
-        machine.write::<u16>((ptr + (i * 8) as u64 + 6) as u64, bits as u16);
+        machine.write::<u16>(ptr + (i * 8) as u64 + 6, bits as u16);
         n += i32::from(bits != 0);
     }
     n
@@ -778,7 +778,7 @@ pub(super) fn call<A: crate::Core>(
                     s.contexts[s.active].comm
                 };
                 name[15] = 0;
-                machine.copy_to(a.a1 as u64, &name);
+                machine.copy_to(a.a1, &name);
                 0
             }
             _ => -EINVAL,

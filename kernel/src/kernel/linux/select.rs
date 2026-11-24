@@ -32,18 +32,18 @@ impl Request {
         for (index, &pointer) in request.pointers.iter().enumerate() {
             if pointer != 0 && size != 0 {
                 let mut bytes = [0; thread::FD_SET_BYTES];
-                machine.copy_from(pointer as u64, &mut bytes[..size]);
+                machine.copy_from(pointer, &mut bytes[..size]);
                 request.sets[index] = thread::FdSet::from_le_bytes(&bytes[..size]);
             }
         }
         if args.a4 != 0 {
             let at = args.a4;
             let (sec, nsec) = if wide {
-                (machine.read::<i64>(at as u64), machine.read::<i64>((at + 8) as u64))
+                (machine.read::<i64>(at), machine.read::<i64>(at + 8))
             } else {
                 (
-                    i64::from(machine.read::<i32>(at as u64)),
-                    i64::from(machine.read::<i32>((at + 4) as u64)),
+                    i64::from(machine.read::<i32>(at)),
+                    i64::from(machine.read::<i32>(at + 4)),
                 )
             };
             if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
@@ -105,7 +105,7 @@ impl Request {
         }
         for (index, &pointer) in self.pointers.iter().enumerate() {
             if pointer != 0 {
-                machine.copy_to(pointer as u64, &output[index].to_le_bytes()[..self.size()]);
+                machine.copy_to(pointer, &output[index].to_le_bytes()[..self.size()]);
             }
         }
         Some(count)

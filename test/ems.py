@@ -42,8 +42,7 @@ def main():
                 command.append('--kvm')
         else:
             target = 'retroos-host' + ('-kvm' if args.kvm or engine == 'kvm' else '')
-            root = work / 'home/retroos'
-            root.mkdir(parents=True)
+            root = work
             shutil.copyfile(probe, root / 'EMSPROBE.COM')
             command = [f'bazel-bin/kernel/{target}', '--cmd', 'EMSPROBE.COM', tmp]
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL,

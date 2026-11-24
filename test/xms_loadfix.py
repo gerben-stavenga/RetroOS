@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     os.chdir(ROOT)
     with tempfile.TemporaryDirectory(prefix='retroos-xms-loadfix-') as tmp:
-        root = Path(tmp) / 'home/retroos'
+        root = Path(tmp)
         (root / 'RETROOS').mkdir(parents=True)
         shutil.copyfile('bazel-bin/tools/command/COMMAND.COM', root / 'COMMAND.COM')
         for name in ('LIMITED', 'NORMAL', 'WRAPPED'):

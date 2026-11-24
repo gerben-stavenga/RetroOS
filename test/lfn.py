@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Exercise the LFN guest ABI on a disposable writable ext4 disk."""
+"""Exercise the LFN guest ABI in a disposable hosted directory."""
 import os
 import pathlib
-import stat
+import shutil
 import subprocess
 import tempfile
 
@@ -19,13 +19,11 @@ def main():
         raise SystemExit(f"Unknown ENGINE: {engine}")
     target = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
     with tempfile.TemporaryDirectory(prefix="retroos-lfn-") as directory:
-        image = pathlib.Path(directory) / "disk.img"
-        # Bazel artifacts are read-only. Never ask a mutation test to open
-        # them directly (the hosted ATA device can fall back to read-only).
-        run("cp", "--reflink=auto", "--sparse=always", ROOT / "bazel-bin/image.bin", image)
-        image.chmod(image.stat().st_mode | stat.S_IWUSR)
-        run("python3", "test/hosted_test.py", "--image", image,
-            "--host-bin", ROOT / "bazel-bin/kernel" / target,
+        root = pathlib.Path(directory)
+        (root / "TESTS").mkdir()
+        shutil.copyfile(ROOT / "bazel-bin/test/dos/lfnprobe/LFNPROBE.COM", root / "TESTS/LFNPROBE.COM")
+        run("python3", "test/hosted_test.py", "--directory", root,
+            "--host-bin", ROOT / "bazel-bin/kernel" / target, "--screenshot", root / "screen.txt",
             "--cmd", "TESTS/LFNPROBE.COM", "--expect-log", "LFN-ALL-OK",
             "--forbid-log", "LFN-FAIL", "--settle", "5", "--timeout", "25")
 

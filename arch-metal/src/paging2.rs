@@ -1935,7 +1935,7 @@ pub fn clear_trampoline(saved: u64) {
 
 /// Map one heap page using only caller-supplied data and table storage.
 pub(crate) fn map_heap_page(address: usize, frame: u64, table: u64) -> bool {
-    assert!(address % PAGE_SIZE == 0 && (heap_base()..HEAP_END).contains(&address));
+    assert!(address.is_multiple_of(PAGE_SIZE) && (heap_base()..HEAP_END).contains(&address));
     let _guard = PagingGuard::lock();
     refresh_kernel_mappings();
     fn install<E: Entry>(e: &mut [E], address: usize, frame: u64, table: u64) -> bool {

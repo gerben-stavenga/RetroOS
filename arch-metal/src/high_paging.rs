@@ -247,10 +247,10 @@ pub(crate) fn read_run(page: UserPage, maximum: usize) -> Result<(PageEntry, usi
             let span = 1u64 << (12 + 9 * level);
             let remaining = ((span - (address & (span - 1))) / 4096).min(maximum as u64) as usize;
             let mut decoded = decode_uniform(entry)?;
-            if inherited_cow {
-                if let PageEntry::Writable(m) = decoded {
-                    if matches!(m.backing, Backing::Owned(_)) { decoded = PageEntry::CopyOnWrite(m); }
-                }
+            if inherited_cow && let PageEntry::Writable(m) = decoded
+                && matches!(m.backing, Backing::Owned(_))
+            {
+                decoded = PageEntry::CopyOnWrite(m);
             }
             return Ok((decoded, remaining));
         }
@@ -276,13 +276,14 @@ pub(crate) fn fill(page: UserPage, count: usize, incoming: PageEntry) -> Result<
             if let Backing::Owned(frame) = m.backing { Some(frame.number()) } else { None },
         _ => None,
     };
+    #[allow(clippy::too_many_arguments)]
     fn update(entry: &mut Entry64, level: u32, base: u64, start: u64, end: u64,
         encoded: Entry64, owned: Option<u64>, completed: &mut usize) -> Result<(), MappingError>
     {
         let span = 1u64 << (12 + 9 * level);
         if level == 0 || owned.is_none() && start <= base && end >= base + span {
-            if let Some(frame) = owned {
-                if !crate::memory::inc_shared_count(frame) { return Err(MappingError::InvalidFrame); }
+            if let Some(frame) = owned && !crate::memory::inc_shared_count(frame) {
+                return Err(MappingError::InvalidFrame);
             }
             let old = *entry; *entry = encoded; release(old, level);
             *completed = ((end.min(base + span) - start) / 4096) as usize;

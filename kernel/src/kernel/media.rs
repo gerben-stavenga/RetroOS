@@ -66,8 +66,10 @@ trait GraphicsJob: Send + Sync {
     fn run(&self);
 }
 
+type Work<T> = (T, Option<fn(&mut T)>);
+
 struct State<T> {
-    work: spin::Mutex<(T, Option<fn(&mut T)>)>,
+    work: spin::Mutex<Work<T>>,
 }
 
 impl<T: Send> GraphicsJob for State<T> {
@@ -373,6 +375,10 @@ fn device_checkpoint() {
 pub struct Commands<T, const N: usize> {
     queue: spin::Mutex<VecDeque<T>>,
     pending: AtomicBool,
+}
+
+impl<T, const N: usize> Default for Commands<T, N> {
+    fn default() -> Self { Self::new() }
 }
 
 impl<T, const N: usize> Commands<T, N> {

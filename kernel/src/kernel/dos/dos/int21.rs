@@ -430,7 +430,7 @@ pub(super) fn int_21h<A: crate::Core>(
                     .then(|| crate::kernel::vfs::seek(handle, 0, 1, &kt.fds));
                 let read_started = machine.now();
                 let fetch_started = crate::kernel::startup::profile_enabled()
-                    .then(|| crate::kernel::event_profile::cycles());
+                    .then(crate::kernel::event_profile::cycles);
                 let n = crate::kernel::vfs::read(handle, &mut buf, &kt.fds);
                 if let Some(offset) = read_offset {
                     let prefix = (n.max(0) as usize).min(buf.len()).min(16);
@@ -464,7 +464,7 @@ pub(super) fn int_21h<A: crate::Core>(
                         });
                     } else {
                         let copy_started = crate::kernel::startup::profile_enabled()
-                            .then(|| crate::kernel::event_profile::cycles());
+                            .then(crate::kernel::event_profile::cycles);
                         finish_file_read(machine, dos, regs, buf_addr, &buf);
                         if let Some(start) = copy_started {
                             crate::kernel::event_profile::record_dos_read_copy(

@@ -119,6 +119,7 @@ fn channels<A: crate::Core>(machine: &mut A) -> alloc::vec::Vec<Arc<Channel>> {
 /// ATA addressing ceilings, in 512-byte sectors.
 const LBA28_MAX: u64 = 1 << 28;
 const LBA48_MAX: u64 = 1 << 48;
+const PROBE_TIMEOUT_NS: u64 = 500_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Addressing {
@@ -261,25 +262,6 @@ impl Ata {
     /// IDENTIFY (no device, or ATAPI, which we don't support) is not a disk.
     fn probe(channel: Arc<Channel>, drive: u8) -> Option<Self> {
         let base = channel.base;
-        let select = 0xA0 | (drive << 4);
-
-        outb(base + reg::LBA_24_27_FLAGS, select);
-
-        let mut ready = false;
-        for _ in 0..100_000 {
-            let s = inb(base + reg::STATUS);
-            if s == 0xFF {
-                return None; // floating bus — no controller decodes these ports
-            }
-            if (s & (status::BSY | status::DRDY)) == status::DRDY {
-                ready = true;
-                break;
-            }
-        }
-        if !ready {
-            return None;
-        }
-
         let mut disk = Ata { base, channel, drive, addressing: Addressing::Lba28(0), mwdma2: false,
                              cache_flush: true, flush_command: cmd::CACHE_FLUSH, bus_master: None };
         disk.addressing = disk.identify_addressing()?;
@@ -300,17 +282,25 @@ impl Ata {
     /// BSY forever, which is exactly what we must not do here).
     fn identify_addressing(&mut self) -> Option<Addressing> {
         self.select();
+        let started = now_ns();
+        loop {
+            let s = inb(self.base + reg::STATUS);
+            if s == 0xff || now_ns().wrapping_sub(started) >= PROBE_TIMEOUT_NS { return None; }
+            if s & (status::BSY | status::DRQ) == 0 { break; }
+        }
         outb(self.base + reg::SECTOR_COUNT, 0);
         outb(self.base + reg::LBA_0_7, 0);
         outb(self.base + reg::LBA_8_15, 0);
         outb(self.base + reg::LBA_16_23, 0);
         outb(self.base + reg::COMMAND, cmd::IDENTIFY);
 
-        for _ in 0..1_000_000 {
+        let started = now_ns();
+        loop {
             let s = inb(self.base + reg::STATUS);
+            if s == 0xff || now_ns().wrapping_sub(started) >= PROBE_TIMEOUT_NS { return None; }
             if s & status::BSY != 0 { continue; }
-            if s == 0 || (s & status::ERR) != 0 {
-                return None; // no device, or IDENTIFY unsupported (ATAPI)
+            if s & status::ERR != 0 {
+                return None; // IDENTIFY unsupported (ATAPI), or a device error
             }
             if s & status::DRQ != 0 {
                 let mut words = [0u16; 256];
@@ -323,7 +313,6 @@ impl Ata {
                 return Addressing::identify(&words);
             }
         }
-        None
     }
 
     /// Point the channel at this drive. Every transfer re-selects, because the
@@ -416,16 +405,21 @@ pub fn probe<A: crate::Core>(machine: &mut A) -> alloc::vec::Vec<AtaDisk> {
         let ctrl = channel.ctrl;
         // Transfers are polled, including native channels without an IRQ handler.
         outb(ctrl, 0x06);
-        // SRST must be asserted for at least 5 us. Port reads also provide
-        // ordering on legacy machines whose clocks cannot yet be calibrated.
-        for _ in 0..256 { inb(ctrl); }
+        // Give the controller time to assert reset and the drives time to
+        // settle after deassertion, even when port reads complete immediately.
+        reset_delay(ctrl, 5_000);
         outb(ctrl, 0x02);
-        for _ in 0..256 { inb(ctrl); }
+        reset_delay(ctrl, 2_000_000);
         for drive in 0..2 {
             if let Some(disk) = AtaDisk::probe(machine, channel.clone(), index, drive) { disks.push(disk); }
         }
     }
     disks
+}
+
+fn reset_delay(ctrl: u16, delay_ns: u64) {
+    let started = now_ns();
+    while now_ns().wrapping_sub(started) < delay_ns { inb(ctrl); }
 }
 
 impl Hardware for Ata {

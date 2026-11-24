@@ -298,10 +298,10 @@ fn replace<E: Entry>(entries: &mut [E], page: UserPage, entry: PageEntry) -> Res
     let incoming = encode::<E>(page, entry)?;
     // Before taking a frame reference, so NeedPages leaves no leak behind.
     prepare_tables(entries, page.address() as usize / 4096)?;
-    if let PageEntry::NoAccess(m) | PageEntry::ReadOnly(m) | PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) = entry {
-        if let Backing::Owned(frame) = m.backing {
-            if !crate::memory::inc_shared_count(frame.number()) { return Err(MappingError::InvalidFrame); }
-        }
+    if let PageEntry::NoAccess(m) | PageEntry::ReadOnly(m) | PageEntry::Writable(m) | PageEntry::CopyOnWrite(m) = entry
+        && let Backing::Owned(frame) = m.backing && !crate::memory::inc_shared_count(frame.number())
+    {
+        return Err(MappingError::InvalidFrame);
     }
     paging2::replace_mapping(&mut entries[page.address() as usize / 4096], incoming);
     Ok(())

@@ -12,8 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     os.chdir(ROOT)
     with tempfile.TemporaryDirectory(prefix='retroos-tsr-session-') as tmp:
-        root = Path(tmp) / 'home/retroos'
-        root.mkdir(parents=True)
+        root = Path(tmp)
         shutil.copyfile('bazel-bin/tools/command/COMMAND.COM', root / 'COMMAND.COM')
         shutil.copyfile('bazel-bin/test/dos/tsrsession/TSRSESS.COM', root / 'TSRSESS.COM')
         for mode in ('I', 'L'):

@@ -206,12 +206,12 @@ pub(super) fn getdents<A: crate::Core>(
         if size > count - written {
             return if written == 0 { -22 } else { written as i32 };
         }
-        machine.zero((out + written as u64) as u64, size);
-        machine.write::<u64>((out + written as u64) as u64, 0xf0000 + slot as u64);
-        machine.write::<u64>((out + written as u64 + 8) as u64, (slot + 1) as u64);
-        machine.write::<u16>((out + written as u64 + 16) as u64, size as u16);
-        machine.write::<u8>((out + written as u64 + 18) as u64, if slot < 2 { 4 } else { 10 });
-        machine.copy_to((out + written as u64 + 19) as u64, &name);
+        machine.zero(out + written as u64, size);
+        machine.write::<u64>(out + written as u64, 0xf0000 + slot as u64);
+        machine.write::<u64>(out + written as u64 + 8, (slot + 1) as u64);
+        machine.write::<u16>(out + written as u64 + 16, size as u16);
+        machine.write::<u8>(out + written as u64 + 18, if slot < 2 { 4 } else { 10 });
+        machine.copy_to(out + written as u64 + 19, &name);
         written += size;
         *cursor += 1;
     }

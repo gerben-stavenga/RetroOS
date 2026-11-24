@@ -1054,7 +1054,9 @@ fn finish_gate<A: crate::Core>(machine: &A, state: &Os2State, regs: &mut Regs, g
         regs.rax = (regs.rax & !0xffff) | result as u16 as u64;
         regs.frame.rip = machine.read::<u16>(sp as u64) as u64;
         regs.frame.cs = machine.read::<u16>((sp + 2) as u64) as u64;
-        regs.frame.rsp = regs.frame.rsp.wrapping_add(4 + gate.far16_args as u64);
+        let mask = u64::from(stack_pointer_mask(state, regs));
+        regs.frame.rsp = (regs.frame.rsp & !mask)
+            | (regs.frame.rsp.wrapping_add(4 + u64::from(gate.far16_args)) & mask);
     }
 }
 
@@ -1218,12 +1220,27 @@ fn dos_write<A: crate::Core>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
 }
 
 fn stack_linear(state: &Os2State, regs: &Regs) -> usize {
-    selector_base(state, regs.frame.ss as u16).unwrap_or(0) as usize + regs.sp() as usize
+    let offset = regs.sp32() & stack_pointer_mask(state, regs);
+    selector_base(state, regs.stack_seg()).unwrap_or(0).wrapping_add(offset) as usize
+}
+
+fn stack_pointer_mask(state: &Os2State, regs: &Regs) -> u32 {
+    // The stack descriptor's B bit determines whether stack operations
+    // use SP or ESP, independently of the caller's code segment.
+    match ldt_descriptor(state, regs.stack_seg()) {
+        Some(desc) if desc & (1 << 54) == 0 => u16::MAX.into(),
+        _ => u32::MAX,
+    }
+}
+
+fn ldt_descriptor(state: &Os2State, selector: u16) -> Option<u64> {
+    if selector & 4 == 0 { return None; }
+    state.ldt.get((selector >> 3) as usize).copied()
 }
 
 fn selector_base(state: &Os2State, selector: u16) -> Option<u32> {
     if selector & 4 == 0 { return (selector == arch_abi::USER_DS).then_some(0); }
-    let desc = *state.ldt.get((selector >> 3) as usize)?;
+    let desc = ldt_descriptor(state, selector)?;
     Some((((desc >> 16) & 0xffff) | (((desc >> 32) & 0xff) << 16) | (((desc >> 56) & 0xff) << 24)) as u32)
 }
 
@@ -1302,7 +1319,7 @@ fn begin_wndproc<A: crate::Core>(
     };
     if window.wndproc == 0 || state.callback.is_some() { return false; }
     let sp = regs.sp().wrapping_sub(20);
-    machine.write::<u32>(sp as u64, state.callback_return);
+    machine.write::<u32>(sp, state.callback_return);
     machine.write::<u32>((sp as usize + 4) as u64, message.hwnd);
     machine.write::<u32>((sp as usize + 8) as u64, message.message);
     machine.write::<u32>((sp as usize + 12) as u64, message.mp1);

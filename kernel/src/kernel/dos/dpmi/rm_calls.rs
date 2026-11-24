@@ -168,7 +168,7 @@ pub(in crate::kernel::dos) fn direct_rm_call<A: crate::Core>(
         return Some(action);
     }
 
-    let profile_start = crate::kernel::startup::profile_enabled().then(|| crate::kernel::event_profile::cycles());
+    let profile_start = crate::kernel::startup::profile_enabled().then(crate::kernel::event_profile::cycles);
     let action = start_transfer(machine, dos, regs, transfer, struct_addr, rm);
     let dispatch_start = profile_start.map(|_| crate::kernel::event_profile::cycles());
     debug_assert!(matches!(&action, thread::KernelAction::Done));

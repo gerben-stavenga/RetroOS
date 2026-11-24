@@ -191,12 +191,10 @@ const KERNEL_BASE: u32 = 0xC000_0000;
 /// it in. Best-effort user names aren't worth a global; kernel frames are what
 /// a panic backtrace needs.
 fn lookup_symbol(addr: u64) -> (&'static str, u64) {
-    if addr >= KERNEL_BASE as u64 {
-        if let Some(data) = KERNEL_SYMBOLS.get() {
-            let (name, offset) = data.lookup(addr);
-            if !name.is_empty() {
-                return (name, offset);
-            }
+    if addr >= KERNEL_BASE as u64 && let Some(data) = KERNEL_SYMBOLS.get() {
+        let (name, offset) = data.lookup(addr);
+        if !name.is_empty() {
+            return (name, offset);
         }
     }
     ("", 0)

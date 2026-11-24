@@ -93,7 +93,6 @@ fn park_at_slot_resume<A: crate::Core>(_machine: &mut A, regs: &mut Regs) {
 
 /// Arithmetic status bits returned by DOS calls. Control flags such as DF and
 /// the caller's interrupt-enable state come from the saved interrupt frame.
-
 fn merge_dos_status(saved_flags: u32, completed_flags: u32) -> u32 {
     (saved_flags & !eflags::STATUS_MASK) | (completed_flags & eflags::STATUS_MASK)
 }

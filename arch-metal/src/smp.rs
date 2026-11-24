@@ -78,7 +78,8 @@ pub unsafe fn init_core(core_id: u32) {
         (&raw const ARCH_STACK_TOP) as u32 - 16
     } else {
         let stack = unsafe {
-            let start = (&mut *(&raw mut START)).as_mut().expect("AP missing startup context");
+            let start = &raw mut START;
+            let start = (*start).as_mut().expect("AP missing startup context");
             crate::memory::bootstrap(&mut start.memory);
             start.trap_stack_top
         };
@@ -104,7 +105,8 @@ pub fn stack_return_addresses(mut frame: u32) -> impl Iterator<Item = u32> {
             (&raw const ARCH_STACK as u32)..(&raw const ARCH_STACK_TOP as u32),
         ]
     } else {
-        let start = unsafe { (&*(&raw const START)).as_ref().expect("AP missing startup context") };
+        let start = &raw const START;
+        let start = unsafe { (*start).as_ref().expect("AP missing startup context") };
         [
             start.stack_top - 65536..start.stack_top,
             start.trap_stack_top - 16368..start.trap_stack_top + 16,
@@ -143,7 +145,8 @@ pub fn stack_return_addresses(mut frame: u32) -> impl Iterator<Item = u32> {
 /// `init_core` must have completed on this AP, with interrupts still disabled.
 pub unsafe fn run_secondary() -> ! {
     paging2::refresh_kernel_mappings();
-    let start = unsafe { (&*(&raw const START)).as_ref().expect("not a secondary core") };
+    let start = &raw const START;
+    let start = unsafe { (*start).as_ref().expect("not a secondary core") };
     // The active GDT is now private TLS storage; the trampoline can be reused.
     start.ready.store(start.core_id, Ordering::Release);
     (start.entry)(start.core_id, start.argument)

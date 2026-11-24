@@ -36,7 +36,7 @@ impl Timer {
     pub(super) fn expirations(&self, now: u64) -> u64 {
         match self.expiry {
             Some(expiry) if now >= expiry => {
-                if self.interval == 0 { 1 } else { 1 + (now - expiry) / self.interval }
+                1 + (now - expiry).checked_div(self.interval).unwrap_or(0)
             }
             _ => 0,
         }

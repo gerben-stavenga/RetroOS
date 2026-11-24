@@ -50,7 +50,7 @@ pub(crate) struct Sample(Option<u64>);
 impl Sample {
     pub(crate) fn start<A: crate::Core>(_machine: &A) -> Self {
         Self((super::startup::profile_enabled() && super::osd::is_open())
-            .then(|| crate::kernel::event_profile::cycles()))
+            .then(crate::kernel::event_profile::cycles))
     }
 
     pub(crate) fn finish<A: crate::Core>(self, _machine: &A, stage: Stage, pixels: usize) {

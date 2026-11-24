@@ -167,7 +167,7 @@ fn next_after<A: crate::Core>(
             ).map(Verdict::Switch)
         }
         thread::KernelAction::Wait { pid, status_ptr, options } => {
-            crate::kernel::linux::handle_wait(machine, threads, regs, tid, pid, status_ptr as u64, options)
+            crate::kernel::linux::handle_wait(machine, threads, regs, tid, pid, status_ptr, options)
                 .map(Verdict::Switch)
         }
         thread::KernelAction::Signal { pid, signal } => {

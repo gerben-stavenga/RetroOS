@@ -235,7 +235,7 @@ integration_test(
     command = ["python3", "test/lfn.py"],
     sources = ["//:integration_sources"],
     host = ["//kernel:retroos-host"],
-    metal = ["//:image"],
+    metal = ["//test/dos/lfnprobe:lfnprobe_com"],
     env = {"ENGINE": "tcg"},
     tags = ["dos"],
 )
@@ -245,7 +245,7 @@ integration_test(
     command = ["bash", "test/dpmi_hx.sh"],
     sources = ["//:integration_sources"],
     host = ["//kernel:retroos-host"],
-    metal = ["//:image"],
+    metal = [],
     env = {"ENGINE": "tcg"},
     tags = ["dos"],
 )
@@ -255,7 +255,7 @@ integration_test(
     command = ["bash", "test/xms.sh"],
     sources = ["//:integration_sources"],
     host = ["//kernel:retroos-host"],
-    metal = ["//:image"],
+    metal = ["//test/dos/xmsprobe:xmsprobe_com"],
     env = {"ENGINE": "tcg"},
     tags = ["dos"],
 )
@@ -275,7 +275,7 @@ integration_test(
     command = ["bash", "test/dpmi_vif.sh"],
     sources = ["//:integration_sources"],
     host = ["//kernel:retroos-host"],
-    metal = ["//:image"],
+    metal = ["//test/dos/vifiret:vifiret_com"],
     env = {"ENGINE": "tcg"},
     tags = ["dos"],
 )
@@ -422,7 +422,7 @@ integration_test(
     command = ["python3", "test/lfn.py"],
     sources = ["//:integration_sources"],
     host = ["//kernel:retroos-host-kvm"],
-    metal = ["//:image"],
+    metal = ["//test/dos/lfnprobe:lfnprobe_com"],
     env = {"ENGINE": "kvm"},
     tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
 )
@@ -432,7 +432,7 @@ integration_test(
     command = ["bash", "test/dpmi_hx.sh"],
     sources = ["//:integration_sources"],
     host = ["//kernel:retroos-host-kvm"],
-    metal = ["//:image"],
+    metal = [],
     env = {"ENGINE": "kvm"},
     tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
 )
@@ -442,7 +442,7 @@ integration_test(
     command = ["bash", "test/xms.sh"],
     sources = ["//:integration_sources"],
     host = ["//kernel:retroos-host-kvm"],
-    metal = ["//:image"],
+    metal = ["//test/dos/xmsprobe:xmsprobe_com"],
     env = {"ENGINE": "kvm"},
     tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
 )
@@ -462,7 +462,7 @@ integration_test(
     command = ["bash", "test/dpmi_vif.sh"],
     sources = ["//:integration_sources"],
     host = ["//kernel:retroos-host-kvm"],
-    metal = ["//:image"],
+    metal = ["//test/dos/vifiret:vifiret_com"],
     env = {"ENGINE": "kvm"},
     tags = ["dos", "requires-kvm", "no-sandbox", "no-cache"],
 )

@@ -281,6 +281,7 @@ pub(super) fn deliver<A: crate::Core>(
 }
 
 /// `status` is siginfo's si_status slot (offset 24); only SIGCHLD sets it.
+#[allow(clippy::too_many_arguments)]
 fn deliver_frame<A: crate::Core>(
     machine: &mut A,
     linux: &mut LinuxState,

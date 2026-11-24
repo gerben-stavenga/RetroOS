@@ -55,16 +55,14 @@ pub unsafe extern "C" fn isr_handler(stack: &mut StackFrame, from_64: bool) -> b
         if from_64 { stack.regs.frame.cs & 3 == 3 }
         else { stack.raw32.raw.cs & 3 == 3 || stack.raw32.raw.eflags & VM_FLAG != 0 }
     };
-    if user {
-        if let Some(hook) = unsafe { ENTRY_HOOK } {
-            let handled = unsafe { instruction32(stack, from_64) }.is_some_and(|state| {
-                let mut access = NativeTrapAccess(core::cell::OnceCell::new());
-                unsafe { (hook.handler)(state, &mut access, hook.regions.map(|region| region.base)) }
-            });
-            if handled {
-                unsafe { prepare_espfix(stack, from_64); }
-                return from_64;
-            }
+    if user && let Some(hook) = unsafe { ENTRY_HOOK } {
+        let handled = unsafe { instruction32(stack, from_64) }.is_some_and(|state| {
+            let mut access = NativeTrapAccess(core::cell::OnceCell::new());
+            unsafe { (hook.handler)(state, &mut access, hook.regions.map(|region| region.base)) }
+        });
+        if handled {
+            unsafe { prepare_espfix(stack, from_64); }
+            return from_64;
         }
     }
     let wide = dispatch(stack, from_64);

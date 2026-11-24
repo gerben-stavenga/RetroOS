@@ -14,7 +14,7 @@ fn send<A: crate::Core>(machine: &mut A, h: i32, header: u64, flags: i32, wide: 
     }
     let unit = if wide { 8 } else { 4 };
     let name = word(machine, header, wide);
-    let namelen = machine.read::<u32>((header + unit) as u64) as usize;
+    let namelen = machine.read::<u32>(header + unit) as usize;
     let iov_at = header + if wide { 16 } else { 8 };
     let iov = word(machine, iov_at, wide);
     let count = word(machine, iov_at + unit, wide);
@@ -39,7 +39,7 @@ fn send<A: crate::Core>(machine: &mut A, h: i32, header: u64, flags: i32, wide: 
     if name != 0 && namelen < 16 {
         return -EINVAL;
     }
-    let (address, n) = read_sockaddr(machine, name as u64, namelen);
+    let (address, n) = read_sockaddr(machine, name, namelen);
     // One send per message: iovecs form a single UDP datagram.
     net::sendto(h, &data, flags, &address[..n])
 }
@@ -77,7 +77,7 @@ pub(super) fn sendmmsg<A: crate::Core>(
         if n < 0 {
             return SyscallResult::val(if index == 0 { n } else { index as i32 });
         }
-        machine.write::<u32>((at + header) as u64, n as u32);
+        machine.write::<u32>(at + header, n as u32);
     }
     SyscallResult::val(args.a2.min(1024) as i32)
 }
@@ -97,7 +97,7 @@ fn receive<A: crate::Core>(machine: &mut A, kt: &thread::KernelThread<A>, args: 
     if header == 0 { return -EFAULT; }
     let unit = if wide { 8 } else { 4 };
     let name = word(machine, header, wide);
-    let namelen = machine.read::<u32>((header + unit) as u64) as usize;
+    let namelen = machine.read::<u32>(header + unit) as usize;
     let iov_at = header + if wide { 16 } else { 8 };
     let iov = word(machine, iov_at, wide);
     let count = word(machine, iov_at + unit, wide);
@@ -109,7 +109,7 @@ fn receive<A: crate::Core>(machine: &mut A, kt: &thread::KernelThread<A>, args: 
         let Some(at) = index.checked_mul(unit * 2).and_then(|n| iov.checked_add(n)) else { return -EFAULT };
         let base = word(machine, at, wide);
         let len = word(machine, at + unit, wide);
-        if len != 0 && (base == 0 || base.checked_add(len as u64).is_none_or(|end| end > 0xc000_0000)) { return -EFAULT; }
+        if len != 0 && (base == 0 || base.checked_add(len).is_none_or(|end| end > 0xc000_0000)) { return -EFAULT; }
         let Some(total) = capacity.checked_add(match usize::try_from(len) { Ok(n) => n, Err(_) => return -EINVAL }) else { return -EINVAL };
         capacity = total;
         vectors.push((base, len as usize));
@@ -129,18 +129,18 @@ fn receive<A: crate::Core>(machine: &mut A, kt: &thread::KernelThread<A>, args: 
     let mut offset = 0;
     for (base, len) in vectors {
         let len = len.min(copied - offset);
-        if len != 0 { machine.copy_to(base as u64, &bytes[offset..offset + len]); }
+        if len != 0 { machine.copy_to(base, &bytes[offset..offset + len]); }
         offset += len;
     }
     if name != 0 {
         let length = net::address_length(h, true);
-        machine.copy_to(name as u64, &address[..namelen.min(length).min(address.len())]);
-        machine.write::<u32>((header + unit) as u64, length as u32);
-    } else { machine.write::<u32>((header + unit) as u64, 0); }
+        machine.copy_to(name, &address[..namelen.min(length).min(address.len())]);
+        machine.write::<u32>(header + unit, length as u32);
+    } else { machine.write::<u32>(header + unit, 0); }
     // msg_controllen and msg_flags are output fields (padding differs by ABI).
-    if wide { machine.write::<u64>((iov_at + 3 * unit) as u64, 0); }
-    else { machine.write::<u32>((iov_at + 3 * unit) as u64, 0); }
-    machine.write::<u32>((iov_at + 4 * unit) as u64, if n as usize > copied { 0x20 } else { 0 });
+    if wide { machine.write::<u64>(iov_at + 3 * unit, 0); }
+    else { machine.write::<u32>(iov_at + 3 * unit, 0); }
+    machine.write::<u32>(iov_at + 4 * unit, if n as usize > copied { 0x20 } else { 0 });
     if datagram && flags & 0x20 != 0 { n } else { copied as i32 }
 }
 
@@ -159,7 +159,7 @@ fn gather_prefix<A: crate::Core>(machine: &mut A, iov: u64, count: u64, wide: bo
         if len != 0 && (base == 0 || base.checked_add(len as u64).is_none_or(|end| end > 0xc000_0000)) { return Err(-EFAULT); }
         let offset = bytes.len();
         bytes.resize(offset + len, 0);
-        machine.copy_from(base as u64, &mut bytes[offset..]);
+        machine.copy_from(base, &mut bytes[offset..]);
         if partial && bytes.len() == 65536 { break; }
     }
     Ok(bytes)

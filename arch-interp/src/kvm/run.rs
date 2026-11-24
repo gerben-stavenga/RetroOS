@@ -59,7 +59,7 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
         cpu.vcpu.set_kvm_immediate_exit(0);
         unsafe {
             (*cpu.message).operation = vm::op::EXECUTE;
-            (*cpu.message).regs = (*(&raw const crate::vcpu::REGS)).regs;
+            (*cpu.message).regs = crate::vcpu::REGS.regs;
         }
         let now = crate::machine::now();
         let deadline = now.saturating_add(max_time.as_nanos().min(u64::MAX as u128) as u64);
@@ -72,7 +72,7 @@ pub fn execute(max_time: core::time::Duration) -> KernelEvent {
         until_return(cpu, true);
         setup::CPU_TID.store(0, Ordering::Release);
         let message = unsafe { &*cpu.message };
-        unsafe { (*(&raw mut crate::vcpu::REGS)).regs = message.regs; }
+        unsafe { crate::vcpu::REGS.regs = message.regs; }
         KernelEvent::decode(message.result[0] as u32, message.result[1])
     })
 }

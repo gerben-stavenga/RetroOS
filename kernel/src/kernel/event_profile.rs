@@ -226,7 +226,7 @@ pub(super) struct Dispatch(Option<(usize, u64, u64)>);
 
 impl Sample {
     pub(super) fn start<A: Core>(_machine: &A) -> Self {
-        Self(super::startup::profile_enabled().then(|| crate::kernel::event_profile::cycles()))
+        Self(super::startup::profile_enabled().then(crate::kernel::event_profile::cycles))
     }
 
     pub(super) fn returned<A: Core>(

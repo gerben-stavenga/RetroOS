@@ -524,8 +524,10 @@ pub(crate) fn copy_resolve(vaddr: u32, write: bool) -> Option<*mut u8> {
     if raw & PRESENT == 0 && (raw & TYPED != 0 || raw == ABSENT || raw & CACHE_DISABLE != 0) { return None; }
     if write && raw & PRESENT != 0 {
         if raw & (WRITABLE | COW) == 0 { return None; }
-        if raw & COW != 0 || read_entry(pd, pde_index(vaddr)) & COW != 0 {
-            if !cow_fault(pd, vaddr, false) { return None; }
+        if (raw & COW != 0 || read_entry(pd, pde_index(vaddr)) & COW != 0)
+            && !cow_fault(pd, vaddr, false)
+        {
+            return None;
         }
     }
     let physical = if let Some(physical) = translate(pd, vaddr) { physical }

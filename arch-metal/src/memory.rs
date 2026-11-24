@@ -24,11 +24,12 @@ pub fn bootstrap(boot: &mut PageBootstrap) {
 pub(crate) fn with_input<R>(pages: PageInput, operation: impl FnOnce() -> R) -> (R, PageInput) {
     struct Restore(PageInput);
     impl Drop for Restore {
-        fn drop(&mut self) { unsafe { *(&raw mut INPUT) = core::mem::take(&mut self.0); } }
+        fn drop(&mut self) { unsafe { INPUT = core::mem::take(&mut self.0); } }
     }
-    let _restore = Restore(unsafe { core::mem::replace(&mut *(&raw mut INPUT), pages) });
+    let input = &raw mut INPUT;
+    let _restore = Restore(unsafe { core::mem::replace(&mut *input, pages) });
     let result = operation();
-    let unused = unsafe { core::mem::take(&mut *(&raw mut INPUT)) };
+    let unused = unsafe { core::mem::take(&mut *input) };
     (result, unused)
 }
 pub fn supply_pages(mut pages: PageInput) -> (usize, PageInput) {
@@ -84,8 +85,9 @@ impl Drop for FaultGuard {
 /// Whether this operation's explicit input or guest fault reserve has backing.
 pub(crate) fn page_available() -> bool {
     unsafe {
-        if (*supply()).fault_depth != 0 { (*supply()).reserve.len() != 0 }
-        else { !(*(&raw const INPUT)).is_empty() }
+        let input = &raw const INPUT;
+        if (*supply()).fault_depth != 0 { !(*supply()).reserve.is_empty() }
+        else { !(*input).is_empty() }
     }
 }
 /// Consume a donated page. Faults use their guaranteed per-core reserve;
@@ -97,7 +99,10 @@ pub fn take_page() -> Option<u64> {
             if page.is_some() { (*supply()).fault_pages_current += 1; (*supply()).fault_pages_used += 1; }
             page.map(OwnedPage::into_number)
         }
-        else { (*(&raw mut INPUT)).take().map(OwnedPage::into_number) }
+        else {
+            let input = &raw mut INPUT;
+            (*input).take().map(OwnedPage::into_number)
+        }
     }
 }
 pub fn get_ref_count(page: u64) -> u8 {
