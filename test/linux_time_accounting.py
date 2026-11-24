@@ -228,8 +228,7 @@ def main():
     parser.add_argument('--direct-io', action='store_true', help='Bypass the host page cache for the private QEMU data disk')
     parser.add_argument('--from-dn', action='store_true', help='Launch the benchmark through real DN and its DOS batch helper')
     args = parser.parse_args()
-    if os.environ.get('RETROOS_PREBUILT') != '1':
-        subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
+    native_program_profile.require_boot_disk()
     spec = importlib.util.spec_from_file_location('serial_bridge', ROOT / 'tools/86box_mcp.py')
     bridge = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bridge)

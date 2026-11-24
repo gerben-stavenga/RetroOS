@@ -385,8 +385,9 @@ process. Reusing its backing avoids repeatedly demand-faulting and releasing
 temporary buffers while hashing large executables. Larger requests may return
 a short read. The file-cache regression checks changing request sizes, EOF,
 and coherence with unflushed shared mappings through this path.
-`python3 test/linux_codex_native_resume.py --resume latest --daemon --full-features`
-profiles the current project's saved session using copied SQLite snapshots,
+After building `//:boot_disk`, run
+`python3 test/linux_codex_native_resume.py --resume latest --daemon --full-features`.
+This fixture profiles the current project's saved session using copied SQLite snapshots,
 the installed managed daemon, and a native ext4/NVMe root. It types a draft
 without submitting it. Omit `--daemon` to compare direct startup. This external
 test needs saved login/package state; its guest state is private and temporary.
@@ -492,7 +493,7 @@ application log also recorded a model-list timeout.
 The comparison is saved in
 `build/ci/codex-native-resume/storage-stall-comparison.json`.
 
-`python3 test/linux_time_accounting.py` gates before a real fork/exec/wait
+After building `//:boot_disk`, `python3 test/linux_time_accounting.py` gates before a real fork/exec/wait
 compile/link/run and compares private ext4 and SMB roots with the same tools,
 32 GiB RAM and six CPUs. `profile totals` exposes cumulative exclusive cycle
 categories and elapsed nanoseconds; idle sleep is separated from scheduler
@@ -2581,13 +2582,13 @@ cache nor the epoll fix is a claim of complete Codex compatibility.
 Reproduce the matching startup fixture with:
 
 ```sh
-RETROOS_PREBUILT=1 python3 test/linux_codex_native_resume.py \
+bazelisk build //:boot_disk
+python3 test/linux_codex_native_resume.py \
   --storage smb --live-tools --memory 2048 --cpus 2 \
   --state-from "$HOME/DOS/.codex" --daemon --full-features --existing-skills \
   --screen-transport qmp --no-profile --sample-interval 0 --timeout 120
 ```
 
-Build `//:boot_disk` first when using `RETROOS_PREBUILT=1`. New regression
 `//tests:linux_exec_cache` checks both Linux ABIs after executable writes,
 shared mappings and name replacement. `//tests:linux_epoll_network` now checks
 notifications for new TCP data with old bytes still unread; the corresponding

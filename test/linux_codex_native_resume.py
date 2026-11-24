@@ -53,11 +53,7 @@ def main():
         parser.error('--live-tools requires --storage smb')
     if args.storage == 'smb' and args.kernel:
         parser.error('--kernel comparison needs native ext4')
-    # Finish host compilation before measuring guest startup. Otherwise an
-    # unrelated Bazel command's lock wait can look like time spent in Codex.
-    if os.environ.get('RETROOS_PREBUILT') != '1':
-        subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True,
-                       stdout=subprocess.DEVNULL)
+    native_program_profile.require_boot_disk()
     label = ('codex-native-resume' if args.storage == 'ext4' else 'codex-smb-resume') + ('-picker' if args.picker else '') + ('-filled' if args.filled else '')
     if args.label:
         label += '-' + args.label

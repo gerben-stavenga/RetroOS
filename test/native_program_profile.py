@@ -7,6 +7,11 @@ import subprocess
 from linux_smb_symlink import ROOT
 
 
+def require_boot_disk():
+    if not (ROOT / 'bazel-bin/boot_disk.bin').is_file():
+        raise SystemExit('Missing boot disk. Run bazelisk build //:boot_disk before profiling.')
+
+
 def prepare(work, home, codex, extra_binaries=(), image_bytes=2 * 1024 * 1024 * 1024,
             allocation_fill_bytes=0):
     root = work / 'native-root'
