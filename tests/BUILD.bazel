@@ -743,6 +743,7 @@ integration_test(
     command = ["bash", "test/bochs_smoke.sh"],
     sources = ["//:integration_sources"],
     metal = ["//:boot_disk", "//:data_disk"],
+    timeout = "eternal",
     tags = ["devices"],
 )
 

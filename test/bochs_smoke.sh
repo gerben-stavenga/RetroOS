@@ -33,8 +33,11 @@ run_probe() {
     shift 2
     local log="$work/$name.log"
     local completion='All commands done'
+    local deadline=600
     # SVGAPROBE deliberately waits for a key after its final success marker.
     [ "$name" != vbe ] || completion='VBE-ALL-OK'
+    # The final raw mode-switch benchmark takes several minutes on CI.
+    [ "$name" != dpmi ] || deadline=1200
     # No sound card on a CI runner: Bochs' own lowlevel sound driver defaults
     # to ALSA, fails to open the default PCM and then dies with "*** buffer
     # overflow detected ***", taking the probe with it. These probes are XMS,
@@ -48,8 +51,8 @@ run_probe() {
         'sound: waveoutdrv=dummy, waveindrv=dummy, midioutdrv=dummy' >"$log" 2>&1 &
     pid=$!
     # Also stop on an early guest exit or panic; marker checks below still
-    # require success. DPMI includes benchmarks, so allow slower CI CPUs.
-    if ! qemu_wait_for_log "$log" "$completion\|All commands done\|KERNEL PANIC\|panicked\|SEGV" 600 "$pid"; then
+    # require success.
+    if ! qemu_wait_for_log "$log" "$completion\|All commands done\|KERNEL PANIC\|panicked\|SEGV" "$deadline" "$pid"; then
         qemu_dump_log "$name" "$log"
         return 1
     fi

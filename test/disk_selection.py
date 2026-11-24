@@ -21,8 +21,13 @@ org 100h
     jc fail
     cmp ax, 1
     jne fail
+    ; The harness stops QEMU on the success marker. Commit before reporting it.
+    mov ah, 68h
+    int 21h
+    jc fail
     mov ah, 3eh
     int 21h
+    jc fail
     jc fail
     mov dx, ok
     jmp print
@@ -100,7 +105,7 @@ def main():
                     result = subprocess.run(['mtype', '-i', volume, '::' + path], capture_output=True)
                 else:
                     result = run('debugfs', '-R', 'cat ' + path, disks[i], capture_output=True)
-                assert (result.stdout == b'S') == (i == selected), (label, i, result.stdout, result.stderr)
+                assert (result.stdout == b'S') == (i == selected), (label, i, result.stdout, result.stderr, text)
         print('PASS: explicit C: UUID/home selection writes reach the chosen physical FAT/ext4 volume')
 
 
