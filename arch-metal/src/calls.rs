@@ -96,6 +96,18 @@ pub fn release_heap_pages(addr: usize, bytes: usize) {
     }
 }
 
+/// Remove cached aliases of permanent kernel storage from ring 1.
+pub fn arch_unmap_kernel_image_pages(addr: usize, pages: usize) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch_call::UNMAP_KERNEL_IMAGE as u32,
+            in("edx") addr as u32,
+            in("ecx") pages as u32,
+        );
+    }
+}
+
 /// Load the LDT: write base+limit into GDT[12] and execute LLDT. Takes the LDT
 /// as a slice so base and limit travel together; the metal backend splits it
 /// into the `edx`/`ecx` register pair for the trap (the kernel address fits

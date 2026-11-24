@@ -419,7 +419,7 @@ fn install_physical_memory() {
                 .checked_add(paging2::KERNEL_PHYS)?;
             Some((storage, (physical / PAGE_SIZE) as u64))
         },
-        unmap: paging2::unmap_kernel_page,
+        unmap: paging2::unmap_kernel_image_pages,
     };
     phys_mm::install_low_dma_memory(&DMA);
     let (needed, returned) = arch::memory::supply_pages(Default::default());

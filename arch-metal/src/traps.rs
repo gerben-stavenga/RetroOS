@@ -53,6 +53,7 @@ pub(crate) fn set_execute_regs(regs: *mut Regs) {
 pub mod arch_call {
     pub const INSTALL_TRAP_HOOK: u64 = 0x134;
     pub const EDIT_MAPPINGS: u64 = 0x135;
+    pub const UNMAP_KERNEL_IMAGE: u64 = 0x136; // EDX=virtual byte address, ECX=page count
     pub const REARRANGE_MAPPINGS: u64 = 0x133;
     pub const READ_MAPPINGS: u64 = 0x12E;
     pub const REPLACE_MAPPINGS: u64 = 0x12F;
@@ -241,6 +242,9 @@ pub(crate) fn arch_dispatch(regs: &mut KernelCall) -> CallOutcome {
         }
         arch_call::CLEAN => paging2::free_user_pages(),
         arch_call::RELEASE_HEAP => paging2::release_heap_pages(regs.rdx as usize, regs.rcx as usize),
+        arch_call::UNMAP_KERNEL_IMAGE => {
+            paging2::unmap_kernel_image_pages(regs.rdx as usize, regs.rcx as usize);
+        }
         arch_call::LOAD_LDT => {
             crate::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
         }

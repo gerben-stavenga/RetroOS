@@ -545,8 +545,8 @@ unsafe fn prepare_boot(
     // memory. Must be done at ring 0 because entries() reads CR4.
     let kstack_guard = (&raw const crate::KERNEL_STACK_GUARD) as usize;
     let astack_guard = (&raw const crate::ARCH_STACK_GUARD) as usize;
-    paging2::unmap_kernel_page(kstack_guard);
-    paging2::unmap_kernel_page(astack_guard);
+    paging2::unmap_kernel_image_pages(kstack_guard, 1);
+    paging2::unmap_kernel_image_pages(astack_guard, 1);
     lib::compact_screenln!(screen, "Stack guards at {:#x} (kernel) {:#x} (arch)", kstack_guard, astack_guard);
 
     lib::screenln!(screen);
@@ -722,7 +722,7 @@ fn install_isa_dma_memory() {
                 .checked_add(paging2::KERNEL_PHYS)?;
             Some((storage, (physical / PAGE_SIZE) as u64))
         },
-        unmap: paging2::unmap_kernel_page,
+        unmap: arch::arch_unmap_kernel_image_pages,
     };
     phys_mm::install_low_dma_memory(&DMA);
 

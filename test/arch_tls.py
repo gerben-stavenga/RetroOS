@@ -39,7 +39,7 @@ def session(work, disk, name, cpu, accel, extra=(), initialized=None):
             while time.monotonic() < deadline:
                 text = log.read_text(errors='replace') if log.exists() else ''
                 assert not any(marker in text for marker in
-                               ('PANIC', 'SEGV', 'fatal Exception',
+                               ('PANIC', '!!! FATAL !!!', 'SEGV', 'fatal Exception',
                                 '[mem] exit tid=1 code=1 ')), text
                 if '[mem] exit tid=1 code=0 ' in text:
                     if initialized is not None:

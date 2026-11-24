@@ -8,8 +8,8 @@ use core::alloc::Layout;
 pub struct LowDmaMemory {
     /// Return (virtual byte address, physical page number), aligned to layout.
     pub reserve: fn(Layout) -> Option<(usize, u64)>,
-    /// Remove the ordinary cached alias before the driver maps it uncached.
-    pub unmap: fn(usize),
+    /// Remove the cached alias at a virtual byte address for a page count.
+    pub unmap: fn(usize, usize),
 }
 static MEMORY: spin::Once<&'static LowDmaMemory> = spin::Once::new();
 pub fn install_low_dma_memory(memory: &'static LowDmaMemory) {
@@ -53,7 +53,7 @@ pub fn dma_channel_buf(ch: usize) -> u64 {
         "boot pool violates ISA DMA address constraints");
     // The driver maps these frames uncached. Remove the ordinary cached alias;
     // physical ownership stays with the pool, already reserved as kernel BSS.
-    for offset in (0..bytes).step_by(PAGE_SIZE) { (memory().unmap)(storage + offset); }
+    (memory().unmap)(storage, bytes / PAGE_SIZE);
     slot.store(page as usize, Ordering::Release);
     page
 }

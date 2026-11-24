@@ -1034,17 +1034,24 @@ pub const fn page_idx(vaddr: usize) -> usize {
     vaddr / PAGE_SIZE
 }
 
-/// Remove a kernel-image virtual mapping without releasing its physical page.
-/// Both stack guards and DMA storage live in the permanently owned kernel
-/// image; dropping the allocator reference would let another device reuse it.
-pub fn unmap_kernel_page(vaddr: usize) {
+/// Remove cached aliases from the permanently owned kernel image at ring 0.
+pub fn unmap_kernel_image_pages(vaddr: usize, count: usize) {
+    assert!(vaddr.is_multiple_of(PAGE_SIZE) && vaddr >= KERNEL_BASE);
+    let start = page_idx(vaddr);
+    let end = start.checked_add(count).expect("kernel image page range overflow");
+    assert!(end <= page_idx(heap_base()));
     let _paging = PagingGuard::lock();
-    let idx = page_idx(vaddr);
     match entries() {
-        Entries::E32(e) => { let _ = replace_entry(&mut e[idx], Entry32(0)); }
-        Entries::E64(e) => { let _ = replace_entry(&mut e[idx], Entry64(0)); }
+        Entries::E32(e) => {
+            for entry in &mut e[start..end] { let _ = replace_entry(entry, Entry32(0)); }
+        }
+        Entries::E64(e) => {
+            for entry in &mut e[start..end] { let _ = replace_entry(entry, Entry64(0)); }
+        }
     }
-    crate::x86::invlpg(vaddr);
+    for page in start..end {
+        crate::x86::invlpg(page * PAGE_SIZE);
+    }
 }
 
 /// Return unused heap backing without faulting in absent page tables. The
