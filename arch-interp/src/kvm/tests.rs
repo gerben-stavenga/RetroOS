@@ -515,10 +515,15 @@ fn kvm_engine_proofs() {
     let mut active = 0;
     let mut syscalls = 0;
     let mut alarms = 0;
-    let start = std::time::Instant::now();
+    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(10);
+    let mut slices = 0;
     set_regs(contexts[active]);
-    while start.elapsed() < std::time::Duration::from_millis(100) {
-        match execute(core::time::Duration::from_micros(100)) {
+    // Keep short preemptive slices, with occasional longer slices to ensure
+    // forward progress when nested KVM entry is slow.
+    while (syscalls <= 100 || alarms <= 10) && std::time::Instant::now() < deadline {
+        let budget = if slices % 4 == 0 { 5_000 } else { 100 };
+        slices += 1;
+        match execute(core::time::Duration::from_micros(budget)) {
             KernelEvent::Irq => {
                 alarms += 1;
             },
@@ -529,8 +534,8 @@ fn kvm_engine_proofs() {
         active ^= 1;
         set_regs(contexts[active]);
     }
-    assert!(syscalls > 100, "64-bit syscall contexts made progress");
-    assert!(alarms > 10, "context switches exercised real alarm preemption");
+    assert!(syscalls > 100 && alarms > 10,
+        "expected 64-bit syscall and alarm preemption coverage, got {syscalls} syscalls and {alarms} alarms");
 
 
 }
