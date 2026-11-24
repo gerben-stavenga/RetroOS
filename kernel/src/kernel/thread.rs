@@ -398,7 +398,7 @@ impl<A: crate::Core> Personality<A> {
     {
         match (self, card) {
             (Self::Dos(d), Some(card)) => {
-                d.pc.audio.lock().sb.adopt_card(machine, card);
+                d.pc.audio.lock().sb.adopt_card(machine, &mut d.pc.dma, card);
                 None
             }
             (_, card) => card,

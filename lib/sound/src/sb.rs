@@ -1102,6 +1102,33 @@ impl Sb {
         self.dma_cursor_at(self.cursor)
     }
 
+    /// Continue an auto-init stream from the hardware 8237's current count.
+    /// The block phase is recoverable when whole DSP blocks fit in the DMA ring.
+    pub fn sync_auto_init_dma_count(&mut self, count: u16) -> Option<u64> {
+        if !self.playing || self.single || !self.dma_auto_init {
+            return None;
+        }
+        let channels = if self.stereo { 2 } else { 1 };
+        let transfers = self.buf_frames * channels;
+        let remaining = u32::from(count) + 1;
+        let frame = transfers.checked_sub(remaining)? / channels;
+        let position = u64::from((self.buf_frames + frame - self.dma_start_frame) % self.buf_frames);
+        if self.buf_frames.is_multiple_of(self.block_frames) {
+            self.cursor = position;
+            self.blocks_done = position / u64::from(self.block_frames);
+            self.blocks_acked = self.blocks_done;
+            self.next_irq = (self.blocks_done + 1) * u64::from(self.block_frames);
+            Some(position)
+        } else {
+            self.dma_start_frame = frame;
+            self.cursor = 0;
+            self.blocks_done = 0;
+            self.blocks_acked = 0;
+            self.next_irq = u64::from(self.block_frames);
+            Some(0)
+        }
+    }
+
     /// [`dma_cursor`](Self::dma_cursor) for a caller-supplied cursor: the
     /// host's between-pump estimator extrapolates the play position and this
     /// converts it with the card's own geometry, so the modulo/units math
@@ -1163,6 +1190,30 @@ pub fn new_boxed() -> Box<Sb> {
 #[cfg(test)]
 mod tests {
     use super::{Sb, Start, Step};
+
+    #[test]
+    fn native_handoff_continues_the_dma_ring_and_dsp_block() {
+        use crate::dma::Request;
+        let mut sb = Sb::new();
+        sb.begin(Start { bits: 8, stereo: true, signed: false, single: false,
+                         block_override: Some(255) }, 4096, true, 0);
+
+        // The native 8237 has transferred 700 bytes, or 350 stereo frames.
+        let position = sb.sync_auto_init_dma_count(4095 - 700).unwrap();
+        assert_eq!(position, 350);
+        assert_eq!(sb.dma_cursor(), (4095 - 700, 700));
+        assert_eq!(sb.next_irq_frames(), 384);
+        let mut block = [(0, 0); 1];
+        let effect = sb.advance(Step::Mix {
+            rate: 11025, position_q32: position << 32, step_q32: 1 << 32,
+            block: &mut block, physical: true,
+        }, None);
+        assert_eq!(effect.dma, Some(Request::Read {
+            offset: 700, bytes: 2, wrap_bytes: Some(4096),
+        }));
+        assert!(!sb.advance(Step::Clock { now: 1, produced: 383 }, None).irq);
+        assert!(sb.advance(Step::Clock { now: 2, produced: 384 }, None).irq);
+    }
 
     #[test]
     fn unity_pcm_preserves_the_cards_fm_to_pcm_balance() {

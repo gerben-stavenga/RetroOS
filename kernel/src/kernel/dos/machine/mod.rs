@@ -774,7 +774,7 @@ pub fn emulate_inb<A: crate::Core>(machine: &mut A, pc: &mut PcMachine, port: u1
 }
 
 /// Emulate OUT to a port.
-pub fn emulate_outb<A: crate::Core>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, val: u8) {
+pub fn emulate_outb<A: crate::Core>(machine: &mut A, pc: &mut PcMachine, _regs: &mut Regs, port: u16, val: u8) {
     match port {
         0x3f8..=0x3ff => { pc.uart.write(port - 0x3f8, val); if pc.uart.poll_irq() { pc.vpic.raise(4); } },
         // VGA ports — pass through to hardware (tracking the AC flip-flop +
@@ -866,7 +866,7 @@ pub fn emulate_outb<A: crate::Core>(machine: &mut A, pc: &mut PcMachine, regs: &
         // so, remap the guest buffer contiguous + program the real 8237.
         p if Dma8237::owns(p) => {
             pc.dma.io_write(p, val);
-            pc.audio.lock().sb.maybe_remap(machine, regs, &mut pc.dma);
+            pc.audio.lock().sb.maybe_remap(machine, &mut pc.dma);
         }
         // Unknown port writes are dropped and logged for missing-device coverage.
         _ => {

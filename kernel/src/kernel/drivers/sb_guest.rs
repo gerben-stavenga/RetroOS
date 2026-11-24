@@ -27,11 +27,8 @@
 use super::sb16::Sb16;
 use sound::sb::Wiring as Blaster;
 
-/// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the
-/// "externally owned" mark — COW-fork and address-space teardown both
-/// skip such frames — exactly what an aliased permanent DMA buffer needs.
-/// Core's `paging2::flags` is private, so the bit is duplicated here per
-/// the arch-boundary rule (small primitives are copied, not cross-called).
+/// Cache-disable attribute for the native ISA DMA alias. The platform
+/// installs it as a borrowed mapping of the card's permanent channel pages.
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
 /// DSP reset: 1 then 0 to `base+6`, the power-on handshake.
@@ -187,6 +184,12 @@ impl NativeSb {
     /// knows it must replay the guest's channel programming.
     pub fn suspended(&self) -> bool {
         self.suspended
+    }
+
+    /// Read the hardware cursor while the guest's playback ring is still bound.
+    pub fn bound_dma_count<A: crate::Core>(&self, machine: &mut A, channel: usize) -> Option<u16> {
+        (self.bound_chan != 0xff && usize::from(self.bound_chan) == channel)
+            .then(|| real_8237_count(machine, self.bound_host))
     }
 
     /// Clear the suspended mark once the caller has replayed the programming.
